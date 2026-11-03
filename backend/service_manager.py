@@ -76,6 +76,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -103,6 +104,7 @@ from credentials import _FD_ENV_PREFIX as _SECRET_FD_ENV_PREFIX
 # ``backend/*.py`` sibling, so a project's own copy of this module
 # resolves to the harness' ledger rather than to a second one.
 import process_ledger
+import kill_audit as _kill_audit
 
 # The identity probe — the same reading the executor's spawn record and
 # the reaper's own check use. One identity rule, not two: the record
@@ -802,6 +804,29 @@ class ServiceRuntime:
     #: service the round cleans up after itself would be reported as a
     #: service that died.
     stopped: bool = False
+    #: Set when the watcher that watches this service's process has
+    #: **finished** (2026-11-01, repair-r1-01).
+    #:
+    #: The watcher is a thread of this module, and a thread that outlives
+    #: the work that started it is a defect the suite refuses: a worker
+    #: still running past the teardown of its test resolves its runtime
+    #: paths against a *later* test and writes there.  So the stop path
+    #: waits for the watcher to finish before it returns — which is the
+    #: same thing as waiting for the service's process to be gone, and
+    #: the reason a stop no longer stops at "the port is free": a
+    #: service can release its address and still be shutting down
+    #: (measured: the port free 0.4-9.4 s after the SIGTERM, the
+    #: process gone 1.0-33 s after it).
+    #:
+    #: ``None`` for a runtime this module did not start — a caller that
+    #: built one by hand, or a runtime read back from the ledger.  There
+    #: is no watcher for those, so there is nothing to wait for.
+    #:
+    #: Deliberately **not** part of ``to_dict()``: the ledger records the
+    #: service, not the thread that watches it.
+    watcher_done: Optional[threading.Event] = field(
+        default=None, repr=False, compare=False,
+    )
 
     @property
     def spawned_by_ac(self) -> bool:
@@ -1031,10 +1056,16 @@ def _process_group_of(pid: int) -> Optional[int]:
     return pgid
 
 
-def _process_groups_table() -> Dict[int, Tuple[int, int]]:
+def _process_groups_table() -> Optional[Dict[int, Tuple[int, int]]]:
     """``pid -> (ppid, pgid)`` for every process the platform reports.
 
-    One ``ps`` call for the whole table, not one call per ancestor.
+    One read of the whole table, not one call per ancestor.
+
+    The native reader comes first: on Linux it reads ``/proc/<pid>/stat``
+    and on macOS it asks ``libproc`` for every pid's ``proc_bsdinfo``.
+    Both answer the same question ``ps`` answers, and both answer it
+    without starting a process — which matters in a sandbox, where
+    ``ps`` may be refused outright and the whole table lost.
 
     ``ps`` rather than ``os.getpgid`` here, on purpose.  ``os.getpgid``
     is the kernel's own answer and it is the right one on the spawn
@@ -1049,8 +1080,169 @@ def _process_groups_table() -> Dict[int, Tuple[int, int]]:
     process it asked about rather than the ancestor it needed, and the
     group it then refuses is a group nobody is in.
 
-    A platform without ``ps`` contributes nothing, and the caller then
-    keeps the behaviour it had.
+    **Fail-closed.**  A table that could not be read comes back as
+    ``None`` — *not* as an empty table.  The difference is the whole
+    point: an empty table says "this machine has no other processes",
+    which is never true, and a caller that believed it would refuse
+    nothing and signal a group that may hold the caller's own shell.
+    ``None`` says "the tree around this stop is unknown", and the
+    caller answers that by refusing to signal at all (see
+    :func:`kill_service`).
+    """
+    table = _process_groups_table_native()
+    if table is not None:
+        return table
+    return _process_groups_table_via_ps()
+
+
+def _process_groups_table_native() -> Optional[Dict[int, Tuple[int, int]]]:
+    """The process table read without starting a process, or ``None``.
+
+    Linux reads ``/proc/<pid>/stat``; macOS asks ``libproc``.  Every
+    other platform has no reader here and answers ``None`` — which is
+    the fail-closed answer, not a gap.
+    """
+    try:
+        if sys.platform.startswith("linux"):
+            return _read_proc_table(Path("/proc"))
+        if sys.platform == "darwin":
+            return _read_libproc_table()
+    except Exception:  # pragma: no cover - defensive: never raise
+        return None
+    return None
+
+
+def _read_proc_table(root: Path) -> Optional[Dict[int, Tuple[int, int]]]:
+    """Read ``pid -> (ppid, pgid)`` out of a ``/proc``-shaped *root*.
+
+    ``/proc/<pid>/stat`` is ``pid (comm) state ppid pgrp ...``.  The
+    ``comm`` is the executable name in parentheses and it may contain
+    spaces *and* parentheses, so the fields are taken from the **last**
+    ``)`` in the line rather than from a split of the whole line.
+
+    One unreadable or unparseable pid costs that pid and nothing else:
+    a process that exits between the directory listing and the read
+    must not cost the whole table.
+    """
+    table: Dict[int, Tuple[int, int]] = {}
+    try:
+        entries = list(root.iterdir())
+    except (OSError, ValueError):
+        return None
+    for entry in entries:
+        name = entry.name
+        if not name.isdigit():
+            continue
+        try:
+            raw = (entry / "stat").read_text()
+        except (OSError, ValueError):
+            continue
+        close = raw.rfind(")")
+        if close < 0:
+            continue
+        fields = raw[close + 2:].split()
+        if len(fields) < 3:
+            continue
+        try:
+            ppid = int(fields[1])
+            pgid = int(fields[2])
+        except ValueError:
+            continue
+        table[int(name)] = (ppid, pgid)
+    if not table:
+        return None
+    return table
+
+
+def _read_libproc_table() -> Optional[Dict[int, Tuple[int, int]]]:
+    """Read ``pid -> (ppid, pgid)`` out of macOS's ``libproc``.
+
+    ``proc_listpids`` gives every pid the kernel knows about, and
+    ``proc_pidinfo`` with ``PROC_PIDTBSDINFO`` gives the parent pid and
+    the process group of each of them.  Both are the kernel's own
+    answers, which is what ``ps`` prints — so this reader and the
+    ``ps`` reader agree by construction.
+
+    The layout of ``struct proc_bsdinfo`` is fixed by the SDK headers;
+    the field order below is theirs and ``sizeof`` must stay at 136.
+    """
+    try:
+        import ctypes
+
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+    except Exception:
+        return None
+
+    PROC_ALL_PIDS = 1
+    PROC_PIDTBSDINFO = 3
+
+    class _ProcBsdInfo(ctypes.Structure):
+        _fields_ = [
+            ("pbi_flags", ctypes.c_uint32),
+            ("pbi_status", ctypes.c_uint32),
+            ("pbi_xstatus", ctypes.c_uint32),
+            ("pbi_pid", ctypes.c_uint32),
+            ("pbi_ppid", ctypes.c_uint32),
+            ("pbi_uid", ctypes.c_uint32),
+            ("pbi_gid", ctypes.c_uint32),
+            ("pbi_ruid", ctypes.c_uint32),
+            ("pbi_rgid", ctypes.c_uint32),
+            ("pbi_svuid", ctypes.c_uint32),
+            ("pbi_svgid", ctypes.c_uint32),
+            ("rfu_1", ctypes.c_uint32),
+            ("pbi_comm", ctypes.c_char * 16),
+            ("pbi_name", ctypes.c_char * 32),
+            ("pbi_nfiles", ctypes.c_uint32),
+            ("pbi_pgid", ctypes.c_uint32),
+            ("pbi_pjobc", ctypes.c_uint32),
+            ("e_tdev", ctypes.c_uint32),
+            ("e_tpgid", ctypes.c_uint32),
+            ("pbi_nice", ctypes.c_int32),
+            ("pbi_start_tvsec", ctypes.c_uint64),
+            ("pbi_start_tvusec", ctypes.c_uint64),
+        ]
+
+    try:
+        needed = libproc.proc_listpids(PROC_ALL_PIDS, 0, None, 0)
+        if not needed or needed <= 0:
+            return None
+        buffer = (ctypes.c_int * (needed // 4 + 64))()
+        written = libproc.proc_listpids(
+            PROC_ALL_PIDS, 0, ctypes.byref(buffer), ctypes.sizeof(buffer),
+        )
+        if not written or written <= 0:
+            return None
+        pids = [p for p in buffer[: written // 4] if p > 0]
+
+        info = _ProcBsdInfo()
+        table: Dict[int, Tuple[int, int]] = {}
+        for pid in pids:
+            got = libproc.proc_pidinfo(
+                pid, PROC_PIDTBSDINFO, 0,
+                ctypes.byref(info), ctypes.sizeof(info),
+            )
+            if not got or got <= 0:
+                continue
+            table[pid] = (int(info.pbi_ppid), int(info.pbi_pgid))
+    except Exception:
+        return None
+    if not table:
+        return None
+    return table
+
+
+def _process_groups_table_via_ps() -> Optional[Dict[int, Tuple[int, int]]]:
+    """The process table as ``ps`` prints it, or ``None``.
+
+    The fallback for a platform whose native reader did not answer.
+    A ``ps`` that cannot be run, times out, or fails as a subprocess
+    contributes nothing — and "nothing" here is ``None``, not ``{}``:
+    the caller has to be able to tell "the machine is empty" (never
+    true) from "the table could not be read".
+
+    A ``ps`` that exits non-zero but still printed something readable
+    is parsed all the same: what it printed is the truth about the
+    machine, and the exit code only says the output is incomplete.
     """
     try:
         completed = subprocess.run(
@@ -1058,7 +1250,7 @@ def _process_groups_table() -> Dict[int, Tuple[int, int]]:
             capture_output=True, text=True, timeout=10, check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        return {}
+        return None
     table: Dict[int, Tuple[int, int]] = {}
     for line in (completed.stdout or "").splitlines():
         fields = line.split()
@@ -1071,10 +1263,39 @@ def _process_groups_table() -> Dict[int, Tuple[int, int]]:
         except ValueError:
             continue
         table[pid] = (ppid, pgid)
+    if not table:
+        return None
     return table
 
 
-def _ancestor_process_groups(max_depth: int = 8) -> Set[int]:
+def _process_tree_available(
+    table: Optional[Dict[int, Tuple[int, int]]],
+) -> bool:
+    """Whether the process tree around this stop could be read.
+
+    ``None`` (the table could not be read) and ``{}`` (nothing to read)
+    are both "not available": only a table with at least one entry is
+    evidence that the tree is known.
+    """
+    return bool(table)
+
+
+#: The "no table was passed" marker for the functions that read the
+#: process table.
+#:
+#: It exists because ``None`` is **not** an omitted argument here: it
+#: is the answer "the table was read and could not be read".  Without
+#: the marker, an explicit ``None`` would be read as "no table, go and
+#: read one", and a stop whose table is unavailable would read the
+#: table again — and again — each read costing a ``ps`` fallback that
+#: may sit in its timeout.
+_PROCESS_TABLE_UNSET = object()
+
+
+def _ancestor_process_groups(
+    max_depth: int = 8,
+    table: Any = _PROCESS_TABLE_UNSET,
+) -> Set[int]:
     """The process groups that hold one of this process's ancestors.
 
     A stop must never group-signal a group that holds an ancestor of
@@ -1085,11 +1306,18 @@ def _ancestor_process_groups(max_depth: int = 8) -> Set[int]:
     group kills the shell, the shell forwards the signal to the child it
     waits for, and the caller dies of a signal it never sent.
 
-    The walk is bounded and every step of it is optional: a platform
-    that cannot answer contributes nothing, and the caller then keeps the
-    behaviour it had.
+    The walk is bounded, and a table that could not be read contributes
+    nothing: the caller then knows the tree is unknown and fails
+    closed (see :func:`_process_groups_table`).
+
+    *table* is the process table the walk reads.  It is passed in when
+    the caller already has one, so that a stop that needs both the
+    groups and the pids reads the table once instead of twice.  An
+    explicit ``None`` means "already read, and unavailable" — the walk
+    then reads nothing and contributes nothing.
     """
-    table = _process_groups_table()
+    if table is _PROCESS_TABLE_UNSET:
+        table = _process_groups_table()
     if not table:
         return set()
     groups: Set[int] = set()
@@ -1112,7 +1340,69 @@ def _ancestor_process_groups(max_depth: int = 8) -> Set[int]:
     return groups
 
 
-def _protected_groups() -> Set[int]:
+def _ancestor_pids(
+    max_depth: int = 8,
+    table: Any = _PROCESS_TABLE_UNSET,
+) -> Set[int]:
+    """The pids of this process's ancestors.
+
+    The groups above are refused; the pids are the other half of the
+    same danger.  A stop that refuses a group falls back to the pids it
+    was about, and a pid that has been recycled onto the caller's own
+    shell is a signal the caller sends to the process that owns it.
+
+    *table* is the process table the walk reads; an explicit ``None``
+    means "already read, and unavailable" (see
+    :data:`_PROCESS_TABLE_UNSET`).
+    """
+    if table is _PROCESS_TABLE_UNSET:
+        table = _process_groups_table()
+    if not table:
+        return set()
+    pids: Set[int] = set()
+    try:
+        pid = int(os.getpid())
+    except OSError:
+        return pids
+    seen: Set[int] = set()
+    for _ in range(max_depth):
+        entry = table.get(pid)
+        if entry is None:
+            break
+        ppid, _pgid = entry
+        if ppid <= 1 or ppid in seen:
+            break
+        seen.add(ppid)
+        pids.add(ppid)
+        pid = ppid
+    return pids
+
+
+def _ancestor_walk_sees_the_caller(table: Any) -> bool:
+    """Whether the ancestor walk can walk at all.
+
+    The walk starts at the caller and reads the caller's own entry out
+    of the table; if the table has no entry for the caller — because
+    it could not be read, or because it does not hold this process —
+    the walk contributes nothing, and the ancestors are protected only
+    by the kernel's own answer about the immediate parent (see
+    :func:`_protected_groups`).
+
+    *table* is the process table the walk reads.  ``None`` means
+    "already read, and unavailable" (see :data:`_PROCESS_TABLE_UNSET`).
+    """
+    if not _process_tree_available(table):
+        return False
+    try:
+        own = int(os.getpid())
+    except OSError:
+        return False
+    return own in table
+
+
+def _protected_groups(
+    table: Any = _PROCESS_TABLE_UNSET,
+) -> Set[int]:
     """The groups a group-signal must never touch.
 
     Two of them, and they are the same kind of danger:
@@ -1127,7 +1417,29 @@ def _protected_groups() -> Set[int]:
     The set is computed per call rather than cached: the tree around a
     stop is short-lived, and a cached answer would be an answer about a
     tree that no longer exists.
+
+    The caller's **immediate parent** is protected when the process
+    table could not be read: the kernel knows the parent's group
+    without anybody reading a table, and the parent is the process that
+    most often forwards a signal to the caller.  This is the one
+    ancestor protection that does not depend on the table, and it is
+    why a table that could not be read still has *some* protection
+    rather than none.
+
+    When the table *could* be read, the ancestor walk below already
+    covers the parent — the walk reads the caller's own entry and
+    follows its parent — so the kernel is not asked about the same
+    tree a second time.  Two questions about one tree can disagree
+    (the walk's table and the kernel's live answer), and a stop that
+    protects two different answers protects a group nobody is in.
+
+    *table* is the process table the ancestors are read out of.  An
+    explicit ``None`` means "already read, and unavailable" (see
+    :data:`_PROCESS_TABLE_UNSET`) — the ancestors are then not read
+    again.
     """
+    if table is _PROCESS_TABLE_UNSET:
+        table = _process_groups_table()
     groups: Set[int] = set()
     try:
         own = int(os.getpgrp())
@@ -1135,8 +1447,69 @@ def _protected_groups() -> Set[int]:
         own = None
     if own is not None and own > 1:
         groups.add(own)
-    groups |= _ancestor_process_groups()
+    if not _ancestor_walk_sees_the_caller(table):
+        parent_pgid = _immediate_parent_group()
+        if parent_pgid is not None and parent_pgid > 1:
+            groups.add(parent_pgid)
+    groups |= _ancestor_process_groups(table=table)
     return groups
+
+
+def _immediate_parent_group() -> Optional[int]:
+    """The process group of this process's immediate parent, or ``None``.
+
+    Read from the kernel, so it does not need the process table and it
+    is available even when the table could not be read at all.
+    """
+    try:
+        ppid = int(os.getppid())
+    except (OSError, ValueError):
+        return None
+    if ppid <= 1:
+        return None
+    try:
+        return int(os.getpgid(ppid))
+    except (OSError, ValueError):
+        return None
+
+
+def _protected_pids(
+    table: Any = _PROCESS_TABLE_UNSET,
+) -> Set[int]:
+    """The pids a stop must never signal: the caller and its ancestors.
+
+    The same two dangers the groups are refused for, seen one pid at a
+    time.  A stop that is refused a group falls back to the pids it was
+    about, so the pids need the same protection the groups get: the
+    caller is never a target of its own stop, and neither is the shell
+    that owns it.
+
+    The immediate parent is protected without the process table, for
+    the same reason its group is (see :func:`_protected_groups`): the
+    kernel knows it without a table.  When the table could be read, the
+    ancestor walk already covers the parent, so the fallback is only
+    for the tree that could not be read.
+
+    *table* is the process table the ancestors are read out of; an
+    explicit ``None`` means "already read, and unavailable" (see
+    :data:`_PROCESS_TABLE_UNSET`).
+    """
+    if table is _PROCESS_TABLE_UNSET:
+        table = _process_groups_table()
+    pids: Set[int] = set()
+    try:
+        pids.add(int(os.getpid()))
+    except OSError:
+        pass
+    if not _ancestor_walk_sees_the_caller(table):
+        try:
+            ppid = int(os.getppid())
+        except (OSError, ValueError):
+            ppid = 0
+        if ppid > 1:
+            pids.add(ppid)
+    pids |= _ancestor_pids(table=table)
+    return pids
 
 
 #: The program a declared service is started through.
@@ -1460,6 +1833,17 @@ _UNSET_PGID = object()
 
 
 # ---------------------------------------------------------------------------
+# The kill audit
+# ---------------------------------------------------------------------------
+#
+# Every ``os.kill`` / ``os.killpg`` this process sends is written down
+# before it goes out, so "who sent the signal" is read from disk rather
+# than inferred from a ``Terminated`` line.  The recorder lives in
+# :mod:`kill_audit` and nowhere else: this module used to carry a copy
+# of it, and two copies meant two hooks in any process that imported
+# both -- one line per signal written twice, and two caps that drifted
+# apart.  Importing the module installs the hook.
+_kill_audit.install_kill_audit()
 # The identity gate of the stop path (2026-11-03, VP-018)
 # ---------------------------------------------------------------------------
 #
@@ -1783,6 +2167,18 @@ def kill_service(
     is written down first, and only then is the signal sent.**  A
     signal can take the round's log with it.
 
+    The answer says whether the process tree could be read
+    (``process_tree``: ``"available"`` / ``"unavailable"``) and why a
+    group was refused (``refused_reason``: ``""``,
+    ``"protected_group"``, ``"process_tree_unavailable"``).
+
+    **Fail-closed.**  When the process tree cannot be read, this
+    function signals *nothing* — not the group, and not the individual
+    pids either — and says so on the record.  A stop that cannot see
+    the tree cannot know what it would be signalling, and the pids are
+    no safer than the group: they may be a recycled pid belonging to
+    somebody else.
+
     Never raises.
     """
     if plan_dir is None:
@@ -1799,6 +2195,26 @@ def kill_service(
         if value > 1 and value not in targets:
             targets.append(value)
 
+    # The tree around the stop is read once: the groups and the pids
+    # that are protected are two views of the same table.
+    process_table = _process_groups_table()
+    tree_known = _process_tree_available(process_table)
+
+    # Never the caller, and never one of the caller's ancestors.  The
+    # group they hold is refused below; the pids are refused here, and
+    # they are refused *before* the group is resolved — a refused group
+    # degrades to the individual pids, so a pid that survived this
+    # filter would be signalled right after the group was let go.
+    refused_pids: List[int] = []
+    protected_pids = _protected_pids(table=process_table)
+    if protected_pids:
+        kept: List[int] = []
+        for pid in targets:
+            if pid in protected_pids:
+                refused_pids.append(pid)
+            else:
+                kept.append(pid)
+        targets = kept
     # The refusals, computed **before** the request is written down, so
     # that the record says what was *not* signalled and why (2026-11-03,
     # VP-018).  A request that says "nothing was signalled" without
@@ -1808,7 +2224,7 @@ def kill_service(
     # The groups a signal must never reach, read once for this call:
     # the group signal and the candidate checks below ask the same
     # question, and the question is answered by the process table.
-    protected_groups = _protected_groups()
+    protected_groups = _protected_groups(table=process_table)
     for pid in targets:
         if pid == runtime.pid:
             # The pid the runtime names is checked against the runtime's
@@ -1881,10 +2297,31 @@ def kill_service(
     # processes this call is about, when the caller allows that
     # (``fallback_to_pids``); a caller that does not allow it gets no
     # signal at all, which is its own choice and not this one's.
+    #
+    # The one exception is an **unknown** tree: when the process table
+    # could not be read, the degradation to individual pids is itself
+    # unsafe (a pid may be just as unknown as the group was), so
+    # nothing is signalled at all.
     refused_pgid: Optional[int] = None
-    if group is not None and group in protected_groups:
+    refused_reason = ""
+    if not tree_known:
+        # The tree around this stop could not be read, so nothing is
+        # known about who is in that group — including whether the
+        # caller itself is.  Fail closed: refuse the group outright
+        # rather than signal a group that may hold the caller's shell.
+        #
+        # The reason is recorded even when there is no group to
+        # refuse: the event has to be able to say *why* nothing was
+        # signalled, and "nothing was signalled because the process
+        # tree could not be read" is the answer.
+        if group is not None:
+            refused_pgid = group
+            group = None
+        refused_reason = "process_tree_unavailable"
+    elif group is not None and group in protected_groups:
         refused_pgid = group
         group = None
+        refused_reason = "protected_group"
     if group is not None and group <= 1:
         # 1 is ``kill(-1)``: every process we may signal.  See
         # ``utils.process._signallable_pgid``.
@@ -1897,6 +2334,9 @@ def kill_service(
         "port": runtime.port,
         "pgid": group,
         "refused_pgid": refused_pgid,
+        "refused_pids": list(refused_pids),
+        "process_tree": "available" if tree_known else "unavailable",
+        "refused_reason": refused_reason,
         "signal": int(sig),
         "caller": str(caller or ""),
         "reason": str(reason or ""),
@@ -1942,7 +2382,14 @@ def kill_service(
             except (ProcessLookupError, PermissionError, OSError):
                 continue
 
-    if pids_first:
+    if not tree_known:
+        # Fail closed: an unknown tree means an unknown target, so no
+        # signal of any kind goes out — neither the group nor the
+        # individual pids.
+        fallback_to_pids = False
+        signallable = []
+        group = None
+    elif pids_first:
         _signal_pids()
         _signal_group()
     else:
@@ -1966,6 +2413,9 @@ def kill_service(
         "port": runtime.port,
         "pgid": group,
         "refused_pgid": refused_pgid,
+        "refused_pids": list(refused_pids),
+        "process_tree": "available" if tree_known else "unavailable",
+        "refused_reason": refused_reason,
         "signal": int(sig),
         "caller": str(caller or ""),
         "reason": str(reason or ""),
@@ -1999,6 +2449,26 @@ def _ambient_round_token() -> str:
     return str(context.get("round_token") or "")
 
 
+def _service_is_gone(runtime: ServiceRuntime) -> bool:
+    """Has the service's process actually gone?
+
+    The port is not the process: a service can release its address and
+    still be shutting down.  When this module started the service it
+    also started the watcher that knows when the process is gone, and
+    that watcher is what the stop waits for — it is the thread that
+    would otherwise outlive the test that started the service.
+
+    A runtime this module did not start (a caller that built one by
+    hand, a runtime read back from the ledger) has no watcher.  For
+    those the port is the only evidence there is, and it is what the
+    stop has always waited for.
+    """
+    done = runtime.watcher_done
+    if done is None:
+        return True
+    return done.is_set()
+
+
 def stop_service(
     runtime: ServiceRuntime,
     decl: Optional[ServiceDeclaration] = None,
@@ -2014,8 +2484,17 @@ def stop_service(
     Signals the **process group** when one is known — an ``npx next
     dev`` chain is three processes (npm exec → node → next-server) and
     killing only the recorded PID leaves the wrapper alive to re-spawn
-    or hold the port. Then waits for the port to be released and
-    reports it.
+    or hold the port. Then waits for the service to be **gone** — the
+    port released *and* the process finished — and reports it.
+
+    The wait is for the service, not only for its address: a service
+    can release its port and still be shutting down (measured: the port
+    free 0.4-9.4 s after the SIGTERM, the process gone 1.0-33 s after
+    it), and the watcher thread that watches the service is still
+    running in that gap.  A stop that returned there would hand the
+    next test a thread that is still running (2026-11-01,
+    repair-r1-01).  A service that has not gone when the grace is
+    over is killed, the way a service that still holds its port is.
 
     ``caller`` and ``reason`` say **who** is stopping the service and
     **why**; they are written to the plan's kill event stream before
@@ -2126,8 +2605,15 @@ def stop_service(
     while time.monotonic() < deadline:
         if not probe_port(runtime.port).listening:
             result["port_free"] = True
-            result["detail"] = "stopped after SIGTERM"
-            return result
+            # The port being free is not the service being gone: a
+            # service can let go of its address and still be shutting
+            # down (measured: the port free 0.4-9.4 s after the
+            # SIGTERM, the process gone 1.0-33 s after it).  A stop
+            # that returned in that gap would leave the watcher thread
+            # running past the test that started it.
+            if _service_is_gone(runtime):
+                result["detail"] = "stopped after SIGTERM"
+                return result
         time.sleep(0.5)
 
     # Escalate.  The recorded pid goes first — it is the process the
@@ -2158,7 +2644,9 @@ def stop_service(
     deadline = time.monotonic() + max(5.0, grace_seconds)
     while True:
         result["port_free"] = not probe_port(runtime.port).listening
-        if result["port_free"] or time.monotonic() >= deadline:
+        if (
+            result["port_free"] and _service_is_gone(runtime)
+        ) or time.monotonic() >= deadline:
             break
         time.sleep(0.1)
     result["detail"] = (
@@ -6065,6 +6553,7 @@ def _watch_service_process(
     plan_dir: Optional[Path],
     round_token: str,
     poll_interval: float = _PROCESS_WATCH_INTERVAL,
+    done: Optional[threading.Event] = None,
 ) -> None:
     """Poll *proc* until it exits, then say how it died.
 
@@ -6076,46 +6565,55 @@ def _watch_service_process(
     The exit is recorded **and** applied to the runtime.  The recording
     is what a reader of the round's log sees; the application is what
     stops the dead runtime from being handed out as an address.
-    """
-    while True:
-        try:
-            code = proc.poll()
-        except Exception:  # noqa: BLE001 - a poll never raises in practice
-            code = None
-        if code is not None:
-            break
-        time.sleep(poll_interval)
 
-    exited_at = time.time()
-    started_at = float(runtime.start_epoch or exited_at)
-    exit_signal = exit_signal_of(code)
-    exit_info = ProcessExit(
-        pid=runtime.pid,
-        port=runtime.port,
-        returncode=code,
-        exit_signal=exit_signal,
-        started_at=started_at,
-        exited_at=exited_at,
-        uptime_sec=max(0.0, exited_at - started_at),
-        round_token=round_token,
-        reason=_describe_exit(code, runtime.stopped),
-    )
-    # The runtime is the state machine: the moment the process is gone,
-    # the runtime stops saying the service is ready.  Nothing else has
-    # to be told — every reader of the runtime sees the same fact.
-    runtime.exit = exit_info
-    runtime.ready = False
-    if not runtime.failure_reason:
-        runtime.failure_reason = exit_info.reason
-    if plan_dir is not None:
-        record_process_event(
-            plan_dir, PROCESS_EVENT_EXITED,
-            pid=exit_info.pid, port=exit_info.port,
-            returncode=exit_info.returncode, exit_signal=exit_info.exit_signal,
-            started_at=exit_info.started_at, exited_at=exit_info.exited_at,
-            uptime_sec=exit_info.uptime_sec, round_token=exit_info.round_token,
-            reason=exit_info.reason,
+    *done* is set when the watcher is finished.  The stop path waits on
+    it (see :func:`stop_service`), and it is set even when the watcher
+    failed: a stop must not wait for something that will not come.
+    """
+    try:
+        while True:
+            try:
+                code = proc.poll()
+            except Exception:  # noqa: BLE001 - a poll never raises in practice
+                code = None
+            if code is not None:
+                break
+            time.sleep(poll_interval)
+
+        exited_at = time.time()
+        started_at = float(runtime.start_epoch or exited_at)
+        exit_signal = exit_signal_of(code)
+        exit_info = ProcessExit(
+            pid=runtime.pid,
+            port=runtime.port,
+            returncode=code,
+            exit_signal=exit_signal,
+            started_at=started_at,
+            exited_at=exited_at,
+            uptime_sec=max(0.0, exited_at - started_at),
+            round_token=round_token,
+            reason=_describe_exit(code, runtime.stopped),
         )
+        # The runtime is the state machine: the moment the process is
+        # gone, the runtime stops saying the service is ready.  Nothing
+        # else has to be told — every reader of the runtime sees the
+        # same fact.
+        runtime.exit = exit_info
+        runtime.ready = False
+        if not runtime.failure_reason:
+            runtime.failure_reason = exit_info.reason
+        if plan_dir is not None:
+            record_process_event(
+                plan_dir, PROCESS_EVENT_EXITED,
+                pid=exit_info.pid, port=exit_info.port,
+                returncode=exit_info.returncode, exit_signal=exit_info.exit_signal,
+                started_at=exit_info.started_at, exited_at=exit_info.exited_at,
+                uptime_sec=exit_info.uptime_sec, round_token=exit_info.round_token,
+                reason=exit_info.reason,
+            )
+    finally:
+        if done is not None:
+            done.set()
 
 
 def _start_process_watcher(
@@ -6137,12 +6635,20 @@ def _start_process_watcher(
     """
     if not isinstance(proc, _REAL_POPEN):
         return None
+    # The watcher announces its own end (2026-11-01, repair-r1-01).  The
+    # stop path waits for it, so that a stop never returns while the
+    # thread that watches the service is still running -- a thread that
+    # outlives its test is a defect the suite refuses, and it fails on
+    # an unrelated test at an unrelated moment.
+    done = threading.Event()
+    runtime.watcher_done = done
     thread = threading.Thread(
         target=_watch_service_process,
         args=(runtime, proc),
         kwargs={
             "plan_dir": plan_dir,
             "round_token": round_token,
+            "done": done,
         },
         name=f"pdt-service-watch-{runtime.name}-{runtime.pid}",
         daemon=True,
@@ -6154,6 +6660,8 @@ def _start_process_watcher(
             "[service_manager] could not start the watcher for %s: %s",
             runtime.name, exc,
         )
+        # No watcher means no watcher to wait for.
+        done.set()
         return None
     return thread
 

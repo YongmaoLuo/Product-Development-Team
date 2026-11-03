@@ -2587,6 +2587,60 @@ def _dispatch_work_clock(tool, budget_seconds: float):
         tool._work_clock = None
 
 
+def _child_pgid(proc) -> Optional[int]:
+    """The child's process-group id, or ``None`` when it has none.
+
+    Read **before** the group is signalled: once the leader is gone,
+    ``os.getpgid`` cannot answer for it any more, and the question
+    "is the group still alive?" needs the group's id, not the leader's.
+
+    A pid that is not a genuine integer is refused (``None``): a mocked
+    process would otherwise resolve to the caller's own group, and the
+    group-existence check that follows would then be asking about the
+    backend itself.
+    """
+    pid = getattr(proc, "pid", None)
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        return None
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        return None
+    if pgid <= 1:
+        # 0 is the caller's own group and 1 is "every process the
+        # caller may signal" — neither names a group this may ask
+        # about.
+        return None
+    return pgid
+
+
+def _group_is_gone(pgid: Optional[int]) -> bool:
+    """True when the process group has no member left.
+
+    ``killpg(pgid, 0)`` is the only question that asks about the
+    **group** rather than about one process: it succeeds while any
+    member is alive and fails with ``ESRCH`` once the group is empty.
+    The group's leader being gone says nothing about the members — the
+    CLI's own children (a shell, a pytest run) sit in the same group,
+    and a kill that only reached the leader leaves them running.
+
+    ``None`` (no group to ask about) counts as gone: there is nothing
+    left to be alive.
+    """
+    if pgid is None:
+        return True
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        # The group exists — it is just not ours to signal.
+        return False
+    except OSError:
+        return True
+    return False
+
+
 def _quota_wake_sleep(seconds: float) -> None:
     """Wait before re-probing a quota-blocked dispatch.
 
@@ -7490,69 +7544,107 @@ class ClaudeCodingTool(CodingTool):
                 # default, and the copy is what keeps the attribution
                 # readable inside the dispatch.
                 _ctx = contextvars.copy_context()
-                with (
-                    _dispatch_work_clock(self, self.HARD_WALL_CLOCK_TIMEOUT_SECONDS) as _budget,
-                    ThreadPoolExecutor(max_workers=1) as executor,
-                ):
-                    future = executor.submit(
-                        _ctx.run, _call, excluded_providers, None,
-                        entry_resume is not None,
-                    )
-                    try:
-                        # 2026-10-22 — same clock as the arm below: the
-                        # wait spends work time, so a quota window this
-                        # dispatch is parked on cannot eat the cap.
-                        result = _result_under_work_clock(future, _budget)
-                    except HardTimeoutError:
-                        # Layer 1 fired (the subprocess went silent for
-                        # ``DEFAULT_TOTAL_TIMEOUT``). It is already the
-                        # error the auto-split routing wants, and it has
-                        # to reach the caller untouched.
-                        raise
-                    except FuturesTimeoutError:
-                        # Two different things arrive here and they do NOT
-                        # get the same answer.
-                        #
-                        # The budget expired: the cap did its job, and the
-                        # error is ``HardTimeoutError`` so the upper
-                        # layers route it to auto-split. A plain
-                        # ``TimeoutError`` here would be read as a
-                        # provider outage and retried against the next
-                        # provider instead.
-                        #
-                        # The dispatch raised a timeout of its OWN while
-                        # the budget still had time in it — the idle
-                        # watcher closing a silent pipe, say. That one is
-                        # NOT a hard timeout and must keep travelling as
-                        # the plain ``TimeoutError`` it was, because it
-                        # is the provider-fallback signal and the outer
-                        # arm below acts on it. The clock is what tells
-                        # the two apart: a budget that ran out has no
-                        # time left in it, and one that did not still
-                        # has plenty.
-                        if _budget.remaining() > 0.0:
-                            raise
-                        # The process group has to die, or this ``with``
-                        # block's ``shutdown(wait=True)`` would not
-                        # return until the dispatch finished on its own.
-                        with self._process_lock:
-                            proc = self._current_process
-                            self._current_process = None
-                        if proc is not None:
-                            kill_process_group(proc)
-                        duration = int(time.monotonic() - start_time)
-                        if self.logger:
-                            self.logger.warning(
-                                "coding_query_hard_timeout",
-                                f"Claude query exceeded the "
-                                f"{self.HARD_WALL_CLOCK_TIMEOUT_SECONDS}s "
-                                f"hard cap",
-                                data={"timeout": self.HARD_WALL_CLOCK_TIMEOUT_SECONDS,
-                                      "duration_sec": duration})
-                        raise HardTimeoutError.for_work_budget(
-                            self.HARD_WALL_CLOCK_TIMEOUT_SECONDS,
-                            float(duration),
+                # 2026-11-02 (层六) — the executor is NOT used as a
+                # context manager on this path.  ``ThreadPoolExecutor.
+                # __exit__`` calls ``shutdown(wait=True)``, which blocks
+                # until the worker thread finishes: the cap's own "this
+                # call is over" moment was followed by an unbounded wait
+                # for the worker to unwind.  Under load that wait is
+                # what turned a 1s cap into an 18s call — the cap fired
+                # on time and the call still took eighteen seconds to
+                # come back.
+                #
+                # The worker is not waited for.  It is a thread running
+                # the dispatch; the process group is killed on the
+                # timeout path below, and how long the thread takes to
+                # notice is not the caller's business — the caller's
+                # budget has already been spent.
+                executor = ThreadPoolExecutor(max_workers=1)
+                try:
+                    with _dispatch_work_clock(
+                        self, self.HARD_WALL_CLOCK_TIMEOUT_SECONDS
+                    ) as _budget:
+                        future = executor.submit(
+                            _ctx.run, _call, excluded_providers, None,
+                            entry_resume is not None,
                         )
+                        try:
+                            # 2026-10-22 — same clock as the arm below: the
+                            # wait spends work time, so a quota window this
+                            # dispatch is parked on cannot eat the cap.
+                            result = _result_under_work_clock(future, _budget)
+                        except HardTimeoutError:
+                            # Layer 1 fired (the subprocess went silent for
+                            # ``DEFAULT_TOTAL_TIMEOUT``). It is already the
+                            # error the auto-split routing wants, and it has
+                            # to reach the caller untouched.
+                            raise
+                        except FuturesTimeoutError:
+                            # Two different things arrive here and they do NOT
+                            # get the same answer.
+                            #
+                            # The budget expired: the cap did its job, and the
+                            # error is ``HardTimeoutError`` so the upper
+                            # layers route it to auto-split. A plain
+                            # ``TimeoutError`` here would be read as a
+                            # provider outage and retried against the next
+                            # provider instead.
+                            #
+                            # The dispatch raised a timeout of its OWN while
+                            # the budget still had time in it — the idle
+                            # watcher closing a silent pipe, say. That one is
+                            # NOT a hard timeout and must keep travelling as
+                            # the plain ``TimeoutError`` it was, because it
+                            # is the provider-fallback signal and the outer
+                            # arm below acts on it. The clock is what tells
+                            # the two apart: a budget that ran out has no
+                            # time left in it, and one that did not still
+                            # has plenty.
+                            if _budget.remaining() > 0.0:
+                                raise
+                            # The process group has to die before the
+                            # call comes back — otherwise the CLI (and
+                            # whatever it spawned) is still running and
+                            # the "the call is over" is a lie.
+                            with self._process_lock:
+                                proc = self._current_process
+                                self._current_process = None
+                            pgid = _child_pgid(proc)
+                            if proc is not None:
+                                kill_process_group(proc)
+                            # 2026-11-02: "killed" is a question, not
+                            # an assumption.  The leader's exit says
+                            # nothing about the group — the CLI's own
+                            # children are in it — so the group is
+                            # asked directly, and the answer goes into
+                            # the verdict.
+                            group_gone = _group_is_gone(pgid)
+                            duration = int(time.monotonic() - start_time)
+                            if self.logger:
+                                self.logger.warning(
+                                    "coding_query_hard_timeout",
+                                    f"Claude query exceeded the "
+                                    f"{self.HARD_WALL_CLOCK_TIMEOUT_SECONDS}s "
+                                    f"hard cap",
+                                    data={"timeout": self.HARD_WALL_CLOCK_TIMEOUT_SECONDS,
+                                          "duration_sec": duration,
+                                          "process_group_killed": group_gone})
+                            error = HardTimeoutError.for_work_budget(
+                                self.HARD_WALL_CLOCK_TIMEOUT_SECONDS,
+                                float(duration),
+                            )
+                            # The verdict carries the kill outcome, so
+                            # the layers above can tell "the cap fired
+                            # and the process died" from "the cap fired
+                            # and something is still running".
+                            error.process_group_killed = group_gone
+                            raise error
+                finally:
+                    # Never wait for the worker.  ``cancel_futures`` is
+                    # about the ones that have not started; this one
+                    # has, so it is left to unwind on its own while the
+                    # process group kill ends what it was running.
+                    executor.shutdown(wait=False, cancel_futures=True)
             else:
                 # 2026-09-06 — BOTH layers of timeout cap are active:
                 # 1. ``total_timeout=timeout`` → daemon watcher inside

@@ -654,8 +654,16 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 动作、failed 相位专属文案「重新排队执行」、重跑验证的两次请求）与调度面板改版
     # （视图重排、在跑运行时长、并行 Agent 数、容量下拉框），按本 gate 的既定流程
     # 重新钉住该文件的哈希。
+    # 2026-11-01：因已批准的 VP-009 修复（f623224e「加载期的 503 不再变成未捕获的
+    # Promise rejection，取证副本搬出被服务的 plans 树」）给该文件加了一层加载期的
+    # 拒绝处理（`loadInBackground` / `renderPlansError` / `renderSidebarError`），
+    # 按本 gate 的既定流程把冻结基线前移到该批准态的哈希。
+    # 前移之前已核对：自上一版基线（bcab67d5 合并 origin/main 之后的状态）以来，
+    # 该文件只有 f623224e 这一处改动（+95/-18），没有夹带别的改动。
+    # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的范围、
+    # sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
     "frontend/app.js": (
-        "d6cd5c015d0e3d4ac1f963e6275b29350c256ff1b6ad8335aef56cd37f1595e0"
+        "85077cadb0ec1439f3249260fdd4e1acdc18aaab0dc26b659faa0f2c0f026a4b"
     ),
     "frontend/style.css": (
         "0cab7b66dae8b5b693a9e8e4b5c4cda4f8651ae649512e81d8aa8c18a24f836b"

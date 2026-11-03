@@ -105,13 +105,16 @@ def _is_the_service_spawn(argv) -> bool:
     would read the probe instead of the spawn, and the probe hands on
     the *parent's* environment -- which is exactly what these pins are
     about.  So the spawn is told apart by its shape: the detached
-    wrapper runs under this interpreter and is a program of its own.
+    wrapper runs under this interpreter and is a program of its own --
+    that is the shape ``service_manager._detached_argv`` builds, and it
+    is the shape no other subprocess in this process has.
     """
     argv = list(argv or [])
     return (
-        len(argv) >= 2
+        len(argv) > 2
         and argv[0] == (sys.executable or "/usr/bin/python3")
         and argv[1] == "-c"
+        and argv[2] == sm._DETACHED_WRAPPER_SOURCE
     )
 
 
@@ -123,13 +126,38 @@ def spawn(monkeypatch, project):
     replacement captures the ``env`` the child would have inherited,
     which is the only thing these pins are about.
 
-    Every call the replacement caught is kept, and the service's own
-    spawn is picked out of them by its shape.
+    The replacement takes the **service's** spawn and nothing else.
+    The start path spawns subprocesses of its own besides the service:
+    the ``ps`` probes that read a pid's start time -- the spawn marker
+    before the spawn, the registry entry after it -- and the machine's
+    process table.  A capture that takes those as well leaves the pins
+    below reading a probe instead of the service, and the probe carries
+    the *inherited* environment, not the one the spawn site wrote.
+    The probes are the production's business, so they are handed to the
+    real ``Popen``.
+
+    Every call the replacement caught is kept as well, and the
+    service's own spawn is picked out of them by its shape.
     """
+    captured = {}
+    service_spawns = []
     calls = []
+    real_popen = sm.subprocess.Popen
 
     def _fake_popen(argv, **kwargs):
-        calls.append((argv, kwargs))
+        # Every call the replacement caught is kept -- the probe included
+        # -- because a recorder that threw the others away would be
+        # hiding them instead of telling them apart.
+        calls.append((list(argv), dict(kwargs)))
+        if not _is_the_service_spawn(argv):
+            # Not the service: a probe of the production's own.  It is
+            # handed to the real ``Popen`` so that the production sees
+            # what it would see.
+            return real_popen(argv, **kwargs)
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        captured["env"] = dict(kwargs.get("env") or {})
+        service_spawns.append(list(argv))
         return _FakeProc()
 
     monkeypatch.setattr(sm.subprocess, "Popen", _fake_popen)
@@ -145,17 +173,27 @@ def spawn(monkeypatch, project):
 
     def _start(**kwargs):
         runtime = sm.start_service(_decl(), project, **kwargs)
+        # The service's spawn is picked out of every call the recorder
+        # caught by its shape -- the start path's own probes are calls
+        # too, and a probe is not the service.
         spawns = [call for call in calls if _is_the_service_spawn(call[0])]
         assert len(spawns) == 1, (
             "the service was never started: "
             f"{calls!r}"
         )
-        argv, spawn_kwargs = spawns[0]
-        captured = {
-            "argv": argv,
-            "kwargs": spawn_kwargs,
-            "env": dict(spawn_kwargs.get("env") or {}),
-        }
+        spawn_kwargs = spawns[0][1]
+        assert captured.get("env") is not None, "the service was never started"
+        assert dict(spawn_kwargs.get("env") or {}) == captured["env"], (
+            "the capture does not hold the environment the service's own "
+            "spawn was given"
+        )
+        # Exactly one spawn is the service's own.  A start that spawned
+        # the service twice, or none at all, would leave the pins below
+        # reading something that is not the service.
+        assert len(service_spawns) == 1, (
+            "the capture took %d service spawns; the start path spawns "
+            "the service exactly once" % len(service_spawns)
+        )
         return runtime, captured
 
     return _start

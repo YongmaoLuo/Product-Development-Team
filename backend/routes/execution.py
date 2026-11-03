@@ -179,6 +179,77 @@ def _restore_execution_state_from_row(
     return state
 
 
+def _reconcile_ownerless_executors(plan_dir: Path, plan_id: str) -> List[str]:
+    """Sweep the executors the ledger knows about whose owner is gone.
+
+    The plan row names ONE pid.  The ledger knows **every** executor
+    this backend started for the plan, and after a backend restart
+    the row is often the only one of them that was written down.  A
+    survivor the row does not name is still a survivor: it holds the
+    plan's resources, and it answers every later start with
+    ``already_running``.
+
+    Each one is checked against the record the ledger holds (start
+    time, command line) before anything is signalled — a pid that
+    cannot be vouched for is reported, not killed, which is the
+    ``ACTION_MISMATCH`` rule the row-level reconcile already follows.
+
+    A plan the **scheduler** holds is left alone: its run is adopted
+    across a backend restart, and reaping it would take away a run
+    the scheduler is about to pick up.
+    """
+    pids = _ownerless_executor_pids(plan_dir)
+    if not pids:
+        return []
+    if scheduler_holds(plan_id):
+        _server.logger.warning(
+            "[startup_reconcile] plan=%s has %s ownerless executor(s); the "
+            "scheduler holds the run, so nothing was signalled",
+            plan_id, len(pids),
+        )
+        return [ACTION_ADOPTED]
+
+    actions: List[str] = []
+    live = ledger_live_records(plan_dir)
+    for pid in pids:
+        record = live.get(pid)
+        identity = probe_process_identity(pid)
+        if identity is None:
+            # It went away between the scan and now.
+            ledger_record_exit(
+                plan_dir, pid, "exit",
+                detail="process gone at startup reconcile",
+            )
+            actions.append(ACTION_CLEARED)
+            continue
+        if record is None or not identity_matches(
+            identity,
+            create_time=record.create_time,
+            cmdline=record.cmdline,
+        ):
+            ledger_record_event(
+                plan_dir,
+                EVENT_IDENTITY_MISMATCH,
+                terminal=False,
+                pid=pid,
+                role=record.role if record is not None else "executor",
+                plan_id=plan_id,
+                reason=STARTUP_RECONCILE_REASON,
+            )
+            _server.logger.warning(
+                "[startup_reconcile] plan=%s executor pid=%s is not the "
+                "recorded process; nothing was signalled",
+                plan_id, pid,
+            )
+            actions.append(ACTION_MISMATCH)
+            continue
+        # The identity matches: this really is our executor, and
+        # nobody is left to own it.
+        reap_plan(plan_dir, plan_id, reason=STARTUP_RECONCILE_REASON)
+        actions.append(ACTION_KILLED)
+    return actions
+
+
 def _recover_execution_states(plans_dir: Path) -> List[Tuple[str, str]]:
     """On startup, scan plan directories and restore execution state.
 
@@ -269,38 +340,45 @@ def _recover_execution_states(plans_dir: Path) -> List[Tuple[str, str]]:
                 else:
                     _park_reconciled_plan(plan_id, plan_dir, row, execution_repo)
                 actions.append((plan_id, action))
-                continue
-
-            # Nothing to reconcile: the row is not running, it names no
-            # pid, or it names this backend's own pid — which is never
-            # a plan's executor and must never be signalled.
-            #
-            # The restore is the shared one: the row's verdict decides
-            # the status and the stop reason, so a plan restored at
-            # boot and a plan restored by a status read answer
-            # identically.
-            _restore_execution_state_from_row(plan_id, row)
-            if status == "running" and not pid:
-                # A row that claims to be running without a pid: the
-                # pre-existing "dead without a pid" case, which the
-                # legacy marking still answers.  There is no pid to
-                # reconcile, so the reconcile is skipped — but the
-                # claim is still a claim, and it is still answered.
-                _judge_process_dead(plan_id, row)
-            elif _shutdown_park_needs_phase(plan_dir, row):
-                # The parking of a run the shutdown interrupted did not
-                # finish: the row says the run was stopped by the
-                # shutdown, but the plan's phase was never written.
-                # The row is not running, so there is no reconcile to
-                # do — and without this the phase stays ``executing``
-                # for ever, and the scheduler never sees the plan
-                # again.  The parking is finished here instead.
-                _park_shutdown_interrupted(
-                    plan_id,
-                    plan_dir=plan_dir,
-                    execution_repo=execution_repo,
-                )
-            actions.append((plan_id, ACTION_SKIPPED))
+            else:
+                # Nothing to reconcile: the row is not running, it names no
+                # pid, or it names this backend's own pid — which is never
+                # a plan's executor and must never be signalled.
+                #
+                # The restore is the shared one: the row's verdict decides
+                # the status and the stop reason, so a plan restored at
+                # boot and a plan restored by a status read answer
+                # identically.
+                _restore_execution_state_from_row(plan_id, row)
+                if status == "running" and not pid:
+                    # A row that claims to be running without a pid: the
+                    # pre-existing "dead without a pid" case, which the
+                    # legacy marking still answers.  There is no pid to
+                    # reconcile, so the reconcile is skipped — but the
+                    # claim is still a claim, and it is still answered.
+                    _judge_process_dead(plan_id, row)
+                elif _shutdown_park_needs_phase(plan_dir, row):
+                    # The parking of a run the shutdown interrupted did not
+                    # finish: the row says the run was stopped by the
+                    # shutdown, but the plan's phase was never written.
+                    # The row is not running, so there is no reconcile to
+                    # do — and without this the phase stays ``executing``
+                    # for ever, and the scheduler never sees the plan
+                    # again.  The parking is finished here instead.
+                    _park_shutdown_interrupted(
+                        plan_id,
+                        plan_dir=plan_dir,
+                        execution_repo=execution_repo,
+                    )
+                actions.append((plan_id, ACTION_SKIPPED))
+            # The plan row names ONE pid; the ledger knows them all.
+            # An executor whose owner is gone is a survivor, and the
+            # survivor is swept here — it is not left to answer the
+            # next start with "already running".
+            for sweep_action in _reconcile_ownerless_executors(
+                plan_dir, plan_id
+            ):
+                actions.append((plan_id, sweep_action))
     finally:
         # 2026-09-23: this connection is opened once for the whole scan
         # and must be released even if the traversal raises. Its sibling
@@ -2440,6 +2518,42 @@ START_ERROR_ALREADY_RUNNING = "already_running"
 START_ERROR_KILL_INCOMPLETE = "kill_incomplete"
 
 
+def _owner_is_alive(record: Any) -> Optional[bool]:
+    """Is the process that started this one still running?
+
+    ``True`` — the owner names a live process.  ``False`` — the owner
+    is gone.  ``None`` — we cannot tell, and an owner we cannot place
+    is treated as an owner that might still be there.
+
+    The owner is the backend that spawned the executor.  When that
+    backend is killed (a SIGKILL leaves no chance to write an exit
+    event), the executor — detached, in a session of its own —
+    survives it, and from then on nothing owns it: it holds the
+    plan's resources, and it answers every later start with "already
+    running".
+
+    The answer is "the owner pid names a process".  A **recycled** pid
+    reads as alive, and that is the safe direction: a survivor we
+    cannot prove is a survivor keeps blocking a start, while a live
+    executor we wrongly called an orphan would be killed.
+    """
+    try:
+        owner_pid = int(getattr(record, "owner_pid", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if owner_pid <= 0:
+        # The ledger does not say who started it.  That is not a
+        # licence to call it an orphan.
+        return None
+    if _is_own_pid(owner_pid):
+        return True
+    try:
+        identity = probe_process_identity(owner_pid)
+    except Exception:  # noqa: BLE001 - an unchecked owner is not a dead one
+        return None
+    if identity is None:
+        return False
+    return True
 def _record_still_names_the_process(identity: Any, record: ProcessRecord) -> bool:
     """Whether the process behind a pid is still the one the ledger recorded.
 
@@ -2480,6 +2594,12 @@ def _live_executor_pids(plan_dir: Path) -> List[int]:
     The kernel is asked, not the record: a pid on its own does not say
     whether the process behind it is still running.
 
+    An executor whose **owner is gone** is not live either.  It
+    outlived the backend that started it; nothing is running the plan
+    through it, and counting it would answer every later start with
+    ``already_running`` while the plan sits idle.  The survivor is
+    swept by the startup reconcile — what this function must not do
+    is treat it as work in progress.
     A pid that names a process is not the whole answer either: the
     process behind it may be a stranger that inherited the number.  The
     ledger's own record of when the process began is what says so — see
@@ -2497,6 +2617,33 @@ def _live_executor_pids(plan_dir: Path) -> List[int]:
             # The pid is alive, but it is not the process this ledger
             # recorded: the pid was recycled.  Refusing a start on it
             # would block the plan on a stranger.
+            continue
+        if _owner_is_alive(record) is False:
+            continue
+        pids.append(int(pid))
+    return pids
+
+
+def _ownerless_executor_pids(plan_dir: Path) -> List[int]:
+    """The live executor records whose owner is gone.
+
+    These are the survivors: executors that outlived the backend that
+    started them.  They are the ones the startup reconcile has to
+    sweep, and the ones that must NOT be counted as "already running"
+    when the next start asks.
+
+    The kernel is asked twice: once whether the executor is still
+    there, and once whether its owner is.  A record that says nothing
+    about its owner (``owner_pid`` of zero) is never one of these —
+    an owner we cannot place is not an owner we can call dead.
+    """
+    pids: List[int] = []
+    for pid, record in sorted(ledger_live_records(plan_dir).items()):
+        if record.role not in SPAWN_ROLES:
+            continue
+        if probe_process_identity(pid) is None:
+            continue
+        if _owner_is_alive(record) is not False:
             continue
         pids.append(int(pid))
     return pids

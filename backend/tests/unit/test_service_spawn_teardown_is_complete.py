@@ -35,6 +35,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -94,6 +95,29 @@ def _alive(pid: Optional[int]) -> bool:
         return False
     state = completed.stdout.strip()
     return bool(state) and not state.startswith("Z")
+
+
+def _wait_until_dead(pid: Optional[int], timeout: float = 10.0) -> bool:
+    """Wait, bounded, for *pid* to be gone and say whether it is.
+
+    The reap escalates TERM to KILL and then waits a short, fixed
+    moment for the process to leave.  On a loaded runner that moment
+    can expire before the kernel has finished tearing the process
+    down, and the very next instant is not enough to read the answer.
+
+    The contract these cases assert is that the service does **not
+    outlive** the run that started it — not that it is gone within the
+    same instant the runner returns.  So the wait here is bounded and
+    the assertion is still "it is gone": a service that genuinely
+    survives is still caught, it is just given the same few seconds a
+    person watching the machine would give it.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _alive(pid):
+            return True
+        time.sleep(0.05)
+    return not _alive(pid)
 
 
 def _kill(proc: Optional[subprocess.Popen]) -> None:
@@ -457,7 +481,7 @@ def test_a_gate_that_was_killed_leaves_no_live_service(tmp_path):
         "the gate never said which service it started:\n"
         + str(result.evidence.get("stdout_tail"))
     )
-    assert _alive(pid) is False, (
+    assert _wait_until_dead(pid), (
         f"the service (pid {pid}) outlived the gate that was killed"
     )
     reaped = result.evidence.get("spawned_processes_reaped")
@@ -497,7 +521,7 @@ def test_a_gate_that_finished_leaves_no_live_service(tmp_path):
         "the gate never said which service it started:\n"
         + str(result.evidence.get("stdout_tail"))
     )
-    assert _alive(pid) is False, (
+    assert _wait_until_dead(pid), (
         f"the service (pid {pid}) outlived the gate that finished"
     )
 
@@ -570,3 +594,253 @@ def test_the_gate_gives_back_what_it_started(tmp_path):
     assert _alive(pid) is False, (
         f"the gate left the service it started running (pid {pid})"
     )
+
+
+# --------------------------------------------------------------------------
+# Who sent the signal
+# --------------------------------------------------------------------------
+#
+# ``Terminated: 15`` says that something was killed and not what.  The
+# gate's way out is a place where that question is asked: the gate gives
+# back what it started, and the processes it gives back are the ones it
+# started -- and nothing else.
+#
+# So the gate's way out has to be able to say two things:
+#
+# * which signals it sent, and to whom; and
+# * that the process it did *not* signal was left alone on purpose, and
+#   not by accident.
+#
+# The second one is the harder half.  "The process is still running" is
+# what a signal that missed looks like as well as what a signal that was
+# never sent looks like, so the liveness alone cannot tell the two apart.
+# The audit can: it says what was signalled, so "no signal was sent" and
+# "a signal was sent and did not land" are two different readings of the
+# same file.
+
+
+#: The fields a kill record carries.  The audit the service manager
+#: writes and the audit the reaper writes are read together, so the two
+#: have to carry the same fields.
+#:
+#: The record the audit hook writes is the one that says a signal was
+#: *about* to be sent; the sender writes the outcome of that attempt
+#: next to it, and that second record adds the errno the kernel
+#: answered with.  Both shapes are the audit's contract (see
+#: ``kill_audit.write_kill_audit`` / ``kill_audit.write_kill_outcome``),
+#: so both are pinned here.
+AUDIT_RECORD_FIELDS = {
+    "kind", "target", "signal", "outcome", "pid", "ts", "stack",
+}
+AUDIT_OUTCOME_RECORD_FIELDS = AUDIT_RECORD_FIELDS | {"errno"}
+
+
+def _audit_files(directory: Path) -> List[Path]:
+    """The audit files under *directory*."""
+    return sorted(directory.glob("kill-audit-*.jsonl"))
+
+
+def _records_in(path: Path) -> List[dict]:
+    """The kill records in one audit file."""
+    records: List[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def _audit_records(directory: Path) -> List[dict]:
+    """Every kill record under *directory*."""
+    records: List[dict] = []
+    for path in _audit_files(directory):
+        records.extend(_records_in(path))
+    return records
+
+
+def _signals_sent(records: List[dict]) -> List[dict]:
+    """The records that name a signal that was actually delivered.
+
+    A liveness probe is ``kill(pid, 0)``: it asks whether a process is
+    there and it delivers nothing.  It is in the audit because it is a
+    call to ``os.kill``, and it is not a signal -- so the records that
+    count as "a signal was sent" are the ones whose signal is not zero.
+    """
+    return [r for r in records if int(r.get("signal") or 0) != 0]
+
+
+def test_the_gate_gives_back_its_own_service_and_nobody_elses(
+    tmp_path, monkeypatch,
+):
+    """The gate's way out takes its own processes and nobody else's.
+
+    The shape the production run hit: the registry carries an entry that
+    belongs to a **live** owner -- another run's service -- and an entry
+    that belongs to this run.  The gate gives its own back and leaves the
+    other one alone, because the owner of that one is still there and may
+    still want it.
+
+    "Leaves it alone" is not the same as "did not kill it by accident": a
+    signal that was sent and missed looks exactly like a signal that was
+    never sent, judged by liveness alone.  So the assertion is made
+    twice -- once on the audit, which says what was signalled, and once on
+    the recorded calls, which say what the reaper decided.
+    """
+    registry = tmp_path / "spawn_registry.jsonl"
+    audit_dir = tmp_path / "kill-audit"
+    pid_file = tmp_path / "service.pid"
+    stub = tmp_path / "fake_pytest.py"
+    stub.write_text(
+        _STUB_SOURCE.format(
+            backend_dir=str(BACKEND_DIR), pid_file=str(pid_file),
+        ),
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+
+    # The owner of the foreign entry: a process of its own, and alive.
+    foreign_owner = _spawn_detached()
+    # The process the foreign entry names.
+    foreign_service = _spawn_detached()
+    try:
+        # ---- the registry the gate is going to sweep ------------------
+        reaper.register_spawned_process(
+            foreign_service.pid, pgid=foreign_service.pid,
+            kind=reaper.KIND_SERVICE, name="another run's service",
+            path=registry,
+        )
+        entries = reaper.read_spawn_registry(registry)
+        # The entry belongs to another run: the process that wrote it
+        # down is that run's owner, and that owner is still alive.
+        entries[0]["owner_pid"] = foreign_owner.pid
+        registry.write_text(
+            json.dumps(entries[0], ensure_ascii=False) + "\n", encoding="utf-8",
+        )
+
+        # ---- the gate's own way out ------------------------------------
+        env = dict(os.environ)
+        env.pop("PDT_RUN_TESTS_DRY_RUN", None)
+        env["PYTEST_BIN"] = str(stub)
+        env[reaper.SPAWN_REGISTRY_ENV] = str(registry)
+        env["PDT_KILL_AUDIT_DIR"] = str(audit_dir)
+
+        completed = subprocess.run(
+            ["bash", str(GATE_SCRIPT), "--lane", "unit"],
+            capture_output=True, text=True, cwd=str(REPO_ROOT), env=env,
+            timeout=300,
+        )
+        assert completed.returncode == 0, (
+            f"the gate exited {completed.returncode}:\n"
+            + completed.stdout + completed.stderr
+        )
+        own_pid = int(pid_file.read_text(encoding="utf-8").strip())
+
+        # ---- what the gate did ----------------------------------------
+        assert _alive(own_pid) is False, (
+            f"the gate left the service it started running (pid {own_pid})"
+        )
+        assert _alive(foreign_service.pid) is True, (
+            "the gate took another run's service: its owner (pid "
+            f"{foreign_owner.pid}) was still alive, so the entry was not "
+            f"the gate's to give back (pid {foreign_service.pid})"
+        )
+
+        # ---- what the gate sent ---------------------------------------
+        records = _audit_records(audit_dir)
+        signals = _signals_sent(records)
+        assert signals, (
+            "the gate sent a signal and wrote nothing down about it; the "
+            f"records under {audit_dir} were: {records!r}"
+        )
+        assert any(int(r.get("target") or 0) == own_pid for r in signals), (
+            "the gate did not record a signal for the service it gave "
+            f"back (pid {own_pid}); the records were: {records!r}"
+        )
+        assert not any(
+            int(r.get("target") or 0) == foreign_service.pid for r in signals
+        ), (
+            "the gate sent a signal to another run's service; the records "
+            f"were: {records!r}"
+        )
+
+        # ---- the shape of the records ---------------------------------
+        # The two audits are read together, so they have to look alike.
+        for record in records:
+            fields = set(record)
+            assert fields in (
+                AUDIT_RECORD_FIELDS, AUDIT_OUTCOME_RECORD_FIELDS,
+            ), (
+                "a kill record does not carry the fields the audit is "
+                f"read by: {record!r}"
+            )
+            assert record.get("kind") in ("kill", "killpg"), (
+                f"a kill record does not say what it did: {record!r}"
+            )
+            assert record.get("outcome"), (
+                f"a kill record does not say what became of the signal: "
+                f"{record!r}"
+            )
+        for path in _audit_files(audit_dir):
+            named = int(path.stem[len("kill-audit-"):])
+            for record in _records_in(path):
+                assert int(record.get("pid") or 0) == named, (
+                    f"the record in {path.name} names pid "
+                    f"{record.get('pid')}, and the file is named after {named}"
+                )
+
+        # ---- the decision, with the reaper's own injection points ------
+        # The same shape, one level down.  Here the signals are recorded
+        # instead of being sent, so "no signal was sent" and "a signal
+        # was sent and missed" are not guessed at: they are the recorded
+        # calls, and they are told apart.
+        calls = _record_signals(monkeypatch)
+        decision_registry = tmp_path / "decision_registry.jsonl"
+        decision_registry.write_text(
+            json.dumps(
+                {
+                    "pid": 424242, "pgid": None, "kind": "service",
+                    "name": "another run's service",
+                    "owner_pid": foreign_owner.pid, "start_epoch": "100",
+                },
+                ensure_ascii=False,
+            ) + "\n" + json.dumps(
+                {
+                    "pid": 424243, "pgid": None, "kind": "service",
+                    "name": "this run's service",
+                    "owner_pid": 424299, "start_epoch": "100",
+                },
+                ensure_ascii=False,
+            ) + "\n",
+            encoding="utf-8",
+        )
+
+        reaper.reap_spawned_processes(
+            decision_registry,
+            reason="the gate is over",
+            grace_seconds=0.1,
+            probe=lambda pid: "100",
+            alive=lambda pid: True,
+            owner_alive=lambda pid: pid == foreign_owner.pid,
+        )
+
+        sent = {int(call[1]) for call in calls if int(call[2]) != 0}
+        assert 424242 not in sent, (
+            "the reaper signalled a process whose owner was still there: "
+            f"{calls!r}"
+        )
+        assert 424243 in sent, (
+            "the reaper did not signal the process that was its own to "
+            f"give back: {calls!r}"
+        )
+    finally:
+        # The signals are recorded, not sent: the real kill has to come
+        # back before the fixtures are cleaned up.
+        monkeypatch.undo()
+        _kill(foreign_service)
+        _kill(foreign_owner)

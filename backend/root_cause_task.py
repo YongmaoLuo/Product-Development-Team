@@ -42,6 +42,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from typing import Any, Dict, List, Optional
 
+from orphan_rules import report_deliverable_marker
 from repair_generator import (
     format_repair_task_id,
     next_repair_seq_base,
@@ -241,6 +242,7 @@ def build_root_cause_task(
     task_id: Optional[str] = None,
     existing_task_ids: Optional[Iterable[str]] = None,
     seq_base: Optional[int] = None,
+    report_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """构建一个只读的根因任务。
 
@@ -253,12 +255,19 @@ def build_root_cause_task(
         task_id: 显式指定 id（调用方自己分配时用）。
         existing_task_ids: 既有任务 id，用来在 repair 序列里找空号。
         seq_base: 调用方已经算好的起始序号。
+        report_path: 报告的落盘路径。缺省是仓库相对路径
+            (``plans/<plan_id>/reports/root-cause-<vp_id>.md``)；调用方
+            知道任务实际跑在哪个目录时，给**绝对路径** —— 围栏放行的那个
+            路径必须与链读取的那个路径是同一个文件，而相对路径会被执行器
+            按它自己的工作目录解析。
 
     Returns:
         任务 dict。``kind`` 是 :data:`ROOT_CAUSE_KIND`，``read_only`` 为
         ``True``，``report_path`` 指向根因报告，**没有** ``files_to_modify``。
     """
-    report_path = root_cause_report_path(plan_id, vp_id)
+    report_path = str(
+        report_path or root_cause_report_path(plan_id, vp_id)
+    ).strip()
     round_number = int(round_no)
     vp = str(vp_id).strip()
 
@@ -273,13 +282,38 @@ def build_root_cause_task(
             "上一轮针对旧根因的修复方案不再适用。先根据本轮证据定位当前"
             "根因，再给出一次覆盖所有层的修复方案，不要重复上一轮的方案。"
             f"根因报告写到 {report_path}。"
+            # 2026-11-02 — 报告契约搭**描述**的便车。
+            #
+            # 执行器读的是 ``SubTask.deliverable`` / ``SubTask.report_path``，
+            # 而这两个字段在链上的这一段要经过 ``plan_tasks``：那张表没有
+            # 这两列，而验证模式的范围门禁（``tests/static_gates/
+            # test_verification_mode_scope_gates.py``）把 schema 的字节
+            # 冻死了，加列这条路走不通。描述是唯一原样存、逐字读回的
+            # 自由文本列 —— 契约就走它。
+            #
+            # 标记放在**改动范围模板之前**：读者（``_root_cause_scope_from_text``）
+            # 切出来的「## 改动范围」那一节因此逐字不变。
+            f"\n{report_deliverable_marker(report_path)}\n"
             # 模板自带标题与代码块，逐行拼接反而难读。
             f"{_SCOPE_CONTRACT_TEMPLATE}"
         ),
         # 只读：诊断任务的产出是报告，不是改动。
         "read_only": True,
         "report_path": report_path,
+        # 2026-11-02 — 这个 ``deliverable`` 是**任务 dict** 的字段，
+        # 不是 ``SubTask`` 的那个：``plan_tasks`` 没有这一列，链在写库
+        # 时会把它连同 ``kind`` / ``read_only`` 一起丢掉，所以它对执行器
+        # 没有任何影响。执行器真正读到的那一对（``deliverable="report"``
+        # + ``report_path``）由上面 description 里的标记带过去，由
+        # ``orphan_rules.parse_report_deliverable`` 读回来。
+        #
+        # 这里保留历史的「五个章节名」形状：仓库自己的契约测试
+        # （``tests/unit/verification/test_root_cause_task_build.py``、
+        # ``test_root_cause_scope_contract.py``）把它钉成了那个形状，
+        # 而这一行的语义在仓库里已经变了 —— 章节名单独放在
+        # ``required_sections``，那里的语义本来就是「必须包含哪几节」。
         "deliverable": list(ROOT_CAUSE_DELIVERABLE),
+        "required_sections": list(ROOT_CAUSE_DELIVERABLE),
         "failed_vp_id": vp,
         "round": round_number,
         "task_group": f"repair-round-{round_number}",
@@ -299,6 +333,7 @@ def build_implementation_task(
     task_id: Optional[str] = None,
     existing_task_ids: Optional[Iterable[str]] = None,
     seq_base: Optional[int] = None,
+    report_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """根据根因报告构建唯一的实现任务。
 
@@ -313,6 +348,9 @@ def build_implementation_task(
         task_id: 显式指定 id。
         existing_task_ids: 既有任务 id，用来在 repair 序列里找空号。
         seq_base: 调用方已经算好的起始序号。
+        report_path: 根因报告的落盘路径。缺省是仓库相对路径；调用方知道
+            任务实际跑在哪个目录时，给**绝对路径** —— 实现任务要读的就是
+            链读过的那一份，相对路径会被执行器按它自己的工作目录解析。
 
     Returns:
         任务 dict。``kind`` 是 :data:`IMPLEMENTATION_KIND`，
@@ -344,7 +382,9 @@ def build_implementation_task(
             "（改动范围为空的任务等于把「改哪里」丢回给执行器）"
         )
 
-    report_path = root_cause_report_path(plan, vp)
+    report_path = str(
+        report_path or root_cause_report_path(plan, vp)
+    ).strip()
     root_cause = str(report.get("root_cause") or "").strip()
     fix_plan = str(report.get("fix_plan") or "").strip()
 

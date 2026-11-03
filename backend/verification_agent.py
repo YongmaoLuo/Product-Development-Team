@@ -115,6 +115,7 @@ from plan_artifacts import is_verification_branch  # noqa: E402
 # ``verification_evidence`` 或本模块），见 ``_resolve_apply_to_verdict``。
 from verification_evidence import (  # noqa: E402
     apply_to_verdict,
+    stage_plan_artifacts,
     tree_fingerprint,
     tree_mutated,
 )
@@ -1645,6 +1646,33 @@ def _environment_block_reason_code(result: Any) -> str:
     else:
         code = evidence.get("reason_code") or evidence.get("error_kind")
     return str(code or "")
+
+
+def _failed_case_ids_from_evidence(evidence: Any) -> List[str]:
+    """The ids of the cases that failed, read out of the gate's evidence.
+
+    The gate writes them under ``junit_failures`` — one record per
+    failing case, carrying the phase, the node id, the kind and the
+    first line. Only the **node id** is the identity of the failure:
+    the phase and the first line are prose, and prose changes from run
+    to run.
+
+    The set is deduplicated and sorted: the same case reported by two
+    phases is one case, and a set is not a sequence.
+    """
+    if not isinstance(evidence, dict):
+        return []
+    failures = evidence.get("junit_failures")
+    if not isinstance(failures, list):
+        return []
+    ids = set()
+    for failure in failures:
+        if not isinstance(failure, dict):
+            continue
+        node_id = str(failure.get("node_id") or "").strip()
+        if node_id:
+            ids.add(node_id)
+    return sorted(ids)
 
 
 def _is_environment_blocked_result(result: Any) -> bool:
@@ -7858,12 +7886,21 @@ class Orchestrator:
         if not isinstance(evidence, str):
             evidence = json.dumps(evidence, ensure_ascii=False)
         evidence = self._enrich_evidence_with_address(str(vp_id), evidence, vp)
-        return {
+        entry = {
             "id": vp_id,
             "status": status,
             "actual_result": actual_result,
             "evidence": evidence,
         }
+        # 2026-11-02: the machine-written set of failing cases travels
+        # with the entry, so the report and the artifact say the same
+        # thing about which cases failed.
+        failed_cases = verdict.get("failed_assertions")
+        if isinstance(failed_cases, (list, tuple)) and failed_cases:
+            entry["failed_assertions"] = [
+                str(item) for item in failed_cases if str(item).strip()
+            ]
+        return entry
 
     def _save_execution_results(self, execution_results: dict) -> None:
         """Write the round's results back to SQLite — best effort.
@@ -8412,6 +8449,15 @@ class Orchestrator:
             }
 
         verdict = result.to_verdict_dict()
+        # 2026-11-02: the gate's own record of WHICH cases failed. The
+        # verdict's evidence carries the whole junit payload; the node
+        # ids are lifted into their own field so the report entry, the
+        # event log and the artifact all name the same set — and so the
+        # failure fingerprint can be the identity of the failing set
+        # instead of the hash of a run summary.
+        verdict["failed_assertions"] = _failed_case_ids_from_evidence(
+            result.evidence
+        )
         # 2026-10-31: the budget evidence belongs in the event.  A gate
         # that ran out of budget is ``INCONCLUSIVE`` — it has no verdict
         # about the deliverable — and an operator reading the round log
@@ -10195,6 +10241,39 @@ class Orchestrator:
             "framework_checks": [],
         }
 
+    def _stage_plan_artifacts(self) -> str:
+        """Stage the plan directory's forensic artifacts into the project dir.
+
+        2026-11-01: a ``code_review`` citation is resolved against
+        ``project_dir`` (``target = (project_dir / rel)``), but the plan
+        directory -- where the forensic products live -- is usually
+        another checkout.  A citation naming a file that does not exist
+        under ``project_dir`` is not evidence: 26 of VP-017's 39
+        citations were rejected that way in round 1.
+
+        The staged copy is byte-for-byte, so the plan's own line anchors
+        keep resolving, and it lives inside ``project_dir`` but outside
+        the plans tree the api service serves -- a plan directory there
+        that the state db does not know makes ``GET /api/plans`` answer
+        503.
+
+        A staging failure is logged, not raised: the evidence check
+        reports every citation it cannot resolve, which is exactly what
+        it is for.
+        """
+        try:
+            root = stage_plan_artifacts(
+                self.plan_dir, self.project_dir, self.plan_dir.name,
+                plans_dir=resolve_plans_dir(),
+            )
+        except Exception as exc:  # noqa: BLE001 - staging must not abort a round
+            if self.logger:
+                self.logger.warning(
+                    "evidence staging failed for %s: %s", self.plan_dir.name, exc,
+                )
+            return ""
+        return str(root)
+
     def _build_verification_executor(self, plan_data: dict) -> "VerificationExecutor":
         """Build a :class:`VerificationExecutor` wired to this agent.
 
@@ -10534,6 +10613,13 @@ class Orchestrator:
             # 引用的，子 agent 也必须从它读行号（见 verification_subagent 的
             # EVIDENCE CONTRACT）。
             vp["project_root"] = str(self.project_dir)
+            # 2026-11-01（取证产物必须暂存）：计划目录里的取证产物在
+            # ``project_dir`` 下没有对应文件 —— 引用它们只会被逐条判成
+            # ``missing_file``（VP-017 第 1 轮：39 条引用里 26 条如此）。
+            # 把它们逐字节暂存到 ``project_dir`` 内、但不在被服务的 plans
+            # 树里的位置，引用才有一棵能解析的树；契约再点名这棵树。
+            # 暂存失败不打断这一轮：核对会把解不开的引用一条条报出来。
+            vp["evidence_staging_root"] = self._stage_plan_artifacts()
             # 2026-09-18（端口让路）：把服务实际地址告诉 VP。
             service_env = self._service_env_for_vps()
             if service_env:
@@ -14140,6 +14226,16 @@ class Orchestrator:
                 value = v.get(key)
                 if value:
                     result[key] = str(value)
+            # 2026-11-02: the set of cases that failed, machine-written
+            # by the gate.  It travels with the entry so the report
+            # entry, the event log and the artifact name the SAME
+            # failure — and so the failure fingerprint can be the
+            # identity of that set instead of the hash of a run summary.
+            failed_cases = v.get("failed_assertions")
+            if isinstance(failed_cases, (list, tuple)) and failed_cases:
+                result["failed_assertions"] = [
+                    str(item) for item in failed_cases if str(item).strip()
+                ]
             results.append(result)
 
         # 2026-10-25 (repair-r1-26): the environment verdict is a round

@@ -34,7 +34,10 @@ What has to be true now
 * a cleanup pass removes the entries it acted on and *only* those -- an
   entry another process wrote down while the pass was waiting for a
   process to die has to survive;
-* the owner filter still decides whose processes a pass gives back.
+* the owner filter still decides whose processes a pass gives back;
+* a process whose owner is still there is not given back: the registry
+  is shared by everything a run starts, so a pass that sweeps all of it
+  would otherwise take the services of a run that is still going.
 
 The tests below do not kill anything.  Every entry names a pid that
 does not exist, and the liveness probe is injected, so the pass takes
@@ -372,6 +375,174 @@ def test_owner_filtering_is_preserved(tmp_path):
     )
     assert reaped == [], (
         f"a process that was already gone was reported as given back: {reaped}"
+    )
+
+
+# --------------------------------------------------------------------------
+# A live owner keeps its processes
+# --------------------------------------------------------------------------
+#
+# The registry is shared by everything a run starts, and a cleanup pass
+# sweeps all of it -- not just the entries of the process that happens to
+# be doing the sweeping.  Two runs can share one registry: a gate that
+# runs inside another gate's pytest worker inherits the registry the
+# outer run named, and the inner gate's own way out sweeps it.
+#
+# A sweep that does not ask *who* owns an entry therefore takes processes
+# away from a run that is still going.  The services the outer worker
+# started died that way -- signalled by a gate that was on its way out
+# and had no business touching them.
+#
+# So an entry whose owner is still there is not this pass's to give back:
+# no signal goes out, and the entry stays in the registry for the run
+# that owns it.
+
+
+def _record_signals(monkeypatch) -> list:
+    """Record every signal the reaper sends, and send none of them.
+
+    ``orphan_reaper`` reaches the kernel through the ``os`` module it
+    imported, so patching ``os.kill`` / ``os.killpg`` here is what
+    "did the pass signal anything?" is answered by.
+    """
+    calls: list = []
+
+    def _kill(pid, sig):
+        calls.append(("kill", pid, sig))
+
+    def _killpg(pgid, sig):
+        calls.append(("killpg", pgid, sig))
+
+    monkeypatch.setattr(reaper.os, "kill", _kill)
+    monkeypatch.setattr(reaper.os, "killpg", _killpg)
+    return calls
+
+
+def _alive_for(probes: int):
+    """A liveness probe that says *alive* for the first *probes* probes.
+
+    The pass asks whether the process is there before it signals it, and
+    then asks again while it waits for the process to go.  A probe that
+    answers *alive* once and *gone* afterwards is enough to walk the
+    whole path -- and it keeps the test from waiting out a grace period.
+    """
+    state = {"calls": 0}
+
+    def probe(pid: int) -> bool:
+        state["calls"] += 1
+        return state["calls"] <= probes
+
+    return probe
+
+
+#: A pid that is not this process: the owner has to be somebody else.
+_OTHER_OWNER = 424242
+
+
+def _entry_for(owner_pid: int, name: str = "service") -> dict:
+    """A registry entry that names *owner_pid* as the process that wrote it."""
+    return {
+        "pid": 4242, "pgid": None, "kind": "service", "name": name,
+        "owner_pid": owner_pid, "start_epoch": "100", "registered_at": 0.0,
+    }
+
+
+def test_a_process_whose_owner_is_alive_is_not_given_back(tmp_path, monkeypatch):
+    """The owner is still there: this pass does not give its process back.
+
+    The entry belongs to a process that is still running, and that
+    process is not this one.  It may still want the service it started
+    -- it is the run that started it, and the run that has to give it
+    back.  Signalling it here would take a live service away from a run
+    that is still going.
+
+    So: no signal goes out, and the entry stays in the registry.
+    """
+    calls = _record_signals(monkeypatch)
+    registry = tmp_path / "spawn_registry.jsonl"
+    entry = _entry_for(_OTHER_OWNER)
+    registry.write_text(
+        json.dumps(entry, ensure_ascii=False) + "\n", encoding="utf-8",
+    )
+    assert _OTHER_OWNER != os.getpid(), (
+        "the owner of the entry has to be another process"
+    )
+
+    reaped = reaper.reap_spawned_processes(
+        registry, reason="the gate is over", grace_seconds=1.0,
+        probe=lambda pid: "100", alive=_alive_for(1),
+        owner_alive=lambda pid: True,
+    )
+
+    assert calls == [], (
+        f"the pass signalled a process whose owner is still alive: {calls}"
+    )
+    assert reaped == [], (
+        f"a process whose owner is still alive was given back: {reaped}"
+    )
+    survivors = reaper.read_spawn_registry(registry)
+    assert [entry["name"] for entry in survivors] == ["service"], (
+        f"the entry was dropped although nothing was given back: {survivors}"
+    )
+
+
+def test_a_process_whose_owner_is_gone_is_given_back(tmp_path, monkeypatch):
+    """The owner is gone: the process is this pass's to give back.
+
+    The owner has exited, so there is nobody left who could want the
+    process it started.  The owner guard must not turn into a reason to
+    leave a service running forever: the process is signalled, and the
+    entry leaves the registry with it.
+    """
+    calls = _record_signals(monkeypatch)
+    registry = tmp_path / "spawn_registry.jsonl"
+    entry = _entry_for(_OTHER_OWNER)
+    registry.write_text(
+        json.dumps(entry, ensure_ascii=False) + "\n", encoding="utf-8",
+    )
+
+    reaped = reaper.reap_spawned_processes(
+        registry, reason="the gate is over", grace_seconds=1.0,
+        probe=lambda pid: "100", alive=_alive_for(1),
+        owner_alive=lambda pid: False,
+    )
+
+    assert calls, "the pass did not signal a process whose owner is gone"
+    assert [int(entry["pid"]) for entry in reaped] == [4242], (
+        f"the pass gave back something else: {reaped}"
+    )
+    assert reaper.read_spawn_registry(registry) == [], (
+        "the entry of a process that was given back stayed in the registry"
+    )
+
+
+def test_a_process_the_caller_owns_is_given_back(tmp_path, monkeypatch):
+    """The owner is this process: the process is ours to give back.
+
+    The owner guard is about *another* run's processes.  The processes
+    this process started are this pass's to give back, and that is the
+    whole point of the registry: the run that started a service is the
+    run that stops it.
+    """
+    calls = _record_signals(monkeypatch)
+    registry = tmp_path / "spawn_registry.jsonl"
+    entry = _entry_for(os.getpid())
+    registry.write_text(
+        json.dumps(entry, ensure_ascii=False) + "\n", encoding="utf-8",
+    )
+
+    reaped = reaper.reap_spawned_processes(
+        registry, reason="the gate is over", grace_seconds=1.0,
+        probe=lambda pid: "100", alive=_alive_for(1),
+        owner_alive=lambda pid: True,
+    )
+
+    assert calls, "the pass did not signal a process its own owner started"
+    assert [int(entry["pid"]) for entry in reaped] == [4242], (
+        f"the pass gave back something else: {reaped}"
+    )
+    assert reaper.read_spawn_registry(registry) == [], (
+        "the entry of a process that was given back stayed in the registry"
     )
 
 

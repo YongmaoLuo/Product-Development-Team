@@ -27,10 +27,26 @@ async function loadSidebar() {
     try {
         const data = await api("/plans");
         const plans = Array.isArray(data) ? data : (data.plans || []);
-    renderSidebar(plans);
-    } catch {
-        // ignore sidebar errors silently
+        renderSidebar(plans);
+    } catch (err) {
+        renderSidebarError(err);
     }
+}
+
+/** The sidebar could not read the plans.  Say so.
+
+    「暂无计划」 is a statement about a read that SUCCEEDED and found
+    nothing.  After a refusal — ``GET /api/plans`` answers 503 when the
+    instance's data plane does not describe the plans tree it serves —
+    it is a lie: the operator is told there is nothing to work on when
+    in fact the backend refused to answer.  The failure is painted
+    instead, with the reason the request wrapper threw. */
+function renderSidebarError(err) {
+    const container = $("#sidebar-plans");
+    if (!container) return;
+    const reason = err && err.message ? String(err.message) : String(err || "");
+    container.innerHTML = `
+        <div class="sidebar-empty">计划列表加载失败<br>${escapeHtml(reason)}</div>`;
 }
 
 function renderSidebar(plans) {
@@ -95,6 +111,32 @@ async function api(path, options = {}) {
 
 function $(sel) { return document.querySelector(sel); }
 function $$(sel) { return document.querySelectorAll(sel); }
+
+/** Run a load the page does not wait for, without letting its failure
+    escape.
+
+    ``init()`` fires three loads and returns: the plans list, the
+    sidebar, the scheduler state.  A promise nobody holds is a promise
+    whose rejection nobody catches — and an uncaught rejection is a
+    page-level failure (the browser reports it as an unhandled promise
+    rejection, and the end-to-end acceptance criteria count it as one).
+
+    The loader paints its own error state; this is the net under it: a
+    loader that rejects anyway must not take the page down with it.
+    The failure is written to the console, where the operator's screen
+    already carries the loader's own error state. */
+function loadInBackground(loader, label) {
+    try {
+        const result = loader();
+        if (result && typeof result.catch === "function") {
+            result.catch((err) => {
+                console.error(`[${label}] load failed:`, err);
+            });
+        }
+    } catch (err) {
+        console.error(`[${label}] load failed:`, err);
+    }
+}
 // The legacy escaping helper — the renderers that predate escapeHtml()
 // still call this one.  It must never throw: a task id in tasks.json is
 // allowed to be a **number**, and `s.replace` on a Number is a TypeError
@@ -510,8 +552,14 @@ class ReviewController {
 // --- Plans View ---
 
 async function loadPlans() {
-    const data = await api("/plans");
     const container = $("#plans-list");
+    let data;
+    try {
+        data = await api("/plans");
+    } catch (err) {
+        renderPlansError(err);
+        return null;
+    }
     const plans = Array.isArray(data) ? data : (data.plans || []);
 
     if (!plans.length) {
@@ -552,6 +600,32 @@ async function loadPlans() {
             resumePlan(planId);
         });
     });
+}
+
+/** The plans listing could not be read.  Show it where the plans would
+    have been.
+
+    ``GET /api/plans`` answers 503 when the instance's data plane does
+    not describe the plans tree it serves
+    (``state_db_does_not_describe_plans_dir``).  That refusal is by
+    design — an empty answer built from somebody else's database looks
+    exactly like "this instance has no plans" — so the frontend has to
+    show it.  Painting 「暂无计划」 over it would dress a broken data
+    plane up as an ordinary empty list, and the operator would never
+    learn that the backend refused to answer.
+
+    The reason is the message the request wrapper threw, and it reaches
+    the DOM through ``escapeHtml()`` like every other piece of
+    server-supplied text. */
+function renderPlansError(err) {
+    const container = $("#plans-list");
+    if (!container) return;
+    const reason = err && err.message ? String(err.message) : String(err || "");
+    container.innerHTML = `
+        <div class="empty-state">
+            <p>计划列表加载失败</p>
+            <p>${escapeHtml(reason)}</p>
+        </div>`;
 }
 
 async function resumePlan(planId) {
@@ -751,7 +825,7 @@ async function generatePrd() {
         $("#prd-content").textContent = data.prd;
         setStep("prd");
         show("prd-view");
-        loadSidebar();
+        loadInBackground(loadSidebar, "sidebar");
     } finally {
         hideLoading();
     }
@@ -766,7 +840,7 @@ async function regenPrd() {
         $("#prd-content").textContent = data.prd;
         setStep("prd");
         show("prd-view");
-        loadSidebar();
+        loadInBackground(loadSidebar, "sidebar");
     } finally {
         hideLoading();
     }
@@ -849,7 +923,7 @@ async function regenArch() {
         $("#arch-content").textContent = data.arch;
         setStep("arch-review");
         show("arch-view");
-        loadSidebar();
+        loadInBackground(loadSidebar, "sidebar");
     } finally {
         hideLoading();
     }
@@ -932,7 +1006,7 @@ async function regenTestDesign() {
         $("#test-content").textContent = data.test_design;
         setStep("test-review");
         show("test-view");
-        loadSidebar();
+        loadInBackground(loadSidebar, "sidebar");
     } finally {
         hideLoading();
     }
@@ -1063,7 +1137,7 @@ function startExecutionPolling() {
             if (data.status !== "running") {
                 stopExecutionPolling();
                 if (data.status === "completed") {
-                    loadSidebar();
+                    loadInBackground(loadSidebar, "sidebar");
                 }
             }
         } catch { /* ignore */ }
@@ -1774,7 +1848,7 @@ async function generateTasks() {
         renderTasks(data.tasks);
         setStep("tasks");
         show("tasks-view");
-        loadSidebar();
+        loadInBackground(loadSidebar, "sidebar");
     } finally {
         hideLoading();
     }
@@ -2657,8 +2731,8 @@ function goHome() {
     renderSteps(false, false);
     setStep("interview");
     show("plans-view");
-    loadPlans();
-    loadSchedulerState();
+    loadInBackground(loadPlans, "plans");
+    loadInBackground(loadSchedulerState, "scheduler state");
     updateSidebarActiveItem(null);
     stopSchedulerPolling();
 }
@@ -2921,11 +2995,11 @@ function init() {
     // Scheduler view
     safeBind("#btn-open-scheduler", "click", () => {
         show("scheduler-view");
-        loadSchedulerState();
+        loadInBackground(() => loadSchedulerState(), "scheduler state");
         startSchedulerPolling();
     });
     safeBind("#btn-refresh-scheduler", "click", () => {
-        loadSchedulerState();
+        loadInBackground(() => loadSchedulerState(), "scheduler state");
     });
     safeBind("#btn-scheduler-back-home", "click", goHome);
     // The capacity knob: the picked number is written to the server,
@@ -2949,11 +3023,14 @@ function init() {
     });
     bindSchedulerActions();
 
-    // Initial load
+    // Initial load.  None of these is waited for — they are fired and
+    // forgotten, so each one carries its own rejection handler (see
+    // loadInBackground): a refused read must not become an uncaught
+    // exception on a page nobody is looking at yet.
     renderSteps(false, false);
-    loadPlans();
-    loadSidebar();
-    loadSchedulerState();
+    loadInBackground(loadPlans, "plans");
+    loadInBackground(loadSidebar, "sidebar");
+    loadInBackground(loadSchedulerState, "scheduler state");
 }
 
 document.addEventListener("DOMContentLoaded", init);
