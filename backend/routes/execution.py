@@ -3262,7 +3262,68 @@ def start_execution(
                 process.returncode,
                 detail="executor_finished",
             )
-            if state["status"] == "running":
+            # 2026-11-03: the hand-off used to hang off a *mutable
+            # in-memory* status.  ``state["status"]`` is written by
+            # other code paths while the executor is still alive
+            # (``stop_execution`` writes ``"stopped"``, the pause path
+            # writes ``"pausing"``).  On 2026-11-03 the status drifted
+            # to ``"stopped"`` while the executor subprocess was still
+            # running; the subprocess then exited 0 and the whole
+            # completion branch below — the auto-verification hand-off
+            # included — was skipped, silently: no log line, no
+            # verification round, the plan just stopped.
+            #
+            # The gate is therefore re-based on facts that survive such
+            # a drift:
+            #
+            #   rc == 0  AND  pending_or_unstarted == 0  AND  no quota marker
+            #
+            # ``rc`` is the subprocess' own exit code, the pending count
+            # is read from the runtime overlay cross-checked against
+            # ``tasks.json``, and the quota marker is read from
+            # ``tasks.json``'s top-level ``stop_reason``.  None of the
+            # three can be flipped by a concurrent writer between the
+            # exit and the hand-off.
+            #
+            # The "status is still running" case keeps its original
+            # behaviour verbatim (all three rc branches, including the
+            # partial-completion and quota-park dispositions).
+            _status_at_exit = state["status"]
+            _unfinished_at_exit = None
+            _durable_completion = False
+            # 2026-11-03: the durable facts above are *stable*.  The
+            # executor's exit code is still 0 when the completion
+            # branch is entered a second time, the plan still has
+            # nothing pending and still carries no quota marker — so
+            # every one of them still says "hand off", and a second
+            # verification round starts against a plan that has already
+            # been handed off.  The material is explicit: the hand-off
+            # may happen only once.
+            #
+            # The one-shot latch lives in the run's own in-memory state
+            # (``_execution_state``) — no new database column, no
+            # migration.  It is written *before* the hand-off call (so a
+            # verification loop that raises cannot be retried into a
+            # second round) and read back here (so the second entry
+            # skips).
+            _already_handed_off = bool(
+                state.get("_auto_verification_handoff_started")
+            )
+            if _status_at_exit != "running" and process.returncode == 0:
+                # ``_count_unfinished_tasks`` is defensive: an
+                # unreadable ``tasks.json`` yields all zeros, i.e.
+                # "nothing detected as unfinished" — so a plan whose
+                # task file cannot be read still hands off rather than
+                # stranding (documented contract of that function).
+                _unfinished_at_exit = _server._count_unfinished_tasks(
+                    plan_id, tasks_file
+                )
+                _durable_completion = (
+                    _unfinished_at_exit["pending_or_unstarted"] == 0
+                    and _quota_wait_detail(tasks_file) is None
+                    and not _already_handed_off
+                )
+            if _status_at_exit == "running" or _durable_completion:
                 if process.returncode == 0:
                     # 2026-08-24: the original code
                     # unconditionally marked the executor "completed"
@@ -3440,6 +3501,12 @@ def start_execution(
                             # ``verification`` and call
                             # ``transition_to("completed")`` once
                             # the round finishes.
+                            #
+                            # 2026-11-03: arm the one-shot latch
+                            # *before* the call — a verification loop
+                            # that raises must not be retried into a
+                            # second round.
+                            state["_auto_verification_handoff_started"] = True
                             loop_outcome = _server._run_auto_verification_loop(
                                 plan_id,
                                 plan_dir,
@@ -3537,6 +3604,10 @@ def start_execution(
                     # below and the plan still needs a resting phase).
                     loop_outcome = _server._VerificationLoopOutcome()
                     try:
+                        # 2026-11-03: arm the one-shot latch *before*
+                        # the call — a verification loop that raises
+                        # must not be retried into a second round.
+                        state["_auto_verification_handoff_started"] = True
                         loop_outcome = _server._run_auto_verification_loop(plan_id, plan_dir, project_dir, tool=req.tool)
                     except Exception:
                         _server.logger.exception(
@@ -3588,6 +3659,60 @@ def start_execution(
                     state["stop_reason"] = "process_died_unexpectedly"
                     state["ended_at"] = datetime.now().isoformat()
                     _server.PlanState(plan_dir).transition_to("failed")
+            else:
+                # 2026-11-03: the run did NOT hand off to auto-verification
+                # — and nothing said so.  The durable-fact gate above can
+                # legitimately rule the hand-off out (the executor exited
+                # non-zero, work is still pending, the plan is parked for
+                # quota), and in every one of those cases the watcher fell
+                # through in silence.  The operator was left with a stopped
+                # plan and no line in the log saying why — the exact
+                # ambiguity the 2026-11-03 incident was diagnosed as.
+                #
+                # The skip is an *observation*, not a disposition: it writes
+                # no state and touches no database row.  It only records
+                # which of the durable facts ruled the hand-off out, so the
+                # fields on the line are exactly the fields the decision
+                # was made on.
+                #
+                # ``_unfinished_at_exit`` is only computed for a clean exit
+                # (a non-zero exit never reaches that read), so on that path
+                # the pending count is genuinely unknown — ``None`` is the
+                # honest value for it, not ``0``.
+                #
+                # 2026-11-03: ``already_handed_off`` has the highest
+                # priority — it is the reason the hand-off did not
+                # happen.  It is only reported when the run was
+                # otherwise finished (a clean exit and nothing
+                # pending): a run that crashed or that still has work
+                # left failed for its own reasons, and mislabelling it
+                # as "already handed off" would hide that.
+                _skip_pending = (_unfinished_at_exit or {}).get(
+                    "pending_or_unstarted", 0
+                )
+                if (
+                    _already_handed_off
+                    and process.returncode == 0
+                    and _skip_pending == 0
+                ):
+                    _skip_reason = "already_handed_off"
+                elif process.returncode != 0:
+                    _skip_reason = "executor_not_clean_exit"
+                elif _skip_pending > 0:
+                    _skip_reason = "pending_tasks"
+                elif _quota_wait_detail(tasks_file) is not None:
+                    _skip_reason = "waiting_for_quota"
+                else:
+                    _skip_reason = "status_not_running"
+                _server.logger.warning(
+                    "auto_verification_skipped plan=%s reason=%s rc=%s "
+                    "pending_or_unstarted=%s status=%s",
+                    plan_id,
+                    _skip_reason,
+                    process.returncode,
+                    (_unfinished_at_exit or {}).get("pending_or_unstarted"),
+                    _status_at_exit,
+                )
             try:
                 persist_conn = open_db(_server._state_db_path())
                 try:
