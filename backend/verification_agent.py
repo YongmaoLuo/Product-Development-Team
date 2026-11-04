@@ -127,7 +127,7 @@ from verification_evidence import (  # noqa: E402
 # 两条导入都是**模块级**的，跟上面的 `base_drift` 同一个理由：测试要能
 # monkeypatch 本模块上的名字（打在源模块上的桩打不中真正被调用的那一份）。
 from verification_quarantine import quarantine_and_restore  # noqa: E402
-from verification_write_guard import read_refusals  # noqa: E402
+from verification_write_guard import is_inside_tree, read_refusals  # noqa: E402
 
 # 2026-10-29（base drift 预检）：漂移检查走 ``base_drift`` **模块本身**
 # —— ``base_drift.check_and_merge_base(...)``，而不是 ``from base_drift
@@ -9496,8 +9496,14 @@ class Orchestrator:
         记在 ``<plan>/vp_write_scope/refusals/round-<n>/<vp>.jsonl`` 里。
         护栏读得见这份账本，子 agent 读不到 —— 它照样交回一个 PASSED。
         而那个 PASSED 是在一个**它自己动过手脚**的树上给出的：结论的依据
-        已经不可信了。所以有拒绝记录的 VP 一律改判 FAILED，原因是
+        已经不可信了。所以**写进了被验证树**的拒绝一律改判 FAILED，原因是
         ``verifier_mutated_tree``（arch 决策点 3）。
+
+        2026-11-04（树外拒绝不再改判）：护栏拒绝的是「写出可写范围」的写，
+        而那**不等于**「改了被验证的树」—— 写
+        ``~/.claude/projects/<project>/memory/…`` 也被拒，但它动不了被验证
+        仓库。只有落在 ``project_dir`` 之内的拒绝才改判；树外的拒绝改记
+        ``verifier_refused_outside_scope`` 事件，**不改判** verdict。
 
         改判后的失败分类是 ``infra``：这次出问题的不是交付物，是这次
         尝试本身出了 malfunction（护栏拦下了它）。来源是
@@ -9507,6 +9513,10 @@ class Orchestrator:
         头上，别的轮次的记录也不该算进这一轮。provider / chosen_model /
         model_complexity 沿用原 verdict：路由是这次尝试的事实，改判结论
         不改变它。
+
+        没有 ``project_dir`` 时无法判断一条拒绝在不在树内 → fail-open：
+        不改判。路径没记下来的拒绝仍按树内处理（「路径未记录」的语义不能
+        丢：连写哪都不记得的 VP 更没有理由拿 PASSED）。
 
         读证据失败 → 原样返回 verdict。护栏的账本坏了，不等于这个 VP
         越权了；拿一个读不出来的账本去否证一个 VP，比放过它更坏。
@@ -9538,9 +9548,53 @@ class Orchestrator:
             return verdict
 
         records = [r for r in refusals if isinstance(r, dict)]
+
+        # 2026-11-04（树外拒绝不再改判）：护栏拒绝的是「写出可写范围」的写，
+        # 而「写出了可写范围」**不等于**「改了被验证的树」—— VP-024 有一条
+        # 拒绝写的是 ``~/.claude/projects/<project>/memory/…``，那动不了被
+        # 验证仓库一根毫毛，却照样把 PASSED 改判成 FAILED，把整轮拖垮。
+        # 所以先把记录按「落在被验证树内还是外」分开：只有树内的才改判，
+        # 树外的只记事件、不动 verdict。
+        #
+        # 树内 = 落在 ``project_dir`` 之下。没有 ``project_dir`` 时无从判断，
+        # 于是 fail-open：一条都算树外，verdict 原样成立。
+        tree = getattr(self, "project_dir", None)
+        inside: List[Dict[str, Any]] = []
+        outside: List[Dict[str, Any]] = []
+        for record in records:
+            path = str(record.get("path") or "").strip()
+            if not path or (tree and is_inside_tree(path, tree)):
+                # 路径没记下来 → 仍按树内处理（「路径未记录」的改判语义不能丢）。
+                inside.append(record)
+            else:
+                outside.append(record)
+
+        if outside:
+            try:
+                self._safe_log_freshness_event(
+                    vp_id,
+                    "verifier_refused_outside_scope",
+                    {
+                        "vp_id": vp_id,
+                        "round": round_no,
+                        "paths": [str(r.get("path") or "") for r in outside],
+                        "count": len(outside),
+                    },
+                )
+            except Exception:  # pragma: no cover - defensive
+                # 树外的拒绝不改判，事件丢了只是少一条痕 —— 不能把这一轮炸掉。
+                logger.exception(
+                    "[verification_write_guard] could not record the "
+                    "out-of-scope refusal event",
+                )
+
+        if not inside:
+            # 只有树外的拒绝 → 子 agent 的 verdict 原样成立。
+            return verdict
+
         paths: List[str] = []
         evidence: List[str] = []
-        for record in records:
+        for record in inside:
             path = str(record.get("path") or "").strip()
             tool = str(record.get("tool") or "unknown")
             reason = str(record.get("reason") or "")
@@ -9560,7 +9614,7 @@ class Orchestrator:
             "paths": paths,
             # How many writes were refused — a path refused twice is one
             # path but two attempts, and the operator wants both numbers.
-            "count": len(records),
+            "count": len(inside),
         }
         try:
             self._safe_log_freshness_event(vp_id, "verifier_mutated_tree", event)

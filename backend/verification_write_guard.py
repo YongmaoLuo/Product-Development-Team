@@ -90,6 +90,7 @@ __all__ = [
     "bash_write_targets",
     "check_bash_payload",
     "check_edit_payload",
+    "is_inside_tree",
     "main",
     "read_refusals",
     "record_refusal",
@@ -203,6 +204,29 @@ def _is_inside(target: str, root: str) -> bool:
         return True
     prefix = root if root.endswith(os.sep) else root + os.sep
     return target.startswith(prefix)
+
+
+def is_inside_tree(path: Any, root: Any) -> bool:
+    """Whether ``path`` lies inside ``root`` once both are resolved.
+
+    护栏拒绝的是"写出可写范围"的写，而"写出了可写范围"和"改了被验证的树"
+    **不是一回事** —— 写 agent 自己的 memory 目录也被拒，但它动不了被验证
+    仓库。调用方要分清这两件事，就得能问"这个路径在树内吗"。
+
+    比较前两边都解析：``~`` 展开、``..`` 消解、符号链接解掉。护栏记下的
+    Edit / Write 路径是**原样**的（可能带 ``~``、可能是相对路径），Bash
+    分支记的是解析过的绝对路径 —— 不先解析就没法把两者放在一起比。
+
+    Args:
+        path: The path to test; may be relative or carry a ``~``.
+        root: The tree the path is compared against.
+
+    Returns:
+        ``True`` when ``path`` is ``root`` itself or lives under it.
+    """
+    if not path or not root:
+        return False
+    return _is_inside(_resolve(str(path)), _resolve(str(root)))
 
 
 def scope_root() -> Optional[Path]:
