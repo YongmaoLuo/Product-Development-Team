@@ -280,6 +280,12 @@ except Exception:  # noqa: BLE001 - a missing module must not break startup
 PLANS_DIR = resolve_plans_dir()
 PLANS_DIR.mkdir(parents=True, exist_ok=True)
 
+#: Whether this process has actually started the HTTP application.
+#: Importing this module must not grant a process the right to sweep the
+#: plans tree: tests, one-off scripts and executors all import it, and
+#: every one of them exits normally.  Only the lifespan sets this.
+_SERVER_PROCESS_STARTED = False
+
 
 def _validated_plan_id(plan_id: str) -> str:
     """Return ``plan_id`` unchanged, or raise if it is not a safe leaf.
@@ -2431,6 +2437,14 @@ async def _lifespan(app):
     # a worker thread behind that nothing would ever stop.
     scheduler = _start_scheduler(app)
 
+    # 2026-11-04: this process is now the backend.  The ``atexit``
+    # backstop that sweeps the plans tree may only run in a process
+    # that got this far — a process that merely *imported* this module
+    # (a test run, a one-off script, an executor) exits normally too,
+    # and its exit must not signal the tree a live backend owns.
+    global _SERVER_PROCESS_STARTED
+    _SERVER_PROCESS_STARTED = True
+
     try:
         yield
     finally:
@@ -2468,6 +2482,12 @@ async def _lifespan(app):
         heartbeat_monitor.stop()
         _stop_feishu_notifier(app, feishu_notifier_handle)
         _shutdown_all_executions()
+        # 2026-11-04: the app is down, so this process is no longer the
+        # backend.  The sweep above was the shutdown sweep; the atexit
+        # backstop must not run it a second time — and a process that
+        # has stopped serving must not go on signalling the plans tree
+        # of a backend that took over.
+        _SERVER_PROCESS_STARTED = False
         # 2026-09-23: leave a restorable copy behind on every clean
         # shutdown.  First checkpoint the WAL so the backup (and the
         # file at rest) is self-contained, then copy it into the backup
@@ -4363,18 +4383,38 @@ def _shutdown_all_executions() -> None:
     # those entries the property of a running round — and leave the
     # backend's own services holding their ports after it exited.
     try:
-        _sweep_process_ledgers(
-            PLANS_DIR,
+        reports = _sweep_process_ledgers(
+            resolve_plans_dir(),
             reason="server_shutdown",
             release_own_owners=True,
             caller="server.shutdown_sweep",
         )
+        logger.warning(
+            "[shutdown_sweep] caller=server.shutdown_sweep plans=%s",
+            [r.to_dict() for r in reports],
+        )
     except Exception:  # pragma: no cover - shutdown must never raise
         logger.exception("[service_manager] shutdown ledger sweep failed")
 
+
+def _atexit_shutdown_sweep() -> None:
+    """atexit backstop: only a process that started the app may sweep.
+
+    A process that merely imported this module (a test run, a script)
+    must never signal the plans tree — those processes belong to the
+    backend that is still running."""
+    if not _SERVER_PROCESS_STARTED:
+        return
+    _shutdown_all_executions()
+
+
 # Ensure subprocess cleanup even on abrupt process exit (SIGKILL bypasses
 # this, but SIGTERM / unhandled exception / sys.exit all trigger atexit).
-atexit.register(_shutdown_all_executions)
+#
+# The registration is unconditional — it costs nothing to have the hook —
+# but the *work* it does is gated on ``_SERVER_PROCESS_STARTED``: the
+# hook only sweeps in a process that actually started the application.
+atexit.register(_atexit_shutdown_sweep)
 
 
 def _signal_handler(signum, frame):
