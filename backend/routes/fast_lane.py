@@ -264,6 +264,101 @@ def _mark_queued(plan_id: str, plan_dir: Path) -> None:
         )
 
 
+#: The phase a plan whose import failed is registered in.
+#:
+#: 2026-11-04: the import lane's own dead end.  The plan exists (its
+#: directory holds the material that was imported and the failure that
+#: stopped it) and it is not runnable (the audit, or one of the
+#: executor gates, refused the list).  Naming that state is what makes
+#: the plan findable: a reader that goes through ``plan_routing`` can
+#: answer "it is there, and it failed" instead of "no such plan".
+#:
+#: It is not ``queued`` — the scheduler collects only ``queued``, so a
+#: failed import is never pulled into the line — and it is not terminal:
+#: a failed import is exactly the plan an operator needs to see.
+IMPORT_FAILED_PHASE = "import_failed"
+
+
+def _register_import_failed(plan_id: str, reason: str) -> None:
+    """Register the plan whose import failed, so it is not an orphan.
+
+    The plan's directory is **kept**: it holds the material that was
+    imported and the failure that stopped it, and it is what an operator
+    reads to find out what happened.  Deleting it would throw away the
+    evidence; leaving it unregistered is what made the plan unreadable.
+    A directory with no row behind it is an orphan — every reader that
+    goes through the tables answers "no such plan" about it, and
+    ``resume`` cannot pick it up.
+
+    Two writes, and only two:
+
+    * ``plan_routing.current_phase = 'import_failed'`` — written through
+      ``_seed_plan_routing_phase``, which is an ``INSERT OR IGNORE`` that
+      swallows its own failures.  So the phase is read **back** to find
+      out whether it actually landed: a row that did not land (SQLite
+      unavailable, or a row that belonged to an older plan with the same
+      id and carries another phase) is an error in the log — not a
+      different answer to the caller.  The import failed either way, and
+      the caller still gets its 422/504.
+    * ``plan_execution.stop_reason`` — the original error text, exactly
+      as it was written.  The HTTP response is the first copy of the
+      reason and the caller throws it away; this is the copy that stays
+      with the plan.
+
+    Nothing here writes a queue row: a failed import is not a waiting
+    plan, and ``import_failed`` is not the phase the scheduler collects.
+
+    Args:
+        plan_id: the plan whose import failed.
+        reason: the error text, unprocessed — the caller gets the same
+            words in the response body.
+    """
+    _server._seed_plan_routing_phase(plan_id, phase=IMPORT_FAILED_PHASE)
+
+    try:
+        from state_machine.db.connection import open as open_db
+        from state_machine.db.schema import migrate
+        from state_machine.repositories.execution_repository import (
+            ExecutionRepository,
+        )
+        from state_machine.repositories.routing_repository import (
+            RoutingRepository,
+        )
+
+        conn = open_db(_server._state_db_path())
+        try:
+            migrate(conn)
+
+            # Read the phase back: calling the seed is not the same as
+            # the row carrying the phase.
+            row = RoutingRepository(conn).find(plan_id) or {}
+            phase = str(row.get("current_phase") or "")
+            if phase != IMPORT_FAILED_PHASE:
+                _server.logger.error(
+                    "import_failed_phase_not_registered: plan %s was "
+                    "seeded at %r but plan_routing reads %r",
+                    plan_id, IMPORT_FAILED_PHASE, phase or None,
+                )
+
+            # The reason, on the plan itself.
+            ExecutionRepository(conn).update_fields(
+                plan_id,
+                create_if_missing=True,
+                stop_reason=reason,
+            )
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 - logged, never swallowed
+        # The registration is a side effect of a failure that already
+        # happened: the caller is told the import failed either way, and
+        # a plan that could not be registered is still not runnable.
+        _server.logger.error(
+            "import_failed_registration_failed: plan %s could not be "
+            "registered as %s (%s: %s)",
+            plan_id, IMPORT_FAILED_PHASE, type(exc).__name__, exc,
+        )
+
+
 def _record_scheduler_intent(plan_dir: Path, priority: int) -> int:
     """Record the priority the caller asked for, in the plan's own files.
 
@@ -455,6 +550,9 @@ def import_plan(req: ImportPlanRequest, request: Request):
         tasks_data = generator.generate(session=session)
     except TimeoutError as exc:
         _server.logger.warning("Fast lane import timed out: %s", exc)
+        # The directory exists and the import failed: register it, so
+        # the plan is findable instead of an orphan.
+        _register_import_failed(plan_id, str(exc))
         raise HTTPException(
             504,
             {
@@ -472,6 +570,9 @@ def import_plan(req: ImportPlanRequest, request: Request):
         _server.logger.warning(
             "Fast lane import generation failed for plan %s: %s", plan_id, exc
         )
+        # The generator refused the list: register the plan as failed
+        # rather than leaving a directory with no row behind it.
+        _register_import_failed(plan_id, str(exc))
         raise HTTPException(
             422,
             {
@@ -490,6 +591,9 @@ def import_plan(req: ImportPlanRequest, request: Request):
 
     problems = validate_tasks(tasks_data, project_dir)
     if problems:
+        # The audit refused the list.  The problems are the reason, and
+        # they are recorded verbatim on the plan.
+        _register_import_failed(plan_id, "; ".join(problems))
         raise HTTPException(
             422,
             {
@@ -513,6 +617,9 @@ def import_plan(req: ImportPlanRequest, request: Request):
         _server.logger.warning(
             "Fast lane import hardening failed for plan %s: %s", plan_id, exc
         )
+        # The executor's own gates refused the list: same registration
+        # as the audit's refusal, one step later.
+        _register_import_failed(plan_id, str(exc))
         raise HTTPException(
             422,
             {

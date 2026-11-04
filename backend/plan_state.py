@@ -160,6 +160,24 @@ VALID_PHASES = [
     # still carry the old value; they are read through
     # :func:`normalize_phase` (historical value → ``verification_repairing``).
     "verification_loop_stopped",
+    # 2026-11-04: ``import_failed`` — the plan the fast lane could not
+    # turn into a runnable plan.
+    #
+    # The import lane refuses material it cannot run (the audit said no,
+    # or one of the executor gates threw the list away).  Before this
+    # name existed, the refusal left the plan's *directory* on disk and
+    # no row anywhere: every reader that goes through ``plan_routing``
+    # answered "no such plan", and the directory was a folder nobody
+    # could account for.  Registering the refusal in a phase of its own
+    # is what makes the plan findable — "it is there, and it failed"
+    # instead of "it does not exist".
+    #
+    # It is deliberately NOT ``queued`` (the scheduler collects only
+    # ``queued``, so a failed import is never pulled into the line) and
+    # deliberately NOT terminal (a terminal phase is filtered out of the
+    # listings — and a failed import is exactly the plan an operator
+    # needs to see).
+    "import_failed",
     "completed",
     "failed",
     "stopped",

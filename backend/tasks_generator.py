@@ -1357,37 +1357,24 @@ class TasksGenerator:
             task.setdefault("updated_time", None)
             task.setdefault("failure_reason", None)
 
-            # Post-processing for ``depends_on`` (3-tier fallback).
-            #
-            # The prompt explicitly asks the LLM to emit ``depends_on``,
-            # but LLM output formatting is unreliable: the field may be
-            # missing, empty, or fail JSON parsing. To guarantee the
-            # downstream executor (``agent._build_layers``) always sees
-            # a well-formed ``depends_on`` array, we run a 3-tier
-            # fallback on every task:
-            #
-            #   1. If the LLM emitted a non-empty ``depends_on`` list,
-            #      keep it as-is.
-            #   2. Otherwise try to extract ids from the description's
-            #      "前置条件/依赖" hint via
-            #      ``_postprocess_extract_from_desc``.
-            #   3. Otherwise infer from the task id (e.g. "1-2" -> ["1"])
-            #      via ``_postprocess_infer_from_id``.
-            #
-            # ``setdefault('depends_on', [])`` at the bottom guarantees
-            # the field is always present, even when both extraction
-            # and inference yield an empty list (top-level tasks).
-            existing = task.get("depends_on")
-            if not existing or not isinstance(existing, list) or len(existing) == 0:
-                desc = task.get("description", "") or ""
-                extracted = self._postprocess_extract_from_desc(desc)
-                if extracted:
-                    task["depends_on"] = extracted
-                else:
-                    task["depends_on"] = self._postprocess_infer_from_id(
-                        task.get("id", "")
-                    )
-            task.setdefault("depends_on", [])
+        # Post-processing for ``depends_on`` (3-tier fallback).
+        #
+        # The prompt explicitly asks the LLM to emit ``depends_on``,
+        # but LLM output formatting is unreliable: the field may be
+        # missing, empty, or fail JSON parsing. To guarantee the
+        # downstream executor (``agent._build_layers``) always sees
+        # a well-formed ``depends_on`` array, we run a 3-tier
+        # fallback on every task — see ``_postprocess_depends_on``.
+        #
+        # The plan's full id set is handed to the desc parser: it is
+        # what tells a hierarchical id ("1-2", an id of this plan) from
+        # a range ("1-4", which names four tasks).
+        known_ids = {
+            str(task.get("id"))
+            for task in tasks
+            if task.get("id") is not None
+        }
+        self._postprocess_depends_on(tasks, known_ids=known_ids)
 
         # Enforce ``files_to_modify`` count limit (max 5 per task).
         #
@@ -2698,68 +2685,112 @@ class TasksGenerator:
         )
 
     @staticmethod
-    def _postprocess_extract_from_desc(description: str) -> list:
+    def _postprocess_extract_from_desc(
+        description: str,
+        known_ids: Optional[set[str]] = None,
+    ) -> list:
         """Extract ``depends_on`` task ids from a task description.
 
-        Recognised patterns (in priority order):
+        **Only a brace group declares a prerequisite** (2026-11-04).
+        The trigger word still says "this sentence declares
+        prerequisites"; the braces say which ids it declares.  Text
+        outside the braces is prose and is never read as an id.
 
-          - ``前置条件：任务 1 已完成。``
-          - ``前置条件：任务 1-2 已完成。``
-          - ``依赖：任务 1 已完成``
-          - ``前置条件/依赖：已完成 任务 1-2。``
-          - ``前置条件：任务 1, 2, 3 已完成``
+        Recognised patterns:
+
+          - ``前置条件：任务 {1} 已完成。``
+          - ``前置条件：任务 {1-4} 已完成。``  (range → 1, 2, 3, 4)
+          - ``依赖：任务 {2,5} 已完成``         (list → 2 and 5)
+          - ``前置条件/依赖：已完成 任务 {1-2}。``
+          - ``前置条件：任务 1-4 已完成。``      (bare → prose, ignored)
 
         The function returns the list of task ids parsed from the
-        description, e.g. ``['1-2']`` for ``"前置条件：任务 1-2 已完成"``.
-        Returns ``[]`` when no recognised trigger word is found or no
-        task id can be parsed.
+        description, e.g. ``['1','2','3','4']`` for
+        ``"前置条件：任务 {1-4} 已完成"``.  Returns ``[]`` when no
+        recognised trigger word is found, when the trigger sentence
+        carries no brace group, or when no task id can be parsed.
+
+        Args:
+            description: The task description to scan.
+            known_ids: The ids that exist in the plan.  Used to tell a
+                hierarchical id ("1-2") from a range ("1-4"): a known id
+                is kept whole, an unknown two-segment token is expanded.
+                ``None`` means "unknown plan" — every token is then kept
+                literal.
 
         Boundary cases:
 
           - ``description`` is empty / ``None`` / non-string -> ``[]``
-          - description has the trigger word but no ``任务`` keyword after
-            it -> ``[]``
-          - description has the trigger + ``任务`` keyword but no parseable
-            id (e.g. just trailing punctuation) -> ``[]``
+          - no trigger word ("前置条件" / "依赖" + a colon) -> ``[]``
+          - trigger word but no brace group in that sentence -> ``[]``
+          - a brace group outside the trigger's sentence (a fenced code
+            block further down the description) -> not parsed
 
-        Implementation note: the trigger regex matches any of the three
-        Chinese phrasings ("前置条件", "依赖", "前置条件/依赖"). The id
-        matcher is deliberately permissive — ``\d+(?:-\d+)*`` — to
-        accept both flat ("1") and hierarchical ("1-2", "1-2-3") task
-        ids, matching the prompt's id convention.
+        Implementation note: the validator
+        (``backend/agent.py::_extract_desc_dep_ids``) is the reference
+        implementation of this rule — it enforces that the desc and the
+        data agree, while this function *creates* the data.  Two
+        hand-written parsers would drift apart (and did: the generator
+        used to read a bare "1-4" as one literal id), so the generator
+        calls the validator's parser instead of copying it.  The import
+        is local because ``agent`` pulls in the whole executor stack
+        and the generator needs nothing else from it.
         """
-        if not description or not isinstance(description, str):
-            return []
+        from agent import _extract_desc_dep_ids
 
-        # Locate the trigger phrase (first occurrence wins).
-        trigger_match = re.search(
-            r"(?:前置条件\s*/\s*依赖|前置条件|依赖)\s*[：:]",
-            description,
-        )
-        if not trigger_match:
-            return []
+        return _extract_desc_dep_ids(description, known_ids=known_ids)
 
-        # Bound the search to the trigger's sentence: stop at the
-        # first sentence terminator or newline after the trigger so
-        # we don't pick up ids from unrelated later sentences.
-        after_trigger = description[trigger_match.end():]
-        boundary = re.search(r"[。\n;；]", after_trigger)
-        if boundary:
-            after_trigger = after_trigger[:boundary.start()]
+    @staticmethod
+    def _postprocess_depends_on(
+        tasks: list,
+        known_ids: Optional[set[str]] = None,
+    ) -> None:
+        """Resolve ``depends_on`` for every task (3-tier fallback).
 
-        # The "任务" keyword (preceded by nothing specific) is where
-        # the id list starts. If absent, no id can be parsed.
-        task_kw_idx = after_trigger.find("任务")
-        if task_kw_idx < 0:
-            return []
-        ids_section = after_trigger[task_kw_idx + len("任务"):]
+        The prompt explicitly asks the LLM to emit ``depends_on``, but
+        LLM output formatting is unreliable: the field may be missing,
+        empty, or fail JSON parsing.  To guarantee the downstream
+        executor (``agent._build_layers``) always sees a well-formed
+        ``depends_on`` array, we run a 3-tier fallback on every task:
 
-        # Extract all valid task ids. The regex is greedy on the
-        # `(?:\-\d+)*` tail so it captures full hierarchical ids
-        # ("1-2-3") rather than splitting them.
-        id_pattern = re.compile(r"\d+(?:-\d+)*")
-        matches = id_pattern.findall(ids_section)
-        return matches
+          1. If the LLM emitted a non-empty ``depends_on`` list, keep it
+             as-is.
+          2. Otherwise try to extract ids from the description's
+             "前置条件/依赖" hint via ``_postprocess_extract_from_desc``.
+          3. Otherwise infer from the task id (e.g. "1-2" -> ["1"]) via
+             ``_postprocess_infer_from_id``.
+
+        ``setdefault('depends_on', [])`` guarantees the field is always
+        present, even when both extraction and inference yield an empty
+        list (top-level tasks).
+
+        Args:
+            tasks: The task dicts to fix up — mutated in place.
+            known_ids: The plan's full id set, handed to the desc parser
+                so it can tell a hierarchical id from a range.  ``None``
+                derives the set from ``tasks`` itself.
+        """
+        if known_ids is None:
+            known_ids = {
+                str(task.get("id"))
+                for task in tasks
+                if task.get("id") is not None
+            }
+
+        for task in tasks:
+            existing = task.get("depends_on")
+            if not existing or not isinstance(existing, list) or len(existing) == 0:
+                desc = task.get("description", "") or ""
+                extracted = TasksGenerator._postprocess_extract_from_desc(
+                    desc, known_ids=known_ids
+                )
+                if extracted:
+                    task["depends_on"] = extracted
+                else:
+                    task["depends_on"] = TasksGenerator._postprocess_infer_from_id(
+                        task.get("id", "")
+                    )
+            task.setdefault("depends_on", [])
 
     @staticmethod
     def _postprocess_infer_from_id(task_id: str) -> list:

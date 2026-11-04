@@ -110,6 +110,9 @@ _PHASES_BEFORE = [
     "verification_failed",
     "verification_repairing",
     "verification_loop_stopped",
+    # 2026-11-05: 新增——快速通道 import 校验失败时把计划注册成这个相位，
+    # 而不是留下「有任务、无注册」的孤儿目录（见 plan_state.py 的同日期说明）。
+    "import_failed",
     "completed",
     "failed",
     "stopped",

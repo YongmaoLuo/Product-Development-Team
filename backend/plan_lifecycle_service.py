@@ -587,6 +587,15 @@ class PlanLifecycleService:
             # 迁移被拒（相位在读与写之间变了，或那条边不合法）：冲突。
             return self._conflict(plan_id, self._current_phase(plan_dir))
 
+        # 迁回队列之后，执行行上那条终态裁决必须一起清掉 —— 否则两个裁决
+        # 互相矛盾，计划会从列表里消失（见 ``_clear_terminal_exec_verdict``）。
+        #
+        # 这条路径与 stop 的 requeue 分支（``pause_plan(requeue=True)``，
+        # 上面 341 行）是同一件事：迁回相位只动了一半的真相，另一半是执行
+        # 行上的裁决。少清一次，用户点的「恢复」就会把计划从调度页上弄没
+        # —— 计划回来了，却不见了。
+        self._clear_terminal_exec_verdict(plan_id)
+
         return LifecycleResult(
             plan_id=plan_id,
             dispatched=None,
