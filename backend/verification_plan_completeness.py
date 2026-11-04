@@ -201,6 +201,15 @@ def detect_full_gate_entries(project_dir: Any) -> List[FullGateEntry]:
 #: 都由子 agent 驱动。护栏查的是**覆盖**（这条入口有没有人把关），不是
 #: **命名**（那条 VP 叫什么）—— 因为名字不同就把一份本来就有 E2E 门禁的
 #: 计划打回重生成，只会换来一条重复的关卡。
+#:
+#: 2026-11-04（arch 决策点 7 —— e2e 与 UI 解耦）：``e2e`` 拆成了两个子类
+#: —— ``browser``（子 agent 驱动真浏览器）与 ``command``（框架直跑一条
+#: 入口命令，判定是退出码的纯函数）。**这张表一个字没改**，而且不该改：
+#: 护栏问的是「这条 E2E 入口有没有人把关」，而两个子类都有人把关 ——
+#: browser 类由子 agent 把关，command 类由框架把关。把子类当成命名来查，
+#: 只会把一份有 E2E 门禁的计划打回重生成，换来一条重复的关卡。
+#: （回归锁：``tests/unit/test_e2e_command_subclass.py`` 的
+#: ``test_e2e_gate_accepts_command_kind``。）
 _BROWSER_METHODS = ("e2e", "ui_validation")
 
 
@@ -217,6 +226,10 @@ def _satisfies(entry: FullGateEntry, vp: Dict[str, Any]) -> bool:
     What it must NOT be is a non-browser method: a Phase-2 ``api_test``
     or ``code_review`` is not an end-to-end run of the user flow, and
     letting one stand in is exactly how a missing gate hides.
+
+    The ``e2e`` sub-class (``browser`` / ``command``) is deliberately
+    **not** read here: both sub-classes are a covered E2E gate, and the
+    guard's question is coverage, not naming.
     """
     method = str(vp.get("verification_method") or "").strip()
     if entry.kind == "ci":

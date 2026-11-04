@@ -1,4 +1,4 @@
-"""Bash 写目标检测 —— 子 agent 不能用 shell 绕过写护栏。
+"""Bash 写目标检测 —— 解析器还在，判定改成了测量。
 
 背景（2026-11-02）
 ------------------
@@ -7,6 +7,29 @@
 
 这一份把同一条边界搬到 shell 上：**写目标落在被验证仓库里 → 拒绝**；落在
 plan 目录或临时目录 → 放行。
+
+契约变更（2026-11-05，任务 7 / 17）
+----------------------------------
+Bash 分支**不再判定**。``check_bash_payload`` 恒返回 0 —— 判定路径上不再有
+命令解析器。
+
+为什么：解析器**猜**写目标，而解析器会持续产生假阳性 —— 它把 Python 代码里的
+``>``（``if a > len(b):``）当成 shell 重定向，把 ``len`` / ``1:`` / ``index`` /
+``single`` 当成写目标。护栏据此拒绝，一个字节都没改过被验证仓库的 VP 被改判
+成 FAILED（``failure_class=infra``）。猜错的代价是误杀，量错的代价是漏看，
+而漏看还有回滚与账本兜着。
+
+所以"改了哪些文件"现在由**测量**回答：PreToolUse 拍快照、PostToolUse 比对
+（``backend/verification_tree_guard.py``）。Bash 那条钩子也已摘除（任务 17）
+—— 留着只会白起一个 Python 进程。
+
+**解析器本身没删。** ``bash_write_targets`` 及其同伴仍是纯函数，仍被别的测试
+import、仍被断言输出 —— 下面每条用例都同时钉两件事：
+
+* **判定**：Bash 一律放行（exit 0），且不写任何拒绝记录；
+* **知识**：解析器仍认得出这条命令的落点（"它想写哪儿"仍有机器可读的答案）。
+
+只看第一件事，这批用例会退化成空断言；只看第二件事，它们就与护栏无关。
 
 关键取舍
 --------
@@ -114,71 +137,127 @@ def _marker(plan_dir, round_no=3, vp_id="VP-055"):
     )
 
 
+def _arm_scope(monkeypatch, plan_dir, vp_id="VP-055", round_no=3):
+    """Declare the write scope in **this** process (for in-process calls).
+
+    钩子是以子进程跑的，它的 scope 走子进程的环境；进程内调
+    ``record_refusal`` 时读的是 ``os.environ`` —— 所以这里单独 arm 一次。
+    """
+    import verification_write_guard
+
+    monkeypatch.setenv(verification_write_guard.SCOPE_ENV, str(plan_dir))
+    monkeypatch.setenv(verification_write_guard.VP_ID_ENV, vp_id)
+    monkeypatch.setenv(verification_write_guard.ROUND_ENV, str(round_no))
+
+
+def _targets(command, cwd=_REPO_DIR):
+    """The write targets the **parser** works out for one command.
+
+    2026-11-05（任务 7）：解析器退出判定路径，但没删 —— 它仍是纯函数。所以
+    每条用例都同时钉两件事：钩子**放行**（判定不再问"这条命令会写哪儿"），
+    解析器仍**认得出落点**（"它想写哪儿"仍有机器可读的答案）。
+    """
+    import verification_write_guard
+
+    # ``bash_write_targets`` 的 ``cwd`` 是 **str** —— 传 Path 进去，解析器
+    # 内部把写目标当字符串处理就会炸（整条命令被当成"解析不出来"）。
+    return verification_write_guard.bash_write_targets(command, str(cwd))
+
+
+def _assert_bash_allowed(command, env, plan_dir, cwd=None):
+    """跑一条 Bash payload，断言已交付契约：放行，且不留拒绝证据。
+
+    Returns:
+        ``(exit_code, stderr)`` —— 调用方自己接着断言解析器的落点。
+    """
+    code, stderr = _run_hook(command, env, cwd=cwd)
+
+    assert code == 0, (
+        "Bash 分支不再判定（任务 7）—— 命令一律放行，却拿到了 %d：%s"
+        % (code, stderr)
+    )
+    assert not _marker(plan_dir).exists(), (
+        "放行的命令不该留下拒绝证据：Bash 分支恒放行，不写拒绝记录"
+    )
+    return code, stderr
+
+
 # ---------------------------------------------------------------------------
-# 写进被验证仓库：拒绝
+# 写进被验证仓库：Bash 分支不再判定（放行），但解析器仍认得出落点
 # ---------------------------------------------------------------------------
 def test_redirect_into_project_is_refused(tmp_path):
-    """``echo x > a.py`` 写进被验证仓库 → exit 2。"""
-    env, _plan = _scoped_env(tmp_path)
-    code, stderr = _run_hook("echo x > a.py", env, cwd=_REPO_DIR)
+    """``echo x > a.py`` 写进被验证仓库 → 放行（判定改由测量回答）。
 
-    assert code == 2, stderr
+    但解析器仍认得出它的落点 —— 落点是被验证仓库里的 ``a.py``。
+    """
+    env, plan = _scoped_env(tmp_path)
+    _assert_bash_allowed("echo x > a.py", env, plan, cwd=_REPO_DIR)
+
+    assert _targets("echo x > a.py") == [str(_REPO_DIR / "a.py")]
 
 
 def test_git_checkout_is_refused(tmp_path):
-    """``git checkout -- a.py`` 会改工作区 → exit 2。"""
-    env, _plan = _scoped_env(tmp_path)
-    code, stderr = _run_hook("git checkout -- a.py", env, cwd=_REPO_DIR)
+    """``git checkout -- a.py`` 会改工作区 → 放行；落点仍被认出来。"""
+    env, plan = _scoped_env(tmp_path)
+    _assert_bash_allowed("git checkout -- a.py", env, plan, cwd=_REPO_DIR)
 
-    assert code == 2, stderr
+    assert _targets("git checkout -- a.py") == [str(_REPO_DIR / "a.py")]
 
 
 def test_sed_in_place_is_refused(tmp_path):
-    """``sed -i`` 原地改仓库里的源文件 → exit 2。"""
-    env, _plan = _scoped_env(tmp_path)
-    code, stderr = _run_hook(
+    """``sed -i`` 原地改仓库里的源文件 → 放行；落点仍被认出来。"""
+    env, plan = _scoped_env(tmp_path)
+    _assert_bash_allowed(
         f"sed -i 's/a/b/' {_REPO_FILE}",
         env,
+        plan,
         cwd=_REPO_DIR,
     )
 
-    assert code == 2, stderr
+    assert _targets(f"sed -i 's/a/b/' {_REPO_FILE}") == [
+        str(_REPO_DIR / _REPO_FILE)
+    ]
 
 
 def test_tee_into_project_is_refused(tmp_path):
-    """``tee`` 写进被验证仓库 → exit 2。"""
-    env, _plan = _scoped_env(tmp_path)
-    code, stderr = _run_hook(f"cat x | tee {_REPO_FILE}", env, cwd=_REPO_DIR)
+    """``tee`` 写进被验证仓库 → 放行；落点仍被认出来。"""
+    env, plan = _scoped_env(tmp_path)
+    _assert_bash_allowed(
+        f"cat x | tee {_REPO_FILE}", env, plan, cwd=_REPO_DIR,
+    )
 
-    assert code == 2, stderr
+    assert _targets(f"cat x | tee {_REPO_FILE}") == [str(_REPO_DIR / _REPO_FILE)]
 
 
 def test_copy_into_project_is_refused(tmp_path):
-    """``cp`` 的**目标**写进被验证仓库 → exit 2。"""
-    env, _plan = _scoped_env(tmp_path)
-    code, stderr = _run_hook(f"cp /tmp/x {_REPO_FILE}", env, cwd=_REPO_DIR)
+    """``cp`` 的**目标**写进被验证仓库 → 放行；落点仍被认出来。"""
+    env, plan = _scoped_env(tmp_path)
+    _assert_bash_allowed(f"cp /tmp/x {_REPO_FILE}", env, plan, cwd=_REPO_DIR)
 
-    assert code == 2, stderr
+    assert _targets(f"cp /tmp/x {_REPO_FILE}") == [str(_REPO_DIR / _REPO_FILE)]
 
 
 def test_dd_of_into_project_is_refused(tmp_path):
-    """``dd of=`` 写进被验证仓库 → exit 2。"""
-    env, _plan = _scoped_env(tmp_path)
-    code, stderr = _run_hook(
+    """``dd of=`` 写进被验证仓库 → 放行；落点仍被认出来。"""
+    env, plan = _scoped_env(tmp_path)
+    _assert_bash_allowed(
         f"dd if=/dev/zero of={_REPO_FILE}",
         env,
+        plan,
         cwd=_REPO_DIR,
     )
 
-    assert code == 2, stderr
+    assert _targets(f"dd if=/dev/zero of={_REPO_FILE}") == [
+        str(_REPO_DIR / _REPO_FILE)
+    ]
 
 
 def test_git_add_is_refused(tmp_path):
-    """``git add`` 写仓库状态 → exit 2。"""
-    env, _plan = _scoped_env(tmp_path)
-    code, stderr = _run_hook(f"git add {_REPO_FILE}", env, cwd=_REPO_DIR)
+    """``git add`` 写仓库状态 → 放行；落点仍被认出来。"""
+    env, plan = _scoped_env(tmp_path)
+    _assert_bash_allowed(f"git add {_REPO_FILE}", env, plan, cwd=_REPO_DIR)
 
-    assert code == 2, stderr
+    assert _targets(f"git add {_REPO_FILE}") == [str(_REPO_DIR)]
 
 
 # ---------------------------------------------------------------------------
@@ -233,11 +312,16 @@ def test_copy_out_of_project_is_allowed(tmp_path):
 
 
 def test_move_out_of_project_is_refused(tmp_path):
-    """``mv`` 把仓库里的文件搬走 → exit 2（源也是写落点：文件从那儿没了）。"""
-    env, _plan = _scoped_env(tmp_path)
-    code, stderr = _run_hook(f"mv {_REPO_FILE} /tmp/x", env, cwd=_REPO_DIR)
+    """``mv`` 把仓库里的文件搬走 → 放行；源与目标都仍被认出来。
 
-    assert code == 2, stderr
+    源也是写落点（文件从那儿没了）—— 解析器两个都报。
+    """
+    env, plan = _scoped_env(tmp_path)
+    _assert_bash_allowed(f"mv {_REPO_FILE} /tmp/x", env, plan, cwd=_REPO_DIR)
+
+    assert _targets(f"mv {_REPO_FILE} /tmp/x") == [
+        str(_REPO_DIR / _REPO_FILE), "/tmp/x",
+    ]
 
 
 def test_scope_off_is_noop(tmp_path):
@@ -250,16 +334,19 @@ def test_scope_off_is_noop(tmp_path):
 
 def test_git_dash_c_paths_resolve_in_that_repo(tmp_path):
     """``git -C <repo>`` 的路径按**那个仓库**解析，不是按 shell 的 cwd。"""
-    env, _plan = _scoped_env(tmp_path)
-    code, stderr = _run_hook(
+    env, plan = _scoped_env(tmp_path)
+    _assert_bash_allowed(
         f"git -C {_REPO_DIR} checkout -- a.py",
         env,
+        plan,
         # nosec B108 — 硬写的 /tmp 就是这里要的东西：cwd 必须在仓库之外，
         # 才能证明路径是按 git 自己的仓库目录解析的
         cwd="/tmp",  # nosec B108
     )
 
-    assert code == 2, stderr
+    assert _targets(f"git -C {_REPO_DIR} checkout -- a.py", cwd="/tmp") == [
+        str(_REPO_DIR / "a.py")
+    ]
 
 
 def test_git_dash_c_other_repo_is_allowed(tmp_path):
@@ -290,10 +377,34 @@ def test_unreadable_command_is_allowed(tmp_path):
 # 拒绝证据
 # ---------------------------------------------------------------------------
 def test_refusal_is_recorded(tmp_path):
-    """被拒的 Bash 写入留下证据：tool=Bash，path 指向被验证仓库。"""
+    """拒绝证据：Bash 侧不再写记录；Edit/Write 侧仍然入账。
+
+    2026-11-05（任务 7）：Bash 分支恒放行，不产生任何拒绝记录 —— 越界写改由
+    树快照的测量链路存证。Edit/Write 分支原样：越界写仍然被拒，仍然留下
+    可查的证据（tool / reason / path）。
+    """
     env, plan_dir = _scoped_env(tmp_path)
-    code, stderr = _run_hook("echo x > a.py", env, cwd=_REPO_DIR)
-    assert code == 2, stderr
+
+    # Bash：放行，且不写证据。
+    _assert_bash_allowed("echo x > a.py", env, plan_dir, cwd=_REPO_DIR)
+    assert not _marker(plan_dir).exists(), (
+        "Bash 分支不再判定，不该留下拒绝证据"
+    )
+
+    # Edit/Write：仍然被拒，仍然入账。
+    payload = {
+        "tool_name": "Edit",
+        "tool_input": {"file_path": str(_REPO_DIR / _REPO_FILE)},
+    }
+    proc = subprocess.run(
+        [sys.executable, str(_HOOK_SCRIPT)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+    assert proc.returncode == 2, proc.stderr
 
     assert _marker(plan_dir).is_file(), (
         "拒绝必须留下证据：没有 marker 的话，这次越权写就事后无人查证。"
@@ -304,9 +415,9 @@ def test_refusal_is_recorded(tmp_path):
         if line.strip()
     ]
     assert len(records) == 1
-    assert records[0]["tool"] == "Bash"
+    assert records[0]["tool"] == "Edit"
     assert records[0]["reason"] == "outside_scope"
-    assert records[0]["path"].endswith("a.py")
+    assert records[0]["path"].endswith(_REPO_FILE)
 
 
 def test_allowed_command_records_nothing(tmp_path):
@@ -356,42 +467,29 @@ def test_bash_write_targets_ignores_read_only_commands():
 #
 # 下面每条正控在修复回退后都会转红（见本文件末尾的负控注释）。
 # ---------------------------------------------------------------------------
-def _refused_paths(plan_dir):
-    """The paths the guard recorded as refused."""
-    marker = _marker(plan_dir)
-    records = [
-        json.loads(line)
-        for line in marker.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    return [record["path"] for record in records]
-
-
 def test_clobber_redirect_into_project_is_refused(tmp_path):
-    """``echo x >| server.py`` 写进被验证仓库 → exit 2。
+    """``echo x >| server.py`` 写进被验证仓库 → 放行；落点仍被认出来。
 
     ``>|`` 与 ``>`` 写的是同一个文件；只认 ``>`` 等于给越界写留了一条路。
     """
     env, plan_dir = _scoped_env(tmp_path)
-    code, stderr = _run_hook("echo x >| server.py", env, cwd=_REPO_DIR)
+    _assert_bash_allowed("echo x >| server.py", env, plan_dir, cwd=_REPO_DIR)
 
-    assert code == 2, stderr
-    # 拒绝的落点必须就是那个文件本身 —— 修复前目标整个丢了（压根没拒）。
-    assert _refused_paths(plan_dir) == [str(_REPO_DIR / "server.py")]
+    # 落点必须就是那个文件本身 —— 修复前目标整个丢了。
+    assert _targets("echo x >| server.py") == [str(_REPO_DIR / "server.py")]
 
 
 def test_append_both_redirect_into_project_is_refused(tmp_path):
-    """``echo x &>> server.py`` 写进被验证仓库 → exit 2。
+    """``echo x &>> server.py`` 写进被验证仓库 → 放行；落点仍被认出来。
 
-    而且拒绝的落点必须是 ``server.py`` 本身：修复前落点被认成了
+    而且落点必须是 ``server.py`` 本身：修复前落点被认成了
     ``<repo>/>server.py``（操作符的尾巴当成了文件名），拒是拒了，写的却是
     另一个地方 —— 证据是错的。
     """
     env, plan_dir = _scoped_env(tmp_path)
-    code, stderr = _run_hook("echo x &>> server.py", env, cwd=_REPO_DIR)
+    _assert_bash_allowed("echo x &>> server.py", env, plan_dir, cwd=_REPO_DIR)
 
-    assert code == 2, stderr
-    assert _refused_paths(plan_dir) == [str(_REPO_DIR / "server.py")]
+    assert _targets("echo x &>> server.py") == [str(_REPO_DIR / "server.py")]
 
 
 def test_append_both_redirect_to_tmp_is_allowed(tmp_path):
@@ -509,21 +607,22 @@ def test_heredoc_command_is_allowed(tmp_path):
 
 
 def test_write_before_heredoc_is_still_refused(tmp_path):
-    """负控：heredoc **之前**的真实重定向仍然被认出来、仍然被拒。
+    """负控：heredoc **之前**的真实重定向仍然被认出来。
 
     正文该跳过，但命令行的落点一个都不能少 —— 否则这条修复就把护栏拆了。
     """
     env, plan_dir = _scoped_env(tmp_path)
     command = f"echo VP022_PROBE > {_REPO_FILE} && " + _HEREDOC_COMMAND
-    code, stderr = _run_hook(command, env, cwd=_REPO_DIR)
+    _assert_bash_allowed(command, env, plan_dir, cwd=_REPO_DIR)
 
-    assert code == 2, stderr
-    assert _refused_paths(plan_dir) == [str(_REPO_DIR / _REPO_FILE)]
+    assert _targets(command) == [
+        str(_REPO_DIR / _REPO_FILE), "/tmp/vp022/probe.py",
+    ]
 
 
 def test_write_commands_before_heredoc_are_still_refused(tmp_path):
-    """负控：算子**之前**的 tee / sed -i / cp / mv 目标仍然被拒。"""
-    env, _plan = _scoped_env(tmp_path)
+    """负控：算子**之前**的 tee / sed -i / cp / mv 目标仍然被认出来。"""
+    env, plan_dir = _scoped_env(tmp_path)
     commands = [
         f"cat x | tee {_REPO_FILE} && " + _HEREDOC_COMMAND,
         f"sed -i 's/a/b/' {_REPO_FILE} && " + _HEREDOC_COMMAND,
@@ -532,45 +631,72 @@ def test_write_commands_before_heredoc_are_still_refused(tmp_path):
     ]
 
     for command in commands:
-        code, stderr = _run_hook(command, env, cwd=_REPO_DIR)
-        assert code == 2, (command, stderr)
+        _assert_bash_allowed(command, env, plan_dir, cwd=_REPO_DIR)
+        assert str(_REPO_DIR / _REPO_FILE) in _targets(command), command
 
 
 def test_write_after_the_heredoc_ends_is_still_refused(tmp_path):
-    """负控：heredoc **结束之后**的命令行不是正文 —— 它的真实写仍然被拒。"""
-    env, _plan = _scoped_env(tmp_path)
+    """负控：heredoc **结束之后**的命令行不是正文 —— 它的真实写仍被认出来。"""
+    env, plan_dir = _scoped_env(tmp_path)
     command = _HEREDOC_COMMAND + f"echo VP022_PROBE > {_REPO_FILE}\n"
-    code, stderr = _run_hook(command, env, cwd=_REPO_DIR)
+    _assert_bash_allowed(command, env, plan_dir, cwd=_REPO_DIR)
 
-    assert code == 2, stderr
+    assert _targets(command) == [
+        "/tmp/vp022/probe.py", str(_REPO_DIR / _REPO_FILE),
+    ]
 
 
-def test_refusal_record_carries_the_command(tmp_path):
-    """拒绝证据里带着原始命令行 —— 事后要查"它到底想干什么"。"""
+def test_refusal_record_carries_the_command(tmp_path, monkeypatch):
+    """拒绝证据里带着原始命令行 —— 事后要查"它到底想干什么"。
+
+    2026-11-05（任务 7）：Bash 分支不再判定，所以再没有"被拒的 Bash 命令"
+    这条记录。**记录本身的契约没变**：``record_refusal`` 仍然接受一条命令并
+    把它写进证据里（历史记录要读得出来，新记录也要查得到）。
+    """
+    import verification_write_guard
+
     env, plan_dir = _scoped_env(tmp_path)
     command = f"echo VP022_PROBE > {_REPO_FILE} && " + _HEREDOC_COMMAND
-    code, stderr = _run_hook(command, env, cwd=_REPO_DIR)
-    assert code == 2, stderr
+
+    # Bash 侧不再产生记录。
+    _assert_bash_allowed(command, env, plan_dir, cwd=_REPO_DIR)
+    assert not _marker(plan_dir).exists(), "Bash 分支不再写拒绝记录"
+
+    # 记录契约本身：命令原样带在里面。
+    _arm_scope(monkeypatch, plan_dir)
+    marker = verification_write_guard.record_refusal(
+        "Bash", str(_REPO_DIR / _REPO_FILE), "outside_scope", command=command,
+    )
+    assert marker is not None
 
     records = [
         json.loads(line)
-        for line in _marker(plan_dir).read_text(encoding="utf-8").splitlines()
+        for line in marker.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
     assert len(records) == 1
     assert "VP022_PROBE" in records[0]["command"], records
 
 
-def test_refusal_record_command_is_truncated(tmp_path):
+def test_refusal_record_command_is_truncated(tmp_path, monkeypatch):
     """记录里的命令行截断到 500 字符 —— 一条命令不能把证据文件撑爆。"""
+    import verification_write_guard
+
     env, plan_dir = _scoped_env(tmp_path)
     command = f"echo {'x' * 600} > {_REPO_FILE}"
-    code, stderr = _run_hook(command, env, cwd=_REPO_DIR)
-    assert code == 2, stderr
+
+    _assert_bash_allowed(command, env, plan_dir, cwd=_REPO_DIR)
+    assert not _marker(plan_dir).exists(), "Bash 分支不再写拒绝记录"
+
+    _arm_scope(monkeypatch, plan_dir)
+    marker = verification_write_guard.record_refusal(
+        "Bash", str(_REPO_DIR / _REPO_FILE), "outside_scope", command=command,
+    )
+    assert marker is not None
 
     records = [
         json.loads(line)
-        for line in _marker(plan_dir).read_text(encoding="utf-8").splitlines()
+        for line in marker.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
     assert len(records) == 1
@@ -688,12 +814,17 @@ def test_unclosed_heredoc_takes_the_rest_as_body():
 # 分发：这条分支怎么被选中
 # ---------------------------------------------------------------------------
 def test_payload_without_tool_name_is_still_a_bash_call(tmp_path):
-    """只有 ``tool_input.command``、没有 ``tool_name`` 的 payload → 仍然 exit 2。
+    """只有 ``tool_input.command``、没有 ``tool_name`` 的 payload → 走 Bash 分支。
 
-    有的调用方只给 ``{"tool_input": {"command": "..."}}``。按 ``tool_name``
-    判的话这种 payload 会被当成 Edit/Write 放过去 —— 那正是要堵的洞。
+    路由没变（``tool_input`` 里有没有 ``command`` 就够），变的是判定：2026-11-05
+    （任务 7）之后 Bash 分支恒放行，所以这类 payload 得到 exit 0，且不留拒绝
+    证据。
+
+    路由本身仍然可观察：给同一份 payload 再加一个指向被验证仓库的
+    ``file_path`` —— 落到 Edit/Write 分支它会被拒（exit 2），它放行 ⇒ 走的
+    确实是 Bash 分支。
     """
-    env, _plan = _scoped_env(tmp_path)
+    env, plan_dir = _scoped_env(tmp_path)
     payload = {
         "tool_input": {
             "command": "sed -i 's/a/b/' backend/app.py",
@@ -709,14 +840,45 @@ def test_payload_without_tool_name_is_still_a_bash_call(tmp_path):
         timeout=60,
     )
 
-    assert proc.returncode == 2, proc.stderr
+    assert proc.returncode == 0, proc.stderr
+    assert not _marker(plan_dir).exists(), "Bash 分支不再写拒绝记录"
+
+    # 路由的可观察证据：同一份 payload 再带一个 file_path。Edit/Write 分支会
+    # 拒它；它放行 ⇒ 这份 payload 走的是 Bash 分支。
+    with_path = {
+        "tool_input": dict(
+            payload["tool_input"],
+            file_path=str(_REPO_DIR / _REPO_FILE),
+        )
+    }
+    proc2 = subprocess.run(
+        [sys.executable, str(_HOOK_SCRIPT)],
+        input=json.dumps(with_path),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+
+    assert proc2.returncode == 0, proc2.stderr
 
 
 def test_mode_bash_selects_the_branch(tmp_path):
-    """``--mode bash`` 显式点名这条分支 → exit 2。"""
-    env, _plan = _scoped_env(tmp_path)
-    payload = {"tool_input": {"command": "echo x > a.py", "cwd": str(_REPO_DIR)}}
-    proc = subprocess.run(
+    """``--mode bash`` 显式点名这条分支 → 放行；``--mode edit`` → 被拒。
+
+    变的是**结论**（Bash 分支恒放行），没变的是**分支的选法**：``--mode``
+    仍然决定这份 payload 走哪条分支。带一个指向被验证仓库的 ``file_path``，
+    两条分支的结论就分开了 —— 放行说明走的是 Bash 分支。
+    """
+    env, plan_dir = _scoped_env(tmp_path)
+    payload = {
+        "tool_input": {
+            "command": "echo x > a.py",
+            "cwd": str(_REPO_DIR),
+            "file_path": str(_REPO_DIR / _REPO_FILE),
+        }
+    }
+    bash_proc = subprocess.run(
         [
             sys.executable,
             str(_HOOK_SCRIPT),
@@ -731,7 +893,25 @@ def test_mode_bash_selects_the_branch(tmp_path):
         timeout=60,
     )
 
-    assert proc.returncode == 2, proc.stderr
+    assert bash_proc.returncode == 0, bash_proc.stderr
+    assert not _marker(plan_dir).exists(), "Bash 分支不再写拒绝记录"
+
+    edit_proc = subprocess.run(
+        [
+            sys.executable,
+            str(_HOOK_SCRIPT),
+            "--mode",
+            "edit",
+            "--payload",
+            json.dumps(payload),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+
+    assert edit_proc.returncode == 2, edit_proc.stderr
 
 # ---------------------------------------------------------------------------
 # git 的 dry-run：只读，不产生写目标
@@ -862,11 +1042,14 @@ def test_git_dry_run_is_allowed_by_the_hook(tmp_path):
 
 
 def test_git_add_without_dry_run_is_still_refused_by_the_hook(tmp_path):
-    """负控（生产入口）：真的 ``git add -A`` → exit 2，仍然被拒。"""
-    env, _plan = _scoped_env(tmp_path)
-    code, stderr = _run_hook("git add -A", env, cwd=_REPO_DIR)
+    """负控（生产入口）：真的 ``git add -A`` → 放行，但落点仍被认出来。
 
-    assert code == 2, stderr
+    解析器的负控仍然成立：不带 dry-run 的 ``git add -A`` 仍然是写。
+    """
+    env, plan_dir = _scoped_env(tmp_path)
+    _assert_bash_allowed("git add -A", env, plan_dir, cwd=_REPO_DIR)
+
+    assert _targets("git add -A") == [str(_REPO_DIR)]
 
 
 def test_git_commit_dash_n_is_no_verify_and_still_writes():

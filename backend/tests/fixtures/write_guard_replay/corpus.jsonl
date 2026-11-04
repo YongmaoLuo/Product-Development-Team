@@ -1,0 +1,83 @@
+{"command": "echo \"=== A) git add -A --dry-run (index NOT modified) ===\"; git add -A --dry-run 2>&1 | head -n 40; echo \"add-n exit=${PIPESTATUS[0]}\"; echo; echo \"=== B) untracked files that WOULD be added (ls-files --others --exclude-standard) ===\"; git ls-files --others --exclude-standard; echo; echo \"=== C) are the 4 runtime files present & untracked here? ===\"; for f in PDT.md PDT.plan.md PDT.execution.md PDT.verification.md; do if [ -e \"$f\" ]; then echo \"$f EXISTS\"; else echo \"$f absent-in-worktree\"; fi; done", "expect": "no_write", "never_run": false, "source": "verification-log"}
+{"command": "VP=/tmp/pdt-artifacts\nmkdir -p \"$VP\"\nmv scheduler_view.png \"/tmp/pdt-artifacts/scheduler_view.png\"\necho \"=== git status after cleanup ===\"; git status --porcelain; echo \"(empty above = clean)\"\necho \"=== evidence copy ===\"; ls -la \"$VP/\"", "expect": "write", "never_run": false, "source": "verification-log"}
+{"command": "D=/tmp/pdt-artifacts; mkdir -p \"$D\"; cp \"$D/citations.json\" /tmp/vp017_probe/citations.prev-round.json 2>/dev/null && echo \"backed up prior round file to /tmp/vp017_probe/citations.prev-round.json ($(wc -c < /tmp/vp017_probe/citations.prev-round.json) bytes)\"; ls -la \"$D\"", "expect": "write", "never_run": false, "source": "verification-log"}
+{"command": "cd /tmp/vp-worktree && sed -i '' '1s|.*|/usr/bin/python3 -|' /tmp/vp034_audit/r103_cmd.sh && head -1 /tmp/vp034_audit/r103_cmd.sh && (sh /tmp/vp034_audit/r103_cmd.sh 2>&1 | tee /tmp/vp034_audit/r103_out.txt; echo \"EXIT=$?\")", "expect": "write", "never_run": false, "source": "verification-log"}
+{"command": "cd /tmp/vp-worktree\necho \"=== count of replaced deadline lines ===\"\ngit show 5da9aec6 -- backend/tests/unit/test_service_manager.py | grep -cE '^-[[:space:]]*ready_timeout_seconds=int\\(_readiness_budget_seconds'\ngit show 5da9aec6 -- backend/tests/unit/test_service_manager.py | grep -E '^-[[:space:]]*ready_timeout_seconds=int\\(_readiness_budget_seconds'\necho \"=== is 76b45ffe an ancestor of HEAD? ===\"\ngit merge-base --is-ancestor 76b45ffe HEAD", "expect": "no_write", "never_run": false, "source": "verification-log"}
+{"command": "cp -R tools/provider-resolver /tmp/vp011/mut_base 2>&1 && ls /tmp/vp011/mut_base/ && echo \"=== TOOL_DIR resolution ===\" && grep -n \"TOOL_DIR\" tools/provider-resolver/tests/test_delegate_wrapper.py | head -5", "expect": "write", "never_run": false, "source": "verification-log"}
+{"command": "python3 -c \"\nimport json\nd=json.load(open('tasks.json'))\nts=d if isinstance(d,list) else d.get('tasks',[])\nfor t in ts:\n    if t.get('id')=='1':\n        desc=t.get('description') or ''\n        i=desc.find('TDD')\n        print(desc[i-200:] if i>0 else desc[-2500:])\n\"", "expect": "no_write", "never_run": false, "source": "verification-log"}
+{"command": "cp /tmp/vp024_harness.log /tmp/vp024_harness.py /tmp/vp024_probe3.log /tmp/vp024_probe4.log /tmp/vp024_probe5.log /tmp/vp024_probe7.log /tmp/vp024_progress.log /tmp/pdt-artifacts/ 2>&1\ncp /tmp/vp024_probe6.py /tmp/vp024_probe7.py /tmp/pdt-artifacts/ 2>&1\nls -la /tmp/pdt-artifacts/ | head -20", "expect": "write", "never_run": false, "source": "verification-log"}
+{"command": "sed -i '' 's/vgw/vwg/g' /tmp/vp024_probe7.py && grep -n \"exec_module\" /tmp/vp024_probe7.py && timeout 240 backend/.venv/bin/python3 /tmp/vp024_probe7.py 2>&1 | tee /tmp/vp024_probe7.log", "expect": "write", "never_run": false, "source": "verification-log"}
+{"command": "D=/tmp/pdt-artifacts; mkdir -p \"$D\"; cp \"/tmp/pdt-artifacts/tool-results/mcp-puppeteer-blob-1793790084906-lo5uo4.png\" \"/tmp/pdt-artifacts/interview-view-after-click.png\" 2>&1; cp /tmp/vp009/standalone_result.json /tmp/vp009/probe2_result.json \"/tmp/pdt-artifacts/\" 2>&1; ls -la \"$D\"", "expect": "write", "never_run": false, "source": "verification-log"}
+{"command": "python3 - <<'PY'\nif a > 1:\n    pass\nPY\n", "expect": "no_write", "never_run": false, "source": "verification-log"}
+{"command": "echo x > a.py", "expect": "write", "never_run": false, "source": "redirect"}
+{"command": "echo x > /tmp/x", "expect": "write", "never_run": false, "source": "redirect"}
+{"command": "echo hi 2>/dev/null", "expect": "no_write", "never_run": false, "source": "redirect"}
+{"command": "echo x > out.txt", "expect": "write", "never_run": false, "source": "redirect"}
+{"command": "echo hi > real.txt", "expect": "write", "never_run": false, "source": "redirect"}
+{"command": "echo hi > real.txt \"没闭合", "expect": "write", "never_run": false, "source": "redirect"}
+{"command": "printf '%s' 'a>b' > out.txt", "expect": "write", "never_run": false, "source": "redirect"}
+{"command": "echo x >| server.py", "expect": "write", "never_run": false, "source": "redirect"}
+{"command": "echo x &>> server.py", "expect": "write", "never_run": false, "source": "redirect"}
+{"command": "echo x &>> /tmp/x.log", "expect": "write", "never_run": false, "source": "redirect"}
+{"command": "echo x >| /tmp/x.log", "expect": "write", "never_run": false, "source": "redirect"}
+{"command": "git checkout -- a.py", "expect": "write", "never_run": false, "source": "git"}
+{"command": "git add agent.py", "expect": "write", "never_run": false, "source": "git"}
+{"command": "git add -A", "expect": "write", "never_run": false, "source": "git"}
+{"command": "git commit -n -m 'x'", "expect": "write", "never_run": false, "source": "git"}
+{"command": "git checkout -n -b feature", "expect": "write", "never_run": false, "source": "git"}
+{"command": "git -C /repo checkout -- a.py", "expect": "write", "never_run": false, "source": "git"}
+{"command": "git -C /tmp/other-repo checkout -- a.py", "expect": "write", "never_run": false, "source": "git"}
+{"command": "git add -A --dry-run", "expect": "no_write", "never_run": false, "source": "git"}
+{"command": "git add -A -n", "expect": "no_write", "never_run": false, "source": "git"}
+{"command": "git -C /repo rm --dry-run x.py", "expect": "no_write", "never_run": false, "source": "git"}
+{"command": "git -C /repo add -n .", "expect": "no_write", "never_run": false, "source": "git"}
+{"command": "git commit --dry-run -m 'x'", "expect": "no_write", "never_run": false, "source": "git"}
+{"command": "git add -A --dry-run 2>&1 | head -n 40", "expect": "no_write", "never_run": false, "source": "git"}
+{"command": "sed -i 's/a/b/' agent.py", "expect": "write", "never_run": false, "source": "existing-test"}
+{"command": "sed -i '' 's/vgw/vwg/g' /tmp/vp024_probe7.py", "expect": "write", "never_run": false, "source": "existing-test"}
+{"command": "sed -i 's/vgw/vwg/g' /tmp/vp024_probe7.py", "expect": "write", "never_run": false, "source": "existing-test"}
+{"command": "sed -i.bak 's/vgw/vwg/g' /tmp/vp024_probe7.py", "expect": "write", "never_run": false, "source": "existing-test"}
+{"command": "sed 's/vgw/vwg/g' /tmp/vp024_probe7.py", "expect": "no_write", "never_run": false, "source": "existing-test"}
+{"command": "sed -n 1p /repo/b.py", "expect": "no_write", "never_run": false, "source": "existing-test"}
+{"command": "cat x | tee agent.py", "expect": "write", "never_run": false, "source": "existing-test"}
+{"command": "cp /tmp/x agent.py", "expect": "write", "never_run": false, "source": "existing-test"}
+{"command": "cp agent.py /tmp/x", "expect": "write", "never_run": false, "source": "existing-test"}
+{"command": "cp -n /tmp/a /repo/b.py", "expect": "write", "never_run": false, "source": "existing-test"}
+{"command": "mv agent.py /tmp/x", "expect": "write", "never_run": false, "source": "existing-test"}
+{"command": "cp /tmp/a.log /tmp/b.log > out.txt", "expect": "write", "never_run": false, "source": "existing-test"}
+{"command": "cp /tmp/a.log /tmp/b.log \"/tmp/vpw-dest\"/ 2>&1", "expect": "write", "never_run": false, "source": "existing-test"}
+{"command": "dd if=/dev/zero of=agent.py", "expect": "write", "never_run": false, "source": "existing-test"}
+{"command": "pytest -q tests/unit", "expect": "no_write", "never_run": false, "source": "existing-test"}
+{"command": "curl -s https://example.com/a?b=c", "expect": "no_write", "never_run": false, "source": "existing-test"}
+{"command": "python3 -c \"import os; open(os.environ['OUT'],'w')\"", "expect": "no_write", "never_run": false, "source": "existing-test"}
+{"command": "mkdir -p /tmp/vp022 && cat > /tmp/vp022/probe.py <<'PYEOF'\nrows = [1]\n# -> spec: something\n# <testsuites><testsuite name=\"x\">\nPYEOF\n", "expect": "write", "never_run": false, "source": "heredoc"}
+{"command": "echo VP022_PROBE > agent.py && mkdir -p /tmp/vp022 && cat > /tmp/vp022/probe.py <<'PYEOF'\nrows = [1]\n# -> spec: something\n# <testsuites><testsuite name=\"x\">\nPYEOF\n", "expect": "write", "never_run": false, "source": "heredoc"}
+{"command": "cat x | tee agent.py && mkdir -p /tmp/vp022 && cat > /tmp/vp022/probe.py <<'PYEOF'\nrows = [1]\n# -> spec: something\n# <testsuites><testsuite name=\"x\">\nPYEOF\n", "expect": "write", "never_run": false, "source": "heredoc"}
+{"command": "mkdir -p /tmp/vp022 && cat > /tmp/vp022/probe.py <<'PYEOF'\nrows = [1]\n# -> spec: something\n# <testsuites><testsuite name=\"x\">\nPYEOF\necho VP022_PROBE > agent.py\n", "expect": "write", "never_run": false, "source": "heredoc"}
+{"command": "cat > /tmp/x.py <<EOF\n# -> spec: done\nEOF\n", "expect": "write", "never_run": false, "source": "heredoc"}
+{"command": "cat > /tmp/x.py <<-'PYEOF'\n\t# -> spec: done\n\tPYEOF\n", "expect": "write", "never_run": false, "source": "heredoc"}
+{"command": "cat <<'A' <<'B' > /tmp/x.py\na > b\nA\nc < d\nB\n", "expect": "write", "never_run": false, "source": "heredoc"}
+{"command": "cat <<'EOF' > /repo/backend/server.py\nbody\nEOF\n", "expect": "write", "never_run": false, "source": "heredoc"}
+{"command": "cat > /tmp/x <<'EOF'\nif n > 3:\nEOF", "expect": "write", "never_run": false, "source": "heredoc"}
+{"command": "cat > /tmp/ok.txt <<'EOF'\nif n > 3:\n  x -> spec:\nEOF", "expect": "write", "never_run": false, "source": "heredoc"}
+{"command": "cat > /tmp/x <<'EOF'\nit's data\nEOF\necho hi > real.txt", "expect": "write", "never_run": false, "source": "heredoc"}
+{"command": "mkdir -p /tmp/vp055 && cat > /tmp/vp055/probe.py <<'PYEOF'\n# git add -A --dry-run\ngit add --dry-run\nPYEOF\n", "expect": "write", "never_run": false, "source": "heredoc"}
+{"command": "cat <<< \"hi\"\necho x > /repo/backend/server.py\n", "expect": "write", "never_run": false, "source": "existing-test"}
+{"command": "python3 -c \"\nimport sys\nif len(sys.argv) > 2:\n    print(sys.argv[0])\n\"", "expect": "no_write", "never_run": false, "source": "existing-test"}
+{"command": "python3 -c '\nimport sys\nif len(sys.argv) > 2:\n    print(len(sys.argv))\n'", "expect": "no_write", "never_run": false, "source": "existing-test"}
+{"command": "python3 -c \"\nx -> spec:\nif a -> b:\n    pass\n\"", "expect": "no_write", "never_run": false, "source": "existing-test"}
+{"command": "sed 's/vgw\n/vwg/g'", "expect": "no_write", "never_run": false, "source": "existing-test"}
+{"command": "python3 -c \"\nif n > 3:\n    pass\n\" > /tmp/vpw-real.txt", "expect": "write", "never_run": false, "source": "existing-test"}
+{"command": "python3 -c '\nprint(1)\n' > escaped.py", "expect": "write", "never_run": false, "source": "existing-test"}
+{"command": "python3 -c \"\nprint(1)\n\" > escaped.py", "expect": "write", "never_run": false, "source": "existing-test"}
+{"command": "python3 -c \"\nimport sys\nif len(sys.argv) > len(sys.argv):\n    pass\n\"", "expect": "no_write", "never_run": false, "source": "existing-test"}
+{"command": "python3 -c '\nif x > not:\n    pass\n'", "expect": "no_write", "never_run": false, "source": "existing-test"}
+{"command": "python3 - <<'PY'\nif a > len(b):\n    pass\nPY\n", "expect": "no_write", "never_run": false, "source": "existing-test"}
+{"command": "python3 - <<'PY'\nif a > single(b):\n    pass\nPY\n", "expect": "no_write", "never_run": false, "source": "existing-test"}
+{"command": "python3 - <<'PY'\nif a > index(b):\n    pass\nPY\n", "expect": "no_write", "never_run": false, "source": "existing-test"}
+{"command": "rm -rf /", "expect": "write", "never_run": true, "source": "disaster"}
+{"command": ":(){ :|:& };:", "expect": "no_write", "never_run": true, "source": "disaster"}
+{"command": "mkfs.ext4 /dev/sda1", "expect": "write", "never_run": true, "source": "disaster"}
+{"command": "dd if=/dev/zero of=/dev/sda", "expect": "write", "never_run": true, "source": "disaster"}
+{"command": "git push --force origin main", "expect": "write", "never_run": true, "source": "disaster"}
+{"command": "pkill -9 -1", "expect": "no_write", "never_run": true, "source": "disaster"}

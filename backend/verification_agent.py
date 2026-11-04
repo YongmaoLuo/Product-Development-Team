@@ -42,7 +42,25 @@ from coding_tool import (
 from config_paths import resolve_plans_dir, resolve_state_db_path
 import provider_capacity
 from verification_config import TimeoutPolicy
-from verification_executor import VerificationExecutor
+# 2026-11-05（缺陷 B 第 1、3、4 条的生成侧）：成本字段的取值从执行器那边借 ——
+# 生成侧补的 ``cost`` 必须与执行器认的 ``cost`` 是同一个词，否则"生成器说
+# none、执行器按 llm_quota 拦"这种事会以最难查的方式出现。
+from verification_executor import (
+    VerificationExecutor,
+    COST_FIELD,
+    COST_LLM_QUOTA,
+    COST_NONE,
+)
+# e2e 的两个子类与它们的字段名同样从执行侧借（``verification_ci_runner`` 是
+# 判定 e2e 能不能跑的那一层）。**同一份常量、不写第二遍**：字段名漂一次，
+# 生成器写的 ``e2e_kind`` 就再也认不出来。
+from verification_ci_runner import (
+    E2E_KIND_BROWSER,
+    E2E_KIND_COMMAND,
+    E2E_KIND_FIELD,
+    E2E_METHOD,
+    ENTRY_COMMAND_FIELD,
+)
 from verification_persistence import VerificationPersistenceManager
 from verification_profile import ExecutionProfileGenerator
 from verification_split import SplitDecision
@@ -55,6 +73,15 @@ from verification_subagent import (
     Verdict,
 )
 from verification_buckets import blocked_reason
+# 2026-11-05（改动面注入，缺陷 B 第 1 条后半）：生成器要判断"这次改动该生成
+# 哪类 E2E"，前提是它知道**这次改动碰了哪些文件**。这个事实只存在于 plan
+# 目录的 ``tasks.json``（``tasks[].files_to_modify``）里，由任务 8 的
+# ``change_surface`` 解析成结构化的改动面。
+#
+# 改动面是**辅助输入**，不是门禁：读不到 / 解析失败时是空改动面而不是错误
+# （``load_change_surface`` 自己吞掉这些情况），空改动面会让提示词逐字节
+# 回到改动面注入之前的样子。
+from change_surface import KIND_ORDER, ChangeSurface, load_change_surface
 from binary_freshness import (
     FreshnessReport,
     FreshnessCache,
@@ -133,6 +160,16 @@ from verification_evidence import (  # noqa: E402
 # monkeypatch 本模块上的名字（打在源模块上的桩打不中真正被调用的那一份）。
 from verification_quarantine import quarantine_and_restore  # noqa: E402
 from verification_write_guard import is_inside_tree, read_refusals  # noqa: E402
+
+# 2026-11-05（mutation 账本接入判定）：树护栏在 post 阶段**测量到**「被验证
+# 的树被动过」时，会先存证（patch）、再回滚、最后把这一轮发生过什么记进
+# 账本 ``<plan>/.pdt/vp_write_scope/mutations/round-<n>/<vp>.jsonl``。
+#
+# 判定层要读这份账本：VP 改过它自己验证的树，它交回的 PASSED 是在一棵
+# **它自己动过手脚**的树上给出的 —— 不可采信（arch 决策点 3，缺陷 A 第 3 条
+# 后半）。拒绝账本（``refusals``）管的是「被拦下的写」，这份管的是「已经
+# 发生过的改动」，两条证据各自改判自己的那部分。
+from verification_tree_guard import read_mutations  # noqa: E402
 
 # 2026-10-29（base drift 预检）：漂移检查走 ``base_drift`` **模块本身**
 # —— ``base_drift.check_and_merge_base(...)``，而不是 ``from base_drift
@@ -899,6 +936,381 @@ def _render_evidence_for_prompt(
     else:
         rendered = str(evidence or "")
     return _truncate_annotated(rendered, limit)
+
+
+# ---------------------------------------------------------------------------
+# 改动面 → 提示词（2026-11-05，缺陷 B 第 1 条后半）
+# ---------------------------------------------------------------------------
+
+#: 提示词里最多列出多少个改动文件。超过这个数量就只列前面这些，并写明还剩
+#: 多少 —— 全量列出来会让提示词本身变成噪声，而前 50 个文件已经足够让生成器
+#: 判断"这次改动属于哪一类"。
+_MAX_PROMPT_SURFACE_FILES = 50
+
+
+def _change_surface_kind_label(surface: Any) -> str:
+    """改动面的分类标签（逗号分隔，顺序固定）。
+
+    * 空分类集 → ``unknown``。"有改动但说不出是哪一类"必须看得见，不能留空
+      —— 留空会被读成"没有分类信息"，而实际是"分类信息缺失"。
+    * 已知分类按 ``KIND_ORDER``（frontend / framework / cli / backend / other）
+      排列：``kinds`` 是无序集合，顺序不定就会让同一份改动面每次生成出不同
+      的提示词。
+    * 不在枚举里的分类追加在后面（按字典序），以免被悄悄丢掉。
+    """
+    kinds = frozenset(getattr(surface, "kinds", ()) or ())
+    if not kinds:
+        return "unknown"
+    ordered = [kind for kind in KIND_ORDER if kind in kinds]
+    extra = sorted(kind for kind in kinds if kind not in KIND_ORDER)
+    return ", ".join(ordered + extra)
+
+
+def _render_change_surface(surface: Optional[ChangeSurface]) -> str:
+    """把改动面渲染成提示词里的 ``## 本次改动面`` 段。
+
+    这段是**纯输入注入**：它告诉生成器"这次改动碰了哪些文件、属于哪一类、
+    是否触及界面"，但**不规定** LLM 该产出什么形状的验证点 —— 那是
+    :func:`_render_output_constraints` 的事（输出约束段）。
+
+    空改动面（没有文件、没有分类、不触及界面）渲染成空字符串，调用方据此
+    整段略去，于是老提示词逐字节不变 —— 既有生成路径的提示词不会因为这次
+    改动而变形。
+    """
+    if surface is None:
+        return ""
+    files = tuple(getattr(surface, "files", ()) or ())
+    kinds = frozenset(getattr(surface, "kinds", ()) or ())
+    has_ui = bool(getattr(surface, "has_ui", False))
+    if not files and not kinds and not has_ui:
+        return ""
+
+    lines = ["## 本次改动面"]
+    listed = files[:_MAX_PROMPT_SURFACE_FILES]
+    for path in listed:
+        lines.append(f"- 文件：{path}")
+    if len(files) > len(listed):
+        lines.append(f"- (另有 {len(files) - len(listed)} 个)")
+    lines.append(f"- 分类：{_change_surface_kind_label(surface)}")
+    lines.append(f"- 触及界面：{'是' if has_ui else '否'}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# ``ui_validation`` 按改动面裁剪（缺陷 B 第 2 条）
+# ---------------------------------------------------------------------------
+
+#: 计划顶层记录"这一轮的 ``ui_validation`` 验证点被裁掉了"的字段名。
+UI_VALIDATION_SKIPPED_FIELD = "ui_validation_skipped"
+
+#: 裁剪原因 —— 改动面里没有界面资源。
+UI_VALIDATION_SKIP_REASON = "no_ui_surface"
+
+#: 被裁剪的验证方法。**方法本身不退役**（它仍在 ``SUPPORTED_METHODS`` 里），
+#: 只裁这一轮用不上的验证点。
+_UI_VALIDATION_METHOD = "ui_validation"
+
+
+def _render_ui_validation_skip_note(
+    files: Tuple[str, ...], dropped_ids: List[str],
+) -> str:
+    """人话版裁剪说明：为什么裁了、裁了哪几条、检查了哪些文件。
+
+    "被检查的文件"必须逐个列出来 —— 一句"检查了 1 个文件"没人能追。
+    """
+    return (
+        f"本次改动不触及界面资源（已检查 {len(files)} 个改动文件："
+        f"{'、'.join(files)}），因此裁掉了 {len(dropped_ids)} 条 "
+        f"ui_validation 验证点（{'、'.join(dropped_ids)}）。"
+        f"若本次改动其实触及界面，请检查任务声明的 files_to_modify "
+        f"是否完整。"
+    )
+
+
+def _apply_ui_validation_policy(
+    plan_data: Any, surface: Optional[ChangeSurface],
+) -> Any:
+    """按改动面裁掉本轮用不上的 ``ui_validation`` 验证点，并留下可读说明。
+
+    为什么要有这一步
+    ----------------
+    纯后端改动本来不该生成 ``ui_validation``：它要起浏览器、要占机器，
+    而这次改动连界面都没碰。任务 9 把改动面注进了提示词，但**提示词不是
+    门禁** —— 规划 LLM 仍然可能为一次纯后端改动生成 ``ui_validation``。
+    这条策略把那份过度产出**裁掉**，而不是让它在执行期白跑一轮。
+
+    为什么"裁掉"必须留痕
+    --------------------
+    静默删掉一条验证点，等于"这轮少验了一件事"却没人知道。所以裁剪的同一
+    份数据里写一条 ``ui_validation_skipped``：原因、被检查过的文件、被裁掉
+    的验证点 id、一句人话。它跟计划一起落盘（写盘写的是整个 plan dict），
+    操作者一眼能看到这一轮少了什么。
+
+    三条边界
+    --------
+    * **改动面触及界面** → 一条都不删，也不写说明（没有裁剪就没有说明）；
+    * **改动面未知**（读不到 ``tasks.json`` / 解析失败 / 全部任务用哨兵）
+      → 一条都不删。**"没看见界面文件"不等于"确定没有界面"**：按后者裁
+      会把 UI 验证静默关掉，而改动面本来就是辅助信息、不是门禁
+      （见 :mod:`change_surface` 的模块 docstring："改动面未知"时下游
+      按"无改动面"继续走）。空改动面的 ``has_ui`` 也是 ``False``，
+      所以这里看的是**文件列表**，不是 ``has_ui`` 本身。
+    * **只裁验证点，不动方法本身**：``ui_validation`` 仍是受支持的方法，
+      只是这一轮的改动面用不上它。
+
+    裁完如果 Phase 2 因此没有门禁，**这里不补验证点** —— 缺口交给既有的
+    completeness 检查（``find_missing_gates``）去报。补一条等于替生成器
+    猜一条"正确的"验证点，那是另一种越权。
+
+    Args:
+        plan_data: 计划 dict（就地裁剪并返回）。
+        surface: 本次改动面。``None`` 视为未知（不裁）。
+
+    Returns:
+        同一个 ``plan_data``（就地裁剪 + 写说明）。
+    """
+    if not isinstance(plan_data, dict):
+        return plan_data
+    points = plan_data.get("verification_points")
+    if not isinstance(points, list):
+        return plan_data
+
+    files = tuple(getattr(surface, "files", ()) or ()) if surface is not None else ()
+    if surface is not None and bool(getattr(surface, "has_ui", False)):
+        # 改动面触及界面：一条都不删。
+        return plan_data
+    if not files:
+        # 改动面未知：没看过任何文件，推不出"这次改动没有界面" → 不裁。
+        return plan_data
+
+    kept: List[Any] = []
+    dropped_ids: List[str] = []
+    for vp in points:
+        method = (
+            str(vp.get("verification_method") or "").strip()
+            if isinstance(vp, dict) else ""
+        )
+        if method == _UI_VALIDATION_METHOD:
+            dropped_ids.append(str(vp.get("id", "")))
+        else:
+            kept.append(vp)
+
+    if not dropped_ids:
+        # 没有裁到东西 → 不写说明（说明是"裁剪的记录"，不是"策略运行过"）。
+        return plan_data
+
+    plan_data["verification_points"] = kept
+    plan_data[UI_VALIDATION_SKIPPED_FIELD] = {
+        "reason": UI_VALIDATION_SKIP_REASON,
+        "method": _UI_VALIDATION_METHOD,
+        "files_checked": len(files),
+        "files": list(files),
+        "dropped": dropped_ids,
+        "detail": _render_ui_validation_skip_note(files, dropped_ids),
+    }
+    return plan_data
+
+
+# ---------------------------------------------------------------------------
+# 生成侧的输出约束 + 确定性归一化（2026-11-05，缺陷 B 第 1、3、4 条）
+# ---------------------------------------------------------------------------
+
+#: 提示词里"输出约束"段的标题。
+OUTPUT_CONSTRAINTS_HEADING = "## 输出约束"
+
+#: 标记"这条 e2e 两条腿都没有"的 VP 字段。
+#:
+#: 它**不是**"这条验证点作废"的意思 —— 这条 VP 原样保留（id 也不改），只是
+#: 明确告诉下游"它既没有浏览器入口、也没有命令入口，判定依据是空的"。
+INVALID_E2E_FIELD = "invalid_e2e"
+
+#: e2e 验证点声明浏览器入口的字段。
+TARGET_URL_FIELD = "target_url"
+
+
+def _render_output_constraints(surface: Optional[ChangeSurface]) -> str:
+    """把"计划必须长成什么样"渲染成提示词里的 ``## 输出约束`` 段。
+
+    为什么要有这一段
+    ----------------
+    执行器早就支持 command 类 e2e（``e2e_kind`` + ``entry_command``）与成本闸
+    （``cost``），但**能力存在 ≠ 能力被用上**：生成器不产出这些字段，那两套能力
+    在真实计划里永远不会被触发。所以提示词必须把字段约定讲清楚 —— 提示词不是
+    门禁（:func:`_apply_method_policy` 才是），但它是生成器唯一能看到"该长成
+    什么样"的地方。
+
+    随改动面变化的那一条
+    --------------------
+    * **改动面不触及界面** → 要求"至少一条 command 类 e2e 且 ``cost=none``"：
+      纯后端 / 本地 CLI 的改动没有界面可验，端到端要走**命令**那条腿（框架直接
+      执行、按退出码判定），而且它不该花 provider 配额。
+    * **改动面触及界面** → 要求"``ui_validation`` 必须带 ``target_url``"：
+      没有入口地址的界面验证点，框架连"去哪个页面"都不知道。
+
+    空改动面（改动面未知）按"不触及界面"处理 —— 那条要求说的是**计划的形状**
+    （至少有一条能跑的端到端验证），不是"这次改动没有界面"这个事实判断。
+    """
+    has_ui = (
+        bool(getattr(surface, "has_ui", False))
+        if surface is not None else False
+    )
+
+    lines = [
+        OUTPUT_CONSTRAINTS_HEADING,
+        "",
+        "验证点的字段写法必须严格按下面的约定 —— 字段缺失会被判为计划不合规：",
+        "",
+        f"- `verification_method` 为 `{E2E_METHOD}` 的验证点必须写 "
+        f"`{E2E_KIND_FIELD}`：",
+        f"  - `{E2E_KIND_BROWSER}`：要带 `{TARGET_URL_FIELD}`，"
+        "由子 agent 驱动真实浏览器；",
+        f"  - `{E2E_KIND_COMMAND}`：要带 `{ENTRY_COMMAND_FIELD}`"
+        "（一条在项目根目录下可直接执行的入口命令），"
+        "由框架直接执行、按退出码判定，不起 LLM 子会话。",
+        f"- 每条验证点都要写 `{COST_FIELD}`：`{COST_NONE}`"
+        "（执行这条验证点不花 provider 配额）或 "
+        f"`{COST_LLM_QUOTA}`"
+        "（被验证的产品会真去调 provider；这类验证点默认不执行）。",
+        "- `full_ci` 验证点的字段语义不变：仍是 `ci_entry` + "
+        "`ci_timeout_seconds`，判定依据是整仓入口的退出码。",
+    ]
+
+    if has_ui:
+        lines.append(
+            "- 本次改动触及界面资源：每条 `ui_validation` 验证点都必须带 "
+            "`target_url`（写成 `http://127.0.0.1:{{svc.<name>.port}}/<路径>` "
+            "这样的占位符形式）。"
+        )
+    else:
+        lines.append(
+            f"- 本次改动不触及界面资源：验证计划里必须**至少有一条 "
+            f"`{E2E_METHOD}` 验证点**，它的 `{E2E_KIND_FIELD}` 必须是 "
+            f"`{E2E_KIND_COMMAND}`、带一条 `{ENTRY_COMMAND_FIELD}`，"
+            f"`{COST_FIELD}` 必须是 `{COST_NONE}`。"
+        )
+
+    return "\n".join(lines)
+
+
+def _normalize_vp_cost(vp: Dict[str, Any]) -> None:
+    """成本声明归一化：缺省 → ``none``；显式声明的一律**原样保留**。
+
+    显式声明不许被改写，尤其是 ``llm_quota`` —— 擅自把它降级成 ``none`` 等于
+    悄悄放行一条要花钱的验证。执行器那边对看不懂的取值是保守处理的（按
+    ``llm_quota`` 算），生成侧不必也不该替它"猜"一个取值。
+    """
+    declared = vp.get(COST_FIELD)
+    if not isinstance(declared, str) or not declared.strip():
+        vp[COST_FIELD] = COST_NONE
+
+
+def _normalize_vp_e2e_kind(vp: Dict[str, Any]) -> bool:
+    """e2e 子类归一化。返回 ``True`` 表示这条 e2e **两条腿都没有**。
+
+    判定依据只有两条腿：**浏览器入口**（``target_url``）与**命令入口**
+    （``entry_command``）。
+
+    * 只有浏览器入口 → ``browser``；
+    * 只有命令入口 → ``command``；
+    * 两条都有 → **显式声明优先**（声明与证据自洽时框架才跑得起来；没声明就按
+      浏览器那条腿读）；
+    * 两条都没有 → **保留这条 VP**、标 ``invalid_e2e=True``、**不改写它的 id**，
+      也**不替它伪造**一条 ``entry_command`` —— 缺口交给完整性检查去报。
+    """
+    target_url = str(vp.get(TARGET_URL_FIELD) or "").strip()
+    entry_command = str(vp.get(ENTRY_COMMAND_FIELD) or "").strip()
+    declared = str(vp.get(E2E_KIND_FIELD) or "").strip().lower()
+
+    has_target = bool(target_url)
+    has_entry = bool(entry_command)
+
+    if has_target and not has_entry:
+        kind = E2E_KIND_BROWSER
+    elif has_entry and not has_target:
+        kind = E2E_KIND_COMMAND
+    elif has_target and has_entry:
+        kind = (
+            declared
+            if declared in (E2E_KIND_BROWSER, E2E_KIND_COMMAND)
+            else E2E_KIND_BROWSER
+        )
+    else:
+        vp[INVALID_E2E_FIELD] = True
+        return True
+
+    vp[E2E_KIND_FIELD] = kind
+    # 自己写的标记不留残骸：证据齐了就不该还挂着"invalid_e2e"。
+    vp.pop(INVALID_E2E_FIELD, None)
+    return False
+
+
+def _apply_method_policy(
+    plan_data: Any, surface: Optional[ChangeSurface],
+) -> Any:
+    """把生成结果里的验证方法字段归一化（e2e 子类 + 成本声明）。
+
+    为什么要有这一步
+    ----------------
+    提示词说了不等于生成器照做 —— 规划 LLM 仍可能产出"没有 ``e2e_kind`` 的
+    e2e"、"没写 ``cost``"的验证点。于是执行器那两套能力（command 类 e2e、
+    成本闸）在真实计划里**永远不被触发**：判定依据是空的，或者成本永远读成
+    缺省。这里做一次**确定性**归一化，让同一份生成结果每次落到同样的形状。
+
+    三条边界
+    --------
+    * **只补形状，不补内容**：没有 ``entry_command`` 就标 ``invalid_e2e`` 交给
+      完整性检查报缺口，**绝不伪造**一条入口命令（凭空造的命令等于替生成器
+      猜一条"正确的"入口，那是另一种越权）。
+    * **不改写 id**：验证点的身份不能因为归一化而变。
+    * **不动 ``full_ci``**：整仓门禁的字段语义一个字都不改（``ci_entry`` /
+      ``ci_timeout_seconds`` / 退出码契约），这里只**新增**成本字段。
+
+    幂等
+    ----
+    连续调用两次结果一致，不产生重复的验证点 —— 它是就地归一化，不增不减。
+
+    Args:
+        plan_data: 计划 dict（就地归一化并返回）。
+        surface: 本次改动面。**归一化规则本身不依赖它**（规则只看验证点自己
+            带着什么证据），它只进日志，让"这条 e2e 缺入口"这条告警能说清
+            是哪一次改动的问题。
+
+    Returns:
+        同一个 ``plan_data``（就地归一化）。
+    """
+    if not isinstance(plan_data, dict):
+        return plan_data
+    points = plan_data.get("verification_points")
+    if not isinstance(points, list):
+        return plan_data
+
+    invalid: List[str] = []
+    for vp in points:
+        if not isinstance(vp, dict):
+            continue
+        _normalize_vp_cost(vp)
+        method = str(vp.get("verification_method") or "").strip()
+        if method != E2E_METHOD:
+            continue
+        if _normalize_vp_e2e_kind(vp):
+            invalid.append(str(vp.get("id", "")))
+
+    if invalid:
+        logger.warning(
+            "[Verification] %d e2e verification point(s) have neither a "
+            "target_url nor an entry_command (%s) — marked %s; the "
+            "completeness check will report the gap. No entry command is "
+            "invented here. Change surface: %s",
+            len(invalid),
+            ", ".join(invalid),
+            INVALID_E2E_FIELD,
+            (
+                _change_surface_kind_label(surface)
+                if surface is not None else "unknown"
+            ),
+        )
+
+    return plan_data
 
 
 # ---------------------------------------------------------------------------
@@ -4069,8 +4481,18 @@ class Orchestrator:
         # Load documents
         documents = self._load_documents()
 
+        # 2026-11-05（改动面注入，缺陷 B 第 1 条后半）：生成器要判断"这次改动
+        # 该生成哪类 E2E"，前提是它知道**这次改动碰了哪些文件**。这个事实只
+        # 存在于 plan 目录的 ``tasks.json``（``tasks[].files_to_modify``），
+        # 由 ``load_change_surface`` 解析成结构化的改动面。
+        #
+        # 读不到 / 解析失败 → 空改动面（不是错误）：改动面是辅助输入，读不到
+        # 时提示词里**改动面那一段**整段略去（输出约束段仍在 —— 它讲的是
+        # "计划该长成什么样"，不是"这次改动长什么样"）。
+        surface = load_change_surface(self.plan_dir)
+
         # Generate plan using LLM
-        prompt = self._build_planning_prompt(documents)
+        prompt = self._build_planning_prompt(documents, surface=surface)
 
         # Plan generation reads full PRD/arch/test docs, so the LLM needs
         # headroom. 2026-09-15: do NOT pass ``timeout`` —
@@ -4288,6 +4710,42 @@ class Orchestrator:
                 else:
                     _best_plan = plan_data
 
+                # 2026-11-05（缺陷 B 第 2 条）：纯后端改动不该生成
+                # ``ui_validation`` —— 它要起浏览器、要占机器，而这次改动连
+                # 界面都没碰。任务 9 把改动面注进了提示词，但提示词不是门禁：
+                # 规划 LLM 仍然可能为纯后端改动生成它。这里按改动面把那份
+                # 过度产出裁掉。
+                #
+                # **裁掉必须留痕**：同一次写一条 ``ui_validation_skipped``
+                # （原因 + 被检查的文件 + 被裁掉的验证点 + 一句人话），随计划
+                # 落盘 —— 一份"全绿"的报告里不该藏着"这轮少验了一件事"。
+                #
+                # 放在重试回路**之后**、阶段完整性检查**之前**：裁完如果
+                # Phase 2 因此没了门禁，那是既有 completeness 检查该报的缺口，
+                # 这里不替生成器补验证点（补一条等于替它猜一条"正确的"）。
+                plan_data = _apply_ui_validation_policy(plan_data, surface)
+                _ui_skipped = plan_data.get(UI_VALIDATION_SKIPPED_FIELD)
+                if isinstance(_ui_skipped, dict):
+                    logger.warning(
+                        "[Verification] dropped %d ui_validation "
+                        "verification point(s) — this change touches no UI "
+                        "surface (%s); recorded in the plan as %s: %s",
+                        len(_ui_skipped.get("dropped", [])),
+                        UI_VALIDATION_SKIP_REASON,
+                        UI_VALIDATION_SKIPPED_FIELD,
+                        _ui_skipped.get("detail", ""),
+                    )
+
+                # 2026-11-05（缺陷 B 第 1、3、4 条的生成侧）：提示词说了不等于
+                # 生成器照做 —— 规划 LLM 仍可能产出"没有 ``e2e_kind`` 的 e2e"、
+                # "没写 ``cost``"的验证点。那样的话，执行器那两套能力（command
+                # 类 e2e、成本闸）在真实计划里**永远不被触发**：判定依据是空的，
+                # 成本永远读成缺省。这里做一次确定性归一化。
+                #
+                # **顺序**：先裁 ``ui_validation``、再归一化 —— 被裁掉的那条
+                # 验证点不该再进归一化。
+                plan_data = _apply_method_policy(plan_data, surface)
+
                 # Enrich each VP with execution metadata (timeout_seconds
                 # + execution_group) so the orchestrator and the bridge
                 # UI can render a per-VP execution budget without
@@ -4460,6 +4918,22 @@ class Orchestrator:
             f"{len(points)} VPs from {path.name} — no Phase-1 LLM call"
         )
         return plan
+
+    #: 按改动面裁掉用不上的 ``ui_validation`` 验证点（缺陷 B 第 2 条）。
+    #:
+    #: 实现是模块级的纯函数（不碰 agent 的任何状态），这里挂一个
+    #: ``staticmethod`` 别名，让 ``verification_agent.
+    #: _apply_ui_validation_policy(plan, surface)`` 与
+    #: ``agent._apply_ui_validation_policy(plan, surface)`` 两种写法都成立 ——
+    #: 调用点与测试用哪种都不该成为"这个功能能不能用"的前提。
+    _apply_ui_validation_policy = staticmethod(_apply_ui_validation_policy)
+
+    #: 按改动面把验证方法字段归一化（缺陷 B 第 1、3、4 条的生成侧）。
+    #:
+    #: 与 :func:`_apply_ui_validation_policy` 同一个理由挂成 ``staticmethod``
+    #: 别名：两种写法都成立，调用点与测试用哪种都不该成为"这个功能能不能用"
+    #: 的前提。
+    _apply_method_policy = staticmethod(_apply_method_policy)
 
     def _enrich_vps_with_execution_metadata(self, plan_data: dict) -> dict:
         """Annotate each verification point with ``timeout_seconds`` and ``execution_group``.
@@ -4689,8 +5163,18 @@ class Orchestrator:
             })
         return findings
 
-    def _build_planning_prompt(self, documents: Dict[str, str]) -> str:
-        """Build prompt for verification plan generation."""
+    def _build_planning_prompt(
+        self,
+        documents: Dict[str, str],
+        surface: Optional[ChangeSurface] = None,
+    ) -> str:
+        """Build prompt for verification plan generation.
+
+        Args:
+            documents: PRD / 架构 / 测试文档。
+            surface: 本次改动面（文件清单 + 分类 + 是否触及界面）。**可选** ——
+                空改动面（或 ``None``）时整段略去，老提示词逐字节不变。
+        """
         parts = []
 
         if "prd" in documents:
@@ -4702,8 +5186,23 @@ class Orchestrator:
         if "test" in documents:
             parts.append(f"## 测试设计文档\n\n{documents['test']}")
 
+        # 2026-11-05（改动面注入）：改动面是生成器判断"用什么方式验"的唯一
+        # 依据 —— 它不进提示词，生成器就仍然只看 PRD / 架构 / 测试文档。
+        surface_block = _render_change_surface(surface)
+        if surface_block:
+            parts.append(surface_block)
+
         if not parts:
             return "请基于当前项目生成基础验证计划。"
+
+        # 2026-11-05（缺陷 B 第 1、3、4 条的生成侧）：输出约束段讲的是"计划该
+        # 长成什么样" —— ``e2e_kind`` / ``entry_command`` / ``cost`` 这些字段
+        # 不讲清楚，执行器那两套能力（command 类 e2e、成本闸）在真实计划里就
+        # 永远不会被触发。
+        #
+        # 放在"没有文档"那条兜底**之后**：没有任何输入时提示词是那句固定的
+        # "生成基础验证计划"，那一行一个字都不许动。
+        parts.append(_render_output_constraints(surface))
 
         return "\n\n".join(parts)
 
@@ -9470,6 +9969,13 @@ class Orchestrator:
         # verifier_mutated_tree）。
         verdict = self._apply_refusal_evidence(verdict, vp_id)
 
+        # 2026-11-05（mutation 账本接入判定）：上面那条管的是「被护栏**拒绝**
+        # 的写」；这一条管的是「**已经发生**的改动」—— 树护栏在 post 阶段
+        # 量到树被动过，存证、回滚、记了一笔账，而那条 PASSED 是在一棵被它
+        # 自己动过手脚的树上给出的。所以照样改判（arch 决策点 3，缺陷 A 第 3
+        # 条后半）。
+        verdict = self._apply_mutation_evidence(verdict, vp_id)
+
         # 2026-11-03（arch 决策点 2）：记下这次尝试真正用的 provider。
         # 父进程里**只有这一处**拿得到它 —— verdict 是子代理交回来的，
         # provider 是它跑的时候挑的。账本要记它（下一轮据此换家），排除集
@@ -9656,6 +10162,155 @@ class Orchestrator:
             # the anchor a human reads before acting on the claim.
             evidence_quote=reasons[0],
         )
+
+    def _apply_mutation_evidence(self, verdict: Verdict, vp_id: str) -> Verdict:
+        """A VP that mutated the tree it verified gets no PASSED.
+
+        2026-11-05（mutation 账本接入判定）：写护栏拒绝的写由
+        :meth:`_apply_refusal_evidence` 改判；这一条管的是**没被拒绝、但
+        被测量到**的改动 —— 树护栏（``backend/verification_tree_guard.py``）
+        在 post 阶段比对了快照与现状，量到被验证的树被动过，于是
+
+          1. **存证** —— 把 diff 写成 patch（回滚之后就重建不出来了）；
+          2. **回滚** —— 把树复原；
+          3. **记账** —— 把这一轮发生过什么写进
+             ``<plan>/.pdt/vp_write_scope/mutations/round-<n>/<vp>.jsonl``。
+
+        子 agent 读不到这份账本（它只看到一棵**已经复原**的树），所以它
+        照样交回一个 PASSED —— 而那条 PASSED 是在一棵**它自己动过手脚**
+        的树上给出的：结论的依据已经不可采信（arch 决策点 3，缺陷 A 第 3
+        条后半）。所以有 mutation 记录的 VP 一律改判 FAILED。
+
+        改判后的失败分类是 ``infra``：出问题的不是交付物，是这次尝试本身
+        出了 malfunction。来源是 ``deterministic``：这个分类是**按规则推
+        出来的**，不是模型说的。
+
+        只读**本 VP、本轮**的记录 —— 别的 VP 改过树不该算在这个 VP 头上，
+        别的轮次的记录也不该算进这一轮。provider / chosen_model /
+        model_complexity 沿用原 verdict：路由是这次尝试的事实，改判结论
+        不改变它。
+
+        账本读不出来 → 原样返回 verdict。账本坏了，不等于这个 VP 越权了；
+        拿一个读不出来的账本去否证一个 VP，比放过它更坏。
+
+        事件 ``verifier_mutated_tree`` **一条账本记录一条**：事件里的字段
+        就是账本那一行的原文，运营拿事件就能对上账本。
+
+        Args:
+            verdict: The verdict the sub-agent handed back.
+            vp_id: The VP the verdict belongs to.
+
+        Returns:
+            The rewritten verdict, or the original one when there is no
+            mutation evidence for this VP in this round.
+        """
+        plan_dir = getattr(self, "plan_dir", None)
+        if not plan_dir:
+            return verdict
+
+        round_no = getattr(self, "_current_round", 0) or 0
+
+        try:
+            mutations = read_mutations(plan_dir, round_no, vp_id)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "[verification_tree_guard] could not read %s's mutations", vp_id,
+            )
+            return verdict
+
+        records = [m for m in mutations if isinstance(m, dict)]
+        if not records:
+            # No mutation evidence → the sub-agent's verdict stands.
+            return verdict
+
+        changed: List[str] = []
+        for record in records:
+            for bucket in ("created", "modified", "deleted"):
+                for path in self._mutation_paths(record, bucket):
+                    if path not in changed:
+                        changed.append(path)
+
+        reasons = [f"verifier_mutated_tree: 改动 {path}" for path in changed]
+        if not reasons:
+            # 账本里有一条记录，却没记下改了哪个文件 —— 照样不可采信：
+            # 连改了什么都不记得的 VP，更没有理由拿 PASSED。
+            reasons.append("verifier_mutated_tree: 改动被验证树（路径未记录）")
+
+        # 拒绝证据的改判已经在上面发生过了 —— 那是另一条证据、另一个原因，
+        # 不许在这里被抹掉。
+        reasons.extend(
+            reason for reason in verdict.reasons
+            if str(reason).startswith("verifier_mutated_tree:")
+        )
+
+        evidence: List[str] = list(verdict.evidence)
+        for record in records:
+            tool_use_id = str(record.get("tool_use_id") or "unknown")
+            command = str(record.get("command") or "")
+            for bucket in ("created", "modified", "deleted"):
+                for path in self._mutation_paths(record, bucket):
+                    evidence.append(f"{tool_use_id} → {path}（{command}）")
+
+        for record in records:
+            event: Dict[str, Any] = {
+                "vp_id": vp_id,
+                "round": round_no,
+                "created": self._mutation_paths(record, "created"),
+                "modified": self._mutation_paths(record, "modified"),
+                "deleted": self._mutation_paths(record, "deleted"),
+                "patch": record.get("patch"),
+                "command": str(record.get("command") or ""),
+                "tool_use_id": str(record.get("tool_use_id") or ""),
+                # How many mutations this VP made in this round — a path
+                # touched twice is one path but two attempts, and the
+                # operator wants both numbers.
+                "count": len(records),
+            }
+            try:
+                self._safe_log_freshness_event(
+                    vp_id, "verifier_mutated_tree", event,
+                )
+            except Exception:  # pragma: no cover - defensive
+                # The verdict is already rewritten; losing the event is
+                # bad, losing the round over it is worse.
+                logger.exception(
+                    "[verification_tree_guard] could not record the mutation event",
+                )
+
+        return Verdict(
+            verdict="FAILED",
+            reasons=reasons,
+            evidence=evidence,
+            provider=verdict.provider,
+            chosen_model=verdict.chosen_model,
+            model_complexity=verdict.model_complexity,
+            failure_class=INFRA_FAILURE_CLASS,
+            failure_class_source=DETERMINISTIC_FAILURE_CLASS_SOURCE,
+            # The quote has to appear verbatim in the reason text — it is
+            # the anchor a human reads before acting on the claim.
+            evidence_quote=reasons[0],
+        )
+
+    @staticmethod
+    def _mutation_paths(record: Dict[str, Any], bucket: str) -> List[str]:
+        """The paths one bucket of a mutation record carries.
+
+        The ledger is written by another module, so its shape is not this
+        module's to assume: a bucket that is missing, ``None`` or not a
+        list of strings contributes nothing rather than blowing up the
+        round.
+        """
+        raw = record.get(bucket)
+        if not isinstance(raw, (list, tuple)):
+            return []
+        paths: List[str] = []
+        for item in raw:
+            if not isinstance(item, str):
+                continue
+            text = item.strip()
+            if text and text not in paths:
+                paths.append(text)
+        return paths
 
     @staticmethod
     def _verdict_to_result(vp_id: str, verdict: Verdict) -> dict:

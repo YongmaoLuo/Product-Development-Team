@@ -29,6 +29,20 @@
 3. ``test_genuine_in_tree_write_still_flips`` —— 真写树内文件 → 仍然 FAILED
    （护栏没有被削弱）。
 
+Bash 分支现在不判定（2026-11-05）
+--------------------------------
+护栏的 Bash 分支**恒放行**：它不再解析命令，也不再产生任何新的拒绝记录（缺陷
+A 第 4 条 —— 解析器猜写目标会持续产生假阳性，把没动过被验证仓库的 VP 改判成
+FAILED）。"改过树"这件事改由**测量**回答：PreToolUse 拍快照、PostToolUse 比对，
+测出改动就存证、回滚、记账（``verification_tree_guard.py``）。
+
+于是本文件剩下的钉法是：
+
+* Bash 分支一条新的拒绝记录都不写（历史形状一个都不再复现，树内写命令也
+  不再被拒）；
+* round-1 留下的**历史**记录仍然读得出来、仍然入账 —— 它们是证据，不是判定；
+* Edit/Write 越界仍然被拒、仍然改判（判定没有被整体放宽）。
+
 夹具仓库建在哪里
 ----------------
 ``_real_home() / f"pdt-heredoc-{uuid4().hex}"`` —— **不能**用 pytest 的
@@ -277,7 +291,9 @@ def test_heredoc_vp_no_longer_writes_a_refusal(
 
     command = VP_016_COMMAND
 
-    # the write target the old parser used to derive out of the body
+    # the parser is still a pure function, and still gets heredoc bodies
+    # right — but it is no longer on any decision path, so this is a check
+    # of the function itself, not of the guard's verdict
     targets = verification_write_guard.bash_write_targets(
         command, str(repo_under_verification),
     )
@@ -285,7 +301,7 @@ def test_heredoc_vp_no_longer_writes_a_refusal(
         f"heredoc 正文不是重定向，却算出了写目标 {targets}"
     )
 
-    # and the call itself is allowed
+    # and the call itself is allowed — the Bash branch no longer judges
     rc = verification_write_guard.check_bash_payload(
         _bash_payload(command, repo_under_verification),
     )
@@ -320,17 +336,23 @@ def test_out_of_scope_write_does_not_flip_the_verdict(
     其中没有一条落在被验证树里 —— 两条 Bash 指向 round-1 那个 checkout，
     Write 指向家目录下的 memory 目录 —— 所以它们改不了 verdict，只留下
     ``verifier_refused_outside_scope`` 这条事件。
+
+    注意那两条 Bash 记录是**重放**出来的历史证据：Bash 分支现在一条新记录都
+    不写（下面第一步就钉了这件事），历史记录仍然读得出来、仍然入账。
     """
     _arm(monkeypatch, plan_dir, VP_024, repo_under_verification)
     worktree = _round1_worktree()
 
-    # 1. the two heredoc commands no longer produce anything at all
-    for command in VP_024_COMMANDS:
+    # 1. the Bash branch produces no refusal record at all — not for the
+    #    historical heredoc shapes, and not for a command that writes into
+    #    the tree either.  The branch no longer judges; measurement does.
+    tree_write = f"echo x >> {repo_under_verification / 'backend' / 'app.py'}"
+    for command in VP_024_COMMANDS + (tree_write,):
         assert verification_write_guard.check_bash_payload(
             _bash_payload(command, repo_under_verification),
-        ) == 0, "heredoc 正文不该触发拒绝"
+        ) == 0, "Bash 分支不再判定 —— 树内写命令必须放行"
     assert not _marker(plan_dir, VP_024).exists(), (
-        "heredoc 正文不该留下拒绝证据 —— 那两条 Bash 记录是旧解析器的产物"
+        "Bash 分支不再产生拒绝证据 —— 那两条 Bash 记录是旧解析器的产物"
     )
 
     # 2. replay the two historical Bash records, in the order round-1 wrote them
@@ -401,6 +423,10 @@ def test_genuine_in_tree_write_still_flips(
 
     这是负控：证明前两条不是把护栏整体放宽了。写进被验证树的写仍然被拒，
     证据仍然改判（``verifier_mutated_tree`` / ``infra`` / ``deterministic``）。
+
+    负控盯的是 **Edit/Write** 分支：Bash 分支是**故意**放开的（树里真的被改
+    过，由测量链路的存证/回滚/记账回答），所以"真写树内文件仍被拒"这条断言
+    说的是另一条路 —— 它证明护栏没有整体失效。
     """
     _arm(monkeypatch, plan_dir, VP_055, repo_under_verification)
     target = repo_under_verification / "backend" / "app.py"

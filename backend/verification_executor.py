@@ -41,6 +41,15 @@ What is implemented in this skeleton
   (read-only).
 * ``_save_state`` — atomic write to ``plan_dir / state_file``.
 
+Cost gate
+---------
+* ``_cost_gate_verdict`` — a verification point that declares
+  ``cost="llm_quota"`` is **not executed** by default: it produces a
+  ``DEFERRED`` verdict instead (never a ``FAILED`` one — "we didn't spend
+  anything" and "it crashed" must stay distinguishable).  The operator's
+  switch ``PDT_VERIFY_ALLOW_LLM_QUOTA=1`` lets it through.  See the
+  cost-gate note next to :data:`COST_FIELD`.
+
 What is NOT implemented in this skeleton
 ----------------------------------------
 * ``run()`` main loop (will be added in a follow-up subtask). The
@@ -135,6 +144,114 @@ ALLOWED_STATUSES = ("PASSED", "FAILED", "SKIPPED", "BLOCKED", "DEFERRED")
 #: Required keys for a valid verdict payload. The contract is
 #: position-free: any extra keys are ignored.
 REQUIRED_VERDICT_KEYS = ("status", "reasons", "evidence")
+
+
+# Cost gate (2026-11-04, defect B item 4) ---------------------------------
+#
+# Some verification points make the **product under test** really call a
+# provider — that costs real money. The plan used to have no way of saying
+# so: "run a verification point that spends quota" and "run one that
+# doesn't" look identical on the plan, so the only place that could tell
+# them apart was the bill after the fact.
+#
+# A verification point now declares its own cost:
+#
+#   * missing / ``"none"`` → runs as usual;
+#   * ``"llm_quota"``      → skipped by default, recorded as ``DEFERRED``;
+#   * anything else        → handled as ``"llm_quota"`` (conservative: a
+#                            cost declaration nobody can read must never be
+#                            mistaken for "free").
+#
+# ``PDT_VERIFY_ALLOW_LLM_QUOTA=1`` (or ``true`` / ``yes``) lets it through:
+# that is the operator explicitly saying "this round may spend".
+#
+# Why ``DEFERRED`` and not ``FAILED`` / ``SKIPPED``:
+#
+#   * ``FAILED`` means "ran and failed" — it manufactures a repair task for
+#     a verification point that never ran;
+#   * ``SKIPPED`` is a terminal success (it joins ``completed_set``), so
+#     the verification point would never run again — but the cost gate
+#     means "not *this* round";
+#   * ``DEFERRED`` means "not run this round": it enters no terminal
+#     bucket, no ``FAILED`` is written, and the ``failure_class`` value
+#     domain is untouched.
+
+#: The verification-point field that declares what executing it costs.
+COST_FIELD = "cost"
+
+#: Cost value: executing this verification point costs nothing.
+COST_NONE = "none"
+
+#: Cost value: executing this verification point makes the product under
+#: test really call a provider (real quota is burned).
+COST_LLM_QUOTA = "llm_quota"
+
+#: The environment variable that lets ``llm_quota`` verification points run.
+ALLOW_LLM_QUOTA_ENV = "PDT_VERIFY_ALLOW_LLM_QUOTA"
+
+#: The values of :data:`ALLOW_LLM_QUOTA_ENV` that mean "yes"
+#: (compared case-insensitively, after stripping whitespace).
+_ALLOW_LLM_QUOTA_TRUTHY = frozenset({"1", "true", "yes"})
+
+#: The reason written into the ``DEFERRED`` verdict. Byte-for-byte fixed:
+#: the report renders it verbatim in its "skipped due to cost" section, so
+#: a reworded reason would silently move that section's rows.
+_COST_DEFERRED_REASON = (
+    f"cost: {COST_LLM_QUOTA} —— 默认跳过"
+    f"（{ALLOW_LLM_QUOTA_ENV}=1 可执行）"
+)
+
+
+def _llm_quota_allowed() -> bool:
+    """Whether the operator has explicitly allowed spending quota.
+
+    Read from the environment **per call** (not at import time) so that
+    a process which starts with the switch off and turns it on later —
+    and a test that flips it — both see the current value.
+    """
+    raw = os.environ.get(ALLOW_LLM_QUOTA_ENV, "")
+    return str(raw).strip().lower() in _ALLOW_LLM_QUOTA_TRUTHY
+
+
+def _cost_gate_verdict(vp: Any) -> Optional[Dict[str, Any]]:
+    """The ``DEFERRED`` verdict this VP's cost declaration earns.
+
+    :param vp: The verification point (executor-schema or LLM-schema —
+        only the ``cost`` field is read).
+    :return: The ``DEFERRED`` verdict when the cost gate blocks this VP,
+        ``None`` when it may run.
+
+    Blocking rules (see the cost-gate note above):
+
+      * ``cost`` missing / empty / ``"none"`` → ``None`` (runs as usual);
+      * ``cost == "llm_quota"`` → blocked unless the operator's switch is
+        on;
+      * any other value → blocked like ``"llm_quota"`` (conservative).
+
+    The unknown-value branch is logged: a cost declaration nobody can
+    read is worth a warning, but it is not worth failing the round over.
+    """
+    if not isinstance(vp, Mapping):
+        return None
+    raw = vp.get(COST_FIELD)
+    if raw is None:
+        return None
+    declared = str(raw).strip()
+    if not declared or declared.lower() == COST_NONE:
+        return None
+    if declared.lower() != COST_LLM_QUOTA:
+        logger.warning(
+            "unknown VP cost %r — handled as %s (conservative)",
+            declared,
+            COST_LLM_QUOTA,
+        )
+    if _llm_quota_allowed():
+        return None
+    return {
+        "status": "DEFERRED",
+        "reasons": [_COST_DEFERRED_REASON],
+        "evidence": {"cost": COST_LLM_QUOTA, "gate": COST_LLM_QUOTA},
+    }
 
 
 # Definition fingerprint -----------------------------------------------------
@@ -554,6 +671,14 @@ class VerificationExecutor(BaseExecutor):
         # return so the same wrapper works for tests that pass a
         # plain function as the runner.
         async def _item_runner(vp: Dict[str, Any]) -> Dict[str, Any]:
+            # 2026-11-04（缺陷 B 第 4 条）：成本闸也必须守在这条**实际分派
+            # 路径**上。``_run_single_vp`` 是单个验证点的入口，而
+            # ``BaseExecutor.run`` 驱动的是这个闭包 —— 闸只落在前者上的
+            # 话，一份声明了 ``cost=llm_quota`` 的计划在真跑一轮时照样会
+            # 去调 provider。
+            cost_verdict = _cost_gate_verdict(vp)
+            if cost_verdict is not None:
+                return cost_verdict
             result = sub_agent_runner(vp)
             if inspect.isawaitable(result):
                 result = await result
@@ -912,6 +1037,14 @@ class VerificationExecutor(BaseExecutor):
                 ],
                 "evidence": {},
             }
+
+        # 2026-11-04（缺陷 B 第 4 条）：成本闸 —— 判定点在「取消检查之后、
+        # 调用 runner 之前」。被闸拦下的验证点**不执行**，产出的是一条
+        # DEFERRED 裁决（不是 FAILED：「没花钱」与「跑挂了」必须一眼可分，
+        # 而 FAILED 会凭空制造一个修复任务）。
+        cost_verdict = _cost_gate_verdict(vp)
+        if cost_verdict is not None:
+            return cost_verdict
 
         try:
             result = self.sub_agent_runner(vp)

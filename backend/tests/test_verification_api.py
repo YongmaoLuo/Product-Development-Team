@@ -1846,11 +1846,14 @@ class TestEndpointContractRegression:
             assert isinstance(vp["execution_group"], int)
 
         # --- Per-method timeout is resolved correctly ---
-        # 2026-09-08: raised from 120 → 3600 to match the 1-hour outer cap
+        # 2026-09-08: raised from 120 → 3600 to match the 1-hour outer cap.
+        # 2026-11-05 (task 14): the wall-clock budget is given per method —
+        # ui_validation runs on 900 (with a 300s no-progress heartbeat), the
+        # other methods keep the flat hour.
         by_id = {vp["id"]: vp for vp in saved_points}
         assert by_id["VP-001"]["timeout_seconds"] == 3600
         assert by_id["VP-003"]["timeout_seconds"] == 3600
-        assert by_id["VP-002"]["timeout_seconds"] == 3600
+        assert by_id["VP-002"]["timeout_seconds"] == 900
 
         # --- Grouping invariants ---
         # automated_test VPs share the same group; ui_validation is

@@ -11,8 +11,9 @@
 --------------
   1. builder 带 ``plan_dir`` 时，写出来的 settings.json 的 ``env`` 里声明了
      可写范围（plan 目录 + 轮次 + VP 号）；
-  2. ``_HOOK_RULES`` 里多出第 10、11 条：``verifier_write_scope_block``
-     （Edit|Write）与 ``verifier_bash_write_block``（Bash）；
+  2. ``_HOOK_RULES`` 里多出第 10 条：``verifier_write_scope_block``
+     （Edit|Write）——第 11 条 ``verifier_bash_write_block``（Bash）已于
+     2026-11-05 摘除：Bash 分支不再判定（恒放行），改动改由树快照事后测量；
   3. 从这份 settings.json 里读出来的钩子命令，跑起来真的能挡住"写被验证
      仓库"（exit 2）；
   4. 不带 ``plan_dir`` 时不写 scope env —— 旧调用方（执行子 agent、refiner、
@@ -60,7 +61,8 @@ _REPO_FILE = _BACKEND_DIR / "agent.py"
 #: 第 10 条钩子的名字（Edit|Write）。
 EDIT_GUARD_NAME = "verifier_write_scope_block"
 
-#: 第 11 条钩子的名字（Bash）。
+#: 已摘除的第 11 条钩子的名字（Bash 写范围）。2026-11-05 起它不再登记在册 ——
+#: Bash 分支恒放行（判定改成事后测量），留着只会白起一个 Python 进程。
 BASH_GUARD_NAME = "verifier_bash_write_block"
 
 #: scope env 的四个键。前两个由护栏脚本消费，后两个是给人看的落点说明。
@@ -191,26 +193,23 @@ def test_build_without_plan_dir_hook_allows_project_write():
 
 
 # ---------------------------------------------------------------------------
-# 钩子登记 —— 第 10、11 条
+# 钩子登记 —— 第 10 条（Edit|Write 写范围）
 # ---------------------------------------------------------------------------
 
 
-def test_build_registers_two_guard_rules():
-    """两条护栏钩子都登记在册，matcher 各自钉死。"""
+def test_build_registers_the_edit_guard_rule_only():
+    """写范围钩子只剩 Edit|Write 一条；Bash 那条已摘除（任务 17）。"""
     names = [rule["name"] for rule in _HOOK_RULES]
 
     assert EDIT_GUARD_NAME in names, names
-    assert BASH_GUARD_NAME in names, names
+    assert BASH_GUARD_NAME not in names, names
 
     edit_rule = next(r for r in _HOOK_RULES if r["name"] == EDIT_GUARD_NAME)
     assert edit_rule["matcher"] == "Edit|Write"
 
-    bash_rule = next(r for r in _HOOK_RULES if r["name"] == BASH_GUARD_NAME)
-    assert bash_rule["matcher"] == "Bash"
-
 
 def test_hook_rules_count_is_11():
-    """9 → 11：既有 9 条不动，多出来的正好是这两条。"""
+    """12 → 11：摘掉的是那条已无判定的 Bash 写范围钩子，其余一条不少。"""
     assert len(_HOOK_RULES) == 11, [r["name"] for r in _HOOK_RULES]
 
 
@@ -228,18 +227,14 @@ def test_guard_command_is_the_quoted_interpreter_and_script():
     assert Path(parts[1]).is_absolute()
 
 
-def test_built_settings_carry_the_two_guard_rules():
-    """两条护栏都进了生产写出来的那份 settings.json。"""
+def test_built_settings_carry_the_edit_guard_rule():
+    """写范围护栏进了生产写出来的那份 settings.json（Edit|Write 一侧）。"""
     data = _build()
 
     edit_commands = _hook_commands(data, "Edit|Write")
-    bash_commands = _hook_commands(data, "Bash")
 
     assert any("verification_write_guard.py" in c for c in edit_commands), (
         "Edit|Write 钩子里没有接上写入护栏脚本"
-    )
-    assert any("verification_write_guard.py" in c for c in bash_commands), (
-        "Bash 钩子里没有接上写入护栏脚本"
     )
 
 
@@ -268,29 +263,18 @@ def test_built_edit_hook_blocks_project_path(tmp_path):
     assert code == 2, "写被验证仓库的源码必须被挡下"
 
 
-def test_built_bash_hook_blocks_write_into_project(tmp_path):
-    """Bash 分支也接上了：往被验证仓库里重定向写文件 → exit 2。"""
+def test_built_settings_carry_no_bash_write_guard(tmp_path):
+    """Bash 侧不再挂写范围护栏 —— 判定改成事后测量（任务 7/17）。
+
+    Bash 分支恒放行（``check_bash_payload`` 恒返回 0），留着这条钩子只是白起
+    一个 Python 进程。漏过去的改动由树快照的前后两张图做差来抓（任务 2/3）。
+    """
     plan_dir = tmp_path / "plan"
     plan_dir.mkdir()
 
     data = _build(plan_dir=plan_dir, round_no=3)
     commands = _hook_commands(data, "Bash")
-    command = next(
-        (c for c in commands if "verification_write_guard.py" in c), None
-    )
-    assert command, "Bash 钩子里没有接上写入护栏脚本"
 
-    target = _REPO_FILE.parent / "_vp_scope_probe.txt"
-    code = _run_hook(
-        command,
-        {
-            "tool_name": "Bash",
-            "tool_input": {
-                "command": f"echo probe > {target}",
-                "cwd": str(_BACKEND_DIR),
-            },
-        },
-        _child_env(data.get("env", {})),
-    )
-    assert code == 2, "往被验证仓库里写文件的 shell 命令必须被挡下"
-    assert not target.exists(), "命令不该真的被执行"
+    assert not any(
+        "verification_write_guard.py" in c for c in commands
+    ), "Bash 侧不该再挂写范围护栏（判定已改成事后测量）"

@@ -12,7 +12,8 @@ VP-055 的子 agent 直接改写了**被验证仓库**的 ``backend/verification
 守卫在、守卫放行、结果不作数。
 
 这条护栏换一个方向：不问"能不能写进 project_dir"，只问"是不是写进了 plan
-目录或临时目录"。写别处 —— 包括被验证仓库的源码 —— 一律 exit 2。
+目录或临时目录"。写别处 —— 包括被验证仓库的源码 —— 一律 exit 2（Edit/Write
+这条路上；Bash 这条路见下面"只放行"那一节）。
 
 它是一个**独立**的钩子脚本（不挂在 ``_HOOK_RULES`` 里），因为它的开关是
 环境变量而不是规则表：``PDT_VP_WRITE_SCOPE`` 没设就完全不生效。旧调用方
@@ -37,29 +38,28 @@ VP-055 的子 agent 直接改写了**被验证仓库**的 ``backend/verification
 * 拒绝证据写失败 → **仍然** exit 2。写不进去只是"这次没留下痕"，不是
   "这次放行"；原因记到 stderr。
 
-Bash 分支
----------
+Bash 分支（2026-11-05 起只放行）
+-------------------------------
 只拦 Edit/Write 是不够的：子 agent 拿不到 Edit/Write 也能改源码 ——
-``sed -i``、``> file``、``git checkout -- file`` 都写得动。所以同一个脚本多
-接一条 Bash 分支（payload 的 ``tool_name`` 是 ``Bash`` 时走这条）。
+``sed -i``、``> file``、``git checkout -- file`` 都写得动。所以同一个脚本早先
+也接了一条 Bash 分支，去**猜**这条命令会把文件写到哪里。
 
-Bash 分支只做一件事：**算出这条命令的写目标，看有没有落在被验证仓库里。**
+**猜的那条路已经拆掉了。** 判定路径上不再有命令解析器：:func:`check_bash_payload`
+恒返回 0。理由是解析器会持续产生假阳性 —— 它把 Python 代码里的 ``>``
+（``if a > len(b):``）当成 shell 重定向，把 ``len`` / ``1:`` / ``index`` /
+``single`` 当成写目标，于是"被验证仓库一个字节都没改过"的 VP 被拒绝、被改判成
+FAILED（``failure_class=infra``）。猜错的代价是误杀，误杀比漏看贵得多。
 
-* 写目标落在 plan 目录或临时目录 → 放行。
-* 写目标落在被验证仓库（``PDT_PROJECT_DIR``，相对路径按 cwd 解析）→
-  exit 2，reason ``outside_scope``，证据同样追加到 marker。
-* 命令解析不出来（变量展开、认不出的写法）→ **放行**。护栏宁可漏一次，
-  也不能把 VP 的正常取证挡下来。
-* ``PDT_VP_WRITE_SCOPE`` 没设 → 放行（和 Edit/Write 分支同一条规矩）。
+现在这条命令会怎样？**放行，然后测量。** PreToolUse 先给被验证树拍一张快照，
+命令跑完之后 PostToolUse 再拍一张，两张快照做差就是"这次改了哪些文件" ——
+那是**量出来的**，不是猜出来的。测出改动就存证、回滚、记账
+（``verification_tree_guard.py``）。
 
-识别的写法：``>`` / ``>>`` / ``tee`` / ``sed -i`` / ``cp`` / ``mv`` 的目标 /
-``dd of=`` / ``git checkout|restore|reset|stash|apply|add|commit``。
+解析器本身没有删：:func:`bash_write_targets` 及其同伴仍然是纯函数，其它测试
+仍然 import 它们、仍然断言它们的输出（包括 heredoc 正文不算命令这条规矩）。
+**它们只是不在判定路径上了。**
 
-**heredoc 的正文不是命令。** ``cat > /tmp/x <<'EOF' … EOF`` 里，分隔符行到
-``EOF`` 之前都是**数据**（子 agent 写的脚本正文）。逐行把正文当 shell 解析，
-正文里的 ``>``、``->``、``<tag>`` 就会被认成重定向，把一行注释认成一次写入
-——"只写 /tmp"的命令于是被算成"写进了被验证仓库"。所以命令先按"命令行 /
-正文"切开，只有命令行参与解析；运算符那一行照常解析（``> /tmp/x`` 留住）。
+Edit/Write 分支不受影响：越界写仍然 exit 2，仍然在 marker 里留下证据。
 
 拒绝证据
 --------
@@ -868,14 +868,6 @@ def _absolute(raw: str, base: str) -> Optional[str]:
     return os.path.normpath(expanded)
 
 
-def _safe_cwd() -> str:
-    """The process's own directory, or ``""`` when it cannot be read."""
-    try:
-        return os.getcwd()
-    except OSError:
-        return ""
-
-
 def _word_text(parts: Sequence[Tuple[str, bool]]) -> str:
     """The text of one shell word, cut at its first unquoted ``<`` / ``>``.
 
@@ -1061,80 +1053,26 @@ def _bash_command(payload: Any) -> str:
     return raw if isinstance(raw, str) else str(raw)
 
 
-def _bash_cwd(payload: Any) -> str:
-    """The directory relative paths in the command resolve against."""
-    tool_input = payload.get("tool_input") if isinstance(payload, dict) else None
-    if isinstance(tool_input, dict):
-        raw = str(tool_input.get("cwd") or "").strip()
-        if raw:
-            return raw
-    env_dir = os.environ.get("PDT_PROJECT_DIR", "").strip()
-    if env_dir:
-        return env_dir
-    return _safe_cwd()
-
-
-def _project_dir(payload: Any) -> str:
-    """The repository under verification — writes must not land in it."""
-    env_dir = os.environ.get("PDT_PROJECT_DIR", "").strip()
-    if env_dir:
-        return env_dir
-    tool_input = payload.get("tool_input") if isinstance(payload, dict) else None
-    if isinstance(tool_input, dict):
-        raw = str(tool_input.get("cwd") or "").strip()
-        if raw:
-            return raw
-    return _safe_cwd()
-
-
 def check_bash_payload(payload: Any) -> int:
-    """Decide whether the Bash command may write where it wants to.
+    """Allow every Bash call — this branch no longer judges.
+
+    Bash 的判定交给**测量**：命令先放行，跑完再拿被验证树的前后两张快照做差
+    （``verification_tree_guard.py`` 的 pre/post 钩子）。测出改动就存证、回滚、
+    记账 —— "改了哪些文件"是量出来的，不是从命令里猜出来的。
+
+    所以这里恒返回 0。判定路径上不再有命令解析器：:func:`bash_write_targets`
+    及其同伴（:func:`_redirect_targets` / :func:`_find_redirect` /
+    :func:`_git_targets`）仍在 —— 它们是纯函数，别的测试还 import 它们、还
+    断言它们的输出 —— 但不再被这里调用。解析器猜写目标时会把 Python 代码里的
+    ``>`` 当成重定向，那种假阳性会把没动过被验证仓库的 VP 改判成 FAILED。
 
     Args:
-        payload: The hook payload the SDK sent on stdin.
+        payload: The hook payload the SDK sent on stdin. 留着是为了让调用方
+            （钩子、测试）不必改签名。
 
     Returns:
-        ``0`` to allow the call, ``2`` to block it. A refused call also leaves
-        a refusal record behind — see :func:`record_refusal`.
+        ``0`` —— 永远放行。
     """
-    root = scope_root()
-    if root is None:
-        return 0  # 护栏没开 —— 旧行为，一个字节都不改。
-
-    command = _bash_command(payload)
-    if not command.strip():
-        return 0
-
-    project = _project_dir(payload)
-    project_resolved = _resolve(project) if project else ""
-    for target in bash_write_targets(command, _bash_cwd(payload)):
-        resolved = _resolve(target)
-        if _is_inside(resolved, str(root)):
-            continue
-        if any(_is_inside(resolved, candidate) for candidate in tmp_roots()):
-            continue
-        if not project_resolved or not _is_inside(resolved, project_resolved):
-            continue
-        marker = record_refusal(
-            "Bash", resolved, REASON_OUTSIDE_SCOPE, command=command,
-        )
-        print(
-            "[pdt] refusing a shell write into the repository under "
-            "verification: "
-            + resolved
-            + ". The verification sub-agent may only write inside the plan "
-            "directory ("
-            + str(root)
-            + ") or a temporary directory; the repository under verification "
-            "is read-only for it."
-            + (
-                " Refusal recorded at " + str(marker) + "."
-                if marker
-                else " The refusal could NOT be recorded (see the line above)."
-            ),
-            file=sys.stderr,
-        )
-        return 2
     return 0
 
 

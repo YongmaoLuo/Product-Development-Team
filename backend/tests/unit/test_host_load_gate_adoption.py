@@ -20,6 +20,9 @@ What this pins
    busy host is not its problem.
 2. CI is never gated.  A runner's load is not the runner's own doing, and a
    lane that quietly skipped would report green while asserting nothing.
+   The one thing that does outrank CI is the gate's own **measurement**
+   (``PDT_HOST_MEASURABLE=0``): a host whose clock was timed and found broken
+   cannot honour a wall-clock bound at all.
 3. The gate is reached from an autouse fixture, so a marked case cannot forget
    to ask.
 4. The wall-clock cases no longer read the load average themselves: one
@@ -107,13 +110,22 @@ def _a_loaded_host(monkeypatch: pytest.MonkeyPatch, load: float = 55.0) -> None:
     """Make the host look busier than the gate's limit allows.
 
     The load is injected rather than produced: a test that can only fail on a
-    busy machine is not a test.  The limit and the CI flag are cleared for the
-    same reason — the answer being asserted must not depend on the machine
-    the suite happens to run on.
+    busy machine is not a test.  The limit, the CI flag **and the gate's own
+    measurement** are cleared for the same reason — the answer being asserted
+    must not depend on the machine the suite happens to run on.
+
+    ``PDT_HOST_MEASURABLE`` is the third input, and forgetting it is what made
+    these cases fail on CI: the gate script probes the host before it runs
+    anything and exports ``0`` when the host could not keep time.  A
+    measurement outranks the CI guess, so with that variable still set the
+    gate answered "the host cannot measure wall-clock time" and none of the
+    load-based assertions was reached.  Clearing it here puts the host back
+    into the state these cases are about — a host whose *load* is too high.
     """
     monkeypatch.setattr(os, "getloadavg", lambda: (load, load, load))
     monkeypatch.delenv(_host_load.HOST_LOAD_LIMIT_ENV, raising=False)
     monkeypatch.delenv(_host_load.CI_ENV, raising=False)
+    monkeypatch.delenv(_host_load.HOST_MEASURABLE_ENV, raising=False)
 
 
 def test_a_perf_item_is_gated(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -161,6 +173,35 @@ def test_ci_keeps_the_marked_tests(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(_host_load.CI_ENV, "true")
 
     assert _conftest._host_load_skip_reason(_FakeItem(["perf"])) is None
+
+
+def test_a_measurement_outranks_the_ci_guess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host that could not keep time is skipped even on CI.
+
+    ``CI=true`` is a **guess** about a machine nobody looked at; the gate's
+    own probe **timed** this host and found it could not keep time.  When the
+    two disagree the measurement wins — otherwise a runner whose clock is
+    broken would assert wall-clock bounds it cannot honour.
+
+    This is the rule that made the four load-based cases above fail on CI:
+    the probe exported ``PDT_HOST_MEASURABLE=0`` there.  Pinning it here says
+    the fix belongs in the *fixture* (clear the variable there) and not in the
+    gate (drop the measurement).
+    """
+    _a_loaded_host(monkeypatch)
+    monkeypatch.setenv(_host_load.CI_ENV, "true")
+    monkeypatch.setenv(_host_load.HOST_MEASURABLE_ENV, "0")
+
+    reason = _conftest._host_load_skip_reason(_FakeItem(["perf"]))
+
+    assert reason == (
+        "skipped: the host cannot measure wall-clock time "
+        "(PDT_HOST_MEASURABLE=0)"
+    ), (
+        "测量压过 CI 的猜测：%r" % (reason,)
+    )
 
 
 def test_a_case_with_both_markers_is_skipped_once(
