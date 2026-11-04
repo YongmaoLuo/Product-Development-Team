@@ -356,6 +356,33 @@ def reap_plan(
             pid: record for pid, record in records.items()
             if record.role in wanted
         }
+    else:
+        # A copy, not the live mapping itself: the owner filter below
+        # removes entries from ``records``, and ``live`` is read further
+        # down — the group vouching and the escape scan both need the
+        # *whole* live set, and a filtered ``live`` would vouch for less
+        # than the ledger actually says.
+        records = dict(live)
+
+    # A shutdown sweep may only collect what the departing process owned.
+    # A record whose owner is a *different, live* process is not an orphan:
+    # it belongs to a backend that is still running.  Only the shutdown
+    # reason is scoped this way — a forced start must still be able to
+    # clear a stale executor whose owner is alive.
+    if reason == "server_shutdown":
+        own = os.getpid()
+        for pid, record in list(records.items()):
+            owner = getattr(record, "owner_pid", 0) or 0
+            if not isinstance(owner, int) or owner <= 0 or owner == own:
+                continue
+            try:
+                os.kill(owner, 0)
+            except ProcessLookupError:
+                continue          # owner is gone — its tree is an orphan
+            except PermissionError:
+                pass              # exists but not ours to inspect — treat as alive
+            _skip(plan_path, record, outcome, "owner_alive")
+            records.pop(pid, None)
 
     handled: Set[int] = set()
     killed: List[_Anchor] = []
