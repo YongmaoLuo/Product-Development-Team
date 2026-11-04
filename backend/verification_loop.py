@@ -6996,6 +6996,20 @@ PREFLIGHT_FAILED_EVENT = "preflight_failed"
 #: Why the round was blocked.
 SERVICE_PREFLIGHT_ERROR_KIND = "service_preflight_failed"
 
+#: Why the round was blocked by the **binary-freshness** preflight: the
+#: working tree was not fresh, so every verification point would have
+#: graded stale code.  A round blocked this way dispatched nothing and
+#: measured nothing about the deliverable.
+#:
+#: The word is the agent's own (see
+#: ``verification_agent.BINARY_FRESHNESS_PREFLIGHT_ERROR_KIND``): the
+#: loop recognises the round by the same word the agent stopped it
+#: with.  A near-miss spelling would leave the round unrecognised — and
+#: an unrecognised blocked round reads as "the round produced no
+#: result", which sends the repair chain after a product nobody ever
+#: looked at.
+BINARY_FRESHNESS_PREFLIGHT_ERROR_KIND = "binary_freshness_preflight_failed"
+
 
 def _install_round_service_preflight(
     orch: Any, plan_id: str, plan_dir: Path,
@@ -7428,6 +7442,41 @@ def _service_preflight_blocked_report(
             "error_kind": "",
             "detail": str(report.get("summary") or ""),
         }
+    return failure
+
+
+def _binary_freshness_blocked_report(
+    report: Any,
+) -> Optional[Dict[str, Any]]:
+    """The failure a freshness-blocked round carries, or ``None``.
+
+    A report whose ``stop_reason`` is
+    ``binary_freshness_preflight_failed`` carries the failure the round
+    was blocked with: the tree was not fresh, so the round dispatched
+    nothing and has no verdict to give.  The evidence travels with the
+    report — which files were stale, which surface was scanned, what
+    the rebuild attempt returned — so the loop can write it down and
+    end the round without a verdict.
+
+    Only that one ``stop_reason`` counts.  A round that ran, a round
+    blocked by its services, a round blocked by a base-drift conflict:
+    none of them is this function's business.
+
+    A payload that is missing or malformed still yields a failure — the
+    fallback carries the report's own summary — because a blocked round
+    that is *not* recognised is a blocked round that is lost: the loop
+    would read the empty verdict as "everything failed" and send the
+    repair chain after a deliverable nobody ever looked at.
+    """
+    if not isinstance(report, dict):
+        return None
+    if str(report.get("stop_reason") or "") != (
+        BINARY_FRESHNESS_PREFLIGHT_ERROR_KIND
+    ):
+        return None
+    failure = report.get(BINARY_FRESHNESS_PREFLIGHT_ERROR_KIND)
+    if not isinstance(failure, dict):
+        return {"detail": str(report.get("summary") or "")}
     return failure
 
 
@@ -8301,6 +8350,24 @@ def _make_repair_on_complete(
                 # down by the dispatch.
                 if _service_preflight_blocked_report(_report) is not None:
                     return
+                # 2026-11-01: the round was blocked by the
+                # binary-freshness preflight — the working tree was not
+                # fresh, so every verification point would have graded
+                # stale code.  The round dispatched nothing and measured
+                # nothing: the judgment phase must not run on it, it
+                # would read the blocked round as a failure and send the
+                # repair chain after a product nobody ever looked at.
+                #
+                # This is the SECOND judgment point — the auto-loop's
+                # own round is the first — and the blocked round is owed
+                # the same treatment here.  The terminal verdict is
+                # written down as well: a bare ``return`` would leave
+                # this path's stop reason unrecorded.
+                if _binary_freshness_blocked_report(_report) is not None:
+                    _record_terminal(
+                        "loop_stopped", BINARY_FRESHNESS_PREFLIGHT_ERROR_KIND,
+                    )
+                    return
                 # 2026-10-30 (VP-012): the round was blocked by the
                 # base-drift check — the branch had drifted away from
                 # its base and merging the base back left conflicts.
@@ -9055,6 +9122,24 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                 if _preflight_blocked is not None:
                     _record_terminal(
                         "loop_stopped", SERVICE_PREFLIGHT_ERROR_KIND,
+                    )
+                    return
+                # 2026-11-01: the round was blocked by the binary-freshness
+                # preflight — the working tree was not fresh, so every
+                # verification point would have graded stale code.  The
+                # round dispatched nothing and measured nothing: there is no
+                # verdict to judge and no verdict to repair against.  The
+                # judgment phase must not run on it — it would read the
+                # blocked round as a failure and send the repair chain after
+                # a product nobody ever looked at.
+                #
+                # The round is NOT charged to the plan's round budget: the
+                # terminal write keeps the round the plan was in, so a
+                # restart resumes THIS round instead of starting the next
+                # one (see ``routes.verification._resolve_start_round``).
+                if _binary_freshness_blocked_report(report) is not None:
+                    _record_terminal(
+                        "loop_stopped", BINARY_FRESHNESS_PREFLIGHT_ERROR_KIND,
                     )
                     return
                 # 2026-10-29: the round was blocked by the base-drift check

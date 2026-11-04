@@ -134,6 +134,13 @@ def _setup_pure_python(project_dir: Path, *, fresh: bool):
     else:
         os.utime(py_path, (time.time(), time.time()))
         os.utime(pyc, (time.time() - 3600, time.time() - 3600))
+    # The freshness check scans the .py files git tracks; without this
+    # the fixture would have zero tracked sources and every verdict
+    # would degenerate to SKIPPED.
+    subprocess.run(
+        ["git", "add", "-A"],
+        cwd=str(project_dir), capture_output=True, text=True, check=True,
+    )
 
 
 def _setup_js_only(project_dir: Path):

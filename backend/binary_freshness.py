@@ -79,6 +79,16 @@ KIND_RUST_PYTHON = "rust_python"
 KIND_PURE_PYTHON = "pure_python"
 KIND_NONE = "none"
 
+SCAN_SCOPE_GIT_TRACKED = "git_tracked"
+"""Sources were taken from git's index (``git ls-files``)."""
+
+SCAN_SCOPE_FULL_TREE = "full_tree_fallback"
+"""Git could not be consulted; the whole tree was scanned instead."""
+
+GIT_LS_FILES_TIMEOUT_SEC = 30
+"""Hard ceiling on ``git ls-files``. A hung git must not hang the
+verification pre-flight check."""
+
 
 @dataclass(frozen=True)
 class FreshnessReport:
@@ -102,6 +112,28 @@ class FreshnessReport:
     binary_path: Optional[str] = None
     newest_source_mtime: Optional[float] = None
     binary_mtime: Optional[float] = None
+    # Scan-surface bookkeeping (see :func:`_tracked_py_files`).
+    # ``scan_scope`` is ``'git_tracked'`` when the sources were taken
+    # from git's index, ``'full_tree_fallback'`` when git could not be
+    # consulted and the check fell back to a full-tree scan.
+    # ``scan_note`` carries the reason for that fallback (empty when
+    # there was none); ``scanned_count`` is how many ``.py`` files the
+    # check actually considered.
+    scan_scope: str = ""
+    scan_note: str = ""
+    scanned_count: Optional[int] = None
+    # ``.pyc`` classification of the scanned sources (see
+    # :func:`_check_pure_python`). The two situations are kept apart
+    # because they mean different things:
+    #   * ``missing_pyc_files`` — a source with no ``.pyc`` sibling
+    #     *yet*. Python compiles it on first import, so the bytecode is
+    #     absent, not stale. It never fails a round.
+    #   * ``stale_pyc_files`` — a source whose ``.pyc`` exists but is
+    #     older than the source. That is genuinely stale bytecode and
+    #     does fail the round.
+    # Both hold project-relative paths.
+    missing_pyc_files: Tuple[str, ...] = ()
+    stale_pyc_files: Tuple[str, ...] = ()
 
     @property
     def is_stale(self) -> bool:
@@ -113,8 +145,13 @@ class FreshnessReport:
         out: Dict[str, Any] = {
             "kind": self.kind,
             "status": self.status,
+            "missing_pyc_files": list(self.missing_pyc_files),
+            "stale_pyc_files": list(self.stale_pyc_files),
             "detail": self.detail,
             "evidence": self.evidence,
+            "scan_scope": self.scan_scope,
+            "scan_note": self.scan_note,
+            "scanned_count": self.scanned_count,
         }
         if self.rebuild_command is not None:
             out["rebuild_command"] = self.rebuild_command
@@ -448,25 +485,116 @@ def _infer_rust_rebuild_command(project_dir: Path) -> str:
     return "cargo build --release"
 
 
+def _tracked_py_files(project_dir: Path) -> Tuple[Optional[List[Path]], str]:
+    """List the git-tracked ``.py`` files under ``project_dir``.
+
+    Returns ``(files, "")`` when the git query succeeded. ``files`` may
+    legitimately be empty — a repository that tracks no ``.py`` at all
+    is a valid answer, not an error.
+
+    Returns ``(None, reason)`` when the query could not be performed:
+    the directory is not inside a git repository, git is not
+    installed, the query timed out, or git exited non-zero. The
+    caller then falls back to a full-tree scan and records ``reason``
+    as the report's ``scan_note``.
+
+    Why git and not the whole tree: the verification harness writes
+    throw-away probe fixtures under ``<project>/.pdt/``. Those are not
+    project source; counting them as ``.py`` files with no ``.pyc``
+    sibling made every Phase-1 verification point come back BLOCKED
+    ("stale bytecode") on a perfectly healthy project.
+
+    Only paths that exist as regular files and resolve to a location
+    inside ``project_dir`` are returned — a tracked symlink pointing
+    out of the tree is not this project's source.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(project_dir), "ls-files", "-z", "--", "*.py"],
+            capture_output=True,
+            timeout=GIT_LS_FILES_TIMEOUT_SEC,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return None, (
+            f"git ls-files timed out after {GIT_LS_FILES_TIMEOUT_SEC}s"
+        )
+    except OSError as exc:
+        return None, f"git ls-files could not be executed: {exc}"
+
+    if proc.returncode != 0:
+        stderr = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+        return None, (
+            "not a git repository or git ls-files failed "
+            f"(exit {proc.returncode}): {stderr}"
+        )
+
+    root = Path(project_dir).resolve()
+    files: list[Path] = []
+    for raw in (proc.stdout or b"").split(b"\0"):
+        if not raw:
+            continue
+        rel = raw.decode("utf-8", errors="replace")
+        candidate = Path(project_dir) / rel
+        try:
+            if not candidate.is_file():
+                continue
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if root not in resolved.parents:
+            # symlink (or odd path) escaping the project tree
+            continue
+        files.append(candidate)
+    return files, ""
+
+
 def _check_pure_python(project_dir: Path) -> FreshnessReport:
-    """Check the freshness of ``.pyc`` bytecode against ``.py`` mtimes."""
-    py_files = [p for p in project_dir.rglob("*.py") if "__pycache__" not in p.parts]
+    """Check the freshness of ``.pyc`` bytecode against ``.py`` mtimes.
+
+    Scan surface: the ``.py`` files git tracks. When git cannot be
+    consulted (not a repository, git missing, timeout, non-zero exit)
+    the check falls back to a full-tree scan, excludes ``__pycache__``
+    and ``.pdt/``, and records the reason in ``scan_note`` /
+    ``scan_scope`` so the fallback is never silent.
+
+    Two kinds of "the bytecode does not match the source" are kept
+    apart, because they call for opposite verdicts:
+
+      * **no ``.pyc`` yet** — the source was added (or the cache was
+        cleared) and nothing imported it since. Python compiles it on
+        first import, so the bytecode is *absent*, not stale. It is
+        listed in ``missing_pyc_files`` and never fails the round.
+      * **``.pyc`` older than the source** — the interpreter would run
+        the previous code. Listed in ``stale_pyc_files``; this is what
+        makes the round FAILED.
+
+    Only the second one is stale. When the tree holds no ``.pyc`` at
+    all the check stays SKIPPED ("no bytecode cache present") and both
+    file lists are empty — that state is reported through ``detail``.
+    """
+    project_dir = Path(project_dir)
+    tracked, fallback_reason = _tracked_py_files(project_dir)
+    if tracked is None:
+        py_files = [
+            p for p in project_dir.rglob("*.py")
+            if "__pycache__" not in p.parts and ".pdt" not in p.parts
+        ]
+        scan_scope = SCAN_SCOPE_FULL_TREE
+        scan_note = fallback_reason
+    else:
+        py_files = tracked
+        scan_scope = SCAN_SCOPE_GIT_TRACKED
+        scan_note = ""
+
+    scanned_count = len(py_files)
     if not py_files:
         return FreshnessReport(
             kind=KIND_PURE_PYTHON, status="SKIPPED",
             detail="no .py files found",
-        )
-
-    pyc_files = list(project_dir.rglob("__pycache__/*.pyc"))
-    if not pyc_files:
-        # No bytecode cache exists yet — Python will recompile on
-        # first import. Treat as SKIPPED (fresh on next run).
-        return FreshnessReport(
-            kind=KIND_PURE_PYTHON,
-            status="SKIPPED",
-            detail="no .pyc bytecode cache present (Python will recompile on import)",
-            evidence="no __pycache__/*.pyc files",
-            rebuild_command="python -m compileall -f .",
+            scan_scope=scan_scope,
+            scan_note=scan_note,
+            scanned_count=0,
         )
 
     # For each .py file, check if its sibling .pyc is at least as
@@ -479,6 +607,42 @@ def _check_pure_python(project_dir: Path) -> FreshnessReport:
             return []
         return list(cache_dir.glob(f"{py.stem}.*.pyc"))
 
+    # The bytecode candidates are derived from the scanned sources — a
+    # ``.pyc`` that no scanned ``.py`` owns (e.g. one belonging to a
+    # fixture under ``.pdt/``) must not influence the SKIPPED verdict
+    # nor the reported ``binary_mtime``.
+    pyc_files: list[Path] = []
+    seen_pyc: set[Path] = set()
+    for py in py_files:
+        for pyc in _matching_pyc(py):
+            if pyc in seen_pyc:
+                continue
+            seen_pyc.add(pyc)
+            pyc_files.append(pyc)
+
+    if not pyc_files:
+        # No bytecode cache exists yet — Python will recompile on
+        # first import. Treat as SKIPPED (fresh on next run).
+        return FreshnessReport(
+            kind=KIND_PURE_PYTHON,
+            status="SKIPPED",
+            detail="no .pyc bytecode cache present (Python will recompile on import)",
+            evidence="no __pycache__/*.pyc files",
+            rebuild_command="python -m compileall -f .",
+            scan_scope=scan_scope,
+            scan_note=scan_note,
+            scanned_count=scanned_count,
+        )
+
+    # Two different situations, kept apart on purpose:
+    #   * ``missing_files`` — the source has no ``.pyc`` sibling yet.
+    #     Python compiles it on first import, so the bytecode is
+    #     absent, not stale. Reporting it as stale made every round
+    #     FAIL as soon as one source file was added.
+    #   * ``stale_files`` — the source has a ``.pyc`` but it is older
+    #     than the source. That *is* stale bytecode.
+    missing_files: list[str] = []
+    stale_files: list[str] = []
     stale_entries: list[str] = []
     newest_py_mtime: Optional[float] = None
     for py in py_files:
@@ -490,41 +654,73 @@ def _check_pure_python(project_dir: Path) -> FreshnessReport:
             newest_py_mtime = py_mtime
         pycs = _matching_pyc(py)
         if not pycs:
-            stale_entries.append(f"{py.relative_to(project_dir)} (no .pyc)")
+            missing_files.append(str(py.relative_to(project_dir)))
             continue
         newest_pyc_mtime = max(p.stat().st_mtime for p in pycs)
         if newest_pyc_mtime < py_mtime:
+            rel = str(py.relative_to(project_dir))
+            stale_files.append(rel)
             stale_entries.append(
-                f"{py.relative_to(project_dir)} (.pyc older by "
+                f"{rel} (.pyc older by "
                 f"{py_mtime - newest_pyc_mtime:.0f}s)"
             )
 
-    if not stale_entries:
+    missing_note = ""
+    if missing_files:
+        missing_note = (
+            "; no .pyc yet (not stale): "
+            f"{', '.join(missing_files[:5])}"
+            f"{'...' if len(missing_files) > 5 else ''}"
+        )
+
+    if not stale_files:
+        if missing_files:
+            detail = (
+                f"{len(missing_files)} .py file(s) have no .pyc yet "
+                "(Python will compile them on first import); "
+                f"no stale .pyc among {len(py_files)} .py file(s)"
+            )
+        else:
+            detail = f"all {len(py_files)} .py files have fresh .pyc siblings"
         return FreshnessReport(
             kind=KIND_PURE_PYTHON,
             status="PASSED",
-            detail=f"all {len(py_files)} .py files have fresh .pyc siblings",
-            evidence=f"checked {len(py_files)} .py files against __pycache__/*.pyc",
+            detail=detail,
+            evidence=(
+                f"checked {len(py_files)} .py files against __pycache__/*.pyc"
+                f"{missing_note}"
+            ),
             rebuild_command=None,
             binary_path=None,
             newest_source_mtime=newest_py_mtime,
             binary_mtime=max((p.stat().st_mtime for p in pyc_files), default=None),
+            scan_scope=scan_scope,
+            scan_note=scan_note,
+            scanned_count=scanned_count,
+            missing_pyc_files=tuple(missing_files),
+            stale_pyc_files=(),
         )
 
     cmd = "python -m compileall -f ."
     return FreshnessReport(
         kind=KIND_PURE_PYTHON,
         status="FAILED",
-        detail=f"{len(stale_entries)} of {len(py_files)} .py files have stale .pyc",
+        detail=f"{len(stale_files)} of {len(py_files)} .py files have stale .pyc",
         evidence=(
             f"stale files: {'; '.join(stale_entries[:5])}"
             f"{'...' if len(stale_entries) > 5 else ''}; "
             f"rebuild command: {cmd}"
+            f"{missing_note}"
         ),
         rebuild_command=cmd,
         binary_path=None,
         newest_source_mtime=newest_py_mtime,
         binary_mtime=max((p.stat().st_mtime for p in pyc_files), default=None),
+        scan_scope=scan_scope,
+        scan_note=scan_note,
+        scanned_count=scanned_count,
+        missing_pyc_files=tuple(missing_files),
+        stale_pyc_files=tuple(stale_files),
     )
 
 
