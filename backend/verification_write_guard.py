@@ -303,8 +303,10 @@ def check_edit_payload(payload: Any) -> Decision:
 # ---------------------------------------------------------------------------
 # Bash 分支：算出命令的写目标，看有没有落在被验证仓库里
 # ---------------------------------------------------------------------------
-def _tokenize(text: str) -> List[List[Tuple[str, bool]]]:
-    """Split one shell line into tokens.
+def _tokenize_with_state(
+    text: str, state: Optional[str] = None
+) -> Tuple[List[List[Tuple[str, bool]]], Optional[str]]:
+    """Split one shell line into tokens, tracking the quote state across lines.
 
     每个 token 是 ``[(片段, 是否被引号包住)]`` 的列表。引号这件事必须留着：
     ``echo "a > b"`` 里的 ``>`` 是数据不是重定向，而"整块是不是被引号包住"
@@ -312,6 +314,24 @@ def _tokenize(text: str) -> List[List[Tuple[str, bool]]]:
 
     分隔符（``;`` ``|`` ``&`` ``(`` ``)``）单独成 token；``&>`` 不是分隔符，
     它是重定向操作符的一部分。
+
+    ``state`` 是**这一行开始时**是否还处在一个没闭合的引号里（``None`` /
+    ``"'"`` / ``'"'``）。跨行的引号在 bash 里是**一个**字符串：``python3 -c "``
+    开了引号，下一行到闭引号为止都是**同一个参数的内容**，不是命令行。
+    逐行独立切词会把那些行当成命令解析，于是 ``if a > len(b):`` 里的 ``>``
+    被认成重定向，"写目标"凭空多出一个 ``<worktree>/len`` —— 护栏据此拒绝，
+    两个没动过被验证仓库的 VP 被改判成 FAILED。
+
+    所以这里返回 ``(tokens, 结束状态)``：结束状态是这一行结束时还开着的引号
+    （``None`` 表示没有）。调用方把它带到下一行 —— heredoc 正文不在这个状态
+    里（正文已在别处被整段跳过），所以正文里的引号不会打断外层的状态机。
+
+    Args:
+        text: 这一行的原文。
+        state: 行首的引号状态。
+
+    Returns:
+        ``(tokens, 结束状态)``。
     """
     tokens: List[List[Tuple[str, bool]]] = []
     parts: List[Tuple[str, bool]] = []
@@ -336,6 +356,30 @@ def _tokenize(text: str) -> List[List[Tuple[str, bool]]]:
 
     index = 0
     length = len(text)
+
+    # 行首就处在引号里：先吃掉"到闭引号为止"的那一段 —— 它是数据。
+    if state is not None:
+        quote = state
+        chunk: List[str] = []
+        closed = False
+        while index < length:
+            current = text[index]
+            if quote == '"' and current == "\\" and index + 1 < length:
+                chunk.append(text[index + 1])
+                index += 2
+                continue
+            if current == quote:
+                index += 1
+                closed = True
+                break
+            chunk.append(current)
+            index += 1
+        push("".join(chunk), True)
+        if not closed:
+            # 引号到行尾还没闭合：整行都是数据，行末仍处在这个引号里。
+            return tokens, state
+        state = None
+
     while index < length:
         char = text[index]
         if char in " \t":
@@ -390,15 +434,22 @@ def _tokenize(text: str) -> List[List[Tuple[str, bool]]]:
         if char in "'\"":
             quote = char
             index += 1
-            chunk: List[str] = []
-            while index < length and text[index] != quote:
+            chunk = []
+            closed = False
+            while index < length:
                 if quote == '"' and text[index] == "\\" and index + 1 < length:
                     chunk.append(text[index + 1])
                     index += 2
                     continue
+                if text[index] == quote:
+                    index += 1
+                    closed = True
+                    break
                 chunk.append(text[index])
                 index += 1
-            index += 1
+            if not closed:
+                # 引号开了没闭：行尾剩下的都是数据，下一行仍在这个引号里。
+                state = quote
             push("".join(chunk), True)
             continue
         if char == "`":
@@ -430,6 +481,16 @@ def _tokenize(text: str) -> List[List[Tuple[str, bool]]]:
         pending.append(char)
         index += 1
     flush_token()
+    return tokens, state
+
+
+def _tokenize(text: str) -> List[List[Tuple[str, bool]]]:
+    """Split one shell line into tokens (no cross-line quote state).
+
+    单行独立切词 —— 调用方不关心引号状态时用它。跨行引号必须走
+    :func:`_tokenize_with_state`。
+    """
+    tokens, _ = _tokenize_with_state(text)
     return tokens
 
 
@@ -544,6 +605,11 @@ def _sed_targets(args: List[str]) -> List[str]:
         if arg in ("-i", "--in-place") or arg.startswith("--in-place="):
             in_place = True
             index += 1
+            # BSD 的写法：``sed -i '' 's/a/b/' file`` —— 紧跟在 ``-i`` 后面的
+            # 空串是**备份文件后缀**，不是脚本。不认它，脚本就会被当成文件，
+            # 凭空多出一个写目标（``<worktree>/s/a/b/``）。
+            if arg == "-i" and index < len(args) and args[index] == "":
+                index += 1
             continue
         if arg.startswith("-i") and len(arg) > 2:
             in_place = True  # -i.bak
@@ -765,6 +831,13 @@ def bash_write_targets(command: str, cwd: str) -> List[str]:
     把一行注释认成一次写入 —— 于是"只写 /tmp"的命令被算成"写进了被验证
     仓库"。所以命令先按"命令行 / 正文"切开，只有命令行参与解析。
 
+    **跨行的引号也是一个整体。** ``python3 -c "`` 开引号之后，到闭引号为止的
+    每一行都属于**同一个参数**，不是命令行。逐行独立切词会把那些行当命令
+    解析，里面的 ``if a > len(b):`` 里的 ``>`` 被认成重定向 —— 写目标凭空
+    多出 ``<worktree>/len``，护栏据此拒绝，两个没动过被验证仓库的 VP 被改判
+    成 FAILED。所以逐行切词时带着"这一行开始时还开着哪个引号"的状态走：
+    闭引号之前的内容当数据，闭引号之后的部分才当命令行。
+
     Args:
         command: The shell command as the agent wrote it.
         cwd: The directory relative paths resolve against.
@@ -783,10 +856,15 @@ def bash_write_targets(command: str, cwd: str) -> List[str]:
     try:
         lines = command.splitlines() or [command]
         index = 0
+        # 跨行引号状态：这一行开始时还开着哪个引号（``None`` 表示没有）。
+        quote_state: Optional[str] = None
         while index < len(lines):
             line = lines[index]
             index += 1
-            tokens = _tokenize(line)
+            # 引号跨行时，闭引号之前的内容是**数据**，不是命令行 ——
+            # ``python3 -c "`` 开引号之后到闭引号为止的每一行都属于同一个
+            # 参数，里面的 ``>`` / ``->`` 是数据，不是重定向。
+            tokens, quote_state = _tokenize_with_state(line, quote_state)
             # 运算符**那一行**照常解析：``cat > /tmp/x <<'EOF'`` 的
             # ``> /tmp/x`` 必须留住。
             for segment in _segments(tokens):
@@ -797,7 +875,14 @@ def bash_write_targets(command: str, cwd: str) -> List[str]:
                 raw_targets = _redirect_targets(segment)
                 if position is not None:
                     name = os.path.basename(_text(segment[position]))
-                    args = [_text(token) for token in segment[position + 1 :]]
+                    args = [
+                        _text(token)
+                        for token in segment[position + 1 :]
+                        # 带重定向操作符的 token 不是操作数：``cp a b >out``
+                        # 的落点是 ``b``，``2>&1`` 的 ``2>`` 也不是 cp 的
+                        # 操作数 —— 把它们当操作数会凭空造出一个写目标。
+                        if _find_redirect(token) is None
+                    ]
                     raw_targets.extend(_command_targets(name, args, current))
                 for raw in raw_targets:
                     resolved = _absolute(raw, current)
