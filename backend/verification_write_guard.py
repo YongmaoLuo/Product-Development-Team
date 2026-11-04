@@ -81,6 +81,7 @@ __all__ = [
     "bash_write_targets",
     "check_bash_payload",
     "check_edit_payload",
+    "is_inside_tree",
     "main",
     "read_refusals",
     "record_refusal",
@@ -123,6 +124,13 @@ _REDIRECT_RE = re.compile(r"(?P<fd>\d*)?(?P<op>&>>|&>|>>[|]|>[|]>|>[|]|>>|>)")
 
 #: shell 的命令分隔符。token 化之后它们单独成 token。
 _SHELL_SEPARATORS = (";", "&&", "||", "|", "&", "(", ")")
+
+#: 识别 shell 的 heredoc 操作符（``<<`` / ``<<-``）。
+#:
+#: ``<<<``（here-string）**不是** heredoc —— 它没有正文，正则用前视把它挡掉：
+#: ``<<`` 后面跟着 ``<`` 时不匹配，靠前的那个 ``<`` 又被后视挡掉。``<<-`` 排在
+#: ``<<`` 前面：长的先试。
+_HEREDOC_RE = re.compile(r"(?<!<)(?P<op><<-|<<)(?!<)")
 
 #: 这些命令只是"包一层"，真正的命令在它们后面（``env FOO=1 cmd``）。
 _COMMAND_PREFIXES = (
@@ -185,6 +193,30 @@ def _is_inside(target: str, root: str) -> bool:
         return True
     prefix = root if root.endswith(os.sep) else root + os.sep
     return target.startswith(prefix)
+
+
+def is_inside_tree(path: Any, root: Any) -> bool:
+    """Whether ``path`` lies inside ``root`` once both are resolved.
+
+    2026-11-04（树外拒绝不再改判）：护栏拒绝的是"写出可写范围"的写，而
+    "写出了可写范围"和"改了被验证的树"**不是一回事** —— 写
+    ``~/.claude/projects/<project>/memory/…`` 也被拒，但它动不了被验证
+    仓库一根毫毛。调用方要分清这两件事，就得能问"这个路径在树内吗"。
+
+    比较前两边都解析：``~`` 展开、``..`` 消解、符号链接解掉。护栏记下的
+    Edit / Write 路径是**原样**的（可能带 ``~``、可能是相对路径），Bash
+    分支记的是解析过的绝对路径 —— 不先解析就没法把两者放在一起比。
+
+    Args:
+        path: The path to test; may be relative or carry a ``~``.
+        root: The tree the path is compared against.
+
+    Returns:
+        ``True`` when ``path`` is ``root`` itself or lives under it.
+    """
+    if not path or not root:
+        return False
+    return _is_inside(_resolve(str(path)), _resolve(str(root)))
 
 
 def scope_root() -> Optional[Path]:
@@ -431,6 +463,96 @@ def _segments(tokens: List[List[Tuple[str, bool]]]) -> List[List[List[Tuple[str,
     return segments
 
 
+def _find_heredoc(token: List[Tuple[str, bool]]) -> Optional[Tuple[str, str]]:
+    """Return ``(operator, delimiter)`` for the token's first heredoc.
+
+    ``operator`` 是 ``<<`` 或 ``<<-``；``delimiter`` 是操作符之后那个**词**
+    （bash 把相邻的引号片段接成一个词），定界符不在这个 token 里时是空串
+    （``<< PY`` 的定界符在下一个 token）。
+
+    定界符只到重定向操作符为止：``cat <<EOF>out.log`` 的定界符是 ``EOF``，
+    ``>out.log`` 是另一件事（bash 的词法也是这么切）。
+
+    只有**没被引号包住**的片段里才找操作符：``echo "a << b"`` 里的 ``<<`` 是
+    数据，不是 heredoc。
+    """
+    for position, (chunk, quoted) in enumerate(token):
+        if quoted:
+            continue
+        match = _HEREDOC_RE.search(chunk)
+        if match is None:
+            continue
+        tail = chunk[match.end() :]
+        redirect = _REDIRECT_RE.search(tail)
+        if redirect:
+            tail = tail[: redirect.start()]
+        for part, part_quoted in token[position + 1 :]:
+            if not part_quoted and _REDIRECT_RE.search(part):
+                break
+            tail += part
+        return match.group("op"), tail
+    return None
+
+
+def _heredoc_specs(line: str) -> List[Tuple[str, bool]]:
+    """Every heredoc the line opens, as ``(delimiter, strip_tabs)`` pairs.
+
+    定界符可以跟 ``<<`` 在同一个 token 里（``<<'PY'``），也可以隔一个空格
+    （``<< 'PY'``）。``<<-`` 的 ``strip_tabs`` 是 ``True`` —— 那种写法按
+    bash 的规矩，制表符缩进的定界符行也算数。
+
+    认不出定界符就交一个空串：那条命令本来也跑不起来，正文会一路吞到末尾
+    （宁可漏一次，也不能把正文里的 ``>`` 误判成重定向）。
+    """
+    specs: List[Tuple[str, bool]] = []
+    tokens = _tokenize(line)
+    index = 0
+    while index < len(tokens):
+        found = _find_heredoc(tokens[index])
+        if found is None:
+            index += 1
+            continue
+        operator, delimiter = found
+        consumed = False
+        if not delimiter and index + 1 < len(tokens):
+            following = _text(tokens[index + 1])
+            if (
+                following
+                and following not in _SHELL_SEPARATORS
+                and not _REDIRECT_RE.match(following)
+            ):
+                delimiter = following
+                consumed = True
+        specs.append((delimiter, operator == "<<-"))
+        index += 2 if consumed else 1
+    return specs
+
+
+def _strip_heredoc_bodies(lines: List[str]) -> List[str]:
+    """Blank out the body of every heredoc the lines open.
+
+    heredoc 正文是**字面数据**：``if len(x) > 0:`` 里的 ``>`` 是 Python 的
+    比较运算符，不是 shell 的重定向。逐行 token 化看见它就是错的 —— 所以正文
+    整段置空，只留下开头的命令那一行。
+
+    正文行原样置空串（**行数不变**），其余行照常解析。只有「定界符单独成行」
+    才结束正文；没终止就一直吞到命令末尾。定界符自己那一行也是正文，置空。
+    """
+    stripped: List[str] = []
+    pending: List[Tuple[str, bool]] = []
+    for line in lines:
+        if pending:
+            delimiter, strip_tabs = pending[0]
+            candidate = line.lstrip("\t") if strip_tabs else line
+            if delimiter and candidate == delimiter:
+                pending.pop(0)
+            stripped.append("")
+            continue
+        stripped.append(line)
+        pending.extend(_heredoc_specs(line))
+    return stripped
+
+
 def _command_index(tokens: List[List[Tuple[str, bool]]]) -> Optional[int]:
     """The index of the segment's command word, or ``None`` when unclear."""
     for position, token in enumerate(tokens):
@@ -647,6 +769,8 @@ def bash_write_targets(command: str, cwd: str) -> List[str]:
     以及改了工作区或仓库状态的 git 子命令（``checkout`` / ``restore`` /
     ``reset`` / ``stash`` / ``apply`` / ``add`` / ``commit``）。
 
+    heredoc 正文不在其列：正文是字面数据，里面的 ``>`` 是数据不是重定向。
+
     Args:
         command: The shell command as the agent wrote it.
         cwd: The directory relative paths resolve against.
@@ -663,7 +787,7 @@ def bash_write_targets(command: str, cwd: str) -> List[str]:
     current = base
     targets: List[str] = []
     try:
-        for line in command.splitlines() or [command]:
+        for line in _strip_heredoc_bodies(command.splitlines() or [command]):
             for segment in _segments(_tokenize(line)):
                 position = _command_index(segment)
                 if position is not None and _text(segment[position]) == "cd":
