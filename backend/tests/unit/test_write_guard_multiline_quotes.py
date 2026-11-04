@@ -42,10 +42,22 @@
 ----------
 两份都写：库级用例钉住"算出来的写目标是什么"，黑盒用例钉住"钩子真的会
 拒绝 / 真的放行"（护栏的契约是退出码 + 拒绝证据，不是内部函数）。
+
+Bash 侧的契约换过一轮（2026-11-05，任务 7/17）
+----------------------------------------------
+护栏的 Bash 分支**恒放行**，Bash matcher 上也**不再挂**写范围护栏 —— 判定
+改成事后测量（树快照的前后两张图做差）。所以本文件里：
+
+* Bash payload 走写范围护栏 → exit 0，不留拒绝记录；
+* 库级断言（``bash_write_targets`` 及其同伴）一条不少地保留 —— 解析器仍然
+  认得出真写，这正是"假阴性"那条主线；
+* "真写会不会被抓住"改由**树护栏**回答：PreToolUse 拍快照、PostToolUse
+  比对，把这次写入记进 ``created``。判据从"事前拒绝"变成"事后留证"。
 """
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -56,6 +68,7 @@ _BACKEND_DIR = Path(__file__).resolve().parents[2]
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
+import verification_tree_guard  # noqa: E402
 import verification_write_guard  # noqa: E402
 
 _HOOK_SCRIPT = _BACKEND_DIR / "verification_write_guard.py"
@@ -134,6 +147,83 @@ def _refusal_paths(plan_dir, round_no=1, vp_id="VP-999"):
         if line.strip():
             paths.append(json.loads(line)["path"])
     return paths
+
+
+def _init_repo(repo: Path) -> Path:
+    """Create a throw-away git repository the tree guard will accept.
+
+    The tree guard measures a **working tree** — a plain directory is not
+    one, and the guard says so instead of pretending it saw nothing.
+    """
+    repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "init", "--initial-branch", "main"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if not (repo / ".git").is_dir():
+        # 老版本 git 不认 ``--initial-branch`` —— 退回默认分支名。
+        subprocess.run(
+            ["git", "-C", str(repo), "init"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Test User"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "commit.gpgsign", "false"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    (repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "-A"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "seed"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return repo
+
+
+def _tree_guard(monkeypatch, repo, phase, command, tool_use_id="tu_1"):
+    """Run the tree guard the way the hook runs it.
+
+    The payload arrives on stdin as JSON; the phase comes from the
+    environment.  Returns the process exit code.
+    """
+    monkeypatch.setenv("PDT_VP_WRITE_SCOPE", str(repo.parent / "plan"))
+    monkeypatch.setenv("PDT_PROJECT_DIR", str(repo))
+    monkeypatch.setenv("PDT_VP_ROUND", "1")
+    monkeypatch.setenv("PDT_VP_ID", "VP-999")
+    monkeypatch.setenv("PDT_TREE_GUARD_PHASE", phase)
+    payload = json.dumps(
+        {
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "tool_use_id": tool_use_id,
+        }
+    )
+    monkeypatch.setattr(sys, "stdin", io.StringIO(payload))
+    return verification_tree_guard.main([])
 
 
 # ---------------------------------------------------------------------------
@@ -380,8 +470,22 @@ def test_hook_allows_multiline_quoted_program_in_repo_cwd(tmp_path):
     assert _refusal_paths(plan_dir) == []
 
 
-def test_hook_refuses_real_write_after_closing_quote(tmp_path):
-    """闭引号之后的真写必须被拒 —— 修之前它是被放过去的（假阴性）。"""
+def test_hook_refuses_real_write_after_closing_quote(tmp_path, monkeypatch):
+    """闭引号之后的真写不再被**拒**，但也不会**没人管**。
+
+    2026-11-05（任务 7/17）：护栏的 Bash 分支恒放行（判定改成事后测量），
+    所以这条命令走钩子是 exit 0、不留拒绝记录 —— 那是**新契约**，不是把
+    真写放过去。
+
+    原来那条"假阴性"判据不能跟着一起丢：闭引号之后的重定向必须仍然被解析
+    出来（不然真写会被悄悄放过），而且这次写入必须被事后测量记下来。两件事
+    分别由两处回答：
+
+    1. **解析器**（``bash_write_targets``）仍然认出落点 —— 闭引号之后的
+       ``>`` 是重定向，不是引号里的数据；
+    2. **树护栏**（PreToolUse 拍快照 / PostToolUse 比对）把这次写入记进
+       ``created`` —— 判据从"事前拒绝"变成"事后留证"。
+    """
     plan_dir = tmp_path / "plan"
     plan_dir.mkdir()
     env = _hook_env(
@@ -392,9 +496,32 @@ def test_hook_refuses_real_write_after_closing_quote(tmp_path):
     )
     target = _REPO_DIR / _REPO_FILE
     command = f"python3 -c '\nprint(1)\n' > {target}"
+
+    # 1) Bash 分支恒放行：不拒绝、不留拒绝记录。
     code, stderr = _run_hook(command, env, cwd=_CWD)
-    assert code == 2, f"真写必须被拒：{stderr}"
-    assert _refusal_paths(plan_dir) == [str(target)]
+    assert code == 0, (
+        f"Bash 分支不再判定（任务 7），却拿到了 {code}：{stderr}"
+    )
+    assert _refusal_paths(plan_dir) == []
+
+    # 2) 解析器仍然认出这个落点 —— 假阴性不能跟着一起回来。
+    assert _targets(command, cwd=_CWD) == [str(target)]
+
+    # 3) 事后测量：同样的写入被树护栏记进 created。
+    repo = _init_repo(tmp_path / "repo")
+    observed = repo / _REPO_FILE
+    observed_command = f"python3 -c '\nprint(1)\n' > {observed}"
+
+    assert _tree_guard(monkeypatch, repo, "pre", observed_command) == 0
+    observed.write_text("print(1)\n", encoding="utf-8")
+    assert _tree_guard(monkeypatch, repo, "post", observed_command) == 0
+
+    compare = repo / ".pdt" / "verify" / "round-1" / "compare-tu_1.json"
+    assert compare.exists(), sorted(
+        p.name for p in (repo / ".pdt" / "verify" / "round-1").iterdir()
+    )
+    report = json.loads(compare.read_text(encoding="utf-8"))
+    assert _REPO_FILE in report["created"], report
 
 
 def test_hook_still_allows_heredoc_to_tmp(tmp_path):

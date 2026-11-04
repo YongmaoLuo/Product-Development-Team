@@ -129,7 +129,12 @@ def test_guard_rule_sits_after_basic_and_before_extended() -> None:
     assert names.index(GUARD_NAME) == 5, names
     assert names.index("plans_delete_block") > names.index(GUARD_NAME), names
     # 2026-11-02: 9 → 11 — the two verifier write-scope guards were added
+    # at the end; 2026-11-04: 11 → 12 — the tree-snapshot rule joined them
     # at the end, so the position of the process-safety guard is unchanged.
+    # 2026-11-05 (task 17): 12 → 11 — the Bash write-scope rule was
+    # removed (it no longer judges anything); the write-scope hook is
+    # now the Edit|Write one only, so the position of the
+    # process-safety guard is still unchanged.
     assert len(_HOOK_RULES) == 11, names
 
 

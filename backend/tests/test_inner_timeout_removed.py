@@ -177,17 +177,24 @@ def test_run_single_vp_async_still_catches_hard_timeout_error():
 
 
 # ---------------------------------------------------------------------------
-# 2. Defensive defaults — all 3600 (1-hour outer cap)
+# 2. Defensive defaults — per-method wall-clock caps
 # ---------------------------------------------------------------------------
 
 
 def test_default_per_method_timeout_seconds_is_uniformly_3600():
-    """DEFAULT_PER_METHOD_TIMEOUT_SECONDS must be 3600 for every method.
+    """DEFAULT_PER_METHOD_TIMEOUT_SECONDS must name every method's cap.
 
     Before 2026-09-08: ``automated_test=120`` and ``api_test=60`` —
     the bug. The values were "fast feedback preferred" defaults,
     not actual caps, but they became the inner asyncio.wait_for
     timeout via TimeoutPolicy.resolve.
+
+    2026-11-05 (task 14): the wall-clock budget is given **per method**
+    rather than as one flat hour.  ``ui_validation`` and ``e2e`` drop to
+    900 — a wedged sub-agent must not burn the whole hour while the only
+    criterion in force is "the total elapsed time ran out" — and they get a
+    300-second no-progress heartbeat instead.  Every other method keeps the
+    flat hour.
     """
     from verification_config import DEFAULT_PER_METHOD_TIMEOUT_SECONDS
     from verification_subagent import SUPPORTED_METHODS
@@ -200,10 +207,15 @@ def test_default_per_method_timeout_seconds_is_uniformly_3600():
         f"Missing/extra methods in defaults: "
         f"{set(DEFAULT_PER_METHOD_TIMEOUT_SECONDS.keys()) ^ expected}"
     )
+
+    # 2026-11-05 (task 14): the two methods with a no-progress heartbeat
+    # are the two that were narrowed.  Everything else is the flat hour.
+    narrowed = {"ui_validation": 900, "e2e": 900}
     for method, value in DEFAULT_PER_METHOD_TIMEOUT_SECONDS.items():
-        assert value == 3600, (
+        expected_value = narrowed.get(method, 3600)
+        assert value == expected_value, (
             f"DEFAULT_PER_METHOD_TIMEOUT_SECONDS[{method!r}] = {value}, "
-            f"expected 3600 (1-hour outer cap)."
+            f"expected {expected_value}."
         )
 
 

@@ -24,6 +24,16 @@
      之后没有拒绝记录 → 子 agent 的 PASSED 原样保留，不写 marker，被验证
      仓库一个字节都没变（``git status --porcelain`` 为空）。
 
+Bash 侧现在由谁回答（2026-11-05，任务 7/17）
+----------------------------------------------
+护栏的 Bash 分支**恒放行**，Bash matcher 上也**不再挂**写范围护栏 —— 判定
+改成事后测量（树快照的前后两张图做差）。所以本文件里：
+
+* 写范围护栏的命令从 **Edit|Write** matcher 取（Bash 侧没有它了）；
+* Bash 侧的"行为"改由**放行语义**表达：一份 Bash payload 走到写范围护栏也
+  只有放行一种结局，且不留拒绝记录；Bash 调用的观测由树护栏承担
+  （PreToolUse 拍快照、PostToolUse 比对）。
+
 断言走的是**生产入口**
 ---------------------
 * 钩子命令来自任务 3 的 ``SettingsJsonBuilder.build()`` —— 子 agent 真正读的
@@ -51,8 +61,10 @@ plan 目录不再豁免                      ``test_edit_into_plan_dir_is_allowe
                                        ``test_passed_verdict_survives_without_refusals``
 临时目录白名单消失                    ``test_edit_into_tmp_is_allowed``、
                                        ``test_passed_verdict_survives_without_refusals``
-Bash 分支的两个出口（临时目录白名单、   ``test_bash_write_to_tmp_is_allowed``、
-"不在被验证仓库里"）都没了              ``test_passed_verdict_survives_without_refusals``
+Bash 分支被挂回 Bash matcher            ``test_bash_write_to_tmp_is_allowed``、
+                                       ``test_heredoc_write_to_tmp_is_allowed``
+Bash 分支又开始判定                    ``test_bash_write_to_tmp_is_allowed``、
+                                       ``test_passed_verdict_survives_without_refusals``
 heredoc 的正文又被当成命令解析         ``test_heredoc_write_to_tmp_is_allowed``
 没有拒绝证据也改判                    ``test_passed_verdict_survives_without_refusals``
 =====================================  ==========================================
@@ -180,6 +192,52 @@ def _guard_command(settings: Dict[str, Any], matcher: str) -> str:
         (c for c in commands if "verification_write_guard.py" in c), None,
     )
     assert command, f"{matcher} 钩子里没有接上写入护栏脚本：{commands}"
+    return command
+
+
+def _bash_guard_absent(settings: Dict[str, Any]) -> None:
+    """Bash 侧**不再**挂写范围护栏 —— 判定改成事后测量（任务 7/17）。
+
+    2026-11-05 之前这里有一条 ``verifier_bash_write_block``；现在 Bash 分支
+    恒放行（``check_bash_payload`` 恒返回 0），留着它只会白起一个 Python
+    进程。漏过去的改动由树快照的前后两张图做差来抓（任务 2/3）。
+
+    所以"Bash 侧的行为"现在由**树护栏**回答：PreToolUse 拍快照、PostToolUse
+    比对 —— 观测，不阻断。
+    """
+    commands = [
+        entry["hooks"][0]["command"]
+        for entry in settings.get("hooks", {}).get("PreToolUse", [])
+        if entry.get("matcher") == "Bash"
+    ]
+    assert not any(
+        "verification_write_guard.py" in c for c in commands
+    ), f"Bash 侧不该再挂写范围护栏：{commands}"
+
+
+def _tree_guard_command(settings: Dict[str, Any], phase: str = "pre") -> str:
+    """The tree-guard hook command the built settings.json carries.
+
+    2026-11-05：Bash 侧不再有写范围护栏，Bash 调用的观测由树护栏承担 ——
+    PreToolUse 侧拍快照（``pre``），PostToolUse 侧比对（``post``）。
+    """
+    hooks = settings.get("hooks", {})
+    if phase == "post":
+        entries = hooks.get("PostToolUse", [])
+    else:
+        entries = [
+            entry
+            for entry in hooks.get("PreToolUse", [])
+            if entry.get("matcher") == "Bash|Edit|Write"
+        ]
+    commands = [
+        entry["hooks"][0]["command"]
+        for entry in entries
+    ]
+    command = next(
+        (c for c in commands if "verification_tree_guard.py" in c), None,
+    )
+    assert command, f"{phase} 侧没有接上树快照护栏：{commands}"
     return command
 
 
@@ -331,8 +389,19 @@ def test_edit_into_tmp_is_allowed(settings, repo, scratch):
 # 3. Bash 往临时目录写 → 放行
 # ---------------------------------------------------------------------------
 def test_bash_write_to_tmp_is_allowed(settings, repo, scratch):
-    """Bash 往临时目录写（``> /tmp/x.log`` / ``tee /tmp/x``）→ 放行。"""
-    command = _guard_command(settings, "Bash")
+    """Bash 往临时目录写（``> /tmp/x.log`` / ``tee /tmp/x``）→ 放行。
+
+    2026-11-05（任务 7/17）：Bash 分支恒放行，Bash 侧也不再挂写范围护栏 ——
+    所以这条用例现在钉三件事：
+
+    1. Bash matcher 上**没有**写范围护栏（判定改成事后测量）；
+    2. 即便一份 Bash payload 走到了写范围护栏（Edit|Write 那条命令），
+       它也被放行，且不留拒绝记录；
+    3. Bash 调用的观测由**树护栏**承担 —— PreToolUse 拍快照，不阻断（exit 0）。
+    """
+    _bash_guard_absent(settings)
+    guard_command = _guard_command(settings, "Edit|Write")
+    tree_command = _tree_guard_command(settings, "pre")
     env = _child_env(settings.get("env", {}), repo, scratch)
 
     unique = uuid.uuid4().hex[:12]
@@ -344,10 +413,11 @@ def test_bash_write_to_tmp_is_allowed(settings, repo, scratch):
         f"echo probe > {targets[0]}",
         f"echo probe | tee {targets[1]}",
     ]
-    exit_codes: List[int] = [
-        _run_hook(command, _bash_payload(shell, repo), env)
-        for shell in shell_commands
-    ]
+    exit_codes: List[int] = []
+    for shell in shell_commands:
+        payload = _bash_payload(shell, repo)
+        exit_codes.append(_run_hook(guard_command, payload, env))
+        exit_codes.append(_run_hook(tree_command, payload, env))
 
     assert all(rc == 0 for rc in exit_codes), (
         f"Bash 写临时目录必须放行，却拿到了 "
@@ -369,10 +439,15 @@ def test_heredoc_write_to_tmp_is_allowed(settings, plan_dir, repo, scratch):
     的命令被拒（``refusals/round-1/VP-022.jsonl`` 里躺着一条
     ``<repo>/spec:``）。子 agent 连临时脚本都写不成，取证做不成。
 
+    2026-11-05（任务 7）：Bash 分支不再判定 —— 这类命令恒放行，正文是不是
+    命令已经与判定无关（正文仍不当命令解析，那是解析器自己的契约，见
+    ``test_write_guard_multiline_quotes.py``）。
+
     正文里必须同时放两种曾被误认的东西：``-> spec:``（``>`` 后面跟着一个
     不含 ``/`` 的词）与 ``<testsuites><testsuite``（``>`` 前面粘着标签）。
     """
-    command = _guard_command(settings, "Bash")
+    _bash_guard_absent(settings)
+    command = _guard_command(settings, "Edit|Write")
     env = _child_env(settings.get("env", {}), repo, scratch)
 
     unique = uuid.uuid4().hex[:12]
@@ -404,7 +479,7 @@ def test_passed_verdict_survives_without_refusals(
 ):
     """合法写入之后没有拒绝记录 → PASSED 原样保留，仓库也没被动过。"""
     edit_command = _guard_command(settings, "Edit|Write")
-    bash_command = _guard_command(settings, "Bash")
+    _bash_guard_absent(settings)
     env = _child_env(settings.get("env", {}), repo, scratch)
 
     # 先做一遍那些**合法**的写入：plan 目录、临时目录、往临时目录写的 shell。
@@ -417,8 +492,10 @@ def test_passed_verdict_survives_without_refusals(
     for path in legal_paths[:2]:
         rc = _run_hook(edit_command, _edit_payload(path), env)
         assert rc == 0, f"写 {path} 必须放行，却拿到了 {rc}"
+    # Bash 侧：不再有写范围护栏（见上面那句断言），所以一份 Bash payload
+    # 走到写范围护栏也只有"放行"这一种结局 —— 且不留拒绝记录。
     rc = _run_hook(
-        bash_command,
+        edit_command,
         _bash_payload(f"echo probe > {legal_paths[2]}", repo),
         env,
     )

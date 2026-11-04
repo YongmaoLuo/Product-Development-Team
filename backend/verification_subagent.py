@@ -359,6 +359,43 @@ LEGACY_METHODS: Tuple[str, ...] = (
 )
 
 
+# ---------------------------------------------------------------------------
+# The per-method wall-clock budget, and the heartbeat that fires first
+# ---------------------------------------------------------------------------
+#
+# 2026-11-05（arch 决策点 9 / 缺陷 B 第 5 条）。墙钟预算以前是**扁平的
+# 一小时** —— ``HARD_WALL_CLOCK_CAP_SECONDS = 3600`` 对所有方法一视同仁。
+# 其中两个方法付不起这个代价：
+#
+#   * ``ui_validation`` —— 子 agent 开真浏览器点页面；
+#   * ``e2e``          —— 子 agent 跑完整条用户链路。
+#
+# 这两个的卡死形态是"安静地卡住"：没有异常、没有输出、没有产出，
+# 于是一个卡死的子 agent 要把整整一小时预算跑满才有人知道。那一小时
+# 里唯一在生效的判据是"总时长到了"—— 而不是"它还活着吗"。
+#
+# 所以预算改成**按方法**给：这两个降到 900（见
+# :meth:`VerificationSubAgent.wall_clock_cap`），其余方法保持扁平一小时。
+# 而且 900 必须配一个**更早**的心跳（:data:`NO_PROGRESS_HEARTBEAT_SECONDS`）：
+# 心跳等于或晚于墙钟上限时它永远触发不了，"无进展就终止"就退化成
+# "总时长兜底" —— 恰好是这次要去掉的那件事。
+#
+# 心跳的语义是"没有新的工具调用 / 产出"，不是"跑了多久"：一条一直在
+# 打印的调用不会被它杀掉（``coding_tool`` 的静默窗口测的是 stdout 静默，
+# 不是经过时间）。
+
+#: 墙钟上限（秒），按方法。列在这里的方法用这个数，其余方法用
+#: :attr:`VerificationSubAgent.HARD_WALL_CLOCK_CAP_SECONDS`。
+METHOD_WALL_CLOCK_CAPS: Dict[str, int] = {
+    "ui_validation": 900,
+    "e2e": 900,
+}
+
+#: 无进展心跳（秒）：多少秒没有新的工具调用 / 产出就算卡死。
+#: 必须**严格小于**对应方法的墙钟上限，否则心跳永远触发不了。
+NO_PROGRESS_HEARTBEAT_SECONDS: int = 300
+
+
 # Shared rule applied to every verification sub-agent (added 2026-09-07
 # after two consecutive rounds were killed by the verification
 # watchdog: long pytest runs produced no log writes for 15+ minutes,
@@ -670,15 +707,23 @@ class VerificationSubAgent:
     #   * Inner layer is the 15-min idle detector in ``coding_tool``
     #     (``DEFAULT_TOTAL_TIMEOUT=900``) — callers now pass
     #     ``timeout=None`` so the coding-tool default applies.
-    HARD_WALL_CLOCK_CAP_SECONDS: int = 3600  # absolute outer cap, flat
+    #
+    # 2026-11-05（arch 决策点 9 / 缺陷 B 第 5 条）：这个"扁平一小时"不再是
+    # 所有方法的唯一预算。``ui_validation`` / ``e2e`` 收窄到 900 并配一个
+    # 300 秒的无进展心跳（见 :data:`METHOD_WALL_CLOCK_CAPS` 与
+    # :data:`NO_PROGRESS_HEARTBEAT_SECONDS`）。**实际生效的数是
+    # :meth:`wall_clock_cap` 的返回值**，不是这个类属性 —— 这个类属性留下
+    # 作为"扁平上限"，并且仍然是可以被单个实例调小的上界。
+    HARD_WALL_CLOCK_CAP_SECONDS: int = 3600  # flat outer cap / ceiling
     # 2026-09-08: outer cap fires the **stuck-agent summarizer**
     # fallback (a fresh LLM call with no tools that reads the tee'd
     # log and returns verdict JSON) instead of bouncing up to the
     # generic HardTimeoutError → split path. The first agent is
     # allowed to re-run pytest if it thinks the run was flaky; the
     # summarizer only steps in when the first agent has not produced a
-    # verdict at all by the time the outer cap fires. Outer cap is a
-    # flat ``HARD_WALL_CLOCK_CAP_SECONDS = 3600`` (2026-09-13 plan).
+    # verdict at all by the time the outer cap fires. Outer cap is
+    # flat ``HARD_WALL_CLOCK_CAP_SECONDS = 3600`` (2026-09-13 plan),
+    # narrowed per method since 2026-11-05 (see ``wall_clock_cap()``).
 
     def __post_init__(self) -> None:
         # Resolve the template eagerly so construction fails fast for
@@ -694,6 +739,71 @@ class VerificationSubAgent:
         self.logger = logging.getLogger(
             f"verification.subagent.{self.method}"
         )
+
+    # ------------------------------------------------------------------
+    # wall_clock_cap() — the budget THIS attempt may spend
+    # ------------------------------------------------------------------
+
+    def wall_clock_cap(self) -> float:
+        """The wall-clock budget (seconds) one attempt of this method may spend.
+
+        2026-11-05（arch 决策点 9 / 缺陷 B 第 5 条）：预算按方法给。
+        ``ui_validation`` 与 ``e2e`` 用 :data:`METHOD_WALL_CLOCK_CAPS` 里的
+        900；其余方法用扁平的一小时
+        (:attr:`HARD_WALL_CLOCK_CAP_SECONDS`)。
+
+        取的是**两者中更小的那个**：按方法的收窄只能把预算变紧，不能把
+        一个已经被显式调小的实例预算（测试里把上限压到秒级的那些）重新
+        放大回 900。
+
+        方法名在比对前会去掉首尾空白并折叠大小写 —— 计划里的
+        ``verification_method`` 未必是干净的 ``"e2e"``，而一个带空格或
+        大小写不同的名字仍然是同一个方法，不该因此拿到另一份预算。
+
+        Returns:
+            A positive number of seconds.
+        """
+        # 2026-11-05: 不做 int() 截断 —— 实例上限可以是秒级以下
+        # （测试把 ``HARD_WALL_CLOCK_CAP_SECONDS`` 压到 0.1 来钉边界），
+        # 截断会把它变成 0，于是每一次尝试都立刻被判成卡死。
+        cap = self.HARD_WALL_CLOCK_CAP_SECONDS
+        per_method = METHOD_WALL_CLOCK_CAPS.get(self._method_key())
+        if per_method is not None:
+            cap = min(cap, per_method)
+        return cap
+
+    def _method_key(self) -> str:
+        """The method name, normalised for lookup.
+
+        Stripped of surrounding whitespace and case-folded — see
+        :meth:`wall_clock_cap` for why the lookup cannot assume the
+        constructor normalised it.
+        """
+        return (self.method or "").strip().lower()
+
+    def _silence_window_seconds(self) -> Optional[int]:
+        """The inner silence window (seconds) for this attempt's LLM call.
+
+        ``None`` means "the coding tool's own default"
+        (``coding_tool.DEFAULT_TOTAL_TIMEOUT`` — 15 minutes of stdout
+        silence).  For the two methods whose wall clock is 900 seconds the
+        window is narrowed to :data:`NO_PROGRESS_HEARTBEAT_SECONDS`
+        (300 seconds), so a call that stops producing output is killed on
+        the evidence of its own silence — long before the wall clock runs
+        out.
+
+        The heartbeat has to be strictly earlier than the ceiling.  At or
+        above it, the ceiling would always win the race and "no progress"
+        would never be distinguishable from "still running" — which is
+        the same single bound this change exists to remove.
+
+        The window measures SILENCE, not elapsed time: a call that keeps
+        printing (thinking deltas, tool events, test output) is not
+        killed however long it runs.
+        """
+        if self._method_key() in METHOD_WALL_CLOCK_CAPS:
+            return NO_PROGRESS_HEARTBEAT_SECONDS
+        return None
 
     # ------------------------------------------------------------------
     # write_verdict() — unified verdict JSON on disk (PRD Decision Point 5)
@@ -1539,7 +1649,7 @@ class VerificationSubAgent:
                     vp_id=str(vp_node.get("id", "unknown")),
                     attempt=attempt,
                     scoped_tool=scoped_tool,
-                    timeout_seconds=self.HARD_WALL_CLOCK_CAP_SECONDS,
+                    timeout_seconds=self.wall_clock_cap(),
                     max_retries=self.max_retries,
                 )
             except Exception:
@@ -1578,12 +1688,18 @@ class VerificationSubAgent:
                 #
                 # 2026-09-13: per-VP timeout
                 # interface DELETED. The timeout contract is now:
-                #   * Outer cap: flat ``HARD_WALL_CLOCK_CAP_SECONDS``
-                #     (3600s) — fires the stuck-agent summarizer.
-                #   * Inner layer: the 15-min idle detector inside
-                #     ``coding_tool`` (``DEFAULT_TOTAL_TIMEOUT=900``).
-                #     We pass ``timeout=None`` so that default applies;
-                #     a legacy plan's per-VP ``timeout_seconds: 120``
+                #   * Outer cap: ``self.wall_clock_cap()`` — the per-method
+                #     wall-clock budget (900s for ``ui_validation`` / ``e2e``,
+                #     the flat 3600s for the rest) — fires the stuck-agent
+                #     summarizer.
+                #   * Inner layer: the silence detector inside
+                #     ``coding_tool``.  For the two narrowed methods this
+                #     attempt passes ``NO_PROGRESS_HEARTBEAT_SECONDS``
+                #     (300s) — the heartbeat has to be strictly earlier
+                #     than the ceiling, or it could never fire; for every
+                #     other method ``timeout=None`` lets the coding-tool
+                #     default (``DEFAULT_TOTAL_TIMEOUT=900``) apply.  A
+                #     legacy plan's per-VP ``timeout_seconds: 120``
                 #     (VP-023) can no longer shrink either layer.
                 #
                 # The outer cap measures *work*. A dispatch parked on a
@@ -1596,7 +1712,7 @@ class VerificationSubAgent:
                 # :class:`coding_tool.WorkClock` the coding tool parks
                 # while it waits, and the budget below asks it how much
                 # work time is left rather than assuming wall time.
-                work_clock = WorkClock(self.HARD_WALL_CLOCK_CAP_SECONDS)
+                work_clock = WorkClock(self.wall_clock_cap())
                 try:
                     scoped_tool._work_clock = work_clock
                 except Exception:
@@ -1638,10 +1754,18 @@ class VerificationSubAgent:
                 # and that error would be swallowed by the
                 # transport-error arm below and reported as a FAILED
                 # verification point.
+                # 2026-11-05（arch 决策点 9 / 缺陷 B 第 5 条）：``timeout``
+                # 是这次调用的**静默窗口**（``coding_tool`` 读它作
+                # ``total_timeout``：多少秒没有 stdout 就杀掉子进程）。
+                # 两个被收窄的方法拿到的是"无进展心跳"
+                # （``NO_PROGRESS_HEARTBEAT_SECONDS``），其余方法仍然是
+                # ``None`` —— 让 coding_tool 自己的默认
+                # （``DEFAULT_TOTAL_TIMEOUT=900``）生效。心跳必须严格早于
+                # 墙钟上限，否则它永远触发不了，"无进展就终止"就等于没有。
                 query_kwargs: Dict[str, Any] = {
                     "prompt": prompt,
                     "system_instruction": self.template,
-                    "timeout": None,
+                    "timeout": self._silence_window_seconds(),
                 }
                 excluded: List[str] = [
                     str(p) for p in (excluded_providers or []) if p
@@ -1705,13 +1829,17 @@ class VerificationSubAgent:
                 # wall time it happened to span: a call that sat on a
                 # closed quota window for a week still only ever gets an
                 # hour of work, and that is the number this reports.
-                outer_cap = float(self.HARD_WALL_CLOCK_CAP_SECONDS)
+                #
+                # 2026-11-05: the number is per method now (900 for
+                # ``ui_validation`` / ``e2e``) — the log line says which
+                # budget actually ran out.
+                outer_cap = float(self.wall_clock_cap())
                 self.logger.warning(
                     "[STUCK SUB-AGENT] vp_id=%s outer_cap=%.0fs "
-                    "(HARD_WALL_CLOCK_CAP_SECONDS=%d) "
+                    "(wall_clock_cap=%d) "
                     "— routing to summarizer (will Read %s)",
                     vp_id_log, outer_cap,
-                    self.HARD_WALL_CLOCK_CAP_SECONDS, output_file,
+                    self.wall_clock_cap(), output_file,
                 )
                 raise StuckAgentError(
                     elapsed=outer_cap,
@@ -1990,7 +2118,10 @@ class VerificationSubAgent:
             response_dict = coding_tool.query_json(
                 prompt=prompt,
                 system_instruction=system_instruction,
-                timeout=self.HARD_WALL_CLOCK_CAP_SECONDS,
+                # 2026-11-05: the summarizer's own budget is the same
+                # per-method wall clock the attempt that got stuck was
+                # given (``wall_clock_cap()``) — not the flat hour.
+                timeout=self.wall_clock_cap(),
                 allowed_tools=[],  # summarizer has no tools
             )
         except Exception as e:
@@ -2742,6 +2873,32 @@ _WRITE_GUARD_COMMAND = (
 )
 
 
+#: The script that measures the tree before and after a tool call.
+#:
+#: Like the write guard above, its absolute path is resolved from THIS
+#: file's own directory, so the command keeps pointing at the right
+#: script no matter which checkout (or worktree) the backend runs from.
+_TREE_GUARD_SCRIPT = (
+    Path(__file__).resolve().parent / "verification_tree_guard.py"
+)
+
+#: The command that runs the tree guard — the interpreter plus the script.
+#:
+#: Both phases run *this* program; the phase travels in the environment,
+#: in front of it, because Claude Code gives a hook exactly one command
+#: per entry and the two halves have to run the same measuring code to
+#: be comparable.
+_TREE_GUARD_BASE_COMMAND = (
+    f"{shlex.quote(sys.executable)} {shlex.quote(str(_TREE_GUARD_SCRIPT))}"
+)
+
+#: The command that takes the "before" snapshot (PreToolUse).
+_TREE_GUARD_PRE_COMMAND = f"PDT_TREE_GUARD_PHASE=pre {_TREE_GUARD_BASE_COMMAND}"
+
+#: The command that takes the "after" snapshot and compares it (PostToolUse).
+_TREE_GUARD_POST_COMMAND = f"PDT_TREE_GUARD_PHASE=post {_TREE_GUARD_BASE_COMMAND}"
+
+
 _HOOK_RULES: Tuple[Dict[str, str], ...] = (
     # Basic 6 — system-level safety nets
     {
@@ -2790,7 +2947,7 @@ _HOOK_RULES: Tuple[Dict[str, str], ...] = (
         "name": "exec_path_block",
         "command": _EXT_EXEC_PATH_BLOCK,
     },
-    # Verifier write scope — 2 rules.
+    # Verifier write scope — 1 rule.
     #
     # The verification sub-agent may write inside the plan directory or a
     # temporary directory; the repository under verification is read-only
@@ -2801,18 +2958,35 @@ _HOOK_RULES: Tuple[Dict[str, str], ...] = (
     # execution sub-agents, the refiners, and every other place that
     # writes its own settings.json are unaffected.
     #
-    # One script, two matchers: the guard reads the payload and decides
-    # for itself whether it is looking at an Edit/Write or at a Bash
-    # command (``tool_input.command``).
+    # Only Edit|Write is matched. The Bash matcher that used to sit next
+    # to it (``verifier_bash_write_block``) was removed on 2026-11-05
+    # (task 17): the guard's Bash branch no longer judges anything — it
+    # always allows, because the command parser left the decision path
+    # (task 7) — so the rule only cost one Python process per Bash call.
+    # Writes that slip through are caught by measurement instead: the
+    # tree guard compares the tree before and after the call
+    # (``verification_tree_guard.py``).
     {
         "matcher": "Edit|Write",
         "name": "verifier_write_scope_block",
         "command": _WRITE_GUARD_COMMAND,
     },
+    # Tree snapshot — 1 rule.
+    #
+    # The rules above all answer "may this call happen?". None of them
+    # answers "what did the tree look like afterwards?" — that is the
+    # PostToolUse half of the tree guard, and this is its PreToolUse
+    # half: the snapshot the comparison is made against.
+    #
+    # Like the write-scope guards, it is switched on by the environment
+    # (``PDT_VP_WRITE_SCOPE`` — see ``backend/verification_tree_guard.py``),
+    # not by the rule table: a caller that declares no scope gets no
+    # snapshot at all, so the execution sub-agents, the refiners and
+    # every other place that writes its own settings.json are unaffected.
     {
-        "matcher": "Bash",
-        "name": "verifier_bash_write_block",
-        "command": _WRITE_GUARD_COMMAND,
+        "matcher": "Bash|Edit|Write",
+        "name": "tree_snapshot_pre",
+        "command": _TREE_GUARD_PRE_COMMAND,
     },
 )
 
@@ -2822,10 +2996,19 @@ class SettingsJsonBuilder:
     """Build a temporary ``settings.json`` with 11 PreToolUse security hooks.
 
     The first 9 hooks are pinned by PRD Decision Point 2 of the
-    verification sub-agent work-package; the last 2 (verifier write
-    scope) were added on 2026-11-02. Each rule is identified by a short
-    ``name`` (≤ 30 Chinese characters) and the ``command`` is a one-liner
-    shell that blocks (exit 2) or allows (exit 0) a given tool invocation.
+    verification sub-agent work-package; the next one (verifier write
+    scope) was added on 2026-11-02; the last one (tree snapshot) was
+    added on 2026-11-04. Each rule is identified by a short ``name``
+    (≤ 30 Chinese characters) and the ``command`` is a one-liner
+    shell that blocks (exit 2) or allows (exit 0) a given tool
+    invocation.
+
+    The built file also carries one **PostToolUse** entry — the second
+    half of the tree guard, which compares the tree after the call with
+    the snapshot the PreToolUse hook took before it. It is the same
+    script with ``PDT_TREE_GUARD_PHASE=post`` in front of it, and it is
+    inert unless a write scope is declared (the tree guard switches
+    itself on through ``PDT_VP_WRITE_SCOPE``).
 
     Attributes:
         vp_id: Verification-point ID, e.g. ``"VP-001"``. Used in the
@@ -2838,9 +3021,8 @@ class SettingsJsonBuilder:
             sub-agent (see :meth:`_scope_env`): it may write inside this
             directory or a temporary one, and nowhere else — the
             repository under verification is read-only for it. When it is
-            ``None`` (the default) no scope is declared, the two scope
-            guards stay inert, and the file looks exactly like it did
-            before they existed.
+            ``None`` (the default) no scope is declared, the scope guard
+            stays inert, and the tree guard takes no snapshot.
         round_no: The round this build belongs to. It decides which
             ``round-<n>/`` directory the refusal evidence lands in.
     """
@@ -2870,7 +3052,13 @@ class SettingsJsonBuilder:
         The ``env`` section carries the write scope (when there is one):
         Claude Code folds a settings file's ``env`` into the process
         environment and the hook subprocesses inherit it — that is how
-        the two scope guards learn where the writable root is.
+        the scope guard learns where the writable root is, and how
+        the tree guard learns whether it is switched on at all.
+
+        The ``PostToolUse`` section carries the second half of the tree
+        guard: the same script as the ``tree_snapshot_pre`` rule, with
+        ``PDT_TREE_GUARD_PHASE=post`` in front of it, so the tree can be
+        compared before and after the call.
 
         Returns:
             Absolute path to the temp settings file.
@@ -2879,6 +3067,7 @@ class SettingsJsonBuilder:
         settings: Dict[str, Any] = {
             "hooks": {
                 "PreToolUse": [self._rule_to_hook(r) for r in _HOOK_RULES],
+                "PostToolUse": [self._post_tool_use_hook()],
             }
         }
         scope_env = self._scope_env()
@@ -2886,6 +3075,26 @@ class SettingsJsonBuilder:
             settings["env"] = scope_env
         write_private_json(Path(path), settings)
         return path
+
+    @staticmethod
+    def _post_tool_use_hook() -> Dict:
+        """The PostToolUse entry that compares the tree after the call.
+
+        同一个脚本、同一个 matcher，只是前面多了 ``PDT_TREE_GUARD_PHASE=post``
+        —— 两个阶段必须跑同一份测量代码，比对才有意义。
+
+        它只在这个 builder 产出的文件里出现：其它子 agent 写自己的
+        settings.json（``backend/subagent_config.py``），那里一个字符都没改。
+        """
+        return {
+            "matcher": "Bash|Edit|Write",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": _TREE_GUARD_POST_COMMAND,
+                }
+            ],
+        }
 
     def _scope_env(self) -> Dict[str, str]:
         """The environment variables that declare the write scope.

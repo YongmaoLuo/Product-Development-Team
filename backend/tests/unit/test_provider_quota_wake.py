@@ -1491,7 +1491,15 @@ class TestTheAttemptAttachesIt:
             "a wall-time bound charges a quota wait for hours it did no work"
         )
         assert "_await_under_work_clock" in source
-        assert "WorkClock(self.HARD_WALL_CLOCK_CAP_SECONDS)" in source
+        # 2026-11-05 (task 14): the budget the clock is loaded with is the
+        # **per-method** wall-clock cap (``wall_clock_cap()``), not the flat
+        # class attribute — ``ui_validation`` / ``e2e`` run on 900 seconds,
+        # everything else on the flat hour.
+        assert "WorkClock(self.wall_clock_cap())" in source
+        assert "WorkClock(self.HARD_WALL_CLOCK_CAP_SECONDS)" not in source, (
+            "the flat class attribute would charge ui_validation / e2e the "
+            "whole hour again"
+        )
 
 
 

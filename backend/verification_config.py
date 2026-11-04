@@ -36,22 +36,30 @@ from typing import Any, Dict, Mapping, Optional
 # 2026-09-13: the per-VP ``timeout_seconds``
 # override was DELETED. These values are no longer per-call knobs:
 # they are surface metadata only (``vp_start`` event observability)
-# and always equal the single hard wall-clock cap,
-# ``VerificationSubAgent.HARD_WALL_CLOCK_CAP_SECONDS=3600``. The
-# actual enforcement layers are:
-#   - 1-hour outer cap: flat, no per-VP scaling
-#   - 15-min idle detector: ``coding_tool.DEFAULT_TOTAL_TIMEOUT=900``
+# and they name the wall-clock cap the method is given.
+#
+# 2026-11-05（arch 决策点 9 / 缺陷 B 第 5 条）：墙钟预算**按方法**给，
+# 不再是"所有方法同一个扁平一小时"。``ui_validation`` 与 ``e2e``
+# 原来都是 3600 —— 一个卡死的子 agent 要把整整一小时预算跑满，
+# 而那一小时里唯一在生效的判据只有"总时长到了"。这两个方法现在
+# 降到 900，并且配一个 300 秒的"无进展心跳"：没有新的工具调用 /
+# 产出就算卡死，而不是等到总时长耗尽。
+#
+# 生效层现在是三层：
+#   - 墙钟上限（按方法）：``VerificationSubAgent.wall_clock_cap()``
+#   - 无进展心跳（仅这两个方法）：``NO_PROGRESS_HEARTBEAT_SECONDS=300``
+#   - 其余方法的内层静默窗口：``coding_tool.DEFAULT_TOTAL_TIMEOUT=900``
 DEFAULT_PER_METHOD_TIMEOUT_SECONDS: Dict[str, int] = {
-    "ui_validation": 3600,
+    # 2026-11-05: 900 —— 见上方说明（配套心跳 300 秒）。
+    "ui_validation": 900,
     "code_review": 3600,
     "api_test": 3600,
     # 2026-09-18（D5 follow-up）：Phase 2 的两个方法。``full_ci`` 跑的是
-    # 整仓门禁（实跑量级在 20-30 分钟），但这里不是给它加预算 —— 上方
-    # HARD_WALL_CLOCK_CAP_SECONDS 的"扁平一小时"契约对所有方法一视同仁，
-    # 加一个更小的值只会让内层 wait_for 提前砍掉一条正在健康运行的门禁
-    # （2026-09-08 那个 ``automated_test=120`` 的 bug 就是这么来的）。
-    # 真正约束整仓命令时长的是 VP 自己的 ``ci_timeout_seconds``。
-    "e2e": 3600,
+    # 整仓门禁（实跑量级在 20-30 分钟），但这里不是给它加预算 —— 它
+    # 保留扁平一小时，真正约束整仓命令时长的是 VP 自己的
+    # ``ci_timeout_seconds``。``e2e`` 则与 ``ui_validation`` 同一条
+    # 执行路径、同一个卡死形态，所以同样收窄到 900。
+    "e2e": 900,
     "full_ci": 3600,
 }
 DEFAULT_GLOBAL_TIMEOUT_SECONDS: int = 3600

@@ -49,7 +49,10 @@ class TestTimeoutPolicyFromYamlDefaults:
         assert policy.global_default() == DEFAULT_GLOBAL_TIMEOUT_SECONDS
 
         # Spec assertion: per-method resolve still works.
-        assert policy.resolve("ui_validation") == 3600
+        # 2026-11-05（task 14）：墙钟预算按方法给 —— ui_validation / e2e 收窄到
+        # 900（配套 300s 无进展心跳），其余方法保持扁平一小时。
+        assert policy.resolve("ui_validation") == 900
+        assert policy.resolve("e2e") == 900
         assert policy.resolve("code_review") == 3600
         assert policy.resolve("automated_test") == 3600
         assert policy.resolve("api_test") == 3600
@@ -111,8 +114,10 @@ class TestTimeoutPolicyPerVPOverrideDeleted:
         policy = TimeoutPolicy.defaults()
 
         # These calls would have returned the override value before.
-        # Now: method-level resolution only → 3600.
-        assert policy.resolve("ui_validation") == 3600
+        # Now: method-level resolution only.
+        # 2026-11-05（task 14）：按方法的墙钟上限 —— ui_validation 900，
+        # 其余仍是 3600。payload 里的 timeout_seconds 依旧不参与。
+        assert policy.resolve("ui_validation") == 900
         assert policy.resolve("automated_test") == 3600
         assert policy.resolve("api_test") == 3600
 

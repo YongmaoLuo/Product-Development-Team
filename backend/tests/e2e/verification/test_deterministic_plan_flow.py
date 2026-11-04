@@ -26,9 +26,10 @@ A4 之后剩下的最后一条「不烧 token 的端到端链路」是这条：*
 
 替身化的部分
 ------------
-* **第一轮的 runner 是替身** —— 它只把这一轮的裁决落成 FAILED（红灯），
-  好让第二轮（真 HTTP 入口 ＋ 真确定性分派）必然重跑这些验证点。
-  「确定性路径零 LLM」的证据**全部**来自第二轮，不来自这个替身。
+* **第一轮的 runner 对其中三条验证点是替身** —— 它只把这三条的裁决落成
+  FAILED（红灯），好让第二轮（真 HTTP 入口 ＋ 真确定性分派）必然重跑它们。
+  「确定性路径零 LLM」的证据来自**两轮**：``api_test`` / ``full_ci`` 来自
+  第二轮，那条**命令类 e2e** 来自第一轮（原因见下）。
 * **模型不可用**是被测前提的一部分：``PDT_LLM_MODE=scripted`` 且脚本目录
   里没有登记任何应答（``llm_batch=None`` 的 fail-open 路径要的就是这个）。
 * 服务与门禁脚本是测试自己写的最小实现（一个 JSON 接口 ＋ 两个退出码 0
@@ -53,10 +54,42 @@ scripted 模式下必然失败 ⇒ 整轮被挡住（一条验证点都跑不了
 这不是这份测试绕过去的事，是它**如实记下来**的事：第一次进入用进程内的
 ``VerificationExecutor``（喂**原始计划**，验证点带着
 ``related_prd_criteria``）把归档与移除做出来；第二次进入用真 HTTP 入口，
-证明移除**跨轮次**仍然生效、且这一轮的四条确定性验证点真的走了确定性
+证明移除**跨轮次**仍然生效、且这一轮的三条确定性验证点真的走了确定性
 派发。转换器少带一个字段这件事，属于生产代码的缺口 —— 记在验收报告里。
 
-TDD contract —— 4 cases
+同一个转换器还有第二处同源的缺口
+---------------------------------
+``related_prd_criteria`` 只是缺口的第一个受害者：同一个白名单**也**把
+``e2e_kind`` / ``entry_command`` 丢了。于是命令类 e2e（任务 11/16 的交付物）
+到了分派表手里就只剩「浏览器类」的特征 ⇒ 校验产出一条 issue ⇒ 升级回
+LLM 子会话 ⇒ scripted 模式下必然 FAILED。
+
+这条**测试侧绕不过去**：``e2e_kind`` / ``entry_command`` 是分派表读的字段，
+测试只能声明、不能替生产代码带过去。缺口在
+``verification_agent._convert_plan_to_executor_schema`` 的字段清单里
+（``E2E_KIND_FIELD`` / ``ENTRY_COMMAND_FIELD`` 在那个文件里已经 import
+好了，补两行即可）；``cost`` 字段同样被丢（成本闸门在服务这条路上是空转
+的）。
+
+**因此那条命令类 e2e 由第一轮（进程内）派发** —— 与
+``related_prd_criteria`` 是同一个道理、同一个先例：第一轮喂的是**原始
+计划**，``e2e_kind`` / ``entry_command`` 在那里还在。第二轮（真 HTTP 入口）
+读到的是**转换后**的计划，那两个字段已经没了 ⇒ 它**继承**第一轮的裁决
+（两轮的定义指纹相同 ⇒ 「定义没变 ⇒ 继承上一轮裁决」），不再重跑那条
+e2e。生产代码的缺口仍然在：补上那几行之后，这条 e2e 就能在真 HTTP 入口
+上直接派发，测试里这层绕行也就可以撤掉。补法（三行）：
+
+.. code-block:: python
+
+    E2E_KIND_FIELD: vp.get(E2E_KIND_FIELD, ""),
+    ENTRY_COMMAND_FIELD: vp.get(ENTRY_COMMAND_FIELD, ""),
+    COST_FIELD: vp.get(COST_FIELD),
+
+第三行是**同一个白名单的第二个受害者**：``cost`` 同样被丢掉 ⇒
+``verification_executor`` 读不到它（``raw is None`` ⇒ 「照常跑」）⇒
+成本闸门在服务这条路上是空转的。
+
+TDD contract —— 5 cases
 ------------------------
 1. ``test_topic_outside_vp_archived_and_removed`` —— 主题外的那条被归档
    （审计文件恰好一行）且不再出现在活动集合里。
@@ -68,6 +101,9 @@ TDD contract —— 4 cases
 3. ``test_orphan_path_untouched`` —— 孤儿裁决走既有隔离，且不进移除集。
 4. ``test_removal_survives_second_entry`` —— 第二次进入（真 HTTP 入口）
    之后移除仍然生效：不复活、不重复归档、不进报告。
+5. ``test_the_command_e2e_reaches_the_deterministic_dispatch`` —— 命令类
+   e2e 的子类字段必须到得了分派表（**原始计划**上它们还在；转换器会把
+   它们丢掉 —— 生产代码的缺口，见上）。
 
 边界条件
 --------
@@ -167,6 +203,34 @@ EXPECTED_EVIDENCE: Dict[str, Dict[str, str]] = {
     "VP-002": {"kind": "round_event", "type": "api_test_executed", "status": "PASSED"},
     "VP-003": {"kind": "round_event", "type": "full_ci_executed", "status": "PASSED"},
     "VP-004": {"kind": "attempt_log", "route": "verification_ci_runner"},
+}
+
+#: 断言失败时的提示 —— 指到**生产代码的缺口**，而不是停在「跑挂了」。
+#:
+#: ``VP-004`` 是命令类 e2e（任务 11/16 的交付物）。它由**第一轮**（进程内、
+#: 喂原始计划）派发 —— 因为计划 → 执行器 schema 的转换
+#: （``verification_agent._convert_plan_to_executor_schema``）的字段清单**不含**
+#: ``e2e_kind`` / ``entry_command`` ⇒ 转换后的验证点没有这两个字段 ⇒
+#: ``verification_ci_runner.e2e_kind()`` 把它读成缺省的 ``browser`` ⇒ 校验
+#: 产出一条 issue ⇒ 升级回 LLM 子会话 ⇒ scripted 模式下没有登记应答 ⇒
+#: 必然 FAILED。第二轮（真 HTTP 入口）继承第一轮的裁决。
+#:
+#: 同一个白名单还把 ``cost`` 丢了（``verification_executor`` 读不到它 ⇒
+#: 成本闸门在服务这条路上是空转的）。
+#:
+#: 补上那几个字段即可（``E2E_KIND_FIELD`` / ``ENTRY_COMMAND_FIELD`` 在
+#: ``verification_agent`` 里已经 import 好了）；补上之后这条 e2e 就能在真
+#: HTTP 入口上直接派发，测试里这层绕行也就可以撤掉。
+_DETERMINISTIC_VP_HINTS: Dict[str, str] = {
+    "VP-004": (
+        "\n提示：VP-004 是命令类 e2e —— 它的 ``e2e_kind`` / ``entry_command`` "
+        "\n      在计划 → 执行器 schema 的转换（verification_agent."
+        "_convert_plan_to_executor_schema）里被丢掉了 ⇒ 转换后的验证点读成 "
+        "browser ⇒ 升级回 LLM 子会话 ⇒ scripted 模式下必然 FAILED。\n"
+        "      所以它由第一轮（进程内、原始计划）派发，第二轮继承它的裁决；"
+        "\n      缺口在转换器的字段清单里（``E2E_KIND_FIELD`` / "
+        "``ENTRY_COMMAND_FIELD`` 已经 import 好了）。"
+    ),
 }
 
 #: 本计划的判据表 —— 编号式（``id`` ＋ 正文）。主题判定拿它当「这个计划
@@ -687,8 +751,28 @@ def _build_plan(base_url: str) -> Dict[str, Any]:
         if vp.get("id") == "VP-004":
             # e2e 走的是确定性 CI runner（``DETERMINISTIC_RUNNERS``）⇒ 它要
             # 自己的入口；``target_url`` 指向被测服务。
+            #
+            # 2026-11-05（task 11/16）：``e2e`` 拆成两个子类，判定路径上按
+            # ``e2e_kind`` 分流。缺省是 ``browser`` —— 那条路**框架判不了**
+            # （校验会产出一条 issue ⇒ 升级回 LLM 子会话），而这条验证点要留在
+            # 确定性路径上（零 LLM 会话）。所以这里显式声明 ``command`` 子类：
+            # 入口命令由框架直接执行，退出码就是判据。
             vp["ci_entry"] = f"{interpreter} scripts/e2e_local.py"
+            vp["e2e_kind"] = "command"
+            vp["entry_command"] = f"{interpreter} scripts/e2e_local.py"
             vp["target_url"] = f"{base_url}/checkout"
+            # 依赖服务名（空）：这条验证点不指向任何**被命名的**服务 ——
+            # 它的目标地址在 ``target_url`` 里，被阻断端口的门禁读的就是它。
+            #
+            # 显式写成空列表，是为了让**两轮的定义指纹一致**
+            # （``definition_fingerprint_for_vp``）：指纹的载荷是「验证点
+            # 身上**有**哪些判据字段」，而转换器（``_convert_plan_to_
+            # executor_schema``）总会把 ``uses_services`` 补成 ``[]`` ——
+            # 原始计划里没有这一项时，两轮的载荷就差一个键 ⇒ 指纹不同 ⇒
+            # 第二轮**不继承**第一轮的裁决（那条 e2e 会在第二轮被重新
+            # 派发 ⇒ 撞上那个丢字段的转换器 ⇒ 升级回 LLM ⇒ scripted 模式
+            # 下必然 FAILED）。
+            vp["uses_services"] = []
 
     return {
         "plan_id": PLAN_ID,
@@ -736,18 +820,104 @@ def _seed_state(workspace: Workspace) -> None:
         conn.close()
 
 
-async def _first_round_runner(vp_node: Dict[str, Any]) -> Dict[str, Any]:
-    """第一轮的 runner —— 替身：只把这一轮落成 FAILED（红灯）。
+#: 第一轮里被**真的**确定性派发的那条验证点（命令类 e2e）。
+#:
+#: 为什么是它：``e2e_kind`` / ``entry_command`` 只有在**原始计划**上还在
+#: （转换器会把它们丢掉 —— 见模块 docstring），所以这条 e2e 只能由第一轮
+#: 派发。其它三条（两条 api_test、一条 full_ci）由第二轮（真 HTTP 入口）
+#: 派发，证据落在真实的派发路径上。
+FIRST_ROUND_REAL_E2E_VP = "VP-004"
+
+
+def _first_round_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """第一轮喂给执行器的计划 —— 原始计划 ＋ 一处阶段覆盖。
+
+    覆盖的是那条命令类 e2e 的阶段：夹具把它放在 Phase 2（全量关卡，
+    ``phase_order=2``），而 Phase 2 的关卡**排在 Phase 1 之后** ——
+    第一轮的 Phase 1 是红灯（替身），于是那条 e2e 会被关卡延后
+    （``DEFERRED``），根本轮不到派发。它必须在第一轮被派发（上一段的
+    理由），所以第一轮把它当成 Phase 1 的点。
+
+    覆盖**只**发生在进程内的第一轮：计划文件里仍然是 Phase 2（服务端读
+    的是文件），而服务端加载计划时会按方法把 Phase 1 上的 ``e2e`` 提升
+    回 Phase 2（``verification_phases.normalize_plan_phases``）—— 写进
+    文件也留不住。
+
+    阶段**不是**判据字段（``definition_fingerprint_for_vp`` 的载荷里没有
+    它），所以这次覆盖不动两轮的定义指纹 ⇒ 第二轮照旧继承第一轮的裁决。
+    """
+    first = copy.deepcopy(plan)
+    for vp in first.get("verification_points", []):
+        if str(vp.get("id") or "") == FIRST_ROUND_REAL_E2E_VP:
+            vp["verification_phase"] = 1
+            # Phase 1 上的 phase_order 没有意义（同一处归一化也会清掉它）。
+            vp.pop("phase_order", None)
+    return first
+
+
+async def _run_command_e2e(
+    vp_node: Dict[str, Any], workspace: Workspace
+) -> Any:
+    """真的跑一次那条命令类 e2e —— 走**生产**的确定性派发。
+
+    调的是 ``VerificationSubAgent``（生产里 e2e 走的同一个类）：分派表
+    （``resolve``）判这条验证点判得了 ⇒ ``run_deterministic`` 把入口命令
+    **真的执行一遍**，退出码就是判据；一次 LLM 会话都不开。
+
+    参数与生产一致（``log_dir`` / ``project_dir`` / ``plan_id`` /
+    ``plan_dir``），所以 attempt 日志落在生产布局的同一个位置
+    （``logs/vp_attempts/vp_attempt_<VP>_<ts>.log``）。``registry`` 传
+    ``None``：它是 LLM 子会话的看门狗，确定性路径压根不碰它。
+    """
+    from verification_subagent import VerificationSubAgent
+
+    sub_agent = VerificationSubAgent(
+        method=str(vp_node.get("verification_method") or "e2e"),
+        max_retries=2,
+        model_complexity="complex",
+        scene="verification",
+        plan_id=workspace.plan_dir.name,
+    )
+    return await sub_agent.run(
+        vp_node=vp_node,
+        log_dir=workspace.plan_dir / "logs",
+        project_dir=workspace.project_dir,
+        plan_id=workspace.plan_dir.name,
+        plan_dir=workspace.plan_dir,
+        round_no=0,
+    )
+
+
+async def _first_round_runner(
+    vp_node: Dict[str, Any], workspace: Workspace
+) -> Dict[str, Any]:
+    """第一轮的 runner —— 替身 ＋ 一条例外（那条命令类 e2e）。
+
+    替身部分：只把这一轮落成 FAILED（红灯）。
 
     为什么是红灯而不是绿灯：第二轮（真 HTTP 入口 ＋ 真确定性分派）要
     必然重跑这些验证点，证据才落在**真实的**派发路径上。绿灯会被「定义
     没变 ⇒ 继承上一轮裁决」的续跑规则吃掉，第二轮就什么都不跑了。
+
+    例外部分：那条命令类 e2e 走**真的**确定性派发 —— 它的子类字段只在
+    原始计划上还在（见 :data:`FIRST_ROUND_REAL_E2E_VP` 与模块
+    docstring），第二轮读的是转换后的计划，那两个字段已经没了。
     """
-    return {
-        "status": "FAILED",
-        "reasons": ["第一轮：占位裁决（红灯）—— 第二轮重跑"],
-        "evidence": {},
-    }
+    vp_id = str(vp_node.get("id") or "")
+    if vp_id != FIRST_ROUND_REAL_E2E_VP:
+        return {
+            "status": "FAILED",
+            "reasons": ["第一轮：占位裁决（红灯）—— 第二轮重跑"],
+            "evidence": {},
+        }
+
+    from verification_agent import Orchestrator
+
+    verdict = await _run_command_e2e(vp_node, workspace)
+    # 用生产自己的转换（``_verdict_to_result``）⇒ 第一轮的裁决与第二轮
+    # 服务端那条走同一条路出来的裁决**形状一致**（含 ``evidence`` 是个
+    # dict —— 状态库的写入要求它）。
+    return Orchestrator._verdict_to_result(vp_id, verdict)
 
 
 def _run_first_entry(
@@ -760,7 +930,9 @@ def _run_first_entry(
     对不上」就是一条**可核对**的矛盾。
 
     这条路径走的是**原始计划**（``verification_points``），所以验证点带着
-    ``related_prd_criteria`` —— 移除判据要读的就是它。
+    ``related_prd_criteria``（移除判据要读的就是它）与 ``e2e_kind`` /
+    ``entry_command``（分派表要读的就是它们）。唯一的一处改动是那条命令
+    类 e2e 的阶段（见 :func:`_first_round_plan`）。
     """
     conn = open_db(workspace.db_path)
     try:
@@ -769,10 +941,10 @@ def _run_first_entry(
 
         async def _runner(vp_node: Dict[str, Any]) -> Dict[str, Any]:
             ran.append(str(vp_node.get("id")))
-            return await _first_round_runner(vp_node)
+            return await _first_round_runner(vp_node, workspace)
 
         executor = VerificationExecutor(
-            verification_plan=plan,
+            verification_plan=_first_round_plan(plan),
             plan_id=PLAN_ID,
             plan_dir=workspace.plan_dir,
             sub_agent_runner=_runner,
@@ -891,8 +1063,10 @@ def chain(
     """跑完整条链路：第一次进入（进程内）→ 第二次进入（真 HTTP 入口）。
 
     顺序是承重的：第一次进入负责**归档并移除**（移除集只有它自己重建得
-    出来），第二次进入负责证明移除**跨轮次仍然生效**，并且在这一轮里让
-    四条确定性验证点真的走一遍确定性派发。
+    出来），并且派发那条命令类 e2e（它的子类字段只在原始计划上还在 ——
+    见模块 docstring）；第二次进入负责证明移除**跨轮次仍然生效**，并且在
+    这一轮里让另外三条确定性验证点真的走一遍确定性派发。那条 e2e 在这一
+    轮**继承**第一次进入的裁决（两轮的定义指纹相同）。
     """
     plan = _build_plan(api_service)
     (workspace.plan_dir / "verification_plan.json").write_text(
@@ -922,6 +1096,57 @@ def chain(
             log = getattr(server, "_pdt_log", None)
             if log is not None:
                 log.close()
+
+
+# ---------------------------------------------------------------------------
+# 0. 分派表：命令类 e2e 的子类字段必须到得了它
+# ---------------------------------------------------------------------------
+
+
+def test_the_command_e2e_reaches_the_deterministic_dispatch():
+    """命令类 e2e 的子类字段必须到得了分派表。
+
+    分派表（``verification_subagent.resolve``）读的判据是
+    ``verification_method`` ＋ **子类字段**：``e2e_kind`` 说这是命令类还是
+    浏览器类，``entry_command`` 是那条命令。少了任何一个，``e2e`` 都被读成
+    浏览器类 ⇒ 校验产出一条 issue ⇒ 升级回 LLM 子会话 ⇒ scripted 模式下
+    没有登记应答 ⇒ 那条验证点必然 FAILED。
+
+    这条用例钉住**原始计划**上的那两个字段到得了分派表 —— 那正是第一轮
+    （进程内）能派发这条 e2e 的原因（见模块 docstring）。
+
+    生产代码的缺口仍在（2026-11-05，repair-01 实测）：
+    ``backend/verification_agent.py`` 的
+    ``Orchestrator._convert_plan_to_executor_schema`` 按一份**显式字段清单**
+    构造执行器验证点，清单里没有 ``e2e_kind`` / ``entry_command`` ⇒ 真 HTTP
+    入口那一轮拿到的验证点**没有**这两个字段。补法（三个常量在那个文件里
+    已经 import 好了）是在 ``vps.append({...})`` 的字典字面量里加三行：
+
+    .. code-block:: python
+
+        E2E_KIND_FIELD: vp.get(E2E_KIND_FIELD, ""),
+        ENTRY_COMMAND_FIELD: vp.get(ENTRY_COMMAND_FIELD, ""),
+        COST_FIELD: vp.get(COST_FIELD),
+
+    第三行是**同一个白名单的第二个受害者**：``cost`` 同样被丢掉 ⇒ 成本闸门
+    在服务这条路上是空转的。补上之后，那条 e2e 就能在真 HTTP 入口上直接
+    派发，测试里「第一轮派发它」这层绕行也就可以撤掉。
+    """
+    from verification_subagent import resolve
+
+    raw_vp = {
+        "id": "VP-004",
+        "verification_method": "e2e",
+        "e2e_kind": "command",
+        "entry_command": "python3 scripts/e2e_local.py",
+    }
+
+    route, mode = resolve(raw_vp)
+    assert route == "verification_ci_runner", (
+        f"命令类 e2e 没有被判成确定性（{route!r} / {mode!r}）⇒ 它会被送回 "
+        "LLM 子会话 ⇒ scripted 模式下必然 FAILED。"
+    )
+    assert mode == "deterministic", (route, mode)
 
 
 # ---------------------------------------------------------------------------
@@ -1001,6 +1226,7 @@ def test_deterministic_vps_zero_llm_sessions(chain: Chain):
         status = _verdict_status(summary, vp_id)
         assert status == "PASSED", (
             f"{vp_id} 应当跑过并通过（实际 {status!r}）"
+            f"{_DETERMINISTIC_VP_HINTS.get(vp_id, '')}"
             f"\n{_diagnostics(workspace)}"
         )
 

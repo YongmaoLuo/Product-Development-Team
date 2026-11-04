@@ -51,6 +51,16 @@
 
 被跳过的验证点同样要能查证：报告里写了「跳过」，就必须出现在
 ``skipped_items[]`` 里 —— 否则「跳过」和「没跑过」在报告里长得一模一样。
+
+成本跳过
+--------
+成本闸（缺陷 B 第 4 条）把「执行它会让被验证产品真的调用 provider」的
+验证点默认挡下，记一条 ``DEFERRED`` 裁决。``DEFERRED`` 的意思是「这轮
+没跑」，**不是**「跑挂了」—— 两者混在一起，操作者会把「没花钱」读成
+「失败」，然后去修一条根本没跑过的验证点。
+
+所以报告给它们单列一节（见 :func:`_cost_deferred_rows`），不混进失败
+清单；没有这类验证点时整节省略 —— 旧报告逐字节不变。
 """
 
 from __future__ import annotations
@@ -156,6 +166,26 @@ _REPAIR_DETAIL_KEYS = (
 _VP_HEADER = ("VP", "计划书条目", "状态", "说明")
 _REVIEW_HEADER = ("条目", "审核状态", "说明")
 _REPAIR_HEADER = ("修复任务", "验证点", "状态", "说明")
+
+#: 「因成本跳过」小节的表头。
+_COST_DEFERRED_HEADER = ("VP", "成本", "原因")
+
+#: 「因成本跳过」小节的标题（渲染时前面加 ``##``）。
+COST_DEFERRED_SECTION_TITLE = "因成本跳过（DEFERRED）"
+
+#: 报告里可能装着验证点结论的字段（按优先级）。
+#:
+#: 三套叫法都真实存在：``verification_results`` 是执行器写回报告的标准字段，
+#: ``results`` 是判断阶段 LLM schema 的字段名，``verification_points`` 是
+#: 计划侧的验证点（执行之后状态会落回它）。三处都可能出现 ``DEFERRED`` ——
+#: 全读，按 VP id 合并。
+_COST_DEFERRED_FIELDS = ("verification_results", "results", "verification_points")
+
+#: 「因成本跳过」的状态值（大写比较）。
+_COST_DEFERRED_STATUS = "DEFERRED"
+
+#: 原因字段（``reasons`` 之外的单值候选）。
+_COST_REASON_KEYS = ("reason", "detail", "details", "message", "summary", "note", "notes")
 
 #: 报告里列出「被跳过」的验证点 id 的字段。
 #:
@@ -361,6 +391,103 @@ def _repair_rows(repair_rows: Sequence[Mapping[str, Any]]) -> List[List[str]]:
 
     prepared.sort(key=lambda row: (row[0], row[1], row[2], row[3]))
     return [[_escape(value or _MISSING_CELL) for value in row] for row in prepared]
+
+
+def _cost_deferred_entries(report: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    """报告里状态为 ``DEFERRED`` 的验证点条目（按字段优先级，未去重）。
+
+    :param report: 报告 JSON。
+    :return: 条目列表（每条是一个 mapping）。
+    """
+    entries: List[Mapping[str, Any]] = []
+    for field in _COST_DEFERRED_FIELDS:
+        container = report.get(field)
+        if not isinstance(container, (list, tuple)):
+            continue
+        for entry in container:
+            if not isinstance(entry, Mapping):
+                continue
+            if _text(entry.get("status")).upper() != _COST_DEFERRED_STATUS:
+                continue
+            entries.append(entry)
+    return entries
+
+
+def _cost_value(entry: Mapping[str, Any]) -> str:
+    """一条验证点声明的成本。
+
+    先看条目自己的 ``cost`` 字段（计划侧声明的），再看裁决证据里的
+    ``evidence.cost``（执行侧写回的）；两处都缺就留空（渲染成 ``—``）——
+    不猜成本。
+
+    :param entry: 报告里的一条验证点结论。
+    :return: 成本文本（可能为空串）。
+    """
+    cost = _text(entry.get("cost"))
+    if cost:
+        return cost
+    evidence = entry.get("evidence")
+    if isinstance(evidence, Mapping):
+        return _text(evidence.get("cost"))
+    return ""
+
+
+def _reason_text(entry: Mapping[str, Any]) -> str:
+    """一条验证点结论的原因文本。
+
+    ``reasons`` 是列表就按 ``"; "`` 连起来；是单个字符串就原样用；都没有
+    就退回单值字段（``reason`` / ``detail`` / ...）。
+
+    :param entry: 报告里的一条验证点结论。
+    :return: 原因文本（可能为空串）。
+    """
+    reasons = entry.get("reasons")
+    if isinstance(reasons, (list, tuple)):
+        parts = [_text(item) for item in reasons]
+        parts = [part for part in parts if part]
+        if parts:
+            return "; ".join(parts)
+    elif isinstance(reasons, str):
+        text = reasons.strip()
+        if text:
+            return text
+    return _first_text(entry, _COST_REASON_KEYS)
+
+
+def _cost_deferred_rows(report: Mapping[str, Any]) -> List[List[str]]:
+    """「因成本跳过（DEFERRED）」小节的数据行（已转义、按 VP id 排序）。
+
+    ``DEFERRED`` 的意思是「这轮没跑」—— 它**不是**失败。成本闸把「执行
+    这个验证点会烧 provider 配额」的验证点挡下，操作者必须一眼看出「没
+    花钱」与「跑挂了」的区别，所以这些条目单独成节，不混进失败清单。
+
+    同一条验证点可能同时出现在报告的几个字段里（计划侧给 ``cost``，执行
+    侧给 ``reasons``）—— 按 VP id 合并，字段互补。
+
+    :param report: 报告 JSON。
+    :return: 数据行列表（每行三格：VP / 成本 / 原因）。
+    """
+    merged: Dict[str, Tuple[str, str, str]] = {}
+    for index, entry in enumerate(_cost_deferred_entries(report)):
+        vp_id = _text(entry.get("id")) or _text(entry.get("vp_id"))
+        key = vp_id or f"#{index}"
+        cost = _cost_value(entry)
+        reason = _reason_text(entry)
+        known = merged.get(key)
+        if known is None:
+            merged[key] = (vp_id, cost, reason)
+        else:
+            merged[key] = (known[0], known[1] or cost, known[2] or reason)
+
+    rows = sorted(merged.values(), key=lambda row: (row[0], row[1], row[2]))
+    return [
+        [
+            _escape(row[0] or _MISSING_CELL),
+            _escape(row[1] or _MISSING_CELL),
+            _escape(row[2] or _MISSING_CELL),
+        ]
+        for row in rows
+    ]
 
 
 def _table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
@@ -661,6 +788,11 @@ def render(
     输出结构固定，「最终结论」与「验证点结果」两节恒在；「审核状态」与
     「修复任务」两节**没有内容时整节省略** —— 空表不携带信息。
 
+    「因成本跳过（DEFERRED）」一节只在**确实有被成本闸挡下的验证点**时
+    出现：没被挡下就不该占一节。它单列的原因是 ``DEFERRED`` 是「这轮
+    没跑」而不是「跑挂了」—— 两者混在一起，操作者会把「没花钱」读成
+    「失败」。
+
     「回溯问题」一节只在**给了机器计划 / 计划书且确实查出问题**时出现：
     没给就不查（无从查起），查了没问题就不渲染（空节不携带信息）。
     """
@@ -674,6 +806,15 @@ def render(
         "## 最终结论\n" + _escape(_final_verdict(report)),
         "## 验证点结果\n" + _table(_VP_HEADER, _vp_rows(report, items)),
     ]
+
+    deferred_rows = _cost_deferred_rows(report)
+    if deferred_rows:
+        sections.append(
+            "## "
+            + COST_DEFERRED_SECTION_TITLE
+            + "\n"
+            + _table(_COST_DEFERRED_HEADER, deferred_rows)
+        )
 
     review_rows = _review_rows(reviews)
     if review_rows:

@@ -263,9 +263,11 @@ class TestExecutionProfileGroupsPartitionByMethod:
 
         summed = sum(g["duration_seconds"] for g in profile["group_profiles"])
         assert profile["total_duration_sec"] == summed
-        # 2 * 3600 + 1 * 3600 = 7200 + 3600 = 10800
-        # 2026-09-08: raised from 120 → 3600 (1-hour outer cap)
-        assert profile["total_duration_sec"] == 10800
+        # 2 * 3600 + 1 * 900 = 7200 + 900 = 8100
+        # 2026-09-08: raised from 120 → 3600 (1-hour outer cap).
+        # 2026-11-05 (task 14): ui_validation 降到 900（配套 300s 无进展心跳），
+        # 其余方法保持扁平一小时 —— 于是同一个计划的总时长不再是一个常数。
+        assert profile["total_duration_sec"] == 8100
 
     def test_execution_profile_per_method_timeouts_includes_used_methods(self):
         """The ``per_method_timeouts`` map must carry every method seen."""
@@ -277,7 +279,9 @@ class TestExecutionProfileGroupsPartitionByMethod:
         gen = ExecutionProfileGenerator(_make_plan(vps))
         profile = gen.build()
 
-        assert profile["per_method_timeouts"]["ui_validation"] == 3600
+        # 2026-11-05 (task 14)：墙钟预算按方法给 —— ui_validation 900，
+        # 其余方法（这里 automated_test 已退役，走全局缺省）仍是 3600。
+        assert profile["per_method_timeouts"]["ui_validation"] == 900
         assert profile["per_method_timeouts"]["automated_test"] == 3600
 
     def test_execution_profile_groups_preserve_first_seen_order(self):

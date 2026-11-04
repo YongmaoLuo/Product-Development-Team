@@ -65,10 +65,35 @@ stdout/stderr 的**头尾**附在 verdict 的 evidence 里、原始输出落盘
 INCONCLUSIVE 不是「过了」，也不是「代码坏了」—— 门禁没有判，它只说明这次
 运行没跑完。把它写成 FAILED 会让修复循环去改一个没被证明有缺陷的交付物。
 
-
-
 一次**什么也没说**的退出 3（门禁没有打印 summary）仍然是 FAILED：没有
 声明可读，历史判定不动 —— 两侧对这一条的判断一致。
+
+e2e 的两个子类（2026-11-04，arch 决策点 7）
+-------------------------------------------
+``e2e`` 以前只有一种意思：「真开浏览器」。于是本地 CLI / 服务级的端到端
+也得起一个 LLM 子会话去驱动一个它根本没有的浏览器 —— 判定落在子 agent 的
+自报上，而自报不可复跑。现在按 ``e2e_kind`` 分流：
+
+* ``e2e_kind: "command"`` —— 声明一条 ``entry_command``，**由框架直接
+  执行**，判定是退出码的纯函数（与 ``full_ci`` 同一档，不起 LLM）：
+
+  ::
+
+      {
+        "id": "VP-009",
+        "verification_method": "e2e",
+        "e2e_kind": "command",
+        "entry_command": "python -m pytest tests/e2e/test_cli.py -q"
+      }
+
+* ``e2e_kind: "browser"``（**缺省**）—— 保留现状：由子 agent 驱动真实
+  浏览器。**框架判不了它**，所以 :func:`validate_vp` 对它返回 issue，
+  上层据此 ESCALATE 回 LLM 子 agent —— 浏览器走查本来就该在那儿。
+
+两类的**判定依据**是同一件事：一条命令的退出码。所以它们共用这一个 runner
+和同一份裁决契约，差别只在**谁来判**：command 类由框架判，browser 类由
+子 agent 判。缺省是 browser，是为了让拆分之前写的计划（``target_url``
+走浏览器）行为一个字没变。
 
 三态（2026-10-31，VP-020）
 --------------------------
@@ -161,6 +186,30 @@ STATUS_INCONCLUSIVE = "INCONCLUSIVE"
 
 #: The one field a ``full_ci`` VP must declare.
 CI_ENTRY_FIELD = "ci_entry"
+
+#: The verification method that has **two sub-classes** (2026-11-04，arch
+#: 决策点 7 —— e2e 与 UI 解耦）。
+#:
+#: ``e2e`` 以前只有一种意思：「真开浏览器」。于是本地 CLI / 服务级的端到端
+#: 也得起一个 LLM 子会话去驱动一个它根本没有的浏览器，判定落在子 agent 的
+#: 自报上。拆成两类之后：
+#:
+#: * :data:`E2E_KIND_BROWSER` —— 保留现状：子 agent 驱动真实浏览器。
+#: * :data:`E2E_KIND_COMMAND` —— 声明一条入口命令，**框架直接执行**，
+#:   判定是退出码的纯函数（与 ``full_ci`` 同一档，不起 LLM）。
+E2E_METHOD = "e2e"
+
+#: The field that names which sub-class an ``e2e`` VP is.
+E2E_KIND_FIELD = "e2e_kind"
+
+#: The browser sub-class —— the sub-agent's job, not the framework's.
+E2E_KIND_BROWSER = "browser"
+
+#: The command sub-class —— the framework runs the entry and reads the exit code.
+E2E_KIND_COMMAND = "command"
+
+#: The field a ``command`` sub-class declares its entry in.
+ENTRY_COMMAND_FIELD = "entry_command"
 
 #: Ceiling for a full CI gate. A whole-repo nightly run is measured in
 #: tens of minutes (a whole workspace build plus the full test suite), so
@@ -620,6 +669,80 @@ def _collect_referenced_paths(tokens: List[str], base: str) -> List[str]:
     return out
 
 
+def e2e_kind(vp: Any) -> str:
+    """Which sub-class is this ``e2e`` verification point?
+
+    ``browser`` unless the VP says ``command``.  The default is what
+    keeps the plans that were written before the split working the way
+    they did: an ``e2e`` point that names a ``target_url`` is a browser
+    flow, and a browser flow is the sub-agent's job.
+
+    An unknown value is read as ``browser`` too: the framework cannot
+    judge a browser flow, so the safe reading is the one that sends the
+    point back to the sub-agent that can.
+    """
+    if not isinstance(vp, dict):
+        return E2E_KIND_BROWSER
+    kind = str(vp.get(E2E_KIND_FIELD) or "").strip().lower()
+    if kind == E2E_KIND_COMMAND:
+        return E2E_KIND_COMMAND
+    return E2E_KIND_BROWSER
+
+
+def _validate_e2e_vp(
+    vp: Dict[str, Any], *, vp_id: str, project_dir: Optional[Path],
+) -> List[SchemaIssue]:
+    """The schema rules of the two ``e2e`` sub-classes.
+
+    * **command** —— the framework runs the entry and grades the exit
+      code.  The entry may name a single test file: that is what an
+      end-to-end point *is*, so the anti-narrowing check does not apply
+      here (it exists to stop a whole-repo gate from decaying into one
+      test case).
+    * **browser** —— the sub-agent drives the real browser.  **The
+      framework cannot judge it**, so this returns an issue and the
+      caller escalates back to the LLM path — which is exactly where a
+      browser flow belongs.
+    """
+    if e2e_kind(vp) == E2E_KIND_COMMAND:
+        return _validate_command_e2e_vp(
+            vp, vp_id=vp_id, project_dir=project_dir,
+        )
+    return [SchemaIssue(
+        vp_id,
+        f"e2e({E2E_KIND_BROWSER}) 由子 agent 驱动真实浏览器，框架判不了："
+        f"要由框架直接执行就声明 `e2e_kind: \"{E2E_KIND_COMMAND}\"` "
+        f"和一条 `{ENTRY_COMMAND_FIELD}`。",
+    )]
+
+
+def _validate_command_e2e_vp(
+    vp: Dict[str, Any], *, vp_id: str, project_dir: Optional[Path],
+) -> List[SchemaIssue]:
+    """The ``command`` sub-class: one entry command, graded on its exit code."""
+    issues: List[SchemaIssue] = []
+    entry = vp.get(ENTRY_COMMAND_FIELD)
+    if not isinstance(entry, str) or not entry.strip():
+        issues.append(SchemaIssue(
+            vp_id,
+            f"e2e({E2E_KIND_COMMAND}) 要求一条非空的 "
+            f"'{ENTRY_COMMAND_FIELD}' 字符串 —— "
+            f"判定依据就是这条入口的退出码",
+        ))
+        return issues
+
+    if project_dir is not None:
+        root = Path(project_dir)
+        for rel in _referenced_paths(entry.strip(), root):
+            if not (root / rel).exists():
+                issues.append(SchemaIssue(
+                    vp_id,
+                    f"{ENTRY_COMMAND_FIELD} 引用的路径不存在：{rel}",
+                ))
+
+    return issues
+
+
 def validate_vp(vp: Any, *, project_dir: Optional[Path] = None) -> List[SchemaIssue]:
     """Return every schema problem that makes this VP unrunnable.
 
@@ -632,11 +755,19 @@ def validate_vp(vp: Any, *, project_dir: Optional[Path] = None) -> List[SchemaIs
     names a repo script that does not exist cannot pass, and finding that
     out at plan time is far cheaper than finding it out after a 40-minute
     round.
+
+    **The two ``e2e`` sub-classes are judged by different rules** (the
+    dispatch is on ``verification_method``).  See :func:`_validate_e2e_vp`
+    for why a browser flow is an *issue* here rather than something this
+    runner grades.
     """
     issues: List[SchemaIssue] = []
     if not isinstance(vp, dict):
         return [SchemaIssue("unknown", f"VP is {type(vp).__name__}, expected an object")]
     vp_id = str(vp.get("id", "unknown"))
+
+    if str(vp.get("verification_method") or "").strip() == E2E_METHOD:
+        return _validate_e2e_vp(vp, vp_id=vp_id, project_dir=project_dir)
 
     entry = vp.get(CI_ENTRY_FIELD)
     if not isinstance(entry, str) or not entry.strip():
@@ -666,6 +797,19 @@ def validate_vp(vp: Any, *, project_dir: Optional[Path] = None) -> List[SchemaIs
                 ))
 
     return issues
+
+
+def _entry_of(vp: Dict[str, Any]) -> str:
+    """The command this runner will run for ``vp``.
+
+    ``full_ci`` runs ``ci_entry``; an ``e2e`` command point runs
+    ``entry_command``.  The two are the same kind of thing — a command
+    whose exit code *is* the verdict — so they share one runner and one
+    verdict contract.
+    """
+    if str(vp.get("verification_method") or "").strip() == E2E_METHOD:
+        return str(vp.get(ENTRY_COMMAND_FIELD) or "").strip()
+    return str(vp.get(CI_ENTRY_FIELD) or "").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -1266,11 +1410,17 @@ def run_ci_verification(
     project_dir: Path,
     artifact_dir: Optional[Path] = None,
 ) -> CiRunResult:
-    """Run one ``full_ci`` gate and grade it on the exit code.
+    """Run one ``full_ci`` gate (or one ``e2e`` command entry) and grade it
+    on the exit code.
 
     Deterministic end to end — same tree, same entry, same verdict, every
     round. Never raises: a broken entry is a FAILED verdict carrying the
     reason, not an exception the round has to survive.
+
+    The two kinds share this runner because they are the same kind of
+    thing: **a command whose exit code is the verdict**.  A ``full_ci`` VP
+    runs its ``ci_entry``; an ``e2e`` command point runs its
+    ``entry_command`` — and neither of them opens an LLM session.
     """
     vp_id = str(vp.get("id", "unknown"))
     result = CiRunResult()
@@ -1284,7 +1434,12 @@ def run_ci_verification(
         }
         return result
 
-    entry = str(vp[CI_ENTRY_FIELD]).strip()
+    entry = _entry_of(vp)
+    # The label and the evidence key name the kind of entry that ran, so
+    # a reader is never told a command point ran a whole-repo gate.
+    is_e2e = str(vp.get("verification_method") or "").strip() == E2E_METHOD
+    label = E2E_METHOD if is_e2e else "full_ci"
+    entry_key = ENTRY_COMMAND_FIELD if is_e2e else CI_ENTRY_FIELD
     project_dir = Path(project_dir)
     timeout = ci_timeout(vp, project_dir=project_dir, entry=entry)
     declared_budget = gate_budget_seconds(project_dir, entry)
@@ -1384,7 +1539,7 @@ def run_ci_verification(
 
     evidence: Dict[str, Any] = {
         "vp_id": vp_id,
-        "ci_entry": entry,
+        entry_key: entry,
         "exit_code": exit_code,
         "timed_out": timed_out,
         "duration_seconds": round(duration, 2),
@@ -1437,7 +1592,7 @@ def run_ci_verification(
     if not timed_out and not error and exit_code == 0:
         result.status = STATUS_PASSED
         result.reasons = [
-            f"[full_ci] `{entry}` 退出码 0（用时 {duration:.0f}s）"
+            f"[{label}] `{entry}` 退出码 0（用时 {duration:.0f}s）"
         ]
     elif could_not_decide and not blocking_failures:
         # The gate could not decide.  That is not a verdict about the
@@ -1446,7 +1601,7 @@ def run_ci_verification(
         # out of time has not proven a deliverable defective.
         result.status = STATUS_INCONCLUSIVE
         result.reasons = [
-            f"[full_ci] `{entry}` "
+            f"[{label}] `{entry}` "
             + _inconclusive_reason(
                 exit_code=exit_code,
                 gate_verdict=gate_verdict,
@@ -1494,7 +1649,7 @@ def run_ci_verification(
         if signal:
             evidence["signal"] = signal
         result.reasons = [
-            f"[full_ci] `{entry}` {detail}（用时 {duration:.0f}s）"
+            f"[{label}] `{entry}` {detail}（用时 {duration:.0f}s）"
         ]
         tail = stderr_tail.strip() or stdout_tail.strip()
         if tail:
