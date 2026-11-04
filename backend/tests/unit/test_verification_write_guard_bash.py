@@ -732,3 +732,153 @@ def test_mode_bash_selects_the_branch(tmp_path):
     )
 
     assert proc.returncode == 2, proc.stderr
+
+# ---------------------------------------------------------------------------
+# git 的 dry-run：只读，不产生写目标
+#
+# 2026-11-04，验证 sub-agent 跑 ``git add -A --dry-run 2>&1 | head -n 40``
+# 取证（纯只读），护栏却把 ``--dry-run`` 当普通 flag 跳过、把 ``-A`` 当成
+# "写全部路径" → 拒绝并记一条 ``outside_scope`` → 该 VP 随后被框架改判
+# ``verifier_mutated_tree``（``failure_class=infra``）。
+#
+# 修法：同一条 git 命令带 ``--dry-run`` / ``-n`` 时，它**不写**任何东西。
+# 下面的负控钉住"不许放宽"：不带 dry-run 的同一条命令必须照旧被认出。
+# ---------------------------------------------------------------------------
+def test_git_dry_run_add_has_no_write_target():
+    """``git add -A --dry-run`` 是只读 → 没有写目标。"""
+    import verification_write_guard
+
+    assert verification_write_guard.bash_write_targets(
+        "git add -A --dry-run",
+        "/repo",
+    ) == []
+
+
+def test_git_dash_n_add_has_no_write_target():
+    """``git add -A -n`` 是只读（``-n`` = ``--dry-run``）→ 没有写目标。"""
+    import verification_write_guard
+
+    assert verification_write_guard.bash_write_targets(
+        "git add -A -n",
+        "/repo",
+    ) == []
+
+
+def test_git_dash_c_rm_dry_run_has_no_write_target():
+    """``git -C /repo rm --dry-run x.py`` → 没有写目标。"""
+    import verification_write_guard
+
+    assert verification_write_guard.bash_write_targets(
+        "git -C /repo rm --dry-run x.py",
+        "/repo",
+    ) == []
+
+
+def test_git_dash_c_add_dash_n_has_no_write_target():
+    """flag 在子命令后面、``-C`` 在前面 → 一样是只读。"""
+    import verification_write_guard
+
+    assert verification_write_guard.bash_write_targets(
+        "git -C /repo add -n .",
+        "/repo",
+    ) == []
+
+
+def test_git_commit_dry_run_has_no_write_target():
+    """``git commit --dry-run`` 不写仓库 → 没有写目标。"""
+    import verification_write_guard
+
+    assert verification_write_guard.bash_write_targets(
+        "git commit --dry-run -m 'x'",
+        "/repo",
+    ) == []
+
+
+def test_git_add_without_dry_run_still_has_write_target():
+    """负控：不带 dry-run 的 ``git add -A`` 必须仍然被认成写。"""
+    import verification_write_guard
+
+    assert verification_write_guard.bash_write_targets(
+        "git add -A",
+        "/repo",
+    ) == ["/repo"]
+
+
+def test_git_add_dash_n_without_dry_run_flag_still_has_write_target():
+    """负控：``-n`` 只在 git 的语境里当 dry-run，其它命令不变。"""
+    import verification_write_guard
+
+    assert verification_write_guard.bash_write_targets(
+        "git add -A",
+        "/repo",
+    ) == ["/repo"]
+    # ``cp -n`` 是 no-clobber（不覆盖），不是 dry-run → 落点仍是写目标。
+    assert verification_write_guard.bash_write_targets(
+        "cp -n /tmp/a /repo/b.py",
+        "/repo",
+    ) == ["/repo/b.py"]
+    # ``sed -n`` 是"不打印"，跟写目标无关 → sed 没被认成写命令。
+    assert verification_write_guard.bash_write_targets(
+        "sed -n 1p /repo/b.py",
+        "/repo",
+    ) == []
+
+
+def test_git_branch_creation_is_not_a_dry_run():
+    """负控：``git checkout -n -b feature`` 建分支 → 真的是写。"""
+    import verification_write_guard
+
+    assert verification_write_guard.bash_write_targets(
+        "git checkout -n -b feature",
+        "/repo",
+    ) == ["/repo"]
+
+
+def test_heredoc_body_git_dry_run_has_no_write_target():
+    """heredoc 正文里的 ``git add --dry-run`` 是数据，不是命令。"""
+    import verification_write_guard
+
+    command = (
+        "mkdir -p /tmp/vp055 && cat > /tmp/vp055/probe.py <<'PYEOF'\n"
+        "# git add -A --dry-run\n"
+        "git add --dry-run\n"
+        "PYEOF\n"
+    )
+    targets = verification_write_guard.bash_write_targets(command, "/repo")
+    assert targets == ["/tmp/vp055/probe.py"], targets
+
+
+def test_git_dry_run_is_allowed_by_the_hook(tmp_path):
+    """生产入口：只读的 ``git add -A --dry-run`` → exit 0，不留拒绝证据。"""
+    env, plan_dir = _scoped_env(tmp_path)
+    code, stderr = _run_hook(
+        "git add -A --dry-run 2>&1 | head -n 40",
+        env,
+        cwd=_REPO_DIR,
+    )
+
+    assert code == 0, stderr
+    assert not _marker(plan_dir).exists(), "放行的命令不该留下拒绝痕迹"
+
+
+def test_git_add_without_dry_run_is_still_refused_by_the_hook(tmp_path):
+    """负控（生产入口）：真的 ``git add -A`` → exit 2，仍然被拒。"""
+    env, _plan = _scoped_env(tmp_path)
+    code, stderr = _run_hook("git add -A", env, cwd=_REPO_DIR)
+
+    assert code == 2, stderr
+
+
+def test_git_commit_dash_n_is_no_verify_and_still_writes():
+    """负控：``git commit -n`` 是 ``--no-verify`` —— 它照样创建提交，仍算写。
+
+    git 里 ``-n`` 确实是 dry-run 的只有 ``add`` / ``rm`` / ``mv`` / ``clean``；
+    ``commit`` 的 ``-n`` 是 ``--no-verify``。当成 dry-run 就等于把一条真写
+    命令放过 —— 护栏被削弱。
+    """
+    import verification_write_guard
+
+    assert verification_write_guard.bash_write_targets(
+        "git commit -n -m 'x'",
+        "/repo",
+    ) == ["/repo"]

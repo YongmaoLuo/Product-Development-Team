@@ -663,10 +663,117 @@ def _copy_targets(args: List[str], include_sources: bool = False) -> List[str]:
     return targets
 
 
+#: git 里取值要吃掉下一个词的选项 —— 它们的**值**不能当成 flag 读。
+#:
+#: ``git commit -m "--dry-run"`` 里的 ``--dry-run`` 是提交信息，不是 dry-run。
+_GIT_VALUE_OPTIONS = (
+    "-m",
+    "-F",
+    "--message",
+    "--file",
+    "--author",
+    "--date",
+    "--cleanup",
+    "--trailer",
+    "-t",
+    "--template",
+    "--squash",
+    "--fixup",
+    "-C",
+    "--reuse-message",
+    "--pathspec-from-file",
+    "--git-path",
+    "-S",
+    "--gpg-sign",
+)
+
+
+#: git 里 ``-n`` **确实是** ``--dry-run`` 的子命令。
+#:
+#: ``git commit -n`` 是 ``--no-verify`` —— 它照样创建提交，不是 dry-run。
+#: 护栏只认得 git 自己的语义：短选项 ``-n`` 只在这几个子命令里当 dry-run。
+_GIT_DRY_RUN_SHORT_SUBCOMMANDS = ("add", "rm", "mv", "clean")
+
+
+def _git_args_have_dry_run(args: List[str], subcommand: str) -> bool:
+    """Whether a git subcommand's own arguments ask for a dry run.
+
+    ``--dry-run`` 是 git 自己的 dry-run（``git commit --dry-run`` 也是
+    dry-run）；短选项 ``-n`` **只在那几个子命令里**是 dry-run ——
+    ``git add -n``、``git rm -n``、``git mv -n``、``git clean -n``。
+    ``git commit -n`` 是 ``--no-verify``：**照样创建提交**，不能当 dry-run
+    （当成 dry-run 就等于把一条真写命令放过）。``--`` 之后的词是 pathspec，
+    不再是 flag。
+
+    **建分支不是 dry-run。** ``git checkout -n -b feature`` 里的 ``-n`` 是
+    ``--no-track``（只影响跟踪设置），而 ``-b`` 真的会写 ``.git`` —— 这种
+    命令要照常当写处理。
+    """
+    index = 0
+    creates_branch = False
+    dry_run = False
+    short_dry_run = False
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            break
+        if arg in _GIT_VALUE_OPTIONS:
+            index += 2
+            continue
+        if arg == "--dry-run":
+            dry_run = True
+            index += 1
+            continue
+        if arg.startswith("--dry-run="):
+            # ``--dry-run=false`` 把布尔量关掉 —— 那是**真写**。
+            dry_run = arg.split("=", 1)[1].strip().lower() in ("1", "true", "yes", "on")
+            index += 1
+            continue
+        if arg == "--orphan" or (
+            arg.startswith("-")
+            and not arg.startswith("--")
+            and len(arg) > 1
+            and ("b" in arg[1:] or "B" in arg[1:])
+        ):
+            creates_branch = True
+            index += 1
+            continue
+        if arg.startswith("--"):
+            index += 1
+            continue
+        if arg.startswith("-") and len(arg) > 1:
+            # 短选项可以打包（``-An``），里面有 ``n`` 就**可能**是 dry-run ——
+            # 是不是，看子命令（``commit`` 的 ``-n`` 不是 dry-run）。
+            if "n" in arg[1:] and not arg.startswith("-c"):
+                short_dry_run = True
+            index += 1
+            continue
+        index += 1
+    if creates_branch:
+        return False
+    if dry_run:
+        return True
+    return short_dry_run and subcommand in _GIT_DRY_RUN_SHORT_SUBCOMMANDS
+
+
 def _git_targets(args: List[str], base: str) -> List[str]:
-    """The paths a state-changing git subcommand writes to."""
+    """The paths a state-changing git subcommand writes to.
+
+    **dry-run 不写。** ``git add -A --dry-run``（``-n``）只报告将要发生什么，
+    工作区和仓库状态一个字都没动 —— 把它算成写目标，护栏就会拒掉一条纯只读
+    的取证命令（``git add -A --dry-run 2>&1 | head -n 40``），VP 随后被框架
+    改判成 ``verifier_mutated_tree``。所以同一条 git 命令带 ``--dry-run`` /
+    ``-n`` 时，这里返回 ``[]``。
+
+    ``-n`` 只在 git 里 **``-n`` 确实是 dry-run 的子命令**里当 dry-run
+    （``add`` / ``rm`` / ``mv`` / ``clean``）；``git commit -n`` 是
+    ``--no-verify``，**照样创建提交** —— 照常算写。其它命令（``cp -n``
+    = no-clobber、``sed -n`` = 不打印）在各自的解析器里，行为不变。
+    """
     index = 0
     repo = base
+    dry_run = False
+    short_dry_run = False
     while index < len(args):
         arg = args[index]
         if arg == "-C":
@@ -682,7 +789,23 @@ def _git_targets(args: List[str], base: str) -> List[str]:
         if arg in ("-c", "--exec-path", "--namespace"):
             index += 2
             continue
-        if arg.startswith("-"):
+        if arg == "--dry-run":
+            dry_run = True
+            index += 1
+            continue
+        if arg.startswith("--dry-run="):
+            # ``--dry-run=false`` 把布尔量关掉 —— 那是**真写**。
+            dry_run = arg.split("=", 1)[1].strip().lower() in ("1", "true", "yes", "on")
+            index += 1
+            continue
+        if arg.startswith("--"):
+            index += 1
+            continue
+        if arg.startswith("-") and len(arg) > 1:
+            # 短选项可以打包（``-An``），里面有 ``n`` 就**可能**是 dry-run ——
+            # 是不是，看子命令（``commit`` 的 ``-n`` 不是 dry-run）。
+            if "n" in arg[1:] and not arg.startswith("-c"):
+                short_dry_run = True
             index += 1
             continue
         break
@@ -692,6 +815,12 @@ def _git_targets(args: List[str], base: str) -> List[str]:
     if subcommand not in _GIT_WRITE_SUBCOMMANDS:
         return []
     rest = args[index + 1 :]
+    if dry_run:
+        return []
+    if short_dry_run and subcommand in _GIT_DRY_RUN_SHORT_SUBCOMMANDS:
+        return []
+    if _git_args_have_dry_run(rest, subcommand):
+        return []
     # git 的相对路径是相对**仓库目录**的，不是相对 shell 的 cwd ——
     # ``git -C other/repo checkout -- a.py`` 动的是 other/repo/a.py。
     repo_root = repo if os.path.isabs(repo) else os.path.join(base or "", repo)
