@@ -61,6 +61,11 @@ from binary_freshness import (
     check_binary_freshness,
     rebuild_binary,
 )
+# 2026-11-01（轮级新鲜度预检）：重建的结果类型。模块级导入是安全的 ——
+# ``binary_rebuild_agent`` 只依赖 ``binary_freshness`` 和标准库，与本模块
+# 之间没有环。之所以要它：``_maybe_rebuild_before_service_start`` 现在**返回**
+# 重建结果，轮级门禁要把它写进阻断报告。
+from binary_rebuild_agent import RebuildResult
 from prompts import (  # noqa: E402 — canonical home for the framework-shared
     # inline prompt constants (Phase C2, hoisted out of this module's
     # module top). Importing from the new ``prompts`` module instead
@@ -1512,6 +1517,19 @@ ENVIRONMENT_BLOCKED = "environment_blocked"
 
 #: The event a round writes when the environment blocked it.
 ROUND_BLOCKED_EVENT = "verification_round_blocked"
+
+#: The ``stop_reason`` a round carries when the **round-level**
+#: binary-freshness preflight could not make the working tree fresh.
+#:
+#: A stale artefact is a fact about the tree the round is about to
+#: verify, not about the deliverable: every VP that ran against it
+#: would have been grading yesterday's code, and each one would have
+#: said so on its own — N independent failures about a problem that was
+#: never the product's.  So the round stops **before** it dispatches
+#: anything and says so in one code: the environment took this round
+#: out, and the repair chain must not read the empty verdict as a
+#: broken deliverable.
+BINARY_FRESHNESS_PREFLIGHT_ERROR_KIND = "binary_freshness_preflight_failed"
 
 #: The transport failures that mean "the service was never reached".
 #: A refused connection, a name that does not resolve, a socket that
@@ -10744,6 +10762,33 @@ class Orchestrator:
             )
             return blocked
 
+        # 2026-11-01（二进制新鲜度轮级预检）：生成计划**之前**再确认一次工作树
+        # 的构建产物是新的。
+        #
+        # 预检自己会「看 → 需要就重建 → 再看一遍」：重建能修好就放行，修不好
+        # 才给出 BLOCKED。阻断的是**环境**而不是被测功能，所以报告里
+        # ``verification_results`` 是空的 —— 本轮一个验证点都没派发过。
+        #
+        # 放在这里是为了不浪费本轮的 Phase-1 LLM 调用：一个注定 BLOCKED 的
+        # 二进制，不该先花一次调用把计划生成出来。
+        #
+        # 变量名不叫 ``blocked``：上面那个是 base drift 的报告，两个都用
+        # ``blocked`` 会让这两段读起来像同一件事。
+        binary_blocked = self._run_binary_freshness_round_preflight()
+        if binary_blocked is not None:
+            try:
+                self.persistence.update_report(binary_blocked)
+            except Exception as exc:  # noqa: BLE001 - a report is a nicety
+                logger.warning(
+                    "[binary_freshness] could not write the blocked report: %s",
+                    exc,
+                )
+            print(
+                f"[Verification] Round blocked by binary freshness: "
+                f"{binary_blocked.get('summary', '')}"
+            )
+            return binary_blocked
+
         plan_data = self.generate_verification_plan()
 
         # 2026-09-16 service-freshness preflight ("VP0"): before the
@@ -14533,7 +14578,7 @@ class Orchestrator:
             self._blocked_service_ports.discard(int(declared_port))
 
 
-    def _maybe_rebuild_before_service_start(self) -> None:
+    def _maybe_rebuild_before_service_start(self) -> Optional[RebuildResult]:
         """Rebuild a stale build artefact before (re)starting services.
 
         Shared by both preflight paths. Never raises — a rebuild failure
@@ -14556,12 +14601,23 @@ class Orchestrator:
         longer holds after a FAILED preflight rebuild: that is the
         single-flight contract, and it is what stops the 20-VP retry
         storm.)
+
+        2026-11-01: the method now **returns** what it did — the
+        ``RebuildResult`` of the rebuild it ran, or ``None`` when
+        nothing had to be rebuilt.  That is an addition, not a change:
+        the two existing call sites ignore the return value, and the
+        many ``monkeypatch.setattr(agent, "_maybe_rebuild_before_service_start",
+        lambda: None)`` stubs stay legal because ``None`` is exactly
+        what the fresh path returns.  The round-level preflight
+        (:meth:`_run_binary_freshness_round_preflight`) is the caller
+        that reads it — it has to put the rebuild's own verdict into the
+        report it hands back.
         """
         freshness = check_binary_freshness(
             self.project_dir, cache=self._freshness_cache,
         )
         if not freshness.is_stale:
-            return
+            return None
         logger.warning(
             "[service_freshness] binary stale before service restart: "
             "%s; rebuilding first", freshness.detail,
@@ -14597,6 +14653,111 @@ class Orchestrator:
             "__preflight__", "binary_rebuild_attempted",
             rebuild_result.to_dict(),
         )
+        return rebuild_result
+
+    def _run_binary_freshness_round_preflight(self) -> Optional[Dict[str, Any]]:
+        """Round-level gate: may this round verify anything at all?
+
+        Returns ``None`` when the round may go on, and the BLOCKED
+        report when it may not.
+
+        The shape of the check is: look, rebuild if needed, look again.
+
+          * Not stale on the first look → ``None``.  Nothing is rebuilt;
+            a healthy tree must not cost a build.
+          * Stale, and the rebuild made it fresh → ``None``.  The round
+            goes on against the fresh tree.
+          * Stale, and it is still stale after the rebuild → the
+            environment BLOCKED report.  The rebuild either failed or
+            could not fix the tree, and the round has to say which.
+
+        The second look is a **real** second look: ``_freshness_cache``
+        is write-only (it records every check and is never read back),
+        so the re-check re-runs the mtime sweep and sees the tree as it
+        is *now*.  There is no cache to invalidate.
+
+        This is a verdict, not a second rebuild path: the rebuild still
+        goes through ``_maybe_rebuild_before_service_start`` and hence
+        through the round's ``_BinaryRebuildCoordinator`` single-flight,
+        exactly like the two preflight arms that already call it.
+        """
+        freshness = check_binary_freshness(
+            self.project_dir, cache=self._freshness_cache,
+        )
+        if not freshness.is_stale:
+            return None
+
+        rebuild_result = self._maybe_rebuild_before_service_start()
+
+        freshness = check_binary_freshness(
+            self.project_dir, cache=self._freshness_cache,
+        )
+        if not freshness.is_stale:
+            return None
+
+        return self._build_binary_freshness_round_blocked_report(
+            freshness, rebuild_result,
+        )
+
+    def _build_binary_freshness_round_blocked_report(
+        self,
+        freshness: FreshnessReport,
+        rebuild_result: Optional[RebuildResult] = None,
+    ) -> Dict[str, Any]:
+        """The report of a round the environment blocked before it began.
+
+        A round that dispatched nothing has measured nothing about the
+        product, so it has no verdict to give: ``verification_results``
+        is **empty** — not a FAILED row, not a skipped one.  A FAILED
+        verdict would send the repair chain after a deliverable nobody
+        ever looked at.
+
+        The payload carries the evidence a reader needs to act on it:
+        what kind of artefact it was, which files were stale (and which
+        were merely missing bytecode — that is not the same problem),
+        which surface was scanned, the command that was supposed to fix
+        it, and what the rebuild attempt actually returned.
+        """
+        detail = str(getattr(freshness, "detail", "") or "")
+        evidence = str(getattr(freshness, "evidence", "") or "")
+        summary = "binary freshness preflight failed"
+        if detail:
+            summary = f"{summary}: {detail}"
+        # The rebuild's own verdict.  ``RebuildResult.to_dict()`` is the
+        # contract; a result that does not carry it must not turn an
+        # environment problem into an AttributeError inside the gate.
+        rebuild_attempt: Optional[Dict[str, Any]] = None
+        if rebuild_result is not None:
+            to_dict = getattr(rebuild_result, "to_dict", None)
+            if callable(to_dict):
+                rebuild_attempt = to_dict()
+            elif isinstance(rebuild_result, Mapping):
+                rebuild_attempt = dict(rebuild_result)
+        return {
+            "overall_status": "BLOCKED",
+            "verification_results": [],
+            "requirement_deviations": [],
+            "summary": summary,
+            "stop_reason": BINARY_FRESHNESS_PREFLIGHT_ERROR_KIND,
+            "binary_freshness_preflight_failed": {
+                "kind": str(getattr(freshness, "kind", "") or ""),
+                "detail": detail,
+                "evidence": [evidence] if evidence else [],
+                "rebuild_command": getattr(
+                    freshness, "rebuild_command", None,
+                ),
+                "scan_scope": str(getattr(freshness, "scan_scope", "") or ""),
+                "scan_note": str(getattr(freshness, "scan_note", "") or ""),
+                "missing_pyc_files": list(
+                    getattr(freshness, "missing_pyc_files", ()) or ()
+                ),
+                "stale_pyc_files": list(
+                    getattr(freshness, "stale_pyc_files", ()) or ()
+                ),
+                "rebuild_attempt": rebuild_attempt,
+            },
+            "execution_profile": {"mode": "binary_freshness_preflight_blocked"},
+        }
 
     def _resolve_service_placeholders(self, plan_data: dict) -> dict:
         """Expand ``{{svc.<name>.<field>}}`` in the in-memory plan.

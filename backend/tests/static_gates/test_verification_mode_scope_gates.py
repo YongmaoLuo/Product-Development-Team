@@ -716,8 +716,13 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # `routes.execution._enter_quota_wait` 重新可达；同时把「配额暂停的 repair 出口」
     # 归到 `waiting_for_quota` 且不再给已 park 的轮次写 `ended_at`。改动只落在本文件
     # 的 repair 出口与 park 判据，按本 gate 的既定流程重新钉住该文件。
+    # 2026-11-04：preflight 被 binary freshness 挡下的轮次不再进入判定与修复链
+    # —— 新增 `_binary_freshness_blocked_report` 与对应的 `_record_terminal(
+    # "loop_stopped", BINARY_FRESHNESS_PREFLIGHT_ERROR_KIND)` 出口，插在
+    # service preflight 之后、base drift 之前；该轮不计入计划的 round 预算。
+    # 改动只落在本文件的 preflight 分支链，按本 gate 的既定流程重新钉住该文件。
     "backend/verification_loop.py": (
-        "93a83d82e2cfb6c8eb138949d0a837d657ca1ebead1f7d0c702f3d8e68619657"
+        "3cf4c3fbf7e5c24436d38861ede2143ac143337aae71e629f6e5204bf25cf0d6"
     ),
 }
 
