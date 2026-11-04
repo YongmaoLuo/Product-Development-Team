@@ -48,6 +48,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 from tests import _host_load  # noqa: E402
+from tests import _readiness  # noqa: E402
 
 
 def _make_agent(tmp_path: Path):
@@ -2523,18 +2524,14 @@ READY_BUDGET_MAX_SECONDS = 120.0
 def _readiness_budget_seconds(base: float = READY_BUDGET_SECONDS) -> float:
     """How long a service is given to come up, decided by the shared gate.
 
-    The budget follows the host's load average, because both the
-    child's own start-up and the cost of one probe scale with it.  The
-    scale is the shared gate's limit: a host at the limit gets twice
-    the base budget, and the budget stops at a ceiling, because a
-    scaled budget is still a budget.
+    The formula lives in ``tests/_readiness.py`` — one place, one
+    answer.  What stays here is this module's own policy: the ceiling
+    that keeps a scaled budget below the shortest per-test timeout
+    this module carries.
     """
-    limit = _host_load.host_load_limit()
-    load = _host_load.current_host_load()
-    if limit <= 0:
-        return float(base)
-    scaled = base * (1.0 + max(0.0, load) / limit)
-    return min(scaled, READY_BUDGET_MAX_SECONDS)
+    return _readiness.readiness_budget_seconds(
+        base, ceiling=READY_BUDGET_MAX_SECONDS,
+    )
 
 
 def _service_declaration(
@@ -2695,6 +2692,11 @@ def test_reensure_adopted_only_after_health_200(tmp_path, monkeypatch):
          graded.
     """
     import service_manager as sm
+
+    # The case waits for a service to answer; on a host that cannot
+    # keep time the wait has no deadline to meet, so the case is
+    # skipped rather than failed on the machine's answer.
+    _readiness.skip_if_host_unmeasurable()
 
     monkeypatch.setattr(
         "service_freshness.expected_routing_rows", lambda *a, **k: 4,

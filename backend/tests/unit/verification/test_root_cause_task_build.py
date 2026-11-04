@@ -23,6 +23,24 @@ TDD contract — 4 cases
 3. ``test_task_id_global_unique`` —— 与既有 repair 序列不冲突。
 4. ``test_kind_field_distinguishes`` —— 两类任务 ``kind`` 不同。
 
+交付通道（2026-11-03）
+---------------------
+根因任务的交付物是**一个文件**，不是 diff。所以：
+
+* ``deliverable`` 装的是交付物的**种类**（``"report"``），不是报告要写
+  什么 —— 后者挪到了 ``deliverable_checklist``。``SubTask`` 把
+  ``deliverable`` 声明成 ``Literal["code", "report"]``，往里塞一个列表
+  会直接 ValidationError，任务连派都派不出去。
+* ``deliverable_checklist`` 走不到任何人（``SubTask`` 是
+  ``extra="ignore"``，白名单也不收它），所以那五件事**同时**出现在
+  ``description`` 里 —— 那是执行器唯一会拼进 brief 的通道，也是唯一能
+  到达写报告的人的通道。描述由清单生成，不写两份字面量。
+* ``report_path`` 下发的是**绝对路径**，锚在**计划自己的目录**上
+  （``<plans 根>/<plan_id>/reports/…``）。执行器把相对地址拼到自己的
+  ``project_dir`` 下面，绝对地址原样使用 —— 相对地址会让同一份报告在
+  不同的工作目录下指向不同的文件；而锚在工作区那一侧时，链读回的是
+  计划目录里的另一份文件，两边对不上。
+
 边界条件
 --------
 * 根因任务必须 ``read_only=True``，且**不含** ``files_to_modify``。
@@ -96,14 +114,19 @@ def test_root_cause_task_shape():
 
     assert task["kind"] == ROOT_CAUSE_KIND
     assert task["read_only"] is True
-    assert task["report_path"] == "plans/p1/reports/root-cause-VP-3.md"
-    # 2026-11-03 — ``deliverable`` 是交付物的**类型**（"report"），
+    # 2026-11-03 — 交付物是**一个文件**，所以 ``deliverable`` 装的是交付物
+    # 的种类，不是报告要写什么。``SubTask`` 把它声明成
+    # ``Literal["code", "report"]``，装一个列表进去会直接 ValidationError，
+    # 任务连数据库都进不去。报告要写什么挪到了 ``deliverable_checklist``。
+    assert task["deliverable"] == "report"
+    # 2026-11-03（main 侧）— ``deliverable`` 是交付物的**类型**（"report"），
     # 这五件事是交付物的**内容**。两者挤在一个键上时，这一行连
     # ``SubTask`` 都构造不出来（``deliverable`` 是
     # ``Literal["code", "report"]``，装不下一个列表），而执行器也因此
-    # 把一份报告当成代码任务来判。
-    assert task["deliverable"] == "report"
-    assert task["report_deliverables"] == [
+    # 把一份报告当成代码任务来判。同一份清单另有一个键名
+    # ``report_deliverables`` —— 两个键装的是同一份列表，两个都留着。
+    assert task["deliverable_checklist"] == task["report_deliverables"]
+    assert task["deliverable_checklist"] == [
         "确定性复现步骤",
         "完整因果链",
         "一次覆盖所有层的修复方案",
@@ -115,6 +138,12 @@ def test_root_cause_task_shape():
         # root_cause_report_without_scope。
         "改动范围（要改动的文件，相对仓库根的路径）",
     ]
+    # 2026-11-03 — 下发的地址是**绝对**路径。执行器（``agent.py`` 的
+    # ``resolve_report_path``）把相对地址拼到任务的 project_dir 下面、
+    # 绝对地址原样使用；相对地址会让同一份报告在不同的工作目录下指向
+    # 不同的文件，而一个解析不出地址的报告任务根本没有交付物可查。
+    assert Path(task["report_path"]).is_absolute()
+    assert task["report_path"].endswith("plans/p1/reports/root-cause-VP-3.md")
     # 只读任务不得声明改动范围。
     assert "files_to_modify" not in task
     # 任务得能派出去：标题、描述、状态、归属轮次都在。
@@ -125,6 +154,107 @@ def test_root_cause_task_shape():
     assert task["status"] == "pending"
     # 证据随任务带过去，根因任务才知道要复现什么。
     assert task["evidence"] == _EVIDENCE
+
+
+# ---------------------------------------------------------------------------
+# 5. 交付通道：任务载荷必须能被执行器重新水合成一个「报告任务」
+# ---------------------------------------------------------------------------
+def test_root_cause_task_is_a_report_task_the_executor_can_dispatch():
+    """``SubTask(**payload)`` 必须成立，而且必须仍是一个报告任务。
+
+    这是 2026-11-03 那次修复的核心：``deliverable`` 装错形状时
+    ``SubTask(**payload)`` 直接 ValidationError，任务连派都派不出去；
+    ``deliverable`` 缺失时它回落成 ``"code"``，执行器的空 diff 闸门就把
+    一份写好的报告读成「什么都没产出」（``empty_diff_no_changes``）。
+    """
+    from agent import is_report_task, resolve_report_path
+    from task import SubTask
+
+    task = build_root_cause_task(
+        plan_id="p1", vp_id="VP-3", round_no=3, evidence=_EVIDENCE,
+    )
+    sub = SubTask(**task)
+
+    assert sub.deliverable == "report"
+    assert is_report_task(sub) is True
+    # 执行器解析出来的地址，必须就是任务下发的那一个 —— 两者不一致时，
+    # 闸门读的是另一个文件，报告写得再好也判成「没产出」。
+    assert resolve_report_path(sub) == Path(task["report_path"]).resolve()
+
+
+def test_root_cause_report_path_follows_the_plan_dir(tmp_path):
+    """地址锚在**计划自己的目录**上，不是工作区，也不是当前工作目录。
+
+    2026-11-03：锚从 ``project_dir`` 改成了 ``plan_dir``。工作区那一侧
+    （``<project_dir>/plans/<plan_id>/reports/…``）与计划目录那一侧
+    （``<plans 根>/<plan_id>/reports/…``）是**两个不同的文件**：链读回
+    的是计划目录那一份，执行器交付的是工作区那一份，于是链读不到执行器
+    交付的东西。
+
+    只有一个锚 —— 调用方没有第二个选项可挑，所以两端不可能分叉。
+    """
+    plan_dir = tmp_path / "plans" / "p1"
+    plan_dir.mkdir(parents=True)
+    task = build_root_cause_task(
+        plan_id="p1", vp_id="VP-3", round_no=3,
+        plan_dir=plan_dir,
+    )
+    assert task["report_path"] == str(
+        plan_dir / "reports/root-cause-VP-3.md"
+    )
+
+
+def test_the_description_carries_the_deliverable_checklist():
+    """那五件事必须在 description 里 —— 那是唯一能到达作者的通道。
+
+    ``deliverable_checklist`` 谁也收不到（``SubTask`` 是
+    ``extra="ignore"``），执行器拼 brief 用的也只有 description。清单
+    落在任何一个别人都收不到的键里，「报告必须含这五项」这条契约就没人
+    执行了。
+    """
+    task = build_root_cause_task(plan_id="p1", vp_id="VP-3", round_no=3)
+
+    assert task["deliverable"] == "report"
+    checklist = task["deliverable_checklist"]
+    assert len(checklist) >= 5
+    description = task["description"]
+    for item in checklist:
+        assert item in description, (
+            f"description 里没有「{item}」：作者看不到自己要写哪几段"
+        )
+    assert "改动范围" in description
+
+
+def test_the_checklist_survives_into_the_subtask_the_executor_gets():
+    """那五件事必须活到 **SubTask** 上 —— 执行器的 brief 是从那儿拼的。
+
+    载荷 dict 上有那五件事**还不够**：执行器拿到的是 ``SubTask``，它的
+    brief 是 ``f"Subtask: {task.description}"``（``agent.py``）。描述要是
+    在载荷 → ``SubTask`` 这一步丢了、或者被截断，作者就看不到自己要写
+    哪几段 ——「报告必须含这五项（尤其『改动范围』）」这条契约又一次没有
+    执行者。
+
+    2026-11-03：这一条是上一轮那五件事进描述的**下游**钉子。上一条钉的
+    是载荷 dict（作者拿到的形状）；这一条钉的是执行器真正读的那一个
+    （``SubTask.description``）。中间隔着 ``SubTask``（``extra="ignore"``），
+    中间那一步没人钉，就等于那条契约只在半路上活着。
+    """
+    from task import SubTask
+
+    task = build_root_cause_task(plan_id="p1", vp_id="VP-3", round_no=3)
+    sub = SubTask(**task)
+
+    checklist = task["deliverable_checklist"]
+    assert len(checklist) >= 5
+    for item in checklist:
+        assert item in sub.description, (
+            f"SubTask.description 里没有「{item}」：执行器的 brief 拼的是"
+            "SubTask.description，作者看不到自己要写哪几段"
+        )
+    assert "改动范围" in sub.description
+
+    # 清单只有一个来源：描述里那五件事就是载荷里那五件事（逐字）。
+    assert all(item in sub.description for item in checklist)
 
 
 # ---------------------------------------------------------------------------

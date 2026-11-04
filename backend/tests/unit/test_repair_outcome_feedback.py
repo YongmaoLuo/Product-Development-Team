@@ -45,7 +45,9 @@ def _make_db(tmp_path: Path) -> Path:
             model_type TEXT, project_dir TEXT, provider TEXT,
             task_group TEXT, execution_group INTEGER, priority TEXT,
             acceptance_criteria TEXT, failed_vp_id TEXT, round INTEGER,
-            updated_at TEXT
+            updated_at TEXT,
+            deliverable TEXT,
+            report_path TEXT
         )
         """
     )

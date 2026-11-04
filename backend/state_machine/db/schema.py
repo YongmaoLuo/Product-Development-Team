@@ -256,10 +256,22 @@ CREATE TABLE IF NOT EXISTS plan_artifacts (
 #:     ``project_dir`` / ``provider`` / ``task_group`` /
 #:     ``execution_group`` / ``priority`` / ``acceptance_criteria`` /
 #:     ``failed_vp_id`` / ``round``
+#:   * Deliverable channel (2026-11-03): ``deliverable`` / ``report_path``
+#:     — what a task hands back (a diff, or ONE report file) and where
+#:     that file lives.  A report task without them rehydrates as a code
+#:     task, and the executor's empty-diff gate then reads a delivered
+#:     report as "this task produced nothing".
 #:   * CAS (audit-only; no longer used for conflict detection):
 #:     ``_repo_version`` (default 0, incremented on every write)
 #:   * ``updated_at``: bumped on every write, used by the JSON-static
 #:     gate and audit tooling.
+#:
+#: The deliverable columns are declared **after** ``updated_at`` on
+#: purpose: ``ALTER TABLE ... ADD COLUMN`` appends, so a table created
+#: by this DDL and one upgraded in place (see
+#: :func:`_add_missing_plan_task_columns`) carry the same column order —
+#: a reader comparing ``PRAGMA table_info`` output sees one shape, not
+#: two.
 _DDL_PLAN_TASKS = """
 CREATE TABLE IF NOT EXISTS plan_tasks (
   plan_id TEXT NOT NULL,
@@ -287,6 +299,8 @@ CREATE TABLE IF NOT EXISTS plan_tasks (
   failed_vp_id TEXT,
   round INTEGER,
   updated_at TEXT NOT NULL,
+  deliverable TEXT,
+  report_path TEXT,
   PRIMARY KEY (plan_id, task_id),
   FOREIGN KEY (plan_id) REFERENCES plan_execution(plan_id) ON DELETE CASCADE
 )
@@ -911,6 +925,57 @@ def _add_missing_plan_decision_columns(conn: sqlite3.Connection) -> None:
             pass
 
 
+#: The deliverable-channel columns ``plan_tasks`` gained on 2026-11-03.
+#:
+#: ``deliverable`` says WHAT a task hands back — ``"code"`` (a diff in
+#: the project repo, the historical shape) or ``"report"`` (ONE file).
+#: ``report_path`` says where that file is.  The pair is what the
+#: executor's empty-diff gate routes by: a report task's deliverable is
+#: a file, so "no diff in the repo" says nothing about whether it
+#: delivered — and a row that lost the pair rehydrates as a code task,
+#: where that same silence reads as "the sub-agent produced nothing".
+_PLAN_TASK_DELIVERABLE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("deliverable", "TEXT"),
+    ("report_path", "TEXT"),
+)
+
+
+def _add_missing_plan_task_columns(conn: sqlite3.Connection) -> None:
+    """Add the deliverable columns a table created before them is missing.
+
+    ``CREATE TABLE IF NOT EXISTS`` cannot change a table that already
+    exists, so a database written by an older backend keeps the columns
+    it was created with — and every write that carries ``deliverable`` /
+    ``report_path`` would fail against it.  The upgrade is therefore
+    *additive*: read the live column set with ``PRAGMA table_info`` and
+    ``ALTER TABLE`` the missing ones in.
+
+    The read is what makes it safe to run on every ``migrate``: a
+    current table has both columns, so the step costs one ``PRAGMA``
+    and no write lock — the hot path a per-request connection open
+    depends on is untouched.
+
+    ``ALTER TABLE ... ADD COLUMN`` appends, so an upgraded table ends
+    up with the same column order as one created by the DDL above.
+    """
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(plan_tasks)")
+    }
+    for name, column_type in _PLAN_TASK_DELIVERABLE_COLUMNS:
+        if name in existing:
+            continue
+        try:
+            conn.execute(
+                f"ALTER TABLE plan_tasks ADD COLUMN {name} {column_type}"
+            )
+        except sqlite3.OperationalError:
+            # Another process added the column between the PRAGMA and
+            # the ALTER (SQLite's write lock serialises the two, so
+            # this is the only way to lose the race).  The column is
+            # there, which is all this step wanted.
+            pass
+
+
 def _ensure_scheduler_tables(conn: sqlite3.Connection) -> None:
     """Create the scheduler tables and their indexes when missing.
 
@@ -1015,6 +1080,17 @@ def migrate(conn: sqlite3.Connection) -> None:
     # written by an older backend is upgraded rather than left behind.
     _ensure_plan_decisions(conn)
 
+    # The per-task deliverable columns are ensured on EVERY call, for
+    # the same reason the HITL table's context columns are: the recorded
+    # schema version cannot tell an OLD table apart from a current one
+    # (the version row says "7" for both), and a table that predates the
+    # deliverable channel would reject every write that carries
+    # ``deliverable`` / ``report_path``.  The guard is the presence of
+    # the columns themselves rather than the version row, so an operator's
+    # database written by an older backend is upgraded rather than left
+    # behind.  See ``_add_missing_plan_task_columns``.
+    _add_missing_plan_task_columns(conn)
+
     # The scheduler tables are ensured on EVERY call, for the same
     # reason the HITL table is: the scheduler's own facts (queue order,
     # slot occupancy, manual commands, runtime settings) must sit next
@@ -1089,6 +1165,19 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     # proper and runs on every call regardless of the recorded version
     # — see migrate()'s docstring for why (pinned contract + idempotent
     # + cheap), and test_db_schema_v4.py for the contract itself.
+
+    # ----------------------------------------------------------------
+    # Deliverable-channel upgrade (2026-11-03): ``deliverable`` and
+    # ``report_path`` on ``plan_tasks``.  ``CREATE TABLE IF NOT EXISTS``
+    # cannot change a table that already exists, so a database written
+    # before these columns would reject every write that carries them —
+    # and a report task whose row cannot hold its own address comes
+    # back as a code task, whose delivered report reads as "nothing was
+    # produced".  The step is additive and idempotent; ``migrate()``
+    # also runs it unconditionally, because the recorded schema version
+    # cannot tell an old table apart from a current one.
+    # ----------------------------------------------------------------
+    _add_missing_plan_task_columns(conn)
 
     # ----------------------------------------------------------------
     # Schema v5 upgrade (2026-09-17): collapse ``plan_routing.stage``

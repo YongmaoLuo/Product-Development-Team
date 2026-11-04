@@ -88,6 +88,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import pytest
 
 from credentials import _FD_ENV_PREFIX as _DESCRIPTOR_ENV_PREFIX
+from tests import _readiness
 from tests.manual import spawn_repro
 
 pytestmark = pytest.mark.integration
@@ -168,6 +169,35 @@ _BACKEND_READY_TIMEOUT = 90
 
 #: How long the one-route service gets to answer.
 _LIGHT_READY_TIMEOUT = 8
+
+
+def _backend_ready_timeout() -> int:
+    """How long the backend is given to come up, on this host.
+
+    The ceiling above is what a quiet host gets; the budget the
+    reproducer is actually given follows the host's load, because the
+    backend's own time-to-ready drifts with it.  A budget that does not
+    drift measures the host instead of the defect this suite guards.
+    """
+    return int(
+        _readiness.readiness_budget_seconds(
+            float(_BACKEND_READY_TIMEOUT), ceiling=120.0,
+        )
+    )
+
+
+def _light_ready_timeout() -> int:
+    """How long the one-route service is given to answer, on this host.
+
+    Eight seconds was written for an idle runner, and it is the number
+    that made this suite red on a busy host for a reason that had
+    nothing to do with the teardown defect it guards.
+    """
+    return int(
+        _readiness.readiness_budget_seconds(
+            float(_LIGHT_READY_TIMEOUT), ceiling=120.0,
+        )
+    )
 
 #: The guard for the platform the reproduction needs.  It is a marker
 #: rather than a module-level ``pytestmark`` entry on purpose: the test
@@ -369,7 +399,7 @@ def test_three_consecutive_spawns_all_ready(
     for index in range(_BATCHES):
         rc, measurement = _run_batch(
             tmp_path, f"batch-{index}", spawned_groups,
-            _REPRODUCING_TARGET, _BACKEND_READY_TIMEOUT,
+            _REPRODUCING_TARGET, _backend_ready_timeout(),
         )
         runs = measurement.get("runs")
         ready = measurement.get("ready")
@@ -437,12 +467,17 @@ def test_ports_freed_after_batch(
     and the property under test is about the teardown rather than about
     the reproduction.
     """
+    # The batch waits for a service to answer; on a host that cannot
+    # keep time the wait has no deadline to meet, so the case is
+    # skipped rather than failed on the machine's answer.
+    _readiness.skip_if_host_unmeasurable()
+
     ports: List[int] = []
     _record_ports(monkeypatch, ports)
 
     rc, measurement = _run_batch(
         tmp_path, "batch", spawned_groups,
-        _LIGHT_TARGET, _LIGHT_READY_TIMEOUT,
+        _LIGHT_TARGET, _light_ready_timeout(),
     )
     assert rc == 0, (
         f"the batch did not pass the reproducer's own zero-failure "

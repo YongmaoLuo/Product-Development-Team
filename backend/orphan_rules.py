@@ -190,7 +190,7 @@ def merged_subtask_kwargs(entry: Any) -> dict:
     — ``status``, ``end_ts``, ``failure_reason`` — is added by the caller
     so each loader keeps ownership of how it sources those.
     """
-    return {
+    kwargs = {
         k: entry.get(k)
         for k in (
             "id", "title", "description", "test_command",
@@ -204,4 +204,33 @@ def merged_subtask_kwargs(entry: Any) -> dict:
             "task_group", "verification_only",
         )
         if entry.get(k) is not None
-    } | _deliverable_kwargs(entry)
+    }
+    # 2026-11-03: the deliverable channel.  A report task's
+    # deliverable is ONE FILE, and the file's address is what the
+    # executor checks.  Without these two the merged orphan falls back
+    # to ``deliverable="code"``, and the empty-diff gate reads a
+    # delivered report as "this task produced nothing".
+    #
+    # The pair travels in one of two places.  The row's own columns
+    # (``plan_tasks`` grew ``deliverable`` / ``report_path`` on
+    # 2026-11-03) are the first place; the marker line in the
+    # description is the second, and it is the one that works on a
+    # table without the columns.  ``_deliverable_kwargs`` reads the
+    # columns first and falls back to the marker, so the pair is
+    # recovered whichever channel carried it.
+    pair = _deliverable_kwargs(entry)
+    # ``deliverable`` and ``report_path`` are a PAIR: the model refuses
+    # a report task with no address, and refuses an address on a code
+    # task.  A row that carries only half of the pair cannot be rebuilt
+    # into a valid task, so the half is dropped — the merge must not be
+    # the thing that raises, and a row with no address has no
+    # deliverable to check anyway.
+    if pair.get("deliverable") == "report" and str(
+        pair.get("report_path") or ""
+    ).strip():
+        kwargs["deliverable"] = "report"
+        kwargs["report_path"] = pair["report_path"]
+    else:
+        kwargs.pop("deliverable", None)
+        kwargs.pop("report_path", None)
+    return kwargs

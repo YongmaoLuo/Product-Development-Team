@@ -147,6 +147,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pytest
 
+from tests import _readiness
+
 pytestmark = [pytest.mark.e2e]
 
 
@@ -1490,7 +1492,7 @@ def _wait_for_executors(world: _World, timeout: float = 90.0) -> Dict[str, int]:
     )
 
 
-def _wait_for_settle(world: _World, timeout: float = 120.0) -> Dict[str, Any]:
+def _wait_for_settle(world: _World, timeout: Optional[float] = None) -> Dict[str, Any]:
     """Wait until the scheduler has filled the capacity and settled the line.
 
     Settled means three things at once: the capacity is used, the line
@@ -1506,7 +1508,14 @@ def _wait_for_settle(world: _World, timeout: float = 120.0) -> Dict[str, Any]:
     reconciliation: otherwise it reads the line in the middle of the
     tick that started the plans, and the table still carries the plans
     that are working.
+
+    The wait is a wall-clock wait, so its budget follows the host's
+    load: a fixed number of seconds is a threshold written for one
+    machine on one quiet afternoon, and this suite runs a whole
+    scheduler's worth of plans through it.
     """
+    if timeout is None:
+        timeout = _readiness.readiness_budget_seconds(120.0)
     deadline = time.monotonic() + timeout
     state: Dict[str, Any] = {}
     rows: List[Dict[str, Any]] = []
@@ -1589,6 +1598,11 @@ def test_operator_full_flow(world):
     the scheduler's own tables, and the panel the operator looks at —
     and never on the server's memory.
     """
+    # The case waits for a whole scheduler to settle; on a host that
+    # cannot keep time the wait has no deadline to meet, so the case is
+    # skipped rather than failed on the machine's answer.
+    _readiness.skip_if_host_unmeasurable()
+
     _assert_seam(world)
     _wait_for_executors(world)
 
@@ -2091,6 +2105,11 @@ def test_queue_survives_kill9(world):
     whole M; carrying an old timestamp over would put it into the
     eviction candidates the moment it was taken over.
     """
+    # The case waits for a whole scheduler to settle; on a host that
+    # cannot keep time the wait has no deadline to meet, so the case is
+    # skipped rather than failed on the machine's answer.
+    _readiness.skip_if_host_unmeasurable()
+
     _assert_seam(world)
     _wait_for_executors(world)
 

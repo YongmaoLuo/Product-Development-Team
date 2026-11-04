@@ -45,6 +45,7 @@ import service_manager as sm  # noqa: E402
 from service_declaration import ServiceDeclaration  # noqa: E402
 from service_freshness import PortProbe  # noqa: E402
 from tests import _host_load  # noqa: E402
+from tests import _readiness  # noqa: E402
 
 
 #: The readiness budget for the tests that really start a service.
@@ -906,18 +907,14 @@ READY_BUDGET_MAX_SECONDS = 90.0
 def _readiness_budget_seconds(base: float = READY_BUDGET_SECONDS) -> float:
     """How long a service is given to come up, decided by the shared gate.
 
-    The budget follows the host's load average, because both the
-    child's own start-up and the cost of one probe scale with it.  The
-    scale is the shared gate's limit: a host at the limit gets twice
-    the base budget, and the budget stops at a ceiling, because a
-    scaled budget is still a budget.
+    The formula lives in ``tests/_readiness.py`` — one place, one
+    answer.  What stays here is this module's own policy: the ceiling
+    that keeps a scaled budget below the shortest per-test timeout
+    this module carries.
     """
-    limit = _host_load.host_load_limit()
-    load = _host_load.current_host_load()
-    if limit <= 0:
-        return float(base)
-    scaled = base * (1.0 + max(0.0, load) / limit)
-    return min(scaled, READY_BUDGET_MAX_SECONDS)
+    return _readiness.readiness_budget_seconds(
+        base, ceiling=READY_BUDGET_MAX_SECONDS,
+    )
 
 
 class _StubServer(NamedTuple):
@@ -1572,6 +1569,11 @@ def test_wait_until_ready_polls_a_real_port():
 def test_start_service_end_to_end(tmp_path: Path):
     """Real detached launch → ready, including the pid/pgid capture the
     C3 ledger depends on."""
+    # A host that cannot keep time has no deadline to meet: the case
+    # waits for a service, and on such a host the wait is the machine's
+    # answer, not the code's.
+    _readiness.skip_if_host_unmeasurable()
+
     import sys as _sys
 
     port = _free_port()
@@ -1604,6 +1606,11 @@ def test_start_service_end_to_end(tmp_path: Path):
 @pytest.mark.timeout(300)
 def test_health_url_drives_readiness(tmp_path: Path):
     """A declared health_url is the readiness signal when present."""
+    # The wait for the service is the deadline; on a host that cannot
+    # keep time the deadline is meaningless, so the case is skipped
+    # rather than failed on the machine's answer.
+    _readiness.skip_if_host_unmeasurable()
+
     import sys as _sys
 
     port = _free_port()

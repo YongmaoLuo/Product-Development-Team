@@ -10,7 +10,7 @@
 失真。所以本文件钉的是**负控**：护栏该放行的地方，它必须放行，而且结论不许
 被改判。
 
-本文件钉四件事
+本文件钉五件事
 --------------
   1. ``test_edit_into_plan_dir_is_allowed`` —— 写 plan 目录的任意子目录
      （``vp_artifacts`` / ``logs`` / 顶层文件）→ exit 0；
@@ -18,7 +18,9 @@
      ``tempfile.gettempdir()`` → exit 0；
   3. ``test_bash_write_to_tmp_is_allowed`` —— Bash 往临时目录写
      （``> /tmp/x.log`` / ``tee /tmp/x``）→ exit 0；
-  4. ``test_passed_verdict_survives_without_refusals`` —— 上面这些合法写入
+  4. ``test_heredoc_write_to_tmp_is_allowed`` —— heredoc 写临时脚本 →
+     exit 0（正文是数据，不是命令）；
+  5. ``test_passed_verdict_survives_without_refusals`` —— 上面这些合法写入
      之后没有拒绝记录 → 子 agent 的 PASSED 原样保留，不写 marker，被验证
      仓库一个字节都没变（``git status --porcelain`` 为空）。
 
@@ -51,6 +53,7 @@ plan 目录不再豁免                      ``test_edit_into_plan_dir_is_allowe
                                        ``test_passed_verdict_survives_without_refusals``
 Bash 分支的两个出口（临时目录白名单、   ``test_bash_write_to_tmp_is_allowed``、
 "不在被验证仓库里"）都没了              ``test_passed_verdict_survives_without_refusals``
+heredoc 的正文又被当成命令解析         ``test_heredoc_write_to_tmp_is_allowed``
 没有拒绝证据也改判                    ``test_passed_verdict_survives_without_refusals``
 =====================================  ==========================================
 """
@@ -355,7 +358,46 @@ def test_bash_write_to_tmp_is_allowed(settings, repo, scratch):
 
 
 # ---------------------------------------------------------------------------
-# 4. 没有拒绝记录 → 原 PASSED 保持不变
+# 4. heredoc 写临时脚本 → 放行
+# ---------------------------------------------------------------------------
+def test_heredoc_write_to_tmp_is_allowed(settings, plan_dir, repo, scratch):
+    """heredoc 写临时脚本 → 放行，不留拒绝证据。
+
+    负控（2026-11-03，round 1 的 VP-022）：heredoc 的**正文**曾被逐行当成
+    shell 命令 —— 正文里的 ``# -> spec: something`` 让 ``>`` 认成了重定向，
+    ``spec:`` 认成了写目标（按 cwd 解析进被验证仓库），于是这条只写 /tmp
+    的命令被拒（``refusals/round-1/VP-022.jsonl`` 里躺着一条
+    ``<repo>/spec:``）。子 agent 连临时脚本都写不成，取证做不成。
+
+    正文里必须同时放两种曾被误认的东西：``-> spec:``（``>`` 后面跟着一个
+    不含 ``/`` 的词）与 ``<testsuites><testsuite``（``>`` 前面粘着标签）。
+    """
+    command = _guard_command(settings, "Bash")
+    env = _child_env(settings.get("env", {}), repo, scratch)
+
+    unique = uuid.uuid4().hex[:12]
+    script = Path("/tmp") / f"vp_probe_{unique}.py"
+    heredoc = (
+        f"cat > {script} <<'PYEOF'\n"
+        "rows = [1]\n"
+        "# -> spec: something\n"
+        '# <testsuites><testsuite name="x">\n'
+        "PYEOF\n"
+    )
+    rc = _run_hook(command, _bash_payload(heredoc, repo), env)
+
+    assert rc == 0, (
+        "只写 /tmp 的 heredoc 必须放行，却拿到了 "
+        f"{rc} —— 正文不是命令"
+    )
+    assert not _refusal_marker(plan_dir).exists(), "放行就不该留下拒绝证据"
+    assert verification_write_guard.read_refusals(
+        plan_dir, ROUND_NO, VP_ID,
+    ) == [], "放行就不该留下拒绝记录"
+
+
+# ---------------------------------------------------------------------------
+# 5. 没有拒绝记录 → 原 PASSED 保持不变
 # ---------------------------------------------------------------------------
 def test_passed_verdict_survives_without_refusals(
     monkeypatch, tmp_path, settings, plan_dir, repo, scratch,

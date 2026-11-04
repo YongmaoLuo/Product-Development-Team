@@ -55,11 +55,20 @@ Bash 分支只做一件事：**算出这条命令的写目标，看有没有落�
 识别的写法：``>`` / ``>>`` / ``tee`` / ``sed -i`` / ``cp`` / ``mv`` 的目标 /
 ``dd of=`` / ``git checkout|restore|reset|stash|apply|add|commit``。
 
+**heredoc 的正文不是命令。** ``cat > /tmp/x <<'EOF' … EOF`` 里，分隔符行到
+``EOF`` 之前都是**数据**（子 agent 写的脚本正文）。逐行把正文当 shell 解析，
+正文里的 ``>``、``->``、``<tag>`` 就会被认成重定向，把一行注释认成一次写入
+——"只写 /tmp"的命令于是被算成"写进了被验证仓库"。所以命令先按"命令行 /
+正文"切开，只有命令行参与解析；运算符那一行照常解析（``> /tmp/x`` 留住）。
+
 拒绝证据
 --------
 ``<plan>/vp_write_scope/refusals/round-<n>/<vp_id>.jsonl`` —— 一行一条 JSON，
 追加写。放在 plan 目录里而不是临时目录：临时目录会被清掉，而"这个 VP 试图
 改被验证仓库"正是事后要查的事。
+
+每条记录里还有 ``command``（原始命令行，截断到 500 字符）：只有落点的话，
+事后看不出"是哪条命令想写它"。
 
 路径比较一律先 ``resolve()``：``/tmp`` 在 macOS 上是 ``/private/tmp`` 的
 软链，``plan/../..`` 也是逃逸的经典写法 —— 不解析符号链接的比较等于没比。
@@ -120,6 +129,15 @@ _TMP_ROOTS = ("/tmp", "/private/tmp")  # nosec B108
 #: 一样，交给人读会数错交替项的边界。``>|`` 是 bash 的 clobber 写法
 #: （``>| file`` 就是写 ``file``），漏了它就等于给"越界 clobber"留了一条路。
 _REDIRECT_RE = re.compile(r"(?P<fd>\d*)?(?P<op>&>>|&>|>>[|]|>[|]>|>[|]|>>|>)")
+
+#: 识别 heredoc 操作符（``<<`` / ``<<-``）。``<<<`` 是 here-string，**不是**
+#: heredoc —— 它不吞掉后面的行，所以前后都得排掉 ``<``：前一个字符不能是
+#: ``<``（否则 ``<<<`` 的第二对也会被认成操作符），后一个字符不能是 ``<``
+#: （否则 ``<<<`` 的第一对会被认成操作符）。
+#:
+#: ``dash`` 是 ``<<-`` 那个 ``-``：它表示正文行首的 tab 会被去掉，分隔符
+#: 行也因此要按同样的规则比较。
+_HEREDOC_RE = re.compile(r"(?<![<>])<<(?P<dash>-?)(?![<>])")
 
 #: shell 的命令分隔符。token 化之后它们单独成 token。
 _SHELL_SEPARATORS = (";", "&&", "||", "|", "&", "(", ")")
@@ -639,6 +657,76 @@ def _safe_cwd() -> str:
         return ""
 
 
+def _word_text(parts: Sequence[Tuple[str, bool]]) -> str:
+    """The text of one shell word, cut at its first unquoted ``<`` / ``>``.
+
+    一个 token 里的片段属于同一个词（token 是按空白切的），所以片段要接
+    起来看；但引号外的 ``<`` / ``>`` 是重定向操作符，**不属于**这个词 ——
+    ``<<EOF>x`` 的分隔符是 ``EOF``，``>x`` 是重定向。引号里的 ``<`` / ``>``
+    是数据（``<<'a>b'`` 的分隔符就是 ``a>b``）。
+    """
+    pieces: List[str] = []
+    for chunk, quoted in parts:
+        if quoted:
+            pieces.append(chunk)
+            continue
+        stop = len(chunk)
+        for char in ("<", ">"):
+            found = chunk.find(char)
+            if found != -1:
+                stop = min(stop, found)
+        pieces.append(chunk[:stop])
+        if stop < len(chunk):
+            break  # 词到这儿就断了，后面的片段是另一个词
+    return "".join(pieces)
+
+
+def _heredoc_delimiters(
+    tokens: List[List[Tuple[str, bool]]],
+) -> List[Tuple[str, bool]]:
+    """The heredoc delimiters in one tokenised line, in order of appearance.
+
+    每个元素是 ``(分隔符, 是否去掉行首 tab)``。
+
+    认得出来的写法：``<<EOF``、``<<'EOF'``、``<<"EOF"``、``<<\\EOF``、
+    ``<<-EOF``（去 tab），操作符与分隔符之间允许有空白。``<<<`` 是
+    here-string，不在这里面。
+
+    分隔符是紧跟操作符的那个**词**：引号里的内容原样算进去（引号被去掉），
+    引号外的重定向字符把词截断。
+    """
+    delimiters: List[Tuple[str, bool]] = []
+    for position, token in enumerate(tokens):
+        for part_index, (text, quoted) in enumerate(token):
+            if quoted:
+                continue
+            cursor = 0
+            while True:
+                match = _HEREDOC_RE.search(text, cursor)
+                if match is None:
+                    break
+                strip_tabs = bool(match.group("dash"))
+                after = match.end()
+                # 分隔符词里不能再有引号外的重定向字符。
+                stop = len(text)
+                for char in ("<", ">"):
+                    found = text.find(char, after)
+                    if found != -1:
+                        stop = min(stop, found)
+                remainder: List[Tuple[str, bool]] = [(text[after:stop], False)]
+                # 同一个 token 里后面的片段属于同一个词（``<<'EOF'``）。
+                remainder.extend(token[part_index + 1 :])
+                word = _word_text(remainder)
+                if not word and position + 1 < len(tokens):
+                    # ``<< EOF``：分隔符是下一个 token。
+                    word = _word_text(tokens[position + 1])
+                delimiters.append((word, strip_tabs))
+                cursor = stop
+                if cursor >= len(text):
+                    break
+    return delimiters
+
+
 def bash_write_targets(command: str, cwd: str) -> List[str]:
     """Every path the shell command writes to, resolved against ``cwd``.
 
@@ -646,6 +734,12 @@ def bash_write_targets(command: str, cwd: str) -> List[str]:
     ``cp`` / ``mv`` 的落点（``mv`` 的源也算：文件从源那儿没了）、``dd of=``、
     以及改了工作区或仓库状态的 git 子命令（``checkout`` / ``restore`` /
     ``reset`` / ``stash`` / ``apply`` / ``add`` / ``commit``）。
+
+    **heredoc 的正文不是命令。** ``cat > /tmp/x <<'EOF' … EOF`` 里，从分隔符
+    行到 ``EOF`` 之前都是**数据**（子 agent 写的脚本正文），不是 shell。
+    逐行把正文当命令解析，正文里的 ``>``、``->``、``<tag>`` 就会被认成重定向，
+    把一行注释认成一次写入 —— 于是"只写 /tmp"的命令被算成"写进了被验证
+    仓库"。所以命令先按"命令行 / 正文"切开，只有命令行参与解析。
 
     Args:
         command: The shell command as the agent wrote it.
@@ -663,8 +757,15 @@ def bash_write_targets(command: str, cwd: str) -> List[str]:
     current = base
     targets: List[str] = []
     try:
-        for line in command.splitlines() or [command]:
-            for segment in _segments(_tokenize(line)):
+        lines = command.splitlines() or [command]
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            index += 1
+            tokens = _tokenize(line)
+            # 运算符**那一行**照常解析：``cat > /tmp/x <<'EOF'`` 的
+            # ``> /tmp/x`` 必须留住。
+            for segment in _segments(tokens):
                 position = _command_index(segment)
                 if position is not None and _text(segment[position]) == "cd":
                     current = _cd_target(segment, position + 1, current)
@@ -678,6 +779,18 @@ def bash_write_targets(command: str, cwd: str) -> List[str]:
                     resolved = _absolute(raw, current)
                     if resolved and resolved not in targets:
                         targets.append(resolved)
+            # heredoc 的正文跟在命令行后面 —— 正文不是命令，逐行跳过。
+            # 分隔符没出现（命令没闭合）时，剩下的行全是正文：bash 自己遇到
+            # 没闭合的 heredoc 是语法错误、整条命令都不跑，所以这里**不**
+            # 回退成逐行解析（回退等于把正文重新当成命令）。
+            for delimiter, strip_tabs in _heredoc_delimiters(tokens):
+                while index < len(lines):
+                    candidate = lines[index]
+                    index += 1
+                    if strip_tabs:
+                        candidate = candidate.lstrip("\t")
+                    if candidate == delimiter:
+                        break
     except Exception:  # noqa: BLE001 —— 解析不了就当没有写目标
         return []
     return targets
@@ -764,7 +877,9 @@ def check_bash_payload(payload: Any) -> int:
             continue
         if not project_resolved or not _is_inside(resolved, project_resolved):
             continue
-        marker = record_refusal("Bash", resolved, REASON_OUTSIDE_SCOPE)
+        marker = record_refusal(
+            "Bash", resolved, REASON_OUTSIDE_SCOPE, command=command,
+        )
         print(
             "[pdt] refusing a shell write into the repository under "
             "verification: "
@@ -817,7 +932,12 @@ def refusal_dir(plan_dir: Any, round_no: Any) -> Path:
     )
 
 
-def record_refusal(tool: Any, path: Any, reason: Any) -> Optional[Path]:
+def record_refusal(
+    tool: Any,
+    path: Any,
+    reason: Any,
+    command: Optional[str] = None,
+) -> Optional[Path]:
     """Append one refusal record; return the marker path, or ``None``.
 
     证据写失败**不抛异常**：调用方要的是"这次拒绝仍然 exit 2"，而写不进去
@@ -828,6 +948,10 @@ def record_refusal(tool: Any, path: Any, reason: Any) -> Optional[Path]:
         tool: The tool that was refused.
         path: The path it wanted to write.
         reason: The machine-readable reason.
+        command: The command line the agent ran, when there is one. It goes
+            into the record (truncated) so that "what was it trying to do"
+            can be answered afterwards from the evidence alone — a refusal
+            that only names the path does not say which command caused it.
 
     Returns:
         The marker file that was written, or ``None`` when the evidence
@@ -849,6 +973,8 @@ def record_refusal(tool: Any, path: Any, reason: Any) -> Optional[Path]:
         "vp_id": vp_id,
         "round": round_no,
     }
+    if command is not None:
+        record["command"] = str(command)[:500]
     try:
         directory.mkdir(parents=True, exist_ok=True)
         with open(marker, "a", encoding="utf-8") as handle:
@@ -983,7 +1109,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     tool = _tool_name(payload)
     path = _target_path(payload)
-    marker = record_refusal(tool, path, decision.reason)
+    marker = record_refusal(
+        tool, path, decision.reason, command=_bash_command(payload),
+    )
     scope = os.environ.get(SCOPE_ENV, "")
     print(
         "[pdt] refusing to write outside the VP write scope: "
