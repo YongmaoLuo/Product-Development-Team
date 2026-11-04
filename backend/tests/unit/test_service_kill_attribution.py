@@ -76,6 +76,15 @@ if str(_BACKEND_DIR) not in sys.path:
 import server  # noqa: E402
 import service_manager as sm  # noqa: E402
 from service_declaration import ServiceDeclaration  # noqa: E402
+from tests import _readiness  # noqa: E402
+
+
+#: The readiness budget a quiet host is given to bring the fixture up.
+#:
+#: The budget follows the host's load, because the fixture's own
+#: start-up and the cost of one probe both scale with it — the number
+#: is worked out by the shared module, not written here.
+READY_BUDGET_SECONDS = 30.0
 
 
 #: The plan the parked run belongs to.
@@ -312,7 +321,20 @@ def _declaration(port: int, script: Path) -> ServiceDeclaration:
         ),
         cwd=".",
         health_url=f"http://127.0.0.1:{port}/health",
-        ready_timeout_seconds=READY_TIMEOUT_SECONDS,
+        # 2026-11-03 — the deadline is the **larger** of the two answers:
+        # the explicit wall-clock floor (120 s — the budget a machine
+        # under load is given to bring a service up) and the load-aware
+        # budget the shared module works out for this host.  Both sides
+        # of this merge argued for MORE patience on a busy machine, and a
+        # deadline that is too short turns a loaded host into a red lane
+        # — a red that says nothing about the code under test.  So the
+        # larger one wins.
+        ready_timeout_seconds=int(
+            max(
+                READY_TIMEOUT_SECONDS,
+                _readiness.readiness_budget_seconds(READY_BUDGET_SECONDS),
+            )
+        ),
         log_path="tmp/api.log",
     )
 
@@ -633,6 +655,11 @@ def test_the_round_s_own_reap_names_itself_as_the_caller(
     The sweep was not wrong to stop an orphan — it was silent about
     stopping it, so nobody could tell it apart from a crash.
     """
+    # The case brings a service up and waits for it; on a host that
+    # cannot keep time the wait has no deadline to meet, so the case is
+    # skipped rather than failed on the machine's answer.
+    _readiness.skip_if_host_unmeasurable()
+
     plan_dir, project_dir = round_dirs
     runtime = _bring_up(plan_dir, project_dir, declaration)
     started.append(runtime)

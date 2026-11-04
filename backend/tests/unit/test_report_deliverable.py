@@ -1161,3 +1161,87 @@ def test_a_code_task_says_nothing_about_a_report(tmp_path):
     assert "Write 工具" not in prompt, (
         "a code task was told to Write a report file:\n" + prompt
     )
+
+
+# ---------------------------------------------------------------------------
+# 6 — the channel a root-cause task travels through (2026-11-03)
+# ---------------------------------------------------------------------------
+#
+# The repair tasks (and the root-cause chain's tasks) are written
+# straight into ``state.db``; the executor picks them up as DB orphans
+# and rebuilds them through ``orphan_rules.merged_subtask_kwargs``. A
+# row that lost ``deliverable`` / ``report_path`` on the way comes back
+# as ``deliverable="code"`` — and the empty-diff gate then reads a
+# delivered report as "this task produced nothing", which is exactly
+# the ``empty_diff_no_changes`` verdict the root-cause task was
+# wrongly given.
+
+
+def test_a_report_task_survives_the_state_db_and_the_orphan_merge():
+    """The two fields have to survive the only path the executor reads."""
+    import sqlite3
+
+    from agent import is_report_task
+    from orphan_rules import merged_subtask_kwargs
+    from root_cause_task import build_root_cause_task
+    from state_machine.db.schema import migrate
+    from state_machine.repositories.plan_task_repository import (
+        ALLOWED_STATIC_TASK_FIELDS,
+        PlanTaskRepository,
+    )
+
+    task = build_root_cause_task(plan_id="p1", vp_id="VP-3", round_no=3)
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        migrate(conn)
+        repo = PlanTaskRepository(conn)
+        # The orchestrator narrows the payload to the table's own
+        # allow-list before writing it — so the allow-list is part of
+        # the contract, not an implementation detail.
+        payload = {
+            k: v for k, v in task.items() if k in ALLOWED_STATIC_TASK_FIELDS
+        }
+        assert payload.get("deliverable") == "report", (
+            "the orchestrator's allow-list dropped the deliverable "
+            f"field: {sorted(payload)}"
+        )
+        assert payload.get("report_path") == task["report_path"], (
+            "the orchestrator's allow-list dropped the report address"
+        )
+        repo.add_task("p1", payload)
+
+        rows = list(repo.iter_orphan_tasks("p1", disk_ids=set()))
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["deliverable"] == "report"
+        assert row["report_path"] == task["report_path"]
+
+        merged = merged_subtask_kwargs(row)
+        assert merged.get("deliverable") == "report", merged
+        assert merged.get("report_path") == task["report_path"], merged
+
+        sub = SubTask(**merged)
+        assert is_report_task(sub) is True
+    finally:
+        conn.close()
+
+
+def test_an_orphan_row_without_a_report_address_stays_a_code_task():
+    """Half a pair is not a report task — and must not raise.
+
+    ``deliverable`` and ``report_path`` are a pair: the model refuses a
+    report task with no address. A row that carries only one half must
+    not turn the merge into the thing that raises.
+    """
+    from orphan_rules import merged_subtask_kwargs
+
+    merged = merged_subtask_kwargs({
+        "id": "repair-01",
+        "title": "t",
+        "description": "d",
+        "deliverable": "report",
+        "report_path": None,
+    })
+    assert "deliverable" not in merged, merged
+    assert "report_path" not in merged, merged

@@ -56,6 +56,7 @@ because its output is a judgement, not a change).
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -67,6 +68,7 @@ if str(_BACKEND_DIR) not in sys.path:
 from root_cause_task import (  # noqa: E402
     ROOT_CAUSE_DELIVERABLE,
     build_root_cause_task,
+    root_cause_report_absolute_path,
 )
 from task import SubTask  # noqa: E402
 
@@ -93,7 +95,21 @@ def test_a_root_cause_task_declares_a_report_deliverable():
     row = build_root_cause_task(PLAN_ID, VP_ID, 3, task_id="repair-04")
 
     assert row["deliverable"] == "report"
-    assert row["report_path"] == REPORT_REL
+    report_path = row["report_path"]
+    # 2026-11-03 — the report's address is ABSOLUTE, anchored on the
+    # PLAN's own directory.  A relative address would be resolved by
+    # the executor against its own working directory and point at a
+    # different file than the one the orchestrator reads back.
+    assert os.path.isabs(report_path)
+    # Its SHAPE is still the documented one — ``plans/<plan>/reports/
+    # <report>`` — just rooted somewhere concrete (no machine-specific
+    # prefix is written down here).
+    assert Path(report_path).parts[-4:] == (
+        "plans", PLAN_ID, "reports", REPORT_NAME,
+    )
+    # One anchor, one source of truth: the very helper the builder
+    # called to compute it.
+    assert report_path == root_cause_report_absolute_path(PLAN_ID, VP_ID)
     # The five required sections survive — they are what the report has
     # to contain, which is a different question from what the task IS.
     assert row["report_deliverables"] == list(ROOT_CAUSE_DELIVERABLE)
@@ -110,7 +126,13 @@ def test_a_root_cause_row_is_parsable_as_a_task():
     task = SubTask(**row)
 
     assert task.deliverable == "report"
-    assert task.report_path == REPORT_REL
+    # Same contract as the row above: absolute, anchored on the plan's
+    # own directory, and derived from the one helper.
+    assert os.path.isabs(task.report_path)
+    assert Path(task.report_path).parts[-4:] == (
+        "plans", PLAN_ID, "reports", REPORT_NAME,
+    )
+    assert task.report_path == root_cause_report_absolute_path(PLAN_ID, VP_ID)
 
 
 # ---------------------------------------------------------------------------

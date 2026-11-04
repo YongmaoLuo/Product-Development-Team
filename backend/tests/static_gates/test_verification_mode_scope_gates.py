@@ -168,6 +168,16 @@ EXCLUDED_SEGMENTS: frozenset[str] = frozenset({
 #: ``test_capacity_wait_status_surface_is_frozen``), so the rest of
 #: ``backend/state_machine/`` stays frozen inside the diff.
 #:
+#: One more file is excluded for the root-cause report delivery
+#: channel (2026-11-04):
+#: ``backend/state_machine/repositories/plan_task_repository.py``.  The
+#: report-style task needs its deliverable to be a file and its address
+#: to live in ``report_path``, so ``ALLOWED_STATIC_TASK_FIELDS`` there
+#: has to carry ``deliverable`` / ``report_path``.  Following the
+#: ``execution_repository.py`` precedent, this is a narrow exclusion
+#: scoped to that one file; the rest of its content, and the rest of
+#: ``backend/state_machine/``, stay frozen inside the diff.
+#:
 #: Two more files are excluded for the native scheduler:
 #: ``backend/state_machine/db/schema.py`` (schema v7 adds the three
 #: ``scheduler_*`` tables) and ``frontend/index.html`` (the scheduler
@@ -191,6 +201,7 @@ FORBIDDEN_MODULE_PATHS: tuple[str, ...] = (
     ":(exclude)frontend/index.html",
     ":(exclude)backend/verification_loop.py",
     ":(exclude)backend/state_machine/repositories/execution_repository.py",
+    ":(exclude)backend/state_machine/repositories/plan_task_repository.py",
     ":(exclude)backend/state_machine/db/schema.py",
 )
 
@@ -537,8 +548,19 @@ FROZEN_REQUIREMENTS_HASH: str = (
 #: (``4e31487b0ae462e470a54ecd03a5e7c6d1cdf5c90a61975c80519868535ddb23``)
 #: is the hash of exactly the fourteen objects that preceded it, and the
 #: new value is the hash of those same fourteen plus this one table.
+#:
+#: 2026-11-04 (root-cause report delivery): re-pinned once more.  The
+#: delta against the 2026-10-29 baseline is exactly two new columns on
+#: ``plan_tasks`` — ``deliverable`` and ``report_path``.  They carry the
+#: root-cause report's delivery channel: a report-style task's
+#: deliverable is a file, and its address is in ``report_path``.  The
+#: object list printed by the failing assertion shows every other object
+#: unchanged, so the previous baseline
+#: (``5ffab1223d67c64c0eb17147eaf479346b163d3dd8e6d0e19c31ddab71cfd521``)
+#: is the hash of exactly the objects that preceded it, and the new value
+#: is the hash of those same objects plus these two columns.
 FROZEN_SCHEMA_DDL_HASH: str = (
-    "5ffab1223d67c64c0eb17147eaf479346b163d3dd8e6d0e19c31ddab71cfd521"
+    "099c1e4948f74efaeaf36337a81d961528d91481b46c8ea43aba0c3b58157dd1"
 )
 
 #: The phase merge renamed the waiting bucket to ``queued``. The rename
@@ -717,8 +739,11 @@ FROZEN_SCHEDULER_SURFACE_SHA256: dict[str, str] = {
     # 2026-10-29：因新增 `scheduler_setting` 表（容量的运行期覆盖）改动本文件，
     # 按本 gate 的既定流程重新钉住该文件的哈希；schema.py 的模块 docstring
     # 已同步改为「four ``scheduler_*`` tables」。
+    # 2026-11-04（根因报告交付）：`plan_tasks` 新增 `deliverable` / `report_path`
+    # 两列（报告型任务的交付通道：交付物是一份文件，地址在 `report_path`），
+    # 同一次改动，按本 gate 的既定流程重新钉住该文件的哈希。
     "backend/state_machine/db/schema.py": (
-        "b35b29a61e764756bdf3686757dc9f7cb4ecb7673bda8ab1443d898c39adf595"
+        "7cb8f032d8b032c3ef96aa4f085e824d48c849ecca948b43ac7cc6a611413069"
     ),
     # 2026-10-30：因调度面板改版（视图重排、在跑运行时长、并行 Agent 数、容量下拉框）
     # 改动本文件，按本 gate 的既定流程重新钉住该文件的哈希。

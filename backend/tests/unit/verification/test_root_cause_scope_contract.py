@@ -23,8 +23,15 @@ TDD contract — 4 cases
 3. ``test_template_round_trips_through_reader`` —— **回归钉子**：把模板里
    那个 ``json`` 块从**原文**切出来，把占位路径换成一条真路径，喂给
    reader，必须读出那条路径 —— 模板给的形状就是读者读的形状。
-4. ``test_deliverable_names_scope`` —— 交付物清单里有「改动范围」这一项，
-   且任务仍然是只读诊断任务（没有 ``files_to_modify``）。
+4. ``test_deliverable_names_scope`` —— ``deliverable`` 是判别式字符串
+   ``"report"``（交付物的**种类**），而那五件事（尤其「改动范围」）出现在
+   **description** 里 —— 描述是执行器唯一会拼进 brief 的通道，也就是唯一
+   能到达写报告的人的通道；清单另有一个独立键 ``deliverable_checklist``，
+   描述由它生成，不写两份字面量。任务仍然是只读诊断任务（没有
+   ``files_to_modify``）。
+
+   2026-11-03（main 侧）：交付物清单里有「改动范围」这一项 —— 同一份清单
+   另有一个键名 ``report_deliverables``，两个键都留着。
 
    2026-11-03: 这份清单从 ``deliverable`` 挪到了 ``report_deliverables``
    —— ``deliverable`` 现在是交付物的**类型**（"report"），这五件事是报告的
@@ -146,29 +153,57 @@ def test_template_round_trips_through_reader():
 
 
 # ---------------------------------------------------------------------------
-# 4. deliverable 点名「改动范围」
+# 4. deliverable 是判别式；那五件事在 description 里
 # ---------------------------------------------------------------------------
 def test_deliverable_names_scope():
-    """交付物清单里有「改动范围」这一项，任务仍是只读诊断任务。"""
+    """deliverable 是 ``"report"``，五件事（尤其「改动范围」）在 description 里。
+
+    2026-11-03：``deliverable`` 装的是交付物的**种类**（``SubTask`` 把它
+    声明成 ``Literal["code", "report"]``，装一个列表进去直接
+    ValidationError，任务连派都派不出去）。报告要写什么挪到了
+    ``deliverable_checklist`` —— 而那个键谁也收不到（``SubTask`` 是
+    ``extra="ignore"``），所以那五件事必须**同时**出现在 description 里：
+    那是执行器唯一会拼进 brief 的通道。
+
+    2026-11-03（main 侧）：同一份清单还有另一个键名
+    ``report_deliverables``（「报告里必须有的章节」）—— 两个键装的是同一份
+    列表，两个都留着。
+    """
     task = build_root_cause_task("p1", "VP-3", 2)
 
-    # 交付物的**类型**：一份报告，落在 plan 自己的 reports/ 下 ——
-    # 执行器据此走报告分支（is_report_task / resolve_report_path）。
+    # 交付物的种类：判别式字符串。
     assert task["deliverable"] == "report"
-    assert task["report_path"] == "plans/p1/reports/root-cause-VP-3.md"
 
-    # 交付物的**内容**：这五件事是报告里必须有的章节。
-    required = task["report_deliverables"]
-    assert len(required) >= 5
-    assert "改动范围" in required[4]
-    assert any("改动范围" in item for item in required)
+    # 报告地址：绝对路径，锚在计划自己的 reports/ 下 ——
+    # 执行器据此走报告分支（is_report_task / resolve_report_path）。
+    assert Path(task["report_path"]).is_absolute()
+    assert task["report_path"].endswith("plans/p1/reports/root-cause-VP-3.md")
+
+    # 清单挪到了独立键。
+    checklist = task["deliverable_checklist"]
+    assert len(checklist) >= 5
+    assert "改动范围" in checklist[4]
+    assert any("改动范围" in item for item in checklist)
     # 前四项是旧契约，一项都不能被这次改动挤掉。
-    assert required[:4] == [
+    assert checklist[:4] == [
         "确定性复现步骤",
         "完整因果链",
         "一次覆盖所有层的修复方案",
         "验收方式（只选中这次失败的用例）",
     ]
+
+    # 另一个键名（main 侧的 ``report_deliverables``）装的是同一份清单 ——
+    # 两个键都在，谁读哪个键都读得到那五件事。
+    required = task["report_deliverables"]
+    assert required == checklist
+
+    # 清单必须**逐字**出现在 description 里 —— 那是唯一能到达作者的通道。
+    description = task["description"]
+    for item in checklist:
+        assert item in description, (
+            f"description 里没有「{item}」：作者看不到自己要写哪几段"
+        )
+    assert "改动范围" in description
 
     # 只读语义不变：诊断任务不许声明改动范围。
     assert task["read_only"] is True

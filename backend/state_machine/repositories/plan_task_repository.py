@@ -105,6 +105,15 @@ ALLOWED_STATIC_TASK_FIELDS: frozenset = frozenset(
         "acceptance_criteria",
         "failed_vp_id",
         "round",
+        # 2026-11-03 — the deliverable channel.  A report task's
+        # deliverable is ONE FILE, and the file's address is what the
+        # executor checks (``agent.read_report_deliverable``).  Without
+        # these two fields the row rehydrates as ``deliverable="code"``
+        # and a report that was written and delivered reads as "this
+        # task produced nothing" — the ``empty_diff_no_changes``
+        # verdict the root-cause task was wrongly given.
+        "deliverable",
+        "report_path",
     }
 )
 
@@ -244,6 +253,10 @@ _WRITABLE_STATIC_COLUMNS: tuple[str, ...] = (
     "acceptance_criteria",
     "failed_vp_id",
     "round",
+    # 2026-11-03 — the deliverable channel (see
+    # :data:`ALLOWED_STATIC_TASK_FIELDS`).
+    "deliverable",
+    "report_path",
     "updated_at",
 )
 
@@ -282,7 +295,7 @@ class PlanTaskRepository:
             "description, test_command, files_to_modify, depends_on, "
             "model_type, project_dir, provider, task_group, "
             "execution_group, priority, acceptance_criteria, "
-            "failed_vp_id, round "
+            "failed_vp_id, round, deliverable, report_path "
             "FROM plan_tasks WHERE plan_id = ? AND task_id = ?",
             (plan_id, task_id),
         )
@@ -295,7 +308,7 @@ class PlanTaskRepository:
             "description", "test_command", "files_to_modify", "depends_on",
             "model_type", "project_dir", "provider", "task_group",
             "execution_group", "priority", "acceptance_criteria",
-            "failed_vp_id", "round",
+            "failed_vp_id", "round", "deliverable", "report_path",
         )
         entry: dict[str, Any] = {}
         for col, val in zip(cols, row):
@@ -331,7 +344,7 @@ class PlanTaskRepository:
             "title, description, test_command, files_to_modify, "
             "depends_on, model_type, project_dir, provider, task_group, "
             "execution_group, priority, acceptance_criteria, "
-            "failed_vp_id, round "
+            "failed_vp_id, round, deliverable, report_path "
             "FROM plan_tasks WHERE plan_id = ?",
             (plan_id,),
         )
@@ -342,7 +355,7 @@ class PlanTaskRepository:
             "description", "test_command", "files_to_modify", "depends_on",
             "model_type", "project_dir", "provider", "task_group",
             "execution_group", "priority", "acceptance_criteria",
-            "failed_vp_id", "round",
+            "failed_vp_id", "round", "deliverable", "report_path",
         )
         for row in cur.fetchall():
             task_id = row[0]
@@ -489,7 +502,7 @@ class PlanTaskRepository:
             "title, description, test_command, files_to_modify, "
             "depends_on, model_type, project_dir, provider, task_group, "
             "execution_group, priority, acceptance_criteria, "
-            "failed_vp_id, round "
+            "failed_vp_id, round, deliverable, report_path "
             "FROM plan_tasks WHERE plan_id = ?",
             (plan_id,),
         )
@@ -499,7 +512,7 @@ class PlanTaskRepository:
             "description", "test_command", "files_to_modify", "depends_on",
             "model_type", "project_dir", "provider", "task_group",
             "execution_group", "priority", "acceptance_criteria",
-            "failed_vp_id", "round",
+            "failed_vp_id", "round", "deliverable", "report_path",
         )
         for row in cur.fetchall():
             tid = row[0]
@@ -534,7 +547,7 @@ class PlanTaskRepository:
             "title, description, test_command, files_to_modify, "
             "depends_on, model_type, project_dir, provider, task_group, "
             "execution_group, priority, acceptance_criteria, "
-            "failed_vp_id, round "
+            "failed_vp_id, round, deliverable, report_path "
             "FROM plan_tasks WHERE plan_id = ? AND task_group LIKE ?",
             (plan_id, prefix + "%"),
         )
@@ -544,7 +557,7 @@ class PlanTaskRepository:
             "description", "test_command", "files_to_modify", "depends_on",
             "model_type", "project_dir", "provider", "task_group",
             "execution_group", "priority", "acceptance_criteria",
-            "failed_vp_id", "round",
+            "failed_vp_id", "round", "deliverable", "report_path",
         )
         for row in cur.fetchall():
             tid = row[0]

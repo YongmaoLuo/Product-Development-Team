@@ -80,6 +80,7 @@ from verification.failure_fingerprint import (
 from root_cause_task import (
     build_implementation_task,
     build_root_cause_task,
+    root_cause_report_absolute_path,
     root_cause_report_path,
 )
 from verification.triage_agent import VPTriageJudge
@@ -2062,11 +2063,16 @@ class VerificationOrchestrator:
         """Where the root-cause report of a point lives.
 
         The path is the one the diagnosis task was handed
-        (:func:`root_cause_task.root_cause_report_path`), so the task
-        and the reader cannot disagree about where the report is.
+        (:func:`root_cause_task.root_cause_report_absolute_path`, same
+        ``plan_dir`` anchor), so the task and the reader cannot disagree
+        about where the report is — the reader and the writer go through
+        the **same helper**, so they cannot even compute two answers.
         """
-        name = Path(root_cause_report_path(self.plan_dir.name, vp_id)).name
-        return Path(self.plan_dir) / "reports" / name
+        return Path(
+            root_cause_report_absolute_path(
+                self.plan_dir.name, vp_id, plan_dir=self.plan_dir,
+            )
+        )
 
     def _root_cause_scope(self, vp_id: str) -> Tuple[bool, List[str]]:
         """The scope the root-cause report delivers, and whether it is there.
@@ -2314,6 +2320,21 @@ class VerificationOrchestrator:
                 task = build_root_cause_task(
                     self.plan_dir.name, vp_id, round_number, evidence,
                     task_id=task_id,
+                    # 2026-11-03 — the report's address is absolute and
+                    # anchored on the **plan's own directory**, so the
+                    # executor resolves the same file the orchestrator
+                    # reads back (``_root_cause_report_file`` goes through
+                    # the same helper with the same anchor). Anchoring it
+                    # on the workspace instead made the two point at two
+                    # different files.
+                    plan_dir=self.plan_dir,
+                    # 2026-11-02 — the address is also handed down
+                    # explicitly, as the **absolute** path of the file the
+                    # chain reads back.  Two readers have to name the same
+                    # file: the fence, which lets a report task write
+                    # exactly the path the task declares
+                    # (``PDT_REPORT_PATH``), and the chain, which reads
+                    # the report back to get the scope.
                     report_path=report_path,
                 )
             tasks.append(self._mark_root_cause_task(task, vp_id))
@@ -4823,21 +4844,30 @@ class VerificationOrchestrator:
                         # task that cannot be written is a task the
                         # executor never runs, and one of them aborting
                         # the write would take the round's plain repair
-                        # rows down with it.
-                        # 2026-11-02: the report contract does NOT ride
-                        # the allow-list — ``deliverable`` /
-                        # ``report_path`` are not columns of
-                        # ``plan_tasks``, and the verification-mode scope
-                        # gate freezes the schema's bytes, so a column
-                        # cannot be added for them.  The contract rides
-                        # the **description** instead: the root-cause
-                        # task's description carries a machine-readable
-                        # marker line (see ``orphan_rules.
+                        # rows down with it.  What the table cannot hold
+                        # stays in the fields it can: the path a
+                        # diagnosis must write is in the task's
+                        # description.
+                        #
+                        # 2026-11-03: ``deliverable`` / ``report_path``
+                        # ARE on the allow-list now, and they are what
+                        # makes the chain's report task dispatchable at
+                        # all: without them the row rehydrates as a code
+                        # task and the executor's empty-diff gate reads
+                        # the delivered report as "nothing was produced".
+                        #
+                        # 2026-11-02: the report contract ALSO rides the
+                        # **description** — the root-cause task's
+                        # description carries a machine-readable marker
+                        # line (see ``orphan_rules.
                         # report_deliverable_marker``), the description
                         # is stored verbatim, and the executor's orphan
-                        # reconcile reads the pair back out of it.  So
-                        # the task still reaches the executor as a
-                        # report task — ``is_report_task()`` is true,
+                        # reconcile reads the pair back out of it.  The
+                        # marker is the channel that works on a table
+                        # without the two columns, so it stays even now
+                        # that the columns exist.  So the task still
+                        # reaches the executor as a report task —
+                        # ``is_report_task()`` is true,
                         # ``PDT_REPORT_PATH`` gets stamped, and the fence
                         # lets the diagnosis write exactly that one
                         # file.  What the table cannot hold at all

@@ -50,6 +50,15 @@ CI_ENV = "CI"
 #: The spellings of ``CI`` that mean "yes, this is a CI run".
 _CI_TRUE_VALUES = frozenset({"1", "true", "yes"})
 
+#: The spellings of a measurement that say "yes" and "no".
+_TRUE_VALUES = frozenset({"1", "true", "yes"})
+_FALSE_VALUES = frozenset({"0", "false", "no"})
+
+#: The environment variable the gate script exports after it **measured**
+#: the host: ``0`` — the host cannot measure wall-clock time, ``1`` — it
+#: can.  Unset means "never measured".
+HOST_MEASURABLE_ENV = "PDT_HOST_MEASURABLE"
+
 
 def _source(env: Optional[Mapping[str, str]] = None) -> Mapping[str, str]:
     """The environment to read: the injected one, or the process's own."""
@@ -103,6 +112,33 @@ def ci_requested(env: Optional[Mapping[str, str]] = None) -> bool:
     return str(raw).strip().lower() in _CI_TRUE_VALUES
 
 
+def host_measurable(env: Optional[Mapping[str, str]] = None) -> Optional[bool]:
+    """What the gate's own probe measured about this host.
+
+    Three-valued, because the three states are three different things:
+
+    * ``True`` — the host can measure wall-clock time;
+    * ``False`` — it cannot (the probe timed a sleep and it came out
+      far too long);
+    * ``None`` — nobody measured.  A run that never measured has not
+      declared the host untrustworthy, and must leave every gate exactly
+      where it was.
+
+    The value comes from the gate script, which probes the host before
+    it runs anything and exports the answer as
+    :data:`HOST_MEASURABLE_ENV`.
+    """
+    raw = _source(env).get(HOST_MEASURABLE_ENV)
+    if raw is None:
+        return None
+    text = str(raw).strip().lower()
+    if text in _FALSE_VALUES:
+        return False
+    if text in _TRUE_VALUES:
+        return True
+    return None
+
+
 def skip_reason(
     *,
     load: Optional[float] = None,
@@ -115,7 +151,19 @@ def skip_reason(
     configured limit, and ``env`` to the process environment.  The message
     carries both numbers, so the lane log says why the bound was not
     asserted without anybody having to go and reproduce the load.
+
+    A **measurement** outranks a **guess**.  ``CI=true`` says "this is a
+    hosted runner, where the load is not the code's own doing" — a guess
+    about a machine nobody looked at.  ``PDT_HOST_MEASURABLE=0`` says the
+    probe *timed* this host and it could not keep time — a measurement.
+    When the two disagree, the measurement wins, and the case is skipped
+    instead of being failed by a clock that does not work.
     """
+    if host_measurable(env) is False:
+        return (
+            "skipped: the host cannot measure wall-clock time "
+            f"({HOST_MEASURABLE_ENV}=0)"
+        )
     if ci_requested(env):
         return None
     if load is None:

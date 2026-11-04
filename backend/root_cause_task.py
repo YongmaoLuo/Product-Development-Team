@@ -35,6 +35,41 @@
 description 里带着一份可照抄的改动范围模板（:data:`_SCOPE_CONTRACT_TEMPLATE`），
 读者（``verification.orchestrator._root_cause_scope_from_text``）从报告里
 读出路径集合；读不出来就是 ``root_cause_report_without_scope``。
+
+交付物（2026-11-03）
+--------------------
+根因任务的交付物是**一个文件**，不是 diff。所以任务载荷带两个字段：
+
+* ``deliverable`` = ``"report"`` —— 交付物的**种类**。报告要写什么
+  （那五件事）挪到了 ``deliverable_checklist``（同一个列表另有一份
+  ``required_sections``，那边的语义是「必须包含哪几节」）：``SubTask`` 把
+  ``deliverable`` 声明成 ``Literal["code", "report"]``，往里塞一个列表
+  会直接 ValidationError，任务连派都派不出去。
+* ``report_path`` —— 报告的**绝对**地址。执行器
+  （``agent.resolve_report_path``）照它查交付物：文件在且非空就算完成，
+  缺失或为空才算失败 —— 而 ``deliverable`` 缺失时它回落成 ``"code"``，
+  一份写好的报告会被空 diff 闸门读成「什么都没产出」。
+
+那五件事（2026-11-03，第三轮）
+------------------------------
+``deliverable_checklist`` **谁也收不到**：``SubTask`` 是
+``extra="ignore"``，静态字段白名单也不收它。于是「报告必须含这五项、
+尤其『改动范围』」这条契约失去了唯一的执行者。
+
+描述是唯一能到达作者的通道 —— 执行器拼 brief 用的就是
+``task.description``（``agent.py`` 的 ``Subtask: {task.description}``），
+再加上两个不点名这五项的 hint。所以那五件事**逐字**写进描述，描述由
+``deliverable_checklist`` 生成（一个来源，不写两份字面量）。
+
+地址只有一个锚（2026-11-03，第三轮）
+------------------------------------
+``report_path`` 锚在**计划自己的目录**（``<plans 根>/<plan_id>/reports/…``），
+不是工作区。锚在工作区时，编排器下发的是
+``<project_dir>/plans/<plan_id>/reports/…``，而链读回的是计划目录里的
+**另一个文件** —— 磁盘上两份都在、内容还差几行，于是执行器交付的那份
+链根本读不到。
+
+锚只有一个，调用方没有第二个选项可挑，所以两端在构造上就分叉不了。
 """
 
 from __future__ import annotations
@@ -44,6 +79,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from config_paths import resolve_plans_dir
 from orphan_rules import report_deliverable_marker
 from repair_generator import (
     format_repair_task_id,
@@ -63,6 +99,7 @@ __all__ = [
     "ROOT_CAUSE_KIND",
     "build_implementation_task",
     "build_root_cause_task",
+    "root_cause_report_absolute_path",
     "root_cause_report_contract",
     "root_cause_report_path",
 ]
@@ -127,6 +164,26 @@ _SCOPE_CONTRACT_TEMPLATE = """
 """
 
 
+def _checklist_section(checklist: Iterable[str]) -> str:
+    """那五件事，写成描述里的一段。
+
+    ``deliverable_checklist`` 谁也收不到（``SubTask`` 是
+    ``extra="ignore"``，静态字段白名单也不收它），而描述是唯一能到达
+    作者的通道 —— 执行器拼 brief 用的就是 ``task.description``。所以
+    清单必须**逐字**出现在描述里，「报告必须含这五项」这条契约才有
+    执行者。
+
+    清单是**唯一来源**：这一段由它生成，不写第二份字面量。
+    """
+    items = "\n".join(
+        f"{index}. {item}" for index, item in enumerate(checklist, start=1)
+    )
+    return (
+        "\n报告必须包含下面这五件事（缺一件都不算交付）：\n"
+        f"{items}\n"
+    )
+
+
 def root_cause_report_path(plan_id: str, vp_id: str) -> str:
     """根因报告的落盘路径（相对仓库根）。
 
@@ -141,6 +198,42 @@ def root_cause_report_path(plan_id: str, vp_id: str) -> str:
         raise ValueError("根因任务必须带 vp_id")
     return f"plans/{plan}/reports/root-cause-{vp}.md"
 
+
+def root_cause_report_absolute_path(
+    plan_id: str,
+    vp_id: str,
+    plan_dir: Optional[Any] = None,
+) -> str:
+    """根因报告的**绝对**落盘路径 —— 锚在**计划自己的目录**上。
+
+    执行器用 ``agent.resolve_report_path`` 解析报告地址：相对路径会被
+    拼到任务的 ``project_dir``（或执行器自己的）下面，绝对路径原样使用。
+    下发的字段必须是绝对形式 —— 相对地址意味着同一份报告在不同的工作
+    目录下会指向不同的文件，而一个解析不出地址的报告任务根本没有交付
+    物可查（执行器只能把它当成「什么都没产出」）。
+
+    ``plan_dir`` 是这个计划**自己的**目录（``<plans 根>/<plan_id>``），
+    报告落在它的 ``reports/`` 下面。缺省时取 plans 根下的那个计划目录。
+
+    2026-11-03：锚从 ``project_dir``（工作区）换成了 ``plan_dir``（计划
+    目录）。工作区那一侧（``<project_dir>/plans/<plan_id>/reports/…``）
+    与计划目录那一侧是**两个不同的文件**：编排器下发前者、链读回后者，
+    执行器交付的那份链根本读不到。锚只有一个，调用方没有第二个选项可
+    挑，于是两端在构造上就分叉不了 —— 读的地方与写的地方是同一处。
+
+    2026-11-03：这是「报告任务被空 diff 闸门判成没产出」那轮修复的
+    另一半 —— ``deliverable`` 说清了交付物是文件，``report_path`` 说清
+    了文件在哪。
+    """
+    name = Path(root_cause_report_path(plan_id, vp_id)).name
+    base = (
+        Path(str(plan_dir)).expanduser()
+        if plan_dir
+        else resolve_plans_dir() / str(plan_id).strip()
+    )
+    if not base.is_absolute():
+        base = base.resolve()
+    return str(base / "reports" / name)
 
 #: 根因报告路径在任务 description 里的形状：
 #: ``plans/<plan_id>/reports/root-cause-<vp_id>.md``。
@@ -314,12 +407,13 @@ def build_root_cause_task(
     task_id: Optional[str] = None,
     existing_task_ids: Optional[Iterable[str]] = None,
     seq_base: Optional[int] = None,
+    plan_dir: Optional[Any] = None,
     report_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """构建一个只读的根因任务。
 
     Args:
-        plan_id: 计划 id，决定根因报告落在 ``plans/<plan_id>/reports/``。
+        plan_id: 计划 id，决定根因报告落在 ``<plans 根>/<plan_id>/reports/``。
         vp_id: 根因演进的那个验证点。
         round_no: 当前验证轮次。
         evidence: 本轮的失败证据（命令、错误原文等），随任务带过去 ——
@@ -327,21 +421,39 @@ def build_root_cause_task(
         task_id: 显式指定 id（调用方自己分配时用）。
         existing_task_ids: 既有任务 id，用来在 repair 序列里找空号。
         seq_base: 调用方已经算好的起始序号。
-        report_path: 报告的落盘路径。缺省是仓库相对路径
-            (``plans/<plan_id>/reports/root-cause-<vp_id>.md``)；调用方
-            知道任务实际跑在哪个目录时，给**绝对路径** —— 围栏放行的那个
-            路径必须与链读取的那个路径是同一个文件，而相对路径会被执行器
-            按它自己的工作目录解析。
+        plan_dir: 这个计划**自己的**目录（``<plans 根>/<plan_id>``）——
+            报告地址的锚点。缺省时取 plans 根下的那个计划目录。
+        report_path: 报告的落盘路径。缺省是由 ``plan_dir`` 算出来的
+            **绝对**路径（``<plan_dir>/reports/root-cause-<vp_id>.md``）；
+            调用方知道任务实际跑在哪个目录时，给**绝对路径** —— 围栏放行
+            的那个路径必须与链读取的那个路径是同一个文件，而相对路径会被
+            执行器按它自己的工作目录解析。
 
     Returns:
         任务 dict。``kind`` 是 :data:`ROOT_CAUSE_KIND`，``read_only`` 为
-        ``True``，``report_path`` 指向根因报告，**没有** ``files_to_modify``。
+        ``True``，``deliverable`` 是 ``"report"``、``report_path`` 是那份
+        报告的**绝对**路径，**没有** ``files_to_modify``。
     """
+    # 2026-11-03 — the report's address is absolute and anchored on the
+    # **plan's own directory**, so the executor resolves the same file
+    # the orchestrator reads back (``_root_cause_report_file`` goes
+    # through the same helper with the same anchor).  Anchoring it on
+    # the workspace instead made the two point at two different files.
+    #
+    # An explicit ``report_path`` wins over the anchor: the caller that
+    # knows where the task actually runs may hand the address down, and
+    # that address is the one the fence (which lets the diagnosis write
+    # exactly the declared file) and the chain (which reads it back) have
+    # to agree on.
     report_path = str(
-        report_path or root_cause_report_path(plan_id, vp_id)
+        report_path
+        or root_cause_report_absolute_path(plan_id, vp_id, plan_dir)
     ).strip()
     round_number = int(round_no)
     vp = str(vp_id).strip()
+    # 清单只有一个来源：描述由它生成（``deliverable_checklist`` 走不到
+    # 任何人，描述才是作者唯一看得到的地方）。
+    checklist = list(ROOT_CAUSE_DELIVERABLE)
 
     return {
         "id": _allocate_task_id(
@@ -354,14 +466,19 @@ def build_root_cause_task(
             "上一轮针对旧根因的修复方案不再适用。先根据本轮证据定位当前"
             "根因，再给出一次覆盖所有层的修复方案，不要重复上一轮的方案。"
             f"根因报告写到 {report_path}。"
+            # 那五件事逐字写进描述：描述是唯一能到达作者的通道。
+            f"{_checklist_section(checklist)}"
             # 2026-11-02 — 报告契约搭**描述**的便车。
             #
             # 执行器读的是 ``SubTask.deliverable`` / ``SubTask.report_path``，
-            # 而这两个字段在链上的这一段要经过 ``plan_tasks``：那张表没有
-            # 这两列，而验证模式的范围门禁（``tests/static_gates/
-            # test_verification_mode_scope_gates.py``）把 schema 的字节
-            # 冻死了，加列这条路走不通。描述是唯一原样存、逐字读回的
-            # 自由文本列 —— 契约就走它。
+            # 而这两个字段在链上的这一段要经过 ``plan_tasks``。描述是唯一
+            # 原样存、逐字读回的自由文本列 —— 契约就走它。
+            #
+            # 2026-11-03：``plan_tasks`` 已经有这两列了（``schema.py`` 的
+            # ``_add_missing_plan_task_columns``），所以契约有**两条**通道：
+            # 列，以及这里的标记行。两条都留着 —— 列承载新写的行，标记承
+            # 载没有这两列的行，而 ``orphan_rules._deliverable_kwargs``
+            # 两条都读（列优先，标记兜底）。
             #
             # 标记放在**改动范围模板之前**：读者（``_root_cause_scope_from_text``）
             # 切出来的「## 改动范围」那一节因此逐字不变。
@@ -371,27 +488,35 @@ def build_root_cause_task(
         ),
         # 只读：诊断任务的产出是报告，不是改动。
         "read_only": True,
-        "report_path": report_path,
-        # 2026-11-02（main）— 这个 ``deliverable`` 是**任务 dict** 的字段，
-        # 不是 ``SubTask`` 的那个：``plan_tasks`` 没有这一列，链在写库
-        # 时会把它连同 ``kind`` / ``read_only`` 一起丢掉。执行器真正读到
-        # 的那一对（``deliverable="report"`` + ``report_path``）由上面
-        # description 里的标记带过去，由
-        # ``orphan_rules.parse_report_deliverable`` 读回来。
+        # 2026-11-03 — 交付物是**一个文件**。``deliverable`` 装的是交付物
+        # 的种类（``SubTask`` 把它声明成 ``Literal["code", "report"]``），
+        # 报告要写什么挪到了 ``deliverable_checklist``（并逐字写进描述，
+        # 因为那个键谁也收不到）；地址下发绝对路径，执行器照它查交付物，
+        # 不再把「没有 diff」读成「没产出」。
         #
-        # 2026-11-03（本分支）— 但**这一行**本身仍要自洽：
-        # ``deliverable`` 是交付物的**类型**（"code" / "report"），
-        # 执行器据此走报告分支（``is_report_task`` /
-        # ``resolve_report_path`` / 写守卫的 ``PDT_REPORT_PATH`` 豁免）；
-        # 报告必须包含的五件事是交付物的**内容**，放在另一个键上 ——
-        # 塞进 ``deliverable`` 会让这一行连 ``SubTask`` 都构造不出来
-        # （``SubTask.deliverable`` 是 ``Literal["code", "report"]``）。
+        # 2026-11-02 的那个形状（``deliverable`` 装五个章节名的列表）不能
+        # 回来：``deliverable`` 现在**会**走到 ``SubTask``（``plan_tasks``
+        # 有了这两列），而 ``SubTask`` 把它声明成 ``Literal["code",
+        # "report"]`` —— 塞一个列表进去是 ValidationError，任务连派都派不
+        # 出去。章节名单独放在 ``required_sections``，那里的语义本来就是
+        # 「必须包含哪几节」。
         "deliverable": "report",
-        # 交付物的**内容**：这五件事是报告里必须有的章节。
+        # 那五件事有两个键名，**一个来源**：``deliverable_checklist`` 是
+        # 交付物的清单，``required_sections`` 是「必须包含哪几节」。两个
+        # 键装的是同一份列表（``ROOT_CAUSE_DELIVERABLE``），谁也收不到
+        # （``SubTask`` 是 ``extra="ignore"``，静态字段白名单也不收）——
+        # 所以那五件事必须**逐字**出现在描述里，那才是执行器唯一会拼进
+        # brief 的通道。
+        "deliverable_checklist": checklist,
+        # 2026-11-02（main）— 同一份清单的**另一个键名**：``report_deliverables``
+        # 装的是「报告里必须有的章节」，与 ``deliverable_checklist`` 装的是
+        # 同一份列表（``ROOT_CAUSE_DELIVERABLE``）。两个键都留着：谁读哪个
+        # 键，两边都在。
         "report_deliverables": list(ROOT_CAUSE_DELIVERABLE),
         # main 侧新增：章节名单独放在 ``required_sections``，那里的语义
         # 本来就是「必须包含哪几节」。
         "required_sections": list(ROOT_CAUSE_DELIVERABLE),
+        "report_path": report_path,
         "failed_vp_id": vp,
         "round": round_number,
         "task_group": f"repair-round-{round_number}",

@@ -458,6 +458,233 @@ def test_bash_write_targets_still_resolves_plain_redirect():
 
 
 # ---------------------------------------------------------------------------
+# heredoc：正文是数据，不是命令
+#
+# 2026-11-03，验证轮 round 1 的 VP-022 用一条**只写 /tmp** 的命令被误拦
+# （``refusals/round-1/VP-022.jsonl`` 里躺着一条 ``<repo>/spec:``）：
+#
+#     mkdir -p /tmp/vp022 && cat > /tmp/vp022/probe.py <<'PYEOF'
+#     rows = [1]
+#     # -> spec: something
+#     # <testsuites><testsuite name="x">
+#     PYEOF
+#
+# 护栏把命令逐行拆开当 shell 解析，于是**正文**也被当成了命令：``->`` 里的
+# ``>`` 认成了重定向，``spec:`` 认成了写目标（按 cwd 解析进被验证仓库）；
+# ``<testsuites><testsuite`` 同理，``<testsuite`` 成了写目标。
+#
+# heredoc 的正文是**数据**（子 agent 写的临时脚本），它不碰仓库。
+# ---------------------------------------------------------------------------
+
+#: 一条只写 /tmp 的 heredoc 命令 —— 正文里有两种曾被误认成重定向的东西。
+_HEREDOC_COMMAND = (
+    "mkdir -p /tmp/vp022 && cat > /tmp/vp022/probe.py <<'PYEOF'\n"
+    "rows = [1]\n"
+    "# -> spec: something\n"
+    '# <testsuites><testsuite name="x">\n'
+    "PYEOF\n"
+)
+
+
+def test_heredoc_body_is_not_parsed_as_shell():
+    """heredoc 的正文不被当成命令 —— 只有命令行上的重定向算数。"""
+    import verification_write_guard
+
+    targets = verification_write_guard.bash_write_targets(
+        _HEREDOC_COMMAND,
+        "/repo",
+    )
+    assert targets == ["/tmp/vp022/probe.py"], targets
+
+
+def test_heredoc_command_is_allowed(tmp_path):
+    """只写 /tmp 的 heredoc 命令 → 放行，且不留拒绝证据。"""
+    env, plan_dir = _scoped_env(tmp_path)
+    code, stderr = _run_hook(_HEREDOC_COMMAND, env, cwd=_REPO_DIR)
+
+    assert code == 0, stderr
+    assert not (plan_dir / "vp_write_scope").exists(), (
+        "放行的命令不该留下拒绝痕迹"
+    )
+
+
+def test_write_before_heredoc_is_still_refused(tmp_path):
+    """负控：heredoc **之前**的真实重定向仍然被认出来、仍然被拒。
+
+    正文该跳过，但命令行的落点一个都不能少 —— 否则这条修复就把护栏拆了。
+    """
+    env, plan_dir = _scoped_env(tmp_path)
+    command = f"echo VP022_PROBE > {_REPO_FILE} && " + _HEREDOC_COMMAND
+    code, stderr = _run_hook(command, env, cwd=_REPO_DIR)
+
+    assert code == 2, stderr
+    assert _refused_paths(plan_dir) == [str(_REPO_DIR / _REPO_FILE)]
+
+
+def test_write_commands_before_heredoc_are_still_refused(tmp_path):
+    """负控：算子**之前**的 tee / sed -i / cp / mv 目标仍然被拒。"""
+    env, _plan = _scoped_env(tmp_path)
+    commands = [
+        f"cat x | tee {_REPO_FILE} && " + _HEREDOC_COMMAND,
+        f"sed -i 's/a/b/' {_REPO_FILE} && " + _HEREDOC_COMMAND,
+        f"cp /tmp/x {_REPO_FILE} && " + _HEREDOC_COMMAND,
+        f"mv {_REPO_FILE} /tmp/x && " + _HEREDOC_COMMAND,
+    ]
+
+    for command in commands:
+        code, stderr = _run_hook(command, env, cwd=_REPO_DIR)
+        assert code == 2, (command, stderr)
+
+
+def test_write_after_the_heredoc_ends_is_still_refused(tmp_path):
+    """负控：heredoc **结束之后**的命令行不是正文 —— 它的真实写仍然被拒。"""
+    env, _plan = _scoped_env(tmp_path)
+    command = _HEREDOC_COMMAND + f"echo VP022_PROBE > {_REPO_FILE}\n"
+    code, stderr = _run_hook(command, env, cwd=_REPO_DIR)
+
+    assert code == 2, stderr
+
+
+def test_refusal_record_carries_the_command(tmp_path):
+    """拒绝证据里带着原始命令行 —— 事后要查"它到底想干什么"。"""
+    env, plan_dir = _scoped_env(tmp_path)
+    command = f"echo VP022_PROBE > {_REPO_FILE} && " + _HEREDOC_COMMAND
+    code, stderr = _run_hook(command, env, cwd=_REPO_DIR)
+    assert code == 2, stderr
+
+    records = [
+        json.loads(line)
+        for line in _marker(plan_dir).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(records) == 1
+    assert "VP022_PROBE" in records[0]["command"], records
+
+
+def test_refusal_record_command_is_truncated(tmp_path):
+    """记录里的命令行截断到 500 字符 —— 一条命令不能把证据文件撑爆。"""
+    env, plan_dir = _scoped_env(tmp_path)
+    command = f"echo {'x' * 600} > {_REPO_FILE}"
+    code, stderr = _run_hook(command, env, cwd=_REPO_DIR)
+    assert code == 2, stderr
+
+    records = [
+        json.loads(line)
+        for line in _marker(plan_dir).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(records) == 1
+    assert len(records[0]["command"]) == 500, records
+
+
+def test_record_refusal_without_command_stays_compatible(tmp_path, monkeypatch):
+    """旧的三参数调用照样能用 —— 记录里只是没有 ``command`` 这一项。"""
+    import verification_write_guard
+
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir()
+    monkeypatch.setenv(verification_write_guard.SCOPE_ENV, str(plan_dir))
+    monkeypatch.setenv(verification_write_guard.VP_ID_ENV, "VP-055")
+    monkeypatch.setenv(verification_write_guard.ROUND_ENV, "3")
+
+    marker = verification_write_guard.record_refusal(
+        "Edit", str(tmp_path / "app.py"), "outside_scope",
+    )
+
+    assert marker is not None
+    records = [
+        json.loads(line)
+        for line in marker.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(records) == 1
+    assert "command" not in records[0], records
+    assert records[0]["tool"] == "Edit"
+    assert records[0]["reason"] == "outside_scope"
+    assert records[0]["vp_id"] == "VP-055"
+    assert records[0]["round"] == 3
+
+
+def test_here_string_is_not_a_heredoc():
+    """``<<<`` 是 here-string：它不吞掉后面的行。"""
+    import verification_write_guard
+
+    targets = verification_write_guard.bash_write_targets(
+        'cat <<< "hi"\necho x > /repo/backend/server.py\n',
+        "/repo",
+    )
+    assert targets == ["/repo/backend/server.py"], targets
+
+
+def test_heredoc_delimiter_quoting_variants():
+    """``<<EOF`` / ``<<'EOF'`` / ``<<"EOF"`` / ``<<\\EOF`` 都认得出来。"""
+    import verification_write_guard
+
+    for operator in ("<<EOF", "<<'EOF'", '<<"EOF"', "<<\\EOF"):
+        command = (
+            f"cat > /tmp/x.py {operator}\n"
+            "# -> spec: done\n"
+            "EOF\n"
+        )
+        targets = verification_write_guard.bash_write_targets(command, "/repo")
+        assert targets == ["/tmp/x.py"], (operator, targets)
+
+
+def test_tab_stripped_heredoc_delimiter():
+    """``<<-``：正文与分隔符行都可以带行首 tab。"""
+    import verification_write_guard
+
+    command = (
+        "cat > /tmp/x.py <<-'PYEOF'\n"
+        "\t# -> spec: done\n"
+        "\tPYEOF\n"
+    )
+    targets = verification_write_guard.bash_write_targets(command, "/repo")
+    assert targets == ["/tmp/x.py"], targets
+
+
+def test_several_heredocs_in_one_command():
+    """一条命令里多个 heredoc：正文按出现顺序各自跳过。"""
+    import verification_write_guard
+
+    command = (
+        "cat <<'A' <<'B' > /tmp/x.py\n"
+        "a > b\n"
+        "A\n"
+        "c < d\n"
+        "B\n"
+    )
+    targets = verification_write_guard.bash_write_targets(command, "/repo")
+    assert targets == ["/tmp/x.py"], targets
+
+
+def test_redirect_next_to_the_heredoc_operator_is_still_a_target():
+    """运算符**那一行**上的重定向仍然算数。"""
+    import verification_write_guard
+
+    targets = verification_write_guard.bash_write_targets(
+        "cat <<'EOF' > /repo/backend/server.py\nbody\nEOF\n",
+        "/repo",
+    )
+    assert targets == ["/repo/backend/server.py"], targets
+
+
+def test_unclosed_heredoc_takes_the_rest_as_body():
+    """分隔符没出现 → 剩下的行全是正文（bash 自己也不执行这条命令）。
+
+    bash 遇到没闭合的 heredoc 是语法错误，整条命令都不跑；所以这里**不回退**
+    成逐行解析 —— 回退等于把正文重新当命令，正是这次要修的那个错。
+    """
+    import verification_write_guard
+
+    targets = verification_write_guard.bash_write_targets(
+        "cat > /tmp/x.py <<'PYEOF'\necho y > /repo/backend/server.py\n",
+        "/repo",
+    )
+    assert targets == ["/tmp/x.py"], targets
+
+
+# ---------------------------------------------------------------------------
 # 分发：这条分支怎么被选中
 # ---------------------------------------------------------------------------
 def test_payload_without_tool_name_is_still_a_bash_call(tmp_path):

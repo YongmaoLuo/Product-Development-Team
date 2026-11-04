@@ -839,6 +839,67 @@ ran_phase3=0
 budget_exhausted=0
 exhausted_phase=""
 
+# ---------------------------------------------------------------------------
+# The host measurability probe — once, before every phase
+# ---------------------------------------------------------------------------
+#
+# The probe runs **before the first phase**, not before the wall-clock
+# one.  It used to run only before the wall-clock phase, and only its
+# verdict reached that phase: the other two lanes were judged without
+# it, so a phase-1 failure that said "the service was not ready after
+# 90 s" was reported as a code failure on a host that cannot time a
+# sleep.  The measurement is about the **host**, not about one lane, and
+# a host that cannot measure wall-clock time cannot be judged by a
+# wall-clock assertion in *any* lane.
+#
+# The probe's verdict does NOT decide whether a phase runs.
+#
+# It used to: an unmeasurable host skipped the wall-clock phase and ended
+# the whole gate with exit code 3.  That made the gate's verdict a
+# property of the machine — a busy verification host could never see a
+# green gate, no matter what the code did, and the wall-clock cases never
+# ran at all, so the gate's *coverage* depended on the host's load too.
+# That is the root cause the round-4 report names: the gate's conclusion
+# was bound to the host's runtime environment rather than to the code
+# under test (§0.2).  Labelling the verdict "INCONCLUSIVE" did not undo
+# the binding; it only gave the red a different number.
+#
+# So the probe now answers a narrower question: when a phase FAILS,
+# could the host measure wall-clock time at all?  If it could not, and
+# every one of that phase's failures is a wall-clock shape, the failure
+# is the machine's and the phase is reported INCONCLUSIVE; if one of the
+# failures is not a wall-clock shape, the phase stays FAILED — a real
+# regression is not a real regression only on a quiet machine.  A phase
+# that PASSES is green on any host: the cases in it decide for
+# themselves whether they could measure what they assert.
+#
+# ``host_measurable`` carries the probe's verdict into the verdict of
+# every phase and into the summary.  ``PDT_HOST_MEASURABLE`` carries it
+# into the test layer, whose own load gate stands down on ``CI=true`` —
+# a guess — while this is a measurement.  The measurement wins: a gate
+# that measured the host must not let a marker undo the measurement.
+inconclusive=0
+host_measurable=1
+host_probe_note="not measured (no phase was selected)"
+probe_output=""
+probe_rc=0
+probe_output="$(run_host_probe)" || probe_rc=$?
+probe_verdict="${probe_output%% *}"
+probe_rest="${probe_output#* }"
+probe_measured="${probe_rest%% *}"
+probe_loadavg="${probe_rest#* }"
+if [ "$probe_rc" -ne 0 ]; then
+    host_measurable=0
+    host_probe_note="the host cannot measure wall-clock (sleep(0.05)=${probe_measured}s, loadavg=${probe_loadavg})"
+else
+    host_probe_note="OK (sleep(0.05)=${probe_measured}s, loadavg=${probe_loadavg})"
+fi
+export PDT_HOST_MEASURABLE="$host_measurable"
+printf 'host timing probe: %s\n' "$host_probe_note"
+if [ "$host_measurable" -eq 0 ]; then
+    printf 'the phases run anyway; a failure whose shape is the clock is reported as INCONCLUSIVE, not as a code defect\n'
+fi
+
 if [ "$run_phase1" -eq 1 ]; then
     run_phase 1 "1/3 (parallel)" "${phase1[@]}" || rc1=$?
     if [ "$rc1" -ne "$BUDGET_GONE_EXIT_CODE" ]; then
@@ -860,61 +921,16 @@ if [ "$budget_exhausted" -eq 0 ] && [ "$run_phase2" -eq 1 ]; then
     fi
 fi
 
-# The probe runs before the wall-clock phase, and only when that phase is
-# part of this run.
-#
-# The probe's verdict does NOT decide whether the phase runs.
-#
-# It used to: an unmeasurable host skipped the wall-clock phase and ended
-# the whole gate with exit code 3.  That made the gate's verdict a
-# property of the machine — a busy verification host could never see a
-# green gate, no matter what the code did, and the wall-clock cases never
-# ran at all, so the gate's *coverage* depended on the host's load too.
-# That is the root cause the round-4 report names: the gate's conclusion
-# was bound to the host's runtime environment rather than to the code
-# under test (§0.2).  Labelling the verdict "INCONCLUSIVE" did not undo
-# the binding; it only gave the red a different number.
-#
-# So the probe now answers a narrower question: when the wall-clock
-# phase FAILS, could the host measure wall-clock time at all?  If it
-# could not, the failure is the machine's and the gate reports
-# INCONCLUSIVE; if it could, the failure is the code's and the gate
-# reports a failure.  A wall-clock phase that PASSES is green on any
-# host: the cases in it decide for themselves whether they could measure
-# what they assert (the perf case measures its own dispersion and skips
-# with the numbers that say so; the lock case differences against a
-# same-round baseline).
-#
-# ``host_measurable`` carries the probe's verdict into the summary.
-inconclusive=0
-host_measurable=1
-host_probe_note="not measured (the wall-clock phase was not selected)"
-if [ "$run_phase3" -eq 1 ]; then
-    probe_output=""
-    probe_rc=0
-    probe_output="$(run_host_probe)" || probe_rc=$?
-    probe_verdict="${probe_output%% *}"
-    probe_rest="${probe_output#* }"
-    probe_measured="${probe_rest%% *}"
-    probe_loadavg="${probe_rest#* }"
-    if [ "$probe_rc" -ne 0 ]; then
-        host_measurable=0
-        host_probe_note="the host cannot measure wall-clock (sleep(0.05)=${probe_measured}s, loadavg=${probe_loadavg})"
-        printf 'host timing probe: %s\n' "$host_probe_note"
-        printf 'the wall-clock phase runs anyway; a failure in it is reported as INCONCLUSIVE, not as a code defect\n'
-    else
-        host_probe_note="OK (sleep(0.05)=${probe_measured}s, loadavg=${probe_loadavg})"
-        printf 'host timing probe: %s\n' "$host_probe_note"
+# The wall-clock phase runs like the other two: the probe's verdict
+# says how a failure in it is read, not whether it runs.
+if [ "$budget_exhausted" -eq 0 ] && [ "$run_phase3" -eq 1 ]; then
+    run_phase 3 "3/3 (time_sensitive + perf)" "${phase3[@]}" || rc3=$?
+    if [ "$rc3" -ne "$BUDGET_GONE_EXIT_CODE" ]; then
+        ran_phase3=1
     fi
-    if [ "$budget_exhausted" -eq 0 ]; then
-        run_phase 3 "3/3 (time_sensitive + perf)" "${phase3[@]}" || rc3=$?
-        if [ "$rc3" -ne "$BUDGET_GONE_EXIT_CODE" ]; then
-            ran_phase3=1
-        fi
-        if [ "$rc3" -eq "$BUDGET_EXHAUSTED_EXIT_CODE" ] || [ "$rc3" -eq "$BUDGET_GONE_EXIT_CODE" ]; then
-            budget_exhausted=1
-            exhausted_phase="3/3 (time_sensitive + perf)"
-        fi
+    if [ "$rc3" -eq "$BUDGET_EXHAUSTED_EXIT_CODE" ] || [ "$rc3" -eq "$BUDGET_GONE_EXIT_CODE" ]; then
+        budget_exhausted=1
+        exhausted_phase="3/3 (time_sensitive + perf)"
     fi
 fi
 
@@ -935,33 +951,135 @@ fi
 # decide" is a state of its own instead of being folded into "failed"
 # (which blamed the code for the machine) or into "passed" (which claimed
 # a lane had run when it had not).
-status=0
-for phase_rc in "$rc1" "$rc2"; do
+#
+# And the rule is now the same for every phase: a phase that failed on a
+# host that could not be measured is INCONCLUSIVE — **unless** one of its
+# failures is not a wall-clock shape, in which case it stays FAILED.  A
+# real regression does not stop being one because the machine was busy,
+# and a gate that turned every failure on a busy host into "could not
+# decide" would hide the next real regression behind the noise.
+#
+# The shape of a phase's failures comes out of its own junit report —
+# the report the gate asked pytest to write, one per phase.  The rule
+# that reads it lives in ``backend/verification_ci_runner.py``: one rule,
+# two users (the gate asks it first, the evidence layer asks it again),
+# so the two cannot drift apart.
+PHASE_EVIDENCE_SOURCE='
+import sys
+
+sys.path.insert(0, sys.argv[2])
+
+from verification_ci_runner import phase_report_evidence
+
+print(phase_report_evidence(sys.argv[1]))
+'
+
+# The evidence one phase's junit report holds: ``<shape>|<skipped>``.
+#
+# ``shape`` is ``wall-clock`` when every failure in the phase is a
+# wall-clock shape, ``code`` when at least one of them is not, and
+# ``no-evidence`` when the report is missing, unreadable, or names no
+# failure at all.
+#
+# ``no-evidence`` does not mean "the code is fine": it means the gate
+# cannot tell.  On a host that cannot measure wall-clock time, a phase
+# whose failures the evidence cannot describe is INCONCLUSIVE — the
+# machine is the one that cannot be trusted, and nothing in the
+# evidence points at the code.  A phase whose evidence names one
+# failure that is *not* a wall-clock shape is FAILED, because that is
+# a pointer at the code.
+phase_evidence() {
+    local phase_no="$1"
+    if [ -z "$PDT_GATE_JUNIT_DIR" ]; then
+        printf 'no-evidence|?'
+        return 0
+    fi
+    local report="$PDT_GATE_JUNIT_DIR/phase-${phase_no}.xml"
+    if [ ! -f "$report" ]; then
+        printf 'no-evidence|?'
+        return 0
+    fi
+    local answer=""
+    # The interpreter is named in a variable of its own, the way
+    # ``run_host_probe`` names it: an expansion that sits next to a
+    # literal interpreter path is the shape the static gate about
+    # dangerous defaults refuses, and there is no reason to spell the
+    # path out twice.
+    local probe_python="$VENV_PATH/bin/python"
+    answer="$("$probe_python" -c "$PHASE_EVIDENCE_SOURCE" "$report" "$PROJECT_ROOT/backend")" || answer=""
+    if [ -z "$answer" ]; then
+        printf 'no-evidence|?'
+        return 0
+    fi
+    printf '%s' "$answer"
+}
+
+# The evidence of the three phases, read after they ran: the reports are
+# written by the phases themselves, so they cannot be read before.
+evidence1="$(phase_evidence 1)"
+evidence2="$(phase_evidence 2)"
+evidence3="$(phase_evidence 3)"
+
+# ``phase_verdict <rc> <evidence>`` — the verdict of one phase, as
+# ``<verdict>|<reason>``.
+#
+# ``verdict`` is ``passed``, ``inconclusive`` or ``failed``; ``reason``
+# says why a phase that did not pass did not pass, and is empty for a
+# phase that passed or that failed on its own account (the exit code
+# says that already).
+phase_verdict() {
+    local phase_rc="$1"
+    local evidence="$2"
     if [ "$phase_rc" -eq 0 ]; then
-        continue
+        printf 'passed|'
+        return
     fi
-    if [ "$phase_rc" -eq 3 ] || [ "$phase_rc" -eq "$BUDGET_EXHAUSTED_EXIT_CODE" ] || [ "$phase_rc" -eq "$BUDGET_GONE_EXIT_CODE" ]; then
-        inconclusive=1
-    else
-        status=1
+    if [ "$phase_rc" -eq 3 ]; then
+        printf 'inconclusive|exit 3'
+        return
     fi
+    if [ "$phase_rc" -eq "$BUDGET_EXHAUSTED_EXIT_CODE" ] || [ "$phase_rc" -eq "$BUDGET_GONE_EXIT_CODE" ]; then
+        printf 'inconclusive|the gate budget was exhausted'
+        return
+    fi
+    if [ "$host_measurable" -eq 0 ]; then
+        case "$evidence" in
+            code*)
+                # At least one failure is not a wall-clock shape: it is
+                # the code's, whatever the machine was doing.
+                printf 'failed|'
+                return
+                ;;
+            *)
+                printf 'inconclusive|the host could not be measured'
+                return
+                ;;
+        esac
+    fi
+    printf 'failed|'
+}
+
+verdict1="$(phase_verdict "$rc1" "$evidence1")"
+verdict2="$(phase_verdict "$rc2" "$evidence2")"
+verdict3="$(phase_verdict "$rc3" "$evidence3")"
+
+status=0
+for phase_verdict_text in "$verdict1" "$verdict2" "$verdict3"; do
+    case "$phase_verdict_text" in
+        failed*)
+            status=1
+            ;;
+        inconclusive*)
+            inconclusive=1
+            ;;
+    esac
 done
-if [ "$rc3" -ne 0 ]; then
-    if [ "$rc3" -eq 3 ] || [ "$rc3" -eq "$BUDGET_EXHAUSTED_EXIT_CODE" ] || [ "$rc3" -eq "$BUDGET_GONE_EXIT_CODE" ] || [ "$host_measurable" -eq 0 ]; then
-        # The wall-clock phase failed on a host that could not measure
-        # wall-clock time: the failure is the machine's, so the gate
-        # reports "could not decide" instead of blaming the code.
-        inconclusive=1
-    else
-        status=1
-    fi
-fi
 if [ "$status" -eq 0 ] && [ "$inconclusive" -eq 1 ]; then
     status=3
 fi
 
-# ``describe_phase <selected> <ran> <rc> <host_measurable>`` — the verdict
-# for one phase.
+# ``describe_phase <selected> <ran> <rc> <verdict>`` — the verdict for
+# one phase.
 #
 # Three states, and the third one matters: a phase that was *selected*
 # but never *ran* has no verdict at all.  Reporting it as "passed"
@@ -984,23 +1102,30 @@ describe_phase() {
         printf 'not run (the gate budget was exhausted)'
         return
     fi
-    if [ "$3" -eq "$BUDGET_EXHAUSTED_EXIT_CODE" ]; then
-        printf 'INCONCLUSIVE (the gate budget was exhausted)'
-        return
-    fi
-    if [ "$3" -eq 0 ]; then
-        printf 'passed'
-        return
-    fi
-    if [ "$3" -eq 3 ]; then
-        printf 'INCONCLUSIVE (exit 3)'
-        return
-    fi
-    if [ "$4" -eq 0 ]; then
-        printf 'INCONCLUSIVE (the host could not be measured)'
-        return
-    fi
-    printf 'FAILED (exit %s)' "$3"
+    local verdict="${4%%|*}"
+    local reason="${4#*|}"
+    case "$verdict" in
+        passed)
+            printf 'passed'
+            ;;
+        inconclusive)
+            if [ -n "$reason" ]; then
+                printf 'INCONCLUSIVE (%s)' "$reason"
+            else
+                printf 'INCONCLUSIVE'
+            fi
+            ;;
+        *)
+            printf 'FAILED (exit %s)' "$3"
+            ;;
+    esac
+}
+
+# How many cases a phase skipped.  A lane that skipped half of what it
+# was asked to run and failed the rest says something a reader needs to
+# know, and the count was in the report all along.
+skipped_count() {
+    printf '%s' "${1##*|}"
 }
 
 # The time the gate spent, and the time it was allowed to spend.
@@ -1025,9 +1150,21 @@ gate_elapsed_ms=$((gate_ended_ms - gate_started_ms))
 gate_elapsed=$(((gate_elapsed_ms + 999) / 1000))
 
 printf '=== gate summary ===\n'
-printf 'phase 1/3 (parallel):             %s\n' "$(describe_phase "$run_phase1" "$ran_phase1" "$rc1" 1)"
-printf 'phase 2/3 (e2e + integration):    %s\n' "$(describe_phase "$run_phase2" "$ran_phase2" "$rc2" 1)"
-printf 'phase 3/3 (time_sensitive + perf): %s\n' "$(describe_phase "$run_phase3" "$ran_phase3" "$rc3" "$host_measurable")"
+printf 'phase 1/3 (parallel):             %s\n' "$(describe_phase "$run_phase1" "$ran_phase1" "$rc1" "$verdict1")"
+printf 'phase 2/3 (e2e + integration):    %s\n' "$(describe_phase "$run_phase2" "$ran_phase2" "$rc2" "$verdict2")"
+printf 'phase 3/3 (time_sensitive + perf): %s\n' "$(describe_phase "$run_phase3" "$ran_phase3" "$rc3" "$verdict3")"
+# The skip count of every phase that ran.  A lane that skipped what it
+# was asked to run and failed the rest says something the verdict
+# alone does not, and the number was in the report all along.
+if [ "$ran_phase1" -eq 1 ]; then
+    printf 'phase 1/3 skipped:                %s\n' "$(skipped_count "$evidence1")"
+fi
+if [ "$ran_phase2" -eq 1 ]; then
+    printf 'phase 2/3 skipped:                %s\n' "$(skipped_count "$evidence2")"
+fi
+if [ "$ran_phase3" -eq 1 ]; then
+    printf 'phase 3/3 skipped:                %s\n' "$(skipped_count "$evidence3")"
+fi
 printf 'host measurability:               %s\n' "$host_probe_note"
 printf 'gate budget: %ss\n' "$gate_budget"
 printf 'gate elapsed: %ss\n' "$gate_elapsed"

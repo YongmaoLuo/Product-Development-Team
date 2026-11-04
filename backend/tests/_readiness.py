@@ -68,9 +68,25 @@ change it.
 Standard library only, and deliberately no ``pytest`` import: the
 module has to be usable from a ``conftest.py`` as well as from ordinary
 test modules.
+
+The load-aware budget
+---------------------
+A deadline is a property of the **machine**, not of the file that
+happens to assert it, so the way a deadline is derived from the host's
+load lives here too — one formula, one answer.  Two suites carried
+their own copy of it, and the copies had already drifted; a third copy
+would have drifted further.
+
+A deadline only means something on a host that can keep time.  The gate
+script measures the host before it runs anything and exports the answer
+(:data:`tests._host_load.HOST_MEASURABLE_ENV`); when the answer is "no",
+a suite that waits for a service **skips** instead of failing on a
+deadline the machine was never going to meet.
 """
 
 from __future__ import annotations
+
+from typing import Optional
 
 #: How long a spawned backend may take to become ready (seconds).
 #:
@@ -97,3 +113,83 @@ STUB_READY_TIMEOUT_SECONDS = 20.0
 #: The total is the one the suites already used; what changed is the
 #: share of it that belongs to the start-up.  Nothing is loosened.
 RUN_BUDGET_SECONDS = READY_TIMEOUT_SECONDS + 30.0
+
+#: The ceiling of a load-aware readiness budget (seconds).
+#:
+#: A scaled budget is still a budget: without a ceiling a host that
+#: never settles would keep the case waiting, and a hang would read as
+#: a slow machine.  A suite whose own per-test watchdog is shorter
+#: passes its own ceiling — the ceiling is a policy about *that*
+#: module's watchdogs, not a constant of the machine.
+READINESS_BUDGET_MAX_SECONDS = 120.0
+
+
+def readiness_budget_seconds(
+    base: float,
+    *,
+    ceiling: float = READINESS_BUDGET_MAX_SECONDS,
+    limit: Optional[float] = None,
+    load: Optional[float] = None,
+) -> float:
+    """How long a spawned process is given to come up, decided by the load.
+
+    The budget follows the host's load average, because both the
+    child's own start-up and the cost of one probe scale with it.  The
+    scale is the shared gate's limit: a host at the limit gets twice
+    the base budget, and the budget stops at ``ceiling``, because a
+    scaled budget is still a budget.
+
+    ``limit`` and ``load`` default to the shared gate's answers for the
+    host this runs on; they are parameters so the rule can be exercised
+    without loading the machine on purpose.
+    """
+    from tests import _host_load
+
+    if limit is None:
+        limit = _host_load.host_load_limit()
+    if load is None:
+        load = _host_load.current_host_load()
+    if limit <= 0:
+        return float(base)
+    scaled = float(base) * (1.0 + max(0.0, load) / limit)
+    return min(scaled, float(ceiling))
+
+
+def host_unmeasurable_reason(
+    env: Optional[dict] = None,
+) -> Optional[str]:
+    """Why this case must be skipped because the host cannot keep time.
+
+    The gate script probes the host before it runs anything and exports
+    the answer.  When the answer is "the host cannot measure wall-clock
+    time", a deadline is not a deadline any more: the machine was
+    never going to meet it, so a case that waits on one is skipped
+    rather than failed.
+
+    ``None`` means "keep going" — the host was never measured, or it
+    was measured and can keep time.
+    """
+    from tests import _host_load
+
+    if _host_load.host_measurable(env) is not False:
+        return None
+    return (
+        "skipped: the host cannot measure wall-clock time "
+        f"({_host_load.HOST_MEASURABLE_ENV}=0)"
+    )
+
+
+def skip_if_host_unmeasurable() -> None:
+    """Skip the calling case when the host cannot measure wall-clock time.
+
+    ``pytest`` is imported here rather than at the top of the module:
+    this module is imported by ``conftest.py`` before the plugin
+    machinery that provides ``pytest.skip`` is in place, so a
+    module-level import would make it unusable there.
+    """
+    reason = host_unmeasurable_reason()
+    if reason is None:
+        return
+    import pytest
+
+    pytest.skip(reason)

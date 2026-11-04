@@ -228,6 +228,15 @@ _GATE_VERDICT_LINE_RE = re.compile(
 )
 _GATE_PHASE_HEADER_RE = re.compile(r"^=== phase (.+?) ===\s*$", re.MULTILINE)
 
+#: The gate's own account of the host it ran on.  The gate measures the
+#: host before it runs anything, and says what it found on this line;
+#: a runner that does not read it throws away the one fact that
+#: separates "the code is broken" from "the machine could not keep
+#: time".
+_GATE_HOST_MEASURABLE_LINE_RE = re.compile(
+    r"^host measurability:\s*(.+?)\s*$", re.MULTILINE
+)
+
 #: Output kept per stream in the verdict evidence — head **and** tail.
 MAX_OUTPUT_CHARS = 4000
 
@@ -719,10 +728,15 @@ def parse_gate_summary(stdout: str) -> Dict[str, Any]:
     """What the gate's own summary says about the run it just did.
 
     The summary is the gate's account of itself: the budget it was
-    given, the time it spent, the phase that ran out of budget, and the
-    verdict it reached.  A reader that cannot parse it is left with the
-    last line of stdout — which is what the round-2 artifact recorded,
-    and it answers nothing.
+    given, the time it spent, the phase that ran out of budget, the
+    verdict it reached — and **whether the host could measure
+    wall-clock time at all** (``host_measurable``).
+
+    The last one is a three-valued fact, not a boolean: ``True`` the
+    host could measure, ``False`` it could not, ``None`` the gate
+    never measured (or never said).  ``None`` is not ``False``: a run
+    that said nothing about the host has not declared the host
+    untrustworthy, and the historical verdict stands.
 
     Anything that is not a gate summary reads as "nothing is known",
     which is what it is: an entry that is not the gate has no summary.
@@ -734,6 +748,7 @@ def parse_gate_summary(stdout: str) -> Dict[str, Any]:
         "exit_code": None,
         "budget_exhausted_in": "",
         "running_phase": "",
+        "host_measurable": None,
     }
     if not stdout:
         return summary
@@ -754,7 +769,29 @@ def parse_gate_summary(stdout: str) -> Dict[str, Any]:
     if phases:
         # The last phase that started is the one that was running.
         summary["running_phase"] = phases[-1]
+    measurable = _GATE_HOST_MEASURABLE_LINE_RE.search(stdout)
+    if measurable:
+        summary["host_measurable"] = _host_measurability(measurable.group(1))
     return summary
+
+
+def _host_measurability(note: str) -> Optional[bool]:
+    """Read the gate's host-measurability note into a three-valued fact.
+
+    The gate writes one of three notes: ``OK (…)``, ``the host cannot
+    measure wall-clock (…)`` or ``not measured (…)``.  Only the first
+    two are declarations; the third says the gate never looked, which
+    is not the same as "the host is untrustworthy".
+    """
+    text = str(note or "").strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    if lowered.startswith("the host cannot measure"):
+        return False
+    if lowered.startswith("ok"):
+        return True
+    return None
 
 
 def ci_timeout(
@@ -1111,6 +1148,118 @@ def _read_junit_evidence(junit_dir: Optional[Path]) -> Dict[str, Any]:
     return evidence
 
 
+# ---------------------------------------------------------------------------
+# The wall-clock shape of a failure
+# ---------------------------------------------------------------------------
+#
+# One rule, two users.  The gate script asks it before it decides
+# whether a failed phase is the code's fault or the machine's, and this
+# module asks it again when the gate's own verdict says "inconclusive" —
+# because a gate's exit code is not the only witness, and a phase that
+# contains one deterministic failure is a code failure on any host.
+#
+# The rule is about the *shape* of the message, not about the case that
+# produced it: the messages are written by the cases themselves, so the
+# shape is what is left when the case's own name is gone.
+#
+# A wall-clock shape says the machine ran out of time:
+#
+#   * a service that was not ready in time ("not ready after 90s");
+#   * a run that did not settle in time ("did not settle within 120.0s");
+#   * a subprocess the clock killed ("timed out after 120 seconds");
+#   * a budget that was exceeded ("took 2441.8 ms (budget 200 ms)");
+#   * a wall-clock bound that was missed ("to finish in < 2s, got 5.94s").
+#
+# Everything else is the code's: an assertion about behaviour, a wrong
+# value, a refused start.  Those stay failures on every host, and a
+# rule that treated them as the machine's would hide real regressions.
+
+#: The shapes that mean "the machine ran out of time".
+_WALL_CLOCK_SHAPE_PATTERNS = (
+    # a service that did not answer in time
+    re.compile(r"\bnot ready (?:after|within)\b", re.IGNORECASE),
+    re.compile(r"\bdid not become ready within\b", re.IGNORECASE),
+    # a run that did not settle in time
+    re.compile(r"\bdid not settle within\b", re.IGNORECASE),
+    re.compile(r"\bdid not (?:finish|complete) within\b", re.IGNORECASE),
+    # a subprocess the clock killed
+    re.compile(r"\btimed out\b", re.IGNORECASE),
+    re.compile(r"\btimeout", re.IGNORECASE),
+    # a budget that was exceeded
+    re.compile(r"\btook\b.*\bbudget\b", re.IGNORECASE),
+    re.compile(r"\bwithin (?:the |its )?budget\b", re.IGNORECASE),
+    re.compile(r"\bbudget (?:was )?exceeded\b", re.IGNORECASE),
+    re.compile(r"\bwall-clock budget\b", re.IGNORECASE),
+    # a wall-clock bound that was missed
+    re.compile(r"\bfinish in\b.*\bgot\b", re.IGNORECASE),
+    re.compile(r"\bexpected\b.*\bin <\s*[\d.]+s\b", re.IGNORECASE),
+)
+
+
+def is_wall_clock_shaped(message: str) -> bool:
+    """Does this failure message describe a wall-clock failure?
+
+    An empty message is **not** a wall-clock shape: a failure the
+    evidence does not describe cannot be excused by the machine.
+    """
+    text = str(message or "")
+    if not text.strip():
+        return False
+    return any(pattern.search(text) for pattern in _WALL_CLOCK_SHAPE_PATTERNS)
+
+
+def _non_wall_clock_failures(
+    junit_evidence: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """The failures in the evidence that are **not** wall-clock shapes.
+
+    These are the failures that keep a phase — and a whole gate run —
+    FAILED even on a host that could not measure wall-clock time.
+    """
+    failures = junit_evidence.get("junit_failures") or []
+    return [
+        failure for failure in failures
+        if not is_wall_clock_shaped(str(failure.get("first_line") or ""))
+    ]
+
+
+def phase_report_evidence(report_path: str) -> str:
+    """What one phase's junit report says about its failures.
+
+    Returns ``"<shape>|<skipped>"``, where ``shape`` is one of:
+
+    * ``no-evidence`` — the report is missing, unreadable, malformed, or
+      names no failure at all.  Nothing in it says the failure was the
+      machine's, so the failure is the code's;
+    * ``wall-clock`` — every failure in the report is a wall-clock shape;
+    * ``code`` — at least one failure is not a wall-clock shape.
+
+    The gate script calls this to decide whether a failed phase is
+    INCONCLUSIVE or FAILED, and the count of skipped cases comes back
+    with it because a lane that skipped half its cases and failed the
+    other half says something a reader needs to know.
+    """
+    try:
+        root = ET.parse(Path(report_path)).getroot()  # nosec B314 - the gate's own pytest wrote it
+    except Exception:  # noqa: BLE001 - a broken report names no failure
+        return "no-evidence|?"
+    suites = root.findall("testsuite") if root.tag == "testsuites" else [root]
+    skipped = 0
+    messages: List[str] = []
+    for suite in suites:
+        cases = suite.findall("testcase")
+        skipped += sum(1 for case in cases if case.find("skipped") is not None)
+        for case in cases:
+            for kind in ("failure", "error"):
+                for node in case.findall(kind):
+                    messages.append(_junit_first_line(node))
+    if not messages:
+        return f"no-evidence|{skipped}"
+    if all(is_wall_clock_shaped(message) for message in messages):
+        return f"wall-clock|{skipped}"
+    return f"code|{skipped}"
+
+
 def run_ci_verification(
     vp: Dict[str, Any],
     *,
@@ -1256,20 +1405,41 @@ def run_ci_verification(
     if error:
         evidence["error"] = error
 
-    # The junit evidence is added to the evidence and never decides the
-    # verdict: the exit code alone decides PASSED / FAILED.  The reports
-    # are read after the gate ran, and a report that cannot be parsed
-    # changes nothing here — it only changes what the evidence says.
-    evidence.update(_read_junit_evidence(junit_dir))
+    # The junit evidence is added to the evidence, and it never decides
+    # the verdict on its own: the exit code alone decides PASSED /
+    # FAILED.  The reports are read after the gate ran, and a report
+    # that cannot be parsed changes nothing here — it only changes what
+    # the evidence says.
+    #
+    # There is one exception, and it is the exception the whole
+    # host-measurability work is about: a gate that says "the host
+    # could not be measured" is asking to be believed, and the only way
+    # to check that claim is to read the failures the gate already
+    # wrote down.  A failure that is not a wall-clock shape is the
+    # code's, whatever the machine was doing — so the gate's exit code
+    # is not allowed to be the only witness.
+    junit_evidence = _read_junit_evidence(junit_dir)
+    evidence.update(junit_evidence)
+    # The host's own account of itself, lifted to the top level of the
+    # evidence: an operator reading the artifact has to be able to see
+    # *why* this machine's verdict is worth less than a quiet one's.
+    evidence["host_measurable"] = gate_summary.get("host_measurable")
+
+    could_not_decide = (
+        not timed_out
+        and not error
+        and _gate_could_not_decide(exit_code, gate_summary)
+    )
+    blocking_failures = (
+        _non_wall_clock_failures(junit_evidence) if could_not_decide else []
+    )
 
     if not timed_out and not error and exit_code == 0:
         result.status = STATUS_PASSED
         result.reasons = [
             f"[full_ci] `{entry}` 退出码 0（用时 {duration:.0f}s）"
         ]
-    elif not timed_out and not error and _gate_could_not_decide(
-        exit_code, gate_summary,
-    ):
+    elif could_not_decide and not blocking_failures:
         # The gate could not decide.  That is not a verdict about the
         # code, so it is not a FAILED verdict: a FAILED verdict is what
         # the repair loop turns into a fix task, and a machine that ran
@@ -1299,6 +1469,19 @@ def run_ci_verification(
         elif error:
             detail = f"入口无法执行：{error}"
             signal = SIGNAL_GATE_NOT_EXECUTABLE
+        elif blocking_failures:
+            # The gate said the machine could not be measured, and the
+            # evidence says otherwise: at least one failure is not a
+            # wall-clock shape, so it is the code's.  The reason names
+            # the case and its message — "the host was busy" is not an
+            # explanation a reader can check.
+            sample = blocking_failures[0]
+            detail = (
+                f"退出码 {exit_code}（门禁说机器答不了，但失败里有不是墙钟"
+                f"形状的：{sample.get('node_id') or '未知用例'} — "
+                f"{sample.get('first_line') or '（无消息）'}）"
+            )
+            signal = SIGNAL_GATE_FAILED
         elif exit_code == GATE_INCONCLUSIVE_EXIT_CODE:
             detail = (
                 f"退出码 {exit_code}（机器答不了：宿主不可测或某条 lane 自称"
@@ -1329,7 +1512,7 @@ def _gate_could_not_decide(
     """Did the gate stop without saying anything about the code?
 
     The gate's own summary is the evidence, and it is the only evidence
-    that fits: a run that could not decide says so.  Three ways it says
+    that fits: a run that could not decide says so.  Four ways it says
     it:
 
     * it names the phase its budget ran out in
@@ -1338,7 +1521,12 @@ def _gate_could_not_decide(
       — which stands on its own even when no phase could be parsed;
     * it exits 3 — the code the gate uses for a run that could not
       decide (``scripts/run_tests.sh`` uses 0 for a pass, 1 for a failed
-      phase, 3 for a run that could not decide).
+      phase, 3 for a run that could not decide);
+    * **it says the host could not be measured**
+      (``host measurability: the host cannot measure wall-clock …``).
+      That is a declaration about the machine, and it stands even when
+      the gate's exit code was 1 — which is exactly what a gate that
+      measured the host after judging the phase used to do.
 
     A run whose summary says nothing at all is not a gate that spoke:
     there is no declaration to read, and the historical FAILED verdict
@@ -1350,14 +1538,27 @@ def _gate_could_not_decide(
         return True
     if exit_code == 3:
         return True
-    return str(summary.get("verdict") or "").upper() == STATUS_INCONCLUSIVE
+    if str(summary.get("verdict") or "").upper() == STATUS_INCONCLUSIVE:
+        return True
+    return summary.get("host_measurable") is False
 
 
 def _summary_has_content(summary: Dict[str, Any]) -> bool:
     """Did the gate print anything the runner could read back?"""
     if not summary:
         return False
-    return any(value not in (None, "", 0) for value in summary.values())
+    for key, value in summary.items():
+        if key == "host_measurable":
+            # ``False`` is a fact, not an absence: "the host cannot be
+            # measured" is precisely what the gate said, and ``False
+            # == 0`` would otherwise hide it behind the empty-value
+            # test below.
+            if value is not None:
+                return True
+            continue
+        if value not in (None, "", 0):
+            return True
+    return False
 
 
 def _inconclusive_reason(
@@ -1389,8 +1590,11 @@ def _inconclusive_reason(
             f"门禁自报用时 {elapsed}s）"
         )
     verdict_text = f"门禁自报 {gate_verdict}；" if gate_verdict else ""
+    host_text = ""
+    if summary.get("host_measurable") is False:
+        host_text = "门禁自报宿主不可测墙钟；"
     return (
-        f"退出码 {exit_code}：门禁没能给出结论（{verdict_text}"
+        f"退出码 {exit_code}：门禁没能给出结论（{verdict_text}{host_text}"
         f"预算用尽或主机不可测量，不是代码失败；duration={duration}s，"
         f"门禁自报用时 {elapsed}s）"
     )
