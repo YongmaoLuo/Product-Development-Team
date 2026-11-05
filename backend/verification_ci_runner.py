@@ -1600,6 +1600,18 @@ def run_ci_verification(
         # the repair loop turns into a fix task, and a machine that ran
         # out of time has not proven a deliverable defective.
         result.status = STATUS_INCONCLUSIVE
+        # 2026-11-05: the machine could not answer — the gate ran out of
+        # its budget, said it could not decide, or said the host was not
+        # measurable.  That is a fact about the *run*, and it says so in
+        # the same machine-readable vocabulary the FAILED branch uses.
+        # Without it the triage layer sees "no signal", which it reads
+        # as "nothing was determined about the deliverable" and files as
+        # a ``deliverable_defect`` — a repair task against a delivery
+        # nobody has proven defective.  The verdict already said
+        # INCONCLUSIVE; the evidence now says *why* in the words the
+        # classifier knows: ``gate_inconclusive`` is an infrastructure
+        # problem.
+        evidence["signal"] = SIGNAL_GATE_INCONCLUSIVE
         result.reasons = [
             f"[{label}] `{entry}` "
             + _inconclusive_reason(

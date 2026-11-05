@@ -534,6 +534,159 @@ class TestGateSignals:
 
 
 # ---------------------------------------------------------------------------
+# An INCONCLUSIVE verdict has to say *why* it is inconclusive
+# ---------------------------------------------------------------------------
+#
+# The runner grades a gate that could not decide as INCONCLUSIVE, and it
+# has always said so in the verdict.  What it did **not** say was the
+# machine-readable fact: the evidence carried no ``signal``, and the
+# triage layer reads a missing signal as "nothing was determined about
+# the deliverable" — which it files as a ``deliverable_defect``, the
+# class that becomes a repair task.  So a gate that ran out of its
+# budget sent the repair loop after a delivery nobody had proven
+# defective.
+#
+# What is pinned here:
+#
+# * every INCONCLUSIVE path writes ``gate_inconclusive`` into the
+#   evidence — the gate ran out of its budget, the gate said it could
+#   not decide, the host was not measurable;
+# * that evidence, fed to the triage layer, is an infrastructure
+#   problem and **not** a deliverable defect;
+# * the FAILED branch keeps every signal it had — the negative control.
+
+
+#: A gate that ran out of its own budget, in the real gate's words.
+_GATE_OUT_OF_BUDGET = """
+echo '=== gate summary ==='
+echo 'phase 1/3 (parallel):             INCONCLUSIVE (the gate budget was exhausted)'
+echo 'host measurability:               OK (sleep(0.05)=0.051s, loadavg=3.10)'
+echo 'gate budget: 7200s'
+echo 'gate elapsed: 7200s'
+echo 'gate budget exhausted in: 1/3 (parallel)'
+echo 'gate: INCONCLUSIVE (exit 3)'
+exit 3
+"""
+
+#: A gate that could not decide without naming a phase — the host was
+#: not measurable, so the real gate prints no "budget exhausted" line.
+_GATE_HOST_UNMEASURABLE = """
+echo '=== gate summary ==='
+echo 'phase 1/3 (parallel):             FAILED (exit 1)'
+echo 'host measurability:               the host cannot measure wall-clock (sleep(0.05)=1.20s, loadavg=31.00)'
+echo 'gate budget: 7200s'
+echo 'gate elapsed: 300s'
+echo 'gate: INCONCLUSIVE (exit 3)'
+exit 3
+"""
+
+
+def _gate_script(tmp_path: Path, body: str) -> str:
+    """Write a gate script and return the ``ci_entry`` that runs it."""
+    gate = tmp_path / "gate.sh"
+    gate.write_text("#!/bin/bash\n" + body, encoding="utf-8")
+    gate.chmod(0o755)
+    return f"bash {gate}"
+
+
+class TestInconclusiveSignal:
+    def test_a_gate_that_ran_out_of_its_budget_carries_the_signal(
+        self, tmp_path,
+    ):
+        """The gate stopped at its own budget — that is the machine's fault.
+
+        Without a signal the triage layer has nothing to classify, and a
+        missing signal lands on ``deliverable_defect``: a repair task
+        against a delivery that was never judged.
+        """
+        result = run_ci_verification(
+            _vp(_gate_script(tmp_path, _GATE_OUT_OF_BUDGET)),
+            project_dir=tmp_path,
+        )
+
+        assert result.status == ci_runner.STATUS_INCONCLUSIVE, result.reasons
+        assert result.evidence["signal"] == "gate_inconclusive", result.evidence
+        assert result.evidence["signal"] == ci_runner.SIGNAL_GATE_INCONCLUSIVE
+
+    def test_a_gate_whose_host_cannot_be_measured_carries_the_signal(
+        self, tmp_path,
+    ):
+        """The host was not measurable — still the machine's fault."""
+        result = run_ci_verification(
+            _vp(_gate_script(tmp_path, _GATE_HOST_UNMEASURABLE)),
+            project_dir=tmp_path,
+        )
+
+        assert result.status == ci_runner.STATUS_INCONCLUSIVE, result.reasons
+        assert result.evidence["signal"] == "gate_inconclusive", result.evidence
+
+    def test_the_signal_reaches_the_triage_layer_as_infrastructure(
+        self, tmp_path,
+    ):
+        """The chain: the runner's evidence → the triage layer's class.
+
+        This is the whole point of the signal.  ``gate_inconclusive`` is
+        an infrastructure problem; a ``deliverable_defect`` would send
+        the repair loop to fix a defect that nobody found.
+        """
+        from verification.failure_triage import (
+            DELIVERABLE_DEFECT,
+            INFRA,
+            classify_deterministic,
+        )
+
+        result = run_ci_verification(
+            _vp(_gate_script(tmp_path, _GATE_OUT_OF_BUDGET)),
+            project_dir=tmp_path,
+        )
+
+        failure_class = classify_deterministic(
+            result.evidence.get("signal"), str(result.evidence.get("error") or ""),
+        )
+        assert failure_class == INFRA, (
+            f"an inconclusive gate was filed as {failure_class!r}"
+        )
+        assert failure_class != DELIVERABLE_DEFECT
+
+    def test_the_failed_branches_keep_their_own_signals(self, tmp_path, monkeypatch):
+        """The negative control: the FAILED branch is untouched.
+
+        Every way the runner can say "this failed" keeps the signal it
+        had — a timeout is a timeout, a gate that could not be started
+        is a gate that could not be started, a red lane is a red lane,
+        and an exit-3 that declared nothing is still the gate's own
+        ``gate_inconclusive``.
+        """
+        monkeypatch.setattr(ci_runner, "MIN_FULL_CI_TIMEOUT_SECONDS", 1)
+
+        red = run_ci_verification(_vp("exit 1"), project_dir=tmp_path)
+        assert red.status == STATUS_FAILED
+        assert red.evidence["signal"] == ci_runner.SIGNAL_GATE_FAILED
+
+        killed = run_ci_verification(
+            _vp("sleep 5", ci_timeout_seconds=1), project_dir=tmp_path,
+        )
+        assert killed.status == STATUS_FAILED
+        assert killed.evidence["signal"] == ci_runner.SIGNAL_TIMEOUT
+
+        silent_three = run_ci_verification(_vp("exit 3"), project_dir=tmp_path)
+        assert silent_three.status == STATUS_FAILED
+        assert silent_three.evidence["signal"] == ci_runner.SIGNAL_GATE_INCONCLUSIVE
+
+        def _boom(*args, **kwargs):
+            raise OSError("no shell for you")
+
+        monkeypatch.setattr(ci_runner, "run_bounded", _boom)
+        not_executable = run_ci_verification(
+            _vp("exit 0"), project_dir=tmp_path,
+        )
+        assert not_executable.status == STATUS_FAILED
+        assert not_executable.evidence["signal"] == (
+            ci_runner.SIGNAL_GATE_NOT_EXECUTABLE
+        )
+
+
+# ---------------------------------------------------------------------------
 # The evidence has to survive the kill
 # ---------------------------------------------------------------------------
 #
@@ -663,6 +816,24 @@ class TestFullCiVerdictClassification:
         )
         assert verdict["status"] == "FAILED"
         assert verdict["failure_class"] == "infra", verdict
+        assert verdict["failure_class_source"] == "deterministic", verdict
+
+    def test_a_gate_that_could_not_decide_is_infrastructure(self, tmp_path):
+        """The chain, end to end: runner → evidence → triage layer.
+
+        A gate that ran out of its budget is INCONCLUSIVE — the verdict
+        says so — but the *class* comes from the evidence's signal.  With
+        no signal the verdict carried no class at all, and a verdict
+        without a class is a deliverable defect: a repair task against a
+        delivery nobody had proven defective.
+        """
+        verdict = _full_ci_agent(tmp_path)._run_full_ci_vp(
+            _full_ci_vp(ci_entry=_gate_script(tmp_path, _GATE_OUT_OF_BUDGET)),
+        )
+        assert verdict["status"] == "INCONCLUSIVE", verdict
+        assert verdict["evidence"]["signal"] == "gate_inconclusive", verdict
+        assert verdict["failure_class"] == "infra", verdict
+        assert verdict["failure_class"] != "deliverable_defect", verdict
         assert verdict["failure_class_source"] == "deterministic", verdict
 
     def test_a_red_gate_is_a_deliverable_defect(self, tmp_path):
