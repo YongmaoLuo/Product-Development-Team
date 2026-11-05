@@ -1771,42 +1771,213 @@ def _validate_dependencies(tasks: list[SubTask]) -> None:
 # accepts any of the three Chinese phrasings the system prompt template
 # asks the LLM to emit: "前置条件", "依赖", "前置条件/依赖".
 _DESC_TRIGGER_RE = re.compile(r"(?:前置条件\s*/\s*依赖|前置条件|依赖)\s*[：:]")
-# Hierarchical-id matcher — same shape as the generator: ``\d+(?:-\d+)*``
-# so flat ("1") and hierarchical ("1-2", "1-2-3") ids are captured whole
-# rather than split into fragments.
-_DESC_ID_RE = re.compile(r"\d+(?:-\d+)*")
+# Brace-delimited reference group — an explicit reference.  "{1-4}"
+# names tasks 1, 2, 3 and 4; "{2,5}" names two tasks.
+#
+# A brace group is NOT the only reference shape: a bare id list
+# ("前置条件：任务 1 已完成", "前置条件：任务 1-4 已完成") is one too.
+# The 2026-11-04 change that made braces the only shape silenced the
+# whole check instead of fixing the range bug it was after, so the
+# bare side is back — with ranges expanded rather than read as one
+# literal id.
+_DESC_BRACE_RE = re.compile(r"\{([^{}]*)\}")
+# Bare id token inside a trigger sentence: flat ("1"), hierarchical
+# ("1-2", "1-2-3") or a range written with any of the range
+# separators ("1-4", "1–4", "1~4").  The token is matched whole so a
+# hierarchical id is never split into fragments and a range is never
+# read as two separate ids.
+_DESC_BARE_ID_RE = re.compile(r"\d+(?:\s*[-–—−~～]\s*\d+)*")
+# Keyword that introduces an id list ("任务 1、任务 2").  A bare id
+# list may also start right after the trigger's colon ("前置条件：1-4").
+_DESC_TASK_KW_RE = re.compile(r"任务")
+# What may sit between two id tokens of one id list: the list
+# separators ("、", ",", "，") and the connector words the planner
+# uses ("任务", "和", "与", "以及").
+_DESC_ID_SEP_RE = re.compile(
+    r"[\s、,，;；]*(?:(?:以及|及|和|与)\s*)?(?:任务\s*)?"
+)
+# Id token inside a brace group: flat ("1") or hierarchical ("1-2",
+# "1-2-3"), matched whole so a hierarchical id is never split into
+# fragments.
+_DESC_ID_TOKEN_RE = re.compile(r"^\d+(?:-\d+)*$")
+# Range token — exactly two numeric segments ("1-4").  A three-segment
+# token ("1-2-3") is a hierarchical id, not a range.
+_DESC_RANGE_RE = re.compile(r"^(\d+)-(\d+)$")
+# Largest span a brace range may expand.  Beyond it the token is kept
+# literal (and then rejected as an unknown id) so one stray brace can
+# never name hundreds of ids.
+_DESC_MAX_RANGE_SPAN = 200
+# Range separators that mean the same thing as an ASCII hyphen.  The
+# PRD lists "a-b" / "a–b" / "a~b" as the range spellings; they are
+# normalised before the token is classified.
+_DESC_RANGE_SEPARATORS = ("–", "—", "−", "～", "~")
 
 
-def _extract_desc_dep_ids(description: str) -> list[str]:
+def _normalize_desc_token(token: str) -> str:
+    """Normalise one id token: strip it, unify its separator.
+
+    Typographic and full-width range separators ("–", "—", "−", "～",
+    "~") all become the ASCII hyphen, so "1–4" and "1~4" are read as
+    the same range "1-4".  Whitespace around the hyphen is dropped
+    too, so "1 - 4" is the same token as "1-4".
+    """
+    for separator in _DESC_RANGE_SEPARATORS:
+        token = token.replace(separator, "-")
+    token = re.sub(r"\s*-\s*", "-", token)
+    return token.strip()
+
+
+def _expand_desc_token(token: str, known_ids: Optional[set[str]]) -> list[str]:
+    """Turn one normalised id token into the task ids it names.
+
+    A token is a reference only when it looks like a task id at all
+    (``\\d+(?:-\\d+)*``); anything else (a file name, a placeholder) is
+    prose and yields ``[]``.
+
+    A token that the plan already knows is kept whole — that is how a
+    hierarchical id ("1-2") survives instead of being expanded into
+    "1" and "2".
+
+    A token that the plan does NOT know is read as a range when it has
+    the two-segment shape ("1-4"), and expanded into its members.  A
+    range that cannot be expanded — reversed ("5-2") or wider than
+    ``_DESC_MAX_RANGE_SPAN`` ("1-500") — keeps its literal token, which
+    is then rejected like any other unknown id.
+
+    Without ``known_ids`` there is nothing to tell a hierarchical id
+    from a range, so every token is kept literal.
+    """
+    if not _DESC_ID_TOKEN_RE.fullmatch(token):
+        return []
+    if known_ids is None or token in known_ids:
+        return [token]
+
+    range_match = _DESC_RANGE_RE.fullmatch(token)
+    if not range_match:
+        return [token]
+
+    start = int(range_match.group(1))
+    end = int(range_match.group(2))
+    if start >= end or (end - start) > _DESC_MAX_RANGE_SPAN:
+        return [token]
+    return [str(value) for value in range(start, end + 1)]
+
+
+def _scan_bare_desc_ids(section: str) -> list[str]:
+    """Collect the id tokens of every bare id list in ``section``.
+
+    An id list starts either right after the trigger's colon or right
+    after a ``任务`` keyword.  From that anchor the scan walks the
+    list — id token, separator/connector, id token, … — and stops at
+    the first thing that is not part of it.  A number that belongs to
+    the prose ("耗时 3 分钟") therefore never becomes a task
+    reference, and a range is never split into two ids.
+
+    The scan returns the normalised tokens; turning a range into its
+    members is :func:`_expand_desc_token`'s job, so the bare and the
+    braced side share one set of rules.
+
+    Args:
+        section: The trigger sentence, with any brace group already
+            removed (a brace group's contents are parsed separately).
+
+    Returns:
+        The normalised tokens of every id list found, in the order
+        they appear.  Duplicates are collapsed.
+    """
+    if not section:
+        return []
+
+    anchors = [0]
+    anchors.extend(match.end() for match in _DESC_TASK_KW_RE.finditer(section))
+
+    tokens: list[str] = []
+    for anchor in anchors:
+        pos = anchor
+        while True:
+            # An anchor may point at whitespace ("任务 1"): the id
+            # list starts at the first non-space character.
+            while pos < len(section) and section[pos].isspace():
+                pos += 1
+            match = _DESC_BARE_ID_RE.match(section, pos)
+            if not match:
+                break
+            token = _normalize_desc_token(match.group(0))
+            pos = match.end()
+            if token and token not in tokens:
+                tokens.append(token)
+            separator = _DESC_ID_SEP_RE.match(section, pos)
+            if not separator:
+                break
+            nxt = separator.end()
+            while nxt < len(section) and section[nxt].isspace():
+                nxt += 1
+            if not _DESC_BARE_ID_RE.match(section, nxt):
+                break
+            pos = nxt
+    return tokens
+
+
+def _extract_desc_dep_ids(
+    description: str,
+    known_ids: Optional[set[str]] = None,
+) -> list[str]:
     """Extract prerequisite task ids mentioned in a task's ``description``.
 
     Mirror of :func:`TasksGenerator._postprocess_extract_from_desc` —
     the generator runs this logic to inject ``depends_on`` from the
     desc when the LLM omits the field, and the validator runs the
     same logic to enforce that the desc and the data agree. Keeping
-    the two parsers byte-identical is essential: a divergence would
+    the two parsers in lock-step is essential: a divergence would
     silently let inconsistencies slip through the load-time check.
 
-    Recognised patterns (in priority order):
+    **A task reference is a brace group or a bare id list**
+    (2026-11-05).  The trigger word still says "this sentence declares
+    prerequisites"; the ids it names may be written inside braces
+    ("{1-4}") or bare ("任务 1-4", "前置条件：1").  Text outside an id
+    list is prose and is never read as an id.
 
-      - ``前置条件：任务 1 已完成。``
-      - ``前置条件：任务 1-2 已完成。``
-      - ``依赖：任务 1 已完成``
-      - ``前置条件/依赖：已完成 任务 1-2。``
-      - ``前置条件：任务 1, 2, 3 已完成``
+    A **range** — "1-4", "1–4", "1~4" — is expanded into its members
+    instead of being read as one literal id.  That was the PRD's
+    defect 2: a desc that wrote "前置条件 1-4" was parsed into the id
+    "1-4", an id that exists in no plan, and the whole plan was
+    rejected at load time with "Task 5 desc 提到前置条件 1-4 但
+    depends_on 是 ['1','2','3','4']".
+
+    Recognised patterns:
+
+      - ``前置条件：任务 {1} 已完成。``
+      - ``前置条件：任务 {1-4} 已完成。``  (range → 1, 2, 3, 4)
+      - ``依赖：任务 {2,5} 已完成``         (list → 2 and 5)
+      - ``前置条件/依赖：已完成 任务 {1-2}。``
+      - ``前置条件：任务 1 已完成。``       (bare id → 1)
+      - ``前置条件：任务 1-4 已完成。``      (bare range → 1, 2, 3, 4)
+      - ``前置条件：1-4 已完成。``          (bare range, no 任务 keyword)
 
     Returns the list of task ids parsed from the description, e.g.
-    ``['1-2']`` for ``"前置条件：任务 1-2 已完成"``. Returns ``[]``
-    when no recognised trigger word is found or no task id can be
-    parsed.
+    ``['1','2','3','4']`` for ``"前置条件：任务 {1-4} 已完成"``. Returns
+    ``[]`` when no recognised trigger word is found, when the trigger
+    sentence carries no id list, or when no task id can be parsed.
 
-    Boundary cases (mirroring the generator):
+    Args:
+        description: The task description to scan.
+        known_ids: The ids that exist in the plan.  Used to tell a
+            hierarchical id ("1-2") from a range ("1-4"): a known id is
+            kept whole, an unknown two-segment token is expanded.
+            ``None`` means "unknown plan" — every token is then kept
+            literal.
+
+    Boundary cases:
 
       * ``description`` is empty / ``None`` / non-string -> ``[]``
-      * description has the trigger word but no ``任务`` keyword
-        after it -> ``[]``
-      * description has the trigger + ``任务`` keyword but no
-        parseable id (e.g. just trailing punctuation) -> ``[]``
+      * no trigger word ("前置条件" / "依赖" + a colon) -> ``[]``
+      * trigger word but no id list in that sentence -> ``[]``
+      * a brace group outside the trigger's sentence (a fenced code
+        block further down the description) -> not parsed
+      * a number that belongs to the prose ("耗时 3 分钟") -> not
+        parsed: a bare id list starts at the trigger's colon or at a
+        ``任务`` keyword and ends at the first token that is not part
+        of the list
     """
     if not description or not isinstance(description, str):
         return []
@@ -1820,12 +1991,28 @@ def _extract_desc_dep_ids(description: str) -> list[str]:
     if boundary:
         after_trigger = after_trigger[:boundary.start()]
 
-    task_kw_idx = after_trigger.find("任务")
-    if task_kw_idx < 0:
-        return []
-    ids_section = after_trigger[task_kw_idx + len("任务"):]
+    ids: list[str] = []
 
-    return _DESC_ID_RE.findall(ids_section)
+    def _add(token: str) -> None:
+        for expanded in _expand_desc_token(token, known_ids):
+            if expanded not in ids:
+                ids.append(expanded)
+
+    # Explicit brace groups: "{1-4}" → 1, 2, 3, 4 ; "{2,5}" → 2 and 5.
+    for group in _DESC_BRACE_RE.findall(after_trigger):
+        for raw_token in re.split(r"[,，、]", group):
+            token = _normalize_desc_token(raw_token)
+            if not token:
+                continue
+            _add(token)
+
+    # Bare id lists: "任务 1、任务 2", "前置条件：1-4".  The brace
+    # groups are blanked out first so their tokens are not counted
+    # twice.
+    for token in _scan_bare_desc_ids(_DESC_BRACE_RE.sub(" ", after_trigger)):
+        _add(token)
+
+    return ids
 
 
 def validate_desc_consistency(tasks: list) -> None:
@@ -1861,6 +2048,16 @@ def validate_desc_consistency(tasks: list) -> None:
     task id and the missing dependency, so a malformed plan never
     reaches the executor.
 
+    **A brace group or a bare id list declares a prerequisite**
+    (2026-11-05).  The desc text outside an id list is prose:
+    "前置条件：任务 1-4 已完成" names tasks 1, 2, 3 and 4, so it must
+    not disagree with ``depends_on``.  Both spellings stay strict —
+    "{9}" / "任务 9" (no such id in the plan) and "{1-4}" / "任务
+    1-4" (the task does not depend on 4) are both rejected.  The
+    plan's full id set is passed to the parser so that a hierarchical
+    id ("1-2") is kept whole while a range ("1-4") is expanded into
+    its members.
+
     Three classes of input (per the task spec):
 
       1. **desc has no trigger word + ``depends_on == []``** —
@@ -1881,11 +2078,15 @@ def validate_desc_consistency(tasks: list) -> None:
         (``[]``) — the field is opt-in.
       * Hierarchical ids (``1-2``, ``1-2-3``) are compared as a
         whole, not as fragments. A desc that says
-        ``前置条件：任务 1-2`` requires ``"1-2"`` (or a transitive
+        ``前置条件：任务 {1-2}`` requires ``"1-2"`` (or a transitive
         ancestor that itself is a prefix? — see test 4) to be
         reachable from the task. The current implementation only
         treats the exact id as satisfiable; partial-id matching
         would be ambiguous and is intentionally rejected.
+      * A two-segment token that is NOT an id of this plan is read as
+        a range and expanded ("{1-4}" → 1, 2, 3, 4); a reversed or
+        over-wide range keeps its literal token and is rejected like
+        any other unknown id.
 
     Args:
         tasks: List of :class:`SubTask` objects. Each may carry a
@@ -1905,6 +2106,25 @@ def validate_desc_consistency(tasks: list) -> None:
     by_id = {getattr(t, "id", None): t for t in tasks if getattr(t, "id", None) is not None}
     closure_cache: dict = {}
 
+    # The plan's full id set.  ``_extract_desc_dep_ids`` needs it to
+    # tell a hierarchical id ("1-2", which exists in this project) from
+    # a range ("1-4", which does not) — a known id stays whole, an
+    # unknown two-segment token is expanded into its members.
+    #
+    # The set holds the plan's task ids AND every id its dependency
+    # edges name.  An id that only appears as a dependency is still a
+    # real id of this plan (a child of a refiner split depends on its
+    # parent id, and that parent may no longer be a task of its own);
+    # reading such an id as a range would expand it into two ids the
+    # graph never declared and reject a consistent plan.
+    known_ids = set()
+    for t in tasks:
+        task_id = getattr(t, "id", None)
+        if task_id is not None:
+            known_ids.add(str(task_id))
+        for dep_id in getattr(t, "depends_on", None) or []:
+            known_ids.add(str(dep_id))
+
     for task in tasks:
         description = getattr(task, "description", "") or ""
         depends_on = set(getattr(task, "depends_on", None) or [])
@@ -1913,7 +2133,7 @@ def validate_desc_consistency(tasks: list) -> None:
         # accept it here so the message is specific to the desc
         # inconsistency, not a self-dependency. Therefore the
         # check is purely a closure comparison.
-        desc_dep_ids = _extract_desc_dep_ids(description)
+        desc_dep_ids = _extract_desc_dep_ids(description, known_ids=known_ids)
         if not desc_dep_ids:
             continue
         reachable = _transitive_deps(getattr(task, "id", None), by_id, closure_cache)

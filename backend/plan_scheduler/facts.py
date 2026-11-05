@@ -92,6 +92,22 @@ execution row's ``project_dir``, then the ``project_dir`` the task
 list declares, then the workspace the PRD declares as a constraint.
 The first one that says something wins.
 
+The two facts a refusal is made of
+--------------------------------
+``import_failed_reason(plan_id)``
+    Why this plan's import failed, in the import's own words.  The
+    import wrote the reason on the plan's execution row and kept no
+    other copy, so the row is where the reason is read from — and the
+    words are passed through unchanged, because a reason that has been
+    reworded is not the reason.
+``plan_directory_exists(plan_id)``
+    Whether this plan's directory is on disk.  This is the stricter
+    question than "where would the directory be?": a directory that
+    holds none of the plan's own files is not a plan's directory,
+    however much of a directory it is.  The two answers together are
+    what lets the command layer tell a plan that is not there apart
+    from one that is there and cannot be run.
+
 The one thing that is kept
 --------------------------
 ``plan_created_at()`` answers from the filesystem rather than from the
@@ -126,6 +142,7 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "PlanFactsReader",
+    "IMPORT_FAILED_PHASE",
     "QUEUED_PHASE",
     "VERIFICATION_PHASES",
     "VERIFICATION_STALE_SECONDS",
@@ -134,6 +151,25 @@ __all__ = [
 
 #: The phase a plan is in while it waits for its turn to run.
 QUEUED_PHASE = "queued"
+
+#: The phase a plan is in when its import failed.  The import left the
+#: plan's directory on disk and registered the plan with the reason it
+#: could not be imported; the plan is never admitted to the queue.
+#:
+#: The name is the one ``plan_state.VALID_PHASES`` carries — the phase
+#: is a fact of the plan, and the scheduler reads it rather than
+#: inventing a second word for it.
+IMPORT_FAILED_PHASE = "import_failed"
+
+#: The files a plan's own directory carries.  A directory that has one
+#: of them holds a plan's material; a directory that has none of them
+#: is a directory that happens to be there.
+_PLAN_FILE_NAMES = (
+    "tasks.json",
+    "prd.json",
+    "import.json",
+    "interview.json",
+)
 
 #: The phases in which a plan is being verified.  In each of them the
 #: verification thread is the thing working on the plan, and the plan
@@ -661,10 +697,7 @@ class PlanFactsReader:
         holds one, so both are tried; a directory that carries the
         plan's own files is the one that is meant.
         """
-        candidates = (
-            self._project_root / plan_id,
-            self._project_root / "plans" / plan_id,
-        )
+        candidates = self._plan_dir_candidates(plan_id)
         for candidate in candidates:
             if (candidate / "prd.json").exists() or (
                 candidate / "tasks.json"
@@ -674,6 +707,69 @@ class PlanFactsReader:
             if candidate.is_dir():
                 return candidate
         return None
+
+    def _plan_dir_candidates(self, plan_id: str) -> Tuple[Path, Path]:
+        """Return the two places this plan's directory may be.
+
+        The root may be the plans tree itself or a repository root that
+        holds one, so both are tried — in that order, because the first
+        is where a plan of this tree really lives.
+        """
+        return (
+            self._project_root / plan_id,
+            self._project_root / "plans" / plan_id,
+        )
+
+    # ------------------------------------------------------------------
+    # The plan that is on disk but not in the tables
+    # ------------------------------------------------------------------
+
+    def import_failed_reason(self, plan_id: str) -> Optional[str]:
+        """Return why this plan's import failed, or ``None``.
+
+        The reason is the plan's own: the import wrote it on the plan's
+        execution row, word for word, so that the plan carries the
+        evidence of its own failure instead of the caller having to
+        keep a copy of a response body nobody saved.
+
+        A plan that never failed to import has no reason, and a row
+        whose reason is blank has none either — there is nothing to
+        pass through.
+        """
+        row = self._conn.execute(
+            "SELECT stop_reason FROM plan_execution WHERE plan_id = ?",
+            (plan_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        value = row[0]
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def plan_directory_exists(self, plan_id: str) -> bool:
+        """Return whether this plan's directory is on disk.
+
+        A directory that carries one of the plan's own files is a plan's
+        directory: it holds the material the plan was built from.  A
+        directory that carries none of them is not a plan — it is a
+        directory that happens to be there, and it must not be answered
+        about as if a plan were in it.
+
+        The lookup does not go through :meth:`_plan_dir`, which answers
+        "where would this plan's directory be?" for **any** directory
+        that exists.  The question here is the stricter one — "is there
+        a plan here?" — and it is asked of the files themselves.
+        """
+        for candidate in self._plan_dir_candidates(plan_id):
+            if not candidate.is_dir():
+                continue
+            if any(
+                (candidate / name).is_file() for name in _PLAN_FILE_NAMES
+            ):
+                return True
+        return False
 
     def _warn_missing_plan_dir(self, plan_id: str) -> None:
         """Say once that a queued plan has no directory under the root.

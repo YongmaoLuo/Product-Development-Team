@@ -18,9 +18,11 @@ request against the mounted app, never a direct call into
    conflict is resolved by giving the second import its own plan id and
    telling the caller, not by writing two plans' history into one
    folder.
-3. **A refused import leaves nothing behind.** A model that answered
-   with an empty task list produces no plan: no routing row, no
-   execution row.
+3. **A refused import is registered as a failure, and is not queued.**
+   A model that answered with an empty task list produces no runnable
+   plan: the plan is parked in ``import_failed`` (never ``queued``, so
+   the scheduler never collects it) and the reason it failed is kept on
+   the plan in ``plan_execution.stop_reason``.
 
 No real LLM is involved: ``server.create_coding_tool`` is monkeypatched
 per-test to return a fake that scripts the two calls the generator
@@ -310,19 +312,24 @@ def test_a_failed_seed_still_reports_queued(
 
 
 # ---------------------------------------------------------------------------
-# 4 — a refused import leaves nothing behind
+# 4 — a refused import is registered as a failure, and is not queued
 # ---------------------------------------------------------------------------
 
 
 def test_empty_task_list_is_refused(
     isolated_plans_dir, checkout, monkeypatch, state_db_reader
 ):
-    """A model that answered with no tasks produces no plan.
+    """A model that answered with no tasks produces a *failed* plan.
 
-    The refusal happens before the plan is marked, so there is no
-    routing row to find: a plan that was never born has no phase, and a
-    plan with a phase but no tasks would be a plan the scheduler picks
-    up and cannot run.
+    The refusal happens before the plan could be queued, so it is never
+    parked in ``queued`` — the scheduler collects only ``queued``, so a
+    refused import is never pulled into the line.
+
+    But the plan is not an orphan: it is registered in the
+    ``import_failed`` phase, so a reader that goes through the tables
+    can find it instead of answering "no such plan", and the reason it
+    failed is attached to the plan in ``plan_execution.stop_reason`` —
+    the copy that survives the HTTP response the caller threw away.
     """
     _install(monkeypatch, {"tasks": []})
 
@@ -335,5 +342,18 @@ def test_empty_task_list_is_refused(
     assert "0 tasks" in response.json()["detail"]
 
     plan_id = response.json()["plan_id"]
-    assert state_db_reader.routing(plan_id) is None
-    assert state_db_reader.execution(plan_id) is None
+
+    routing = state_db_reader.routing(plan_id)
+    assert routing is not None, (
+        "a refused import must leave a routing row behind; without one "
+        "every table-driven reader answers 'no such plan'"
+    )
+    assert routing["current_phase"] != "queued"
+    assert routing["current_phase"] == "import_failed"
+
+    execution = state_db_reader.execution(plan_id)
+    assert execution is not None, (
+        "the reason has to be attached to the plan; a plan with no "
+        "execution row has nowhere to keep it"
+    )
+    assert execution["stop_reason"], "stop_reason must not be empty"

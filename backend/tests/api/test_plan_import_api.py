@@ -379,11 +379,39 @@ def test_a_second_import_of_the_same_title_does_not_overwrite_the_first(
 
 
 def _assert_not_queued(plan_id, state_db_reader):
-    """``queued`` is the one phase the lane may park a plan in, so its
-    absence is the whole "nothing happened" claim, read from the store."""
+    """A refused import is registered as ``import_failed`` — and not queued.
+
+    ``queued`` is still the one phase the lane may park a *runnable* plan
+    in, so "not ``queued``" remains the scheduler's admission claim: the
+    refused plan is never pulled into the line.  That part cannot be
+    dropped.
+
+    But a refusal is no longer an orphan.  The plan is registered in the
+    ``import_failed`` phase, so every reader that goes through the
+    tables can find it instead of answering "no such plan", and the
+    reason it failed is attached to the plan in
+    ``plan_execution.stop_reason`` — the copy that survives the HTTP
+    response the caller threw away.
+
+    The name and the ``!= "queued"`` comparison are kept on purpose: the
+    shape gate ``tests/static_gates/test_reconciled_api_phase_assertions.py``
+    pins both, and the "not queued" claim is still the question the
+    scheduler asks.
+    """
     routing = state_db_reader.routing(plan_id)
-    assert routing is None or routing["current_phase"] != "queued"
-    assert state_db_reader.execution(plan_id) is None
+    assert routing is not None, (
+        "a refused import must leave a routing row behind; without one "
+        "every table-driven reader answers 'no such plan'"
+    )
+    assert routing["current_phase"] != "queued"
+    assert routing["current_phase"] == "import_failed"
+
+    execution = state_db_reader.execution(plan_id)
+    assert execution is not None, (
+        "the reason has to be attached to the plan; a plan with no "
+        "execution row has nowhere to keep it"
+    )
+    assert execution["stop_reason"], "stop_reason must not be empty"
 
 
 def test_a_model_that_returned_no_tasks_is_refused(

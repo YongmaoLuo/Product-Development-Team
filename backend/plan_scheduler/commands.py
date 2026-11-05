@@ -88,6 +88,23 @@ The command answers with one of five words, and the set is closed:
 ``not_found``
     The scheduler does not know the plan.
 
+A refusal says which one it is
+------------------------------
+The outcome is a word; the **detail** says what the word means here,
+and a refusal that cannot be acted on is half an answer.  So the two
+refusals a resume can give name the thing they are about:
+
+* a plan whose **import failed** is a conflict that carries the reason
+  the import refused it with, word for word — the plan is on disk with
+  its material, and the reason is on its execution row;
+* a plan whose **directory is on disk but which is not registered** is
+  a not-found that says so — the material is there, and what is missing
+  is the row behind it.
+
+A plan that is not there at all is still ``no_such_plan``: that is the
+answer every other caller relies on, and there is nothing in this
+answer to change it.
+
 A refusal is not one of the five
 --------------------------------
 The lifecycle answers 400, 404 and 409 in its own words, and those
@@ -118,7 +135,7 @@ from typing import Any, Callable, Optional, Tuple
 
 from .capacity import CapacityLedger
 from .config import DEFAULT_CAPACITY, DEFAULT_MIN_RUNTIME_SECONDS
-from .facts import QUEUED_PHASE
+from .facts import IMPORT_FAILED_PHASE, QUEUED_PHASE
 from .policy import select_victim
 from .store import SqliteSchedulerStore
 
@@ -448,6 +465,12 @@ class CommandExecutor:
         it takes no slot, so the only things it changes are the plan's
         phase — through the lifecycle — and its place in the queue.
 
+        The answer is the **fact**, not the request: the resume is
+        applied when the plan really came back — it is waiting in the
+        queue, or the engine has already pulled it up.  A resume that
+        did not bring the plan back is a conflict, and it names the
+        phase the plan is really in.
+
         Args:
             plan_id: the plan to resume.
             command_id: the command row to finish; a new one is written
@@ -537,8 +560,20 @@ class CommandExecutor:
 
     def _do_resume(self, plan_id: str) -> Tuple[str, Optional[str]]:
         """Carry out a resume; return the outcome and the detail."""
-        if self._phase_of(plan_id) is None:
-            return NOT_FOUND, "no_such_plan"
+        phase = self._phase_of(plan_id)
+        if phase is None:
+            return self._refuse_unknown_plan(plan_id)
+        if phase == IMPORT_FAILED_PHASE:
+            # The plan could not be imported: its directory is on disk
+            # with the material that was imported, and it carries the
+            # reason the import was refused with.  It is not a plan that
+            # can be run, so it is not resumed — and the answer says
+            # why, in the import's own words, because "this plan
+            # cannot be resumed" is not something an operator can act
+            # on.
+            return CONFLICT, "plan is in import_failed: {0}".format(
+                self._import_failed_reason(plan_id)
+            )
         if self._is_running(plan_id):
             # A plan that is working has no "put it back to wait" to do.
             return CONFLICT, "running"
@@ -562,6 +597,30 @@ class CommandExecutor:
         with self._store.transaction(self._conn):
             self._ensure_queued(plan_id)
             self._store.promote(self._conn, plan_id)
+
+        # The postcondition.  The facade's answer is a **request**, not a
+        # fact: what counts is where the plan really is now.  A resume
+        # that did not bring the plan back has to say so — an ``applied``
+        # answer that is not backed by a fact loses the plan and tells
+        # the operator it was fine.
+        phase = self._phase_of(plan_id)
+        if phase is None:
+            # The plan is not there any more.
+            return NOT_FOUND, "no_such_plan"
+        if self._is_running(plan_id):
+            # The engine pulled the plan up in the meantime: it is
+            # working, so it was not lost.  The resume did what it came
+            # to do — one moment later than it said.
+            return APPLIED, "resumed"
+        if phase != QUEUED_PHASE:
+            # The phase did not move: the plan is not waiting, and
+            # nothing is going to start it.  The detail names the phase
+            # the plan is really in.
+            return CONFLICT, "resume_not_queued:{0}".format(phase)
+        if not self._is_queued(plan_id):
+            # The phase says the plan is waiting, but the queue does not
+            # hold it: the row is gone, so the plan waits nowhere.
+            return CONFLICT, "resume_not_queued:queued"
         return APPLIED, "resumed"
 
     def _do_start(self, plan_id: str) -> Tuple[str, Optional[str]]:
@@ -597,7 +656,7 @@ class CommandExecutor:
 
         # The capacity.  The start is the only action that may interrupt
         # somebody, and it does so only when the capacity is full and
-        # there is a victim the rules allow.  The capacity and ``M``
+        # there is a victim the rules allow to interrupt.  The capacity and ``M``
         # are read from the configuration **as it is now**: the tick
         # reads the same snapshot, and the two triggers that may
         # interrupt somebody have to pick their victim out of the same
@@ -751,6 +810,33 @@ class CommandExecutor:
         spec = self._facts.start_spec(plan_id)
         phase = spec.get("phase") if isinstance(spec, dict) else None
         return None if phase is None else str(phase)
+
+    def _refuse_unknown_plan(self, plan_id: str) -> Tuple[str, Optional[str]]:
+        """Refuse a plan the scheduler does not know.
+
+        Two situations, two answers.  A plan that has neither a
+        registration nor a directory is not there at all.  A plan whose
+        directory is on disk but whose row is not registered is an
+        **orphan**: something is there and the scheduler cannot see it,
+        and answering "no such plan" would send the operator looking
+        for a plan that is right there on the disk — with the material
+        that explains what happened sitting in the same directory.
+        """
+        if self._facts.plan_directory_exists(plan_id):
+            return NOT_FOUND, "plan directory exists but is not registered"
+        return NOT_FOUND, "no_such_plan"
+
+    def _import_failed_reason(self, plan_id: str) -> str:
+        """Return why the plan's import failed, in the import's own words.
+
+        A plan that is registered as ``import_failed`` but carries no
+        reason has still failed — the reason was simply not recorded.
+        The answer says so rather than trailing a colon into nothing.
+        """
+        reason = self._facts.import_failed_reason(plan_id)
+        if not reason:
+            return "no reason recorded"
+        return str(reason)
 
     def _is_running(self, plan_id: str) -> bool:
         """Return whether the plan is holding compute right now."""
