@@ -16,9 +16,9 @@ D2/D4 补回了表达方式（``full_ci`` / ``e2e``）与提示词。这个模�
 -----------------------------------
 :func:`detect_full_gate_entries` 只看**文件系统**：
 
-* **CI 总入口** —— ``scripts/ci_local.py`` / ``scripts/ci_prgate.py`` /
-  ``scripts/*nightly*`` / ``.github/workflows/nightly.yml`` /
-  ``.github/workflows/ci.yml``
+* **CI 总入口** —— ``scripts/ci_gate.sh`` / ``scripts/ci_local.py`` /
+  ``scripts/ci_prgate.py`` / ``scripts/*nightly*`` /
+  ``.github/workflows/nightly.yml`` / ``.github/workflows/ci.yml``
 * **全量 E2E 套件** —— ``playwright.config.*`` / ``cypress.config.*`` /
   ``tests/e2e/`` / ``e2e/``（项目根与一级子目录都看，that run's
   ``frontend-app/playwright.config.ts`` 就在一级子目录）
@@ -65,7 +65,15 @@ _SKIP_DIRS = frozenset({
 })
 
 #: CI 总入口的候选路径（相对项目根）。``*`` 段由 :func:`_glob_relative` 处理。
+#:
+#: **顺序有意义。** 缺口反馈只把**首个**命中的候选当推荐证据
+#: （``find_missing_gates`` 的 ``head = kind_entries[0]``），其余的当
+#: ``alternatives`` 附在后面。所以首项是"项目约定的适配脚本"时，提示里
+#: 指的就是那条真会被执行的入口 —— 2026-11-05（arch 决策点 1）把
+#: ``scripts/ci_gate.sh`` 提到首位就是因为它是本项目约定的适配脚本，而
+#: ``scripts/ci_local.py`` 不是。没有它的时候回落原有候选，顺序不变。
 _CI_ENTRY_PATTERNS = (
+    "scripts/ci_gate.sh",
     "scripts/ci_local.py",
     "scripts/ci_prgate.py",
     "scripts/*nightly*",

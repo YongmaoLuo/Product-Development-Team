@@ -477,12 +477,38 @@ def _write_scripted_llm(script_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _install_ci_adapter(project_dir: Path) -> Path:
+    """Give the checkout an executable CI adapter script.
+
+    The adapter is the project's own CI entry: exit 0 means green. The
+    import route only looks at the file and its execute bit, so a
+    one-line stub is enough here.
+
+    It is installed **before** the git commit below so the commit records
+    the execute bit (git tracks mode 100755 vs 100644) instead of leaving
+    the checked-out file without one.
+    """
+    scripts_dir = project_dir / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    adapter = scripts_dir / "ci_gate.sh"
+    adapter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    adapter.chmod(0o755)
+    return adapter
+
+
 def _make_checkout(work: Path) -> Path:
-    """A real git checkout for the imported plan's tasks to work on."""
+    """A real git checkout for the imported plan's tasks to work on.
+
+    It also carries an **executable** ``scripts/ci_gate.sh``: the import
+    route refuses a project that has no CI adapter (2026-11-05), so a
+    checkout without one would stop the story at step 1 — before the
+    lifecycle this file walks through ever starts.
+    """
     checkout = work / "checkout"
     (checkout / "backend").mkdir(parents=True, exist_ok=True)
     for name in ("chart.py", "reporting_view.py"):
         (checkout / "backend" / name).write_text("# placeholder\n", encoding="utf-8")
+    _install_ci_adapter(checkout)
     subprocess.run(["git", "init", "-q"], cwd=str(checkout), check=False)
     subprocess.run(["git", "-C", str(checkout), "add", "-A"], check=False)
     subprocess.run(

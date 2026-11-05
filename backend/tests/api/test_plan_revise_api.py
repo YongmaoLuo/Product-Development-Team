@@ -133,6 +133,21 @@ def no_probe(monkeypatch):
     monkeypatch.setenv("PDT_DISABLE_FALSIFIABILITY_PROBE", "1")
 
 
+def _install_ci_adapter(project_dir: Path) -> Path:
+    """Give the checkout an executable CI adapter script.
+
+    The adapter is the project's own CI entry: exit 0 means green. The
+    import route only looks at the file and its execute bit, so a
+    one-line stub is enough here.
+    """
+    scripts_dir = project_dir / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    adapter = scripts_dir / "ci_gate.sh"
+    adapter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    adapter.chmod(0o755)
+    return adapter
+
+
 @pytest.fixture
 def checkout(tmp_path):
     """A real directory for the tasks to target.
@@ -140,11 +155,17 @@ def checkout(tmp_path):
     ``harden_for_execution`` refuses a plan whose ``project_dir`` does not
     exist, and the route runs that gate — so a fixture that pointed at a
     made-up path would be testing the 400 branch on the happy path.
+
+    The checkout also carries an **executable** ``scripts/ci_gate.sh``:
+    the import route refuses a project that has no CI adapter
+    (2026-11-05), so a checkout without one would be testing the 422
+    branch instead of the revision this file is about.
     """
     path = tmp_path / "checkout"
     (path / "backend").mkdir(parents=True)
     for name in ("chart.py", "reporting_view.py", "loader.py", "a.py", "b.py"):
         (path / "backend" / name).write_text("# existing\n", encoding="utf-8")
+    _install_ci_adapter(path)
     return path
 
 

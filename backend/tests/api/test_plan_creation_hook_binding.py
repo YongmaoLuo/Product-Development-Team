@@ -110,11 +110,21 @@ def checkout(tmp_path):
     ``harden_for_execution`` refuses a plan whose ``project_dir`` does not
     exist, and the import route runs that gate — so a fixture pointing
     at a made-up path would be testing the 422 branch on the happy path.
+
+    The checkout also carries an executable ``scripts/ci_gate.sh``: the
+    import lane refuses a project that has no CI adapter (2026-11-05), so
+    a fixture without one would be testing the *refusal* branch on the
+    happy path.  The execute bit is set explicitly — a file without it
+    counts as "no adapter" just as much as a missing file does.
     """
     path = tmp_path / "checkout"
     (path / "backend").mkdir(parents=True)
     for name in ("chart.py", "reporting_view.py"):
         (path / "backend" / name).write_text("# existing\n", encoding="utf-8")
+    (path / "scripts").mkdir(parents=True, exist_ok=True)
+    adapter = path / "scripts" / "ci_gate.sh"
+    adapter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    adapter.chmod(0o755)
     return path
 
 

@@ -275,7 +275,9 @@ class TestValidateVpCompoundCommands:
             "bash -c 'cd backend && ./.venv/bin/python -m pytest "
             "state_machine/tests -q'"
         )
-        assert validate_vp(_vp(entry), project_dir=tmp_path) == []
+        assert validate_vp(
+            _vp(entry), project_dir=tmp_path, require_single_entry=False,
+        ) == []
 
     def test_missing_path_after_cd_is_still_an_issue(self, tmp_path):
         # Negative control: the ``cd`` must resolve the path, not turn the
@@ -287,7 +289,9 @@ class TestValidateVpCompoundCommands:
             "bash -c 'cd backend && ./.venv/bin/python -m pytest "
             "state_machine/tests -q'"
         )
-        issues = validate_vp(_vp(entry), project_dir=tmp_path)
+        issues = validate_vp(
+            _vp(entry), project_dir=tmp_path, require_single_entry=False,
+        )
         assert len(issues) == 1
         assert "backend/state_machine/tests" in issues[0].detail
         assert "不存在" in issues[0].detail
@@ -300,6 +304,7 @@ class TestValidateVpCompoundCommands:
         issues = validate_vp(
             _vp("bash -c 'cd backend && pytest state_machine/tests -q'"),
             project_dir=tmp_path,
+            require_single_entry=False,
         )
         assert any("backend/state_machine/tests" in i.detail for i in issues)
 
@@ -308,6 +313,7 @@ class TestValidateVpCompoundCommands:
         (tmp_path / "backend" / "scripts" / "run.sh").write_text("#!/bin/sh\n")
         assert validate_vp(
             _vp("cd backend && bash scripts/run.sh"), project_dir=tmp_path,
+            require_single_entry=False,
         ) == []
 
     def test_flags_urls_and_absolute_paths_are_still_skipped(self, tmp_path):
@@ -315,7 +321,9 @@ class TestValidateVpCompoundCommands:
             "bash -c 'cd backend && pytest -q --junit-xml=out/report.xml "
             "https://example.com/x /opt/bin/tool'"
         )
-        assert validate_vp(_vp(entry), project_dir=tmp_path) == []
+        assert validate_vp(
+            _vp(entry), project_dir=tmp_path, require_single_entry=False,
+        ) == []
 
     def test_run_ci_verification_runs_after_cd_resolution(self, tmp_path):
         backend = tmp_path / "backend"
