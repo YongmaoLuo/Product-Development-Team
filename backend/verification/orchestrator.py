@@ -461,6 +461,40 @@ OUT_OF_SCOPE_OPTIONS = ("skip_the_check", "bring_it_into_scope")
 #: default is to leave the plan alone.
 OUT_OF_SCOPE_DEFAULT_OPTION = "skip_the_check"
 
+#: The answers a terminal question offers.
+#:
+#: The chain's terminal branch stopped — the repair path could not get
+#: the plan further — and a human has to say what happens next.  The
+#: three answers are the three things that can happen to a stuck plan:
+#: try the round again from the start, close the plan out as failed
+#: without blocking anything, or turn the failure into manual repair
+#: tasks for someone to work through.
+TERMINAL_OPTIONS = (
+    "rerun_this_round",
+    "accept_as_failed",
+    "manual_repair_tasks",
+)
+
+#: The answer a terminal question falls back to when nobody replies.
+#:
+#: The conservative reading of a stopped chain: the plan does not
+#: finish successfully, but it also does not block on a question nobody
+#: is there to answer.  The round is recorded as failed and the run
+#: moves on.
+TERMINAL_DEFAULT_OPTION = "accept_as_failed"
+
+#: The marker that says "the point's own id is the point's id".
+#:
+#: :meth:`VerificationOrchestrator._ask_a_human_about` names the point a
+#: question is about through ``vp_id``, and by default that is the id of
+#: the point it was handed. A caller that asks about something that is
+#: **not** a point — the chain's terminal branch asks about the plan —
+#: passes ``vp_id=None`` instead. ``None`` is itself a legal value, so
+#: "no point" and "not given" cannot be told apart without a marker of
+#: their own; this is that marker, and it is the default so the two
+#: readings stay distinguishable.
+_VP_ID_FROM_POINT = object()
+
 
 #: The module logger.
 #:
@@ -1186,6 +1220,18 @@ def _attach_round_run_output(
 
 class VerificationOrchestrator:
     """Manages the verification loop and state transitions."""
+
+    #: This class's own copy of :data:`_VP_ID_FROM_POINT`.
+    #:
+    #: The module-level sentinel is what
+    #: :meth:`_ask_a_human_about` binds its ``vp_id`` argument to, but
+    #: the module can be reloaded — the test suite does exactly that —
+    #: and a reload rebinds the module global while a class imported
+    #: before it keeps the older sentinel as its default.  Comparing
+    #: against the class's own copy keeps the two in step: the default
+    #: and the thing it is compared with are always the same object,
+    #: whoever imported the class and whenever.
+    _VP_ID_FROM_POINT = _VP_ID_FROM_POINT
 
     def __init__(
         self,
@@ -2543,9 +2589,12 @@ class VerificationOrchestrator:
         return repairable, deferred
 
     def _ask_a_human_about(
-        self, vp: Dict[str, Any], failure_class: str, round_number: int,
+        self, vp=None, failure_class=None, round_number=0, *,
+        question=None, options=None, default_option=None,
+        vp_id=_VP_ID_FROM_POINT, check_open_question=True,
+        audit_event="verification_out_of_scope_decision_failed",
     ) -> str:
-        """Put an out-of-scope check to a human, and report the question.
+        """Put a check to a human, and report the question.
 
         The question is asked through :func:`hitl.service.create_decision`
         — the only writer of ``plan_decisions`` — so it lands in the
@@ -2557,6 +2606,42 @@ class VerificationOrchestrator:
         question is still open does not pile up questions nobody can
         answer.
 
+        The question itself is the caller's to write. Left alone, this
+        asks the out-of-scope question — the check asked for something
+        nobody scoped — with the two answers and the default the
+        operator already knows. A caller asking about something else
+        (the chain's terminal branch asks about the plan, not about one
+        point) supplies its own ``question`` / ``options`` /
+        ``default_option``.
+
+        Parameters
+        ----------
+        vp:
+            The verification point the question is about, when there is
+            one. Its ``id`` is the default for ``vp_id``.
+        failure_class:
+            The class of the failure that raised the question.
+        round_number:
+            Which round of the verification loop raised it.
+        question:
+            The question, in the words shown to the human. ``None``
+            asks the out-of-scope question.
+        options:
+            The answers on the table. ``None`` offers the out-of-scope
+            pair.
+        default_option:
+            The answer to fall back to when nobody replies. ``None``
+            falls back to :data:`OUT_OF_SCOPE_DEFAULT_OPTION`.
+        vp_id:
+            The point the question is about. The default takes it from
+            ``vp``; ``None`` says the question is not about a point.
+        check_open_question:
+            Whether an open question about the point suppresses a
+            second one. ``False`` asks regardless.
+        audit_event:
+            The audit event written when the question could not be
+            created.
+
         Returns:
             The decision id, or ``""`` when no question was asked (one
             was already open, or the question could not be created).
@@ -2565,25 +2650,47 @@ class VerificationOrchestrator:
         from hitl.service import create_decision
 
         plan_id = self.plan_dir.name
-        vp_id = str(vp.get("id") or "")
-        if self._open_decision_for(plan_id, vp_id):
+        point = vp or {}
+        # "The caller did not name a point" is read off the sentinel
+        # itself — the class's own copy first, so a class imported
+        # before the module was reloaded still recognises its own
+        # default, and the module's current copy second, so a caller
+        # that names the sentinel outright is understood too.
+        from_the_point = (
+            vp_id is self._VP_ID_FROM_POINT or vp_id is _VP_ID_FROM_POINT
+        )
+        resolved_vp_id = (
+            str(point.get("id") or "") if from_the_point else vp_id
+        )
+        if (
+            check_open_question
+            and resolved_vp_id
+            and self._open_decision_for(plan_id, resolved_vp_id)
+        ):
             return ""
 
         summary = str(
-            vp.get("actual_result_summary") or vp.get("evidence_summary") or ""
+            point.get("actual_result_summary") or point.get("evidence_summary") or ""
         )
+        if question is None:
+            question = (
+                f"the verification check {resolved_vp_id} asks for something this "
+                f"plan never scoped: {summary}"
+            )
+        if options is None:
+            options = list(OUT_OF_SCOPE_OPTIONS)
+        if default_option is None:
+            default_option = OUT_OF_SCOPE_DEFAULT_OPTION
+
         request = DecisionRequest(
             plan_id=plan_id,
             source=VERIFICATION_DECISION_SOURCE,
-            vp_id=vp_id,
+            vp_id=resolved_vp_id,
             failure_class=failure_class,
             round=round_number,
-            question=(
-                f"the verification check {vp_id} asks for something this "
-                f"plan never scoped: {summary}"
-            ),
-            options=list(OUT_OF_SCOPE_OPTIONS),
-            default_option=OUT_OF_SCOPE_DEFAULT_OPTION,
+            question=question,
+            options=list(options),
+            default_option=default_option,
         )
         try:
             decision = create_decision(request, self.plan_dir)
@@ -2591,13 +2698,14 @@ class VerificationOrchestrator:
             # A decision that could not be created must not take the
             # round down with it: the failure is still recorded, still
             # not repaired, and the operator sees why in the audit.
+            label = resolved_vp_id or f"round {round_number}"
             self._log_audit(
-                "verification_out_of_scope_decision_failed",
-                f"the out-of-scope question for {vp_id} could not be asked: "
+                audit_event,
+                f"the out-of-scope question for {label} could not be asked: "
                 f"{type(exc).__name__}: {exc}",
                 data={
                     "plan_id": plan_id,
-                    "vp_id": vp_id,
+                    "vp_id": resolved_vp_id,
                     "failure_class": failure_class,
                     "round": round_number,
                 },
@@ -2635,6 +2743,141 @@ class VerificationOrchestrator:
             and str(getattr(decision, "vp_id", "") or "") == vp_id
             for decision in decisions
         )
+
+    def _plan_has_terminal_decision(
+        self, plan_id: str, round_number: int,
+    ) -> bool:
+        """Whether this plan has already been asked what happens next.
+
+        The terminal question is about the **plan**, not about one point
+        (``vp_id=None``), so the point-keyed check
+        (:meth:`_open_decision_for`) cannot see it: with that check
+        alone, every entry into the terminal branch wrote a new row and
+        the person who answers it got the same question once per round.
+        The point-keyed check is not turned on for this question — it
+        would read every point-less question as one question and swallow
+        the ones that are not this one. This is the plan-level check
+        the terminal branch needs, and it looks for a question the
+        verification side asked **about the plan**: ``source ==
+        "verification"`` and no point attached.
+
+        A plan may not be asked again when
+
+        * the question is still **open** (``pending`` / ``paused``) —
+          somebody may still be answering it, and a second copy of the
+          same question is a second thing to answer; or
+        * the question was already recorded **for this round** — one
+          round asks the plan once, whatever became of the first one.
+
+        A question that was answered, or that fell back to its default,
+        is a question the plan already has the answer to: a later round
+        that walks the machine's road out again asks a new one. A
+        question that was ``unroutable`` is one nobody was ever asked
+        (``verification_loop._wait_for_open_verification_decisions``
+        calls it "one nobody was ever asked, and it blocks nothing"), so
+        a later round asks again — the same rule the point-keyed check
+        follows.
+        """
+        from hitl.models import DecisionStatus
+        from hitl.service import list_decisions
+
+        open_statuses = (
+            DecisionStatus.PENDING.value,
+            DecisionStatus.PAUSED.value,
+        )
+        try:
+            decisions = list_decisions(plan_id)
+        except Exception as exc:  # noqa: BLE001 — the store may be gone
+            self._log_audit(
+                "verification_terminal_decision_lookup_failed",
+                f"the plan's terminal questions could not be read: "
+                f"{type(exc).__name__}: {exc}",
+                data={"plan_id": plan_id, "round": round_number},
+            )
+            return False
+        for decision in decisions:
+            if str(getattr(decision, "source", "") or "") != (
+                VERIFICATION_DECISION_SOURCE
+            ):
+                continue
+            if str(getattr(decision, "vp_id", "") or ""):
+                # A question about a point is not this question.
+                continue
+            if str(getattr(decision, "status", "") or "") in open_statuses:
+                return True
+            decision_round = getattr(decision, "round", None)
+            if decision_round is None:
+                continue
+            try:
+                same_round = int(decision_round) == int(round_number)
+            except (TypeError, ValueError):
+                same_round = False
+            if same_round:
+                return True
+        return False
+
+    def _terminal_decision_question(
+        self, report, round_number, failed_vp_ids, repair_task_count=0,
+    ) -> Dict[str, Any]:
+        """The question the terminal branch puts to a human.
+
+        A terminal branch that cannot repair its way out stops and asks
+        a human how to proceed.  The question carries **facts**, not an
+        adjective: which round stopped, that it stopped for
+        ``repair_execution_failed``, how many repair tasks were
+        produced, and which verification points failed with which
+        verdict.  A human asked "the plan failed, what now?" cannot
+        answer without going and reading the report; a human asked this
+        can.
+
+        Parameters
+        ----------
+        report:
+            The verification report the round produced.  Read through
+            :meth:`_report_failure_entries`, so the same two result
+            lists the failed-id collection walks are the ones read here.
+        round_number:
+            Which round of the verification loop stopped.
+        failed_vp_ids:
+            The verification points that failed.
+        repair_task_count:
+            How many repair tasks the round produced.  The terminal
+            branch builds none by construction, so ``0`` is the factual
+            value and not a placeholder; the parameter exists so a
+            caller whose branch does produce tasks can pass the real
+            count.
+
+        Returns:
+            The question, the answers on the table and the answer to
+            fall back to — the three things
+            :meth:`_ask_a_human_about` takes.
+        """
+        verdicts: Dict[str, str] = {}
+        for entry in self._report_failure_entries(report):
+            vp_id = str(entry.get("id") or "")
+            if not vp_id:
+                continue
+            # ``_report_failure_entries`` 的契约是「最新在前」：top-level 结果
+            # 在前，上一轮快照在后。setdefault 保住第一份，别让旧快照覆盖
+            # 本轮已经给出的 verdict。
+            verdicts.setdefault(
+                vp_id,
+                str(entry.get("status") or entry.get("verdict") or "unknown"),
+            )
+        ordered = sorted({str(v) for v in failed_vp_ids})
+        reported = ", ".join(
+            f"{v}={verdicts.get(v, 'unknown')}" for v in ordered
+        ) or "none"
+        question = (
+            f"verification round {int(round_number)} stopped with "
+            f"repair_execution_failed: {int(repair_task_count)} repair task(s) "
+            f"were generated; failed checks: {reported}. Choose how to proceed."
+        )
+        return {
+            "question": question,
+            "options": list(TERMINAL_OPTIONS),
+            "default_option": TERMINAL_DEFAULT_OPTION,
+        }
 
     def _read_verification_plan(self) -> Optional[Dict[str, Any]]:
         """The verification plan file's payload — ``None`` when it cannot be read.
@@ -4140,6 +4383,65 @@ class VerificationOrchestrator:
         # to look at.
         if chain_decision["terminal"]:
             self._save_root_cause_chain(chain_decision["payload"])
+            # 2026-11-02: the machine's road on this point is walked out,
+            # so the round **asks** what happens next.  Until now the
+            # terminal branch only raised two flags
+            # (``needs_operator_decision`` / ``waiting_for_user``) and
+            # never asked anything: the human was told a hand was
+            # needed, with nothing on the table to decide on.
+            #
+            # The question carries facts, not an adjective — which round
+            # stopped, why, which points failed and with which verdict,
+            # how many repair tasks the round produced.  "The plan
+            # failed, what now?" cannot be answered without going to
+            # read the report; this one can.
+            #
+            # The question is about the **plan**, not about one point
+            # (``vp_id=None``): the person who decides what happens to
+            # the plan is not one point's owner.  ``check_open_question``
+            # is off because the check keys on a point's id, and this
+            # question names none.
+            terminal_failed_ids = sorted(
+                set(current_failed_ids)
+                | set(chain_decision.get("blocked") or [])
+            )
+            terminal_question = self._terminal_decision_question(
+                report, round_number, terminal_failed_ids,
+            )
+            # 2026-11-04: the plan is asked **once**. The question is
+            # about the plan, so the point-keyed check cannot see it,
+            # and without a plan-level check every entry into this
+            # branch wrote a new row: the person who answers it got the
+            # same question once per round. When the plan has already
+            # been asked — the question is still open, or this round
+            # already asked it — the round does not put a second copy
+            # in front of them.
+            #
+            # Only the **asking** is skipped. The phase call, the stop
+            # and the verdict below happen exactly as before: a plan
+            # that was asked already is still a plan that stops, and a
+            # plan that stops still says why.
+            if self._plan_has_terminal_decision(
+                self.plan_dir.name, round_number,
+            ):
+                self._log_audit(
+                    "verification_terminal_decision_already_asked",
+                    f"the plan was already asked what happens next — the "
+                    f"round {round_number} asks once",
+                    data={
+                        "plan_id": self.plan_dir.name,
+                        "round": round_number,
+                    },
+                )
+            else:
+                self._ask_a_human_about(
+                    round_number=round_number,
+                    question=terminal_question["question"],
+                    options=terminal_question["options"],
+                    default_option=terminal_question["default_option"],
+                    vp_id=None,
+                    check_open_question=False,
+                )
             self._safe_phase_call(
                 "verification_failed", "verification_failed",
             )
