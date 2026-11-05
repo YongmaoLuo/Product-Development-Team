@@ -34,6 +34,17 @@ The rule
   ``capacity.total``.  A failed write says so — the error's own text,
   in the action-result box — and never leaves the operator's rejected
   pick on screen as if it were the capacity in force.
+* **One exception to "the panel follows the server": a pick the
+  operator has not applied yet is not overwritten by the poll.**  The
+  panel polls every five seconds (``SCHEDULER_POLL_MS = 5000``), and a
+  poll that wrote the server's number into the select would wipe the
+  pick without a word: the operator would then press 「应用」 and write
+  the server's *old* number — the override that lands on the server is
+  then the server's number and not the one the operator picked.  So the
+  select carries a *pending* mark while the pick is unapplied,
+  ``renderSchedulerCapacity()`` leaves the control alone while the
+  mark is there, and the mark is cleared when the pick is applied (or
+  rejected) — after which the control follows the server again.
 * ``renderSchedulerCapacity()`` reads ``capacity.source`` and writes
   「(覆盖)」 when the number in force is the override; otherwise it
   writes nothing, so a configured capacity is never passed off as an
@@ -88,6 +99,13 @@ _OVERRIDE_TEXT = "(覆盖)"
 
 #: The body a reset carries.
 _RESET_BODY = '{"reset": true}'
+
+#: The dataset attribute that marks the select as holding a pick the
+#: operator has not applied yet.
+_PENDING_MARK = "dataset.pending"
+
+#: The value that mark carries while the pick is unapplied.
+_PENDING_VALUE = '"1"'
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +196,34 @@ def _element_children(html: str, element_id: str) -> str:
     end = rest.find(close)
     assert end != -1, f"element {element_id!r} is never closed"
     return rest[:end]
+
+
+def _guard_condition(body: str, needle: str) -> str | None:
+    """Return the innermost ``if`` condition that guards ``needle``.
+
+    The body is walked line by line and the conditions of the open
+    ``if`` blocks are kept on a stack; the condition on top of the
+    stack when the statement is met is the one that decides whether it
+    runs.
+
+    ``None`` means the statement is not guarded at all — it always
+    runs.  That is the thing the gate is after: an assignment that is
+    not guarded by the pending mark wipes the operator's pick on every
+    poll.
+    """
+    stack: list[str] = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("if") and "(" in stripped:
+            stack.append(stripped[stripped.index("(") + 1 : stripped.rindex(")") + 1])
+            continue
+        if stripped in ("}", "};"):
+            if stack:
+                stack.pop()
+            continue
+        if needle in stripped:
+            return stack[-1] if stack else None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -334,4 +380,113 @@ def test_capacity_control_buttons_are_bound() -> None:
     assert "schedulerApplyCapacity(" in body, (
         "init() never calls schedulerApplyCapacity(), so neither button "
         "can write anything."
+    )
+
+
+def test_capacity_pick_is_not_wiped_by_the_poll() -> None:
+    """The poll must not overwrite a pick that has not been applied.
+
+    ``renderSchedulerCapacity()`` runs on every poll — every five
+    seconds — and it fills the select from the server's
+    ``capacity.total``.  Unconditionally, that wipes the operator's
+    pick: the operator moves the select away from the number in force,
+    the poll arrives, the control shows the server's number again, and
+    pressing 「应用」 writes the server's number — the override on the
+    server is then not the number the operator picked.
+
+    So the assignment to ``select.value`` must be guarded by the
+    pending mark, and the mark must carry the value the guard tests
+    against.
+    """
+    body = _function_body(_source(_APP_JS), "renderSchedulerCapacity")
+
+    assert "select.value" in body, (
+        "renderSchedulerCapacity() never writes the select's value, so "
+        "the control cannot follow the server at all."
+    )
+
+    condition = _guard_condition(body, "select.value =")
+
+    assert condition is not None, (
+        "renderSchedulerCapacity() writes `select.value` without any "
+        "guard, so every five-second poll overwrites the operator's "
+        "unapplied pick and pressing 「应用」 writes the server's old "
+        "number."
+    )
+
+    assert _PENDING_MARK in condition, (
+        "the assignment to `select.value` is not guarded by the "
+        f"{_PENDING_MARK} mark. The operator's pick must survive the "
+        "poll until it is applied."
+    )
+
+    assert _PENDING_VALUE in body, (
+        f"the pending mark is never compared against {_PENDING_VALUE}. "
+        "The guard and the mark that sets it must agree on the value."
+    )
+
+
+def test_capacity_change_marks_the_pick_as_pending() -> None:
+    """Turning the select must set the pending mark.
+
+    Nothing else knows that the operator has moved the control: the
+    mark is what tells ``renderSchedulerCapacity()`` that the number
+    on screen is the operator's and not the server's.
+    """
+    body = _function_body(_source(_APP_JS), "init")
+
+    match = re.search(
+        r"safeBind\(\s*\"#" + _SELECT_ID + r"\"\s*,\s*\"change\"\s*,"
+        r"(?:(?!safeBind).)*?" + re.escape(_PENDING_MARK) + r"\s*=\s*"
+        + re.escape(_PENDING_VALUE),
+        body,
+        re.DOTALL,
+    )
+
+    assert match is not None, (
+        f"init() binds no \"change\" handler on `#{_SELECT_ID}` that sets "
+        f"{_PENDING_MARK}. Without the mark the poll cannot tell an "
+        "unapplied pick from the server's number."
+    )
+
+
+def test_capacity_apply_clears_the_pending_mark() -> None:
+    """Applying (or failing to apply) must clear the pending mark.
+
+    The mark means "the operator has a pick that has not been applied
+    yet".  Once the write is done the pick is settled — applied or
+    rejected — and the control must follow the server again; a mark
+    that outlived the write would freeze the control on a number the
+    server never accepted.
+    """
+    body = _function_body(_source(_APP_JS), "schedulerApplyCapacity")
+
+    assert _PENDING_MARK in body, (
+        "schedulerApplyCapacity() never mentions the pending mark, so "
+        "the control stays frozen on the pick after it was written (or "
+        "rejected) and stops following the server."
+    )
+
+    applied, separator, rejected = body.partition("catch (err)")
+    assert separator, (
+        "schedulerApplyCapacity() has no rejected path, so a failed "
+        "write cannot clear the pending mark."
+    )
+
+    clearing = r"delete\s+[\w.]*\." + re.escape(_PENDING_MARK)
+
+    assert re.search(clearing, applied), (
+        f"the applied path never deletes {_PENDING_MARK}; the control "
+        "would stay frozen on the pick that was written."
+    )
+
+    assert re.search(clearing, rejected), (
+        f"the rejected path never deletes {_PENDING_MARK}. The "
+        "operator's rejected pick must not stay on the control as if "
+        "it were the capacity in force."
+    )
+
+    assert applied.index(_CAPACITY_CALL) < re.search(clearing, applied).start(), (
+        "the pending mark is cleared before the write goes out, so the "
+        "poll may wipe the control while the write is still in flight."
     )

@@ -2108,9 +2108,19 @@ function schedulerToggle(el, visible) {
     are read out of one read model, so they cannot disagree.
 
     The control that changes the capacity follows the server as well:
-    the number in force is the server's, never the operator's
-    unfinished pick, and the word beside it says whether that number
-    is the operator's own override or the configured one. */
+    the number in force is the server's, and the word beside it says
+    whether that number is the operator's own override or the
+    configured one.
+
+    One exception, and it is the operator's right: a pick that has
+    **not** been applied yet is theirs, not the server's.  The panel
+    polls every five seconds, and a poll that overwrites the control
+    would wipe the pick without a word — the operator would then press
+    「应用」 and write the server's old number, so the override that
+    lands on the server is the server's number and not the one the
+    operator picked.  So the pending mark holds the control until the
+    pick is applied (or rejected), and the control follows the server
+    again after that. */
 function renderSchedulerCapacity(snapshot) {
     const capacity = (snapshot && snapshot.capacity) || {};
     const total = Number(capacity.total) || 0;
@@ -2162,7 +2172,16 @@ function renderSchedulerCapacity(snapshot) {
             option.textContent = value;
             select.appendChild(option);
         }
-        select.value = value;
+        // A pick the operator has not applied yet is **theirs**: the
+        // panel polls every five seconds, and a poll that overwrites
+        // the control would silently wipe the pick — the operator
+        // would then press 「应用」 and write the server's old number.
+        // The pending mark holds the control; the mark is cleared when
+        // the pick is applied (or rejected), and the control follows
+        // the server again after that.
+        if (select.dataset.pending !== "1") {
+            select.value = value;
+        }
     }
 }
 
@@ -2177,18 +2196,30 @@ function renderSchedulerCapacity(snapshot) {
     says what went wrong — the error's own text, in the action-result
     box — and puts the control back to the number that is really in
     force, so the operator's rejected pick is never mistaken for the
-    capacity the scheduler is running with. */
+    capacity the scheduler is running with.
+
+    Either way the pick is **settled** — applied or rejected — so the
+    pending mark is cleared here and the control follows the server
+    again.  Until then the mark keeps the poll from wiping the pick. */
 async function schedulerApplyCapacity(total) {
     const reset = total === null || total === undefined;
     const body = reset ? {"reset": true} : {total: total};
     try {
         const result = await api("/scheduler/capacity", {method: "POST", body: JSON.stringify(body)});
+        // The pick is settled: it is the server's number now, so the
+        // control stops holding it and follows the server again.
+        const select = $("#scheduler-capacity-select");
+        if (select) delete select.dataset.pending;
         await loadSchedulerState();
         return result;
     } catch (err) {
         // The pick failed: read the state again so the control is
         // filled from the server's number, and then say what went
-        // wrong.
+        // wrong.  The mark is cleared here too — the rejected pick
+        // must not stay on the control as if it were the capacity in
+        // force.
+        const select = $("#scheduler-capacity-select");
+        if (select) delete select.dataset.pending;
         await loadSchedulerState();
         renderSchedulerError(err);
         throw err;
@@ -3004,6 +3035,14 @@ function init() {
     safeBind("#btn-scheduler-back-home", "click", goHome);
     // The capacity knob: the picked number is written to the server,
     // and the reset puts the configured capacity back.
+    // A pick that has not been applied yet is the operator's: the
+    // mark tells renderSchedulerCapacity() to leave the control alone
+    // when the five-second poll comes round, so the pick is not
+    // silently wiped before 「应用」 is pressed.
+    safeBind("#scheduler-capacity-select", "change", (e) => {
+        const select = e.target;
+        if (select) select.dataset.pending = "1";
+    });
     safeBind("#scheduler-capacity-apply", "click", async () => {
         const select = $("#scheduler-capacity-select");
         const total = select ? Number(select.value) : NaN;

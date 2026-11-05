@@ -684,8 +684,13 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 该文件只有 f623224e 这一处改动（+95/-18），没有夹带别的改动。
     # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的范围、
     # sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-05：因「容量下拉框未应用的选择不被轮询抹掉」给该文件加了一层
+    # 「未应用的选择」状态（`select.dataset.pending` 的置位与清除、
+    # `renderSchedulerCapacity` 里受保护的 `select.value` 赋值），按本 gate 的既定流程
+    # 重新钉住该文件的哈希。这是「移动冻结」而不是「放松门禁」：断言强度、被钉文件的
+    # 范围与逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
     "frontend/app.js": (
-        "85077cadb0ec1439f3249260fdd4e1acdc18aaab0dc26b659faa0f2c0f026a4b"
+        "8a8e75bed55b7fb8150e8d533ab025639542ec5bbfaa5190db2bb9930c919d70"
     ),
     "frontend/style.css": (
         "0cab7b66dae8b5b693a9e8e4b5c4cda4f8651ae649512e81d8aa8c18a24f836b"
