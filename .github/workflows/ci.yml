@@ -1772,7 +1772,7 @@ jobs:
       # repository of tens of thousands, so one of them can sit far below
       # the floor while the union still reads above it — and the union
       # says nothing about WHICH module is the weak one.
-      # `root_cause_task.py` is the clearest case: a brand-new module that
+      # `verification/scan.py` is the clearest case: a brand-new module that
       # the whole-tree number never mentions.
       #
       # The measurement is the shards' union — the same combined data the
@@ -1815,7 +1815,7 @@ jobs:
       # enforces that direction mechanically; a floor that walks
       # downwards shows up as a diff on this file.
       #
-      # WHERE THE FLOORS ARE PINNED. The seven numbers below are
+      # WHERE THE FLOORS ARE PINNED. The numbers below are
       # mirrored in
       # `backend/tests/static_gates/test_new_kernel_coverage_targets.py`
       # as `NEW_KERNEL_COVERAGE_FLOORS`, and that file's
@@ -1832,7 +1832,6 @@ jobs:
           ./.venv/bin/python3 -m coverage report --include="verification/vp_removal_audit.py" --fail-under=69
           ./.venv/bin/python3 -m coverage report --include="context_pack.py" --fail-under=80
           ./.venv/bin/python3 -m coverage report --include="effect_report.py" --fail-under=72
-          ./.venv/bin/python3 -m coverage report --include="root_cause_task.py" --fail-under=55
 
       - name: Upload combined coverage report
         if: always()

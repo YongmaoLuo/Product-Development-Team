@@ -73,7 +73,6 @@ from repair_generator import (  # noqa: E402
     next_repair_seq_base,
     parse_repair_task_id,
 )
-from root_cause_task import build_root_cause_task  # noqa: E402
 from state_machine.db.connection import open as open_db  # noqa: E402
 from state_machine.repositories.plan_task_repository import (  # noqa: E402
     PlanTaskRepository,
@@ -373,40 +372,36 @@ def test_an_explicit_seq_still_wins():
 # ---------------------------------------------------------------------------
 
 
-def test_the_three_writers_share_one_counter():
-    """The base-drift task, the root-cause task and the repair batch
-    all allocate from the same pool.
+def test_the_two_writers_share_one_counter():
+    """The base-drift task and the repair batch allocate from the same
+    pool.
 
-    They are three different writers in three different modules.  If
-    each kept its own counter, two of them would eventually hand out the
-    same number and the plan would get two tasks under one id — which is
+    They are two different writers in two different modules.  If each
+    kept its own counter, they would eventually hand out the same
+    number and the plan would get two tasks under one id — which is
     the accident in its purest form.
 
+    (2026-11-06: there used to be a third writer — the root-cause
+    task of the deleted chain.  The chain is gone, so the pool now has
+    two writers, and the contract is the one that is left: one pool,
+    no id handed out twice.)
+
     The plan below already owns numbers 1…5 (``repair-01`` …
-    ``repair-05``).  The three writers are then given that same pool and
-    must take 6, 7 and 8 — in that order.
+    ``repair-05``).  The two writers are then given that same pool and
+    must take 6 and 7 — in that order.
     """
     existing = [f"repair-{n:02d}" for n in range(1, 6)]
 
     base_drift_task = _task(round_number=3, existing_task_ids=existing)
     assert base_drift_task["id"] == "repair-06", base_drift_task["id"]
 
-    root_cause = build_root_cause_task(
-        plan_id=PLAN_ID, vp_id="VP-003", round_no=3,
-        evidence={"command": "pytest tests/x.py", "error": "AssertionError"},
-        existing_task_ids=existing + [base_drift_task["id"]],
-    )
-    assert root_cause["id"] == "repair-07", root_cause["id"]
-
     batch = RepairTaskAssembler(
         round_number=3,
         failed_vps=[_vp("VP-009")],
         vp_test_commands={"VP-009": "pytest -q tests/test_vp.py"},
-        existing_task_ids=existing + [
-            base_drift_task["id"], root_cause["id"],
-        ],
+        existing_task_ids=existing + [base_drift_task["id"]],
     ).assemble(_contents("VP-009"))
-    assert [t["id"] for t in batch] == ["repair-08"], batch
+    assert [t["id"] for t in batch] == ["repair-07"], batch
 
 
 # ---------------------------------------------------------------------------

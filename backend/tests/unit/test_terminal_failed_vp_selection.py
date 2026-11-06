@@ -5,19 +5,15 @@ asks carries **the points that failed** — and a point that is not in
 that list is a point the human is not told about.  So the list has to
 be exactly the points that did not pass this round.
 
-Two sources feed that list, and both of them have carried points that
-passed:
+One source feeds that list — **the round's failed ids** —
+``_extract_failed_ids`` unions the top-level results with the last
+round's snapshot, and the snapshot is the *older* reading.  A point
+that failed last round and passed this round is still in the union.
 
-* **the chain's blocked points** — a point enters the chain at the
-  diagnosis stage and leaves the machine's road at the
-  ``MACHINE_EXHAUSTED`` stage (the stage it used to be named
-  ``BLOCKED_ON_USER``).  The stage it *reached* is remembered, so a
-  point that was blocked once and passed afterwards is still in the
-  blocked list;
-* **the round's failed ids** — ``_extract_failed_ids`` unions the
-  top-level results with the last round's snapshot, and the snapshot
-  is the *older* reading.  A point that failed last round and passed
-  this round is still in the union.
+(2026-11-06: the root-cause chain's blocked points used to be a
+second source.  The chain is deleted, so there is no second source:
+the round's own failed set is the whole list of what a human has to
+decide about.)
 
 The 2026-11-05 terminal decision is what this is about: its question
 read ``failed checks: VP-002=FAILED, VP-004=FAILED, VP-017=DEFERRED,
@@ -27,10 +23,7 @@ points that had **passed** were listed as failed.
 The rule this module pins down:
 
 * **The latest reading wins.**  A point whose newest entry says it
-  passed is not a failure, whichever source named it.
-* **Both sources go through the same gate.**  Filtering only the
-  blocked side would let a stale snapshot leak a passed point in
-  through the failed-ids side.
+  passed is not a failure, whoever named it.
 * **Three statuses are not failures**: ``PASSED``, ``SKIPPED`` and
   ``DEFERRED``.  Everything else is one — including ``SPLIT``, which
   the executor calls a terminal success but the failed-id collection
@@ -93,8 +86,7 @@ def test_only_failed_points_survive_a_mixed_report(orchestrator):
 
     ids = orchestrator._terminal_failed_vp_ids(
         report,
-        {"VP-001", "VP-002"},
-        ["VP-001", "VP-002", "VP-003"],
+        {"VP-001", "VP-002", "VP-003"},
     )
 
     assert ids == ["VP-001"]
@@ -111,10 +103,10 @@ def test_only_failed_points_survive_a_mixed_report(orchestrator):
     )
 
 
-def test_blocked_passed_point_is_excluded_from_question_and_failed_points(
+def test_passed_point_is_excluded_from_question_and_failed_points(
     orchestrator,
 ):
-    """A blocked point that has since passed is not in the failure list."""
+    """A point that has since passed is not in the failure list."""
     report = {
         "verification_results": [
             {"id": "VP-001", "status": "FAILED"},
@@ -123,7 +115,7 @@ def test_blocked_passed_point_is_excluded_from_question_and_failed_points(
     }
 
     ids = orchestrator._terminal_failed_vp_ids(
-        report, {"VP-001"}, ["VP-001", "VP-009"],
+        report, {"VP-001", "VP-009"},
     )
 
     assert "VP-009" not in ids
@@ -159,7 +151,7 @@ def test_stale_snapshot_failure_is_excluded(orchestrator):
     )
 
     ids = orchestrator._terminal_failed_vp_ids(
-        report, current_failed_ids, [],
+        report, current_failed_ids,
     )
 
     assert ids == []
@@ -174,8 +166,8 @@ def test_real_terminal_decision_regression(orchestrator):
     """The 2026-11-05 decision, as it was asked.
 
     Seven points: four failed, one deferred, two passed — and the
-    blocked list named all seven.  Only the four failures belong in the
-    question.
+    failed-id set named all seven.  Only the four failures belong in
+    the question.
     """
     report = {
         "verification_results": [
@@ -188,13 +180,10 @@ def test_real_terminal_decision_regression(orchestrator):
             {"id": "VP-023", "status": "FAILED"},
         ],
     }
-    blocked = [
-        "VP-002", "VP-004", "VP-017",
-        "VP-020", "VP-021", "VP-022", "VP-023",
-    ]
-
     ids = orchestrator._terminal_failed_vp_ids(
-        report, {"VP-002", "VP-004", "VP-022", "VP-023"}, blocked,
+        report,
+        {"VP-002", "VP-004", "VP-017",
+         "VP-020", "VP-021", "VP-022", "VP-023"},
     )
 
     assert ids == ["VP-002", "VP-004", "VP-022", "VP-023"]
@@ -212,7 +201,7 @@ def test_real_terminal_decision_regression(orchestrator):
     assert "VP-021" not in question, "a passed point was listed as failed"
 
 
-def test_blocked_point_missing_from_report_is_kept(orchestrator):
+def test_point_missing_from_report_is_kept(orchestrator):
     """A point the report says nothing about is kept."""
     report = {
         "verification_results": [
@@ -221,7 +210,7 @@ def test_blocked_point_missing_from_report_is_kept(orchestrator):
     }
 
     ids = orchestrator._terminal_failed_vp_ids(
-        report, {"VP-001"}, ["VP-001", "VP-777"],
+        report, {"VP-001", "VP-777"},
     )
 
     assert ids == ["VP-001", "VP-777"], (
@@ -239,7 +228,7 @@ def test_verdict_field_counts_as_status(orchestrator):
     }
 
     ids = orchestrator._terminal_failed_vp_ids(
-        report, {"VP-9", "VP-10"}, ["VP-9", "VP-10"],
+        report, {"VP-9", "VP-10"},
     )
 
     assert ids == [], (
@@ -257,7 +246,7 @@ def test_skipped_point_is_not_a_failure(orchestrator):
     }
 
     ids = orchestrator._terminal_failed_vp_ids(
-        report, {"VP-005"}, ["VP-005"],
+        report, {"VP-005"},
     )
 
     assert ids == []

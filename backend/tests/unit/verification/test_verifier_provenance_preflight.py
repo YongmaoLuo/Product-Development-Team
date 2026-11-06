@@ -13,8 +13,13 @@
    （负控：这正是 2026-11-05 那种静默重复失败）；
 2. **被测树就是框架仓、评分器确实来自被测树** → 没有 issue；
 3. **被测树不是框架仓** → 没有 issue（用 harness 副本是设计，不是事故）；
-4. 预检的结论**随预检决策一起走**（``_root_cause_preflight`` 的返回值里
-   带着它），所以它不会在决策被丢掉的时候一起消失。
+4. 预检的结论**在轮次开工那一刻就写进计划的 audit**
+   （``start_verification_cycle`` 的第一步），所以它不会在别的东西被丢掉
+   的时候一起消失。
+
+   2026-11-06：出处预检原本挂在根因链的 preflight 上。链被删了，查被
+   搬到 ``start_verification_cycle`` 的开头 —— 它跟链无关，它回答的是
+   "这一轮会被哪份评分器判"。
 
 测试命令::
 
@@ -23,6 +28,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -148,19 +154,74 @@ def test_a_plain_project_raises_nothing(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 4. 结论随预检决策一起走
+# 4. 结论在轮次开工时落到 audit（生产入口）
 # ---------------------------------------------------------------------------
-def test_the_preflight_decision_carries_the_provenance(tmp_path):
-    """出处结论在 ``_root_cause_preflight`` 的返回值里 —— 不会随决策丢掉。"""
+def test_the_round_start_writes_the_provenance_mismatch_to_the_audit(
+    tmp_path,
+):
+    """轮次开工 → 出处对不上 → 计划的 audit 里有那一条。
+
+    走的是**生产入口** ``start_verification_cycle``：出处预检是轮次的
+    第一步，它的问题「这一轮会被哪份评分器判」在轮次真正跑起来之前就
+    问掉了，而答案落在计划的 audit 里 —— 不是落在某个会被丢掉的东西上。
+    """
+    from unittest.mock import Mock
+
+    from verification_persistence import AUDIT_LOG_FILENAME
+
     project = tmp_path / "worktree"
     _framework_checkout(project, source=_BROKEN_RUNNER_SOURCE)
-    orch = _orchestrator(_plan_dir(tmp_path), project)
+    plan = _plan_dir(tmp_path)
+    # The plan's state: the round has to be able to start (the phases
+    # have to be legal) for the test to be about the provenance and not
+    # about the phase machine.
+    (plan / "plan_state.json").write_text(
+        json.dumps({
+            "plan_id": plan.name,
+            "current_phase": "executing",
+            "completed_phases": ["execution"],
+            "review_rounds": {"prd": 0, "arch": 0, "test": 0},
+            "flags": {},
+            "verification": {
+                "status": "pending",
+                "round": 0,
+                "max_rounds": 3,
+                "stop_reason": None,
+            },
+        }),
+        encoding="utf-8",
+    )
+    orch = VerificationOrchestrator(
+        plan_dir=plan, project_dir=project, coding_tool=Mock(),
+    )
+    orch.verification_agent = Mock()
+    orch.verification_agent.run_full_verification.return_value = {
+        "overall_status": "PASSED",
+        "verification_results": [],
+        "requirement_deviations": [],
+    }
 
-    decision = orch._root_cause_preflight(round_number=3)
+    orch.start_verification_cycle(round_number=1)
 
-    assert "verifier_provenance" in decision
-    provenance = decision["verifier_provenance"]
-    assert provenance["issues"], "预检决策里必须带着那条响亮的信号"
+    audit = plan / "logs" / AUDIT_LOG_FILENAME
+    assert audit.exists(), (
+        f"轮次开工必须把出处结论写进 audit，{audit} 不存在"
+    )
+    entries = [
+        json.loads(line)
+        for line in audit.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    mismatches = [
+        entry for entry in entries
+        if entry.get("event_type") == "verifier_provenance_mismatch"
+    ]
+    assert mismatches, (
+        f"audit 里必须有出处对不上的那一条，实际是 {entries!r}"
+    )
+    data = mismatches[0].get("data") or {}
+    assert data.get("issues"), "那一条必须带着响亮的信号"
+    assert data.get("resolution") == RESOLUTION_HARNESS
 
 
 # ---------------------------------------------------------------------------

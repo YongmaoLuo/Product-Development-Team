@@ -14,7 +14,7 @@
 | --- | --- | --- | --- |
 | AC-1 | A1′ 判定：每次进入 verification 对全部活动 VP 各产生一次判定，批量模型调用次数 ≤1，判定抛异常时一律判保留。 | `backend/tests/unit/verification/test_strictness_invariants.py`、`backend/tests/unit/verification/test_topic_relevance.py`、`backend/tests/unit/verification/test_normalization_properties.py` | PENDING(operator) |
 | AC-2 | A1′ 删除：每条删除都有完整审计记录，只有归档成功才移除该 VP，已分配的编号只增不减、已删编号永不复用。 | `backend/tests/integration/verification_chain/test_vp_removal_audit.py`、`backend/tests/unit/test_vp_removal_audit_is_append_only.py`、`backend/tests/static_gates/test_removal_audit_has_no_truncate_path.py`、`backend/tests/integration/verification_chain/test_vp_id_ledger.py`、`backend/tests/integration/verification_chain/test_storage_path_equivalence.py`、`backend/tests/static_gates/test_removal_exemption_wording.py` | PENDING(operator) |
-| AC-3 | A2：根因演进时恰生成一个根因任务、至多一个实现任务，再失败则转人工，轮次上限与停止原因的语义保持不变。 | `backend/tests/integration/verification_chain/test_root_cause_task_flow.py`、`backend/tests/unit/verification/test_root_cause_task_build.py`、`backend/tests/integration/verification_chain/test_round_payload_migration.py`、`backend/tests/unit/verification/test_failure_fingerprint.py`、`backend/tests/unit/verification/test_failure_fingerprint_golden.py`、`backend/tests/unit/verification/test_root_cause_decision.py`、`backend/tests/integration/verification_chain/test_runner_outcomes.py`、`backend/tests/integration/verification_chain/test_zero_llm_on_deterministic_path.py` | PENDING(operator) |
+| AC-3 | A2：不再有根因链 —— 验证点失败就走普通修复任务，同一个原因最多修两轮，第三次同因失败就停下并转人工，而失败指纹的语义保持不变。 | `backend/tests/unit/verification/test_terminal_decision_on_stop.py`、`backend/tests/integration/verification_chain/test_terminal_operator_decision.py`、`backend/tests/integration/verification_chain/test_round_payload_migration.py`、`backend/tests/unit/test_terminal_cpea_archive.py`、`backend/tests/unit/test_terminal_failed_vp_selection.py`、`backend/tests/unit/verification/test_failure_fingerprint.py`、`backend/tests/unit/verification/test_failure_fingerprint_golden.py`、`backend/tests/integration/verification_chain/test_runner_outcomes.py`、`backend/tests/integration/verification_chain/test_zero_llm_on_deterministic_path.py` | PENDING(operator) |
 | AC-4 | A4：扫描报告可复跑且数字自洽，确定性 VP 执行时不产生任何模型会话。 | `backend/tests/e2e/verification/test_scan_and_effect_report_cli.py`、`backend/tests/integration/verification_chain/test_scan_report_artifact.py`、`backend/tests/unit/verification/test_scan.py`、`backend/tests/unit/verification/test_dispatch_table.py`、`backend/tests/e2e/verification/test_deterministic_plan_flow.py`、`backend/tests/integration/verification_chain/test_run_pipeline_order.py` | PENDING(operator) |
 | AC-5 | A5：上下文包字段精确等于白名单，每轮一个新文件，brief 只按路径引用它，包内零凭据。 | `backend/tests/unit/test_context_pack_schema.py`、`backend/tests/unit/test_context_pack_path_safety.py`、`backend/tests/static_gates/test_brief_references_context_pack.py`、`backend/tests/integration/test_context_pack_reduces_exploration.py` | PENDING(operator) |
 | AC-6 | A9：验证会话都带 vp_id 与 round，并行跑的两个验证互相看不到对方的归因，未归因占比是一个读者能算出来的数。 | `backend/tests/integration/verification_chain/test_attribution_isolation.py`、`backend/tests/unit/test_usage_registry_attribution.py`、`backend/tests/unit/test_plan_usage_report.py`、`backend/tests/e2e/verification/test_effect_report_contract.py`、`backend/tests/unit/verification/test_effect_report_window.py`、`backend/tests/static_gates/test_effect_report_metrics_frozen.py` | PENDING(operator) |
@@ -35,7 +35,7 @@
 | --- | --- | --- |
 | AC-1 | 主题相关性两级判定 | `backend/verification/topic_relevance.py` |
 | AC-2 | 主题外删除审计与编号账本 | `backend/verification/vp_removal_audit.py` |
-| AC-3 | 失败指纹与根因任务 | `backend/verification/failure_fingerprint.py`、`backend/root_cause_task.py` |
+| AC-3 | 失败指纹与同因修复预算 | `backend/verification/failure_fingerprint.py`、`backend/verification/orchestrator.py` |
 | AC-4 | 扫描与派发表 | `backend/verification/scan.py` |
 | AC-5 | 每轮只读上下文包 | `backend/context_pack.py` |
 | AC-6 | usage 归因（vp_id / round） | `backend/verification_executor.py`、`backend/verification_subagent.py` |
@@ -58,10 +58,10 @@ cd backend && .venv/bin/python3 -m pytest tests/unit/verification/test_strictnes
 cd backend && .venv/bin/python3 -m pytest tests/integration/verification_chain/test_vp_removal_audit.py tests/unit/test_vp_removal_audit_is_append_only.py tests/static_gates/test_removal_audit_has_no_truncate_path.py tests/integration/verification_chain/test_vp_id_ledger.py tests/integration/verification_chain/test_storage_path_equivalence.py tests/static_gates/test_removal_exemption_wording.py -q -n 4
 ```
 
-### AC-3 — 根因
+### AC-3 — 修复预算与人
 
 ```bash
-cd backend && .venv/bin/python3 -m pytest tests/integration/verification_chain/test_root_cause_task_flow.py tests/unit/verification/test_root_cause_task_build.py tests/integration/verification_chain/test_round_payload_migration.py tests/unit/verification/test_failure_fingerprint.py tests/unit/verification/test_failure_fingerprint_golden.py tests/unit/verification/test_root_cause_decision.py tests/integration/verification_chain/test_runner_outcomes.py tests/integration/verification_chain/test_zero_llm_on_deterministic_path.py -q -n 4
+cd backend && .venv/bin/python3 -m pytest tests/unit/verification/test_terminal_decision_on_stop.py tests/integration/verification_chain/test_terminal_operator_decision.py tests/integration/verification_chain/test_round_payload_migration.py tests/unit/test_terminal_cpea_archive.py tests/unit/test_terminal_failed_vp_selection.py tests/unit/verification/test_failure_fingerprint.py tests/unit/verification/test_failure_fingerprint_golden.py tests/integration/verification_chain/test_runner_outcomes.py tests/integration/verification_chain/test_zero_llm_on_deterministic_path.py -q -n 4
 ```
 
 ### AC-4 — 扫描
