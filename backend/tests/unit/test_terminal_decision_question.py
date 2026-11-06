@@ -61,7 +61,7 @@ _ANALYSIS = {
     "context": "第 2 轮终局停止",
     "problem": "修复链没有可用的下一步",
     "evidence": ["VP-3 连续 3 轮失败"],
-    "recommendation": "manual_repair_tasks",
+    "recommendation": "revise_criterion",
     "recommendation_reason": "重跑不会改变同一失败",
     "uncertainty": "无法判断是否环境问题",
 }
@@ -149,11 +149,10 @@ def test_question_carries_round_stop_reason_verdicts_and_count(orchestrator):
     assert "VP-4=FAILED" in question
     assert payload["options"] == [
         "rerun_this_round",
-        "accept_as_failed",
-        "manual_repair_tasks",
+        "revise_criterion",
     ]
     assert payload["options"] == list(TERMINAL_OPTIONS)
-    assert payload["default_option"] == "accept_as_failed"
+    assert payload["default_option"] == "rerun_this_round"
     assert payload["default_option"] == TERMINAL_DEFAULT_OPTION
 
 
@@ -261,6 +260,6 @@ def test_recommendation_never_changes_default_option(analysis_orchestrator):
     )
 
     assert "rerun_this_round" in payload["question"]
-    assert payload["default_option"] == "accept_as_failed"
+    assert payload["default_option"] == "rerun_this_round"
     assert payload["default_option"] == TERMINAL_DEFAULT_OPTION
     assert payload["options"] == list(TERMINAL_OPTIONS)

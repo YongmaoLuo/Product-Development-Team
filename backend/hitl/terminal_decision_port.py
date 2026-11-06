@@ -12,46 +12,57 @@ This module is the other half of that contract: a thin, mechanical
 adapter that carries each of those calls to the thing that already
 knows how to do it.
 
-What the three actions call
----------------------------
+What the actions call
+---------------------
 
 ==================  ==========================================================
 ``reset``           :func:`routes.verification.reset_verification`, with a
-                     ``clear_artifacts`` request
+                     ``clear_artifacts`` request and
+                     ``clear_root_cause_chain=True`` — a round that
+                     restarts with the chain still hanging on it walks
+                     straight back into the terminal branch
 ``start``           :func:`routes.verification.start_verification`
 ``close_as_failed`` :meth:`plan_state.PlanState.transition_to` — the
-                     ``failed`` phase
+                     ``failed`` phase (retired option; still resolved)
 ==================  ==========================================================
 
-The fourth door: free text
---------------------------
-The three actions above are what a human *picks*.  A human can also
-write free text instead, and then nobody knows what they meant — so
-the **analysis agent** reads it, in the conversation it already had
-about the failure.
+The door: revise the criterion
+------------------------------
+*Revise the criterion* is the answer that says "the criterion is
+wrong, not the deliverable" — the round's failed points are marked
+**obsolete** and the round carries on without them.  The new criterion
+is written by the operator **outside** the framework (a new plan, or a
+delta of their own); this door does not invent verification points.
 
-That conversation has an id.  The analysis call recorded the session
-its answer came out of, and the sidecar keeps that id next to the
-analysis.  So :meth:`DefaultTerminalDecisionPort.resume_agent`
-re-opens that session by id.  When there is no id to re-open, it opens
-a fresh one and puts the **whole analysis context** into the prompt,
-so the new conversation starts from the same facts the old one had.
+It closes in the shape the rest of the chain already speaks:
 
-The port does not decide what the agent's answer means — it only
-carries the call out.  The vocabulary of "what happens next" belongs to
-the orchestrator, and this file stays out of it.
+* the sidecar record's ``failed_points`` become the ids to obsolete
+  (:func:`failed_vps_from_record`);
+* the ids go through the **existing delta machinery**
+  (:func:`verification_plan_delta.apply_delta_persisted`) — the plan
+  file is rewritten by the same code that rewrites it for a
+  criterion replacement, so the obsoleting keeps the same audit trail
+  and the same atomic write.  Nothing here hand-writes the plan file;
+* the obsoleted points are then removed from the **root-cause chain**
+  (:func:`verification.orchestrator.load_root_cause_chain` /
+  :func:`verification.orchestrator.save_root_cause_chain`) — the same
+  ledger the orchestrator reads, written by the same functions, so the
+  two cannot disagree about its shape.
 
-The fifth door: generate repair tasks
--------------------------------------
-*Generate repair tasks* is the answer that says "the deliverable is
-wrong, go and fix it" — and it is the one answer that used to have a
-name and no implementation.  The executor called
-``port.generate_repair_tasks(...)`` and nothing happened, so a plan
-whose round had stopped sat in ``verification_failed`` with nobody
-working on it.
+**Nothing obsoleted means nothing happened.**  If the delta refuses —
+the point is not in the plan, or the write fails — this method raises
+with the reason, and
+:func:`hitl.terminal_execution.execute_terminal_decision` is what
+records it in the audit (arch decision point 5).  A silent success
+would leave the human believing the criterion was revised when the
+plan still carries it.
 
-This module closes that door, and it closes it in the shape the rest of
-the chain already speaks:
+The retired door: generate repair tasks
+---------------------------------------
+*Generate repair tasks* used to be the answer that says "the
+deliverable is wrong, go and fix it".  It is retired from the menu
+(2026-11-06), but a decision recorded before that day still names it,
+so the door stays open:
 
 * the sidecar record's ``failed_points`` become **failed-VP records**
   (:func:`failed_vps_from_record`) — the shape
@@ -102,14 +113,13 @@ supplies its own resolver instead.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 __all__ = [
-    "AGENT_SYSTEM_PROMPT",
-    "AGENT_TIMEOUT_SECONDS",
     "DefaultTerminalDecisionPort",
     "default_port",
     "failed_vps_from_record",
@@ -134,152 +144,6 @@ def _default_plan_dir_of(plan_id: str) -> Any:
 
     return _server._plan_dir(plan_id)
 
-
-# ---------------------------------------------------------------------------
-# The agent's constants
-# ---------------------------------------------------------------------------
-
-#: The system instruction the resumed analysis call runs under.
-#:
-#: The agent that reads a human's free text is the *same* agent that
-#: read the failure scene: it is the conversation that gets re-opened,
-#: so the instruction is the analysis instruction with the human's
-#: words added to it.  What it is **not** given is a vocabulary of
-#: actions — that belongs to the orchestrator, and this port stays out
-#: of it.  The agent says what it read and what it would do; somebody
-#: else decides whether that happens.
-_AGENT_SYSTEM_PROMPT = (
-    "你是验证轮的分析 agent。上一轮验证停下来问人怎么走，人用自由文本回答了。"
-    "你之前已经和这个场景打过一次交道；现在轮到你读人的自由文本，"
-    "解释人想要什么、你接下来要做什么。\n\n"
-    "NO TOOLS. 你没有任何工具：不读写文件、不执行命令、不访问网络。"
-    "你唯一的输入是 prompt 里给出的内容，唯一的工作是解释它。\n\n"
-    "HARD RULES — 违反任何一条，这个回答会被丢弃：\n"
-    "1. DO NOT FABRICATE. 不许编造事实。prompt 没有给出的失败原因、"
-    "代码、日志都不许当成确定结论；证据不足就在 uncertainty 里说清楚。\n"
-    "2. 只解释，不动手。你不重跑、不改动任何东西、不做任何操作；"
-    "你只负责把人的意思和要做的事说清楚，动手是别的环节的事。\n"
-    "3. 全部用中文回答。字段名（interpretation / next_step / reasoning / "
-    "uncertainty）保持英文原样，其余内容一律中文。\n"
-    "4. 只输出 JSON，不要输出解释性文字，不要用 markdown 代码块包裹。"
-    "四个字段一个都不许少。"
-)
-
-#: How long one resumed analysis call may take.
-_AGENT_TIMEOUT_SECONDS = 300
-
-
-# ---------------------------------------------------------------------------
-# The agent's prompt
-# ---------------------------------------------------------------------------
-
-
-def _json_text(value: Any) -> str:
-    """Render ``value`` as JSON text; never raises.
-
-    The text is the *original* — no re-shaping, no summarising — so
-    that what the agent reads is what was recorded.  A value that
-    cannot be serialised is rendered with ``str`` instead: the prompt
-    is a rendering of what was given, and a value that cannot be shown
-    must not take the whole call down with it.
-    """
-    try:
-        return json.dumps(value, ensure_ascii=False)
-    except (TypeError, ValueError):
-        return str(value)
-
-
-def _record_session_id(record: Any) -> Optional[str]:
-    """The session id the record carries, or ``None``.
-
-    Only a non-empty string counts.  An id that is ``None``, an empty
-    string or whitespace names no session, and re-opening "no session"
-    is the same as opening a new one.
-    """
-    if not isinstance(record, Mapping):
-        return None
-    value = record.get("session_id")
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
-
-
-def _agent_prompt(plan_id: str, record: Any, note: str) -> str:
-    """Render the prompt for the resumed analysis call.
-
-    The prompt carries three things, in this order:
-
-    * **the session state** — whether the recorded analysis session is
-      being re-opened, or whether a new one is being started because
-      there was no id to re-open;
-    * **the human's own words** — verbatim, or a placeholder when the
-      human wrote nothing;
-    * **the analysis context** — the analysis and the failed points, in
-      full.
-
-    The context is in the prompt even when the session already holds
-    it, because the degraded path — no id to re-open — is exactly the
-    path where the prompt is the *only* copy of it.  Rendering it
-    always means the two paths say the same thing to the agent.
-
-    Nothing here raises: a missing record is not an error, it is a
-    round whose analysis was never recorded, and the prompt says so.
-    """
-    record_map = record if isinstance(record, Mapping) else {}
-    session_id = _record_session_id(record_map)
-    analysis = record_map.get("analysis")
-    failed_points = record_map.get("failed_points")
-
-    if isinstance(note, str):
-        words = note.strip()
-    elif note is None:
-        words = ""
-    else:
-        words = str(note).strip()
-
-    parts: List[str] = [
-        "# 终局自由文本续跑请求",
-        "",
-        "## 会话状态",
-        "",
-        f"- plan_id: {plan_id}",
-    ]
-    if session_id:
-        parts.append(
-            f"- 分析会话：已续跑记录里的分析会话（session id: {session_id}）"
-        )
-    else:
-        parts.append(
-            "- 分析会话：没有可续跑的分析会话（记录里没有 session id），"
-            "已开启新会话"
-        )
-        parts.append(
-            "- 原会话的分析上下文不可用（没有 session id 可续跑），"
-            "下面的分析上下文以全文形式带入。"
-        )
-
-    parts.extend(["", "## 人工的自由文本回答", ""])
-    if words:
-        parts.append(words)
-    else:
-        parts.append(
-            "（人工没有填写自由文本；请只依据下面的分析上下文判断，"
-            "并把不确定的地方说清楚。）"
-        )
-
-    parts.extend(["", "## 分析上下文", ""])
-    if analysis:
-        parts.append(_json_text(analysis))
-    else:
-        parts.append("分析上下文不可用：没有留下任何分析记录。")
-
-    parts.extend(["", "## 失败验证点", ""])
-    if failed_points:
-        parts.append(_json_text(failed_points))
-    else:
-        parts.append("(没有失败验证点记录)")
-
-    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -436,23 +300,19 @@ def _default_write_tasks(plan_id: str, rows: List[Dict[str, Any]]) -> None:
 
 
 class DefaultTerminalDecisionPort:
-    """The mechanical port: three actions, three calls, no engine.
+    """The mechanical port: a few actions, a few calls, no engine.
 
     Every method takes the plan id and nothing else, so the port can be
     handed to :func:`hitl.terminal_execution.execute_terminal_decision`
     as-is.
 
-    The fourth door — the free-text one — is here too: it re-opens the
-    analysis session the human's words belong to, and degrades to a
-    fresh session with the whole analysis context when there is no
-    session to re-open.  It carries the call out and nothing more.
+    The doors are the ones the terminal menu names: reset the round and
+    start it again, obsolete the round's failed points and start it
+    again, and — for a decision recorded before the menu changed —
+    close the plan as failed or queue repair tasks.  The free-text door
+    is gone: a human who writes something the menu does not offer does
+    it outside the framework.
     """
-
-    #: The system instruction the resumed analysis call runs under.
-    AGENT_SYSTEM_PROMPT = _AGENT_SYSTEM_PROMPT
-
-    #: How long one resumed analysis call may take.
-    AGENT_TIMEOUT_SECONDS = _AGENT_TIMEOUT_SECONDS
 
     def __init__(
         self,
@@ -466,7 +326,7 @@ class DefaultTerminalDecisionPort:
 
         ``plan_dir_of`` maps a plan id to the plan's directory; the
         default asks ``server._plan_dir``.  ``coding_tool`` is the tool
-        the free-text path calls; without one the port builds a
+        the repair path calls; without one the port builds a
         :class:`coding_tool.ClaudeCodingTool` on the ``verification``
         scene when it is first needed.
 
@@ -501,7 +361,7 @@ class DefaultTerminalDecisionPort:
 
     @property
     def coding_tool(self) -> Any:
-        """The tool the free-text path calls — built on first use when absent.
+        """The tool the repair path calls — built on first use when absent.
 
         Built on first use, not in the constructor: a port that only
         ever resets and starts a plan must not build a provider nobody
@@ -513,21 +373,39 @@ class DefaultTerminalDecisionPort:
             self._coding_tool = ClaudeCodingTool(scene="verification")
         return self._coding_tool
 
-    # -- the three actions ---------------------------------------------
+    # -- the actions -----------------------------------------------------
 
-    def reset(self, plan_id: str, *, clear_artifacts: bool = True) -> Any:
+    def reset(
+        self,
+        plan_id: str,
+        *,
+        clear_artifacts: bool = True,
+        clear_root_cause_chain: bool = True,
+    ) -> Any:
         """Reset the round's state so it can run again.
 
         The round is cleared by the route that owns the reset procedure,
         with ``clear_artifacts`` saying whether the round's disk outputs
         go with it.  The flag is handed over unchanged — whether a stale
         artefact survives is not this port's decision to make.
+
+        ``clear_root_cause_chain`` is **on** here, and that is the whole
+        point of the *rerun this round* answer: the chain is the ledger
+        that says which points are still standing between the plan and
+        the human, and a round that restarts with the chain still
+        hanging on it walks straight back into the terminal branch —
+        the very state the human asked to get out of.  The chain's
+        clearing is a decision, so the route's own default (off) is not
+        what this path uses.
         """
         import server as _server
 
         from routes.verification import reset_verification
 
-        request = _server.ResetVerificationRequest(clear_artifacts=clear_artifacts)
+        request = _server.ResetVerificationRequest(
+            clear_artifacts=clear_artifacts,
+            clear_root_cause_chain=clear_root_cause_chain,
+        )
         return reset_verification(plan_id, request)
 
     def start(self, plan_id: str) -> Any:
@@ -682,81 +560,147 @@ class DefaultTerminalDecisionPort:
         self._task_writer(plan_id, rows)
         return len(rows)
 
-    # -- the free-text path ---------------------------------------------
+    # -- the criterion door ----------------------------------------------
 
-    def _agent_prompt(self, plan_id: str, record: Any, note: str) -> str:
-        """The prompt for the resumed analysis call.
+    def revise_criterion(self, plan_id: str, record: Any = None) -> int:
+        """Obsolete the round's failed points; return how many.
 
-        A thin door into the module-level renderer, so the rendering can
-        be read — and exercised — without a port in hand.
+        This is the *revise the criterion* answer, carried out:
+
+        1. the record's failed points become the ids to obsolete
+           (:func:`failed_vps_from_record`);
+        2. the ids go through the **existing delta machinery**
+           (:func:`verification_plan_delta.apply_delta_persisted`) — the
+           plan file is rewritten by the same code that rewrites it for
+           a criterion replacement, so the obsoleting keeps the same
+           audit trail (``obsolete`` / ``obsolete_reason`` /
+           ``obsoleted_round``) and the same atomic write.  The plan
+           file is **not** hand-written here;
+        3. the obsoleted points are removed from the **root-cause
+           chain** (:func:`_clear_chain_entries`) — the same ledger the
+           orchestrator reads, written by the same functions.
+
+        The new criterion itself is **not** written here: it is the
+        operator's work, outside the framework (a new plan, or a delta
+        of their own).  What this door does is take the broken
+        criterion out of the round's way and leave a record of why.
+
+        **Nothing obsoleted means nothing happened.**  When the delta
+        refuses — the point is not in the plan, or the write fails —
+        this method raises with the reason instead of returning zero:
+        a silent zero would read as "the criterion was revised" while
+        the plan still carries it.  The failure is recorded by
+        :func:`hitl.terminal_execution.execute_terminal_decision` (arch
+        decision point 5).
         """
-        return _agent_prompt(plan_id, record, note)
+        from verification_plan_delta import PlanDelta, apply_delta_persisted
 
-    def resume_agent(
-        self, plan_id: str, record: Any = None, note: str = ""
-    ) -> None:
-        """Continue the recorded analysis session with the human's own words.
+        failed_vps = failed_vps_from_record(record)
+        vp_ids: List[str] = []
+        for failed_vp in failed_vps:
+            vp_id = str(failed_vp.get("id") or "").strip()
+            if vp_id and vp_id not in vp_ids:
+                vp_ids.append(vp_id)
+        if not vp_ids:
+            raise ValueError(
+                "the record names no failed verification point to revise"
+            )
 
-        This is the free-text door.  The human wrote something nobody
-        can match against a table of options, so the *analysis agent*
-        reads it — and it reads it in the conversation it already had
-        about the failure, because that conversation already holds the
-        facts.
+        plan_dir = Path(self._plan_dir_of(plan_id))
+        plan_file = plan_dir / "verification_plan.json"
+        try:
+            raw = plan_file.read_bytes()
+        except OSError as exc:
+            raise RuntimeError(
+                f"the verification plan could not be read: {exc}"
+            ) from exc
+        digest = hashlib.sha256(raw).hexdigest()
+        try:
+            plan_data = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise RuntimeError(
+                f"the verification plan is not readable JSON: {exc}"
+            ) from exc
+        if not isinstance(plan_data, dict):
+            raise RuntimeError(
+                "the verification plan does not hold a plan object"
+            )
 
-        Two paths, one call:
+        round_number = _record_round_number(record) or 1
+        delta = PlanDelta(
+            added=[],
+            obsoleted=[
+                {
+                    "id": vp_id,
+                    "reason": (
+                        "the operator revised the criterion — the round's "
+                        "failure was accepted and the criterion is written "
+                        "outside the framework"
+                    ),
+                }
+                for vp_id in vp_ids
+            ],
+        )
+        summary = apply_delta_persisted(
+            plan_file, plan_data, delta, round_number,
+            expected_digest=digest,
+        )
+        obsoleted = [
+            str(entry.get("id"))
+            for entry in (summary.get("obsoleted") or [])
+            if isinstance(entry, Mapping) and entry.get("id")
+        ]
+        if not obsoleted:
+            # The delta refused: the plan file is untouched, and
+            # nothing may be claimed about it.
+            raise RuntimeError(
+                "the plan delta obsoleted nothing — the failed "
+                f"verification point(s) {', '.join(vp_ids)} are not in "
+                "the plan, or the plan refused the change"
+            )
 
-        * **There is a session id** in the record.  The session is
-          re-opened: the handle carries that id and says it was
-          *resumed*, so the agent keeps the context it had.
-        * **There is no session id** (or no record at all).  A fresh
-          session opens and the **whole analysis context** goes into
-          the prompt, so the new conversation starts from the same
-          facts the old one had.  The prompt says that the original
-          session's context was unavailable, so nobody reads the
-          substitution as a claim that the session was re-opened.
+        self._clear_chain_entries(plan_dir, obsoleted)
+        return len(obsoleted)
 
-        Neither path raises.  A missing record is not an error — it is
-        a round whose analysis was never recorded — so the prompt says
-        the analysis context is unavailable and the call still happens.
+    def _clear_chain_entries(self, plan_dir: Path, vp_ids: List[str]) -> None:
+        """Take the given points off the root-cause chain.
 
-        What this method does **not** do is swallow the provider's
-        failure: the call is allowed to raise, and
-        :func:`hitl.terminal_execution.execute_terminal_decision` is
-        what records it in the audit.
+        The chain is the ledger that says which points are still
+        standing between the plan and the human.  A point that has been
+        obsoleted is not standing in anybody's way any more, so its
+        entry goes — otherwise the next round walks into the terminal
+        branch for a point that is no longer in the plan.
 
-        The port does not read the agent's answer and does not decide
-        what it means.  The vocabulary of what happens next belongs to
-        the orchestrator; this method only carries the call out.
+        The chain is read and written by the **orchestrator's own**
+        functions (:func:`verification.orchestrator.load_root_cause_chain`
+        and :func:`verification.orchestrator.save_root_cause_chain`), so
+        the two cannot disagree about its shape.  The import is
+        function-level for the same reason the route imports are (see
+        the module docstring).
         """
-        from coding_tool import JsonSession, query_json_in_session
-
-        session_id = _record_session_id(record)
-        handle = (
-            JsonSession(session_id=session_id, stage="resumed")
-            if session_id
-            else JsonSession()
+        from verification.orchestrator import (
+            load_root_cause_chain,
+            save_root_cause_chain,
         )
 
-        query_json_in_session(
-            self.coding_tool,
-            handle,
-            prompt=self._agent_prompt(plan_id, record, note),
-            system_instruction=self.AGENT_SYSTEM_PROMPT,
-            timeout=self.AGENT_TIMEOUT_SECONDS,
-            allowed_tools=[],
-        )
+        chain = load_root_cause_chain(plan_dir)
+        entries = chain.get("vps")
+        if not isinstance(entries, dict) or not entries:
+            return
+        remaining = {
+            vp_id: entry
+            for vp_id, entry in entries.items()
+            if vp_id not in set(vp_ids)
+        }
+        if len(remaining) == len(entries):
+            return
+        chain["vps"] = remaining
+        save_root_cause_chain(plan_dir, chain)
 
 
 # ---------------------------------------------------------------------------
 # The factory
 # ---------------------------------------------------------------------------
-
-
-#: Module-level aliases for the port's two agent constants, so a caller
-#: that only wants the instruction or the timeout does not have to reach
-#: into the class for them.
-AGENT_SYSTEM_PROMPT = DefaultTerminalDecisionPort.AGENT_SYSTEM_PROMPT
-AGENT_TIMEOUT_SECONDS = DefaultTerminalDecisionPort.AGENT_TIMEOUT_SECONDS
 
 
 def default_port() -> DefaultTerminalDecisionPort:

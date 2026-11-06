@@ -15,13 +15,17 @@ the mechanics:
    The request that reaches ``reset_verification`` must carry
    ``clear_artifacts`` — and carry it verbatim, because the executor
    does not get a say in whether a stale artefact survives.
-2. **Start goes to the start route**, with no request body.
-3. **Close-as-failed goes to the state machine**, as the ``failed``
+2. **Reset asks the reset route to clear the root-cause chain.**  The
+   *rerun this round* answer is the one that clears it: a round that
+   restarts with the chain still hanging on it walks straight back
+   into the terminal branch.
+3. **Start goes to the start route**, with no request body.
+4. **Close-as-failed goes to the state machine**, as the ``failed``
    phase.
-4. **The port constructs with no engine.**  Mechanical actions do not
+5. **The port constructs with no engine.**  Mechanical actions do not
    depend on the scheduler, and the constructor signature is where
    that is made visible.
-5. **Reset and start are two calls, not one.**  The *executor* decides
+6. **Reset and start are two calls, not one.**  The *executor* decides
    the order; the port does not fuse them, or *accept the failure*
    would silently start the round again.
 
@@ -144,6 +148,28 @@ def test_reset_passes_clear_artifacts_true(route_calls, tmp_path):
     assert getattr(request_2, "clear_artifacts", None) is False, (
         "clear_artifacts must be handed to the request object unchanged; "
         f"it arrived as {getattr(request_2, 'clear_artifacts', None)!r}"
+    )
+
+
+def test_reset_clears_the_root_cause_chain_by_default(route_calls, tmp_path):
+    """A rerun takes the chain with it — the port asks for that.
+
+    The chain is the ledger that says which points are still standing
+    between the plan and the human.  A round that restarts with the
+    chain still hanging on it walks straight back into the terminal
+    branch — the very state the human asked to get out of.  The route's
+    own default is *off*; this path is what turns it on.
+    """
+    module = _port_module()
+
+    port = module.DefaultTerminalDecisionPort(plan_dir_of=lambda pid: tmp_path)
+    port.reset("p1")
+
+    kind, _, request = route_calls[0]
+    assert kind == "reset"
+    assert getattr(request, "clear_root_cause_chain", None) is True, (
+        "the rerun path must ask the route to clear the chain; the request "
+        f"carried {getattr(request, 'clear_root_cause_chain', None)!r}"
     )
 
 

@@ -32,8 +32,15 @@ What this file pins
    must not name the delivery layer at all: no ``session_send``, no
    ``from hooks`` / ``import hooks``, no ``cc-connect send``.
 2. **The delivery layer carries no terminal-branch vocabulary.**  The
-   five tokens below are the terminal branch's own words; the protocol
+   six tokens below are the terminal branch's own words; the protocol
    must not learn them.
+
+   The list carries the **retired** option ids as well as the current
+   ones, on purpose.  ``accept_as_failed`` and ``manual_repair_tasks``
+   are no longer on the menu, but they are still the branch's words —
+   and the delivery protocol learning one of them would be just as bad
+   as learning a live one.  A token leaves this list when the *branch*
+   drops the word for good, not when the menu changes.
 
 What is deliberately *not* pinned
 --------------------------------
@@ -68,6 +75,7 @@ _SESSION_SEND = _BACKEND_DIR / "hooks" / "session_send.py"
 _TERMINAL_TOKENS: Tuple[str, ...] = (
     "repair_execution_failed",
     "rerun_this_round",
+    "revise_criterion",
     "accept_as_failed",
     "manual_repair_tasks",
     "_terminal_decision_question",

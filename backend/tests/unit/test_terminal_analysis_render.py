@@ -65,7 +65,7 @@ def _analysis(**overrides):
         "context": "第 3 轮终局停止",
         "problem": "链路无法自愈",
         "evidence": ["VP-3 连续 3 轮失败"],
-        "recommendation": "accept_as_failed",
+        "recommendation": "revise_criterion",
         "recommendation_reason": "同一失败重复 3 轮",
         "uncertainty": "无法判断",
     }
@@ -96,7 +96,7 @@ def test_render_has_five_cpea_sections():
     assert "第 3 轮终局停止" in result, "the context is missing"
     assert "链路无法自愈" in result, "the problem is missing"
     assert "VP-3 连续 3 轮失败" in result, "the evidence is missing"
-    assert "accept_as_failed" in result, "the recommendation is missing"
+    assert "revise_criterion" in result, "the recommendation is missing"
     assert "同一失败重复 3 轮" in result, "the recommendation reason is missing"
     assert "无法判断" in result, "the uncertainty is missing"
 
