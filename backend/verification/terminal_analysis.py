@@ -45,7 +45,7 @@ verdict it has not fully seen.
 is written into the prompt.  A judge that sees ten of twelve failures
 without being told about the other two does not know it is missing them.
 
-**The three answers are spelled out.**  The judge is told which
+**The answers are spelled out.**  The judge is told which
 recommendations exist and what each one means, in the language the human
 who reads the result will read.
 
@@ -66,7 +66,7 @@ the scene it was given.
 **The answer is accepted whole or not at all.**  Six fields —
 ``context``, ``problem``, ``evidence``, ``recommendation``,
 ``recommendation_reason``, ``uncertainty``.  An answer that is missing
-one, or whose recommendation is not one of the three actions, is
+one, or whose recommendation is not one of the actions, is
 rejected whole rather than half-used: a half-analysis in front of a
 human is worse than none, because it reads as an analysis.
 
@@ -91,7 +91,7 @@ whole 不确定 section dropped, because half an uncertainty is a fact.
 Only then is the text cut, and the cut is marked with ``…``.
 
 **An analysis that is not one renders as nothing.**  Not a mapping, a
-missing field, a recommendation outside the three actions — all of them
+missing field, a recommendation outside the actions — all of them
 produce ``""``, and the caller's fallback is the factual question it
 asked before.
 
@@ -132,7 +132,7 @@ logger = logging.getLogger(__name__)
 # The vocabulary
 # ---------------------------------------------------------------------------
 
-#: The three answers a human can give at the terminal round.
+#: The answers a human can give at the terminal round.
 #:
 #: These are the orchestrator's terminal options, written out here rather
 #: than imported from :mod:`verification.orchestrator`: the orchestrator
@@ -142,8 +142,7 @@ logger = logging.getLogger(__name__)
 #: divergence.
 RECOMMENDATIONS: Tuple[str, ...] = (
     "rerun_this_round",
-    "accept_as_failed",
-    "manual_repair_tasks",
+    "revise_criterion",
 )
 
 #: What each recommendation means, in the language the human who reads
@@ -152,8 +151,7 @@ RECOMMENDATIONS: Tuple[str, ...] = (
 #: the person answering is Chinese-speaking.
 RECOMMENDATION_LABELS: Dict[str, str] = {
     "rerun_this_round": "重跑本轮验证",
-    "accept_as_failed": "接受失败结论",
-    "manual_repair_tasks": "人工修复任务",
+    "revise_criterion": "修订判据（本轮失败的判据作废，由操作者另行补充新判据）",
 }
 
 #: How many failed points are rendered before the rest are cut.
@@ -220,7 +218,7 @@ def _validate_analysis(payload: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     """The answer as the six contracted fields, or ``None``.
 
     The contract is strict on purpose.  An analysis that is missing a
-    section, or whose recommendation is not one of the three actions the
+    section, or whose recommendation is not one of the actions the
     question offers, is not an analysis the caller can put in front of a
     human — so it is rejected whole rather than half-used.
     """
@@ -426,7 +424,7 @@ def render_analysis(
     Returns:
         The rendered question, or ``""`` when the analysis is not one —
         not a mapping, missing a field, or a recommendation outside the
-        three actions the question offers.  ``""`` means "no analysis",
+        actions the question offers.  ``""`` means "no analysis",
         and the caller's fallback is the factual question it asked
         before, so a human is always asked something.
     """
@@ -544,13 +542,11 @@ class TerminalDecisionJudge:
             "HARD RULES — 违反任何一条，这个回答会被丢弃：\n"
             "1. DO NOT FABRICATE. 不许编造事实。prompt 没有给出的失败原因、"
             "代码、日志都不许当成确定结论；证据不足就在 uncertainty 里说清楚。\n"
-            "2. recommendation 只能是以下三者之一，不许自创第四种：\n"
+            "2. recommendation 只能是以下两者之一，不许自创第三种：\n"
             f"   - rerun_this_round：{RECOMMENDATION_LABELS['rerun_this_round']}"
             "（环境偶发失败、重跑一轮可能就过）。\n"
-            f"   - accept_as_failed：{RECOMMENDATION_LABELS['accept_as_failed']}"
-            "（失败已经定性，本轮就此结束）。\n"
-            f"   - manual_repair_tasks：{RECOMMENDATION_LABELS['manual_repair_tasks']}"
-            "（失败需要人来安排修复，本轮不再自动重跑）。\n"
+            f"   - revise_criterion：{RECOMMENDATION_LABELS['revise_criterion']}"
+            "（判据本身有问题，不是交付物有问题：这一轮的失败判据要由人重写）。\n"
             "3. 全部用中文回答。字段名（context / problem / evidence / "
             "recommendation / recommendation_reason / uncertainty）和 "
             "recommendation 的取值保持英文原样，其余内容一律中文。\n"
@@ -619,7 +615,7 @@ class TerminalDecisionJudge:
             if hidden > 0:
                 parts.append(f"({hidden} more failed point(s) not shown)")
 
-        parts.extend(["", "## 可选动作（recommendation 只能三选一）"])
+        parts.extend(["", "## 可选动作（recommendation 只能二选一）"])
         for recommendation in RECOMMENDATIONS:
             parts.append(
                 f"- {recommendation}: {RECOMMENDATION_LABELS[recommendation]}"
@@ -633,7 +629,7 @@ class TerminalDecisionJudge:
                 '{"context": "<背景：这一轮停在哪里，中文>", "problem": '
                 '"<问题：到底出了什么问题，中文>", "evidence": '
                 '["<支撑判断的事实，中文>"], "recommendation": '
-                '"<rerun_this_round|accept_as_failed|manual_repair_tasks>", '
+                '"<rerun_this_round|revise_criterion>", '
                 '"recommendation_reason": "<为什么是这个建议，中文>", '
                 '"uncertainty": "<证据不足或需要人来判断的地方，中文>"}',
             ]
@@ -658,7 +654,7 @@ class TerminalDecisionJudge:
 
         One call, no tools, one answer.  Everything that could make the
         answer unusable — an exception from the provider, an answer that
-        is not a JSON object, a recommendation outside the three actions
+        is not a JSON object, a recommendation outside the actions
         the question offers, a field that is missing — produces
         ``None``.
 
