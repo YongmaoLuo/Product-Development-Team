@@ -15,14 +15,33 @@ VENV_PATH="$PROJECT_ROOT/backend/.venv"
 
 # Check if venv exists
 if [ ! -d "$VENV_PATH" ]; then
-    echo "Error: Virtual environment not found at $VENV_PATH"
-    echo "Create it from the lockfile with:"
-    echo "  uv sync --project backend"
-    echo ""
-    echo "That builds backend/.venv at the versions backend/uv.lock pins,"
-    echo "on the Python backend/pyproject.toml declares. If uv is not"
-    echo "installed, see https://docs.astral.sh/uv/getting-started/installation/"
-    exit 1
+    # 2026-11-05: the tree under test often has no venv of its own -- a
+    # fresh worktree is the usual case -- and the entry used to have to
+    # create one with a ``ln -sfn <another checkout>/backend/.venv``
+    # shell hack.  That hack is what the path preflight then had to
+    # guess about ("which operand does this command *produce*?"), and
+    # it pointed at another checkout by absolute path.
+    #
+    # A venv the operator names is reused instead: offline, deterministic,
+    # and the entry stays a plain command -- ``CI=true bash
+    # scripts/run_tests.sh``.
+    if [ -n "${PDT_SHARED_VENV:-}" ] && [ -d "$PDT_SHARED_VENV" ]; then
+        mkdir -p "$(dirname "$VENV_PATH")"
+        ln -sfn "$PDT_SHARED_VENV" "$VENV_PATH"
+        echo "gate: reusing the venv at $PDT_SHARED_VENV as $VENV_PATH"
+    else
+        echo "Error: Virtual environment not found at $VENV_PATH"
+        echo "Create it from the lockfile with:"
+        echo "  uv sync --project backend"
+        echo ""
+        echo "That builds backend/.venv at the versions backend/uv.lock pins,"
+        echo "on the Python backend/pyproject.toml declares. If uv is not"
+        echo "installed, see https://docs.astral.sh/uv/getting-started/installation/"
+        echo ""
+        echo "Or reuse an existing venv instead -- name it in PDT_SHARED_VENV:"
+        echo "  PDT_SHARED_VENV=/path/to/backend/.venv bash scripts/run_tests.sh"
+        exit 1
+    fi
 fi
 
 # Activate the virtual environment

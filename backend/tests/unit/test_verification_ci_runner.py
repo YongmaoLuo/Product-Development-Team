@@ -17,6 +17,10 @@ Covers:
 from __future__ import annotations
 
 import json
+import hashlib
+import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -337,6 +341,188 @@ class TestValidateVpCompoundCommands:
         assert result.status == STATUS_PASSED
         assert result.evidence["exit_code"] == 0
         assert "schema_issues" not in result.evidence
+
+
+# ---------------------------------------------------------------------------
+# validate_vp — shell 分组括号与入口自建路径（2026-11-05）
+# ---------------------------------------------------------------------------
+#
+# 一条真实的整仓门禁入口长这样：
+#
+#     (test -e backend/.venv || ln -sfn <别处的 venv> backend/.venv) \
+#         && CI=true bash scripts/run_tests.sh
+#
+# 两个坑叠在一起，把它挡在了 schema 预检上，门禁一行都没跑：
+#
+# 1. **分组括号没人剥。** ``(test`` 与 ``backend/.venv)`` 都是带括号
+#    的 token，``backend/.venv)`` 于是被当成一个独立的仓库相对路径去
+#    查存在性 —— 一条纯解析伪影的 issue。前导的 ``(`` 同理让
+#    ``(cd backend && …)`` 里的 ``cd`` 不被认出来，路径解析基准错了。
+# 2. **入口自己建的路径被当成"引用的路径"。** 入口用 ``ln -sfn`` 在
+#    工作树里自建 ``backend/.venv``（新 clone 的树里没有它），框架却
+#    把"入口要创建这个路径"读成"入口要读取这个路径"，于是一条完全
+#    可跑的入口被判成不可运行。
+#
+# 豁免只给**生产者位置**：入口自己 ``ln`` / ``mkdir`` / ``touch`` /
+# ``cp`` / ``mv`` 出来的那一个路径不查存在性；被**消费**的路径
+# （``bash scripts/missing.sh``、``pytest state_machine/tests``）照旧
+# 必须存在 —— 负控不放宽。
+
+
+class TestValidateVpShellGroupingAndSelfCreatedPaths:
+    def test_grouping_parens_are_stripped_from_path_tokens(self):
+        paths = _referenced_paths(
+            "(test -e backend/.venv || true) && bash scripts/run_tests.sh",
+        )
+        # 括号不是路径的一部分 …
+        assert "backend/.venv)" not in paths
+        # … 剥掉之后它就是那条路径本身。
+        assert "backend/.venv" in paths
+        assert "scripts/run_tests.sh" in paths
+
+        # 贴着右括号的写法也要剥 —— 那正是报告里那条伪影 issue 的来源。
+        attached = _referenced_paths("(ln -sfn /tmp/venv backend/.venv)")
+        assert "backend/.venv)" not in attached
+        assert "backend/.venv" in attached
+
+    def test_entry_that_creates_a_path_it_checks_passes_schema(self, tmp_path):
+        # 这就是 VP-015 的入口形态：入口在工作树里自建 backend/.venv，
+        # 再跑整仓门禁。它必须被判成**可运行**。
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "run_tests.sh").write_text("#!/bin/sh\n")
+        entry = (
+            "(test -e backend/.venv || ln -sfn /tmp/venv backend/.venv) && "
+            "CI=true bash scripts/run_tests.sh"
+        )
+        # 执行期形态：历史计划的复合入口照旧要能跑，所以这里关掉
+        # 「必须是对适配脚本的一次调用」那道**规划期**契约
+        # （``require_single_entry=False``，见 ``validate_vp`` 的 docstring）。
+        assert validate_vp(
+            _vp(entry), project_dir=tmp_path, require_single_entry=False,
+        ) == []
+
+    def test_created_path_exemption_keeps_the_existence_check_for_consumed_paths(
+        self, tmp_path,
+    ):
+        # 负控：豁免只给生产者位置。被消费的路径照旧必须存在。
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "run_tests.sh").write_text("#!/bin/sh\n")
+        entry = (
+            "(test -e backend/.venv || ln -sfn /tmp/venv backend/.venv) && "
+            "CI=true bash scripts/run_tests.sh && bash scripts/missing.sh"
+        )
+        issues = validate_vp(
+            _vp(entry), project_dir=tmp_path, require_single_entry=False,
+        )
+        assert any("scripts/missing.sh" in i.detail for i in issues), issues
+
+        # ``cd`` 之后的路径也一样：解析基准对了，存在性检查不能松。
+        venv_bin = tmp_path / "backend" / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        (venv_bin / "python").write_text("#!/bin/sh\n")
+        issues = validate_vp(
+            _vp("cd backend && ./.venv/bin/python -m pytest state_machine/tests -q"),
+            project_dir=tmp_path,
+            require_single_entry=False,
+        )
+        assert any("backend/state_machine/tests" in i.detail for i in issues), issues
+
+    def test_leading_paren_does_not_hide_cd(self, tmp_path):
+        # 前导的 ``(`` 不能把 ``cd`` 藏起来 —— 括号里的路径仍然相对
+        # 于 ``cd`` 之后的目录解析。
+        venv_bin = tmp_path / "backend" / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        (venv_bin / "python").write_text("#!/bin/sh\n")
+        (tmp_path / "backend" / "state_machine" / "tests").mkdir(parents=True)
+        assert validate_vp(
+            _vp("(cd backend && ./.venv/bin/python -m pytest state_machine/tests -q)"),
+            project_dir=tmp_path,
+            require_single_entry=False,
+        ) == []
+
+    def test_a_missing_path_inside_a_group_is_still_an_issue(self, tmp_path):
+        # 负控：括号不豁免任何存在性检查。
+        (tmp_path / "scripts").mkdir()
+        issues = validate_vp(
+            _vp("(bash scripts/missing.sh)"), project_dir=tmp_path,
+            require_single_entry=False,
+        )
+        assert any("scripts/missing.sh" in i.detail for i in issues), issues
+
+    def test_only_the_producer_position_is_exempt(self, tmp_path):
+        # ``mkdir`` / ``touch`` 创建它们的操作数；``cp`` / ``mv`` 创建的是
+        # 目标，而**源**是被消费的 —— 源照旧必须存在。
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "run_tests.sh").write_text("#!/bin/sh\n")
+        assert validate_vp(
+            _vp(
+                "mkdir -p backend/.venv && touch backend/.venv/marker "
+                "&& bash scripts/run_tests.sh",
+            ),
+            project_dir=tmp_path,
+            require_single_entry=False,
+        ) == []
+
+        issues = validate_vp(
+            _vp(
+                "cp scripts/missing.txt scripts/out.sh "
+                "&& mv scripts/other.txt scripts/out2.sh "
+                "&& bash scripts/run_tests.sh",
+            ),
+            project_dir=tmp_path,
+            require_single_entry=False,
+        )
+        assert any("scripts/missing.txt" in i.detail for i in issues), issues
+        assert any("scripts/other.txt" in i.detail for i in issues), issues
+        # 目标位置是生产者 —— 不报。
+        assert not any("scripts/out.sh" in i.detail for i in issues), issues
+        assert not any("scripts/out2.sh" in i.detail for i in issues), issues
+
+
+# ---------------------------------------------------------------------------
+# 失败身份：认路径，不认写法
+# ---------------------------------------------------------------------------
+
+
+class TestFailureIdentityIsCanonical:
+    """同一个缺陷，换一种写法，还是同一个缺陷（2026-11-06）。
+
+    失败身份取自机器写的失败集合，集合里的每个 id 取自「哪条路径不存在」。
+    同一个文件写成 ``./scripts/missing.sh`` 和 ``scripts/missing.sh`` 是**同一个
+    缺陷** —— 报告换一种写法，指纹就换一次，循环又判成"根因演进"，于是又拿
+    旧根因的方案再打一轮。
+
+    2026-11-05 的 VP-015 正是这样烧掉一轮的：那一轮报告的路径带着一条多余的
+    右括号，下一轮不带 ⇒ 机器写的集合不同 ⇒ 指纹不同 ⇒ "根因演进"。解析器
+    修好了括号，**写法**这一层还没修：身份必须认路径本身。
+    """
+
+    def test_the_same_missing_file_spelled_two_ways_is_one_issue(self, tmp_path):
+        (tmp_path / "scripts").mkdir()
+
+        dotted = validate_vp(
+            _vp("bash ./scripts/missing.sh"), project_dir=tmp_path,
+        )
+        plain = validate_vp(
+            _vp("bash scripts/missing.sh"), project_dir=tmp_path,
+        )
+
+        assert [issue.failure_id() for issue in dotted] == [
+            issue.failure_id() for issue in plain
+        ]
+        assert dotted[0].failure_id() == (
+            "schema:ci_entry_path_missing:scripts/missing.sh"
+        )
+
+    def test_the_reported_path_is_the_canonical_one(self, tmp_path):
+        (tmp_path / "scripts").mkdir()
+
+        issues = validate_vp(
+            _vp("bash ./scripts/missing.sh"), project_dir=tmp_path,
+        )
+
+        assert issues[0].subject == "scripts/missing.sh"
+        assert "scripts/missing.sh" in issues[0].detail
 
 
 # ---------------------------------------------------------------------------
@@ -865,6 +1051,88 @@ class TestFullCiVerdictClassification:
         assert verdict["failed_assertions"] == [], verdict
         assert "failure_class" not in verdict, verdict
         assert "failure_class_source" not in verdict, verdict
+
+
+# ---------------------------------------------------------------------------
+# 出处：结论说得出来，而且**留在不会丢的地方**
+# ---------------------------------------------------------------------------
+#
+# 2026-11-06 的那轮（round 4）的证据：``full_ci_executed`` 事件里没有
+# ``verifier_source``，``vp_artifacts/VP-015/`` 也不存在 —— 于是"这次判定
+# 跑的是哪份代码"**没有任何磁盘证据**。这正是本次事故里最贵的一层：框架
+# 答不出来，于是同一件事重复了一轮又一轮（根因报告 F2）。
+#
+# 两条判据：
+#
+# 1. **加载器坏掉不许抹掉 runner 自报的出处** —— loader 知道的是"这份是
+#    **怎么**被选中的"（resolution / fallback_reason），runner 知道的是
+#    "**我就是**哪个文件"（module_path / sha256 / git_head）。loader 知道得
+#    **更少**的时候，它那份空值不许盖掉 runner 已经答出来的答案。
+# 2. **出处要落在计划的持久审计里** —— 轮次日志是每轮一个文件、还可能没
+#    开着；``logs/audit_events.jsonl`` 才是那件不会丢的东西。
+class TestVerifierProvenanceSurvivesTheRound:
+    """出处随结论走，而且留在不会丢的地方。"""
+
+    def test_a_broken_loader_does_not_erase_who_judged(
+        self, tmp_path, monkeypatch,
+    ):
+        """加载器自己坏了的时候，结论**仍然**说得出"谁在判"。
+
+        loader 的出处直接盖住 runner 自报的出处 —— 于是加载器一坏，结论里的
+        ``module_path`` / ``sha256`` / ``git_head`` 全被抹成空串，"谁在判"
+        就答不出来了。而这正是本次事故里最贵的那一层：答不出来，于是重复
+        失败。
+        """
+        import verification_ci_runner_loader as loader
+
+        def _boom(project_dir=None):
+            raise RuntimeError("loader is not importable")
+
+        monkeypatch.setattr(loader, "load_ci_runner", _boom)
+
+        verdict = _full_ci_agent(tmp_path)._run_full_ci_vp(_full_ci_vp())
+        source = verdict["evidence"]["verifier_source"]
+
+        # the runner still says which file it is ...
+        assert source["module_path"] == str(
+            Path(ci_runner.__file__).resolve()
+        ), source
+        assert source["sha256"], source
+        assert source["git_head"], source
+        # ... and the loader's own failure is still on the record
+        assert source["fallback_reason"], source
+        assert "loader is not importable" in source["fallback_reason"], source
+
+    def test_the_provenance_reaches_the_durable_audit(self, tmp_path):
+        """出处不只进轮次日志 —— 轮次日志没开时它就丢了。
+
+        round 4 的 ``full_ci_executed`` 事件里没有 ``verifier_source``，而
+        ``vp_artifacts/VP-015/`` 也不存在：那轮**一条**关于"谁在判"的磁盘
+        证据都没留下。计划的持久审计（``logs/audit_events.jsonl``）不依赖
+        轮次日志开着，所以它才是那件不会丢的东西。
+        """
+        verdict = _full_ci_agent(tmp_path)._run_full_ci_vp(_full_ci_vp())
+
+        audit = tmp_path / "plan" / "logs" / "audit_events.jsonl"
+        assert audit.is_file(), (
+            "the provenance must not live only in the round log"
+        )
+        entries = [
+            json.loads(line)
+            for line in audit.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        recorded = [
+            entry for entry in entries
+            if entry.get("event_type") == "verifier_provenance_recorded"
+        ]
+        assert recorded, entries
+        source = recorded[0]["data"]["verifier_source"]
+        assert source == verdict["evidence"]["verifier_source"], recorded
+        assert source["module_path"], source
+        assert source["resolution"] in ("project", "harness"), source
+
+
 # ---------------------------------------------------------------------------
 # The per-phase junit evidence
 # ---------------------------------------------------------------------------
@@ -1098,3 +1366,342 @@ class TestJunitEvidence:
         assert result.status == STATUS_PASSED
         assert result.evidence["junit_phases"] == []
         assert result.evidence["junit_failures"] == []
+
+
+# ---------------------------------------------------------------------------
+# 出处随结论走（2026-11-05，F2）
+# ---------------------------------------------------------------------------
+#
+# 2026-11-05 的 VP-015 失败了两轮，两轮的 detail 逐字节相同，而判定用的
+# 评分器早就修好了 —— 差别只在**谁在判**。框架当时答不了这个问题，于是
+# "修复没部署到位"变成了一轮又一轮的重复失败。
+#
+# 所以每一条结论都要自带出处：谁在判、判的是哪份文件、那份文件是什么
+# 哈希。而且**预检就红**的那种失败（一条用例都没跑）也要落盘 —— 今天
+# 那条路径不写 artifact，于是 ``vp_artifacts/`` 里连 VP-015 都没有。
+
+
+class TestVerifierProvenance:
+    """出处随结论走 —— 正常路径与预检路径都带。"""
+
+    def test_verifier_source_reports_the_module_on_disk(self):
+        source = ci_runner.verifier_source()
+        module_path = Path(ci_runner.__file__).resolve()
+        assert source["module_path"] == str(module_path)
+        assert source["sha256"] == hashlib.sha256(
+            module_path.read_bytes()
+        ).hexdigest()
+
+    def test_a_passing_verdict_carries_the_provenance(self, tmp_path):
+        result = run_ci_verification(_vp("exit 0"), project_dir=tmp_path)
+        source = result.evidence["verifier_source"]
+        assert source["module_path"] == str(
+            Path(ci_runner.__file__).resolve()
+        )
+        assert source["sha256"]
+
+    def test_a_schema_failure_carries_the_provenance(self, tmp_path):
+        """预检就红的那条路径也要说得出"谁在判"。"""
+        result = run_ci_verification(
+            _vp("pytest tests/test_x.py::test_y"), project_dir=tmp_path,
+        )
+        assert result.status == STATUS_FAILED
+        assert result.evidence["schema_issues"]
+        assert result.evidence["verifier_source"]["sha256"]
+
+    def test_a_schema_failure_leaves_an_artifact(self, tmp_path):
+        """预检就红**也要落盘** —— 今天不落，于是 vp_artifacts 里没有它。"""
+        artifact = tmp_path / "vp_artifacts"
+        run_ci_verification(
+            _vp("pytest tests/test_x.py::test_y"),
+            project_dir=tmp_path,
+            artifact_dir=artifact,
+        )
+        payload = json.loads(
+            (artifact / "VP-901" / "ci_output.json").read_text(encoding="utf-8")
+        )
+        assert payload["schema_issues"]
+        assert payload["verifier_source"]["sha256"]
+
+    def test_the_artifact_names_the_module_it_came_from(self, tmp_path):
+        artifact = tmp_path / "vp_artifacts"
+        run_ci_verification(
+            _vp("exit 0"), project_dir=tmp_path, artifact_dir=artifact,
+        )
+        payload = json.loads(
+            (artifact / "VP-901" / "ci_output.json").read_text(encoding="utf-8")
+        )
+        assert payload["verifier_source"]["module_path"] == str(
+            Path(ci_runner.__file__).resolve()
+        )
+
+    def test_the_verdict_says_which_copy_judged(self, tmp_path):
+        """结论说得出"判的是哪一份"。
+
+        被测树没有自带评分器（那不是框架仓的检出）→ 判的是 harness
+        自己那份，结论就是这么说的。
+        """
+        result = run_ci_verification(_vp("exit 0"), project_dir=tmp_path)
+        assert result.evidence["verifier_source"]["resolution"] == "harness"
+
+    def test_the_artifact_says_which_copy_judged(self, tmp_path):
+        """落盘的那份也得说得出 —— 磁盘上的证据是轮次之后唯一留下的。"""
+        artifact = tmp_path / "vp_artifacts"
+        run_ci_verification(
+            _vp("exit 0"), project_dir=tmp_path, artifact_dir=artifact,
+        )
+        payload = json.loads(
+            (artifact / "VP-901" / "ci_output.json").read_text(encoding="utf-8")
+        )
+        assert payload["verifier_source"]["resolution"] == "harness"
+
+
+# ---------------------------------------------------------------------------
+# venv 自举（2026-11-05，F3）
+# ---------------------------------------------------------------------------
+#
+# ``scripts/run_tests.sh`` 硬要求 ``$PROJECT_ROOT/backend/.venv``，而
+# "在一棵干净的工作树里跑整仓门禁"是常有的场景 —— 于是每个这样的场景
+# 都要在入口里塞一段 ``ln -sfn <别的检出>/backend/.venv`` 的 shell hack，
+# 而那段 hack 正是路径预检要猜"哪个操作数是生产出来的"的原因。
+#
+# 自举下沉到仓库之后，入口可以回归 ``CI=true bash scripts/run_tests.sh``：
+# 没有分组括号、没有 ``ln``、没有指向仓外检出的绝对路径。
+
+
+class TestSharedVenv:
+    """门禁被告知可以复用哪个 venv。"""
+
+    def test_a_shared_venv_is_offered_when_the_project_has_none(self, tmp_path):
+        """被测树没有 venv → 给出 harness 自己那份。"""
+        shared = ci_runner.shared_venv_for(tmp_path)
+        if shared is None:
+            pytest.skip("no venv available to share")
+        assert Path(shared).is_dir()
+
+    def test_the_project_venv_wins_over_the_shared_one(self, tmp_path):
+        """被测树自己有 venv → 用它自己的。"""
+        own = tmp_path / "backend" / ".venv"
+        own.mkdir(parents=True)
+        assert ci_runner.shared_venv_for(tmp_path) == str(own)
+
+    def test_the_gate_receives_the_shared_venv(self, tmp_path):
+        """门禁的环境里带着它 —— 入口脚本据此自举。"""
+        shared = ci_runner.shared_venv_for(tmp_path)
+        if shared is None:
+            pytest.skip("no venv available to share")
+        result = run_ci_verification(
+            _vp("printenv PDT_SHARED_VENV"), project_dir=tmp_path,
+        )
+        assert result.status == STATUS_PASSED
+        assert shared in result.evidence["stdout_head"]
+
+
+_REPO_ROOT = _BACKEND_DIR.parent
+_GATE_SCRIPT = _REPO_ROOT / "scripts" / "run_tests.sh"
+
+
+def _fake_venv(root: Path) -> Path:
+    """A venv that is only good enough for the gate to *start*."""
+    venv = root / "shared-venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "activate").write_text("# fake activation\n", encoding="utf-8")
+    python = venv / "bin" / "python"
+    python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    python.chmod(0o755)
+    return venv
+
+
+def _fake_project(root: Path) -> Path:
+    """A project root with the gate script in it and no venv."""
+    project = root / "project"
+    (project / "scripts").mkdir(parents=True)
+    (project / "backend").mkdir(parents=True)
+    shutil.copy(_GATE_SCRIPT, project / "scripts" / "run_tests.sh")
+    return project
+
+
+class TestGateVenvBootstrap:
+    """``scripts/run_tests.sh`` 的 venv 自举。"""
+
+    def test_the_gate_links_the_shared_venv_when_the_project_has_none(
+        self, tmp_path,
+    ):
+        """没有 venv、给了 PDT_SHARED_VENV → 软链进来，门禁起得来。"""
+        project = _fake_project(tmp_path)
+        shared = _fake_venv(tmp_path)
+        env = dict(os.environ)
+        env["PDT_SHARED_VENV"] = str(shared)
+        env["CI"] = "true"
+
+        subprocess.run(
+            ["bash", "scripts/run_tests.sh", "--lane", "unit"],
+            cwd=str(project), env=env, capture_output=True, text=True,
+            timeout=180, check=False,
+        )
+
+        link = project / "backend" / ".venv"
+        assert link.is_symlink()
+        assert Path(os.readlink(link)) == shared
+
+    def test_without_a_shared_venv_the_gate_says_how_to_fix_it(
+        self, tmp_path,
+    ):
+        """没有 venv、也没有 PDT_SHARED_VENV → 报错文案说清两条出路。"""
+        project = _fake_project(tmp_path)
+        env = dict(os.environ)
+        env.pop("PDT_SHARED_VENV", None)
+        env["CI"] = "true"
+
+        completed = subprocess.run(
+            ["bash", "scripts/run_tests.sh", "--lane", "unit"],
+            cwd=str(project), env=env, capture_output=True, text=True,
+            timeout=180, check=False,
+        )
+
+        assert completed.returncode != 0
+        assert "PDT_SHARED_VENV" in (completed.stdout + completed.stderr)
+        assert not (project / "backend" / ".venv").exists()
+
+
+# ---------------------------------------------------------------------------
+# 失败的身份（2026-11-05 第 3 轮）
+# ---------------------------------------------------------------------------
+#
+# 第 3 轮 VP-015 的失败指纹从 ``be0a4e421f361e5a`` 变成
+# ``db929c18eeb90214`` —— 而**缺陷一个字都没变**：三轮的 schema detail
+# 逐字节相同，三轮都被判成"换了根因"。
+#
+# 原因：被 schema 拒绝的 full_ci **一个用例都没跑过**，于是没有"机器写的
+# 失败集合"，失败身份退回旧路 —— 旧路把报告证据的第一行**散文**算进
+# 哈希。报告换个说法，指纹就变；于是"根因演进"这个判断被触发了两次，
+# 两次都是假的。
+#
+# 这一组钉住：**失败的身份来自机器**（哪条规则、哪个对象），不来自散文。
+
+
+class TestFailureIdentity:
+    """预检就红的那条也得有机器写的失败集合。"""
+
+    def test_a_schema_rejection_carries_a_machine_written_failing_set(
+        self, tmp_path,
+    ):
+        """预检拒绝 → 结论里带着机器写的失败集合。"""
+        result = run_ci_verification(
+            _vp("bash scripts/does_not_exist.sh"), project_dir=tmp_path,
+        )
+        assert result.status == STATUS_FAILED
+        assert result.evidence["failed_cases"] == [
+            "schema:ci_entry_path_missing:scripts/does_not_exist.sh",
+        ]
+
+    def test_the_identity_is_the_rule_not_the_wording(self, tmp_path):
+        """身份说得出"哪条规则、哪个对象"，不复述那句解释。"""
+        result = run_ci_verification(
+            _vp("bash scripts/does_not_exist.sh"), project_dir=tmp_path,
+        )
+        detail = result.evidence["schema_issues"][0]["detail"]
+        identity = result.evidence["failed_cases"][0]
+        assert detail not in identity
+        assert identity.startswith("schema:")
+
+    def test_the_same_defect_gives_the_same_identity(self, tmp_path):
+        """同一个缺陷 → 同一个身份（措辞变不影响它）。"""
+        first = run_ci_verification(
+            _vp("bash scripts/does_not_exist.sh"), project_dir=tmp_path,
+        )
+        second = run_ci_verification(
+            _vp("bash scripts/does_not_exist.sh"), project_dir=tmp_path,
+        )
+        assert first.evidence["failed_cases"] == second.evidence["failed_cases"]
+
+    def test_a_different_defect_gives_a_different_identity(self, tmp_path):
+        """不同的缺陷 → 不同的身份（不然指纹就分不出问题）。"""
+        first = run_ci_verification(
+            _vp("bash scripts/does_not_exist.sh"), project_dir=tmp_path,
+        )
+        second = run_ci_verification(
+            _vp("bash scripts/other_missing.sh"), project_dir=tmp_path,
+        )
+        assert first.evidence["failed_cases"] != second.evidence["failed_cases"]
+
+    def test_the_gate_path_carries_the_same_key(self, tmp_path):
+        """门禁跑过的路径也带这个键 —— 键在两条路径上是一个意思。"""
+        result = run_ci_verification(_vp("exit 0"), project_dir=tmp_path)
+        assert result.evidence["failed_cases"] == []
+
+    def test_the_artifact_carries_the_failing_set(self, tmp_path):
+        """落盘的那份也得带 —— 磁盘上的证据是轮次之后唯一留下的。"""
+        artifact = tmp_path / "vp_artifacts"
+        run_ci_verification(
+            _vp("bash scripts/does_not_exist.sh"),
+            project_dir=tmp_path,
+            artifact_dir=artifact,
+        )
+        payload = json.loads(
+            (artifact / "VP-901" / "ci_output.json").read_text(encoding="utf-8")
+        )
+        assert payload["failed_cases"] == [
+            "schema:ci_entry_path_missing:scripts/does_not_exist.sh",
+        ]
+
+
+# ---------------------------------------------------------------------------
+# The plan → executor schema conversion (2026-11-06)
+# ---------------------------------------------------------------------------
+
+
+class TestPlanToExecutorSchemaKeepsE2eFields:
+    """The e2e sub-class fields must survive the plan → executor schema.
+
+    ``e2e_kind`` / ``entry_command`` are what the dispatch table reads
+    (:func:`verification_subagent.resolve`): a **command** e2e is graded
+    by the framework, a **browser** flow is not — it is escalated back to
+    the LLM path.  ``cost`` is the cost gate's input.
+
+    The conversion built the executor's VP from an **explicit field
+    list**, and those three were not on it, so every e2e point reached
+    the dispatch table as a browser flow (2026-11-05: the deterministic
+    plan-flow's e2e went to a scripted LLM session and failed there).
+
+    The field names are pinned by the module under test
+    (``verification_ci_runner``), which is why this spec lives here.
+    """
+
+    PLAN = {
+        "verification_points": [
+            {
+                "id": "VP-004",
+                "verification_method": "e2e",
+                "title": "从列表页走到结算页",
+                "expected_result": "结算完成页出现确认文案",
+                "e2e_kind": "command",
+                "entry_command": "python3 scripts/e2e_local.py",
+                "cost": "none",
+            },
+        ],
+    }
+
+    @staticmethod
+    def _converted():
+        from verification_agent import Orchestrator
+
+        return Orchestrator._convert_plan_to_executor_schema(
+            TestPlanToExecutorSchemaKeepsE2eFields.PLAN,
+        )["vps"]
+
+    def test_the_conversion_carries_the_three_fields(self):
+        vps = self._converted()
+        assert vps[0]["e2e_kind"] == "command"
+        assert vps[0]["entry_command"] == "python3 scripts/e2e_local.py"
+        assert vps[0]["cost"] == "none"
+
+    def test_the_runner_reads_the_converted_point_as_a_command_e2e(self):
+        """The runner must not read the converted point as a browser flow."""
+        converted = dict(self._converted()[0])
+        # The dispatch closure translates the executor schema's ``method``
+        # back into the LLM schema's ``verification_method``
+        # (``verification_agent``) — the runner dispatches on the latter.
+        converted["verification_method"] = converted["method"]
+        assert ci_runner.e2e_kind(converted) == ci_runner.E2E_KIND_COMMAND
+        assert validate_vp(converted) == []

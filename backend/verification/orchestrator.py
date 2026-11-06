@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Set, Tuple
@@ -84,6 +85,10 @@ from root_cause_task import (
     root_cause_report_path,
 )
 from verification.triage_agent import VPTriageJudge
+# 2026-11-06: the canonical spelling of a repo-relative path — the ONE
+# rule, owned by the runner that mints the paths and read here, so the
+# identity of a failure never depends on how the path was written.
+from verification_ci_runner import canonical_repo_path
 from verification_plan_delta import (
     OBSOLETE_FIELD,
     OBSOLETE_REASON_FIELD,
@@ -140,6 +145,20 @@ _CHAIN_STAGE_ROOT_CAUSE = "root_cause"
 _CHAIN_STAGE_IMPLEMENTATION = "implementation"
 CHAIN_STAGE_BLOCKED_ON_USER = "BLOCKED_ON_USER"
 
+#: The origin every task the root-cause **preflight** generates carries.
+#:
+#: 2026-11-05. The preflight dispatches the chain's work **before** a
+#: round runs, so its tasks are not a round's repair rows — they are the
+#: chain's own next step, dispatched early. The marker says which of the
+#: two it is, so a consumer can tell "the chain continued" from "the
+#: round failed and asked for a fix".
+_ROOT_CAUSE_PREFLIGHT_ORIGIN = "root_cause_preflight"
+
+#: The reason a preflight hands the plan back to a human: every point the
+#: chain owns is already with one, so there is nothing the machine can do
+#: and nothing a round would change.
+_ROOT_CAUSE_BLOCKED_REASON = "root_cause_blocked_on_user"
+
 #: The headings a root-cause report may put its scope under.
 #:
 #: The report is written by the executor, so its shape is not ours to
@@ -169,6 +188,11 @@ _ROOT_CAUSE_SCOPE_MISSING_EVENT = "root_cause_scope_missing"
 #: Why a point went to a human because its root-cause report named no
 #: file to change. It is also the reason the chain's record carries.
 _ROOT_CAUSE_SCOPE_MISSING_REASON = "root_cause_report_without_scope"
+
+#: The event name the "the same repair task id appeared twice in one
+#: batch" warning carries. It is the name an operator greps for, so it
+#: must not change with the wording of the message.
+_REPAIR_TASK_DUPLICATE_EVENT = "verification_repair_task_duplicate_id"
 
 
 def _decision_key_str(key: Tuple[str, str]) -> str:
@@ -377,6 +401,96 @@ def _root_cause_scope_from_text(text: str) -> List[str]:
     return []
 
 
+# ---------------------------------------------------------------------------
+# The chain's head — "is this chain still about the failure in front of us?"
+# ---------------------------------------------------------------------------
+#
+# 2026-11-05 (arch 决策点 8). The chain's record used to say *where* each
+# point stood and nothing else, so a chain that outlived its failure (a
+# ``reset_rounds`` keeps the chain and its reports) kept describing a
+# failure nobody could still see. The record now carries the commit the
+# diagnosis was dispatched at, and the question "is that still this
+# failure?" has an answer: compare it with the workspace's HEAD.
+
+
+def _recorded_head_sha(value: Any) -> Optional[str]:
+    """The commit sha a record carries — or ``None`` when it carries none.
+
+    A record that does not say which commit it describes cannot be
+    compared with the current HEAD, so it reads as "unknown" rather than
+    as some sha. An empty string is the same answer: a sha is never
+    empty.
+    """
+    if isinstance(value, str):
+        sha = value.strip()
+        if sha:
+            return sha
+    return None
+
+
+def _git_head_sha(project_dir: Any, timeout_sec: int = 10) -> Optional[str]:
+    """The commit ``HEAD`` points at in ``project_dir``.
+
+    ``None`` when git cannot answer: no repository, no commit yet, git
+    missing, or git too slow. Never raises — the caller degrades to "no
+    head", and a chain whose head cannot be read is treated as stale
+    (conservative: a normal round, not a continuation of the chain).
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def _chain_is_stale(chain: Mapping[str, Any], head_sha: Optional[str]) -> bool:
+    """Does the chain still describe the failure at ``head_sha``?
+
+    ``True`` means "this chain is about something else (or about
+    something we cannot check) — do not continue it, run an ordinary
+    round instead". ``False`` means the chain may be continued.
+
+    The rules, in the order they are applied:
+
+    * **no chain → not stale.** A record that owns no point and names no
+      commit is not a chain; there is nothing that could be stale, and
+      the caller falls through to an ordinary round anyway.
+    * **no recorded head → stale.** A record written before the chain
+      carried a head does not say which failure it describes, so we
+      cannot claim it is still this one. Conservative on purpose.
+    * **no current head → stale.** Same reasoning: the comparison could
+      not be made, so the chain is not trusted.
+    * **different commits → stale.** The chain describes a failure of
+      another version of the code.
+    * **same commit → not stale.**
+    """
+    if not isinstance(chain, Mapping) or not chain:
+        return False
+    vps = chain.get("vps")
+    owns_points = isinstance(vps, Mapping) and bool(vps)
+    recorded = _recorded_head_sha(chain.get("head_sha"))
+    if not owns_points and recorded is None:
+        # An empty chain — no point, no commit. Nothing to be stale.
+        return False
+    if recorded is None:
+        # A record that does not say which commit it describes.
+        return True
+    current = _recorded_head_sha(head_sha)
+    if current is None:
+        # The current HEAD could not be read: we cannot tell, so we do
+        # not trust the chain.
+        return True
+    return recorded != current
+
+
 def _is_counted_failure(key: Tuple[str, str]) -> bool:
     """Whether this failure may move the same-cause counter.
 
@@ -513,6 +627,14 @@ logger = logging.getLogger(__name__)
 #: under the point whose criterion was to be replaced — that point's own
 #: events say what happened to the check, not to the plan.
 PLAN_DELTA_AUDIT_VP_ID = "__plan_delta__"
+
+#: The synthetic point id the verifier-provenance audit events are filed
+#: under (2026-11-05).
+#:
+#: The event is about the **round**, not about one verification point: it
+#: says which file would grade the gate, and that is a fact about the
+#: round before any point has run.
+VERIFIER_PROVENANCE_AUDIT_VP_ID = "__preflight__"
 
 #: The event written when the plan delta could not be written to disk.
 EVENT_PLAN_DELTA_PERSIST_FAILED = "plan_delta_persist_failed"
@@ -1218,6 +1340,44 @@ def _attach_round_run_output(
     return attached
 
 
+#: The gate's schema ids: ``schema:<code>:<subject>``.  The framework
+#: mints them, and the subject of the path rules is a repo-relative
+#: path.
+_SCHEMA_CASE_ID_RE = re.compile(r"^schema:(?P<code>[^:]+):(?P<subject>.+)$")
+
+
+def _canonical_case_id(case_id: Any) -> str:
+    """One failing case's id, spelled the way the defect is.
+
+    A pytest node id is left exactly as it is: it is an identifier, and
+    two node ids differing in one letter are two different tests.
+
+    The gate's schema ids are a different kind of thing — the framework
+    mints them, and their subject is a **path**.  A path arrives with
+    whatever spelling the command line gave it: ``backend/.venv`` and
+    ``backend/.venv)`` (the ``)`` closes the grouping the entry opened)
+    name the same file.  The identity of a failure must not depend on
+    that: the same defect written two ways would fingerprint two ways,
+    and the loop would read the second one as "the root cause evolved" —
+    the exact false signal this chain exists to kill (2026-11-05, VP-015:
+    three rounds, one defect, two identities).
+
+    The rule is read from the ids wherever they come from — the report
+    entry's own set, or the artifact an older runner wrote — because the
+    spelling is a property of the **producer**, not of the defect.
+    """
+    text = str(case_id or "").strip()
+    match = _SCHEMA_CASE_ID_RE.match(text)
+    if not match:
+        return text
+    subject = match.group("subject").strip()
+    if not subject:
+        return text
+    return "schema:{0}:{1}".format(
+        match.group("code"), canonical_repo_path(subject),
+    )
+
+
 class VerificationOrchestrator:
     """Manages the verification loop and state transitions."""
 
@@ -1746,6 +1906,10 @@ class VerificationOrchestrator:
         a source: that is the run's summary, and the fingerprint has to
         be the identity of the defect, not of the run. Reading it is
         exactly what made every round look like a new root cause.
+
+        The ids are **canonically spelled** before they leave here: the
+        identity of a defect must not depend on how the producer wrote
+        the path (see :func:`_canonical_case_id`).
         """
         carried = entry.get("failed_assertions")
         if isinstance(carried, str):
@@ -1753,15 +1917,29 @@ class VerificationOrchestrator:
         if carried:
             ids = [str(item).strip() for item in carried if str(item).strip()]
             if ids:
-                return sorted(set(ids))
+                return sorted({_canonical_case_id(item) for item in ids})
 
-        return self._artifact_failed_case_ids(vp_id)
+        return sorted({
+            _canonical_case_id(item)
+            for item in self._artifact_failed_case_ids(vp_id)
+        })
+
     def _artifact_failed_case_ids(self, vp_id: str) -> List[str]:
         """The failing node ids the gate recorded in this round's artifact.
 
         The artifact is the machine-written record of the run. A missing
         or unreadable artifact yields no ids — the caller then falls back
         to the legacy fingerprint, which is worse but never wrong.
+
+        ``failed_cases`` is read first: it is the key that means the
+        same thing whether the gate ran (node ids) or never ran because
+        the entry was rejected (the schema rule that fired).  Without it
+        a rejected entry had **no** machine-written identity at all, so
+        the fingerprint fell back to the report's wording — and every
+        round that reworded its report looked like a new defect
+        (2026-11-05, VP-015: three fingerprints for one defect).  The
+        junit key stays as the fallback for artifacts an older runner
+        wrote.
         """
         if not vp_id:
             return []
@@ -1774,6 +1952,14 @@ class VerificationOrchestrator:
             return []
         if not isinstance(payload, dict):
             return []
+        machine_written = payload.get("failed_cases")
+        if isinstance(machine_written, (list, tuple)):
+            ids = {
+                str(item).strip() for item in machine_written
+                if str(item).strip()
+            }
+            if ids:
+                return sorted(ids)
         failures = payload.get("junit_failures")
         if not isinstance(failures, list):
             return []
@@ -2042,8 +2228,33 @@ class VerificationOrchestrator:
         """Where the chain's record lives."""
         return Path(self.plan_dir) / _ROOT_CAUSE_CHAIN_FILENAME
 
+    def _current_head_sha(self) -> Optional[str]:
+        """The commit the workspace sits on — ``None`` when unreadable.
+
+        2026-11-05: the chain's record is written against this. It is
+        the anchor of "is the chain still about the failure in front of
+        us?" — a reset may leave the workspace on another commit, and
+        then the chain describes a failure of a version of the code that
+        is no longer there.
+        """
+        return _git_head_sha(self.project_dir)
+
+    def _chain_is_stale(
+        self, chain: Mapping[str, Any], head_sha: Optional[str],
+    ) -> bool:
+        """Does the chain still describe the failure at ``head_sha``?
+
+        The same answer as the module-level :func:`_chain_is_stale`, as
+        a method — the chain's own reader asks it this way.
+        """
+        return _chain_is_stale(chain, head_sha)
+
     def _load_root_cause_chain(self) -> Dict[str, Any]:
-        """The chain's record: ``{"version", "stage", "vps"}``.
+        """The chain's record: ``{"version", "stage", "vps", "head_sha"}``.
+
+        ``head_sha`` (2026-11-05) is the commit the chain describes —
+        ``None`` when the record does not say (a record written before
+        the chain carried one).
 
         A record that cannot be read is an **empty** chain, not an error:
         the worst a lost record can do is send the plan back to the
@@ -2054,6 +2265,7 @@ class VerificationOrchestrator:
             "version": 1,
             "stage": "",
             "vps": {},
+            "head_sha": None,
         }
         try:
             raw = json.loads(
@@ -2076,6 +2288,10 @@ class VerificationOrchestrator:
             "version": 1,
             "stage": str(raw.get("stage") or ""),
             "vps": clean,
+            # 2026-11-05: the commit the chain describes. A record
+            # written before the chain carried one reads as "unknown"
+            # (``None``) — not as an error, and not as some sha.
+            "head_sha": _recorded_head_sha(raw.get("head_sha")),
         }
 
     def _save_root_cause_chain(self, payload: Mapping[str, Any]) -> None:
@@ -2084,13 +2300,20 @@ class VerificationOrchestrator:
         Best-effort and atomic, like every other record the orchestrator
         keeps: a write failure must never abort a round that has already
         reached its verdict, and a reader must never see half a file.
+
+        2026-11-05: the record always carries ``head_sha`` — the commit
+        the chain describes, or ``None`` when it does not describe one.
+        The field is nullable on purpose: a reader must be able to ask
+        the question without guarding for its absence.
         """
+        record = dict(payload)
+        record["head_sha"] = _recorded_head_sha(record.get("head_sha"))
         path = self._root_cause_chain_path()
         tmp = path.with_name(path.name + ".tmp")
         try:
             tmp.parent.mkdir(parents=True, exist_ok=True)
             with tmp.open("w", encoding="utf-8") as handle:
-                json.dump(dict(payload), handle, ensure_ascii=False)
+                json.dump(record, handle, ensure_ascii=False)
             os.replace(tmp, path)
         except OSError:
             try:
@@ -2169,6 +2392,10 @@ class VerificationOrchestrator:
         Nothing is written here — the caller writes the record once the
         round has decided what to do with it. A round that stops early
         must not leave the chain advanced.
+
+        2026-11-05: the record this returns carries the commit the
+        chain describes (``head_sha``), written when a diagnosis is
+        dispatched — see the comment at the write.
         """
         chain = self._load_root_cause_chain()
         vps: Dict[str, Dict[str, Any]] = dict(chain.get("vps") or {})
@@ -2260,6 +2487,22 @@ class VerificationOrchestrator:
                 "scope": [],
             })
 
+        # 2026-11-05 (arch 决策点 8): the commit the chain's description
+        # belongs to.
+        #
+        # It is written **when a diagnosis is dispatched** — that is the
+        # moment the chain starts describing a failure — and never
+        # otherwise. The implementation the diagnosis asked for lands as
+        # a commit, and refreshing the head then would wash the chain
+        # fresh: a chain describing an old failure would look current
+        # forever, and the staleness check could never fire.
+        if any(
+            action["action"] == _CHAIN_STAGE_ROOT_CAUSE for action in actions
+        ):
+            head_sha = self._current_head_sha()
+        else:
+            head_sha = _recorded_head_sha(chain.get("head_sha"))
+
         if not vps:
             # No chain, no record — the round is an ordinary repair round.
             return {
@@ -2267,6 +2510,7 @@ class VerificationOrchestrator:
                     "version": 1,
                     "stage": "",
                     "vps": {},
+                    "head_sha": head_sha,
                     "updated_round": int(round_number),
                 },
                 "actions": [],
@@ -2294,6 +2538,9 @@ class VerificationOrchestrator:
                 "version": 1,
                 "stage": stage,
                 "vps": vps,
+                # 2026-11-05: the commit the chain describes — written
+                # when a diagnosis was dispatched, kept otherwise.
+                "head_sha": head_sha,
                 "updated_round": int(round_number),
             },
             "actions": actions,
@@ -2385,6 +2632,368 @@ class VerificationOrchestrator:
                 )
             tasks.append(self._mark_root_cause_task(task, vp_id))
         return tasks
+
+    # ------------------------------------------------------------------
+    # The preflight — what the chain owes BEFORE a round runs
+    # ------------------------------------------------------------------
+    #
+    # 2026-11-05 (arch 决策点 6/7). A ``reset_rounds`` keeps the chain
+    # and its reports, but the next ``/start`` ran a **whole verification
+    # round** before the chain was read — and the chain is only read when
+    # the round fails again.  So a plan whose chain owed one
+    # implementation task burned a full round (and a full ``max_rounds``
+    # budget) to get to the step it was already at.
+    #
+    # The preflight asks the chain **first**.  The chain's own decision
+    # says what the round would owe; if it owes something, the work is
+    # dispatched and the round does not run at all.
+
+    def _verifier_provenance_preflight(self) -> Dict[str, Any]:
+        """Which ``verification_ci_runner`` would judge this round?
+
+        2026-11-05: a point failed two rounds in a row, byte for byte
+        the same way, while the file on disk was already fixed — because
+        the round was graded by **another copy** of the runner (the
+        harness' own, resolved through ``sys.path``).  The framework
+        could not answer "was this graded by the code I fixed?", so the
+        failure looked like a new root cause every time.
+
+        The answer is asked here, before the round is spent:
+
+        * the tree under test **is** a checkout of this framework (it
+          carries ``backend/verification_ci_runner.py`` **and**
+          ``backend/pyproject.toml``) → its own copy must judge it;
+        * the loader fell back to the harness' copy anyway → that is an
+          **issue**, and it is loud: the round would be graded by code
+          the tree under test does not even carry.
+
+        Never raises: the answer is a fact about the round, and a
+        preflight that cannot answer it says so instead of failing.
+        """
+        provenance: Dict[str, Any] = {
+            "resolution": "",
+            "module_path": "",
+            "sha256": "",
+            "git_head": "",
+            "fallback_reason": "",
+            "project_is_framework_checkout": False,
+            "issues": [],
+        }
+        try:
+            from verification_ci_runner_loader import (
+                RESOLUTION_HARNESS,
+                is_framework_checkout,
+                load_ci_runner,
+            )
+
+            project_is_framework = bool(
+                is_framework_checkout(self.project_dir)
+            )
+            loaded = load_ci_runner(self.project_dir)
+            provenance.update({
+                "resolution": str(loaded.provenance.get("resolution") or ""),
+                "module_path": str(
+                    loaded.provenance.get("module_path") or ""
+                ),
+                "sha256": str(loaded.provenance.get("sha256") or ""),
+                "git_head": str(loaded.provenance.get("git_head") or ""),
+                "fallback_reason": str(
+                    loaded.provenance.get("fallback_reason") or ""
+                ),
+                "project_is_framework_checkout": project_is_framework,
+            })
+        except Exception as exc:  # noqa: BLE001
+            provenance["fallback_reason"] = f"{type(exc).__name__}: {exc}"
+            provenance["issues"].append({
+                "code": "verifier_provenance_unknown",
+                "detail": (
+                    "问不出这次判定会用哪份评分器："
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            })
+            return provenance
+
+        if (
+            provenance["project_is_framework_checkout"]
+            and provenance["resolution"] == RESOLUTION_HARNESS
+        ):
+            expected = (
+                Path(self.project_dir) / "backend" / "verification_ci_runner.py"
+            )
+            provenance["issues"].append({
+                "code": "verifier_provenance_mismatch",
+                "detail": (
+                    f"被测树就是框架仓（{expected}），但这次判定用的是 "
+                    f"harness 副本 {provenance['module_path']}"
+                    f"（回落原因：{provenance['fallback_reason']}）—— "
+                    f"该用 {expected}。"
+                ),
+            })
+        return provenance
+
+    def _audit_verifier_provenance(self, provenance: Dict[str, Any]) -> None:
+        """Say the provenance mismatch out loud, where it cannot be lost.
+
+        A mismatch is not a warning in a log file nobody reads: it means
+        the round is about to be graded by code the tree under test does
+        not carry — so it goes to the plan's durable audit file (which
+        does not depend on a round log being open) and to the structured
+        log.
+        """
+        issues = list((provenance or {}).get("issues") or [])
+        if not issues:
+            return
+        payload = {
+            "plan_id": getattr(self.plan_dir, "name", "?"),
+            "event": "verifier_provenance_mismatch",
+            "resolution": (provenance or {}).get("resolution", ""),
+            "module_path": (provenance or {}).get("module_path", ""),
+            "sha256": (provenance or {}).get("sha256", ""),
+            "git_head": (provenance or {}).get("git_head", ""),
+            "fallback_reason": (provenance or {}).get("fallback_reason", ""),
+            "project_is_framework_checkout": (provenance or {}).get(
+                "project_is_framework_checkout", False,
+            ),
+            "issues": issues,
+        }
+        try:
+            from verification_persistence import write_audit_event
+
+            write_audit_event(
+                self.plan_dir,
+                VERIFIER_PROVENANCE_AUDIT_VP_ID,
+                "verifier_provenance_mismatch",
+                dict(payload),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        logger.warning(
+            "[verification] the verifier provenance does not match the tree "
+            "under test: %s", payload,
+        )
+
+    def _root_cause_preflight(self, round_number: int) -> Dict[str, Any]:
+        """What the chain owes **before** a round runs.
+
+        The four branches (arch 决策点 6):
+
+        * **no chain** (or a chain that owns no point) →
+          ``handled=False``.  There is nothing to continue, so the round
+          runs as usual.
+        * **a stale chain** — the workspace moved on, or the record does
+          not say which commit it describes → ``handled=False``.  The
+          chain describes a failure that is not in front of us, and the
+          round has to look at the code as it is now (arch 决策点 8).
+        * **every point with a human** → ``handled=True``,
+          ``blocked=True``.  Nothing is dispatched and the round does not
+          run: the machine's road on these points is walked out.
+        * **the chain owes work** → ``handled=True``.  The tasks are
+          dispatched through the same write path the round uses
+          (:meth:`_persist_repair_tasks`), and the round does not run.
+
+        A point the chain **just demoted** to ``BLOCKED_ON_USER`` (its
+        implementation ran and it still fails) is not the preflight's
+        call: that verdict needs the round's own evidence, so the
+        preflight hands the round back (``handled=False``) and the
+        round's own chain decision makes the demotion — with the report
+        to back it.
+
+        The returned dict always carries the same keys, so a consumer can
+        read any of them without guarding for its absence.
+        """
+        decision: Dict[str, Any] = {
+            # Did the preflight take the round over?
+            "handled": False,
+            # Is the chain with a human (nothing the machine can do)?
+            "blocked": False,
+            # What the chain owes (``[]`` when it owes nothing).
+            "actions": [],
+            # The tasks that were dispatched (``[]`` when none were).
+            "tasks": [],
+            # The ids that actually landed in ``state.db``.
+            "task_ids": [],
+            # The points the decision is about.
+            "vp_ids": [],
+            # The phase the plan belongs in once the decision is acted on.
+            "phase": "",
+            # Why the preflight answered the way it did.
+            "reason": "",
+            # 2026-11-05: which ``verification_ci_runner`` would judge
+            # this round, and whether that is the tree under test's own
+            # copy.  The verdict carries it, but the verdict comes
+            # **after** the round has been spent — so the check is here,
+            # where a mismatch can still be said out loud.
+            "verifier_provenance": self._verifier_provenance_preflight(),
+        }
+        self._audit_verifier_provenance(decision["verifier_provenance"])
+
+        try:
+            chain = self._load_root_cause_chain()
+        except Exception as exc:  # noqa: BLE001
+            # A record that cannot be read is an empty chain, not an
+            # error: the worst it can do is send the plan back to the
+            # ordinary round.
+            decision["reason"] = f"chain_unreadable: {exc}"
+            return decision
+
+        vps = chain.get("vps") or {}
+        if not vps:
+            decision["reason"] = "no_root_cause_chain"
+            return decision
+
+        # 2026-11-05 (arch 决策点 8): the chain is only worth continuing
+        # while it still describes the failure in front of us.  A
+        # workspace that moved on — or a record that does not say which
+        # commit it describes — is stale, and a stale chain is not
+        # continued: the round looks at the code as it is now.
+        head_sha = self._current_head_sha()
+        if self._chain_is_stale(chain, head_sha):
+            decision["reason"] = "stale_root_cause_chain"
+            return decision
+
+        try:
+            chain_decision = self._root_cause_chain_decision(
+                [], int(round_number),
+            )
+        except Exception as exc:  # noqa: BLE001
+            decision["reason"] = f"chain_decision_failed: {exc}"
+            return decision
+
+        actions = list(chain_decision.get("actions") or [])
+        blocked = list(chain_decision.get("blocked") or [])
+        # The points that were **already** with a human when the preflight
+        # read the record — as opposed to the ones this decision demoted.
+        already_blocked = {
+            vp_id
+            for vp_id, entry in (vps or {}).items()
+            if str((entry or {}).get("stage") or "")
+            == CHAIN_STAGE_BLOCKED_ON_USER
+        }
+        newly_blocked = [
+            vp_id for vp_id in blocked if vp_id not in already_blocked
+        ]
+
+        if not actions:
+            if blocked and not newly_blocked:
+                # Every point the chain owns is already with a human.
+                # Nothing is dispatched and the round does not run.
+                decision.update({
+                    "handled": True,
+                    "blocked": True,
+                    "reason": _ROOT_CAUSE_BLOCKED_REASON,
+                    "vp_ids": sorted(blocked),
+                })
+                return decision
+            # Either the chain owes nothing, or it just demoted a point —
+            # and that verdict belongs to the round, which has the
+            # evidence for it.
+            decision["reason"] = (
+                "root_cause_demoted_to_blocked" if newly_blocked
+                else "no_root_cause_action"
+            )
+            return decision
+
+        # The chain owes work: dispatch it, and do not run the round.
+        try:
+            tasks = self._root_cause_chain_tasks(
+                actions,
+                int(round_number),
+                self._preflight_repair_seq_base(int(round_number)),
+                {},
+                self._preflight_vp_test_commands(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            decision["reason"] = f"chain_task_build_failed: {exc}"
+            return decision
+
+        for task in tasks:
+            task["origin"] = _ROOT_CAUSE_PREFLIGHT_ORIGIN
+
+        try:
+            written = self._persist_repair_tasks(tasks, int(round_number))
+        except Exception as exc:  # noqa: BLE001
+            # 2026-11-05: the write path **raises** on failure (task 9),
+            # and the preflight has to know that nothing landed.  Nothing
+            # landed → the round runs as usual, and the round's own
+            # chain decision dispatches the work with the report behind
+            # it.
+            self._log_audit(
+                "root_cause_preflight_persist_failed",
+                f"the root-cause preflight could not write its tasks: {exc}",
+                data={
+                    "plan_id": getattr(self.plan_dir, "name", "?"),
+                    "round": int(round_number),
+                },
+            )
+            decision["reason"] = f"repair_tasks_not_written: {exc}"
+            return decision
+
+        # The chain's record advances with the work: the point now owes
+        # (or has had) its implementation, so the **next** preflight must
+        # not dispatch the same task again.  The record is written once
+        # the round has decided what to do with it — and here the
+        # preflight is the round that decided.
+        if chain_decision.get("active"):
+            self._save_root_cause_chain(chain_decision["payload"])
+
+        decision.update({
+            "handled": True,
+            "blocked": False,
+            "actions": actions,
+            "tasks": tasks,
+            "task_ids": list(written),
+            "vp_ids": sorted(
+                str(action.get("vp_id") or "") for action in actions
+            ),
+            # The plan is in the repair half of the loop now: the chain's
+            # work is queued and the round did not run.
+            "phase": "verification_repairing",
+            "reason": "root_cause_chain_continued",
+        })
+        return decision
+
+    def _preflight_repair_seq_base(self, round_number: int) -> int:
+        """The next free repair-id number for this plan.
+
+        The same source the round reads (:func:`next_repair_seq_base`
+        over both stores' ids) — one counter for the whole repair chain,
+        so the preflight's ids never collide with the round's.
+        """
+        try:
+            from repair_generator import next_repair_seq_base
+            from verification.failure_history import load_task_titles
+
+            db_titles = load_task_titles(
+                _state_db_path_for_orchestrator(), self.plan_dir.name,
+            )
+            existing = set(db_titles) | set(self._load_disk_task_titles())
+            return int(next_repair_seq_base(existing, round_number))
+        except Exception as exc:  # noqa: BLE001
+            # The id allocation is an integrity improvement, never a
+            # precondition for the preflight.  Falling back to 1
+            # reproduces the pre-2026-09-20 behaviour exactly.
+            print(
+                f"[Verification] round {round_number}: repair-id allocation "
+                f"check skipped ({exc})"
+            )
+            return 1
+
+    def _preflight_vp_test_commands(self) -> Dict[str, str]:
+        """Each point's own command, read from the verification plan.
+
+        The preflight runs before a round, so it has no round report to
+        read the commands out of — the plan file is the only source.
+        """
+        try:
+            from verification.verification_report_reader import (
+                extract_vp_test_commands,
+            )
+
+            return dict(extract_vp_test_commands(
+                self.plan_dir / "verification_plan.json",
+            ))
+        except Exception:  # noqa: BLE001
+            return {}
 
     # ------------------------------------------------------------------
     # The same-failure triage
@@ -3786,6 +4395,20 @@ class VerificationOrchestrator:
                 a clean slate" behaviour that protects against stale
                 verdicts from a previous ``verification_plan.json``.
         """
+        # 2026-11-05 (arch 决策点 6/7): the root-cause chain's
+        # **preflight** comes first — before the plan enters
+        # ``verification_running`` and before a single verification point
+        # runs.  A chain that owes work is continued here, so the round
+        # that would have discovered it again is not spent.
+        #
+        # The preflight never raises and never decides on its own: it
+        # either takes the round over (``handled=True``) or hands it back
+        # (``handled=False``), and the original path below runs exactly
+        # as it did before.
+        preflight = self._root_cause_preflight(round_number=round_number)
+        if preflight.get("handled"):
+            return self._root_cause_preflight_report(preflight, round_number)
+
         # 2026-08-19 audit: the orchestrator's ``PlanState`` instance
         # is long-lived but its in-memory ``_state`` cache can drift
         # from the SQLite row whenever another writer (the ``/start``
@@ -3921,6 +4544,201 @@ class VerificationOrchestrator:
         except Exception:
             self.plan_state.verification_failed()
             raise
+
+    def _root_cause_preflight_report(
+        self, preflight: Mapping[str, Any], round_number: int,
+    ) -> Dict[str, Any]:
+        """The round report a preflight-handled cycle returns.
+
+        No verification point ran, so the report says so: it carries the
+        preflight's decision under ``root_cause_preflight`` — the key
+        every consumer reads to learn that the round was replaced by the
+        chain's work — and **no** verdict about the deliverable.
+
+        ``overall_status`` is ``FAILED`` on purpose.  The round did not
+        pass: nothing was verified, so a consumer that ignores the
+        preflight key must not read this as a pass (a pass clears the
+        chain and marks the plan delivered).
+        """
+        tasks = list(preflight.get("tasks") or [])
+        if preflight.get("blocked"):
+            summary = (
+                "the root-cause chain is with a human — no verification "
+                "round ran"
+            )
+        else:
+            summary = (
+                f"the root-cause chain's preflight dispatched "
+                f"{len(tasks)} task(s) — no verification round ran"
+            )
+        return {
+            "overall_status": "FAILED",
+            "verification_results": [],
+            "requirement_deviations": [],
+            "summary": summary,
+            "execution_profile": {"mode": "root_cause_preflight"},
+            # The decision itself — the consumer reads it, it does not
+            # have to guess what the round did.
+            "root_cause_preflight": dict(preflight),
+        }
+
+    def _persist_repair_tasks(
+        self,
+        repair_tasks: List[Dict[str, Any]],
+        round_number: int,
+    ) -> List[str]:
+        """Write a round's repair rows into ``state.db``.
+
+        This is **the** write path for repair tasks (2026-11-05): the
+        failure path (:meth:`check_cycle_conditions`) and the root-cause
+        preflight both go through it, so the two cannot drift apart — a
+        preflight row missing one field is a row the executor's orphan
+        reconcile does not recognise.
+
+        Returns the ids that were written, in the order they were
+        written.  A row that was **not** written is not in the list.
+
+        Boundaries:
+
+        * An empty batch writes nothing at all — the database is not
+          even opened.
+        * The same id twice in one batch is written **once** (the first
+          occurrence wins) and the second is skipped with a warning.
+          ``plan_tasks`` is keyed by ``(plan_id, task_id)``, so writing
+          the same id twice edits the same row twice — and the second
+          payload would silently replace the first.
+        * A write failure **raises**.  Swallowing it is the caller's
+          decision, not this method's: the failure path wants to keep
+          the round alive, the preflight wants to know that nothing
+          landed.
+        """
+        if not repair_tasks:
+            return []
+
+        from state_machine.db.connection import open as _open_db
+        from state_machine.db.schema import migrate as _migrate
+        from state_machine.repositories.plan_task_repository import (
+            ALLOWED_STATIC_TASK_FIELDS,
+            PlanTaskRepository,
+        )
+
+        plan_id = self.plan_dir.name
+        written_ids: List[str] = []
+        seen_ids: Set[str] = set()
+        conn = _open_db(_state_db_path_for_orchestrator())
+        try:
+            _migrate(conn)
+            repo = PlanTaskRepository(conn)
+            for rt in repair_tasks:
+                if not isinstance(rt, dict):
+                    continue
+                task_id = rt.get("id")
+                if not task_id:
+                    continue
+                if task_id in seen_ids:
+                    print(
+                        f"[Repair] round {round_number}: skipped duplicate "
+                        f"repair task id {task_id}"
+                    )
+                    self._log_audit(
+                        _REPAIR_TASK_DUPLICATE_EVENT,
+                        f"duplicate repair task id in round "
+                        f"{round_number}, skipped: {task_id}",
+                        data={
+                            "plan_id": plan_id,
+                            "round": round_number,
+                            "task_id": task_id,
+                        },
+                    )
+                    continue
+                seen_ids.add(task_id)
+                # ``add_task`` **rejects** a payload that carries a
+                # field it does not know (``TaskProgressValidationError``)
+                # — it does not filter it out. So the payload is
+                # narrowed to the table's own allow-list here.
+                #
+                # The repair fields (task_group / execution_group
+                # / priority / acceptance_criteria / failed_vp_id
+                # / round) are all on the allow-list as of
+                # 2026-09-08, so they pass through verbatim.
+                # ``status`` is NOT on the allow-list — it
+                # belongs to ``update_task``'s runtime mirror.
+                # :class:`RepairTaskAssembler.assemble` stamps
+                # ``status='pending'`` on every output dict,
+                # which would cause ``add_task`` to raise
+                # ``TaskProgressValidationError``. Strip the
+                # key here so ``add_task`` can apply its own
+                # default (also ``status='pending'`` — same
+                # outcome, single source of truth).
+                #
+                # 2026-10-27 (root-cause chain): the chain's
+                # tasks carry fields the repair rows never had
+                # (``kind`` / ``read_only`` / ``evidence``).
+                # They are taken out by the same narrowing — a
+                # task that cannot be written is a task the
+                # executor never runs, and one of them aborting
+                # the write would take the round's plain repair
+                # rows down with it.  What the table cannot hold
+                # stays in the fields it can: the path a
+                # diagnosis must write is in the task's
+                # description.
+                #
+                # 2026-11-03: ``deliverable`` / ``report_path``
+                # ARE on the allow-list now, and they are what
+                # makes the chain's report task dispatchable at
+                # all: without them the row rehydrates as a code
+                # task and the executor's empty-diff gate reads
+                # the delivered report as "nothing was produced".
+                #
+                # 2026-11-02: the report contract ALSO rides the
+                # **description** — the root-cause task's
+                # description carries a machine-readable marker
+                # line (see ``orphan_rules.
+                # report_deliverable_marker``), the description
+                # is stored verbatim, and the executor's orphan
+                # reconcile reads the pair back out of it.  The
+                # marker is the channel that works on a table
+                # without the two columns, so it stays even now
+                # that the columns exist.  So the task still
+                # reaches the executor as a report task —
+                # ``is_report_task()`` is true,
+                # ``PDT_REPORT_PATH`` gets stamped, and the fence
+                # lets the diagnosis write exactly that one
+                # file.  What the table cannot hold at all
+                # (``kind`` / ``read_only`` / ``evidence``)
+                # stays where it was: dropped.
+                static_payload = {
+                    k: v
+                    for k, v in rt.items()
+                    if k in ALLOWED_STATIC_TASK_FIELDS
+                }
+                repo.add_task(plan_id, static_payload)
+                written_ids.append(task_id)
+            _logger = getattr(self, "logger", None)
+            if _logger is not None:
+                try:
+                    _logger.info(
+                        "verification_repair_tasks_persisted",
+                        f"Wrote {len(written_ids)} repair tasks to state.db "
+                        f"for round {round_number}",
+                        data={
+                            "plan_id": plan_id,
+                            "round": round_number,
+                            "written": len(written_ids),
+                            "task_ids": [
+                                rt.get("id") for rt in repair_tasks
+                                if isinstance(rt, dict)
+                            ],
+                        },
+                    )
+                except Exception:
+                    pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return written_ids
 
     def check_cycle_conditions(self, report: dict, round_number: int = 1) -> dict:
         """
@@ -5095,117 +5913,20 @@ class VerificationOrchestrator:
         # ``self._current_repair_tasks`` so the legacy in-memory contract
         # is preserved.
         #
+        # 2026-11-05: the write itself moved into
+        # ``_persist_repair_tasks`` so the root-cause preflight writes
+        # through the same path; what stays here is the **handling** —
+        # this round swallows the failure, the preflight does not.
+        #
         # Note: ``RepairTaskAssembler.assemble`` stamps ``status='pending'``
         # on every output dict. ``add_task`` rejects ``status`` (it is a
-        # runtime mirror field owned by ``update_task``), so we strip it
-        # before calling — ``add_task`` defaults the new entry to
-        # ``status='pending'`` internally, so the end state is the same
-        # with a single source of truth.
+        # runtime mirror field owned by ``update_task``), so the write
+        # path strips it before calling — ``add_task`` defaults the new
+        # entry to ``status='pending'`` internally, so the end state is
+        # the same with a single source of truth.
         if repair_tasks:
             try:
-                from state_machine.db.connection import open as _open_db
-                from state_machine.db.schema import migrate as _migrate
-                from state_machine.repositories.plan_task_repository import (
-                    ALLOWED_STATIC_TASK_FIELDS,
-                    PlanTaskRepository,
-                )
-                plan_id = self.plan_dir.name
-                conn = _open_db(_state_db_path_for_orchestrator())
-                try:
-                    _migrate(conn)
-                    repo = PlanTaskRepository(conn)
-                    written = 0
-                    for rt in repair_tasks:
-                        if not isinstance(rt, dict):
-                            continue
-                        if not rt.get("id"):
-                            continue
-                        # ``add_task`` **rejects** a payload that carries a
-                        # field it does not know (``TaskProgressValidationError``)
-                        # — it does not filter it out. So the payload is
-                        # narrowed to the table's own allow-list here.
-                        #
-                        # The repair fields (task_group / execution_group
-                        # / priority / acceptance_criteria / failed_vp_id
-                        # / round) are all on the allow-list as of
-                        # 2026-09-08, so they pass through verbatim.
-                        # ``status`` is NOT on the allow-list — it
-                        # belongs to ``update_task``'s runtime mirror.
-                        # :class:`RepairTaskAssembler.assemble` stamps
-                        # ``status='pending'`` on every output dict,
-                        # which would cause ``add_task`` to raise
-                        # ``TaskProgressValidationError``. Strip the
-                        # key here so ``add_task`` can apply its own
-                        # default (also ``status='pending'`` — same
-                        # outcome, single source of truth).
-                        #
-                        # 2026-10-27 (root-cause chain): the chain's
-                        # tasks carry fields the repair rows never had
-                        # (``kind`` / ``read_only`` / ``evidence``).
-                        # They are taken out by the same narrowing — a
-                        # task that cannot be written is a task the
-                        # executor never runs, and one of them aborting
-                        # the write would take the round's plain repair
-                        # rows down with it.  What the table cannot hold
-                        # stays in the fields it can: the path a
-                        # diagnosis must write is in the task's
-                        # description.
-                        #
-                        # 2026-11-03: ``deliverable`` / ``report_path``
-                        # ARE on the allow-list now, and they are what
-                        # makes the chain's report task dispatchable at
-                        # all: without them the row rehydrates as a code
-                        # task and the executor's empty-diff gate reads
-                        # the delivered report as "nothing was produced".
-                        #
-                        # 2026-11-02: the report contract ALSO rides the
-                        # **description** — the root-cause task's
-                        # description carries a machine-readable marker
-                        # line (see ``orphan_rules.
-                        # report_deliverable_marker``), the description
-                        # is stored verbatim, and the executor's orphan
-                        # reconcile reads the pair back out of it.  The
-                        # marker is the channel that works on a table
-                        # without the two columns, so it stays even now
-                        # that the columns exist.  So the task still
-                        # reaches the executor as a report task —
-                        # ``is_report_task()`` is true,
-                        # ``PDT_REPORT_PATH`` gets stamped, and the fence
-                        # lets the diagnosis write exactly that one
-                        # file.  What the table cannot hold at all
-                        # (``kind`` / ``read_only`` / ``evidence``)
-                        # stays where it was: dropped.
-                        static_payload = {
-                            k: v
-                            for k, v in rt.items()
-                            if k in ALLOWED_STATIC_TASK_FIELDS
-                        }
-                        repo.add_task(plan_id, static_payload)
-                        written += 1
-                    _logger = getattr(self, "logger", None)
-                    if _logger is not None:
-                        try:
-                            _logger.info(
-                                "verification_repair_tasks_persisted",
-                                f"Wrote {written} repair tasks to state.db "
-                                f"for round {round_number}",
-                                data={
-                                    "plan_id": plan_id,
-                                    "round": round_number,
-                                    "written": written,
-                                    "task_ids": [
-                                        rt.get("id") for rt in repair_tasks
-                                        if isinstance(rt, dict)
-                                    ],
-                                },
-                            )
-                        except Exception:
-                            pass
-                finally:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
+                self._persist_repair_tasks(repair_tasks, round_number)
             except Exception as persist_exc:
                 # Non-fatal: the in-memory ``repair_tasks`` list is
                 # still returned for any caller that consumes it.
@@ -5214,6 +5935,13 @@ class VerificationOrchestrator:
                 # write failure leaves no disk artifact. Operators
                 # can recover by re-triggering ``check_cycle_conditions``
                 # (the next round will re-emit and re-attempt the write).
+                #
+                # The write itself lives in ``_persist_repair_tasks``
+                # (2026-11-05) — the root-cause preflight goes through
+                # the same path.  The method **raises** on a write
+                # failure; swallowing it is *this* caller's decision,
+                # because the preflight has to know that nothing landed
+                # while this round must not die over it.
                 _logger = getattr(self, "logger", None)
                 if _logger is not None:
                     try:
