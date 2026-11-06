@@ -112,6 +112,13 @@ REASON_OUTSIDE_SCOPE = "outside_scope"
 #: 拒绝证据相对 plan 目录的位置。
 REFUSAL_SUBDIR = ("vp_write_scope", "refusals")
 
+#: 拒绝记录里 ``ts`` 的形状：ISO-8601 UTC，秒级精度，``Z`` 结尾。
+#:
+#: 只有这个形状的时间戳参与"早于 since"的比较（字符串比较即可：形状固定、
+#: 都是 UTC、同一时区下的字典序就是时间序）。别的形状一律保留 —— 详见
+#: :func:`read_refusals`。
+_ISO_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
 #: 临时目录的根。``/tmp`` 与 ``/private/tmp`` 都列上：macOS 上前者是后者
 #: 的软链，Linux 上只有前者；``tempfile.gettempdir()`` 还要算进去，因为
 #: ``$TMPDIR`` 可以把临时目录挪到别处（macOS 默认就是 ``/var/folders/...``）。
@@ -1164,23 +1171,56 @@ def record_refusal(
     return marker
 
 
+def _is_iso_utc(value: Any) -> bool:
+    """Whether ``value`` is an ISO-8601 UTC stamp of the shape we write.
+
+    形状固定为 ``YYYY-MM-DDTHH:MM:SSZ``（:func:`record_refusal` 写的就是
+    这个形状）。只有这个形状的时间戳才参与"早于/晚于 since"的比较 ——
+    别的形状（``2026-11-04``、带毫秒的、带时区偏移的、根本不是字符串的）
+    一律按"看不懂"处理，而看不懂的记录**保留**：宁可多算一条证据，也不要
+    因为一条记录的时间戳长得奇怪就放过一次越权写。
+    """
+    if not isinstance(value, str):
+        return False
+    return bool(_ISO_UTC_RE.match(value))
+
+
 def read_refusals(
     plan_dir: Any,
     round_no: Any,
     vp_id: Optional[str] = None,
+    since: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Read one round's refusal records back.
+
+    2026-11-06（本轮起点）：轮次可以**退回**（``reset_rounds`` 把轮次号
+    拨回 1），而 ``round-<n>/`` 目录不会跟着清 —— 于是昨天（护栏修复前）
+    留下的拒绝记录还躺在 ``round-1/`` 里，被当成今天的证据，把整轮 VP
+    误判成 ``verifier_mutated_tree``。所以读的时候要能说清"只读本轮开始
+    之后写的"。
 
     Args:
         plan_dir: The plan directory the refusals were recorded under.
         round_no: The round to read.
         vp_id: When given, only that VP's records; otherwise every VP's.
+        since: When given, an ISO-8601 UTC stamp (``YYYY-MM-DDTHH:MM:SSZ``)
+            — records stamped **earlier** than it are dropped. Records whose
+            ``ts`` is missing or not in that shape are **kept**: an
+            unreadable timestamp is not a licence to forget the evidence.
+            ``None`` (the default) reads everything, which is what every
+            caller did before this parameter existed.
 
     Returns:
         The records, in the order they were appended. A marker line that is
         not valid JSON is skipped rather than fatal — a truncated last line
         from a crashed run must not cost the whole round's evidence.
     """
+    if since is not None and not _is_iso_utc(since):
+        # A cutoff we cannot compare against → read everything. Dropping
+        # records on the strength of a cutoff we cannot parse would be
+        # dropping evidence we do not have grounds to drop.
+        since = None
+
     directory = refusal_dir(plan_dir, round_no)
     if not directory.is_dir():
         return []
@@ -1207,6 +1247,12 @@ def read_refusals(
             except ValueError:
                 continue
             if isinstance(parsed, dict):
+                if since is not None:
+                    stamp = parsed.get("ts")
+                    if _is_iso_utc(stamp) and stamp < since:
+                        # Written before this round started → not this
+                        # round's evidence.
+                        continue
                 records.append(parsed)
     return records
 
