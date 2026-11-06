@@ -712,22 +712,28 @@ def test_passed_scenario(make_env: Any) -> None:
 
 @pytest.mark.timeout(180)
 def test_same_failure_repeated_stops(make_env: Any) -> None:
-    """连续两轮同失败 → ``verification_loop_stopped``。
+    """连续三轮同失败 → ``verification_loop_stopped``。
 
-    两轮的失败集合一模一样，回路必须收敛而不是继续修。
+    三轮的失败集合一模一样，回路必须收敛而不是继续修。同因上限是三轮
+    （两轮修复预算），所以第二轮还在预算内、第三轮才命中上限。
     """
     env = make_env()
 
     report_1, decision_1 = _run_round(env, round_number=1)
     assert decision_1.get("status") == "verification_failed", decision_1
 
-    # 第二轮：缺陷没修，失败集合与上一轮相同。
+    # 第二轮：缺陷没修，失败集合与上一轮相同 —— 还在修复预算内，不停机。
     report_2, decision_2 = _run_round(env, round_number=2)
     assert report_2.get("overall_status") == "FAILED", report_2
-    assert decision_2.get("status") == "loop_stopped", decision_2
-    assert decision_2.get("stop_reason") == (
+    assert decision_2.get("status") != "loop_stopped", decision_2
+
+    # 第三轮：失败集合仍然相同 → 命中同因上限 → 停机。
+    report_3, decision_3 = _run_round(env, round_number=3)
+    assert report_3.get("overall_status") == "FAILED", report_3
+    assert decision_3.get("status") == "loop_stopped", decision_3
+    assert decision_3.get("stop_reason") == (
         "same_failure_repeated_after_max_attempts"
-    ), decision_2
+    ), decision_3
 
     state = env.plan_state()
     assert state.get_current_phase() == "verification_loop_stopped", (
@@ -741,6 +747,14 @@ def test_same_failure_repeated_stops(make_env: Any) -> None:
     ), state.get_verification_stop_reason()
     _assert_no_blocked_on_user(env, report_1, decision_1)
     _assert_no_blocked_on_user(env, report_2, decision_2)
+
+    # 第三轮是停机轮：根因链删除后，终局决策搬进了同因上限的停机分支，
+    # 所以这一轮**要**人来决定（2026-11-06）—— 它不再是"没有人被问"。
+    assert decision_3.get("needs_operator_decision") is True, decision_3
+    for result in report_3.get("verification_results", []) or []:
+        assert result.get("status") != "BLOCKED", (
+            f"{result.get('id')} 被判成 BLOCKED —— 场景不允许等用户"
+        )
 
 
 @pytest.mark.timeout(180)

@@ -702,6 +702,22 @@ STOP_REASON_CRITERION_DEFECT = "same_failure_criterion_defect"
 #: on disk, so the loop continues with the *new* criterion.
 REASON_CRITERION_REPLACED = "criterion_replaced"
 
+#: The reason a round carries when the repair budget is spent and the
+#: failure is still there.
+#:
+#: 2026-11-06 (the root-cause chain is gone): the chain used to be the
+#: thing that escalated a repeated failure, and it had its own stages.
+#: With the chain deleted there is one ordinary repair loop, so the
+#: repeat itself has to carry the verdict: the same failure repeated
+#: after the budget was spent → a human has to look.
+#:
+#: The spelling is the state machine's own closed vocabulary
+#: (``same_failure_repeated_after_max_attempts`` is in
+#: ``plan_state.stop_verification_loop``'s valid reasons), so the code
+#: the triage's verdict carries is the code the machine compares
+#: against.
+STOP_REASON_MAX_ATTEMPTS = "same_failure_repeated_after_max_attempts"
+
 #: The source a question asked from the verification side carries.
 #:
 #: The verification loop waits for the questions it recognises by this
@@ -1701,11 +1717,21 @@ class VerificationOrchestrator:
         #   哪个点、哪一类失败、分诊自己说了什么）；
         # * 分诊本身炸了 → 既不终止也不作废计数：坏的分诊不是关于失败的证据。
         #
-        # 计数的单位：阈值 2 = **同一个 `(点, 失败类别)` 连续失败两轮**就
-        # 触发分诊（首次失败那轮记 1，第二轮记 2）。这是"轮数"，不是
-        # "重复次数"——后者见 `_consecutive_same_failure_rounds` 的
+        # 计数的单位：阈值 3 = **同一个 `(点, 失败类别)` 连续失败三轮**就
+        # 触发分诊（首次失败那轮记 1，第二轮记 2，第三轮记 3）。这是"轮数"，
+        # 不是"重复次数"——后者见 `_consecutive_same_failure_rounds` 的
         # docstring，两者相差一轮。
-        self._MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS = 2
+        #
+        # 2026-11-06（删掉根因链之后）：阈值 2 → 3，也就是**最多两轮修复**。
+        # 根因链整条删掉以后，回路只剩"VP 失败 → 生成修复任务 → 执行 →
+        # 再验证"这一条普通修复回路，而普通回路需要一个绝对上限：分诊对
+        # deliverable defect 会**清零计数**（见 `classify_cycle`），没有绝对
+        # 上限就会无限重修下去。
+        #
+        # 阈值 3 的实际账：第 1 次同因失败记 1（生成第一批修复任务），第 2 次
+        # 记 2（第二批修复任务），第 3 次记 3 命中阈值 → 分诊 → 停下并问人。
+        # 所以**恰好两批**修复任务，第三批不再生成。
+        self._MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS = 3
         # ``vp_id -> list of {round, actual_result, evidence}`` —
         # one entry per round where the VP failed. The list grows
         # monotonically and is cleared only when the VP passes.
@@ -3237,8 +3263,9 @@ class VerificationOrchestrator:
         count is the number of rounds that failure has repeated — one on
         the round it first failed. The cap is
         ``_MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS`` **rounds**, so a cap of
-        2 fires on the round the same failure repeats for the second
-        time.
+        3 fires on the round the same failure repeats for the third
+        time — that is, after **two** repair rounds have already been
+        spent on it.
 
         Only the current round's keys are considered: a count left over
         from an earlier round describes a failure that is not being made
@@ -3754,17 +3781,25 @@ class VerificationOrchestrator:
 
     def _terminal_decision_question(
         self, report, round_number, failed_vp_ids, repair_task_count=0,
+        stop_reason: str = "repair_execution_failed",
     ) -> Dict[str, Any]:
         """The question the terminal branch puts to a human.
 
         A terminal branch that cannot repair its way out stops and asks
         a human how to proceed.  The question carries **facts**, not an
         adjective: which round stopped, that it stopped for
-        ``repair_execution_failed``, how many repair tasks were
-        produced, and which verification points failed with which
-        verdict.  A human asked "the plan failed, what now?" cannot
-        answer without going and reading the report; a human asked this
-        can.
+        ``stop_reason``, how many repair tasks were produced, and which
+        verification points failed with which verdict.  A human asked
+        "the plan failed, what now?" cannot answer without going and
+        reading the report; a human asked this can.
+
+        ``stop_reason`` is the **real** reason the round stopped
+        (2026-11-06).  It used to be the hard-coded
+        ``repair_execution_failed``, which was the root-cause chain's
+        own reason; with the chain deleted the round stops for other
+        reasons (the same failure repeated after the repair budget was
+        spent), and a question that names the wrong reason is a
+        question about something that did not happen.
 
         When the failure scene has been **analysed** — the judge read
         it and said what it means — the analysis is the question: the
@@ -3799,6 +3834,11 @@ class VerificationOrchestrator:
             value and not a placeholder; the parameter exists so a
             caller whose branch does produce tasks can pass the real
             count.
+        stop_reason:
+            Why the round stopped — the machine-facing code the state
+            machine's vocabulary knows.  It is what the question says
+            the round stopped *for*, and what the archive and the
+            analysis are recorded under.
 
         Returns:
             The question, the answers on the table and the answer to
@@ -3831,7 +3871,7 @@ class VerificationOrchestrator:
         ) or "none"
         question = (
             f"verification round {int(round_number)} stopped with "
-            f"repair_execution_failed: {int(repair_task_count)} repair task(s) "
+            f"{str(stop_reason)}: {int(repair_task_count)} repair task(s) "
             f"were generated; failed checks: {reported}. Choose how to proceed."
         )
         # The analysis is what the failure scene **means**, read by the
@@ -3842,6 +3882,7 @@ class VerificationOrchestrator:
         # two ways of having none behave the same way.
         analysis = self._terminal_analysis(
             report, round_number, failed_vp_ids, repair_task_count,
+            stop_reason=stop_reason,
         )
         if isinstance(analysis, Mapping):
             rendered = render_analysis(analysis)
@@ -4171,6 +4212,7 @@ class VerificationOrchestrator:
         round_number: int,
         failed_vp_ids: List[str],
         repair_task_count: int = 0,
+        stop_reason: str = "repair_execution_failed",
     ) -> Optional[Dict[str, Any]]:
         """What the terminal round's failure scene means — or ``None``.
 
@@ -4214,7 +4256,7 @@ class VerificationOrchestrator:
             answer = judge.analyze(
                 plan_id=self.plan_dir.name,
                 round_number=int(round_number),
-                stop_reason="repair_execution_failed",
+                stop_reason=str(stop_reason),
                 repair_task_count=int(repair_task_count),
                 deferred_count=self._terminal_deferred_count(report),
                 failed_points=self._terminal_failed_points(
@@ -4282,6 +4324,7 @@ class VerificationOrchestrator:
         report: Dict[str, Any],
         round_number: int,
         failed_vp_ids: List[str],
+        stop_reason: str = "repair_execution_failed",
     ) -> Optional[Path]:
         """Write the terminal decision's session and analysis to the sidecar.
 
@@ -4354,7 +4397,7 @@ class VerificationOrchestrator:
                 failed_points=self._terminal_failed_points(
                     report, failed_vp_ids,
                 ),
-                stop_reason="repair_execution_failed",
+                stop_reason=str(stop_reason),
                 round_number=int(round_number),
             )
             # ``build_record`` normalises a missing analysis to an empty
@@ -4740,14 +4783,21 @@ class VerificationOrchestrator:
           criterion is replaced on disk (the broken one is obsoleted, a
           new one is added) and the loop continues with the new
           criterion. The replacement is only used when it checks at
-          least as much as the criterion it replaces.
+          least as much as the criterion it replaces. The counter for
+          that failure is voided: the criterion is new, so the failure
+          is new too.
         * **A criterion defect without a replacement** → the loop
           stops: no amount of rework can satisfy a broken check, and
           nobody said what the check should be, so a human has to fix
           the criterion.
-        * **Anything else** → the loop diverts into the repair path
-          with a fresh budget for this failure (the triage HAS decided,
-          so the same-cause counter starts over).
+        * **A criterion defect whose replacement was refused** → the
+          criterion stays broken, so the loop stops too (2026-11-06).
+        * **Anything else** → the loop stops (2026-11-06). The triage
+          only runs **at** the cap, so this branch already means the
+          repair budget is spent; the root-cause chain that used to
+          escalate a repeated failure is gone, and voiding the
+          same-cause counter here is how the same failure would be
+          repaired over and over.
         * **A triage that malfunctioned** → the loop does *not* stop:
           the provider blew up, the answer was unreadable, or the quote
           it carried could not be verified. None of that is a
@@ -4848,10 +4898,11 @@ class VerificationOrchestrator:
             #   disk (the old one obsoleted, a new one added) and the
             #   loop continues with the new criterion;
             # * the proposal existed but could not be used (a weaker
-            #   method, a write that failed) → the criterion stays and
-            #   the failure is downgraded to a deliverable defect, so
-            #   the loop keeps working instead of stopping on something
-            #   it cannot repair;
+            #   method, a write that failed) → the criterion stays, and
+            #   the loop **stops** (2026-11-06: with the root-cause
+            #   chain gone there is no other loop control for the
+            #   point, so diverting here would repair the same failure
+            #   over and over);
             # * no proposal at all → a human has to decide what the
             #   criterion should be, so the loop stops.
             outcome = self._apply_criterion_replacement(
@@ -4889,8 +4940,7 @@ class VerificationOrchestrator:
                     "void_counter": False,
                 }
             # A proposal that could not be used: the criterion stays as
-            # it is, and the failure is treated as a deliverable defect
-            # so the loop keeps repairing instead of stopping.
+            # it is, and the failure is treated as a deliverable defect.
             #
             # 2026-10-23 (VP-020): the refusal is recorded, not just
             # survived. The reason travels with the round's decision, so
@@ -4898,34 +4948,71 @@ class VerificationOrchestrator:
             # proposal checked less than the criterion it replaces" —
             # and the criterion is *not* treated as obsoleted, because
             # the plan on disk still says it is there.
+            #
+            # 2026-11-06 (the root-cause chain is gone): this branch used
+            # to divert the failure into the repair path **and void the
+            # same-cause counter** — a fresh budget for a failure that
+            # had already spent its budget. With the chain deleted there
+            # is no other loop control left for the point, so voiding
+            # the counter here is how the loop repairs the same failure
+            # forever. The branch now stops instead: the criterion stays
+            # broken, the deliverable may be fine, and only a human can
+            # say which of the two it is.
             rejected_reason = str(
                 outcome.get("replacement_rejected_reason") or ""
             )
             self._log_triage(
                 vp_id, failure_class,
-                "criterion defect — replacement refused, diverting into "
-                "repair",
+                "criterion defect — replacement refused, the repair "
+                "budget is spent — stopping for a human",
             )
             return {
-                "should_stop": False,
-                "stop_reason": None,
+                "should_stop": True,
+                "stop_reason": {
+                    "reason": STOP_REASON_MAX_ATTEMPTS,
+                    "vp_id": vp_id,
+                    "failure_class": failure_class,
+                    "triage_rationale": rationale,
+                    "criterion_replacement_refused": True,
+                    "replacement_rejected_reason": rejected_reason,
+                    "replacement_rejected_error": str(outcome.get("error") or ""),
+                },
                 "reason": DELIVERABLE_DEFECT,
-                "void_counter": True,
+                "void_counter": False,
                 "replacement_rejected_reason": rejected_reason,
                 "replacement_rejected_error": str(outcome.get("error") or ""),
             }
 
         # A deliverable defect (or a class the loop may retry / skip):
-        # the loop keeps working on it — with a fresh budget, because
-        # the triage HAS decided what the failure is.
+        # the failure is the work's own, and the work has already been
+        # repaired twice.
+        #
+        # 2026-11-06 (the root-cause chain is gone): this branch used to
+        # divert the failure into the repair path **and void the
+        # same-cause counter** — the triage "decided what the failure
+        # is", so the failure got a fresh budget. That was safe while
+        # the root-cause chain was the thing that escalated a failure
+        # that kept repeating; with the chain deleted there is no other
+        # loop control, so voiding the counter is how the same failure
+        # gets repaired over and over. The triage only runs **at** the
+        # cap, so reaching this branch already means the budget is
+        # spent: the loop stops here and a human is asked what happens
+        # next.
         self._log_triage(
-            vp_id, failure_class, f"{concluded_class} — diverting into repair",
+            vp_id, failure_class,
+            f"{concluded_class} — the repair budget is spent, stopping "
+            f"for a human",
         )
         return {
-            "should_stop": False,
-            "stop_reason": None,
+            "should_stop": True,
+            "stop_reason": {
+                "reason": STOP_REASON_MAX_ATTEMPTS,
+                "vp_id": vp_id,
+                "failure_class": failure_class,
+                "triage_rationale": rationale,
+            },
             "reason": concluded_class,
-            "void_counter": True,
+            "void_counter": False,
         }
 
     def _criterion_replacement_guard(
@@ -6171,6 +6258,15 @@ class VerificationOrchestrator:
                     "void_vp_ids": sorted(void_vp_ids),
                     "undefined_vp_ids": sorted(undefined_vp_ids),
                     "operator_action": operator_action,
+                    # 2026-11-06: the round stopped **after** the triage
+                    # read the criterion, so the two facts the triage
+                    # produced travel with the verdict — a replacement
+                    # that was refused (and why) and the replacements
+                    # that were used.  Before, only the round that kept
+                    # going carried them, so a round that stopped on a
+                    # refused replacement lost the reason.
+                    "criterion_replacements": criterion_replacements,
+                    "replacement_rejected_reason": replacement_rejected_reason,
                     # 2026-10-27 — the same two fields every return path
                     # carries. On this path the round stopped instead of
                     # repairing, so the list says which points had a
@@ -6198,6 +6294,101 @@ class VerificationOrchestrator:
                 self._save_triage_verdict(
                     decision.get("stop_reason") or {}, round_number,
                 )
+                # 2026-11-06 (the root-cause chain is gone): the round
+                # that stops **asks** what happens next.
+                #
+                # The chain's terminal branch used to own this: the
+                # machine's road on the chain's points was walked out, so
+                # the round raised two flags and asked nothing — a sign
+                # saying "a hand is needed" with nothing on the table to
+                # decide on.  With the chain deleted this branch is the
+                # only terminal path the ordinary repair loop has, so
+                # the whole terminal-decision apparatus moves here: the
+                # question, the decision, the session, the archive.
+                #
+                # The question is about the **plan**, not about one point
+                # (``vp_id=None``): the person who decides what happens
+                # to the plan is not one point's owner.
+                stop_reason = stop_reason_code(stop_payload)
+                terminal_failed_ids = self._terminal_failed_vp_ids(
+                    report, current_failed_ids, [],
+                )
+                terminal_question = self._terminal_decision_question(
+                    report, round_number, terminal_failed_ids,
+                    stop_reason=stop_reason,
+                )
+                # 2026-11-06: the round's **analysis** is a fact about
+                # this round, and it is computed whether or not the plan
+                # is asked again — ``_terminal_decision_question`` runs
+                # the judge before the check below.  So the decision id
+                # starts empty: the branch that asks nobody leaves it
+                # empty on purpose.
+                decision_id = ""
+                # 2026-11-04: the plan is asked **once**.  The question
+                # is about the plan, so the point-keyed check cannot see
+                # it, and without a plan-level check every entry into
+                # this branch wrote a new row: the person who answers it
+                # got the same question once per round.
+                if self._plan_has_terminal_decision(
+                    self.plan_dir.name, round_number,
+                ):
+                    self._log_audit(
+                        "verification_terminal_decision_already_asked",
+                        f"the plan was already asked what happens next — "
+                        f"the round {round_number} asks once",
+                        data={
+                            "plan_id": self.plan_dir.name,
+                            "round": round_number,
+                        },
+                    )
+                else:
+                    decision_id = self._ask_a_human_about(
+                        round_number=round_number,
+                        question=terminal_question["question"],
+                        options=terminal_question["options"],
+                        default_option=terminal_question["default_option"],
+                        vp_id=None,
+                        check_open_question=False,
+                    )
+                    # 2026-11-05: the decision now exists, so the
+                    # round's analysis session and the analysis itself
+                    # have something to belong to.
+                    self._record_terminal_decision_session(
+                        decision_id=decision_id,
+                        analysis=self._terminal_last_analysis,
+                        report=report,
+                        round_number=round_number,
+                        failed_vp_ids=terminal_failed_ids,
+                        stop_reason=stop_reason,
+                    )
+                # 2026-11-06: the analysis is archived **whatever** the
+                # branch above did — a model call that already happened
+                # must not be thrown away.
+                self._save_terminal_cpea_archive(
+                    round_number=round_number,
+                    stop_reason=stop_reason,
+                    question=terminal_question["question"],
+                    options=terminal_question["options"],
+                    default_option=terminal_question["default_option"],
+                    analysis=self._terminal_last_analysis,
+                    decision_id=decision_id,
+                    failed_vp_ids=terminal_failed_ids,
+                )
+                # The two flags the round carries are **read**, not
+                # asserted: a question that reached nobody (it may have
+                # been settled ``unroutable``) leaves nobody waiting.
+                waiting = self._waiting_for_a_human_answer()
+                stop_payload["needs_operator_decision"] = (
+                    bool(decision_id) or waiting
+                )
+                stop_payload["waiting_for_user"] = waiting
+                stop_payload["blocked_on_user"] = waiting
+                # The machine's road on this failure is walked out: the
+                # same failure repeated after the repair budget was
+                # spent.  The field keeps the name the chain's terminal
+                # branch used, so a consumer that reads it does not
+                # break.
+                stop_payload["machine_exhausted"] = True
                 return stop_payload
             if decision.get("void_counter"):
                 # The triage decided what this failure is, so the

@@ -512,14 +512,20 @@ def test_same_failure_counts_untouched(plan_dir, project_dir, repair_mocks):
     _, r1 = _run_round(plan_dir, project_dir, report, 1, judge=_InconclusiveJudge())
     assert r1["status"] != "loop_stopped", "the first failure is not a repeat"
 
-    orch, r2 = _run_round(plan_dir, project_dir, report, 2, judge=_InconclusiveJudge())
-    assert r2["status"] == "loop_stopped", (
-        "the same failure for a second round still stops the loop"
+    _, r2 = _run_round(plan_dir, project_dir, report, 2, judge=_InconclusiveJudge())
+    assert r2["status"] != "loop_stopped", (
+        "the second failure is still inside the repair budget (2026-11-06: "
+        "the budget is two rounds)"
     )
-    assert orch._same_failure_counts == {DECISION_KEY: 2}, (
+
+    orch, r3 = _run_round(plan_dir, project_dir, report, 3, judge=_InconclusiveJudge())
+    assert r3["status"] == "loop_stopped", (
+        "the same failure for a third round stops the loop"
+    )
+    assert orch._same_failure_counts == {DECISION_KEY: 3}, (
         "the old counter still counts the repeat"
     )
-    assert r2["root_cause_vp_ids"] == [], (
+    assert r3["root_cause_vp_ids"] == [], (
         "the same failure is the old key's business — the fingerprint "
         "branch must not claim it"
     )

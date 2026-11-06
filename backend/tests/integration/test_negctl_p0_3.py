@@ -10,7 +10,8 @@ not tell a broken criterion (a human must fix the check) from a wrong
 deliverable (the work must be redone), so it took the former for the
 latter and killed the chain.
 
-The fix raised the threshold to ``2`` **and** turned the cap into a
+The fix raised the threshold (to ``2`` then, to ``3`` in 2026-11-06)
+**and** turned the cap into a
 semantic triage: reaching it buys one ``VPTriageJudge`` call, and the
 triage's verdict decides between stopping and diverting into the repair
 path.
@@ -113,7 +114,7 @@ RED_THRESHOLD_LINE = (
 RED_BRANCH_LINE = "RED: pre-fix same-failure branch returns repair_tasks=[]"
 
 #: The script's GREEN line — the fixed shape, found in the working tree.
-GREEN_LINE = "GREEN: current orchestrator.py has threshold 2 and triage dispatch"
+GREEN_LINE = "GREEN: current orchestrator.py has threshold 3 and triage dispatch"
 
 #: The script's PASS line.
 PASS_LINE = "PASS: negctl-p0-3"
@@ -125,7 +126,7 @@ PRE_FIX_THRESHOLD = "self._MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS = 1"
 
 #: The fix's threshold, quoted from the current
 #: ``backend/verification/orchestrator.py``.
-POST_FIX_THRESHOLD = "self._MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS = 2"
+POST_FIX_THRESHOLD = "self._MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS = 3"
 
 #: The triage call, quoted from the current
 #: ``backend/verification/orchestrator.py``. The pre-fix source has no
@@ -225,7 +226,7 @@ def _prefix_source() -> str:
 
     Two things changed in the fix, and both are reverted here:
 
-    1. the threshold — ``2`` back to ``1``, so the cap fires on the
+    1. the threshold — ``3`` back to ``1``, so the cap fires on the
        first repeat instead of the second;
     2. the triage — the ``classify_cycle`` call replaced by a verdict
        the branch can act on without asking anyone, so the branch
@@ -400,7 +401,7 @@ def test_negctl_p0_3_passes():
       * confirm the pre-fix branch returned an empty ``repair_tasks``
         without dispatching a triage (the second RED line) — that is
         the behaviour the fix replaced;
-      * confirm the current source has the threshold at 2 and does
+      * confirm the current source has the threshold at 3 and does
         dispatch a triage (the GREEN line);
       * print exactly one PASS line.
     """
@@ -453,7 +454,7 @@ def test_negctl_p0_3_passes():
 def test_negctl_p0_3_detects_prefix():
     """Pointing the baseline at the POST-fix source makes the script fail.
 
-    ``HEAD`` holds the fixed source: the threshold is 2 and the branch
+    ``HEAD`` holds the fixed source: the threshold is 3 and the branch
     dispatches a triage. A control that accepted it as a pre-fix
     baseline would be measuring nothing — so the script must exit
     non-zero and say which shape it did not find.
@@ -592,9 +593,9 @@ def test_negctl_p0_3_detects_an_unguarded_triage():
     source = (PROJECT_ROOT / TARGET_REL).read_text(encoding="utf-8")
 
     facts = _analyse(source)
-    assert facts["threshold"] == "2", (
+    assert facts["threshold"] == "3", (
         f"the current source's threshold is {facts['threshold']!r}, "
-        f"expected '2' — the fixture this test mutates is not the fixed one"
+        f"expected '3' — the fixture this test mutates is not the fixed one"
     )
     assert facts["triage_dispatch"] == "1"
     assert facts["stop_guarded_by_triage"] == "1", (

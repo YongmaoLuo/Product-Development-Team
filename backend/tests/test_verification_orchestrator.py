@@ -366,7 +366,21 @@ class TestStateTransitions:
                 "the first failure is not a repeat yet — no triage is due"
             )
 
-            # Second cycle with IDENTICAL failure → must terminate
+            # Second cycle with the IDENTICAL failure → still inside
+            # the repair budget (the cap is three rounds), so no triage yet.
+            orch.start_verification_cycle(round_number=2)
+            second = orch.check_cycle_conditions(report)
+
+            assert judge.calls == [], (
+                "the cap is three rounds — the second repeat is still "
+                "inside the repair budget"
+            )
+            assert second["status"] != "loop_stopped", (
+                "the second identical round is still inside the repair "
+                "budget — it must not stop the loop"
+            )
+
+            # Third cycle with the IDENTICAL failure → must terminate
             orch.start_verification_cycle(round_number=2)
             result = orch.check_cycle_conditions(report)
 
@@ -375,7 +389,7 @@ class TestStateTransitions:
                 "round and not one per point"
             )
             assert result["status"] == "loop_stopped", (
-                "Two rounds with the SAME failure set must stop the loop — "
+                "Three rounds with the SAME failure set must stop the loop — "
                 "that is the documented stop condition"
             )
             assert result["stop_reason"] == (
@@ -386,8 +400,8 @@ class TestStateTransitions:
                 "Nothing left to repair — the same fix already ran and "
                 "changed nothing"
             )
-            assert orch._consecutive_same_failure_rounds == 1, (
-                "Counter counts repeats: the 2nd identical round is 1"
+            assert orch._consecutive_same_failure_rounds == 2, (
+                "Counter counts repeats: the 3rd identical round is 2"
             )
             assert result["stop_reason"]["reason"] == (
                 "same_failure_no_triage_conclusion"
@@ -489,30 +503,43 @@ class TestStateTransitions:
                 "the first failure is not a repeat yet — no triage is due"
             )
 
-            # Round 2 — same failures → the threshold is reached → the
-            # triage is asked, and its verdict stops the chain.
+            # Round 2 — same failures → still inside the repair budget
+            # (the cap is three rounds), so the triage is not due yet.
             orch.start_verification_cycle(round_number=2)
             r2 = orch.check_cycle_conditions(failed_report)
+            assert judge.calls == [], (
+                "the cap is three rounds — the second repeat is still "
+                "inside the repair budget"
+            )
+            assert r2["status"] != "loop_stopped", (
+                "the second identical round is still inside the repair "
+                "budget — it must not stop the loop"
+            )
+
+            # Round 3 — same failures → the threshold is reached → the
+            # triage is asked, and its verdict stops the chain.
+            orch.start_verification_cycle(round_number=3)
+            r3 = orch.check_cycle_conditions(failed_report)
             assert len(judge.calls) == 1, (
                 "the threshold buys exactly one triage call — not one per "
                 "round and not one per point"
             )
-            assert r2["status"] == "loop_stopped", (
-                "Round 2 repeating round 1's failure set MUST terminate — "
-                "two identical rounds is the documented stop condition"
+            assert r3["status"] == "loop_stopped", (
+                "Round 3 repeating round 1's failure set MUST terminate — "
+                "three identical rounds is the documented stop condition"
             )
-            assert orch._consecutive_same_failure_rounds == 1
-            assert r2["stop_reason"] == "same_failure_repeated_after_max_attempts"
-            assert r2["should_stop"] is True
-            assert r2["repair_tasks"] == []
-            assert r2["stop_reason"]["reason"] == (
+            assert orch._consecutive_same_failure_rounds == 2
+            assert r3["stop_reason"] == "same_failure_repeated_after_max_attempts"
+            assert r3["should_stop"] is True
+            assert r3["repair_tasks"] == []
+            assert r3["stop_reason"]["reason"] == (
                 "same_failure_no_triage_conclusion"
             ), (
                 "the triage ran and could not name the failure — the "
                 "reason says so, and says which point and which class"
             )
-            assert r2["stop_reason"]["vp_id"] == "VP-006"
-            assert r2["stop_reason"]["failure_class"] == (
+            assert r3["stop_reason"]["vp_id"] == "VP-006"
+            assert r3["stop_reason"]["failure_class"] == (
                 "deliverable_defect"
             ), "a report that names no class reads as a deliverable defect"
 
@@ -1004,10 +1031,21 @@ class TestPersistence:
                 "the first failure is not a repeat yet — no triage is due"
             )
 
-            # Second check with the same failure — the count reaches the
+            # Second check with the same failure — still inside the
+            # repair budget (the cap is three rounds), so the triage is
+            # not due yet.
+            orch.start_verification_cycle(round_number=2)
+            second = orch.check_cycle_conditions(failed_report)
+            assert judge.calls == [], (
+                "the cap is three rounds — the second repeat is still "
+                "inside the repair budget"
+            )
+            assert second["status"] != "loop_stopped"
+
+            # Third check with the same failure — the count reaches the
             # threshold, so the triage is asked; its verdict stops the
             # chain.
-            orch.start_verification_cycle(round_number=2)
+            orch.start_verification_cycle(round_number=3)
             result = orch.check_cycle_conditions(failed_report)
 
             assert len(judge.calls) == 1, (
@@ -1015,13 +1053,13 @@ class TestPersistence:
                 "round and not one per point"
             )
             assert (
-                orch._consecutive_same_failure_rounds == 1
-            ), "Counter counts repeats: the 2nd identical round is 1"
+                orch._consecutive_same_failure_rounds == 2
+            ), "Counter counts repeats: the 3rd identical round is 2"
             assert result["status"] == "loop_stopped"
 
             raw = _read_state(temp_plan_dir)
             assert raw["current_phase"] == "verification_loop_stopped", (
-                "Two identical failure sets must park the plan — the "
+                "Three identical failure sets must park the plan — the "
                 "executor already tried a fix and it changed nothing"
             )
             assert raw["verification"].get("stop_reason") == (
