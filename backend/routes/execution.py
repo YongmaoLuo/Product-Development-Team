@@ -38,6 +38,14 @@ import server as _server
 # directory is.
 from project_dir_guard import ProjectDirInvalidError, validate_project_dir
 
+# The CI-adapter gate: "does this project provide an executable
+# ``scripts/ci_gate.sh``?".  The rule lives in ONE place
+# (``backend/ci_adapter.py``) because the import lane and this start lane
+# ask the same question -- two copies of the rule drift, and the drift
+# shows up as "passed at import, refused at start".  Imported by value (it
+# has no state and no late binding to preserve).
+from ci_adapter import missing_ci_adapter
+
 # The process ledger is the durable record of what this backend started.
 # ``record_spawn`` / ``record_exit`` are imported by value so the seam
 # is explicit and a test can make the write fail on purpose; the
@@ -2517,6 +2525,22 @@ START_ERROR_ALREADY_RUNNING = "already_running"
 #: The error a start answers when a forced sweep left something alive.
 START_ERROR_KILL_INCOMPLETE = "kill_incomplete"
 
+#: The plan-directory member that says "this plan came from the import
+#: lane".  The import lane writes the caller's upstream material there
+#: verbatim (``fast_lane.store_import_payload``); no other lane writes
+#: that file, so its presence is the only evidence of where the plan came
+#: from.
+#:
+#: The name is spelled out here rather than imported because TWO modules
+#: carry a copy of the constant (``fast_lane.IMPORT_PAYLOAD_FILENAME``
+#: and ``tasks_generator.IMPORT_PAYLOAD_FILENAME``) -- picking one of
+#: them would be arbitrary, and the plan directory's member name is a
+#: contract between the lane that writes it and the lane that reads it.
+#: ``backend/tests/unit/test_ci_adapter_start.py`` pins this name against
+#: the one the import lane writes, so a rename there turns the alarm on
+#: here instead of silently disabling the gate.
+IMPORT_PAYLOAD_FILENAME = "import.json"
+
 
 def _owner_is_alive(record: Any) -> Optional[bool]:
     """Is the process that started this one still running?
@@ -2928,6 +2952,36 @@ def start_execution(
     except ProjectDirInvalidError as exc:
         _record_project_dir_rejection(plan_id, plan_dir, exc)
         raise HTTPException(400, str(exc))
+
+    # --- The CI-adapter gate (imported plans only) ----------------------
+    # A plan whose directory carries ``import.json`` came through the
+    # import lane: the caller pointed at THEIR OWN checkout and expects
+    # the CI gate to run there.  If that project has no executable
+    # ``scripts/ci_gate.sh`` there is nothing to judge the run against --
+    # so the start is refused instead of spawning an executor whose
+    # result nobody can call green or red.
+    #
+    # Only imported plans are checked.  The PRD lane keeps the contract
+    # it has always had ("no pre-run gate" -- see
+    # ``backend/tests/contract/test_no_prerun_gate.py``), and so do the
+    # plans that predate the import lane.
+    #
+    # The order is load-bearing:
+    #
+    #   * AFTER ``validate_project_dir`` -- a request naming a directory
+    #     that does not exist is answered with THAT 400.  The adapter
+    #     gate must not mask it: the missing directory is the problem
+    #     the operator has to fix first, and a second reason about a
+    #     script they never mentioned sends them the wrong way.
+    #   * BEFORE the single-instance guard and BEFORE the routing CAS --
+    #     a refusal must leave the plan in the phase it was in (never
+    #     ``executing``), must spawn nothing and must not write an
+    #     execution row.  The rejection's only landing place is the
+    #     response body.
+    if (plan_dir / IMPORT_PAYLOAD_FILENAME).exists():
+        adapter_reason = missing_ci_adapter(project_dir)
+        if adapter_reason is not None:
+            raise HTTPException(400, adapter_reason)
 
     # --- The single-instance guard --------------------------------------
     # The ledger is asked whether this plan already has a live

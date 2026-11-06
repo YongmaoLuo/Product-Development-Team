@@ -258,7 +258,7 @@ VERIFICATION_PLAN_SYSTEM_PROMPT = """你是一位资深测试架构师。你的�
       "verification_phase": 2,
       "phase_order": 1,
       "priority": "high",
-      "ci_entry": "<当前项目根目录下可直接执行的整仓 CI 总入口>",
+      "ci_entry": "bash scripts/ci_gate.sh",
       "ci_timeout_seconds": 7200,
       "expected_result": "整仓门禁与全部测试通过，退出码 0；退出码 3 表示机器答不了（宿主不可测），不是代码失败"
     },
@@ -332,9 +332,9 @@ VP 开始之前，把这些服务**统一启动一次**，然后让所有 VP 请
   **只有 Phase 1 全部通过之后才会执行**；Phase 1 有失败时它们会被系统标记
   为 DEFERRED（本轮延后）而不执行。顺序固定，两种关卡各有自己的方法：
     · `phase_order: 1` —— 全量 **Nightly CI**（整仓门禁 + 全部测试）**先跑**
-      → `verification_method: "full_ci"`，`ci_entry` 写项目根目录下可直接
-      执行的整仓 CI 总入口。判定依据就是这条入口的退出码，框架自己跑、
-      自己读，你没有别的字段要填。
+      → `verification_method: "full_ci"`，`ci_entry` 写**一条调用项目 CI
+      适配脚本的命令**（示例：`bash scripts/ci_gate.sh`）。判定依据就是
+      这条入口的退出码，框架自己跑、自己读，你没有别的字段要填。
     · `phase_order: 2` —— 全量 **E2E 测试**（端到端真实链路）**后跑**，
       且只有 Nightly CI 通过之后才会执行
       → `verification_method: "e2e"`，真开浏览器把整条用户流程走一遍，
@@ -396,10 +396,14 @@ VP 开始之前，把这些服务**统一启动一次**，然后让所有 VP 请
    - e2e: **Phase 2 专用 —— 全量端到端**。真实链路上把整条用户流程走一遍，
      由子 agent 驱动（真开浏览器、真交互），作用域是整条链路而不是某个组件。
      同样要写 `target_url` 与 `uses_services`。
-   - full_ci: **Phase 2 专用 —— 全量 CI 门禁**。`ci_entry` 必填，写**仓库的
-     CI 总入口**（如 `python scripts/ci_local.py`、`cargo test --workspace
-     && pytest tests/`）；判定依据就是这条入口的退出码，由框架执行，没有
-     LLM 参与。**入口不得收窄**：点名单个测试文件、`-k` / `-m` 选择器、
+   - full_ci: **Phase 2 专用 —— 全量 CI 门禁**。`ci_entry` 必填，写**一条
+     调用项目 CI 适配脚本的命令**（示例：`bash scripts/ci_gate.sh`）。
+     **适配脚本由项目提供**（路径约定 `<project>/scripts/ci_gate.sh`，
+     须可执行）；框架不解析脚本内容，也不判断它在本地、云端还是容器里
+     执行。`ci_entry` **不得是内联复合命令**（`&&` / `||` / `;` / 管道 /
+     重定向一律判为计划不合规）—— 整仓门禁只能由那条适配脚本执行。
+     判定依据就是这条入口的退出码，由框架执行，没有 LLM 参与。
+     **入口不得收窄**：点名单个测试文件、`-k` / `-m` 选择器、
      pytest `::` 节点语法、`cargo test --test/--lib` 都会被判为计划不合规
      —— 那是 Phase 1 的粒度，不是整仓门禁。`ci_timeout_seconds` 必须
      **≥ 7200**：整仓门禁在 18 并发 worker 下实测约 3458s，3600 的余量只有

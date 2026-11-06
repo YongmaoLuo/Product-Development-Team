@@ -68,10 +68,18 @@ class FakeCodingTool:
     reviews the list as it stands at that moment, and the review comes
     back as the idempotent "reviewed it, found nothing" rewrite the
     generator already accepts.
+
+    ``on_query`` is an optional hook fired while the synthesis is being
+    *asked*. It exists for the one case where the world has to change
+    during the import: the CI adapter gate runs before the model is asked
+    and the hardening gate runs after, so a case that wants the second
+    gate to see a checkout that is gone has to take the checkout away
+    here. See ``test_a_generated_task_pointing_nowhere_is_refused``.
     """
 
-    def __init__(self, reply):
+    def __init__(self, reply, on_query=None):
         self._reply = reply
+        self._on_query = on_query
         self.json_calls = []
         self.query_calls = []
 
@@ -80,6 +88,8 @@ class FakeCodingTool:
             "prompt": prompt,
             "system_instruction": system_instruction,
         })
+        if self._on_query is not None:
+            self._on_query()
         return self._reply
 
     def query(self, prompt: str) -> str:
@@ -103,11 +113,21 @@ def checkout(tmp_path):
     ``harden_for_execution`` refuses a plan whose ``project_dir`` does not
     exist, and the route runs that gate — so a fixture that pointed at a
     made-up path would be testing the 422 branch on the happy path.
+
+    The checkout also carries an executable ``scripts/ci_gate.sh``: the
+    import lane refuses a project that has no CI adapter (2026-11-05), so
+    a fixture without one would be testing the *refusal* branch on the
+    happy path.  The execute bit is set explicitly — a file without it
+    counts as "no adapter" just as much as a missing file does.
     """
     path = tmp_path / "checkout"
     (path / "backend").mkdir(parents=True)
     for name in ("chart.py", "reporting_view.py", "loader.py", "a.py", "b.py"):
         (path / "backend" / name).write_text("# existing\n", encoding="utf-8")
+    (path / "scripts").mkdir(parents=True, exist_ok=True)
+    adapter = path / "scripts" / "ci_gate.sh"
+    adapter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    adapter.chmod(0o755)
     return path
 
 
@@ -137,9 +157,9 @@ def _tasks_payload(**overrides):
     return payload
 
 
-def _install(monkeypatch, reply):
+def _install(monkeypatch, reply, on_query=None):
     """Point ``server.create_coding_tool`` at a fake and hand it back."""
-    tool = FakeCodingTool(reply)
+    tool = FakeCodingTool(reply, on_query=on_query)
     monkeypatch.setattr(server, "create_coding_tool", lambda **kwargs: tool)
     return tool
 
@@ -493,12 +513,23 @@ def test_a_generated_task_pointing_nowhere_is_refused(
     """``harden_for_execution`` is the last gate, and this route runs it.
 
     Every task targets the checkout the request named — so nothing about
-    the list itself is wrong — but the checkout is not on this machine.
-    That is a plan the executor would refuse at start, and finding it out
-    at import is the point of the lane.
+    the list itself is wrong — but by the time that gate runs, the checkout
+    is not on this machine any more.  That is a plan the executor would
+    refuse at start, and finding it out at import is the point of the lane.
+
+    The checkout is taken away **while the model is being asked**, not
+    before the request: the CI adapter gate runs first and the project has
+    to be complete for it, and the hardening gate runs last and the
+    project has to be gone for it.  Taking it away up front would be
+    refused by the adapter gate instead — a different gate, saying a
+    different thing, and the case would stop testing the one it is named
+    after.
     """
-    _install(monkeypatch, _tasks_payload())
-    shutil.rmtree(checkout)
+    _install(
+        monkeypatch,
+        _tasks_payload(),
+        on_query=lambda: shutil.rmtree(checkout, ignore_errors=True),
+    )
 
     response = _post({"project_dir": str(checkout), "content": "do the thing"})
 

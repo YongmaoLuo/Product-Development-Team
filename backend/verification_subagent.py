@@ -3643,11 +3643,18 @@ def _runner_issues(runner_name: str, vp: Any) -> List[Any]:
     校验器问的是「这条验证点你能不能执行」，答案只有它能给：分派器不替
     runner 做这个判断。抄一份规则进分派器，抄出来的那份一定会和真规则
     漂移，而漂移的方向是「看起来能跑」。
+
+    CI runner 的「入口必须是单条适配脚本调用」这条**形态契约**在执行期
+    不启用（``require_single_entry=False``）—— 历史计划里的内联复合入口
+    不重写，它仍然要能跑、仍然归确定性 runner 判。形态契约是**规划期**的
+    规则（生成时就退回重写），不是执行期的准入条件。
     """
     module = _runner_module(runner_name)
     validator = getattr(module, "validate_vp", None)
     if validator is None:
         return [f"{runner_name} 没有提供校验器，无法判定这条验证点"]
+    if runner_name == "verification_ci_runner":
+        return list(validator(vp, require_single_entry=False) or [])
     return list(validator(vp) or [])
 
 

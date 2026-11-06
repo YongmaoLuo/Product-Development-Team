@@ -70,6 +70,7 @@ from fast_lane import (
     store_import_session,
     validate_tasks,
 )
+from ci_adapter import missing_ci_adapter
 from coding_tool import JsonSession
 from framework.ids import derive_plan_id
 from framework.task_graph import DanglingTaskDependency
@@ -495,6 +496,34 @@ def import_plan(req: ImportPlanRequest, request: Request):
                     "project_dir is required: give the absolute path of the "
                     "checkout these tasks will modify"
                 ],
+            },
+        )
+
+    # The CI adapter gate (2026-11-05, arch decision 3: fail close on
+    # import).  A project without an executable ``scripts/ci_gate.sh``
+    # cannot be verified at all — the CI gate the executor runs does not
+    # exist — so a plan imported for it is a plan that is guaranteed to
+    # fail later, in the most expensive place to find out.  Refusing here
+    # costs the caller one round trip instead of a whole plan.
+    #
+    # **Where** the refusal happens is part of the contract: after the
+    # ``project_dir`` sanity check (a request without a project cannot be
+    # judged at all) and before the payload is looked at, and long before
+    # ``_allocate_plan_id`` — so a refused import leaves nothing behind:
+    # no plan directory, no routing row, no queue row.  A refusal that
+    # left a half-built plan behind would be a plan that exists and
+    # cannot run, which is exactly what this gate exists to prevent.
+    #
+    # The reason text comes from :func:`ci_adapter.missing_ci_adapter`,
+    # the one definition the import lane and the start lane share — the
+    # same project must not pass here and be refused there.
+    adapter_problem = missing_ci_adapter(project_dir)
+    if adapter_problem:
+        raise HTTPException(
+            422,
+            {
+                "error": "Project has no CI adapter",
+                "problems": [adapter_problem],
             },
         )
 

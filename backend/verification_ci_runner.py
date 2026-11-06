@@ -95,6 +95,18 @@ e2e 的两个子类（2026-11-04，arch 决策点 7）
 子 agent 判。缺省是 browser，是为了让拆分之前写的计划（``target_url``
 走浏览器）行为一个字没变。
 
+整仓门禁必须由项目适配脚本执行（2026-11-05，arch 决策点 2）
+-------------------------------------------------------
+一条 ``ci_entry`` 必须是**对项目适配脚本的一次调用**，不能是内联复合命令
+（``(test -e backend/.venv) && bash scripts/run_tests.sh``）。复合命令把
+「跑不跑」「跑哪一段」「失败了算谁的」全写进了入口 —— 于是同一条门禁在不同
+机器上跑的是**不同的东西**，退出码也不再是「整仓门禁」这一条判据。
+
+这条规则是**规划期**的规则：:func:`validate_vp` 缺省就报 issue（生成阶段
+退回重写）。**执行期不启用** —— 历史计划里的复合入口不重写，执行时仍然要
+能跑，所以 :func:`run_ci_verification` 与分派器的 ``_runner_issues`` 都传
+``require_single_entry=False``。
+
 三态（2026-10-31，VP-020）
 --------------------------
 本仓的整仓门禁 ``scripts/run_tests.sh`` 有**三个**退出码，不是两个：
@@ -404,8 +416,27 @@ _SHELL_OPTIONS_WITH_VALUE = frozenset({"-o", "+o"})
 #: Characters that end a command inside a compound command line.
 _COMMAND_SEPARATORS = ";&|"
 
+#: Characters that group a command in the shell but belong to no path.
+#:
+#: 2026-11-05（arch 决策点 2 —— 路径提取）：``(test -e backend/.venv)``
+#: 里的括号是 shell 的分组符号。留在 token 上，路径就被读成
+#: ``backend/.venv)`` —— 执行期的「引用路径存在性检查」于是去找一个
+#: 不存在的文件，报一条假的「路径不存在」。
+_GROUPING_CHARS = "()"
+
 #: An environment assignment in front of a command (``FOO=bar cmd``).
 _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+#: Shell 操作符 —— 一条 ``ci_entry`` 里出现任何一个，说明它是**内联复合命令**
+#: （自己拼出来的命令链），而不是"对项目适配脚本的一次调用"。
+#:
+#: 2026-11-05（arch 决策点 2 —— VP 校验）：整仓门禁必须由**项目适配脚本**
+#: 执行。内联复合命令（``(test -e backend/.venv) && bash scripts/run_tests.sh``）
+#: 把「跑不跑」「跑哪一段」「失败了算谁的」全写进了 ``ci_entry`` —— 于是同一条
+#: 门禁在不同机器上跑的是**不同的东西**，退出码也不再是「整仓门禁」这一条判据。
+#:
+#: 重定向（``2>&1``）同样算：它把 shell 的语义也塞进了入口。
+_COMPOUND_ENTRY_OPERATORS = ("&&", "||", ";", "(", ")", "|", ">", "<")
 
 
 @dataclass
@@ -523,6 +554,27 @@ def looks_narrowed(entry: str) -> Optional[str]:
     return None
 
 
+def compound_operators(entry: str) -> List[str]:
+    """The shell operators ``entry`` contains, in a fixed order.
+
+    An empty list means "one command" — the shape a ``ci_entry`` is
+    supposed to have: **one call to the project's adapter script**.
+
+    A non-empty list means the entry is an **inline compound command**:
+    it decides for itself what to run, in what order, and what a failure
+    means.  See :data:`_COMPOUND_ENTRY_OPERATORS` for why that is not
+    an acceptable whole-repo gate.
+    """
+    text = str(entry or "")
+    found: List[str] = []
+    for op in _COMPOUND_ENTRY_OPERATORS:
+        # ``||`` already covers ``|`` and ``&&`` already covers ``&`` — a
+        # redundant entry in the message is noise, not information.
+        if op in text and not any(op in seen for seen in found):
+            found.append(op)
+    return found
+
+
 def _referenced_paths(entry: str, project_dir: Optional[Path] = None) -> List[str]:
     """Path-like tokens in ``entry`` that look repo-local.
 
@@ -540,7 +592,10 @@ def _referenced_paths(entry: str, project_dir: Optional[Path] = None) -> List[st
     * a ``cd <dir>`` moves the commands that follow it into ``<dir>``, so
       a relative path named after it is relative to that directory, not
       to the repository root (``state_machine/tests`` after
-      ``cd backend`` is ``backend/state_machine/tests``).
+      ``cd backend`` is ``backend/state_machine/tests``);
+    * the parentheses of a grouped command belong to the shell, not to
+      the path: ``backend/.venv)`` in ``(test -e backend/.venv)`` is
+      ``backend/.venv``.
 
     The flag / absolute-path / URL skip rules are unchanged, and the
     existence check in :func:`validate_vp` is not relaxed: a path that
@@ -586,6 +641,22 @@ def _shell_command_payload(tokens: List[str], index: int) -> Optional[int]:
     return None
 
 
+def _normalize_token(token: str) -> str:
+    """The token as the shell reads it, without the grouping punctuation.
+
+    ``(test -e backend/.venv)`` reaches the reader as the tokens
+    ``(test`` / ``-e`` / ``backend/.venv)`` — the parentheses belong to
+    the shell's grouping, not to the path. Left on, the path is read as
+    ``backend/.venv)`` and the existence check then looks for a file
+    that does not exist.
+
+    The separators go first: a token can carry both (``backend/.venv)&&``),
+    and the parenthesis only becomes the outermost character once the
+    separators are gone.
+    """
+    return token.rstrip(_COMMAND_SEPARATORS).strip(_GROUPING_CHARS)
+
+
 def _looks_like_path(token: str) -> bool:
     """Is this token a repo-local path the gate names?"""
     if token.startswith("-") or "://" in token or token.startswith("#"):
@@ -627,10 +698,11 @@ def _collect_referenced_paths(tokens: List[str], base: str) -> List[str]:
     at_command_start = True
 
     while index < len(tokens):
-        token = tokens[index].rstrip(_COMMAND_SEPARATORS)
+        token = _normalize_token(tokens[index])
         if not token:
             # A separator (``&&`` / ``||`` / ``;`` …): the next token
-            # starts a new command.
+            # starts a new command. A lone ``)`` lands here too — it is
+            # a grouping symbol, not a path.
             at_command_start = True
             index += 1
             continue
@@ -654,7 +726,7 @@ def _collect_referenced_paths(tokens: List[str], base: str) -> List[str]:
 
         if at_command_start and token == "cd" and index + 1 < len(tokens):
             base = _resolve_cd_target(
-                base, tokens[index + 1].rstrip(_COMMAND_SEPARATORS),
+                base, _normalize_token(tokens[index + 1]),
             )
             index += 2
             at_command_start = False
@@ -743,7 +815,12 @@ def _validate_command_e2e_vp(
     return issues
 
 
-def validate_vp(vp: Any, *, project_dir: Optional[Path] = None) -> List[SchemaIssue]:
+def validate_vp(
+    vp: Any,
+    *,
+    project_dir: Optional[Path] = None,
+    require_single_entry: bool = True,
+) -> List[SchemaIssue]:
     """Return every schema problem that makes this VP unrunnable.
 
     Called at plan-generation time (so a malformed ``full_ci`` plan is
@@ -755,6 +832,14 @@ def validate_vp(vp: Any, *, project_dir: Optional[Path] = None) -> List[SchemaIs
     names a repo script that does not exist cannot pass, and finding that
     out at plan time is far cheaper than finding it out after a 40-minute
     round.
+
+    ``require_single_entry`` is the **形态契约**（2026-11-05，arch 决策点 2）：
+    一条 ``ci_entry`` 必须是对项目适配脚本的**一次调用**，不能是内联复合
+    命令（``(test -e backend/.venv) && bash scripts/run_tests.sh``）。它
+    缺省打开，所以规划期就会把不合形态的入口退回重写；**执行期显式关掉**
+    （``require_single_entry=False``）—— 历史计划不重写，复合入口在执行时
+    仍然要能跑。两个执行入口（:func:`run_ci_verification` 与分派器的
+    ``_runner_issues``）都传的是关掉的那一个。
 
     **The two ``e2e`` sub-classes are judged by different rules** (the
     dispatch is on ``verification_method``).  See :func:`_validate_e2e_vp`
@@ -777,6 +862,16 @@ def validate_vp(vp: Any, *, project_dir: Optional[Path] = None) -> List[SchemaIs
             f"整仓门禁的判定依据就是这条入口的退出码",
         ))
         return issues
+
+    if require_single_entry:
+        operators = compound_operators(entry)
+        if operators:
+            issues.append(SchemaIssue(
+                vp_id,
+                f"{CI_ENTRY_FIELD} 含 shell 操作符（{', '.join(operators)}）："
+                f"整仓门禁必须由项目适配脚本执行，不能是内联复合命令",
+            ))
+            return issues
 
     narrowed = looks_narrowed(entry)
     if narrowed:
@@ -1425,7 +1520,9 @@ def run_ci_verification(
     vp_id = str(vp.get("id", "unknown"))
     result = CiRunResult()
 
-    issues = validate_vp(vp, project_dir=project_dir)
+    issues = validate_vp(
+        vp, project_dir=project_dir, require_single_entry=False,
+    )
     if issues:
         result.reasons = [f"schema: {i.detail}" for i in issues]
         result.evidence = {
