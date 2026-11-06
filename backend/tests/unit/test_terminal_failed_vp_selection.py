@@ -9,9 +9,11 @@ Two sources feed that list, and both of them have carried points that
 passed:
 
 * **the chain's blocked points** — a point enters the chain at the
-  diagnosis stage and leaves for a human at the ``BLOCKED_ON_USER``
-  stage.  The stage it *reached* is remembered, so a point that was
-  blocked once and passed afterwards is still in the blocked list;
+  diagnosis stage and leaves the machine's road at the
+  ``MACHINE_EXHAUSTED`` stage (the stage it used to be named
+  ``BLOCKED_ON_USER``).  The stage it *reached* is remembered, so a
+  point that was blocked once and passed afterwards is still in the
+  blocked list;
 * **the round's failed ids** — ``_extract_failed_ids`` unions the
   top-level results with the last round's snapshot, and the snapshot
   is the *older* reading.  A point that failed last round and passed

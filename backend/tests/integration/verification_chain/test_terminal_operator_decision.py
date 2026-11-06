@@ -19,7 +19,7 @@
    **一条决策也不产生**（负控：接线不能过宽）。
 3. ``test_terminal_round_keeps_its_existing_outcome`` —— 接线**不改变**终局
    轮次原有的结论：``repair_tasks`` 仍为空、仍 ``blocked_on_user``、链路阶段
-   仍是 ``BLOCKED_ON_USER``。
+   仍是 ``MACHINE_EXHAUSTED``。
 
 再加上「同一个计划只问一次」的三份契约
 --------------------------------------
@@ -98,7 +98,7 @@ FAILURE_CLASS = "deliverable_defect"
 CHAIN_FILENAME = "verification_root_cause_chain.json"
 
 #: The stage the chain reaches when a human has to take over.
-CHAIN_STAGE_BLOCKED_ON_USER = "BLOCKED_ON_USER"
+CHAIN_STAGE_MACHINE_EXHAUSTED = "MACHINE_EXHAUSTED"
 
 #: The file the root cause report lands in (the report the diagnosis
 #: task delivers, and the implementation task reads).
@@ -501,7 +501,7 @@ def test_terminal_round_keeps_its_existing_outcome(
 
     问人是为了让人**接手**，不是为了改掉机器这一侧已经算清楚的结论：
     终局分支仍然不派新任务（``repair_tasks == []``）、仍然等一个人
-    （``blocked_on_user``）、链路仍然停在 ``BLOCKED_ON_USER``。
+    （``waiting_for_user``）、链路仍然停在 ``MACHINE_EXHAUSTED``。
 
     接线如果动了这些，接线就变成了「多加一个任务」，而不是「多问一句」。
     """
@@ -522,17 +522,22 @@ def test_terminal_round_keeps_its_existing_outcome(
     assert r4["repair_tasks"] == [], (
         f"no new task may be dispatched: {r4['repair_tasks']!r}"
     )
-    assert r4["blocked_on_user"] is True
+    # 2026-11-06: 「机器没路了」（``machine_exhausted``）与「有人在等
+    # 回答」（``blocked_on_user``）是两个事实：这个环境里问题被问出来了，
+    # 但没有人接得住它（没有出口），所以没有人在等。
+    assert r4["machine_exhausted"] is True
+    assert r4["blocked_on_user"] is False
     assert r4["waiting_for_user"] is True
     assert r4["needs_operator_decision"] is True
     assert r4["status"] == "loop_stopped"
     assert r4["should_stop"] is True
-    assert r4["root_cause_chain"]["stage"] == CHAIN_STAGE_BLOCKED_ON_USER, (
-        f"the chain stops at the human: {r4['root_cause_chain']!r}"
+    assert r4["root_cause_chain"]["stage"] == CHAIN_STAGE_MACHINE_EXHAUSTED, (
+        f"the chain stops where the machine has no road left: "
+        f"{r4['root_cause_chain']!r}"
     )
 
     chain = _read_chain(plan_dir)
-    assert chain["stage"] == CHAIN_STAGE_BLOCKED_ON_USER, (
+    assert chain["stage"] == CHAIN_STAGE_MACHINE_EXHAUSTED, (
         f"the chain's record says where it stopped: {chain!r}"
     )
 
@@ -621,12 +626,14 @@ def test_open_terminal_question_is_not_asked_again(
     # 收尾路径一个字段都没变。
     assert r4["stop_reason"] == "repair_execution_failed"
     assert r4["repair_tasks"] == []
+    # 这个计划**拿着一个未决的问题**，所以确实有人在等回答。
     assert r4["blocked_on_user"] is True
+    assert r4["machine_exhausted"] is True
     assert r4["waiting_for_user"] is True
     assert r4["needs_operator_decision"] is True
     assert r4["status"] == "loop_stopped"
     assert r4["should_stop"] is True
-    assert r4["root_cause_chain"]["stage"] == CHAIN_STAGE_BLOCKED_ON_USER
+    assert r4["root_cause_chain"]["stage"] == CHAIN_STAGE_MACHINE_EXHAUSTED
 
 
 def test_same_round_terminal_question_is_not_asked_again(

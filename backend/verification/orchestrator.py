@@ -137,13 +137,30 @@ _ROOT_CAUSE_CHAIN_FILENAME = "verification_root_cause_chain.json"
 #: ``implementation``
 #:     The diagnosis came back with a scope. What the point owes now is
 #:     **exactly one** implementation task — the blind repairs are over.
-#: ``BLOCKED_ON_USER``
+#: ``MACHINE_EXHAUSTED``
 #:     The machine's road on this point is walked out: one diagnosis, one
 #:     implementation, and the point still fails. A human takes it from
 #:     here.
+#:
+#: 2026-11-06. The stage used to be spelled ``BLOCKED_ON_USER``, which
+#: said the same thing twice and meant two different things: the chain's
+#: stage said it, and the round's payload said it about "a decision is
+#: waiting for an answer".  The chain's stage says nothing about a
+#: question: the machine can be exhausted **without** anybody having
+#: been asked (the decision may even be ``unroutable``).  The stage is
+#: therefore named after what it says — the machine is out of road.
 _CHAIN_STAGE_ROOT_CAUSE = "root_cause"
 _CHAIN_STAGE_IMPLEMENTATION = "implementation"
-CHAIN_STAGE_BLOCKED_ON_USER = "BLOCKED_ON_USER"
+CHAIN_STAGE_MACHINE_EXHAUSTED = "MACHINE_EXHAUSTED"
+
+#: The stage name the chain's record carried before 2026-11-06.
+#:
+#: Read-side only: a record written by an older build still says
+#: ``BLOCKED_ON_USER``, and it must keep meaning "the machine is out of
+#: road" — never "the point is not on the chain" and never "the stage is
+#: unknown".  :func:`_normalise_chain_stage` maps it onto the current
+#: name, so the next write lands the new one.
+_CHAIN_STAGE_LEGACY_BLOCKED_ON_USER = "BLOCKED_ON_USER"
 
 #: The origin every task the root-cause **preflight** generates carries.
 #:
@@ -155,8 +172,13 @@ CHAIN_STAGE_BLOCKED_ON_USER = "BLOCKED_ON_USER"
 _ROOT_CAUSE_PREFLIGHT_ORIGIN = "root_cause_preflight"
 
 #: The reason a preflight hands the plan back to a human: every point the
-#: chain owns is already with one, so there is nothing the machine can do
-#: and nothing a round would change.
+#: chain owns is already out of road, so there is nothing the machine can
+#: do and nothing a round would change.
+#:
+#: 2026-11-06: the **value** is kept as it is — it is a stable reason
+#: code two callers key on, and renaming it would be a contract change,
+#: not a naming fix.  What it names is the chain's state, not a
+#: question that is waiting for an answer.
 _ROOT_CAUSE_BLOCKED_REASON = "root_cause_blocked_on_user"
 
 #: The headings a root-cause report may put its scope under.
@@ -426,6 +448,39 @@ def _recorded_head_sha(value: Any) -> Optional[str]:
         if sha:
             return sha
     return None
+
+
+def _normalise_chain_stage(stage: Any) -> str:
+    """The stage a chain record names, in the current vocabulary.
+
+    2026-11-06. A record written before the rename says
+    ``BLOCKED_ON_USER``; it means exactly what ``MACHINE_EXHAUSTED``
+    means now.  The mapping is **one-way and total**: an unknown stage
+    keeps its own name (the chain's vocabulary is not policed here —
+    an unfamiliar stage must not read as "no chain" or "off the
+    chain"), and the legacy name never survives into memory.
+
+    The next write of the record lands the new name, so a legacy record
+    is rewritten once and never read as legacy again.
+    """
+    text = str(stage or "")
+    if text == _CHAIN_STAGE_LEGACY_BLOCKED_ON_USER:
+        return CHAIN_STAGE_MACHINE_EXHAUSTED
+    return text
+
+
+def _decision_status_value(decision: Any) -> str:
+    """The status of a stored decision, as the plain string it is.
+
+    The stored form is a string (``hitl.models.Decision.status``), but a
+    decision handed around as an enum member carries its value inside
+    ``.value`` — and ``str()`` on a ``str``-mixin enum is *not* its
+    value on modern Python.  Both spellings are therefore read the same
+    way, so a status is never mistaken for another one.
+    """
+    status = getattr(decision, "status", "")
+    value = getattr(status, "value", status)
+    return str(value or "")
 
 
 def _git_head_sha(project_dir: Any, timeout_sec: int = 10) -> Optional[str]:
@@ -2316,10 +2371,18 @@ class VerificationOrchestrator:
                     continue
                 if not isinstance(entry, dict):
                     continue
-                clean[vp_id] = dict(entry)
+                kept = dict(entry)
+                # 2026-11-06: a record written before the stage rename
+                # still says ``BLOCKED_ON_USER``.  It is normalised **in
+                # memory** — the point stays on the chain and keeps
+                # saying "the machine is out of road" — and the next
+                # write of the record lands the current name.
+                if "stage" in kept:
+                    kept["stage"] = _normalise_chain_stage(kept["stage"])
+                clean[vp_id] = kept
         return {
             "version": 1,
-            "stage": str(raw.get("stage") or ""),
+            "stage": _normalise_chain_stage(raw.get("stage")),
             "vps": clean,
             # 2026-11-05: the commit the chain describes. A record
             # written before the chain carried one reads as "unknown"
@@ -2448,22 +2511,23 @@ class VerificationOrchestrator:
         actions: List[Dict[str, Any]] = []
         blocked: List[str] = []
         # 2026-10-30: the points whose root-cause report came back
-        # without saying what to change. They go to a human — and the
-        # round says so, because a stop nobody can see is a stop nobody
-        # can act on.
+        # without saying what to change. The machine has no road left on
+        # them — and the round says so, because a stop nobody can see is
+        # a stop nobody can act on.
         scope_missing: List[str] = []
         for vp_id in sorted(vps):
             entry = vps[vp_id]
             stage = str(entry.get("stage") or _CHAIN_STAGE_ROOT_CAUSE)
-            if stage == CHAIN_STAGE_BLOCKED_ON_USER:
-                # Already with a human — this round owes it nothing.
+            if stage == CHAIN_STAGE_MACHINE_EXHAUSTED:
+                # The machine's road on this point is walked out — this
+                # round owes it nothing.
                 blocked.append(vp_id)
                 continue
             if stage == _CHAIN_STAGE_IMPLEMENTATION:
                 # The implementation task ran; the point still fails.
                 # One diagnosis and one implementation, both spent: the
                 # machine has nothing left to try on this point.
-                entry["stage"] = CHAIN_STAGE_BLOCKED_ON_USER
+                entry["stage"] = CHAIN_STAGE_MACHINE_EXHAUSTED
                 entry["blocked_round"] = int(round_number)
                 entry["blocked_reason"] = "implementation_still_fails"
                 blocked.append(vp_id)
@@ -2474,7 +2538,7 @@ class VerificationOrchestrator:
                 # The report came back without saying what to change.
                 # Guessing the scope is how a repair task ends up
                 # touching the wrong files, so this goes to a human too.
-                entry["stage"] = CHAIN_STAGE_BLOCKED_ON_USER
+                entry["stage"] = CHAIN_STAGE_MACHINE_EXHAUSTED
                 entry["blocked_round"] = int(round_number)
                 entry["blocked_reason"] = _ROOT_CAUSE_SCOPE_MISSING_REASON
                 scope_missing.append(vp_id)
@@ -2482,7 +2546,7 @@ class VerificationOrchestrator:
                 # entry only — no log line, no summary field — so "why
                 # did the chain stop here?" was answerable only by
                 # whoever read the chain record on disk. One event per
-                # point: the stage moves to ``BLOCKED_ON_USER``, so the
+                # point: the stage moves to ``MACHINE_EXHAUSTED``, so the
                 # next round never comes back through this branch.
                 report_path = str(
                     entry.get("report_path")
@@ -2557,7 +2621,7 @@ class VerificationOrchestrator:
             }
 
         if blocked and len(blocked) == len(vps):
-            stage = CHAIN_STAGE_BLOCKED_ON_USER
+            stage = CHAIN_STAGE_MACHINE_EXHAUSTED
         elif any(
             action["action"] == _CHAIN_STAGE_IMPLEMENTATION
             for action in actions
@@ -2579,9 +2643,9 @@ class VerificationOrchestrator:
             "actions": actions,
             "blocked": blocked,
             # 2026-10-30: the points whose root-cause report named no
-            # file to change. They are with a human, and the round says
-            # which ones — a stop that is not in the summary is a stop
-            # nobody can see.
+            # file to change. The machine has no road left on them, and
+            # the round says which ones — a stop that is not in the
+            # summary is a stop nobody can see.
             "scope_missing": list(scope_missing),
             "vp_ids": sorted(vps),
             # The round ends here when every point the chain owns is with
@@ -2817,14 +2881,15 @@ class VerificationOrchestrator:
           not say which commit it describes → ``handled=False``.  The
           chain describes a failure that is not in front of us, and the
           round has to look at the code as it is now (arch 决策点 8).
-        * **every point with a human** → ``handled=True``,
+        * **every point out of road** (the chain's stage is
+          ``MACHINE_EXHAUSTED``) → ``handled=True``,
           ``blocked=True``.  Nothing is dispatched and the round does not
           run: the machine's road on these points is walked out.
         * **the chain owes work** → ``handled=True``.  The tasks are
           dispatched through the same write path the round uses
           (:meth:`_persist_repair_tasks`), and the round does not run.
 
-        A point the chain **just demoted** to ``BLOCKED_ON_USER`` (its
+        A point the chain **just demoted** to ``MACHINE_EXHAUSTED`` (its
         implementation ran and it still fails) is not the preflight's
         call: that verdict needs the round's own evidence, so the
         preflight hands the round back (``handled=False``) and the
@@ -2837,7 +2902,7 @@ class VerificationOrchestrator:
         decision: Dict[str, Any] = {
             # Did the preflight take the round over?
             "handled": False,
-            # Is the chain with a human (nothing the machine can do)?
+            # Is the chain out of road (nothing the machine can do)?
             "blocked": False,
             # What the chain owes (``[]`` when it owes nothing).
             "actions": [],
@@ -2894,13 +2959,13 @@ class VerificationOrchestrator:
 
         actions = list(chain_decision.get("actions") or [])
         blocked = list(chain_decision.get("blocked") or [])
-        # The points that were **already** with a human when the preflight
+        # The points that were **already** out of road when the preflight
         # read the record — as opposed to the ones this decision demoted.
         already_blocked = {
             vp_id
             for vp_id, entry in (vps or {}).items()
             if str((entry or {}).get("stage") or "")
-            == CHAIN_STAGE_BLOCKED_ON_USER
+            == CHAIN_STAGE_MACHINE_EXHAUSTED
         }
         newly_blocked = [
             vp_id for vp_id in blocked if vp_id not in already_blocked
@@ -2908,7 +2973,7 @@ class VerificationOrchestrator:
 
         if not actions:
             if blocked and not newly_blocked:
-                # Every point the chain owns is already with a human.
+                # Every point the chain owns is already out of road.
                 # Nothing is dispatched and the round does not run.
                 decision.update({
                     "handled": True,
@@ -3386,6 +3451,56 @@ class VerificationOrchestrator:
             for decision in decisions
         )
 
+    def _waiting_for_a_human_answer(self) -> bool:
+        """Whether this plan has a question that is still waiting.
+
+        2026-11-06. "Waiting for a human" is a fact about the
+        **questions**, not about the chain's stage: the machine can be
+        out of road (``MACHINE_EXHAUSTED``) without a single question
+        having reached anybody — the question may even have been settled
+        ``unroutable``, because the plan's outlet names nobody who can
+        be asked.
+
+        So the answer is read from the store: a decision in one of the
+        two states the verification loop waits on (``pending`` /
+        ``paused``) means somebody has a question in front of them.  A
+        settled question — answered, defaulted, unroutable — is nobody's
+        problem any more.
+
+        A store that cannot be read answers **False** and says so in a
+        warning: the round must not claim that somebody is waiting for
+        an answer it cannot see.
+        """
+        from hitl.models import DecisionStatus
+        from hitl.service import list_decisions
+
+        waiting_statuses = (
+            DecisionStatus.PENDING.value,
+            DecisionStatus.PAUSED.value,
+        )
+        try:
+            decisions = list_decisions(self.plan_dir.name)
+        except Exception as exc:  # noqa: BLE001 — the store may be gone
+            logger.warning(
+                "[verification] the waiting questions of plan %s could not "
+                "be read: %s: %s",
+                self.plan_dir.name, type(exc).__name__, exc,
+            )
+            try:
+                self._log_audit(
+                    "verification_waiting_decision_lookup_failed",
+                    f"the waiting questions could not be read: "
+                    f"{type(exc).__name__}: {exc}",
+                    data={"plan_id": self.plan_dir.name},
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+        return any(
+            _decision_status_value(decision) in waiting_statuses
+            for decision in decisions
+        )
+
     def _plan_has_terminal_decision(
         self, plan_id: str, round_number: int,
     ) -> bool:
@@ -3625,7 +3740,7 @@ class VerificationOrchestrator:
           snapshot is the older reading, so a point that failed last
           round and passed this round is still in it;
         * ``chain_blocked_ids`` — the points the root-cause chain left
-          with a human.  The stage a point *reached* is remembered, so
+          out of road.  The stage a point *reached* is remembered, so
           a point that was blocked once and passed afterwards is still
           in it.
 
@@ -5141,7 +5256,7 @@ class VerificationOrchestrator:
         tasks = list(preflight.get("tasks") or [])
         if preflight.get("blocked"):
             summary = (
-                "the root-cause chain is with a human — no verification "
+                "the root-cause chain is out of road — no verification "
                 "round ran"
             )
         else:
@@ -5353,6 +5468,17 @@ class VerificationOrchestrator:
           environment never let the round judge the deliverable, so the
           chain stops instead of iterating.  Mutually exclusive with
           ``environment_blocked``
+        - machine_exhausted: bool   # 2026-11-06: True when the
+          root-cause chain is out of road on every point it owns (the
+          chain's stage is ``MACHINE_EXHAUSTED``) — one diagnosis, one
+          implementation, and the points still fail.  It says nothing
+          about a human being asked anything.
+        - blocked_on_user: bool   # 2026-11-06: True when a question is
+          actually **waiting for an answer** — a decision in the store
+          is ``pending`` or ``paused``.  Read from the store, so a
+          question that never reached anybody (``unroutable``) does not
+          count, and an unreadable store answers ``False`` (with a
+          warning) rather than claiming a human is waiting.
         """
         overall_status = report.get("overall_status", "FAILED")
 
@@ -5661,7 +5787,8 @@ class VerificationOrchestrator:
                 f"stage {chain_decision['payload']['stage']} for "
                 f"{', '.join(chain_vp_ids)} — this round owes "
                 f"{len(chain_decision['actions'])} chain task(s), "
-                f"{len(chain_decision['blocked'])} point(s) with a human"
+                f"{len(chain_decision['blocked'])} point(s) the machine "
+                f"has no road left on"
             )
 
         # 2026-10-22 (triage): reaching the cap no longer terminates the
@@ -5770,7 +5897,7 @@ class VerificationOrchestrator:
                     _decision_key_str(stuck_keys[0])
                 ] = 0
         # 2026-10-27 (root-cause chain): every point the chain owns is
-        # with a human.
+        # out of road.
         #
         # The point had its diagnosis, it had its one implementation
         # task, and it still fails. The machine's road on it is walked
@@ -5890,11 +6017,23 @@ class VerificationOrchestrator:
                 "intent_conflicts": [],
                 # 2026-10-27: the round ends with a person, not with a
                 # task. The two flags say so: the chain's own stage
-                # (``BLOCKED_ON_USER``) says where the point stands, and
+                # (``MACHINE_EXHAUSTED``) says where the point stands, and
                 # these say that the round is waiting for a human.
                 "needs_operator_decision": True,
                 "waiting_for_user": True,
-                "blocked_on_user": True,
+                # 2026-11-06: ``blocked_on_user`` says **a question is
+                # waiting for an answer** — and it is read from the
+                # store, not asserted.  The round asked a question
+                # above; if that question reached nobody (it may have
+                # been settled ``unroutable``), then nobody is waiting
+                # and the flag says so.  The machine being out of road
+                # is a different fact, and it has its own field.
+                "blocked_on_user": self._waiting_for_a_human_answer(),
+                # The machine's road on the chain's points is walked
+                # out: one diagnosis, one implementation, and the points
+                # still fail.  This is the chain's stage, not a claim
+                # about a human.
+                "machine_exhausted": True,
                 "status": "loop_stopped",
                 "void_vp_ids": sorted(void_vp_ids),
                 "undefined_vp_ids": sorted(undefined_vp_ids),
@@ -6628,10 +6767,18 @@ class VerificationOrchestrator:
             # 2026-10-27: where the root-cause chain stands, and what it
             # owes. The chain's own stage says how far the escalation
             # got (``root_cause`` → ``implementation`` →
-            # ``BLOCKED_ON_USER``); the round says whether it ended with
-            # a person in the loop.
+            # ``MACHINE_EXHAUSTED``); the round says whether it ended
+            # with a person in the loop.
             "root_cause_chain": chain_decision["payload"],
-            "blocked_on_user": bool(chain_decision["terminal"]),
+            # 2026-11-06: the chain's stage and the plan's questions are
+            # two different facts, and they have two different fields.
+            # ``machine_exhausted`` says the machine has no road left on
+            # the chain's points; ``blocked_on_user`` says a question is
+            # actually waiting for an answer (read from the store — an
+            # unreadable store answers ``False``, so the round never
+            # claims a human is waiting when it cannot see one).
+            "machine_exhausted": bool(chain_decision["terminal"]),
+            "blocked_on_user": self._waiting_for_a_human_answer(),
             # 2026-10-30: the points whose root-cause report named no file
             # to change — the ones the chain handed to a human because
             # nobody could act on the diagnosis. The round says which
