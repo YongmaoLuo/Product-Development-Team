@@ -3,9 +3,10 @@
 背景
 ----
 根因链台账 ``plans/<plan>/verification_root_cause_chain.json`` 记着每个验证点
-走到了链条的哪一段（``root_cause`` → ``implement`` → ``BLOCKED_ON_USER``）。
+走到了链条的哪一段（``root_cause`` → ``implement`` → ``MACHINE_EXHAUSTED``，
+2026-11-06 之前叫 ``BLOCKED_ON_USER``）。
 reset 会把裁决、修复任务、每轮的磁盘产物都清掉，却**没有**清这条台账 ——
-于是重跑时，链上那条旧的 ``BLOCKED_ON_USER`` 记录继续占着验证点：链记得
+于是重跑时，链上那条旧的（老名字的）记录继续占着验证点：链记得
 这个点已经"交给人了"，新一轮不会再自动派根因任务。
 
 台账点名的报告（``vps[*].report_path``，即

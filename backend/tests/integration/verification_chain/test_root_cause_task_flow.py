@@ -17,7 +17,7 @@
 2. ``test_single_implementation_after_diagnosis`` —— 诊断交付之后，实现任务
    **恰 1 个**，且 ``files_to_modify`` 非空。
 3. ``test_impl_failure_blocks_on_user`` —— 实现任务再失败，状态是
-   ``BLOCKED_ON_USER``，且**没有新任务**。
+   ``MACHINE_EXHAUSTED``，且**没有新任务**。
 4. ``test_max_rounds_semantics_unchanged`` —— 既有的 ``max_rounds`` 判定
    一个字符未改：既有测试本体原样跑过（零修改）。
 
@@ -31,7 +31,7 @@ orchestrator，所以一轮记得的东西必须能从磁盘上回来）::
         ("fail", "aaa"),          # 第 1 轮：失败 → 一个普通修复任务
         ("fail", "bbb"),          # 第 2 轮：指纹变了 → 根因任务（无第三个 repair）
         ("root_cause_done", "bbb"),  # 第 3 轮：诊断交付 → 1 个 implementation
-        ("fail", "bbb"),          # 第 4 轮：实现再失败 → BLOCKED_ON_USER
+        ("fail", "bbb"),          # 第 4 轮：实现再失败 → MACHINE_EXHAUSTED
     ]
     results = run_orchestrator_rounds(rounds, plan_dir, project_dir)
 
@@ -85,7 +85,7 @@ DECISION_KEY = f"{VP_ID}|{FAILURE_CLASS}"
 CHAIN_FILENAME = "verification_root_cause_chain.json"
 
 #: The stage the chain reaches when a human has to take over.
-CHAIN_STAGE_BLOCKED_ON_USER = "BLOCKED_ON_USER"
+CHAIN_STAGE_MACHINE_EXHAUSTED = "MACHINE_EXHAUSTED"
 
 #: The file the root cause report lands in (the report the diagnosis
 #: task delivers, and the implementation task reads).
@@ -403,7 +403,7 @@ def test_single_implementation_after_diagnosis(plan_dir, project_dir, repair_moc
 
 
 def test_impl_failure_blocks_on_user(plan_dir, project_dir, repair_mocks):
-    """实现任务再失败 → 状态 ``BLOCKED_ON_USER``，且没有新任务。
+    """实现任务再失败 → 状态 ``MACHINE_EXHAUSTED``，且没有新任务。
 
     根因任务已经定位了根因，实现任务已经按根因改了代码 —— 还是失败。
     这时候再派一轮任务只是把同一个问题再问一遍：机器这一侧的路已经走完
@@ -425,14 +425,17 @@ def test_impl_failure_blocks_on_user(plan_dir, project_dir, repair_mocks):
     )
     _, r4 = results[3]
 
-    # 第 4 轮后状态 == BLOCKED_ON_USER
+    # 第 4 轮后状态 == MACHINE_EXHAUSTED
     assert r4["repair_tasks"] == [], (
         f"no new task may be dispatched: {r4['repair_tasks']!r}"
     )
-    assert r4["root_cause_chain"]["stage"] == CHAIN_STAGE_BLOCKED_ON_USER, (
-        f"the chain stops at the human: {r4['root_cause_chain']!r}"
+    assert r4["root_cause_chain"]["stage"] == CHAIN_STAGE_MACHINE_EXHAUSTED, (
+        f"the chain stops where the machine has no road left: "
+        f"{r4['root_cause_chain']!r}"
     )
-    assert r4["blocked_on_user"] is True
+    # 2026-11-06: 「机器没路了」与「有人在等回答」是两个事实。
+    assert r4["machine_exhausted"] is True
+    assert r4["blocked_on_user"] is False
     assert r4["waiting_for_user"] is True
     assert r4["status"] == "loop_stopped", (
         "the chain ends here — the auto-loop must not start another round"
@@ -440,7 +443,7 @@ def test_impl_failure_blocks_on_user(plan_dir, project_dir, repair_mocks):
     assert r4["should_stop"] is True
 
     chain = _read_chain(plan_dir)
-    assert chain["stage"] == CHAIN_STAGE_BLOCKED_ON_USER, (
+    assert chain["stage"] == CHAIN_STAGE_MACHINE_EXHAUSTED, (
         f"the chain's record says where it stopped: {chain!r}"
     )
 
@@ -560,6 +563,6 @@ def test_same_fingerprint_repeat_keeps_the_existing_path(
         f"a same-fingerprint repeat is still a plain repair: "
         f"{r2['repair_tasks']!r}"
     )
-    assert r2.get("blocked_on_user") is not True, (
+    assert r2.get("machine_exhausted") is not True, (
         "the same failure is not a human decision"
     )
