@@ -5995,6 +5995,10 @@ def _dispatch_verification_round(
     resume: bool,
     force: bool = False,
     wait_seconds: float = _VERIFICATION_ROUND_LEASE_WAIT_SECONDS,
+    project_dir: Optional[Path] = None,
+    tool: Optional[str] = None,
+    round_token: str = "",
+    outcome: Optional["_VerificationLoopOutcome"] = None,
 ) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
     """Run ONE verification round while holding the plan's round lease.
 
@@ -6014,6 +6018,13 @@ def _dispatch_verification_round(
     ``wait_seconds`` is how long the run waits for the lease before it
     gives up.  It is a parameter so a caller (and a test) can ask for
     the refusal without waiting out the production window.
+
+    2026-11-05: ``project_dir`` / ``tool`` / ``round_token`` /
+    ``outcome`` are what the root-cause chain's preflight needs to hand
+    the chain's work to the executor (see
+    :func:`_handle_root_cause_preflight`).  They default to the empty
+    values so a caller that knows nothing about the repair path keeps
+    its old behaviour.
     """
     lease, conflict = _acquire_verification_round_lease(
         plan_dir, wait_seconds=wait_seconds,
@@ -6049,7 +6060,187 @@ def _dispatch_verification_round(
     # written here because this is the one place every dispatch goes
     # through, so the record is made exactly once.
     _record_round_instance_handover(orch, plan_id, plan_dir)
+    # 2026-11-05: the round may not have run at all.  The root-cause
+    # chain's preflight runs BEFORE the first verification point is
+    # dispatched: when the chain owes work it writes the tasks and
+    # hands the round back, so the report carries no verification
+    # result whatsoever.
+    #
+    # The chain's work is dispatched **here** — this is the one place
+    # every dispatch goes through, so the tasks the preflight wrote to
+    # ``state.db`` are handed to the executor exactly once, whichever
+    # caller asked for the round.  Without it the queue nobody read.
+    _handle_root_cause_preflight(
+        plan_id, plan_dir, report,
+        project_dir=project_dir, tool=tool, round_token=round_token,
+        outcome=outcome,
+    )
     return report, None
+
+
+# ---------------------------------------------------------------------------
+# The root-cause chain's preflight (2026-11-05)
+# ---------------------------------------------------------------------------
+#
+# ``start_verification_cycle`` asks the root-cause chain what it owes
+# BEFORE it dispatches the first verification point.  When the chain
+# owes work, the preflight writes the tasks and hands the round back —
+# the round measured nothing, so its report carries no verification
+# result at all.
+#
+# Two things follow, and both of them used to be missing:
+#
+#   1. **Someone has to run the tasks.**  The preflight wrote them to
+#      ``state.db`` — a queue nobody was reading.  Without a dispatch
+#      the plan sat in ``verification_repairing`` with work queued and
+#      nothing moving.
+#   2. **Nobody may judge the round.**  A report with no verification
+#      result reads as "nothing was verified" — which the judgment
+#      phase would turn into a failure and send the repair chain after
+#      a product nobody ever looked at.
+#
+# The dispatch reuses the base-drift branch's entry points: the same
+# ``_make_repair_on_complete`` callback factory and the same
+# ``_run_repair_execution_async`` dispatcher.  A second execution entry
+# point would be a second thing that can drift.
+
+#: The provider-routing scene the preflight's repair runs under.  The
+#: executor is a CHILD PROCESS, so the scene crosses the process
+#: boundary as ``PDT_EXECUTOR_SCENE`` — the same channel the base-drift
+#: merge scene uses.
+ROOT_CAUSE_PREFLIGHT_SCENE = "root_cause_preflight"
+
+#: The phase a plan whose chain was continued by the preflight belongs
+#: in.  The preflight's own decision carries it; this is the fallback
+#: for a decision that does not.
+_ROOT_CAUSE_PREFLIGHT_REPAIRING_PHASE = "verification_repairing"
+
+#: The phase a plan whose chain is with a human is parked in.  The
+#: plan is neither finished nor failed — it is waiting, and the phase
+#: says so.
+_ROOT_CAUSE_PREFLIGHT_STOPPED_PHASE = "verification_loop_stopped"
+
+
+def _root_cause_preflight_decision(
+    report: Any,
+) -> Optional[Dict[str, Any]]:
+    """The root-cause chain's decision, read out of a round report.
+
+    ``start_verification_cycle`` returns it under ``root_cause_preflight``
+    when the preflight took the round over.  A report that does not
+    carry the key — an ordinary round — gives ``None``.
+    """
+    if not isinstance(report, dict):
+        return None
+    decision = report.get("root_cause_preflight")
+    if not isinstance(decision, dict):
+        return None
+    return decision
+
+
+def _root_cause_preflight_took_over(report: Any) -> bool:
+    """True iff the root-cause chain's preflight took this round over.
+
+    The round did not run: it carries no verification result, so every
+    judgment on it reads "nothing was verified".  The caller must skip
+    the judgment phase and let the chain's own continuation run.
+    """
+    decision = _root_cause_preflight_decision(report)
+    return bool(decision and decision.get("handled"))
+
+
+def _set_root_cause_preflight_phase(
+    plan_id: str, plan_dir: Path, phase: str,
+) -> bool:
+    """Move the plan into ``phase``; best effort, never raises.
+
+    ``transition_to`` enforces the legal edges and the execution gate;
+    when the plan sits somewhere the edge does not reach from, the
+    ``force_set_phase`` fall-through states the intent explicitly — the
+    same two-step the terminal write uses.
+    """
+    try:
+        ps = _server.PlanState(plan_dir)
+        ps.reload()
+        try:
+            ps.transition_to(phase)
+        except ValueError:
+            ps.force_set_phase(phase)
+        return True
+    except Exception:
+        _server.logger.exception(
+            "[root_cause_preflight] the phase could not be moved to "
+            "'%s' plan=%s", phase, plan_id,
+        )
+        return False
+
+
+def _handle_root_cause_preflight(
+    plan_id: str,
+    plan_dir: Path,
+    report: Any,
+    *,
+    project_dir: Optional[Path] = None,
+    tool: Optional[str] = None,
+    round_token: str = "",
+    outcome: Optional["_VerificationLoopOutcome"] = None,
+) -> bool:
+    """Act on the root-cause chain's preflight, when it took the round.
+
+    Returns ``True`` iff the preflight took the round over — the round
+    did not run, and the caller must NOT judge it.  ``False`` means the
+    report is an ordinary round report and the caller goes on exactly
+    as it did before this function existed.
+
+    Two outcomes, both taken from the decision itself:
+
+    * **the chain is with a human** (``blocked=True``) — the plan is
+      parked in ``verification_loop_stopped``.  No repair is dispatched
+      (there is nothing the machine may run), no round is closed (no
+      round ran, so there is no verdict to record) and no terminal
+      state is written.
+    * **the chain owes work** — the tasks the preflight wrote are
+      dispatched to the executor through the base-drift branch's own
+      entry points, and the plan moves to ``verification_repairing``
+      FIRST, so a dispatch that raises leaves the plan where the work
+      is still owed.
+    """
+    decision = _root_cause_preflight_decision(report)
+    if decision is None or not decision.get("handled"):
+        return False
+
+    if decision.get("blocked"):
+        _server.logger.warning(
+            "[root_cause_preflight] the chain is with a human plan=%s — "
+            "no repair dispatched, no round closed",
+            plan_id,
+        )
+        _set_root_cause_preflight_phase(
+            plan_id, plan_dir, _ROOT_CAUSE_PREFLIGHT_STOPPED_PHASE,
+        )
+        return True
+
+    phase = str(
+        decision.get("phase") or _ROOT_CAUSE_PREFLIGHT_REPAIRING_PHASE
+    )
+    _set_root_cause_preflight_phase(plan_id, plan_dir, phase)
+    try:
+        _server._run_repair_execution_async(
+            plan_id, project_dir, tool=tool,
+            on_complete=_make_repair_on_complete(
+                plan_id, project_dir, tool, round_token=round_token,
+            ),
+            outcome=outcome,
+            scene=ROOT_CAUSE_PREFLIGHT_SCENE,
+        )
+    except Exception:
+        # The chain's work stays queued in ``state.db``: the plan is
+        # left in the repair phase, so the next ``/start`` picks it up.
+        _server.logger.exception(
+            "[root_cause_preflight] the chain's repair could not be "
+            "started plan=%s — the work stays queued", plan_id,
+        )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -8327,6 +8518,8 @@ def _make_repair_on_complete(
                     _report, _round_conflict = _dispatch_verification_round(
                         plan_id, plan_dir, _new_orch, _next_round,
                         resume=True,
+                        project_dir=project_dir, tool=tool,
+                        round_token=round_token,
                     )
                 finally:
                     _close_round_in_ledger(plan_dir, round_token)
@@ -8339,6 +8532,18 @@ def _make_repair_on_complete(
                     _record_round_lease_refusal(
                         plan_id, plan_dir, _round_conflict,
                     )
+                    return
+                # 2026-11-05: the root-cause chain's preflight may have
+                # taken this round over before it measured anything.  The
+                # dispatch already handed the chain's work to the
+                # executor (or parked the plan where a human can pick it
+                # up); the judgment phase must NOT run on it — a report
+                # with no verification result reads as "nothing was
+                # verified", and the repair chain would go after a product
+                # nobody ever looked at.  This is the SECOND judgment
+                # point — the auto-loop's own round is the first — and
+                # the taken-over round is owed the same treatment here.
+                if _root_cause_preflight_took_over(_report):
                     return
                 # 2026-10-25 (repair-r1-33): the round's services were
                 # not usable, so the round dispatched nothing and
@@ -9099,6 +9304,8 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                 report, _round_conflict = _dispatch_verification_round(
                     plan_id, plan_dir, orch, round_num,
                     resume=(round_num > 1),
+                    project_dir=project_dir, tool=tool,
+                    round_token=round_token, outcome=outcome,
                 )
                 if _round_conflict is not None:
                     # 2026-10-25: another live round owns this plan.  The
@@ -9110,6 +9317,16 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                     _record_round_lease_refusal(
                         plan_id, plan_dir, _round_conflict,
                     )
+                    return
+                # 2026-11-05: the root-cause chain's preflight may have
+                # taken this round over before it measured anything.  The
+                # dispatch already handed the chain's work to the
+                # executor (or parked the plan where a human can pick it
+                # up); the judgment phase must NOT run on it — a report
+                # with no verification result reads as "nothing was
+                # verified", and the repair chain would go after a product
+                # nobody ever looked at.
+                if _root_cause_preflight_took_over(report):
                     return
                 # 2026-10-25 (repair-r1-33): the round's services were not
                 # usable, so the round dispatched nothing and measured

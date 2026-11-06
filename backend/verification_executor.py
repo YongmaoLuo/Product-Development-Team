@@ -39,6 +39,10 @@ What is implemented in this skeleton
   ``pending_vps``, and persists state.
 * ``collect_verdicts`` — return all verdicts collected so far
   (read-only).
+* ``_current_round_verdicts`` — return **this round's** verdicts only
+  (read-only). Every verdict carries the round it was earned in
+  (``round``); a verdict from an earlier round is never handed out as
+  this round's conclusion.
 * ``_save_state`` — atomic write to ``plan_dir / state_file``.
 
 Cost gate
@@ -105,6 +109,15 @@ from verification_phases import (
     infer_phase_order,
     is_final_gate,
     split_by_phase,
+)
+# 2026-11-05（轮次作用域 · 复用）：复用判据与轮次记录的口径**只有这一份** ——
+# 执行器与编排器引用同一个模块，两侧的说法不可能分叉（口径分叉正是"上一轮
+# PASSED 被当成本轮已完成"这个缺陷的成因）。判定内核是纯函数，不读盘不调模型。
+from verification_round_scope import (
+    is_shared_surface,
+    load_round_scope,
+    may_reuse,
+    normalise_prefix,
 )
 
 #: 视为"终态成功"的状态——Phase 2 门禁只认这些。
@@ -310,6 +323,38 @@ _GENERIC_CRITERION_FIELDS: Tuple[str, ...] = (
 )
 
 
+# Round scope ---------------------------------------------------------------
+#
+# 2026-11-05: 一条结论只对**产生它的那一轮**有效。
+#
+# 起因：``plan_verification.verdicts`` 里的条目不带轮次。装载时按
+# ``{v["vp_id"]: v}`` 折叠 —— 后写的覆盖先写的 —— 于是「本轮真跑出来的
+# 结论」与「上一轮留下来的结论」在内存里长得一模一样。读侧（Phase-2 关卡 /
+# 报告 / 卡片）没有办法只取本轮那一份：上一轮的 PASSED 能替本轮说话
+# （实测：本轮 VP-001 真跑 PASSED，关卡却按上一轮那份 FAILED 判）。
+#
+# 修法：每条裁决带一个 ``round``（轮次号），读侧按轮次取本轮那一份。
+# 与定义指纹（:data:`DEFINITION_FINGERPRINT_FIELD`）同源 —— 都是「这份
+# 结论对什么有效」的标记，只是一个标「哪条命令 / 哪份定义」，另一个标
+# 「哪一轮」。
+
+#: 裁决里带轮次号的字段名。
+VERDICT_ROUND_FIELD = "round"
+
+#: 裁决里标记"这条结论是从上一轮**复用**来的"字段名，值是**来源轮次号**。
+#:
+#: 复用是例外（默认每轮真跑），例外必须留痕：账本与报告据此把"本轮真跑"与
+#: "从上一轮拿来的"分开列（见 :meth:`VerificationExecutor._seed_reused_verdicts`）。
+REUSED_FROM_ROUND_FIELD = "reused_from_round"
+
+#: 裁决里带"它负责哪一片"（``covers_paths``）的字段名。
+#:
+#: 范围是**框架**从任务声明派生的（见
+#: :func:`verification_round_scope.covers_paths_for_files`），不是模型自由发明的
+#: —— 范围如果由模型说了算，复用判据随之失效。
+COVERS_PATHS_FIELD = "covers_paths"
+
+
 def _fold_whitespace(value: Any) -> Any:
     """Collapse whitespace runs in a text value; other values pass through.
 
@@ -405,6 +450,24 @@ _REFERENCE_SPLIT_RE = re.compile(
 
 #: 计划文件的名字（判据表的第二个来源）。
 _PLAN_FILENAME = "verification_plan.json"
+
+
+def _prefix_list(value: Any) -> Tuple[str, ...]:
+    """一份 ``covers_paths``（列表 / 单串 / 缺省）→ 前缀元组。
+
+    形状不认得（数字、字典…）就当没有范围：范围只用来**缩小**复用的可能，
+    认不出来时一律按"没有范围"处理 —— 那是安全的一侧（每轮重跑）。
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(
+        item.strip() for item in value
+        if isinstance(item, str) and item.strip()
+    )
 
 
 def _reference_key(text: Any) -> str:
@@ -580,6 +643,11 @@ class VerificationExecutor(BaseExecutor):
         # 「本轮的移除集」可言（真正重建在 ``run()`` 的第三步）。
         self._removed_vp_ids: Set[str] = set()
 
+        # 2026-11-05（轮次作用域 · 复用）：盘上计划里每个验证点的**范围**
+        # （``covers_paths``）。读一次就够（计划在一轮里不变），所以这里缓存。
+        # ``None`` = 还没读过。
+        self._disk_covers_cache: Optional[Dict[str, Tuple[str, ...]]] = None
+
         # 2026-10-27：``reset_state()`` 之后的**那一轮**不许装载裁决。
         #
         # 「装载裁决」（``run()`` 的第一步）把持久化存储里的旧结论读回内存 ——
@@ -627,6 +695,14 @@ class VerificationExecutor(BaseExecutor):
 
         # Verdicts map keyed by VP id. Populated by _load_or_init_state.
         self._verdicts: Dict[str, Dict[str, Any]] = {}
+
+        # 2026-11-05（轮次作用域）：``轮次`` → ``{vp_id: 裁决}``。
+        #
+        # ``_verdicts`` 每个 VP 只留**最新一条**（跨轮继承靠它），所以
+        # 「同一个 VP 在第 1 轮和第 2 轮各有一条结论」这件事只有这张表
+        # 记得住。读侧（:meth:`_current_round_verdicts`）按轮次取本轮那
+        # 一份；写侧（:meth:`_store_verdict`）两份一起写。
+        self._verdicts_by_round: Dict[int, Dict[str, Dict[str, Any]]] = {}
 
         # 2026-10-25（VP-031）：**计划没有定义的验证点**，它们的裁决不得
         # 以失败的身份出现在报告里。
@@ -804,7 +880,10 @@ class VerificationExecutor(BaseExecutor):
             )
         # Also clear the in-memory state so the caller is not surprised
         # by the executor holding a copy after reset_state returned.
+        # 2026-11-05: 轮次作用域表一起清 —— 留着它，本轮视图里还会冒出
+        # 刚被清掉的那几条结论（清空等于没做）。
         self._verdicts = {}
+        self._verdicts_by_round = {}
         self._pending_vps = []
         self._failed_vps = []
         self._skipped_vps = []
@@ -982,7 +1061,14 @@ class VerificationExecutor(BaseExecutor):
         self._quarantine_orphan_verdicts()
         # 3. 扣除移除集 + 主题判定 + 先归档后移除。
         self._apply_topic_relevance()
-        # 4. 派生索引 —— 在移除**之后**派生，所以被移除的验证点不进任何桶。
+        # 4. 跨轮复用 —— **先复用、再派生桶**（顺序不能换：桶只喂本轮的裁决，
+        #    而复用搬进来的结论必须已经以**本轮**的轮次号写好，否则本轮视图
+        #    里没有它，复用等于没发生）。
+        #
+        #    默认一条都不复用：没有本轮的轮次作用域记录 = 不知道这一轮相对
+        #    上一轮改了什么 = 全量重跑（安全的一侧）。
+        self._seed_reused_verdicts_for_current_round()
+        # 5. 派生索引 —— 在移除**之后**派生，所以被移除的验证点不进任何桶。
         #
         #    派生放在执行**之前**是有原因的：``_backfill_index_lists_from_verdicts``
         #    会把「出处过期」的结论摘掉，而刚写下的结论还没有出处指纹
@@ -1142,7 +1228,15 @@ class VerificationExecutor(BaseExecutor):
         # 下一轮可能换成别的判据（增量重发 id / 改写 expected_result）——
         # 没有这份指纹，resume 路径会按 id 把上一轮的结论继承过来。
         verdict = self._stamp_definition_fingerprint(vp_id, verdict)
-        self._verdicts[vp_id] = dict(verdict)  # defensive copy
+        # 2026-11-05: 盖上「这份结论属于哪一轮」—— 没有它，本轮真跑出来
+        # 的结论与上一轮留下来的结论在读侧无法区分（见
+        # :meth:`_current_round_verdicts`）。
+        verdict = self._stamp_round(verdict)
+        # 2026-11-05（轮次作用域）：盖上「这份结论负责哪一片」
+        # （``covers_paths``）—— 不盖的话，重启后从 DB 水合回来的结论答不出
+        # 「它负责哪一片」，跨轮复用永远不成立（判据 2 直接答不上来）。
+        verdict = self._stamp_covers_paths(vp_id, verdict)
+        self._store_verdict(vp_id, verdict)
         # Idempotent removal: ``list.remove`` would raise if the vp
         # is not in the pending list, which would mask a benign
         # double-record. Use a filter to keep behaviour predictable.
@@ -1184,6 +1278,16 @@ class VerificationExecutor(BaseExecutor):
                     # 的结论就是"没有指纹"的旧格式条目，只能全部重跑。
                     DEFINITION_FINGERPRINT_FIELD: verdict.get(
                         DEFINITION_FINGERPRINT_FIELD, "",
+                    ),
+                    # 2026-11-05: 轮次同理 —— 不落库的话，重启后从 DB
+                    # 水合回来的结论就分不出本轮与历史轮（那正是这一层要
+                    # 治的病）。
+                    VERDICT_ROUND_FIELD: verdict.get(VERDICT_ROUND_FIELD, 0),
+                    # 2026-11-05: 范围同理 —— 不落库的话，水合回来的结论
+                    # 答不出「它负责哪一片」，判据 2 永远答不上来 → 永远
+                    # 全量重跑。
+                    COVERS_PATHS_FIELD: list(
+                        verdict.get(COVERS_PATHS_FIELD) or [],
                     ),
                 },
             )
@@ -1454,15 +1558,21 @@ class VerificationExecutor(BaseExecutor):
                 # legacy list shape and current dict shape into
                 # the in-memory dict.
                 if isinstance(verdicts_raw, list):
-                    self._verdicts = {
-                        (v.get("vp_id") if isinstance(v, dict) else None): v
+                    loaded: List[Tuple[Any, Any]] = [
+                        (v.get("vp_id"), v)
                         for v in verdicts_raw
                         if isinstance(v, dict) and v.get("vp_id")
-                    }
+                    ]
                 elif isinstance(verdicts_raw, dict):
-                    self._verdicts = dict(verdicts_raw)
+                    loaded = list(verdicts_raw.items())
                 else:
-                    self._verdicts = {}
+                    loaded = []
+                # 2026-11-05: 轮次作用域 —— 折叠成 ``{vp_id: v}`` 会把先写
+                # 的那条弄丢，于是同一个 VP 在两轮各有一条结论时，分不出
+                # 哪条属于哪一轮。``_adopt_loaded_verdicts`` 两份表一起建：
+                # ``_verdicts`` 仍留每个 VP 的最新一条，轮次表把每一条按
+                # 它自己的轮次留下。
+                self._adopt_loaded_verdicts(loaded)
                 self._current_vp = progress_state.get("current_vp")
                 self._completed_vps = list(progress_state.get("completed_vps") or [])
                 self._updated_at = progress_state.get("updated_at")
@@ -1472,6 +1582,9 @@ class VerificationExecutor(BaseExecutor):
                 # （修复环的输入）并原样进报告。
                 self._load_orphan_ledger(row.get("executor_state"))
                 self._quarantine_orphan_verdicts()
+                # 2026-11-05（轮次作用域）：**先复用、再派生桶** —— 桶只喂
+                # 本轮的裁决，复用搬进来的结论必须已经以本轮的轮次号写好。
+                self._seed_reused_verdicts_for_current_round()
                 self._backfill_index_lists_from_verdicts()
                 # Mirror into BaseExecutor's in-memory fields so a
                 # caller that goes through the base-class run loop
@@ -1488,10 +1601,26 @@ class VerificationExecutor(BaseExecutor):
                 with open(self.state_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 self._pending_vps = list(data.get("pending_vps", []))
-                self._verdicts = dict(data.get("verdicts", {}))
+                raw_verdicts = data.get("verdicts") or {}
+                if isinstance(raw_verdicts, list):
+                    loaded = [
+                        (v.get("vp_id"), v)
+                        for v in raw_verdicts
+                        if isinstance(v, dict) and v.get("vp_id")
+                    ]
+                elif isinstance(raw_verdicts, dict):
+                    loaded = list(raw_verdicts.items())
+                else:
+                    loaded = []
+                self._adopt_loaded_verdicts(loaded)
+                # 2026-11-05: 旧的 state 文件另有一份轮次作用域表 ——
+                # ``verdicts`` 每个 VP 只留最新一条，跨轮的那几条在那张表里。
+                self._adopt_loaded_rounds(data.get("verdict_rounds"))
                 # 2026-10-25（VP-031）：与 SQLite 分支同一套顺序与理由。
                 self._load_orphan_ledger(data.get("orphaned_vp_ids"))
                 self._quarantine_orphan_verdicts()
+                # 2026-11-05（轮次作用域）：与 SQLite 分支同一套顺序与理由。
+                self._seed_reused_verdicts_for_current_round()
                 self._backfill_index_lists_from_verdicts()
                 # Mirror into BaseExecutor's in-memory fields so a
                 # caller that goes through the base-class run loop
@@ -1515,7 +1644,7 @@ class VerificationExecutor(BaseExecutor):
         # and LLM schema ("verification_points").
         vps = self.verification_plan.get("vps") or self.verification_plan.get("verification_points") or []
         self._pending_vps = [vp.get("id") for vp in vps if vp.get("id")]
-        self._verdicts = {}
+        self._adopt_loaded_verdicts([])
         self._backfill_index_lists_from_verdicts()
         self._completed_items = []
         self._failed_items = list(self._failed_vps)
@@ -1610,6 +1739,10 @@ class VerificationExecutor(BaseExecutor):
         ]
         for vp_id in stale_ids:
             self._verdicts.pop(vp_id, None)
+            # 2026-11-05（轮次作用域）：轮次表里那一份也要摘 —— 桶只喂本轮
+            # 的结论，留在轮次表里的话本轮视图会读到一条出处过期的结论。
+            for round_verdicts in self._verdicts_by_round.values():
+                round_verdicts.pop(vp_id, None)
 
         # 2026-10-14：计划自己已经作废的 VP，它的裁决同样不进失败桶。判据是
         # **计划有没有标记**，不是命令有没有变过 —— 一个被 ``obsolete`` 的
@@ -1644,10 +1777,23 @@ class VerificationExecutor(BaseExecutor):
         # id 的裁决不是失败信号，而是「计划里没有这个点」这个结构性事实 ——
         # 它不进任何桶（失败桶是修复环的输入，完成桶等于把没验过的东西记成
         # 验证通过）。过滤放在分桶**之前**，所以它同样不进 skipped / deferred。
+        #
+        # 2026-11-05（轮次作用域）：桶**只喂本轮**的结论。上一轮的结论留在
+        # 裁决表里（审计痕迹不丢），但它们不是本轮的结论 —— 混进桶里就等于
+        # 让上一轮的 PASSED 替本轮说话（实测：27 个验证点只跑了 7 个，却报出
+        # 27 条结果）。
+        #
+        # 轮次未知（0）时**不**按轮次筛：不知道轮次时不能凭轮次拒掉任何一条
+        # —— 那会让整轮什么都不跑。
+        current_round = self._verdict_round_no()
+        if current_round > 0:
+            bucket_source = self._current_round_verdicts()
+        else:
+            bucket_source = dict(self._verdicts)
         buckets = derive_index_buckets(
             {
                 vp_id: verdict
-                for vp_id, verdict in self._verdicts.items()
+                for vp_id, verdict in bucket_source.items()
                 if str(vp_id).strip() not in orphaned
                 # 2026-10-27：**被移除的验证点不进任何桶**。它既不是失败
                 # （没人要它了），也不是验证通过（没验过就报通过是撒谎）。
@@ -1751,7 +1897,9 @@ class VerificationExecutor(BaseExecutor):
                 except VerdictSchemaError:
                     on_disk_verdict = None
             if isinstance(on_disk_verdict, dict):
-                self._verdicts[in_flight] = dict(on_disk_verdict)
+                # 2026-11-05: 这条结论是**这一轮**跑出来的 —— 盖上轮次戳
+                # （子 agent 写的 verdict 文件里没有轮次字段）。
+                self._store_verdict(in_flight, self._stamp_round(on_disk_verdict))
                 self._pending_vps = [
                     v for v in self._pending_vps if v != in_flight
                 ]
@@ -1814,7 +1962,9 @@ class VerificationExecutor(BaseExecutor):
         # Insert the verdict, evict from pending, and update the
         # index lists in the canonical order so the public
         # properties observe the recovered state.
-        self._verdicts[vp_id] = dict(verdict)
+        # 2026-11-05: 合成出来的失败也是**这一轮**的结论 —— 盖上轮次戳，
+        # 否则本轮视图里看不到它（本轮真跑出了失败，视图却说没有）。
+        self._store_verdict(vp_id, self._stamp_round(verdict))
         self._pending_vps = [v for v in self._pending_vps if v != vp_id]
         self._backfill_index_lists_from_verdicts()
 
@@ -1855,6 +2005,13 @@ class VerificationExecutor(BaseExecutor):
             "plan_id": self.plan_id,
             "pending_vps": self._pending_vps,
             "verdicts": self._verdicts,
+            # 2026-11-05: 轮次作用域的裁决表 —— ``verdicts`` 每个 VP 只留
+            # 最新一条，跨轮的那几条在这张表里（JSON 的键是字符串，轮次号
+            # 落盘时变成 ``"2"`` 这样的文本，装载时还原成 ``int``）。
+            "verdict_rounds": {
+                str(round_no): verdicts
+                for round_no, verdicts in sorted(self._verdicts_by_round.items())
+            },
             # 2026-10-25（VP-031）：发号账本随状态一起落盘 —— 下一次装载
             # 必须记得"这些号已经作废过"。
             "orphaned_vp_ids": sorted(self._orphan_ledger),
@@ -2067,7 +2224,8 @@ class VerificationExecutor(BaseExecutor):
                 "reasons": [reason],
                 "evidence": {},
             }
-            self._verdicts[item_id] = verdict
+            # 2026-11-05: 整层跳过也是**这一轮**的结论 —— 盖上轮次戳。
+            self._store_verdict(item_id, self._stamp_round(verdict))
             # ``_place_in_bucket`` 负责互斥：先进 skipped，再把它从
             # failed / completed / deferred 里摘掉。
             self._place_in_bucket(item_id, BUCKET_SKIPPED)
@@ -2111,7 +2269,14 @@ class VerificationExecutor(BaseExecutor):
         # 也盖上 —— 只有 ``record_verdict`` 盖的话，resume 从磁盘/DB 读回
         # 的结论永远没有指纹，每一轮都会全量重跑。
         result = self._stamp_definition_fingerprint(item_id, result)
-        self._verdicts[item_id] = result
+        # 2026-11-05: 轮次戳 —— 生产路径（``BaseExecutor.run``）写出来的
+        # 结论也必须带轮次，否则真跑时本轮视图是空的（关卡读不到本轮的
+        # 结论，只能读到历史轮）。
+        result = self._stamp_round(result)
+        # 2026-11-05（轮次作用域）：范围戳 —— 生产路径写出来的结论也必须带
+        # 「它负责哪一片」，否则下一轮的复用判据 2 永远答不上来。
+        result = self._stamp_covers_paths(item_id, result)
+        self._store_verdict(item_id, result)
         status = result.get("status", "FAILED")
         # 2026-08-25: contract change — ``completed_vps`` is now
         # PASSED-only. Failed VPs live in ``failed_vps``,
@@ -2170,6 +2335,14 @@ class VerificationExecutor(BaseExecutor):
                     # 回来的结论是"没有指纹"的旧格式条目，只能全部重跑。
                     DEFINITION_FINGERPRINT_FIELD: result.get(
                         DEFINITION_FINGERPRINT_FIELD, "",
+                    ),
+                    # 2026-11-05: 轮次同理 —— 不落库的话，重启后从 DB
+                    # 水合回来的结论就分不出本轮与历史轮。
+                    VERDICT_ROUND_FIELD: result.get(VERDICT_ROUND_FIELD, 0),
+                    # 2026-11-05: 范围同理 —— 不落库的话，水合回来的结论
+                    # 答不出「它负责哪一片」。
+                    COVERS_PATHS_FIELD: list(
+                        result.get(COVERS_PATHS_FIELD) or [],
                     ),
                 },
             )
@@ -2502,6 +2675,10 @@ class VerificationExecutor(BaseExecutor):
             if key in defined and key not in self._orphan_ledger:
                 continue
             verdict = self._verdicts.pop(vp_id, None)
+            # 2026-11-05: 孤儿也要离开轮次作用域表 —— 留着它，本轮视图里
+            # 就会冒出一个「计划从没写过的验证点」。
+            for bucket in self._verdicts_by_round.values():
+                bucket.pop(vp_id, None)
             status = verdict.get("status") if isinstance(verdict, dict) else None
             self._orphaned_vps[key] = str(status) if status else "UNKNOWN"
             self._orphan_ledger.add(key)
@@ -2558,9 +2735,12 @@ class VerificationExecutor(BaseExecutor):
             key = str(vp_id)
             if not key.strip():
                 continue
-            self._verdicts[key] = (
-                dict(verdict) if isinstance(verdict, dict) else verdict
-            )
+            if isinstance(verdict, dict):
+                # 2026-11-05: 走 ``_store_verdict`` —— 轮次作用域表要跟着
+                # 一起更新（这条结论带着它自己的轮次）。
+                self._store_verdict(key, verdict)
+            else:
+                self._verdicts[key] = verdict
 
     def _stored_verdicts(self) -> Dict[str, Any]:
         """持久化存储里的裁决表（SQLite 优先，否则旧的 state 文件）。
@@ -2829,6 +3009,396 @@ class VerificationExecutor(BaseExecutor):
         current = self._current_round()
         return current if current > 0 else None
 
+    # ------------------------------------------------------------------
+    # Round scope (2026-11-05)
+    # ------------------------------------------------------------------
+    #
+    # 一条裁决属于**哪一轮**是它的一部分：结论是「这一次复核的结论」，
+    # 不跨轮沿用。写侧盖戳（:meth:`_stamp_round`），读侧取本轮那一份
+    # （:meth:`_current_round_verdicts`）。
+    #
+    # 0 是「轮次未知」，不是「第 0 轮」：状态库没绑定、也没人给轮次时，
+    # 写出来的裁决带 ``round=0``，读侧这时才用「最大轮」兜底。
+
+    def _verdict_round_no(self) -> int:
+        """这一轮是第几轮 —— 裁决盖戳用的那一份。
+
+        显式给的轮次（``round_no``）优先，其次问状态库
+        （:meth:`_current_round`）。两边都问不出来 → 0（「轮次未知」）。
+        """
+        if self._round_no is not None:
+            try:
+                explicit = int(self._round_no)
+            except (TypeError, ValueError):
+                explicit = 0
+            if explicit > 0:
+                return explicit
+        current = self._current_round()
+        return current if current > 0 else 0
+
+    @staticmethod
+    def _verdict_round_of(verdict: Any) -> int:
+        """一条裁决身上的轮次号 —— 规范化成 ``int``。
+
+        旧数据没有这个字段 → 0（「轮次未知」）。**绝不**因为字段缺失就
+        丢掉那条裁决：丢一份结论比标错一个轮次贵得多。
+        """
+        if not isinstance(verdict, dict):
+            return 0
+        raw = verdict.get(VERDICT_ROUND_FIELD)
+        try:
+            round_no = int(raw)
+        except (TypeError, ValueError):
+            return 0
+        return round_no if round_no > 0 else 0
+
+    def _stamp_round(self, verdict: Dict[str, Any]) -> Dict[str, Any]:
+        """给一条裁决盖上「它属于哪一轮」（返回副本，不改原对象）。
+
+        写侧**唯一**的盖戳入口 —— :meth:`record_verdict`、
+        :meth:`_record_result`、整层跳过、崩溃恢复都走它，免得三处各写
+        一份、各理解一次「轮次未知」。
+        """
+        stamped = dict(verdict)
+        stamped[VERDICT_ROUND_FIELD] = self._verdict_round_no()
+        return stamped
+
+    def _store_verdict(self, vp_id: str, verdict: Dict[str, Any]) -> None:
+        """把一条裁决放进裁决表 + 轮次作用域表。
+
+        ``_verdicts`` 每个 VP 只留最新一条（跨轮继承靠它），
+        ``_verdicts_by_round`` 记下每一条裁决**属于哪一轮** —— 同一个
+        VP 在两轮各有一条结论时，两条都在（审计痕迹不丢）。
+
+        轮次从裁决自己身上的 ``round`` 字段读（没有就当 0）：装载历史
+        数据时必须保住它原来的轮次，不能盖成"当前轮"。
+        """
+        entry = dict(verdict)
+        round_no = self._verdict_round_of(entry)
+        entry[VERDICT_ROUND_FIELD] = round_no
+        self._verdicts[vp_id] = entry
+        self._verdicts_by_round.setdefault(round_no, {})[vp_id] = entry
+
+    def _current_round_verdicts(self) -> Dict[str, Dict[str, Any]]:
+        """**本轮**的裁决 —— ``{vp_id: 裁决}``。
+
+        只给本轮那一份：本轮没有的验证点**不回落**到历史轮 —— 回落
+        等于「上一轮的结论替本轮说话」，那正是这一层要治的病。
+
+        两种兜底，都只在本轮**一条都没有**时生效，绝不把别的轮次混进
+        本轮：
+
+        * 轮次未知（状态库说「不知道」，调用方也没给）→ 取**最大轮**；
+        * 轮次已知、但表里只有**没有轮次字段**的旧结论（``round`` 0）→
+          取那一份。升级前写下的裁决没有轮次可认，丢掉它就等于把
+          resume 状态一起丢掉（2026-08-25 修的正是这个）；而把它与本轮
+          的结论混在一起，又会复活「上一轮替本轮说话」。
+        """
+        current = self._verdict_round_no()
+        if current > 0:
+            bucket = self._verdicts_by_round.get(current) or {}
+            if bucket:
+                return {
+                    vp_id: dict(verdict)
+                    for vp_id, verdict in bucket.items()
+                }
+            legacy = self._verdicts_by_round.get(0) or {}
+            return {
+                vp_id: dict(verdict) for vp_id, verdict in legacy.items()
+            }
+        if not self._verdicts_by_round:
+            return {}
+        latest = max(self._verdicts_by_round)
+        return {
+            vp_id: dict(verdict)
+            for vp_id, verdict in self._verdicts_by_round[latest].items()
+        }
+
+    # ------------------------------------------------------------------
+    # Cross-round reuse (2026-11-05)
+    # ------------------------------------------------------------------
+    #
+    # **默认每轮真跑。** 一条结论是"这一次复核的结论"，不跨轮沿用 ——
+    # 上一轮 PASSED 的验证点被当成本轮"已经跑过"而跳过，实测 27 个验证点
+    # 只跑了 7 个，却报出 27 条结果。
+    #
+    # 复用不是不能做，但**必须说得出凭什么**。那"凭什么"是四条判据（判据
+    # 内核在 :mod:`verification_round_scope`，执行器与编排器共用同一份口径）：
+    #
+    #   1. 上一轮该验证点是 ``PASSED``；
+    #   2. 该验证点声明了非空的范围（``covers_paths``）；
+    #   3. 本轮变更集与那个范围**不相交**；
+    #   4. 本轮变更集不碰任何**共享面**。
+    #
+    # 四条全真才复用；任何一条答不上来 → 全量重跑。复用是例外，例外必须
+    # 能被这四条复核出来。
+
+    def _resumable_completed_ids(self, items: List[Dict[str, Any]]) -> Set[str]:
+        """这一轮可以跳过哪些验证点 —— **本轮**的结论才算。
+
+        基类那份规则是"缓存里有这个 id、且定义指纹对得上"就够了。轮次作用域
+        加上之后还要一条：**这条结论必须是本轮的** —— 本轮真跑出来的，或本轮
+        明确判定可以复用、从上一轮带过来的。
+
+        历史轮的结论不再自动算"已完成"（2026-11-05：上一轮 PASSED 的验证点被
+        当成本轮已经跑过，27 个验证点只跑了 7 个）。
+
+        定义指纹那道校验**原样保留**（走基类）：一条结论只对它产生它的那份
+        定义有效，轮次作用域是**加**了一道判据，不是把既有那道换掉。
+        """
+        resumable = super()._resumable_completed_ids(items)
+        return {
+            item_id for item_id in resumable
+            if self._is_current_round_verdict(item_id)
+        }
+
+    def _is_current_round_verdict(self, item_id: str) -> bool:
+        """这条结论是不是**本轮**的。
+
+        轮次未知（0）时一律当"是"：不知道轮次时不能凭轮次拒掉任何一条 ——
+        那会让整轮什么都不跑。
+        """
+        current = self._verdict_round_no()
+        if current <= 0:
+            return True
+        if item_id in self._verdicts_by_round.get(current, {}):
+            return True
+        verdict = self._verdicts.get(item_id)
+        return (
+            isinstance(verdict, dict)
+            and self._verdict_round_of(verdict) == current
+        )
+
+    def _seed_reused_verdicts(self, prev_round: int) -> Set[str]:
+        """把上一轮**可以复用**的结论搬进本轮（返回复用的验证点 id）。
+
+        四条判据（全在 :func:`verification_round_scope.may_reuse` 里）：
+
+        1. 上一轮该验证点是 ``PASSED``；
+        2. 该验证点声明了非空的范围（``covers_paths``）；
+        3. 本轮变更集与那个范围**不相交**；
+        4. 本轮变更集不碰任何**共享面**。
+
+        搬进来的结论以**本轮**的轮次号重新写入，并附
+        ``reused_from_round=<上一轮号>``：不重新盖戳的话，
+        :meth:`_current_round_verdicts` 会把它当历史轮排除 —— 本轮视图里就
+        没有它，复用等于没发生。
+
+        任何一条判据答不上来（没有本轮的轮次作用域记录、上一轮没有
+        ``head_sha``、轮次未知、上一轮根本没跑过）→ **一条都不复用**：
+        全量重跑是安全的一侧。
+        """
+        current = self._verdict_round_no()
+        if current <= 0:
+            # 轮次未知：没有"本轮"可言，复用无从落地。
+            return set()
+        if prev_round <= 0 or prev_round >= current:
+            return set()
+        previous = self._verdicts_by_round.get(prev_round)
+        if not previous:
+            return set()
+        scope = self._reuse_scope(current)
+        if scope is None:
+            return set()
+        changed, shared_hit = scope
+
+        reused: Set[str] = set()
+        for vp_id, verdict in previous.items():
+            if not isinstance(verdict, dict):
+                continue
+            # 被移除的验证点不进本轮的任何结论（它不属于本计划的主题）。
+            if str(vp_id).strip() in self._removed_vp_ids:
+                # 上一轮搬过来的那份要从本轮视图里拿走 —— 移除集是**每轮**
+                # 重建的，而装载阶段（``__init__`` → ``_load_or_init_state``）
+                # 那时还读不到它。
+                self._verdicts_by_round.get(current, {}).pop(vp_id, None)
+                carried = self._verdicts.get(vp_id)
+                if (
+                    isinstance(carried, dict)
+                    and carried.get(REUSED_FROM_ROUND_FIELD)
+                ):
+                    self._verdicts.pop(vp_id, None)
+                continue
+            covers = self._covers_paths_for_vp(vp_id, verdict)
+            if not may_reuse(
+                str(verdict.get("status") or ""), covers, changed, shared_hit,
+            ):
+                continue
+            seeded = dict(verdict)
+            seeded[VERDICT_ROUND_FIELD] = current
+            seeded[REUSED_FROM_ROUND_FIELD] = prev_round
+            self._store_verdict(vp_id, seeded)
+            reused.add(vp_id)
+        if reused:
+            logger.info(
+                "[verification_executor] round %s reuses %s verdict(s) from "
+                "round %s (changed=%s)",
+                current, sorted(reused), prev_round, list(changed),
+            )
+        return reused
+
+    def _seed_reused_verdicts_for_current_round(self) -> Set[str]:
+        """按当前轮次复用上一轮的结论（``_seed_reused_verdicts`` 的入口）。
+
+        上一轮 = 当前轮 − 1。第一轮没有上一轮 → 一条都不复用。
+        """
+        current = self._verdict_round_no()
+        if current <= 1:
+            return set()
+        return self._seed_reused_verdicts(current - 1)
+
+    def _reuse_scope(
+        self, current_round: int,
+    ) -> Optional[Tuple[Tuple[str, ...], bool]]:
+        """本轮复用的两个输入：变更集 + 共享面命中。
+
+        ``None`` = **不知道变了什么** → 全量重跑。口径在
+        :mod:`verification_round_scope`（读记录的人与写记录的人是同一份）。
+
+        两个 sha 缺一个都不行：上一轮没有 ``head_sha`` → 变更集算不出来；
+        本轮没有 ``head_sha`` → 同样算不出来。变更集为空在这里是"什么都没
+        变"（两个 sha 都在、diff 为空、工作区干净），不是"不知道"——
+        记录里没有 ``changed`` 键且两个 sha 齐全才是这一种。
+        """
+        try:
+            record = load_round_scope(self.plan_dir, current_round)
+        except Exception:  # noqa: BLE001 — 读不到记录不是致命的
+            logger.warning(
+                "[verification_executor] round scope unreadable (round=%s) — "
+                "full re-run", current_round,
+            )
+            return None
+        if not isinstance(record, dict):
+            return None
+        prev_head_sha = record.get("prev_head_sha")
+        head_sha = record.get("head_sha")
+        if not isinstance(prev_head_sha, str) or not prev_head_sha.strip():
+            return None
+        if not isinstance(head_sha, str) or not head_sha.strip():
+            return None
+        raw_changed = record.get("changed")
+        changed = tuple(
+            path for path in (raw_changed or ())
+            if isinstance(path, str) and path.strip()
+        )
+        shared_hit = any(is_shared_surface(path) for path in changed)
+        return changed, shared_hit
+
+    def _covers_paths_for_vp(
+        self,
+        vp_id: str,
+        verdict: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, ...]:
+        """这个验证点负责的范围（``covers_paths``）。
+
+        三个来源，取**并集**（范围越大越保守：越容易与变更集相交，越不容易
+        复用）：
+
+        * **裁决身上带着的** —— 上一轮落库时记下来的那份（裁决表的形状是
+          固定的，不带范围就答不了"这条结论负责哪一片"）；
+        * **本轮计划里的** —— 计划声明的范围；
+        * **盘上计划里的** —— ``verification_plan.json``（执行器拿到的是
+          **转换后**的计划形状，范围字段在转换里没有带过来）。
+
+        一个来源都没有 → 空范围 → 每轮重跑（安全的一侧）。
+        """
+        prefixes: List[str] = []
+        if isinstance(verdict, dict):
+            prefixes.extend(_prefix_list(verdict.get(COVERS_PATHS_FIELD)))
+        for vp in self._plan_vps():
+            if isinstance(vp, dict) and str(vp.get("id") or "") == str(vp_id):
+                prefixes.extend(_prefix_list(vp.get(COVERS_PATHS_FIELD)))
+                break
+        prefixes.extend(
+            _prefix_list(self._disk_plan_covers_paths().get(str(vp_id)))
+        )
+        normalised = normalise_prefix(prefixes)
+        return normalised if isinstance(normalised, tuple) else (normalised,)
+
+    def _disk_plan_covers_paths(self) -> Dict[str, Tuple[str, ...]]:
+        """盘上计划（``verification_plan.json``）里每个验证点的范围。
+
+        范围只写在 LLM 形状的盘上计划里（由任务声明派生，见
+        ``verification_agent._attach_covers_paths``）；执行器拿到的是转换后的
+        形状，那份没有范围字段 —— 所以要回盘上取。
+
+        读不到 → 空表：没有范围的验证点每轮重跑（安全的一侧）。
+        """
+        if self._disk_covers_cache is not None:
+            return self._disk_covers_cache
+        table: Dict[str, Tuple[str, ...]] = {}
+        try:
+            raw = json.loads(
+                (self.plan_dir / _PLAN_FILENAME).read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError, TypeError):
+            raw = None
+        if isinstance(raw, dict):
+            points = raw.get("verification_points")
+            if isinstance(points, list):
+                for vp in points:
+                    if not isinstance(vp, dict):
+                        continue
+                    vp_id = str(vp.get("id") or "").strip()
+                    if not vp_id:
+                        continue
+                    table[vp_id] = _prefix_list(vp.get(COVERS_PATHS_FIELD))
+        self._disk_covers_cache = table
+        return table
+
+    def _stamp_covers_paths(
+        self, vp_id: str, verdict: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """给一条裁决盖上"它负责哪一片"（``covers_paths``）。
+
+        没有范围就不盖：空范围与"没有这个字段"对读侧是一回事（每轮重跑），
+        多盖一个空列表只会让裁决表变胖。
+
+        范围必须**落库**（``record_verdict`` / ``_record_result`` 一起写）——
+        否则重启后从 DB 水合回来的结论不带范围，下一轮就答不出"这条结论负责
+        哪一片"，复用永远不成立。
+        """
+        covers = self._covers_paths_for_vp(vp_id)
+        if not covers:
+            return verdict
+        stamped = dict(verdict)
+        stamped[COVERS_PATHS_FIELD] = list(covers)
+        return stamped
+
+    def _adopt_loaded_verdicts(self, entries: List[Tuple[Any, Any]]) -> None:
+        """装载到的裁决 → 裁决表 + 轮次作用域表。
+
+        ``entries`` 是 ``(vp_id, 裁决)`` 的序列，**按存储顺序**给（旧的
+        在前）：同一个 VP 出现多次时，后来的覆盖先来的（与历史行为
+        一致），而轮次作用域表把每一条都按它自己的轮次留下。
+        """
+        self._verdicts = {}
+        self._verdicts_by_round = {}
+        for vp_id, verdict in entries:
+            if not isinstance(verdict, dict):
+                continue
+            self._store_verdict(vp_id, verdict)
+
+    def _adopt_loaded_rounds(self, raw: Any) -> None:
+        """装载轮次作用域表（旧的 state 文件里是 ``{轮次: {vp_id: 裁决}}``）。
+
+        JSON 的键只能是字符串，所以轮次号落盘时是 ``"2"`` 这样的文本，
+        这里还原成 ``int``。
+        """
+        if not isinstance(raw, dict):
+            return
+        for round_key, verdicts in raw.items():
+            try:
+                round_no = int(round_key)
+            except (TypeError, ValueError):
+                continue
+            if round_no < 0 or not isinstance(verdicts, dict):
+                continue
+            bucket = self._verdicts_by_round.setdefault(round_no, {})
+            for vp_id, verdict in verdicts.items():
+                if isinstance(verdict, dict):
+                    bucket.setdefault(vp_id, dict(verdict))
+
     def _load_orphan_ledger(self, raw: Any) -> None:
         """Read the persisted orphan ledger (``orphaned_vp_ids``).
 
@@ -3092,7 +3662,10 @@ class VerificationExecutor(BaseExecutor):
             try:
                 self.record_verdict(item_id, verdict)
             except Exception:  # noqa: BLE001 — 记录失败也不能让整轮崩掉
-                self._verdicts[item_id] = verdict
+                # 2026-11-05: 兜底也走 :meth:`_store_verdict` —— 直接写
+                # ``_verdicts`` 会漏掉轮次表，本轮视图（``_current_round_
+                # verdicts``）就看不见这条结论。
+                self._store_verdict(item_id, self._stamp_round(verdict))
                 self._save_state()
             if item_id not in self._deferred_vps:
                 self._deferred_vps.append(item_id)

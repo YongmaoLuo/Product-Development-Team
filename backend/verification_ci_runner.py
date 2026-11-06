@@ -168,6 +168,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -177,7 +178,7 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from bounded_subprocess import run_bounded
 from credentials import _FD_ENV_PREFIX as _SECRET_FD_ENV_PREFIX
@@ -416,13 +417,35 @@ _SHELL_OPTIONS_WITH_VALUE = frozenset({"-o", "+o"})
 #: Characters that end a command inside a compound command line.
 _COMMAND_SEPARATORS = ";&|"
 
-#: Characters that group a command in the shell but belong to no path.
+#: Shell grouping punctuation: ``(`` opens a group, ``)`` closes one.
 #:
-#: 2026-11-05（arch 决策点 2 —— 路径提取）：``(test -e backend/.venv)``
-#: 里的括号是 shell 的分组符号。留在 token 上，路径就被读成
-#: ``backend/.venv)`` —— 执行期的「引用路径存在性检查」于是去找一个
-#: 不存在的文件，报一条假的「路径不存在」。
-_GROUPING_CHARS = "()"
+#: A bracket is **not** part of the token it is glued to: ``(test`` is the
+#: ``test`` builtin, and ``backend/.venv)`` is the path ``backend/.venv``
+#: with the group's closing bracket stuck to it.  Reading the bracket as
+#: part of the path made the pre-flight look up a path that can never
+#: exist — and it hid the ``cd`` of ``(cd backend && …)``, so the paths
+#: after it were resolved against the wrong directory (2026-11-05).
+_GROUPING_PREFIX = "("
+_GROUPING_SUFFIX = ")"
+
+#: Commands whose operands *create* a path.
+#:
+#: ``ln`` creates its last operand, ``mkdir`` / ``touch`` create all of
+#: theirs, ``cp`` / ``mv`` create their last one (the destination).  An
+#: entry is allowed to build the very path it goes on to read — that is
+#: how a fresh worktree bootstraps its own virtualenv
+#: (``ln -sfn … backend/.venv``), and the pre-flight must not call such
+#: an entry "it reads a path that does not exist".
+#:
+#: Only the *producer* position is exempt.  The consumed side of the
+#: same command (``cp missing.txt out.txt``) still has to exist.
+_PATH_CREATING_COMMANDS = {
+    "ln": "last",
+    "mkdir": "all",
+    "touch": "all",
+    "cp": "last",
+    "mv": "last",
+}
 
 #: An environment assignment in front of a command (``FOO=bar cmd``).
 _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -445,9 +468,43 @@ class SchemaIssue:
 
     vp_id: str
     detail: str
+    #: The machine-written **rule** that fired — the identity of the
+    #: defect.  ``detail`` is the human-readable explanation; this is
+    #: the part that stays the same when the explanation is reworded.
+    code: str = ""
+    #: The machine-written **subject** of the rule: the offending path,
+    #: the narrowed target.  Empty when the rule has no subject.
+    subject: str = ""
 
     def to_dict(self) -> Dict[str, str]:
-        return {"vp_id": self.vp_id, "detail": self.detail}
+        return {
+            "vp_id": self.vp_id,
+            "detail": self.detail,
+            "code": self.code,
+            "subject": self.subject,
+        }
+
+    def failure_id(self) -> str:
+        """The machine-written identity of this defect.
+
+        The failure identity has to be the same whenever the defect is
+        the same — including when the round's report words it
+        differently.  So it is built from the **rule** and its
+        **subject**, never from ``detail``: the detail is prose, and
+        prose is what the report rewords from round to round.
+
+        On 2026-11-05 that difference cost a whole round: the same
+        schema rejection produced three different failure fingerprints
+        (``a61e387a…`` / ``be0a4e42…`` / ``db929c18…``) because the
+        fingerprint hashed the report's first line of evidence, and the
+        report reworded it every round.  Three narratives, one defect,
+        two false "the root cause changed" signals.
+        """
+        code = str(self.code or "").strip() or "unknown"
+        subject = str(self.subject or "").strip()
+        if subject:
+            return f"schema:{code}:{subject}"
+        return f"schema:{code}"
 
 
 @dataclass
@@ -593,15 +650,17 @@ def _referenced_paths(entry: str, project_dir: Optional[Path] = None) -> List[st
       a relative path named after it is relative to that directory, not
       to the repository root (``state_machine/tests`` after
       ``cd backend`` is ``backend/state_machine/tests``);
-    * the parentheses of a grouped command belong to the shell, not to
-      the path: ``backend/.venv)`` in ``(test -e backend/.venv)`` is
-      ``backend/.venv``.
+    * the shell's grouping brackets are punctuation, not part of the
+      token they are glued to (``(test`` → ``test``,
+      ``backend/.venv)`` → ``backend/.venv``).
 
     The flag / absolute-path / URL skip rules are unchanged, and the
     existence check in :func:`validate_vp` is not relaxed: a path that
-    cannot be found is still an issue.
+    cannot be found is still an issue — unless the entry itself creates
+    it (see :func:`_missing_referenced_paths`).
     """
-    return _collect_referenced_paths(_split_command_text(entry), "")
+    referenced, _created = _collect_entry_paths(entry)
+    return referenced
 
 
 def _split_command_text(text: str) -> List[str]:
@@ -611,6 +670,21 @@ def _split_command_text(text: str) -> List[str]:
     except ValueError:
         # Unbalanced quotes — the shell will decide at run time.
         return text.split()
+
+
+def _normalize_token(token: str) -> str:
+    """Strip the shell punctuation that is not part of a token's meaning.
+
+    * the command separators (``&&`` / ``||`` / ``;`` / ``|``) at the end;
+    * the grouping brackets at either end (``(`` … ``)``).
+
+    A token that is *only* punctuation normalises to the empty string,
+    which the reader takes as "a separator".
+    """
+    text = token.rstrip(_COMMAND_SEPARATORS)
+    if not text:
+        return ""
+    return text.lstrip(_GROUPING_PREFIX).rstrip(_GROUPING_SUFFIX)
 
 
 def _shell_command_payload(tokens: List[str], index: int) -> Optional[int]:
@@ -623,11 +697,11 @@ def _shell_command_payload(tokens: List[str], index: int) -> Optional[int]:
     first word that is not a flag, so the ``-c`` of a *later* command in
     the chain is never mistaken for this one's payload.
     """
-    if os.path.basename(tokens[index]) not in _SHELL_BINARIES:
+    if os.path.basename(_normalize_token(tokens[index])) not in _SHELL_BINARIES:
         return None
     offset = index + 1
     while offset < len(tokens):
-        flag = tokens[offset]
+        flag = _normalize_token(tokens[offset])
         if not flag.startswith("-"):
             # A command word — this shell invocation carries no -c.
             return None
@@ -639,22 +713,6 @@ def _shell_command_payload(tokens: List[str], index: int) -> Optional[int]:
             return offset + 1 if offset + 1 < len(tokens) else None
         offset += 1
     return None
-
-
-def _normalize_token(token: str) -> str:
-    """The token as the shell reads it, without the grouping punctuation.
-
-    ``(test -e backend/.venv)`` reaches the reader as the tokens
-    ``(test`` / ``-e`` / ``backend/.venv)`` — the parentheses belong to
-    the shell's grouping, not to the path. Left on, the path is read as
-    ``backend/.venv)`` and the existence check then looks for a file
-    that does not exist.
-
-    The separators go first: a token can carry both (``backend/.venv)&&``),
-    and the parenthesis only becomes the outermost character once the
-    separators are gone.
-    """
-    return token.rstrip(_COMMAND_SEPARATORS).strip(_GROUPING_CHARS)
 
 
 def _looks_like_path(token: str) -> bool:
@@ -686,14 +744,73 @@ def _join_base(base: str, token: str) -> str:
     return os.path.normpath(os.path.join(base, token))
 
 
-def _collect_referenced_paths(tokens: List[str], base: str) -> List[str]:
+def _command_operands(tokens: List[str], start: int) -> List[str]:
+    """The non-option operands of the command that starts at ``start``.
+
+    The scan stops at the first separator: the operands belong to *this*
+    command only.  ``--`` ends the option parsing — everything after it
+    is an operand.
+    """
+    operands: List[str] = []
+    options_done = False
+    for token in tokens[start:]:
+        text = _normalize_token(token)
+        if not text:
+            # A separator (``&&`` / ``||`` / ``;`` …) or a lone bracket
+            # ends this command.
+            break
+        if not options_done:
+            if text == "--":
+                options_done = True
+                continue
+            if text.startswith("-"):
+                continue
+        operands.append(text)
+    return operands
+
+
+def _collect_created_paths(
+    command: str,
+    tokens: List[str],
+    start: int,
+    base: str,
+    created: List[str],
+) -> None:
+    """Record the paths the command at ``start`` creates.
+
+    ``ln`` creates its last operand, ``mkdir`` / ``touch`` create all of
+    theirs, ``cp`` / ``mv`` create their last one (the destination).
+    """
+    rule = _PATH_CREATING_COMMANDS.get(os.path.basename(command))
+    if rule is None:
+        return
+    operands = _command_operands(tokens, start)
+    if not operands:
+        return
+    targets = operands if rule == "all" else operands[-1:]
+    for target in targets:
+        created.append(_join_base(base, target))
+
+
+def _collect_referenced_paths(
+    tokens: List[str],
+    base: str,
+    created: Optional[List[str]] = None,
+) -> List[str]:
     """Repo-relative paths named by ``tokens``, given the current ``base``.
 
     ``base`` is the directory the commands run in — relative to the
     repository root (``""`` = the root itself), or absolute when a
     ``cd`` named an absolute directory.
+
+    ``created`` collects the paths the command line *creates* itself
+    (``ln -sfn … backend/.venv``); the caller exempts them from the
+    existence check, because an entry that builds the path it then reads
+    is runnable by definition.
     """
     out: List[str] = []
+    if created is None:
+        created = []
     index = 0
     at_command_start = True
 
@@ -718,19 +835,22 @@ def _collect_referenced_paths(tokens: List[str], base: str) -> List[str]:
             # inside it. The payload runs in a subshell, so a ``cd`` in
             # it does not change the directory of the outer chain.
             out.extend(_collect_referenced_paths(
-                _split_command_text(tokens[payload_index]), base,
+                _split_command_text(tokens[payload_index]), base, created,
             ))
             index = payload_index + 1
             at_command_start = False
             continue
 
         if at_command_start and token == "cd" and index + 1 < len(tokens):
-            base = _resolve_cd_target(
-                base, _normalize_token(tokens[index + 1]),
-            )
+            base = _resolve_cd_target(base, _normalize_token(tokens[index + 1]))
             index += 2
             at_command_start = False
             continue
+
+        if at_command_start:
+            # The command word itself — it may be a producer (``ln`` …),
+            # in which case its operand is a path this entry creates.
+            _collect_created_paths(token, tokens, index + 1, base, created)
 
         if _looks_like_path(token):
             out.append(_join_base(base, token))
@@ -739,6 +859,70 @@ def _collect_referenced_paths(tokens: List[str], base: str) -> List[str]:
         index += 1
 
     return out
+
+
+def _collect_entry_paths(entry: str) -> Tuple[List[str], List[str]]:
+    """The paths an entry reads, and the paths it creates itself."""
+    created: List[str] = []
+    referenced = _collect_referenced_paths(
+        _split_command_text(entry), "", created,
+    )
+    return (
+        [canonical_repo_path(path) for path in referenced],
+        [canonical_repo_path(path) for path in created],
+    )
+
+
+def canonical_repo_path(rel: str) -> str:
+    """The canonical spelling of a repo-relative path.
+
+    ``./scripts/missing.sh`` and ``scripts/missing.sh`` name the **same**
+    file.  The failure identity is built from the offending path, so
+    leaving the spelling in would make the identity a property of the
+    report's wording — and a reworded report would read as "the root
+    cause evolved", which is the false signal this whole chain exists to
+    kill (2026-11-05, VP-015).
+
+    The canonical form is the one the repository itself uses: no ``./``
+    prefix, no redundant separators, no ``..`` segments.  An absolute
+    path keeps its shape — the rule never rewrites what it cannot
+    resolve.
+
+    The shell punctuation that **surrounds** a path in a command line is
+    not part of the path either: ``backend/.venv)`` — the ``)`` closes
+    the grouping the entry opened — names the same file as
+    ``backend/.venv``.  The runner reads that punctuation off while it
+    tokenizes; a path that arrives from **elsewhere** (an artifact an
+    older runner wrote, a report that quoted the raw command line) can
+    still carry it, and the identity must not depend on it.
+    """
+    text = _normalize_token(str(rel or "").strip())
+    if not text:
+        return text
+    return posixpath.normpath(text)
+
+
+def _missing_referenced_paths(entry: str, root: Path) -> List[str]:
+    """The paths ``entry`` reads that do not exist under ``root``.
+
+    A path the entry *creates* itself is not missing — the entry builds
+    it before it reads it (``(test -e backend/.venv || ln -sfn … backend/.venv)``).
+    Every other referenced path still has to exist: the exemption is for
+    the producer position only, never for the consumed one.
+    """
+    referenced, created = _collect_entry_paths(entry)
+    created_paths: Set[str] = set(created)
+    missing: List[str] = []
+    seen: Set[str] = set()
+    for rel in referenced:
+        if rel in seen:
+            continue
+        seen.add(rel)
+        if rel in created_paths:
+            continue
+        if not (root / rel).exists():
+            missing.append(rel)
+    return missing
 
 
 def e2e_kind(vp: Any) -> str:
@@ -785,6 +969,7 @@ def _validate_e2e_vp(
         f"e2e({E2E_KIND_BROWSER}) 由子 agent 驱动真实浏览器，框架判不了："
         f"要由框架直接执行就声明 `e2e_kind: \"{E2E_KIND_COMMAND}\"` "
         f"和一条 `{ENTRY_COMMAND_FIELD}`。",
+        code="e2e_browser_unsupported",
     )]
 
 
@@ -800,17 +985,19 @@ def _validate_command_e2e_vp(
             f"e2e({E2E_KIND_COMMAND}) 要求一条非空的 "
             f"'{ENTRY_COMMAND_FIELD}' 字符串 —— "
             f"判定依据就是这条入口的退出码",
+            code="e2e_command_missing",
         ))
         return issues
 
     if project_dir is not None:
         root = Path(project_dir)
-        for rel in _referenced_paths(entry.strip(), root):
-            if not (root / rel).exists():
-                issues.append(SchemaIssue(
-                    vp_id,
-                    f"{ENTRY_COMMAND_FIELD} 引用的路径不存在：{rel}",
-                ))
+        for rel in _missing_referenced_paths(entry.strip(), root):
+            issues.append(SchemaIssue(
+                vp_id,
+                f"{ENTRY_COMMAND_FIELD} 引用的路径不存在：{rel}",
+                code="e2e_command_path_missing",
+                subject=rel,
+            ))
 
     return issues
 
@@ -848,7 +1035,10 @@ def validate_vp(
     """
     issues: List[SchemaIssue] = []
     if not isinstance(vp, dict):
-        return [SchemaIssue("unknown", f"VP is {type(vp).__name__}, expected an object")]
+        return [SchemaIssue(
+            "unknown", f"VP is {type(vp).__name__}, expected an object",
+            code="vp_not_an_object",
+        )]
     vp_id = str(vp.get("id", "unknown"))
 
     if str(vp.get("verification_method") or "").strip() == E2E_METHOD:
@@ -860,6 +1050,7 @@ def validate_vp(
             vp_id,
             f"full_ci requires a non-empty '{CI_ENTRY_FIELD}' string — "
             f"整仓门禁的判定依据就是这条入口的退出码",
+            code="ci_entry_missing",
         ))
         return issues
 
@@ -880,16 +1071,19 @@ def validate_vp(
             f"{CI_ENTRY_FIELD} 收窄了验证范围（{narrowed}）："
             f"full_ci 的职责是整仓门禁；收窄到用例级的验证属于 Phase 1，"
             f"而 Phase 1 不跑命令。",
+            code="ci_entry_narrowed",
+            subject=narrowed,
         ))
 
     if project_dir is not None:
         root = Path(project_dir)
-        for rel in _referenced_paths(entry.strip(), root):
-            if not (root / rel).exists():
-                issues.append(SchemaIssue(
-                    vp_id,
-                    f"{CI_ENTRY_FIELD} 引用的路径不存在：{rel}",
-                ))
+        for rel in _missing_referenced_paths(entry.strip(), root):
+            issues.append(SchemaIssue(
+                vp_id,
+                f"{CI_ENTRY_FIELD} 引用的路径不存在：{rel}",
+                code="ci_entry_path_missing",
+                subject=rel,
+            ))
 
     return issues
 
@@ -1139,6 +1333,113 @@ def ci_subprocess_env() -> Dict[str, str]:
     }
 
 
+def _resolution_of(module_path: Path, project_dir: Any) -> str:
+    """Is this module the tree under test's own copy, or the harness'?
+
+    The module knows which file it is, and it is told which tree it is
+    judging — so it can answer that itself.  The answer has to travel
+    **with the verdict**, because the verdict is what outlives the
+    round: the artifact a reader finds on disk has to say not only
+    "this file judged" but also "that file was the tree under test's
+    own".
+
+    ``""`` when the question cannot be asked (no project, no readable
+    path): an unanswerable question is not a wrong answer.
+    """
+    try:
+        expected = (
+            Path(project_dir) / "backend" / "verification_ci_runner.py"
+        ).resolve()
+    except (OSError, TypeError):
+        return ""
+    try:
+        from verification_ci_runner_loader import (
+            RESOLUTION_HARNESS,
+            RESOLUTION_PROJECT,
+        )
+    except Exception:  # noqa: BLE001 — the loader is optional here
+        project, harness = "project", "harness"
+    else:
+        project, harness = RESOLUTION_PROJECT, RESOLUTION_HARNESS
+    return project if module_path == expected else harness
+
+
+def verifier_source(project_dir: Any = None) -> Dict[str, str]:
+    """Which file is judging — this module's own path, hash and HEAD.
+
+    2026-11-05: a round could not answer "was the code that judged me the
+    code I fixed?".  The failure was byte-for-byte the same in two
+    rounds while the file on disk was already fixed — because the round
+    ran *another* copy of this module.  So every verdict now carries the
+    answer, and this function is where the answer comes from.
+
+    The path is this module's own file, resolved: the module is loaded
+    from wherever the tree under test keeps it, and that is exactly the
+    file that has to be named.
+
+    ``project_dir`` is optional: without it the module cannot say which
+    copy it is, and it says so rather than guessing.  The loader knows
+    the answer anyway — it is the one that chose the file — so it
+    reports its own resolution alongside this one.
+    """
+    module_path = Path(__file__).resolve()
+    source = {
+        "module_path": str(module_path),
+        "sha256": "",
+        "git_head": "",
+        "resolution": "",
+    }
+    if project_dir is not None:
+        source["resolution"] = _resolution_of(module_path, project_dir)
+    try:
+        from verification_ci_runner_loader import file_sha256, git_head_at
+
+        source["sha256"] = file_sha256(module_path)
+        source["git_head"] = git_head_at(module_path)
+    except Exception:  # noqa: BLE001 — provenance never fails a round
+        logger.debug(
+            "[ci_runner] could not compute the provenance of %s",
+            module_path, exc_info=True,
+        )
+    return source
+
+
+def shared_venv_for(project_dir: Any) -> Optional[str]:
+    """The venv a gate in ``project_dir`` may reuse when it has none.
+
+    ``scripts/run_tests.sh`` hard-requires ``$PROJECT_ROOT/backend/.venv``.
+    A tree under test that has none — a fresh worktree is the usual
+    case — therefore needs one, and the cheapest deterministic answer is
+    the harness' own: **offline**, and the same versions the harness
+    itself runs.
+
+    The tree under test's own venv wins: if it has one, that is the one
+    its lockfile pinned.
+    """
+    candidates = []
+    try:
+        candidates.append(Path(project_dir) / "backend" / ".venv")
+    except TypeError:
+        pass
+    try:
+        from verification_ci_runner_loader import harness_shared_venv
+
+        shared = harness_shared_venv()
+        if shared:
+            candidates.append(Path(shared))
+    except Exception:  # noqa: BLE001 — a hint, never a failure
+        logger.debug(
+            "[ci_runner] no shared venv available", exc_info=True,
+        )
+    for candidate in candidates:
+        try:
+            if candidate.is_dir():
+                return str(candidate)
+        except OSError:
+            continue
+    return None
+
+
 def _spawn_registry() -> Tuple[Path, Path]:
     """The registry of this run's detached processes, and its directory.
 
@@ -1299,7 +1600,15 @@ def _read_junit_evidence(junit_dir: Optional[Path]) -> Dict[str, Any]:
     the exit code, and a report that cannot be parsed must not be able
     to disturb it.
     """
-    evidence: Dict[str, Any] = {"junit_phases": [], "junit_failures": []}
+    evidence: Dict[str, Any] = {
+        "junit_phases": [],
+        "junit_failures": [],
+        # 2026-11-06: the machine-written failing set is present even
+        # when there is no junit report to read — the key has to mean
+        # the same thing on every path, or its absence reads as "the
+        # machine did not say".
+        "failed_cases": [],
+    }
     if junit_dir is None:
         return evidence
 
@@ -1382,6 +1691,16 @@ def _read_junit_evidence(junit_dir: Optional[Path]) -> Dict[str, Any]:
 
     evidence["junit_phases"] = phases
     evidence["junit_failures"] = failures
+    # 2026-11-06: the machine-written identity of the failing set, under
+    # the same key the schema path uses.  One key, one meaning: "which
+    # cases failed, as the machine says it".  The fingerprint reads it
+    # instead of the report's wording, so re-wording a round's report
+    # can no longer look like a different defect.
+    evidence["failed_cases"] = sorted({
+        str(failure.get("node_id") or "").strip()
+        for failure in failures
+        if str(failure.get("node_id") or "").strip()
+    })
     if errors:
         evidence["junit_error"] = "; ".join(errors)
     return evidence
@@ -1528,7 +1847,20 @@ def run_ci_verification(
         result.evidence = {
             "vp_id": vp_id,
             "schema_issues": [i.to_dict() for i in issues],
+            # 2026-11-06: the machine-written identity of the defect.
+            # This path never ran a single case, so there were no junit
+            # node ids to name — and the failure identity fell back to
+            # the report's **wording**, which is reworded every round.
+            # That is what made the same rejection look like a new
+            # root cause three rounds in a row (2026-11-05).
+            "failed_cases": sorted({i.failure_id() for i in issues}),
+            # 2026-11-05: this path used to carry no provenance at all
+            # and wrote no artifact — so a round that never ran a single
+            # case left **nothing** on disk, and the next round could
+            # not tell "which file judged me" from "what did it say".
+            "verifier_source": verifier_source(project_dir),
         }
+        _write_artifact(artifact_dir, vp_id, result.evidence)
         return result
 
     entry = _entry_of(vp)
@@ -1557,6 +1889,15 @@ def run_ci_verification(
     registry_dir, registry = _spawn_registry()
     gate_env = ci_subprocess_env()
     gate_env["PDT_SPAWN_REGISTRY"] = str(registry)
+    # 2026-11-05: the gate entry used to have to create the venv
+    # itself, and the way it did that was a ``ln -sfn`` shell hack
+    # pointing at another checkout — which is what the path preflight
+    # then had to guess about ("which operand does this command
+    # *produce*?").  The venv the gate may reuse is named here instead,
+    # so a new entry can be the plain ``CI=true bash scripts/run_tests.sh``.
+    shared_venv = shared_venv_for(project_dir)
+    if shared_venv:
+        gate_env["PDT_SHARED_VENV"] = shared_venv
 
     # The junit reports of the phases land next to the audit copy of this
     # verdict — the same directory ``_write_artifact`` uses — so the two
@@ -1653,6 +1994,10 @@ def run_ci_verification(
         "spawned_processes_reaped": reaped,
         "budget_exhausted_in": exhausted_in,
         "gate_elapsed_seconds": gate_elapsed,
+        # 2026-11-05: the verdict says which file judged it — the same
+        # question the schema-failure path answers, asked of the normal
+        # path too.
+        "verifier_source": verifier_source(project_dir),
     }
     if error:
         evidence["error"] = error

@@ -231,6 +231,7 @@ VERIFICATION_PLAN_SYSTEM_PROMPT = """你是一位资深测试架构师。你的�
       "id": "VP-001",
       "title": "验证点标题（这是 Phase 1 的形状：一条子任务级断言）",
       "related_prd_criteria": "对应的 PRD 验收标准",
+      "source_task_ids": ["3", "4"],
       "verification_method": "api_test|code_review|ui_validation",
       "verification_phase": 1,
       "priority": "high|medium|low",
@@ -466,6 +467,18 @@ VP **没有 test_command**。它的判定由 method 自己的依据决定，你�
 - 因此**不要**把 VP 写成"把某个测试跑一遍"。VP 要回答的是「这个功能点真的按
   需求工作了吗」（黑盒验收），而"我写的这段代码对不对"由执行阶段的任务自测覆盖
   —— 见上文"验证视角"。
+
+**验证点的范围（2026-11-05，必须遵守）**：
+
+每条验证点都要声明它验的是**哪些任务**：`source_task_ids` 填那些任务的 id
+（提示词里的"本次任务清单"段列出了 id、标题与要改的文件）。这份声明是
+"这一轮能不能复用上一轮结论"的唯一依据 —— 范围必须能追溯到任务。
+
+- **`covers_paths` 不是你写的字段。** 框架会从 `source_task_ids` 对应任务的
+  `files_to_modify` 取目录前缀，写成这条验证点的 `covers_paths`。你写了也会
+  被覆盖 —— 范围由任务声明派生，不允许发明路径。
+- 找不到对应任务时 `source_task_ids` 写成空数组 `[]`：那条验证点没有范围，
+  每轮都会重跑（这是安全的一侧，不是失败）。
 
 **已有验证点的处置（2026-10-27，必须遵守）**：
 

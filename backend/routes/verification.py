@@ -1534,6 +1534,23 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
                 force=force_verify,
                 resume=(resumed or next_round > 1),
             )
+            # 2026-11-05: the root-cause chain's preflight may have taken
+            # this round over before it measured anything.  The dispatch
+            # hands the chain's work to the executor (or parks the plan
+            # where a human can pick it up), and the judgment phase must
+            # NOT run on it — a report with no verification result reads
+            # as "nothing was verified", and the repair chain would go
+            # after a product nobody ever looked at.
+            #
+            # The early return also keeps the round OUT of the terminal
+            # write: no ``complete_round``, no ``_persist_verification_terminal``
+            # — there is no round to close and no verdict to record.
+            from verification_loop import _handle_root_cause_preflight
+            if _handle_root_cause_preflight(
+                plan_id, plan_dir, report,
+                project_dir=project_dir, tool=tool_type,
+            ):
+                return
             result = orch.check_cycle_conditions(report, round_number=next_round)
             v_state = _server._verification_state[plan_id]
             v_state.update({

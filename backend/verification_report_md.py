@@ -128,7 +128,13 @@ _VERDICT_TEXT_KEYS = (
 _PLAN_ITEM_TITLE_KEYS = ("title", "name", "summary", "description", "text", "content")
 
 #: 验证点的说明文字字段（按优先级取第一个非空）。
+#:
+#: ``actual_result`` 排在最前：它是**这一轮跑出来的结论**（「登录接口返回
+#: 200 且字段齐全」），而 ``evidence`` 是结论背后的长证据 —— 几千字的一坨
+#: 塞进一个表格单元格里，那不是「说明」，是噪音。计划侧的条目没有
+#: ``actual_result``，它落到 ``title`` —— 与从前一样。
 _VP_DETAIL_KEYS = (
+    "actual_result",
     "title",
     "detail",
     "details",
@@ -173,6 +179,31 @@ _COST_DEFERRED_HEADER = ("VP", "成本", "原因")
 #: 「因成本跳过」小节的标题（渲染时前面加 ``##``）。
 COST_DEFERRED_SECTION_TITLE = "因成本跳过（DEFERRED）"
 
+#: 复用标记：一条结论是从**第几轮**复用来的。
+#:
+#: **缺这个字段 = 本轮真跑**。复用是例外，而例外必须说得出凭什么 ——
+#: 凭什么就是这一条。没有它，「本轮真跑」与「复用上一轮的结论」在报告里
+#: 长得一模一样：一份 27 条全绿的报告可能只有 7 个验证点真的跑过。
+REUSED_FROM_ROUND_FIELD = "reused_from_round"
+
+#: 修复任务的来源标记：预检（根因链的接续）派发的活。
+PREFLIGHT_ORIGIN = "root_cause_preflight"
+
+#: 报告里装着「预检派发的修复」的字段（执行侧写进报告的那份清单）。
+PREFLIGHT_REPAIRS_FIELD = "preflight_repairs"
+
+#: 「复用」小节的标题（渲染时前面加 ``##``）。
+REUSE_SECTION_TITLE = "复用"
+
+#: 「预检接续」小节的标题（渲染时前面加 ``##``）。
+PREFLIGHT_SECTION_TITLE = "预检接续"
+
+#: 「复用」小节的表头。
+_REUSE_HEADER = ("VP", "状态", "来源")
+
+#: 「预检接续」小节的表头。
+_PREFLIGHT_HEADER = ("修复任务", "验证点", "根因报告", "改动范围")
+
 #: 报告里可能装着验证点结论的字段（按优先级）。
 #:
 #: 三套叫法都真实存在：``verification_results`` 是执行器写回报告的标准字段，
@@ -180,6 +211,14 @@ COST_DEFERRED_SECTION_TITLE = "因成本跳过（DEFERRED）"
 #: 计划侧的验证点（执行之后状态会落回它）。三处都可能出现 ``DEFERRED`` ——
 #: 全读，按 VP id 合并。
 _COST_DEFERRED_FIELDS = ("verification_results", "results", "verification_points")
+
+#: 报告里装着**验证点结论**的字段（按优先级，结论侧优先）。
+#:
+#: 与 :data:`_COST_DEFERRED_FIELDS` 同一套叫法、同一套理由 —— 只是这里取的是
+#: 全部结论，而不只是 ``DEFERRED`` 那几条。计划侧的 ``verification_points``
+#: 排在最后：它给的是计划书条目（``plan_item_id``），结论侧给的是状态与结论，
+#: 两者互补时结论侧说了算。
+_VP_ENTRY_FIELDS = ("verification_results", "results", "verification_points")
 
 #: 「因成本跳过」的状态值（大写比较）。
 _COST_DEFERRED_STATUS = "DEFERRED"
@@ -302,8 +341,65 @@ def _plan_item_cell(plan_items: Mapping[str, Any], plan_item_id: str) -> str:
     return f"{title}（{plan_item_id}）"
 
 
+def _vp_entries(report: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    """报告里的验证点结论条目（按 VP id 合并，结论侧优先）。
+
+    三套叫法都真实存在（见 :data:`_VP_ENTRY_FIELDS`）：``verification_results``
+    是执行器写回报告的标准字段，``results`` 是判断阶段 LLM schema 的字段名，
+    ``verification_points`` 是计划侧的验证点。全读，按 VP id 合并 ——
+    同一个验证点散在两个字段里时两边的字段互补（计划侧给 ``plan_item_id``，
+    结论侧给状态与结论），**后来的字段只补空，不覆盖**已有的值。
+
+    :param report: 报告 JSON。
+    :return: 条目列表（每条是一个 dict）。
+    """
+    merged: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for field in _VP_ENTRY_FIELDS:
+        container = report.get(field)
+        if not isinstance(container, (list, tuple)):
+            continue
+        for entry in container:
+            if not isinstance(entry, Mapping):
+                continue
+            vp_id = _text(entry.get("id")) or _text(entry.get("vp_id"))
+            key = vp_id or f"#{len(order)}"
+            known = merged.get(key)
+            if known is None:
+                merged[key] = dict(entry)
+                order.append(key)
+                continue
+            for name, value in entry.items():
+                if not known.get(name):
+                    known[name] = value
+    return [merged[key] for key in order]
+
+
+def _reused_from_round(entry: Mapping[str, Any]) -> Optional[int]:
+    """一条结论是从**第几轮**复用来的。
+
+    ``None`` = 本轮真跑。缺这个字段就是本轮真跑 —— 复用是例外，而例外
+    必须说得出凭什么；答不上来就当没有例外。
+
+    :param entry: 报告里的一条验证点结论。
+    :return: 来源轮次（``None`` = 本轮真跑）。
+    """
+    raw = entry.get(REUSED_FROM_ROUND_FIELD)
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        round_no = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return round_no if round_no > 0 else None
+
+
 def _vp_rows(report: Mapping[str, Any], plan_items: Mapping[str, Any]) -> List[List[str]]:
     """验证点表的数据行（已转义、按 VP id 排序）。
+
+    这里只放**本轮真跑**的结论 —— 复用来的那些单列一节（见
+    :func:`_reuse_rows`）。两者混在一张表里，读者就分不清「这一轮跑过」
+    与「上一轮跑过、这一轮没动它所以复用了」。
 
     排序键包含这一行渲染出来的全部内容，所以两个入参顺序不同的报告渲染
     出来的表格逐行相同。
@@ -312,13 +408,9 @@ def _vp_rows(report: Mapping[str, Any], plan_items: Mapping[str, Any]) -> List[L
     :param plan_items: 计划书条目表（由 :func:`render` 保证是 mapping）。
     :return: 数据行列表。
     """
-    points = report.get("verification_points")
-    if not isinstance(points, (list, tuple)):
-        points = []
-
     prepared: List[Tuple[str, str, str, str, str]] = []
-    for point in points:
-        if not isinstance(point, Mapping):
+    for point in _vp_entries(report):
+        if _reused_from_round(point) is not None:
             continue
         vp_id = _text(point.get("id")) or _text(point.get("vp_id"))
         plan_item_id = _text(point.get("plan_item_id")) or vp_id
@@ -339,6 +431,40 @@ def _vp_rows(report: Mapping[str, Any], plan_items: Mapping[str, Any]) -> List[L
             _escape(row[4] or row[1] or _MISSING_CELL),
             _escape(row[2]),
             _escape(row[3] or _MISSING_CELL),
+        ]
+        for row in prepared
+    ]
+
+
+def _reuse_rows(report: Mapping[str, Any]) -> List[List[str]]:
+    """「复用」小节的数据行（已转义、按 VP id 排序）。
+
+    复用来的结论写清它**来自第几轮** —— 「复用自第 1 轮」就是那条结论的
+    凭据，读者不必去翻上一轮的日志才知道它是不是真的跑过。
+
+    :param report: 报告 JSON。
+    :return: 数据行列表（每行三格：VP / 状态 / 来源）。
+    """
+    prepared: List[Tuple[str, str, str]] = []
+    for point in _vp_entries(report):
+        source_round = _reused_from_round(point)
+        if source_round is None:
+            continue
+        vp_id = _text(point.get("id")) or _text(point.get("vp_id"))
+        prepared.append(
+            (
+                vp_id,
+                _status_label(point.get("status")),
+                f"复用自第 {source_round} 轮",
+            )
+        )
+
+    prepared.sort(key=lambda row: (row[0], row[1], row[2]))
+    return [
+        [
+            _escape(row[0] or _MISSING_CELL),
+            _escape(row[1]),
+            _escape(row[2]),
         ]
         for row in prepared
     ]
@@ -370,19 +496,28 @@ def _review_rows(review_state: Mapping[str, Any]) -> List[List[str]]:
     return rows
 
 
-def _repair_rows(repair_rows: Sequence[Mapping[str, Any]]) -> List[List[str]]:
+def _repair_rows(
+    repair_rows: Sequence[Mapping[str, Any]],
+    exclude_ids: Optional[Set[str]] = None,
+) -> List[List[str]]:
     """修复任务表的数据行（已转义、按任务 id 排序）。
 
     :param repair_rows: 修复行列表（由 :func:`render` 保证是序列）。
+    :param exclude_ids: 这些任务 id 不进本表 —— 预检派发的活单列一节，
+        不重复出现在主表里（见 :func:`_preflight_rows`）。
     :return: 数据行列表。
     """
+    skipped = exclude_ids or set()
     prepared: List[Tuple[str, str, str, str]] = []
     for row in repair_rows:
         if not isinstance(row, Mapping):
             continue
+        task_id = _first_text(row, _REPAIR_ID_KEYS)
+        if task_id and task_id in skipped:
+            continue
         prepared.append(
             (
-                _first_text(row, _REPAIR_ID_KEYS),
+                task_id,
                 _first_text(row, _REPAIR_VP_KEYS),
                 _status_label(row.get("status"), missing=_MISSING_CELL),
                 _first_text(row, _REPAIR_DETAIL_KEYS),
@@ -391,6 +526,124 @@ def _repair_rows(repair_rows: Sequence[Mapping[str, Any]]) -> List[List[str]]:
 
     prepared.sort(key=lambda row: (row[0], row[1], row[2], row[3]))
     return [[_escape(value or _MISSING_CELL) for value in row] for row in prepared]
+
+
+def _scope_text(row: Mapping[str, Any]) -> str:
+    """一条修复任务要改的范围（文件清单）。
+
+    范围是两个字段里的一个：修复任务用 ``files_to_modify``，预检写进报告的
+    那份清单用 ``scope``。两个都没有就是空 —— 不猜。
+
+    :param row: 一条修复行。
+    :return: 范围文本（可能为空串）。
+    """
+    for key in ("files_to_modify", "scope"):
+        value = row.get(key)
+        if isinstance(value, (list, tuple)):
+            parts = [_text(item) for item in value]
+            parts = [part for part in parts if part]
+            if parts:
+                return ", ".join(parts)
+        elif isinstance(value, str):
+            text = value.strip()
+            if text:
+                return text
+    return ""
+
+
+def _preflight_entry(row: Mapping[str, Any]) -> Dict[str, str]:
+    """一条预检派发的修复，在报告里长什么样。
+
+    只有四样：**谁**（任务 id）、**哪个验证点**、根因报告的**地址**、要改的
+    **范围**。报告正文**不内联** —— 正文是那份文件的事，报告只负责指路：
+    把几千字的根因分析抄进报告，报告就既不是报告也读不动了。
+
+    :param row: 一条修复行（或报告里那份预检清单的一行）。
+    :return: 四格内容。
+    """
+    return {
+        "id": _first_text(row, _REPAIR_ID_KEYS),
+        "vp_id": _first_text(row, _REPAIR_VP_KEYS),
+        "report_path": _text(row.get("report_path")),
+        "scope": _scope_text(row),
+    }
+
+
+def _preflight_entries(
+    report: Mapping[str, Any], repair_rows: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, str]]:
+    """预检派发的修复（接续根因链的活）。
+
+    两个来源，都读：
+
+    * 修复行里带 ``origin == "root_cause_preflight"`` 的那些；
+    * 报告里 ``preflight_repairs[]`` 那份清单（执行侧写进报告的）。
+
+    ``origin`` 是**可选**字段：缺了就是普通修复任务，按普通任务处理 ——
+    本模块不替一条没有标记的行猜它是不是预检派发的。
+
+    :param report: 报告 JSON。
+    :param repair_rows: 修复行列表。
+    :return: 预检修复条目（按出现顺序，任务 id 去重）。
+    """
+    entries: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+
+    def _add(row: Mapping[str, Any]) -> None:
+        entry = _preflight_entry(row)
+        key = entry["id"] or entry["report_path"]
+        if key and key in seen:
+            return
+        if key:
+            seen.add(key)
+        entries.append(entry)
+
+    for row in repair_rows:
+        if not isinstance(row, Mapping):
+            continue
+        if _text(row.get("origin")) != PREFLIGHT_ORIGIN:
+            continue
+        _add(row)
+
+    container = report.get(PREFLIGHT_REPAIRS_FIELD)
+    if isinstance(container, (list, tuple)):
+        for row in container:
+            if not isinstance(row, Mapping):
+                continue
+            _add(row)
+
+    return entries
+
+
+def _preflight_rows(
+    report: Mapping[str, Any], repair_rows: Sequence[Mapping[str, Any]],
+) -> List[List[str]]:
+    """「预检接续」小节的数据行（已转义、按任务 id 排序）。
+
+    :param report: 报告 JSON。
+    :param repair_rows: 修复行列表。
+    :return: 数据行列表（每行四格：修复任务 / 验证点 / 根因报告 / 改动范围）。
+    """
+    prepared: List[Tuple[str, str, str, str]] = [
+        (
+            entry["id"],
+            entry["vp_id"],
+            entry["report_path"],
+            entry["scope"],
+        )
+        for entry in _preflight_entries(report, repair_rows)
+    ]
+
+    prepared.sort(key=lambda row: (row[0], row[1], row[2], row[3]))
+    return [
+        [
+            _escape(row[0] or _MISSING_CELL),
+            _escape(row[1] or _MISSING_CELL),
+            _escape(row[2] or _MISSING_CELL),
+            _escape(row[3] or _MISSING_CELL),
+        ]
+        for row in prepared
+    ]
 
 
 def _cost_deferred_entries(report: Mapping[str, Any]) -> List[Mapping[str, Any]]:
@@ -788,6 +1041,15 @@ def render(
     输出结构固定，「最终结论」与「验证点结果」两节恒在；「审核状态」与
     「修复任务」两节**没有内容时整节省略** —— 空表不携带信息。
 
+    「验证点结果」一节只放**本轮真跑**的结论；复用来的那些单列在「复用」
+    一节里，写清来自第几轮。两者混在一张表里，读者就分不清「这一轮跑过」
+    与「上一轮跑过、这一轮没动它所以复用了」—— 一份 27 条全绿的报告可能
+    只有 7 个验证点真的跑过。
+
+    「预检接续」一节放**预检派发**的修复（接续根因链的活）：它们不重复
+    出现在「修复任务」一节里 —— 混进去就看不出这一轮到底做了什么。预检
+    是可选的（``origin`` 缺失即普通任务），没有预检派发的活就整节省略。
+
     「因成本跳过（DEFERRED）」一节只在**确实有被成本闸挡下的验证点**时
     出现：没被挡下就不该占一节。它单列的原因是 ``DEFERRED`` 是「这轮
     没跑」而不是「跑挂了」—— 两者混在一起，操作者会把「没花钱」读成
@@ -807,6 +1069,12 @@ def render(
         "## 验证点结果\n" + _table(_VP_HEADER, _vp_rows(report, items)),
     ]
 
+    reuse_rows = _reuse_rows(report)
+    if reuse_rows:
+        sections.append(
+            "## " + REUSE_SECTION_TITLE + "\n" + _table(_REUSE_HEADER, reuse_rows)
+        )
+
     deferred_rows = _cost_deferred_rows(report)
     if deferred_rows:
         sections.append(
@@ -820,9 +1088,22 @@ def render(
     if review_rows:
         sections.append("## 审核状态\n" + _table(_REVIEW_HEADER, review_rows))
 
-    repair_table = _repair_rows(repairs)
+    preflight_rows = _preflight_rows(report, repairs)
+    preflight_ids = {
+        entry["id"] for entry in _preflight_entries(report, repairs) if entry["id"]
+    }
+
+    repair_table = _repair_rows(repairs, exclude_ids=preflight_ids)
     if repair_table:
         sections.append("## 修复任务\n" + _table(_REPAIR_HEADER, repair_table))
+
+    if preflight_rows:
+        sections.append(
+            "## "
+            + PREFLIGHT_SECTION_TITLE
+            + "\n"
+            + _table(_PREFLIGHT_HEADER, preflight_rows)
+        )
 
     if plan_json is not None or parsed is not None:
         issues = traceability_issues(report, plan_json, parsed)

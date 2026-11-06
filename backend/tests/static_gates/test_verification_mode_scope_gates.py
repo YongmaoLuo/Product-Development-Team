@@ -726,8 +726,14 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # "loop_stopped", BINARY_FRESHNESS_PREFLIGHT_ERROR_KIND)` 出口，插在
     # service preflight 之后、base drift 之前；该轮不计入计划的 round 预算。
     # 改动只落在本文件的 preflight 分支链，按本 gate 的既定流程重新钉住该文件。
+    # 2026-11-06：验证轮次作用域与根因链预检——本文件新增轮次开头记录 `head_sha`
+    # 与变更集、复用 verdict 以本轮 round 重新落盘并标 `reused_from_round`、
+    # 关卡只读本轮结论，以及 `start_verification_cycle` 进入验证轮之前的链预检
+    # （预检派发不推进 round）。改动只落在轮次记录与预检接线，未改动既有分支语义；
+    # 按本 gate 的既定流程重新钉住该文件。这是「移动冻结」而不是「放松门禁」：
+    # 断言强度、被钉文件的范围与逐字节比对的强度都不变，该文件此后仍被逐字节钉住。
     "backend/verification_loop.py": (
-        "3cf4c3fbf7e5c24436d38861ede2143ac143337aae71e629f6e5204bf25cf0d6"
+        "f8282b0694221dd7840820cb005d4d20d345c95bc75f4af0032e124982d044a6"
     ),
 }
 

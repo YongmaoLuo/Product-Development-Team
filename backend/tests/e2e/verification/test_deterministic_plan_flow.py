@@ -1065,8 +1065,10 @@ def chain(
     顺序是承重的：第一次进入负责**归档并移除**（移除集只有它自己重建得
     出来），并且派发那条命令类 e2e（它的子类字段只在原始计划上还在 ——
     见模块 docstring）；第二次进入负责证明移除**跨轮次仍然生效**，并且在
-    这一轮里让另外三条确定性验证点真的走一遍确定性派发。那条 e2e 在这一
-    轮**继承**第一次进入的裁决（两轮的定义指纹相同）。
+    这一轮里让另外三条确定性验证点真的走一遍确定性派发。那条 e2e 在第二次
+    进入里**会再跑一次**：2026-11-05 起 verdict 默认每轮真跑，第一次进入是
+    进程内直接跑执行器（裁决落在「轮次未知」），既没有 ``covers_paths`` 也
+    没有本轮的 head_sha，按判据一条都不复用。
     """
     plan = _build_plan(api_service)
     (workspace.plan_dir / "verification_plan.json").write_text(
@@ -1251,7 +1253,13 @@ def test_deterministic_vps_zero_llm_sessions(chain: Chain):
                 for event in _attempt_events(workspace.plan_dir, vp_id)
                 if event.get("event") == "deterministic_verdict"
             ]
-            assert routes == [expectation["route"]], (
+            # 次数不钉：2026-11-05 起 verdict 默认**每轮真跑**，只有声明了
+            # ``covers_paths`` 且本轮未触及该范围才跨轮复用；这条用例的
+            # 第一次进入是在进程内直接跑执行器（没有轮次上下文，裁决落在
+            # 「轮次未知」），所以第二次进入不会把它算作本轮已完成，会再跑
+            # 一次。这里钉的是「每一次都走确定性 runner、一次都不碰 LLM」。
+            assert routes, f"{vp_id} 一次都没有走确定性路径"
+            assert set(routes) == {expectation["route"]}, (
                 f"{vp_id} 应当走确定性 runner（{expectation['route']}），"
                 f"实际 {routes!r}\n{_diagnostics(workspace)}"
             )

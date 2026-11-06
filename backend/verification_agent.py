@@ -50,6 +50,11 @@ from verification_executor import (
     COST_FIELD,
     COST_LLM_QUOTA,
     COST_NONE,
+    # 2026-11-05（arch 决策点 5）：账本与报告分列「本轮真跑」与「复用」。
+    # 字段名从执行侧借 —— **同一份常量、不写第二遍**：字段名漂一次，
+    # 写侧标了复用、读侧认不出来，报告里就看不出哪条是复用的。
+    REUSED_FROM_ROUND_FIELD,
+    VERDICT_ROUND_FIELD,
 )
 # e2e 的两个子类与它们的字段名同样从执行侧借（``verification_ci_runner`` 是
 # 判定 e2e 能不能跑的那一层）。**同一份常量、不写第二遍**：字段名漂一次，
@@ -62,6 +67,14 @@ from verification_ci_runner import (
     ENTRY_COMMAND_FIELD,
 )
 from verification_persistence import VerificationPersistenceManager
+# 2026-11-05（arch 决策点 5）：根因报告的**地址**从根因任务那一份借 ——
+# 报告要写「这份活接的是哪份根因报告」，而根因报告的文件名（``root-cause-<vp>.md``）
+# 是根因任务定的。**同一份常量、不写第二遍**：名字在这里写第二遍，
+# 根因任务改了命名，报告这一节就指着一个不存在的文件。
+from root_cause_task import (
+    root_cause_report_absolute_path,
+    root_cause_report_path,
+)
 from verification_profile import ExecutionProfileGenerator
 from verification_split import SplitDecision
 from verification_subagent import (
@@ -81,7 +94,13 @@ from verification_buckets import blocked_reason
 # 改动面是**辅助输入**，不是门禁：读不到 / 解析失败时是空改动面而不是错误
 # （``load_change_surface`` 自己吞掉这些情况），空改动面会让提示词逐字节
 # 回到改动面注入之前的样子。
-from change_surface import KIND_ORDER, ChangeSurface, load_change_surface
+from change_surface import (
+    KIND_ORDER,
+    ChangeSurface,
+    NO_FILE_CHANGES_SENTINEL,
+    UNKNOWN_MODIFICATIONS_SENTINEL,
+    load_change_surface,
+)
 from binary_freshness import (
     FreshnessReport,
     FreshnessCache,
@@ -129,6 +148,21 @@ from verification_ac_coverage import (  # noqa: E402
     annotate_acceptance_gap as _annotate_acceptance_gap,
     find_uncovered_criteria,
     render_gap_feedback as render_acceptance_gap_feedback,
+)
+# 2026-11-05（VP 范围派生）：``covers_paths`` 的派生口径只写一遍 ——
+# 文件所在的目录、去重保序、不跨目录合并，哨兵不是路径。范围的口径由
+# :mod:`verification_round_scope` 说了算（它同时是复用判据那一侧的口径），
+# 生成侧与判定侧因此不会分叉。
+#
+# 2026-11-05（轮次作用域记录）：同一模块还负责"这一轮相对上一轮改了什么"
+# —— 本轮 HEAD、上一轮 HEAD、变更集（diff ∪ 脏文件）。复用判定要吃的
+# ``changed`` 就是它算出来的，口径仍然只有这一处。
+from verification_round_scope import (  # noqa: E402
+    changed_files,
+    covers_paths_for_files,
+    current_head_sha,
+    load_round_scope,
+    record_round_scope,
 )
 # 2026-10-25（验证分支输入路径）：分支判定只有一个判据 ——
 # plan 目录里躺着的是验证计划书还是任务清单。判定收敛在
@@ -352,6 +386,15 @@ def persist_conflict_repair_task(
 #: queued task, a running task, a failed task, a row whose status was
 #: never written — still counts as unfinished.
 TERMINAL_TASK_STATUSES = frozenset({"completed", "skipped"})
+
+
+#: 来源标记：这条修复是**预检**（根因链的接续）派发的。
+#:
+#: 同一个值在 ``verification/orchestrator.py`` 里叫
+#: ``_ROOT_CAUSE_PREFLIGHT_ORIGIN``、在 ``verification_loop.py`` 里叫
+#: ``ROOT_CAUSE_PREFLIGHT_SCENE`` —— 三层各有各的叫法，但**值必须一样**：
+#: 报告靠它把「接续根因链的活」与「这一轮的修复」分开列。
+ROOT_CAUSE_PREFLIGHT_ORIGIN = "root_cause_preflight"
 
 
 def _read_plan_task_rows(
@@ -994,6 +1037,148 @@ def _render_change_surface(surface: Optional[ChangeSurface]) -> str:
     lines.append(f"- 分类：{_change_surface_kind_label(surface)}")
     lines.append(f"- 触及界面：{'是' if has_ui else '否'}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# VP 范围派生（``covers_paths``）
+# ---------------------------------------------------------------------------
+#
+# 一条验证点能不能在下一轮复用上一轮的结论，取决于它声明的**范围**
+# （``covers_paths``）。范围如果由模型自由发明，"范围"就成了模型说了算的事，
+# 复用判据随之失效 —— 所以范围的内容**只能**来自任务声明：模型负责声明"我
+# 验的是哪几个任务"（``source_task_ids``），框架从那些任务的
+# ``files_to_modify`` 派生范围（文件所在的目录前缀）。
+#
+# 派生口径在 :mod:`verification_round_scope`（``covers_paths_for_files``），
+# 与复用判据那一侧共用同一份实现：去重保序、不跨目录合并、哨兵不是路径。
+
+#: "这不是文件路径"的哨兵值 —— 提示词里不显示它们（显示出来只会让生成器
+#: 以为那是真路径）。
+_TASK_FILE_SENTINELS = frozenset({
+    UNKNOWN_MODIFICATIONS_SENTINEL,
+    NO_FILE_CHANGES_SENTINEL,
+})
+
+
+def _load_task_rows(plan_dir: Any) -> List[Dict[str, Any]]:
+    """读 plan 目录的 ``tasks.json``，返回任务行列表。
+
+    读不到 / JSON 解析失败 → **空表**，不是错误：``covers_paths`` 是辅助
+    事实，读不到时范围为空 → 那些验证点每轮重跑 —— 这是安全的一侧。
+
+    读法只有一条：``verification_plan_delta.load_tasks``（那里已经知道
+    ``tasks.json`` 的两种载荷形状），不在这里再写第二份 JSON 读取。
+    """
+    from verification_plan_delta import load_tasks
+
+    try:
+        return list(load_tasks(Path(plan_dir)))
+    except (OSError, TypeError, ValueError):
+        return []
+
+
+def _attach_covers_paths(
+    plan: List[Dict[str, Any]],
+    task_rows: Optional[List[Dict[str, Any]]],
+    *,
+    create_empty: bool = True,
+) -> List[Dict[str, Any]]:
+    """给每条验证点派生 ``covers_paths``（就地写回，返回同一个列表）。
+
+    :param plan: 验证点列表。每条验证点用 ``source_task_ids`` 声明它对应
+        哪些任务（模型写的）。
+    :param task_rows: 任务行列表（``id`` + ``files_to_modify``）。
+    :param create_empty: 派生不出范围时，要不要**新建**一个空的
+        ``covers_paths`` 键。
+
+        * ``True``（生成路径）：计划是这一轮新建的，每条验证点都带着自己的
+          范围（派生不出就是空列表）—— 计划的形状自洽，读侧不需要猜
+          "这个键是缺了还是空的"。
+        * ``False``（复用路径）：磁盘上那份计划是上一轮写下的，复用路径的
+          既有契约是"只标注、不重问"，**不改写计划的结构**（见
+          ``tests/unit/test_plan_completeness.py::test_reused_plan_gets_the_gap_annotated``）。
+          派生不出范围时就不动那条验证点：读侧把"没有范围"当成"每轮重跑"
+          （安全的一侧），不需要那个空键。
+
+    规则（四条，全部是"往安全的一侧偏"）：
+
+    * 范围 = 那些任务的 ``files_to_modify`` 所在目录，去重保序，**不跨目录
+      合并**（``backend/verification/`` 与 ``backend/tests/unit/`` 是两条，
+      不会合并成 ``backend/``）；
+    * 任务 id 不存在 / ``source_task_ids`` 缺失 → 范围为空（该验证点每轮
+      重跑）；
+    * ``files_to_modify`` 只含哨兵（"这个任务不改文件"）→ 范围为空；
+    * **模型自己写的 ``covers_paths`` 一律被覆盖** —— 模型能声明范围，
+      但范围的内容由框架从任务清单派生。派生不出内容时，模型写的那些也
+      一起抹掉：留着就等于让模型自己决定"这条验证点可以不重跑"。
+    """
+    files_by_task: Dict[str, List[str]] = {}
+    for row in task_rows or []:
+        if not isinstance(row, Mapping):
+            continue
+        task_id = str(row.get("id") or "").strip()
+        if not task_id:
+            continue
+        declared = row.get("files_to_modify")
+        if not isinstance(declared, (list, tuple)):
+            declared = []
+        files_by_task.setdefault(task_id, []).extend(
+            item for item in declared if isinstance(item, str)
+        )
+
+    for vp in plan or []:
+        if not isinstance(vp, dict):
+            continue
+        raw_ids = vp.get("source_task_ids")
+        source_ids = (
+            [str(item).strip() for item in raw_ids if isinstance(item, (str, int))]
+            if isinstance(raw_ids, (list, tuple))
+            else []
+        )
+        files: List[str] = []
+        for task_id in source_ids:
+            files.extend(files_by_task.get(task_id, ()))
+        # 目录前缀写成"目录"的形状（带尾斜杠），与
+        # ``verification_round_scope.SHARED_SURFACE_PREFIXES`` 里目录项的
+        # 写法一致；读侧 ``normalise_prefix`` 会把尾斜杠归一化掉，两种写法
+        # 都认。
+        derived = [f"{prefix}/" for prefix in covers_paths_for_files(files)]
+        if derived or create_empty or "covers_paths" in vp:
+            vp["covers_paths"] = derived
+    return plan
+
+
+def _render_task_catalog(task_rows: Optional[List[Dict[str, Any]]]) -> str:
+    """把任务清单渲染成提示词里的 ``## 本次任务清单`` 段。
+
+    这段是**纯输入注入**：它告诉生成器"这次要验的任务有哪些、id 是多少"，
+    生成器据此在每条验证点上填 ``source_task_ids``。范围的**内容**不在这段
+    里 —— 那由框架从任务清单派生（见 :func:`_attach_covers_paths`），模型
+    不参与。
+
+    没有任务行 → 空字符串，调用方据此整段略去，于是老提示词逐字节不变。
+    """
+    if not task_rows:
+        return ""
+    lines: List[str] = []
+    for row in task_rows:
+        if not isinstance(row, Mapping):
+            continue
+        task_id = str(row.get("id") or "").strip()
+        if not task_id:
+            continue
+        title = str(row.get("title") or "").strip()
+        declared = row.get("files_to_modify")
+        files = [
+            item for item in declared
+            if isinstance(item, str) and item not in _TASK_FILE_SENTINELS
+        ] if isinstance(declared, (list, tuple)) else []
+        lines.append(
+            f"- 任务 {task_id}｜{title}｜文件：{', '.join(files) or '（未声明）'}"
+        )
+    if not lines:
+        return ""
+    return "\n".join(["## 本次任务清单", *lines])
 
 
 # ---------------------------------------------------------------------------
@@ -2081,17 +2266,32 @@ def _environment_block_reason_code(result: Any) -> str:
 def _failed_case_ids_from_evidence(evidence: Any) -> List[str]:
     """The ids of the cases that failed, read out of the gate's evidence.
 
-    The gate writes them under ``junit_failures`` — one record per
-    failing case, carrying the phase, the node id, the kind and the
-    first line. Only the **node id** is the identity of the failure:
-    the phase and the first line are prose, and prose changes from run
-    to run.
+    The gate writes them under ``failed_cases`` — the machine-written
+    identity of the failing set.  It also writes the raw per-case
+    records under ``junit_failures`` (one record per failing case,
+    carrying the phase, the node id, the kind and the first line); only
+    the **node id** is the identity of the failure: the phase and the
+    first line are prose, and prose changes from run to run.
+
+    ``failed_cases`` is read first because it is the one key that means
+    the same thing on **both** paths: the gate that ran (node ids) and
+    the gate that never ran because the entry was rejected (the schema
+    rule that fired).  The junit fallback stays for evidence written by
+    an older runner, which knew only the junit key.
 
     The set is deduplicated and sorted: the same case reported by two
     phases is one case, and a set is not a sequence.
     """
     if not isinstance(evidence, dict):
         return []
+    machine_written = evidence.get("failed_cases")
+    if isinstance(machine_written, (list, tuple)):
+        ids = {
+            str(item).strip() for item in machine_written
+            if str(item).strip()
+        }
+        if ids:
+            return sorted(ids)
     failures = evidence.get("junit_failures")
     if not isinstance(failures, list):
         return []
@@ -4377,6 +4577,15 @@ class Orchestrator:
 
         print("[Verification] Phase 1: Generating verification plan...")
 
+        # 2026-11-05（范围派生）：验证点的范围（``covers_paths``）由**任务
+        # 声明**派生 —— 模型只声明"我验的是哪几个任务"
+        # （``source_task_ids``），范围的内容由框架从那些任务的
+        # ``files_to_modify`` 算出来。
+        #
+        # 任务行读自 plan 目录的 ``tasks.json``。读不到 / 解析失败 → **空表**，
+        # 不是错误：范围为空 → 那些验证点每轮重跑 —— 这是安全的一侧。
+        task_rows = _load_task_rows(self.plan_dir)
+
         # Reuse the on-disk plan when present and structurally valid so a
         # restart after a failed round does NOT silently re-run the LLM
         # Phase-1 (which can introduce new VPs the executor hasn't seen
@@ -4408,6 +4617,20 @@ class Orchestrator:
                     # the deterministic regex is cheap (microseconds) and
                     # idempotent.
                     disk_plan = self._normalize_legacy_methods(disk_plan)
+                    # 2026-11-05（范围派生）：复用路径上按任务声明**重算**
+                    # 已经带着范围的那些验证点 —— 磁盘上那份计划可能是这次
+                    # 改动之前写的（没有范围），也可能带着模型自己编的范围。
+                    # 前者不动（复用路径不改写计划的结构，见
+                    # ``create_empty=False``），后者纠正（范围永远来自任务
+                    # 声明）。
+                    #
+                    # 放在增量评估**之前**：增量会把计划写回磁盘，范围一并
+                    # 落盘，下一轮读到的就是带范围的那份。
+                    _disk_points = disk_plan.get("verification_points")
+                    if isinstance(_disk_points, list):
+                        disk_plan["verification_points"] = _attach_covers_paths(
+                            _disk_points, task_rows, create_empty=False,
+                        )
                     # 2026-09-16: 阶段字段在复用路径上同样要归一化——老计划
                     # 没有 ``verification_phase``，一律按 Phase 1 处理。
                     # 归一化只让字段自洽，**不判定阶段**：阶段由规划 LLM 在
@@ -4492,7 +4715,9 @@ class Orchestrator:
         surface = load_change_surface(self.plan_dir)
 
         # Generate plan using LLM
-        prompt = self._build_planning_prompt(documents, surface=surface)
+        prompt = self._build_planning_prompt(
+            documents, surface=surface, task_rows=task_rows,
+        )
 
         # Plan generation reads full PRD/arch/test docs, so the LLM needs
         # headroom. 2026-09-15: do NOT pass ``timeout`` —
@@ -4787,6 +5012,18 @@ class Orchestrator:
                         f"acceptance criterion/criteria have no VP — "
                         f"recorded in the plan as acceptance_gap:\n"
                         + "\n".join(f"  - {m.evidence}" for m in _uncovered)
+                    )
+
+                # 2026-11-05（范围派生）：范围由**任务声明**派生，模型写的
+                # ``covers_paths`` 一律被覆盖 —— 否则"范围"就成了模型说了算的
+                # 事，跨轮复用的判据随之失效。
+                #
+                # 放在重试回路之后、被裁掉的验证点之后：范围是最终那份计划上
+                # 每条验证点的属性，早一步算出来的范围会被后来的增删作废。
+                _points = plan_data.get("verification_points")
+                if isinstance(_points, list):
+                    plan_data["verification_points"] = _attach_covers_paths(
+                        _points, task_rows,
                     )
 
                 # Save plan
@@ -5167,6 +5404,7 @@ class Orchestrator:
         self,
         documents: Dict[str, str],
         surface: Optional[ChangeSurface] = None,
+        task_rows: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """Build prompt for verification plan generation.
 
@@ -5174,6 +5412,9 @@ class Orchestrator:
             documents: PRD / 架构 / 测试文档。
             surface: 本次改动面（文件清单 + 分类 + 是否触及界面）。**可选** ——
                 空改动面（或 ``None``）时整段略去，老提示词逐字节不变。
+            task_rows: 本次任务清单（``id`` + ``title`` + ``files_to_modify``）。
+                **可选** —— 空清单时整段略去，老提示词逐字节不变。生成器据此
+                在每条验证点上填 ``source_task_ids``（范围本身由框架派生）。
         """
         parts = []
 
@@ -5191,6 +5432,13 @@ class Orchestrator:
         surface_block = _render_change_surface(surface)
         if surface_block:
             parts.append(surface_block)
+
+        # 2026-11-05（范围派生）：生成器要声明"我验的是哪几个任务"
+        # （``source_task_ids``），前提是它知道有哪些任务、id 是多少。
+        # 这段是纯输入注入；范围的**内容**仍由框架从任务清单派生。
+        task_block = _render_task_catalog(task_rows)
+        if task_block:
+            parts.append(task_block)
 
         if not parts:
             return "请基于当前项目生成基础验证计划。"
@@ -5285,7 +5533,56 @@ class Orchestrator:
         self._round_request_id = _mint_request_id(
             self.plan_dir.name, round_number,
         )
-        return self.persistence.start_round(round_number)
+        log_path = self.persistence.start_round(round_number)
+        # 2026-11-05（轮次作用域）：这一轮的 HEAD、上一轮的 HEAD、以及
+        # "这一轮相对上一轮改了什么"必须**在轮次开始时**记下来 ——
+        # 复用判定要拿它跟上一轮的 verdict 对照，而上一轮那些改动正是本轮
+        # 开工前就已经存在的。轮次跑完再记就晚了：那时候记到的是本轮自己
+        # 造成的改动，不是"本轮开工时相对上一轮"的那批。
+        self._record_round_scope(round_number)
+        return log_path
+
+    def _record_round_scope(self, round_number: int) -> None:
+        """记录本轮的轮次作用域（HEAD / 上一轮 HEAD / 变更集）。
+
+        变更集 = ``diff(上一轮 HEAD → 本轮 HEAD)`` ∪ 工作区的脏文件
+        （口径在 :mod:`verification_round_scope` 里，读的人与算的人因此
+        是同一份）。
+
+        上一轮的记录缺失 → ``prev_head_sha`` 是 ``None``、变更集是空的 ——
+        空在这里意味着**"不知道变了什么"**而不是"什么都没变"，读记录的人
+        必须按前者处理（未知 → 全量重跑）。
+
+        记录失败不得阻断轮次启动：作用域记录是复用判据的**输入**，缺了它
+        只是"下一轮全量跑"，不是"这一轮跑不起来"。
+        """
+        try:
+            repo_root = Path(self.project_dir)
+            head_sha = current_head_sha(repo_root)
+
+            previous = load_round_scope(self.plan_dir, round_number - 1)
+            prev_head_sha: Optional[str] = None
+            if isinstance(previous, dict):
+                candidate = previous.get("head_sha")
+                if isinstance(candidate, str) and candidate.strip():
+                    prev_head_sha = candidate.strip()
+
+            changed: Tuple[str, ...] = ()
+            if head_sha and prev_head_sha:
+                changed = changed_files(repo_root, prev_head_sha, head_sha)
+
+            record_round_scope(
+                self.plan_dir,
+                round_number,
+                head_sha=head_sha,
+                prev_head_sha=prev_head_sha,
+                changed=changed,
+            )
+        except Exception as exc:  # noqa: BLE001 — 记录失败不阻断轮次
+            logger.warning(
+                "verification round scope record failed (round=%s): %s",
+                round_number, exc,
+            )
 
     def execute_verification_plan(self, plan_data: Optional[dict] = None) -> dict:
         """
@@ -7686,6 +7983,179 @@ class Orchestrator:
             entry["failure_class_source"] = failure_class_source
         return report_data
 
+    def _backfill_reuse_markers(
+        self, report_data: dict, execution_results: dict,
+    ) -> dict:
+        """把账本的复用标记回填到报告条目上。
+
+        判断阶段的 LLM **看不到**「这条结论是复用来的」—— 它的输出 schema
+        里没有这个槽位，而它读到的执行结果摘要里也没有。不回填的话，报告
+        里「本轮真跑」与「复用上一轮的结论」长得一模一样：一份 27 条全绿的
+        报告可能只有 7 个验证点真的跑过，读者无从分辨。
+
+        规则只有一条：**账本说了算**。执行器知道哪条是复用来的（四条判据
+        是它判的），LLM 不知道 —— 所以回填是**复制**，不是判断：
+
+          * 账本里标了 ``reused_from_round`` 的 → 报告条目带上同一个轮次；
+          * 账本里没标的 → 报告条目的标记是 ``None``（本轮真跑）。
+
+        执行器**没有**结论的验证点不动：回填不替它编一条结论出来。
+
+        报告 dict 是**就地**更新的（同时返回它），调用方用返回值或忽略
+        都行。
+        """
+        if not isinstance(report_data, dict):
+            return report_data
+
+        raw_results = (
+            execution_results.get("execution_results")
+            if isinstance(execution_results, dict)
+            else None
+        )
+        executor_entries: Dict[str, Dict[str, Any]] = {}
+        for result in raw_results or []:
+            if not isinstance(result, dict):
+                continue
+            entry_id = str(result.get("id") or "").strip()
+            if not entry_id:
+                continue
+            executor_entries.setdefault(entry_id, result)
+        if not executor_entries:
+            return report_data
+
+        for field in ("verification_results", "verification_points"):
+            entries = report_data.get(field)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                entry_id = str(
+                    entry.get("id") or entry.get("vp_id") or ""
+                ).strip()
+                if not entry_id:
+                    continue
+                source = executor_entries.get(entry_id)
+                if source is None:
+                    # 执行器没判过这个点 —— 没有可复制的，也没什么可编的。
+                    continue
+                entry[REUSED_FROM_ROUND_FIELD] = self._reused_from_round(source)
+        return report_data
+
+    def _preflight_repairs(self) -> List[Dict[str, Any]]:
+        """接续根因链的活（预检派发的修复），报告要写的那几样。
+
+        报告只写四样：**谁**（任务 id）、**哪个验证点**、根因报告的
+        **地址**、要改的**范围**。报告正文**不内联** —— 正文是那份文件的
+        事，报告只负责指路。
+
+        哪些行算「接续根因链的活」，见 :meth:`_is_root_cause_task`：
+        上游持久化把 ``origin`` 丢掉了（``plan_tasks`` 的静态字段白名单里
+        没有它），所以库里那一行只能凭**自己指向哪份根因报告**认出来。
+
+        :return: 预检修复清单（按任务 id 排序）。
+        """
+        plan_dir = getattr(self, "plan_dir", None)
+        plan_id = Path(str(plan_dir)).name if plan_dir else ""
+        if not plan_id:
+            return []
+        rows, error = _read_plan_task_rows(plan_id)
+        if error is not None or not rows:
+            return []
+
+        repairs: List[Dict[str, Any]] = []
+        for task_id in sorted(rows):
+            row = rows.get(task_id)
+            if not isinstance(row, dict):
+                continue
+            if not self._is_root_cause_task(row, plan_id):
+                continue
+            vp_id = str(row.get("failed_vp_id") or "").strip()
+            scope = [
+                str(item)
+                for item in (row.get("files_to_modify") or [])
+                if str(item).strip()
+            ]
+            repairs.append(
+                {
+                    "id": str(row.get("id") or task_id),
+                    "vp_id": vp_id,
+                    "report_path": self._root_cause_report_address(
+                        row, plan_id, vp_id,
+                    ),
+                    "scope": scope,
+                }
+            )
+        return repairs
+
+    @staticmethod
+    def _is_root_cause_task(
+        row: Mapping[str, Any], plan_id: str,
+    ) -> bool:
+        """这一行是**接续根因链**的活吗？
+
+        两个信号各自成立即可：
+
+          * 行上带着 ``origin == "root_cause_preflight"``（来源标记还在时）；
+          * 行**指向一份根因报告** —— 诊断任务与实现任务的描述里都写着
+            那份报告的地址。
+
+        第二个信号是必需的：上游持久化把 ``origin`` 丢掉了
+        （``plan_tasks`` 的静态字段白名单里没有它），库里那一行**没有**
+        来源标记。没有第二个信号，这一节在真跑里永远是空的。
+
+        报告的文件名（``root-cause-<vp>.md``）由根因任务那一份算出来 ——
+        **不写第二遍**：名字漂一次，这里就指着一份不存在的报告。
+
+        :param row: 持久化后的任务行。
+        :param plan_id: 计划 id（根因报告的地址是按它算的）。
+        :return: 是 / 不是。
+        """
+        origin = str(row.get("origin") or "").strip()
+        if origin == ROOT_CAUSE_PREFLIGHT_ORIGIN:
+            return True
+        vp_id = str(row.get("failed_vp_id") or "").strip()
+        if not vp_id:
+            return False
+        try:
+            report_name = Path(root_cause_report_path(plan_id, vp_id)).name
+        except ValueError:
+            return False
+        if not report_name:
+            return False
+        haystack = "\n".join(
+            str(row.get(key) or "")
+            for key in ("description", "report_path")
+        )
+        return report_name in haystack
+
+    def _root_cause_report_address(
+        self, row: Mapping[str, Any], plan_id: str, vp_id: str,
+    ) -> str:
+        """这一行的活接的是**哪份根因报告**。
+
+        行上写着就用行上的（诊断任务落库时带着它）；没写就按根因任务那
+        一份算出来 —— 与链读回的是同一个地址（同一个 helper）。
+
+        :param row: 持久化后的任务行。
+        :param plan_id: 计划 id。
+        :param vp_id: 验证点 id。
+        :return: 根因报告的地址（空串 = 算不出来）。
+        """
+        declared = str(row.get("report_path") or "").strip()
+        if declared:
+            return declared
+        if not vp_id:
+            return ""
+        try:
+            return str(
+                root_cause_report_absolute_path(
+                    plan_id, vp_id, plan_dir=self.plan_dir,
+                )
+            )
+        except (TypeError, ValueError):
+            return ""
+
     # -----------------------------------------------------------------------
     # The cross-round infra retry ledger (2026-11-03, arch decision point 2)
     # -----------------------------------------------------------------------
@@ -9552,6 +10022,44 @@ class Orchestrator:
         verdict["failure_class"] = failure_class
         verdict["failure_class_source"] = SOURCE_DETERMINISTIC
 
+    def _record_verifier_provenance(
+        self, vp_id: str, source: Dict[str, Any],
+    ) -> None:
+        """Write "which copy judged this" where it cannot be lost.
+
+        2026-11-06 (round 4): the ``full_ci_executed`` event carried no
+        ``verifier_source`` and ``vp_artifacts/VP-015/`` did not exist, so
+        the round left **no** disk evidence of which copy graded it — and
+        the next round could not tell "which file judged me" from "what
+        did it say".  That is the layer this accident was most expensive
+        at: the framework could not answer whether it was running the code
+        that had been fixed.
+
+        Two places already carry the answer, and both can be missing: the
+        round log is one file per round and may not be open when the event
+        fires, and the artifact is only written once the runner has
+        decided it has something to say.  The plan's durable audit trail
+        (``logs/audit_events.jsonl``) depends on neither, so the answer
+        goes there too.
+
+        Never raises: an audit trail that cannot be written is a fact
+        about the round, not a failure of the round.
+        """
+        try:
+            from verification_persistence import write_audit_event
+
+            write_audit_event(
+                self.plan_dir,
+                vp_id,
+                "verifier_provenance_recorded",
+                {"verifier_source": dict(source)},
+            )
+        except Exception:  # noqa: BLE001 - provenance never fails a round
+            logger.debug(
+                "[ci_runner] could not record the verifier provenance for %s",
+                vp_id, exc_info=True,
+            )
+
     def _run_full_ci_vp(self, vp: dict) -> dict:
         """Grade a ``full_ci`` VP without an LLM (2026-09-18, D2).
 
@@ -9568,12 +10076,39 @@ class Orchestrator:
         gate's own cost (7200 s default, 2026-10-31) — and is killed at
         that ceiling rather than left to eat the round.
 
+        Which copy of the runner grades the gate is **not** left to
+        ``sys.path``: 2026-11-05 a round graded a gate with the
+        harness' own (unfixed) copy of ``verification_ci_runner`` while
+        the tree under test carried the fixed one, and the two rounds
+        failed byte-for-byte the same way.  The loader picks the tree
+        under test's copy and reloads it every round, and the verdict
+        carries where it came from.
+
         Never raises — :func:`verification_ci_runner.run_ci_verification`
         turns every failure mode into a FAILED verdict carrying its reason.
         """
-        from verification_ci_runner import run_ci_verification
-
         vp_id = str(vp.get("id", "unknown"))
+        provenance: Dict[str, Any] = {}
+        try:
+            from verification_ci_runner_loader import load_ci_runner
+
+            loaded = load_ci_runner(self.project_dir)
+            run_ci_verification = loaded.run_ci_verification
+            provenance = dict(loaded.provenance)
+        except Exception as exc:  # noqa: BLE001 - a fallback, not a failure
+            logger.exception(
+                "[ci_runner] could not load the runner for %s", vp_id,
+            )
+            from verification_ci_runner import run_ci_verification
+
+            provenance = {
+                "resolution": "harness",
+                "module_path": "",
+                "sha256": "",
+                "git_head": "",
+                "fallback_reason": f"{type(exc).__name__}: {exc}",
+            }
+
         try:
             result = run_ci_verification(
                 vp,
@@ -9589,10 +10124,47 @@ class Orchestrator:
                 "reasons": [
                     f"full_ci runner crashed: {type(exc).__name__}: {exc}"
                 ],
-                "evidence": {"vp_id": vp_id, "method": "full_ci"},
+                "evidence": {
+                    "vp_id": vp_id,
+                    "method": "full_ci",
+                    "verifier_source": provenance,
+                },
             }
 
         verdict = result.to_verdict_dict()
+        # 2026-11-05: the verdict names the file that judged it.  The
+        # runner reports the file it is (module path, hash, HEAD) and
+        # the loader reports how it was chosen (``resolution`` and, when
+        # it fell back, why) — together they answer "was this graded by
+        # the code I fixed?".
+        source = dict(
+            (verdict.get("evidence") or {}).get("verifier_source") or {}
+        )
+        # 2026-11-06: the two sides answer the same question from two
+        # directions, and **neither erases the other**.  The loader knows
+        # *how* the copy was chosen (resolution, fallback reason); the
+        # runner knows *which file it is* (module path, hash, HEAD).  A
+        # loader that failed knows **less** than the runner — so its empty
+        # values must not overwrite what the runner already answered.
+        # Before this, a loader that could not be imported wiped
+        # ``module_path`` / ``sha256`` / ``git_head`` to empty strings and
+        # the verdict stopped being able to say who judged it — which is
+        # the very question the whole provenance layer exists to answer
+        # (the 2026-11-05 accident: the framework could not tell whether
+        # it was running the code that was fixed).
+        for key, value in provenance.items():
+            if key in ("module_path", "sha256", "git_head") and not value:
+                continue
+            source[key] = value
+        verdict.setdefault("evidence", {})["verifier_source"] = source
+        # 2026-11-06: the provenance must land where it cannot be lost.
+        # The round log is one file per round and may not even be open
+        # when the event fires — round 4 (2026-11-06) left **no** disk
+        # evidence of which copy judged it: the ``full_ci_executed`` event
+        # carried no ``verifier_source`` and ``vp_artifacts/VP-015/`` did
+        # not exist.  The plan's durable audit trail does not depend on a
+        # round log being open.
+        self._record_verifier_provenance(vp_id, source)
         # 2026-11-02: the gate's own record of WHICH cases failed. The
         # verdict's evidence carries the whole junit payload; the node
         # ids are lifted into their own field so the report entry, the
@@ -9618,6 +10190,10 @@ class Orchestrator:
                     "budget_exhausted_in",
                 ),
                 "duration_seconds": result.evidence.get("duration_seconds"),
+                # 2026-11-05: the event says which file graded the gate,
+                # so the round log answers "which code judged me?"
+                # without anyone having to guess.
+                "verifier_source": source,
             },
         )
         return verdict
@@ -10991,6 +11567,13 @@ class Orchestrator:
                     report_data, execution_results,
                 )
 
+                # 2026-11-05（arch 决策点 5）：把账本的复用标记回填到报告
+                # 条目上。判断阶段的 LLM 看不到「这条结论是复用来的」——
+                # 不回填，报告里「本轮真跑」与「复用」就长得一模一样。
+                report_data = self._backfill_reuse_markers(
+                    report_data, execution_results,
+                )
+
                 # 2026-11-03 (arch decision point 2 — infra 的跨轮有界
                 # 重试): 把这一轮 infra 的失败记进跨轮重试账本。
                 #
@@ -11039,6 +11622,11 @@ class Orchestrator:
                 report_data["generated_at"] = datetime.now().isoformat()
                 report_data["plan_id"] = self.plan_dir.name
                 report_data["project_dir"] = str(self.project_dir)
+                # 2026-11-05（arch 决策点 5）：预检派发的修复单列一节。
+                # 它们是**接续根因链**的活，不是这一轮的修复 —— 混在主表
+                # 里就看不出这一轮到底做了什么。报告只写根因报告的地址与
+                # 改动范围，正文不内联。
+                report_data["preflight_repairs"] = self._preflight_repairs()
                 # 2026-10-25 (repair-r1-26): the report says out loud
                 # when the round was about the environment rather than
                 # about the product.  The upper layer reads this to
@@ -15661,6 +16249,18 @@ class Orchestrator:
                     # 一个坑。
                     "ci_entry": vp.get("ci_entry", ""),
                     "ci_timeout_seconds": vp.get("ci_timeout_seconds"),
+                    # 2026-11-06：e2e 的子类必须**活着**到分派表手里 ——
+                    # `e2e_kind` 说这条 e2e 是命令类（框架判得了，退出码就是
+                    # 判据）还是浏览器类（框架判不了，只能升级回 LLM 子会话），
+                    # `entry_command` 是那条命令。字段清单漏了这两个 ⇒ 每一条
+                    # e2e 到分派表手里都成了浏览器类 ⇒ 升级回 LLM（2026-11-05
+                    # 实测：确定性计划流里那条命令类 e2e 被送进 scripted LLM
+                    # 会话，必 FAILED）。
+                    E2E_KIND_FIELD: vp.get(E2E_KIND_FIELD, ""),
+                    ENTRY_COMMAND_FIELD: vp.get(ENTRY_COMMAND_FIELD, ""),
+                    # 成本闸的输入：同一个字段清单漏掉它 ⇒ 成本闸在这条路上
+                    # 是空转的（读不到 `cost` ⇒ 「照常跑」）。
+                    COST_FIELD: vp.get(COST_FIELD),
                     # 2026-09-18：依赖服务名要带过去。被阻断端口的判定允许
                     # 按名字匹配（占位符在派发前已展开，但 name 匹配是更直接
                     # 的一条路），丢了它这条门禁就只能靠正则去刮 URL。
@@ -15678,6 +16278,45 @@ class Orchestrator:
                 }
             )
         return {"vps": vps}
+
+    @staticmethod
+    def _executor_round_no(executor: Any) -> int:
+        """执行器这一轮是第几轮（``0`` = 轮次未知）。
+
+        问的是执行器自己的那一份（它盖戳时用的就是它），所以两边的轮次
+        不可能对不上。问不出来（替身执行器没这个方法、轮次没绑定）→ 0，
+        调用方据此**不清空**账本。
+
+        :param executor: 执行器（任何有 ``_verdict_round_no`` 的对象）。
+        :return: 轮次号（``0`` = 轮次未知）。
+        """
+        getter = getattr(executor, "_verdict_round_no", None)
+        if getter is None:
+            return 0
+        try:
+            round_no = int(getter())
+        except (TypeError, ValueError):
+            return 0
+        return round_no if round_no > 0 else 0
+
+    @staticmethod
+    def _reused_from_round(verdict: Mapping[str, Any]) -> Optional[int]:
+        """一条裁决是从**第几轮**复用来的（``None`` = 本轮真跑）。
+
+        缺这个字段就是本轮真跑 —— 复用是例外，而例外必须说得出凭什么；
+        答不上来就当没有例外。
+
+        :param verdict: 执行器的一条裁决。
+        :return: 来源轮次（``None`` = 本轮真跑）。
+        """
+        raw = verdict.get(REUSED_FROM_ROUND_FIELD)
+        if raw is None or isinstance(raw, bool):
+            return None
+        try:
+            round_no = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return round_no if round_no > 0 else None
 
     def _build_execution_results_from_executor(
         self, plan_data: dict, executor: "VerificationExecutor"
@@ -15738,6 +16377,24 @@ class Orchestrator:
 
         executor_verdicts = executor.collect_verdicts()
 
+        # 2026-11-05（arch 决策点 5）：账本只留**本轮**的结论。
+        #
+        # 执行器的 ``collect_verdicts()`` 交出的是「每个验证点最新的一条
+        # 裁决」，而那份表是**跨轮**的：从状态库水合回来的上一轮结论与本轮
+        # 真跑出来的长得一模一样（都没有「我来自哪一轮」）。于是账本里混着
+        # 历史轮的结论，报告分不清「这一轮跑过」与「上一轮跑过」。
+        #
+        # 轮次已知就按轮次筛（同一个验证点多轮记录 → 只取本轮那条）；轮次
+        # 未知（执行器没绑定轮次、状态库也没记）→ **不清空**：不知道轮次
+        # 不等于没有结论，把一份能用的账本清空比多留一条历史结论贵得多。
+        current_round = self._executor_round_no(executor)
+        if current_round > 0:
+            executor_verdicts = [
+                verdict
+                for verdict in executor_verdicts
+                if VerificationExecutor._verdict_round_of(verdict) == current_round
+            ]
+
         # 2026-10-25 (repair-r1-31): the plan's own VPs are the
         # fallback for a VP that never dispatched — the address it was
         # *going to* use is still worth recording.
@@ -15778,6 +16435,14 @@ class Orchestrator:
                 "status": status,
                 "actual_result": actual_result,
                 "evidence": evidence,
+                # 2026-11-05（arch 决策点 5）：这条结论是**本轮真跑**还是
+                # **复用**来的。复用是例外，例外必须说得出凭什么 ——
+                # 凭什么就是这一条（来源轮次）。没有它，报告里「本轮真跑」
+                # 与「复用上一轮的结论」长得一模一样。
+                #
+                # 缺标记 = 本轮真跑（``None``）：本轮真跑出来的结论**没有**
+                # 来源轮次，报告不该替它猜一个。
+                REUSED_FROM_ROUND_FIELD: self._reused_from_round(v),
             }
             # 2026-10-24（api_test 的分类不能在这里丢掉）：裁决里带的
             # failure_class / failure_class_source 是四分类判定的结果 ——
