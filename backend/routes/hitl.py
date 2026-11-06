@@ -327,6 +327,15 @@ def answer_hitl_decision(
     plan back at the head of the queue; a plan that is still working is
     left alone, and a scheduler that is not there is not a reason to
     refuse the answer.
+
+    The route also hands over the plan's directory
+    (``server._plan_dir`` — the one funnel every ``plans/{plan_id}``
+    access goes through).  That is where the terminal round's sidecar
+    lives, and the sidecar is what tells the service whether this
+    answer is an ordinary one (resume the plan) or a terminal one
+    (carry out the action the option names, and do **not** resume the
+    plan).  The route does not read the sidecar itself: what an answer
+    *means* is the service's business.
     """
     _server._validated_plan_id(plan_id)   # uniform contract — see that function
 
@@ -339,6 +348,7 @@ def answer_hitl_decision(
         payload.note,
         plan_id=plan_id,
         engine=engine,
+        plan_dir=_server._plan_dir(plan_id),
     )
 
     if code == 404:

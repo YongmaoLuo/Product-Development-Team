@@ -695,6 +695,21 @@ _JSON_SESSION: "contextvars.ContextVar[Optional[JsonSession]]" = (
 )
 
 
+def current_json_session() -> Optional[JsonSession]:
+    """The session handle bound to the call in flight, if any.
+
+    The public way for a tool implementation — or a test double — to see
+    that its caller asked for a session, and to write the id of the
+    session that actually answered back onto that handle.  The handle is
+    read at the dispatch, not at the signature, so a ``query_json`` that
+    knows nothing about sessions keeps working.
+
+    Outside a session-bound call this is ``None``, which means "fresh
+    session" — what every caller that never opted in sees.
+    """
+    return _JSON_SESSION.get()
+
+
 def query_json_in_session(tool, session: Optional[JsonSession], /, *args, **kwargs) -> dict:
     """``tool.query_json(*args, **kwargs)`` with ``session`` bound for that call.
 
