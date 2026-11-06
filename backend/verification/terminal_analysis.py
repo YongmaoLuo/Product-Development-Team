@@ -13,16 +13,28 @@ from a sentence, decide what it means, and then answer *in the
 vocabulary the system understands*.
 
 This module is the analysis behind that question: it renders the failure
-scene into a prompt, makes **one** tool-less call with it, and reads the
-answer back under a strict contract.  It is deliberately a separate
-module with no tools and no orchestrator import, so that
+scene into a prompt, makes **one** call with it, and reads the answer
+back under a strict contract.  It is deliberately a separate module with
+no orchestrator import, so that
 
 * the rendering can be tested on its own — every fact, every cut, every
   bound is asserted without an LLM in the loop;
 * the orchestrator, which will import *this* module, is not imported
-  *by* it — an import the other way round would be a cycle;
-* the model behind the ask cannot act on the scene it is shown.  It gets
-  no tools, so it can only read what the loop already recorded.
+  *by* it — an import the other way round would be a cycle.
+
+The judge is an **investigator with a leash** (2026-11-06).  It used to
+be a reader: it was handed the failure facts and could only repeat them
+back, so its analysis came out empty of the two things a human actually
+needs — *what was expected versus what happened, per verification
+point*, and *why the framework could not iterate on its own*.  Now it
+gets the **read-only** investigation tools the main agent has
+(``Bash`` / ``Read`` / ``Grep`` / ``Glob`` — the same set as
+``binary_rebuild_agent.BinaryRebuildAgent.ALLOWED_TOOLS``) plus the
+paths it is allowed to look at (``plan_dir`` / ``project_dir``), so the
+chain record, the root-cause reports, the repair tasks and the code are
+facts it can go and read instead of facts it has to guess at.  It may
+not write anything: the tools it gets cannot change the workspace, and
+the prompt says so.
 
 What the prompt guarantees
 ==========================
@@ -49,6 +61,13 @@ without being told about the other two does not know it is missing them.
 recommendations exist and what each one means, in the language the human
 who reads the result will read.
 
+**The judge is told where to look.**  The prompt carries ``plan_dir`` and
+``project_dir``, and the files under them that answer the two questions
+the facts cannot: the root-cause chain record, the root-cause reports,
+the repair-task snapshot, the verification report.  A judge that is
+handed a path is an investigator; a judge that is handed a summary is a
+repeater.
+
 **The recommendation vocabulary is the orchestrator's.**  This module
 does not import the orchestrator (the orchestrator will import *this*
 module), so the two lists of recommendations can drift apart unless
@@ -58,10 +77,13 @@ is that something.
 What the call guarantees
 ========================
 
-**One call, no tools.**  The judge is a reader, not an investigator: it
-is shown what the loop already recorded and asked what that means.  A
-judge with tools would go and look at the repository instead of reading
-the scene it was given.
+**One call, read-only tools.**  The judge is an investigator that may
+read but never write: it gets ``Bash`` / ``Read`` / ``Grep`` / ``Glob``
+— the same read-only set ``binary_rebuild_agent`` uses — so it can go
+and read the chain record, the root-cause reports and the code instead
+of answering from the summary it was handed.  It gets no ``Edit`` and
+no ``Write``: the analysis is a reading, and a reading that can change
+the workspace is not one.
 
 **The answer is accepted whole or not at all.**  Six fields —
 ``context``, ``problem``, ``evidence``, ``recommendation``,
@@ -118,6 +140,7 @@ __all__ = [
     "MAX_EXPECTED_RESULT_CHARS",
     "MAX_FAILED_POINTS",
     "MAX_REASON_CHARS",
+    "READ_ONLY_TOOLS",
     "RECOMMENDATIONS",
     "RECOMMENDATION_LABELS",
     "TERMINAL_QUESTION_MAX_CHARS",
@@ -155,6 +178,16 @@ RECOMMENDATION_LABELS: Dict[str, str] = {
     "accept_as_failed": "接受失败结论",
     "manual_repair_tasks": "人工修复任务",
 }
+
+#: The tools the judge may use to investigate.
+#:
+#: **Read-only, on purpose.**  The judge is asked to *understand* a
+#: failure, not to repair one: the repair belongs to the next round, and
+#: a judge that could edit the workspace would be editing it from
+#: inside a call whose answer is allowed to be thrown away.  The set is
+#: the same one ``binary_rebuild_agent.BinaryRebuildAgent`` uses, so
+#: both agents investigate the repository the same way.
+READ_ONLY_TOOLS: Tuple[str, ...] = ("Bash", "Read", "Grep", "Glob")
 
 #: How many failed points are rendered before the rest are cut.
 MAX_FAILED_POINTS = 10
@@ -496,10 +529,20 @@ class TerminalDecisionJudge:
     :class:`coding_tool.ClaudeCodingTool` on first use, on the
     ``verification`` scene — the same scene the verification path itself
     runs on.
+
+    The judge investigates with the **read-only** tools
+    (:data:`READ_ONLY_TOOLS`): it may read the chain record, the
+    root-cause reports, the repair tasks and the code, and it may not
+    write anything.
     """
 
     #: How long one analysis call may take.
-    TIMEOUT_SECONDS = 300
+    #:
+    #: 600, not 300 (2026-11-06): the call now carries read-only tools,
+    #: so the model may spend several rounds reading files and running
+    #: commands before it answers.  The old budget was sized for a
+    #: single read-and-answer over a prompt that held every fact.
+    TIMEOUT_SECONDS = 600
 
     def __init__(
         self,
@@ -537,24 +580,33 @@ class TerminalDecisionJudge:
         """The constant half of the prompt: role, forbid, contract."""
         return (
             "你是验证轮终局的失败分析助手。一次验证轮没能通过，循环停下来，"
-            "接下来怎么办要由人决定。你要读的是下面 prompt 里给出的失败现场，"
-            "然后给出一个 recommendation（建议）。\n\n"
-            "NO TOOLS. 你没有任何工具：不读写文件、不执行命令、不访问网络。"
-            "你唯一的输入就是 prompt 里给出的事实，唯一的工作就是分析它们。\n\n"
+            "接下来怎么办要由人决定。\n\n"
+            "你有只读调查工具（Bash / Read / Grep / Glob）："
+            "你可以读文件、搜代码、跑只读命令去查证事实。"
+            "READ ONLY：不要修改任何文件、不要写文件、不要提交、"
+            "不要执行会改变工作区的命令。你的工作只是查证和判断。\n\n"
             "HARD RULES — 违反任何一条，这个回答会被丢弃：\n"
-            "1. DO NOT FABRICATE. 不许编造事实。prompt 没有给出的失败原因、"
-            "代码、日志都不许当成确定结论；证据不足就在 uncertainty 里说清楚。\n"
-            "2. recommendation 只能是以下三者之一，不许自创第四种：\n"
+            "1. DO NOT FABRICATE. 不许编造事实。你没有真正读到过的失败原因、"
+            "代码、日志，都不许当成确定结论；凡是写进答案的事实，"
+            "都要指得出它的出处（哪个文件、哪条命令、哪一行）。\n"
+            "2. INVESTIGATE. prompt 给的是摘要，不是全貌。"
+            "凡是摘要里没有的事实，你必须自己去读："
+            "根因链状态文件、根因报告、修复任务记录、实现轮记录、代码。"
+            "没读就下结论，等于没查。\n"
+            "3. NO \"无法确定\". 事实不足的时候，禁止只写「无法确定」。"
+            "必须写清楚：**缺哪一条具体事实**、**去哪个文件或跑哪条命令能读到它**。"
+            "uncertainty 字段写的是「还差什么、怎么取」，不是「不知道」。\n"
+            "4. recommendation 只能是以下三者之一，不许自创第四种：\n"
             f"   - rerun_this_round：{RECOMMENDATION_LABELS['rerun_this_round']}"
             "（环境偶发失败、重跑一轮可能就过）。\n"
             f"   - accept_as_failed：{RECOMMENDATION_LABELS['accept_as_failed']}"
             "（失败已经定性，本轮就此结束）。\n"
             f"   - manual_repair_tasks：{RECOMMENDATION_LABELS['manual_repair_tasks']}"
             "（失败需要人来安排修复，本轮不再自动重跑）。\n"
-            "3. 全部用中文回答。字段名（context / problem / evidence / "
+            "5. 全部用中文回答。字段名（context / problem / evidence / "
             "recommendation / recommendation_reason / uncertainty）和 "
             "recommendation 的取值保持英文原样，其余内容一律中文。\n"
-            "4. 只输出 JSON，不要输出解释性文字，不要用 markdown 代码块包裹。"
+            "6. 只输出 JSON，不要输出解释性文字，不要用 markdown 代码块包裹。"
             "六个字段一个都不许少。"
         )
 
@@ -567,6 +619,8 @@ class TerminalDecisionJudge:
         repair_task_count: int,
         deferred_count: int,
         failed_points: Any,
+        plan_dir: str = "",
+        project_dir: str = "",
     ) -> str:
         """The per-call half of the prompt: the scene, the answers, the
         output contract.
@@ -575,6 +629,15 @@ class TerminalDecisionJudge:
         named, the round-level facts carry their numbers, the long fields
         are cut and the cut is marked, and the points that did not fit
         are counted out loud.
+
+        The prompt also carries **where to look** (``plan_dir`` and
+        ``project_dir``) and **what to answer** — because a judge that
+        is handed a summary and nothing else can only repeat the summary
+        back.  The investigation guide names the files that hold the
+        facts the summary does not, and the answer format names the
+        three things a human reading the result needs: what each
+        verification point expected and got, why the framework could not
+        iterate on its own, and what to do next.
         """
         parts: List[str] = [
             "# 验证轮终局分析请求",
@@ -625,20 +688,128 @@ class TerminalDecisionJudge:
                 f"- {recommendation}: {RECOMMENDATION_LABELS[recommendation]}"
             )
 
+        parts.extend(self._investigation_section(plan_dir, project_dir))
+        parts.extend(self._answer_requirements_section())
+
         parts.extend(
             [
                 "",
                 "## 输出要求",
                 "只输出下面这个 JSON 对象，不要解释、不要 markdown：",
                 '{"context": "<背景：这一轮停在哪里，中文>", "problem": '
-                '"<问题：到底出了什么问题，中文>", "evidence": '
+                '"<问题：到底出了什么问题，逐 VP 的预期/实际/为何失败，中文>", '
+                '"evidence": '
                 '["<支撑判断的事实，中文>"], "recommendation": '
                 '"<rerun_this_round|accept_as_failed|manual_repair_tasks>", '
                 '"recommendation_reason": "<为什么是这个建议，中文>", '
-                '"uncertainty": "<证据不足或需要人来判断的地方，中文>"}',
+                '"uncertainty": "<还缺哪一条事实、去哪读，中文>"}',
             ]
         )
         return "\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # The investigation guide
+    # ------------------------------------------------------------------
+
+    def _investigation_section(
+        self, plan_dir: str, project_dir: str,
+    ) -> List[str]:
+        """Where the judge may look, and what is in there.
+
+        The paths are the ones the caller knows — the plan's own
+        directory and the project it verifies.  The file names are the
+        ones the verification loop actually writes, so a judge that
+        opens one of them finds the record it was told to look for
+        rather than an empty directory.
+        """
+        plan = _text(plan_dir)
+        project = _text(project_dir)
+        parts: List[str] = [
+            "",
+            "## 调查路径（只读）",
+            f"- plan_dir: {plan or '(未提供)'}",
+            f"- project_dir: {project or '(未提供)'}",
+            "",
+            "你可以（也必须）自己去读这些地方，不要只看上面的摘要：",
+        ]
+        if plan:
+            parts.extend(
+                [
+                    f"- {plan}/verification_root_cause_chain.json"
+                    " —— 根因链状态：每个 VP 的 stage、round、"
+                    "implementation_round、blocked_round、blocked_reason",
+                    f"- {plan}/reports/root-cause-<vp_id>.md"
+                    " —— 每个 VP 的根因报告（诊断结论与要改的文件）",
+                    f"- {plan}/verification_repair_tasks.json"
+                    " —— 修复任务记录（本轮修了什么、修了没有）",
+                    f"- {plan}/verification_report.json"
+                    " —— 本轮验证报告（每个 VP 的完整结果）",
+                ]
+            )
+        if project:
+            parts.append(
+                f"- {project}/ 下的实现代码"
+                "（用 Read / Grep / Glob 定位被改的那部分）"
+            )
+        parts.append(
+            "- 用 Bash 跑只读命令查证（ls / cat / grep / git log / "
+            "git show），但绝不允许修改文件、提交代码或改动工作区。"
+        )
+        return parts
+
+    def _answer_requirements_section(self) -> List[str]:
+        """The three things the answer has to contain.
+
+        Each one is a thing the summary alone cannot answer: the per
+        point expectation-versus-actual, the reason the framework could
+        not iterate, and the actionable next step.
+        """
+        return [
+            "",
+            "## 必须回答的问题（缺一不可）",
+            "",
+            "1. **逐 VP 结论**。每个失败点都要有一行 `id — title`，"
+            "并在该行下面逐点写清三行，格式固定：",
+            "   ```",
+            "   VP-3 — 登录接口",
+            "     预期: <该点的 expected_result>",
+            "     实际: <该点的 verdict>",
+            "     为何失败: <一句话，引用你读到的证据>",
+            "   ```",
+            "   失败点有几个就写几组，不许只写其中一个、"
+            "也不许用「其余类似」代替。"
+            "上面若写了「more failed point(s) not shown」，"
+            "就去 <plan_dir>/verification_report.json 读完整列表，"
+            "被砍掉的那些也要写。",
+            "",
+            "2. **框架为什么不能自动迭代**。这必须靠你读文件得到，"
+            "不能从摘要里猜：",
+            "   - 读根因链文件"
+            "（<plan_dir>/verification_root_cause_chain.json），"
+            "看链停在哪一步；",
+            "   - 读根因报告（<plan_dir>/reports/root-cause-*.md）"
+            "与修复任务记录（<plan_dir>/verification_repair_tasks.json）；",
+            "   - 如果链停在某个 VP 的 BLOCKED_ON_USER，"
+            "再读这个 VP 的根因报告和它的实现轮记录"
+            "（链里的 implementation_round / blocked_round / blocked_reason），"
+            "回答它**为什么 block**：是「已经实现过但没修好」、"
+            "「环境敏感/环境本身挡住了」、还是「需要方向性决策、人来定」；",
+            "   - 如果 repair_task_count=0，要说明这个 0 的机制："
+            "链已经 terminal 时，check_cycle_conditions 在生成修复任务之前"
+            "就返回了空表，所以这一轮没有任务可以自动派发 —— "
+            "说清楚「不是没人看见，是这条路已经走完」。",
+            "",
+            "3. **可执行的下一步**。不要只写「人工安排」「建议人工介入」："
+            "要写清楚改哪个文件（或哪一类行为）、为什么改它、"
+            "以及谁来做（实现 agent / 验证 agent / 人）。",
+            "",
+            "## 禁止「无法确定」",
+            "事实不足的时候，禁止只写「无法确定」「信息不足」「有待确认」。"
+            "必须写成：**缺哪一条具体事实** + "
+            "**去哪个文件读或跑哪条命令能读到**。"
+            "例如「缺少 VP-3 最近一次实现的 diff："
+            "读 <project_dir> 下的 git log --oneline -- <文件路径>」。",
+        ]
 
     # ------------------------------------------------------------------
     # The call
@@ -653,14 +824,19 @@ class TerminalDecisionJudge:
         repair_task_count: int,
         deferred_count: int,
         failed_points: Any,
+        plan_dir: str = "",
+        project_dir: str = "",
     ) -> Optional[Dict[str, Any]]:
         """Read the failure scene and say what should happen next.
 
-        One call, no tools, one answer.  Everything that could make the
-        answer unusable — an exception from the provider, an answer that
-        is not a JSON object, a recommendation outside the three actions
-        the question offers, a field that is missing — produces
-        ``None``.
+        One call, one answer.  The call carries the **read-only**
+        investigation tools (:data:`READ_ONLY_TOOLS`), so the judge can
+        go and read the chain record, the root-cause reports and the
+        code instead of answering from the summary alone.  Everything
+        that could make the answer unusable — an exception from the
+        provider, an answer that is not a JSON object, a recommendation
+        outside the three actions the question offers, a field that is
+        missing — produces ``None``.
 
         ``None`` means **"no analysis"**, not "the analysis found
         nothing": the caller falls back to the factual question, so a
@@ -678,6 +854,12 @@ class TerminalDecisionJudge:
             failed_points: The failed points — each with ``id``,
                 ``title``, ``expected_result``, ``failure_class`` and
                 ``verdict``.
+            plan_dir: The plan's own directory — where the chain record,
+                the root-cause reports and the repair tasks live.  It
+                goes into the prompt so the judge can read them.
+            project_dir: The project the plan verifies — where the
+                implementation lives.  It goes into the prompt for the
+                same reason.
 
         Returns:
             The analysis as a dict with ``context``, ``problem``,
@@ -713,10 +895,12 @@ class TerminalDecisionJudge:
                     repair_task_count=repair_task_count,
                     deferred_count=deferred_count,
                     failed_points=failed_points,
+                    plan_dir=plan_dir,
+                    project_dir=project_dir,
                 ),
                 system_instruction=self.build_system_prompt(),
                 timeout=self._timeout,
-                allowed_tools=[],
+                allowed_tools=list(READ_ONLY_TOOLS),
             )
         except Exception as exc:  # noqa: BLE001 — the judge never raises
             logger.warning(

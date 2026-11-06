@@ -29,6 +29,15 @@ What is pinned here
    import *this* module, so an import the other way would be a cycle) —
    which means the two lists of recommendations can drift apart unless
    something pins them together.  This is that something.
+6. **The prompt tells the judge where to look and what to answer**
+   (2026-11-06).  The judge now investigates on its own, so the prompt
+   carries ``plan_dir`` / ``project_dir`` and the files under them that
+   hold the facts the summary does not — the root-cause chain record,
+   the root-cause reports, the repair tasks.  It also demands the three
+   things the summary alone cannot give: a per-point 预期 / 实际 /
+   为何失败, why the framework could not iterate on its own, and an
+   actionable next step.  「无法确定」 is forbidden: the prompt asks for
+   the missing fact and where to read it instead.
 
 The module under test is imported inside the test bodies on purpose: a
 module that does not exist (or does not export the contract) then shows
@@ -83,6 +92,8 @@ def _build(judge, failed_points, **overrides):
         "repair_task_count": 0,
         "deferred_count": 4,
         "failed_points": failed_points,
+        "plan_dir": "/tmp/plans/p1",
+        "project_dir": "/tmp/projects/demo",
     }
     kwargs.update(overrides)
     return judge.build_prompt(**kwargs)
@@ -239,12 +250,18 @@ def test_build_prompt_lists_all_three_actions():
 
 
 def test_system_prompt_states_its_rules():
-    """The system prompt says: no tools, no invention, three choices, JSON."""
+    """The system prompt says: read-only, no invention, three choices, JSON."""
     system_prompt = _judge().build_system_prompt()
 
-    assert "NO TOOLS" in system_prompt, "the no-tools rule is not stated"
+    assert "READ ONLY" in system_prompt, "the read-only rule is not stated"
+    assert "不要修改任何文件" in system_prompt, (
+        "the no-writing rule is not stated"
+    )
     assert "DO NOT FABRICATE" in system_prompt, (
         "the no-invention rule is not stated"
+    )
+    assert "NO \"无法确定\"" in system_prompt, (
+        "the no-「无法确定」 rule is not stated"
     )
     assert "recommendation" in system_prompt, (
         "the recommendation field is not named"
@@ -255,6 +272,120 @@ def test_system_prompt_states_its_rules():
         )
     assert "中文" in system_prompt, "the all-Chinese rule is not stated"
     assert "JSON" in system_prompt, "the JSON-only rule is not stated"
+
+
+# ---------------------------------------------------------------------------
+# 6. The judge is told where to look and what to answer
+# ---------------------------------------------------------------------------
+
+
+def test_build_prompt_carries_the_investigation_paths():
+    """The prompt names the plan's directory and the project's."""
+    prompt = _build(_judge(), [_point()])
+
+    assert "/tmp/plans/p1" in prompt, "the plan directory is missing"
+    assert "/tmp/projects/demo" in prompt, "the project directory is missing"
+    assert "plan_dir: /tmp/plans/p1" in prompt, (
+        "the plan directory is not labelled"
+    )
+    assert "project_dir: /tmp/projects/demo" in prompt, (
+        "the project directory is not labelled"
+    )
+
+
+def test_build_prompt_names_the_root_cause_chain_file():
+    """The prompt says which file holds the root-cause chain."""
+    prompt = _build(_judge(), [_point()])
+
+    assert "/tmp/plans/p1/verification_root_cause_chain.json" in prompt, (
+        "the root-cause chain file is not named"
+    )
+    assert "/tmp/plans/p1/reports/root-cause-<vp_id>.md" in prompt, (
+        "the root-cause report is not named"
+    )
+    assert "/tmp/plans/p1/verification_repair_tasks.json" in prompt, (
+        "the repair-task record is not named"
+    )
+    for field in ("implementation_round", "blocked_round", "blocked_reason"):
+        assert field in prompt, (
+            f"the prompt does not tell the judge about {field}"
+        )
+
+
+def test_build_prompt_demands_a_per_vp_verdict():
+    """The prompt asks for 预期 / 实际 / 为何失败, per failed point."""
+    prompt = _build(_judge(), [_point()])
+
+    assert "预期:" in prompt, "the expected-result line is not asked for"
+    assert "实际:" in prompt, "the actual-result line is not asked for"
+    assert "为何失败:" in prompt, "the why-it-failed line is not asked for"
+    assert "id — title" in prompt, (
+        "the per-point heading format is not spelled out"
+    )
+
+
+def test_build_prompt_demands_why_the_framework_cannot_iterate():
+    """The prompt asks why the loop could not fix it on its own."""
+    prompt = _build(_judge(), [_point()])
+
+    assert "框架为什么不能自动迭代" in prompt, (
+        "the framework's own limit is not asked for"
+    )
+    assert "BLOCKED_ON_USER" in prompt, (
+        "the blocked stage is not named"
+    )
+    assert "repair_task_count=0" in prompt, (
+        "the empty repair-task table is not asked about"
+    )
+
+
+def test_build_prompt_forbids_无法确定():
+    """The prompt says what to write instead of 「无法确定」."""
+    prompt = _build(_judge(), [_point()])
+
+    assert "禁止「无法确定」" in prompt, (
+        "the ban on 「无法确定」 is not stated"
+    )
+    assert "缺哪一条具体事实" in prompt, (
+        "the prompt does not say what to write instead"
+    )
+
+
+def test_build_prompt_carries_each_points_expected_and_actual():
+    """Every failed point's expected result and verdict are in the prompt."""
+    prompt = _build(
+        _judge(),
+        [
+            _point(
+                id="VP-3",
+                title="登录接口",
+                expected_result="返回 200 且 body 带 token",
+                verdict="AssertionError: expected 200, got 500",
+            ),
+            _point(
+                id="VP-7",
+                title="导出报表",
+                expected_result="生成 xlsx 文件",
+                verdict="FileNotFoundError: no such file",
+            ),
+        ],
+    )
+
+    for point_id in ("VP-3", "VP-7"):
+        assert point_id in prompt, f"{point_id} is missing"
+    assert "返回 200 且 body 带 token" in prompt, (
+        "the first point's expected_result is missing"
+    )
+    assert "AssertionError: expected 200, got 500" in prompt, (
+        "the first point's verdict is missing"
+    )
+    assert "生成 xlsx 文件" in prompt, (
+        "the second point's expected_result is missing"
+    )
+    assert "FileNotFoundError: no such file" in prompt, (
+        "the second point's verdict is missing"
+    )
+
 
 
 # ---------------------------------------------------------------------------

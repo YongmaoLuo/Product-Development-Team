@@ -10,9 +10,10 @@ What is pinned here
 
 1. **A good answer comes back whole.**  Six fields, exactly those six,
    with the model's own text (stripped) and nothing invented on top.
-2. **One call, no tools.**  The judge is a reader, not an investigator:
-   it calls the model once, with no tools, and with the timeout the
-   module declares.
+2. **One call, read-only tools.**  The judge is an investigator that
+   may read but not write: it calls the model once, with the read-only
+   tool set (``Bash`` / ``Read`` / ``Grep`` / ``Glob``), with the
+   timeout the module declares.
 3. **Every failure is a downgrade, never an exception.**  A provider
    that raises, an answer that is not JSON, a payload that is not an
    object, a recommendation outside the three actions, a missing field —
@@ -128,6 +129,8 @@ def _analyze(judge):
         repair_task_count=0,
         deferred_count=4,
         failed_points=_points(),
+        plan_dir="/tmp/plans/p1",
+        project_dir="/tmp/projects/demo",
     )
 
 
@@ -193,24 +196,33 @@ def test_extra_keys_are_not_passed_through():
 
 
 # ---------------------------------------------------------------------------
-# 2. One call, no tools
+# 2. One call, read-only tools
 # ---------------------------------------------------------------------------
 
 
-def test_single_call_is_tool_less():
-    """One call, no tools, and the declared timeout."""
+def test_single_call_uses_read_only_tools():
+    """One call, the read-only investigation tools, and the declared timeout."""
     tool = _FakeTool(response=dict(_PAYLOAD))
     judge = _judge(tool)
 
     _analyze(judge)
 
     assert len(tool.calls) == 1, (
-        f"the judge made {len(tool.calls)} calls; it is a reader, not an "
-        f"investigator"
+        f"the judge made {len(tool.calls)} calls; it is one call, not a loop"
     )
     call = tool.calls[0]
-    assert call["allowed_tools"] == [], "the judge was given tools"
-    assert call["timeout"] == 300, "the judge used another timeout"
+    allowed = list(call["allowed_tools"])
+    for tool_name in ("Read", "Grep", "Glob", "Bash"):
+        assert tool_name in allowed, (
+            f"the judge cannot {tool_name}; it cannot investigate the "
+            f"failure it was handed"
+        )
+    for tool_name in ("Edit", "Write", "NotebookEdit"):
+        assert tool_name not in allowed, (
+            f"the judge was given {tool_name}; the analysis is a reading, "
+            f"not a repair"
+        )
+    assert call["timeout"] == 600, "the judge used another timeout"
     assert call["prompt"], "the judge called the model without a prompt"
     assert call["system_instruction"], "the judge called the model without rules"
 

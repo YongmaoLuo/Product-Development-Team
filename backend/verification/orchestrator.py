@@ -4020,6 +4020,12 @@ class VerificationOrchestrator:
         with what the failure means and which of the three actions it
         recommends.
 
+        The judge is also handed **where to look** (``plan_dir`` and
+        ``project_dir``, 2026-11-06): it may read the chain record, the
+        root-cause reports, the repair tasks and the code itself, so the
+        answer can say *why* the framework could not iterate instead of
+        repeating the summary back.
+
         The answer is **optional by construction**.  The judge is a model
         call: it may raise, or answer with something that is not an
         answer.  Neither may keep the human from being asked — a missing
@@ -4052,6 +4058,12 @@ class VerificationOrchestrator:
                 failed_points=self._terminal_failed_points(
                     report, failed_vp_ids,
                 ),
+                # 2026-11-06: the judge investigates on its own now, so
+                # it is told where the records are.  Without these two
+                # paths its only source is the summary above, and the
+                # summary cannot answer "why did the chain stop here?".
+                plan_dir=str(self.plan_dir),
+                project_dir=str(self.project_dir),
             )
         except Exception as exc:  # noqa: BLE001 — the question still goes out
             self._log_audit(

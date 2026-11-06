@@ -12,7 +12,9 @@ This module pins the wiring between the orchestrator and that judge:
    round, why the round stopped, how many repair tasks it produced, how
    many points were deferred and which points failed (with their facts).
    A judge that receives only some of them reasons about a scene that is
-   not the one that happened.
+   not the one that happened.  It is also told **where to look**
+   (``plan_dir`` / ``project_dir``) — the judge investigates on its own
+   now, and a judge with no paths can only repeat the summary back.
 2. **Only ``DEFERRED`` counts as "not executed".**  ``SKIPPED`` and
    ``SPLIT`` are terminal successes and ``BLOCKED`` is a failure — none
    of them is a point that did not run.  The count is per verification
@@ -151,6 +153,23 @@ def test_analysis_passes_all_facts_to_judge(make_orchestrator):
     assert len(failed_points) == 1
     assert failed_points[0]["id"] == "VP-3"
     assert failed_points[0]["failure_class"] == "deliverable_defect"
+
+
+def test_analysis_hands_over_the_paths_to_investigate(make_orchestrator):
+    """The judge is told where the chain record and the code live."""
+    judge = _FakeJudge({"recommendation": "accept_as_failed"})
+    orchestrator = make_orchestrator(judge=judge)
+
+    orchestrator._terminal_analysis(_report(), 3, ["VP-3"], 0)
+
+    kwargs = judge.kwargs
+    assert kwargs is not None, "the judge was never asked"
+    assert kwargs["plan_dir"] == str(orchestrator.plan_dir), (
+        "the judge was not told where the plan's records are"
+    )
+    assert kwargs["project_dir"] == str(orchestrator.project_dir), (
+        "the judge was not told where the implementation is"
+    )
 
 
 def test_analysis_counts_the_deferred_points_it_hands_over(make_orchestrator):

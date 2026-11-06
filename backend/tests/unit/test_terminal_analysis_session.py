@@ -128,6 +128,8 @@ def _analyze(judge):
         repair_task_count=0,
         deferred_count=1,
         failed_points=_points(),
+        plan_dir="/tmp/plans/p1",
+        project_dir="/tmp/projects/demo",
     )
 
 
