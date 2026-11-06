@@ -68,12 +68,6 @@ A2 要回答的是「同一 VP 相邻两次失败,根因有没有演进」。现
 跨机器可比的。跨机器比较失败指纹没有意义:那台机器上的失败根本不是这
 台机器上的那次失败。
 
-从指纹到决定
-------------
-指纹本身只是一个键。「根因有没有演进」这个**决定**由
-:func:`needs_root_cause_task` 给出 —— 它是纯函数,读一条失败的历史
-(连续失败几轮 + 前后两个指纹),回答「这一轮要不要先做根因任务,而不是
-再生成一个盲目的修复任务」。
 """
 
 from __future__ import annotations
@@ -82,7 +76,6 @@ import hashlib
 import os
 import re
 import tempfile
-from collections.abc import Mapping
 from typing import Any, List, Optional, Sequence
 
 from failure_classification import (
@@ -101,7 +94,6 @@ __all__ = [
     "canonical_fingerprint_input",
     "failure_fingerprint",
     "fingerprint_rule",
-    "needs_root_cause_task",
 ]
 
 
@@ -122,14 +114,6 @@ FINGERPRINT_LENGTH = 16
 #: the same on both.
 _FIXED_TMP_ROOTS = ("/private/tmp", "/tmp")
 
-#: The round on which a repeated failure becomes a *different* failure.
-#:
-#: The count is the number of consecutive rounds a failure has repeated —
-#: one on the round it first failed. So ``2`` is the round on which the
-#: failure repeats for the **second** time: the first round it failed, the
-#: second round it failed again. That is the only round at which "it failed
-#: again" and "it failed for a different reason" can be told apart.
-_ROOT_CAUSE_ROUNDS = 2
 
 
 #: The rule a fingerprint was computed under.
@@ -484,110 +468,5 @@ def _known_rule(value: Any) -> Optional[str]:
     return None
 
 
-def _rules_are_comparable(rule_prev: Any, rule_curr: Any) -> bool:
-    """Whether two fingerprints may be compared for equality at all.
-
-    Two fingerprints are comparable when the same rule produced them.
-    Comparing across rules reads the change of the measuring instrument
-    as a change of the defect, which is how the loop ends up opening a
-    root-cause task for a failure nobody touched.
-
-    The three cases:
-
-    * **both rules known and equal** — comparable; the fingerprints may
-      be compared, and a difference means the defect changed.
-    * **both rules known and different** — not comparable. We cannot say
-      anything about the defect, so we say nothing about the root cause.
-    * **one or both rules unknown** — the records pre-date the rule ids
-      (or are unreadable). When *neither* side names a rule, the
-      comparison is the one the loop has always made and it stays. When
-      only one side names a rule, the other side's rule is unknown, so
-      the two may have been made by different rules: not comparable.
-
-    The "not comparable" answer is a *false*, not an error: the round
-    then hands the failure to a repair task instead of re-opening a
-    diagnosis, which is the direction that lets the chain close.
-    """
-    known_prev = _known_rule(rule_prev)
-    known_curr = _known_rule(rule_curr)
-    if known_prev is None and known_curr is None:
-        return True
-    if known_prev is None or known_curr is None:
-        return False
-    return known_prev == known_curr
 
 
-def needs_root_cause_task(history: Mapping[str, Any]) -> bool:
-    """Whether this failure needs a root-cause task instead of a repair.
-
-    The old key (``VP-x|分类``) answers one question: *did the same failure
-    happen again?* It cannot answer *is this the same root cause?* — two
-    failures can share a classification and differ in everything that
-    matters. So the loop keeps generating repair tasks for a failure whose
-    cause has moved on.
-
-    The fingerprint answers the second question, and this function turns
-    that answer into a decision.
-
-    Args:
-        history: The failure's history. Read four keys, plus two
-            optional ones:
-
-            * ``vp_id`` — the verification point (carried along, not used
-              to branch);
-            * ``consecutive_failures`` — how many consecutive rounds this
-              failure has repeated (one on the round it first failed);
-            * ``fp_prev`` — the previous round's fingerprint of this
-              point's failure;
-            * ``fp_curr`` — this round's fingerprint of it;
-            * ``rule_prev`` / ``rule_curr`` — **optional** — the rule
-              each of the two fingerprints was computed under (see
-              :func:`fingerprint_rule`). Records written before the
-              rules existed simply do not carry them.
-
-    Returns:
-        ``True`` only on the round where a failure repeats for the second
-        time **and** its fingerprint changed — the round the root cause
-        evolved. Everything else is ``False``:
-
-        * one round of failure → not a repeat yet;
-        * the same fingerprint → the *same* failure, which is the old
-          key's business (the repeat count), not this branch's;
-        * three rounds or more → the same-cause cap has been reached and
-          the path that owns that verdict decides;
-        * a missing key → we do not know, so we fail open to the old
-          path. A record we cannot read must never raise: one
-          unreadable payload must not be able to abort a round;
-        * **the two fingerprints were computed under different rules** →
-          not comparable, so no verdict: the difference between them
-          says the instrument changed, not the defect, and reading it
-          as "the root cause evolved" would re-open a diagnosis for a
-          failure nobody touched. The round hands the failure to a
-          repair task instead, which is the direction that lets the
-          chain close.
-
-    The function is pure — same record in, same answer out, in this
-    process and in any other.
-    """
-    if not isinstance(history, Mapping):
-        return False
-
-    rounds = history.get("consecutive_failures")
-    if isinstance(rounds, bool) or not isinstance(rounds, int):
-        return False
-    if rounds != _ROOT_CAUSE_ROUNDS:
-        return False
-
-    fp_prev = history.get("fp_prev")
-    fp_curr = history.get("fp_curr")
-    if not isinstance(fp_prev, str) or not isinstance(fp_curr, str):
-        return False
-    if not fp_prev or not fp_curr:
-        return False
-
-    if not _rules_are_comparable(
-        history.get("rule_prev"), history.get("rule_curr"),
-    ):
-        return False
-
-    return fp_prev != fp_curr

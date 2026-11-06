@@ -60,11 +60,10 @@ from git_manager import GitManager
 from refiner import TaskRefiner
 from refiner_necessity import command_source_paths
 from task import SubTask, UNKNOWN_MODIFICATIONS_SENTINEL, NO_FILE_CHANGES_SENTINEL
-# 2026-11-03: a root-cause row reaches the executor with its deliverable
+# 2026-11-06: a report task can reach the executor with its deliverable
 # contract missing (the persistence allow-list has no column for
-# ``deliverable`` / ``report_path``). The helper restores it from the
-# row's own text — see ``root_cause_task.root_cause_report_contract``.
-from root_cause_task import root_cause_report_contract
+# ``deliverable`` / ``report_path``). The marker in the row's own text
+# carries it — see ``orphan_rules.parse_report_deliverable``.
 from test_command_quality import inspect_command as inspect_test_command
 from test_command_quality import find_vacuous_pass as _find_vacuous_pass
 from test_command_quality import check_falsifiable as _check_falsifiable
@@ -533,6 +532,7 @@ from orphan_rules import (  # noqa: E402
     MERGE_REQUIRED_FIELDS as _ORPHAN_MERGE_REQUIRED_FIELDS,
     has_mergeable_content as _orphan_has_mergeable_content,
     merged_subtask_kwargs as _orphan_merged_subtask_kwargs,
+    parse_report_deliverable,
 )
 
 
@@ -3333,12 +3333,6 @@ class AutonomousAgent:
         # forcing the operator to diff tasks.json against a baseline.
         legacy_ids: list[str] = []
 
-        # The plan's own directory — the report a root-cause task owes
-        # lives in its ``reports/`` subdirectory, which is also where the
-        # root-cause chain reads it from
-        # (``verification.orchestrator._root_cause_report_file``).
-        plan_dir = tasks_file.parent
-
         def _make_task(t: dict) -> SubTask:
             task_dict = {k: v for k, v in t.items() if k in _TASK_FIELDS}
             task_dict.setdefault("updated_time", None)
@@ -3348,13 +3342,19 @@ class AutonomousAgent:
             task_dict.setdefault("breakdown_count", 0)
             if "files_to_modify" not in t:
                 legacy_ids.append(t.get("id", "<missing>"))
-            # 2026-11-03: restore the report contract a root-cause row
-            # lost on the way through persistence. Without it the task
-            # loads as a code task, and the empty-diff gate asks "did
-            # the repo change?" about a deliverable that IS a file.
-            contract = root_cause_report_contract(task_dict, plan_dir)
-            if contract:
-                task_dict.update(contract)
+            # 2026-11-06: restore the report contract a row lost on the
+            # way through persistence. Without it the task loads as a code
+            # task, and the empty-diff gate asks "did the repo change?"
+            # about a deliverable that IS a file.  The row's own text
+            # carries the contract (the marker line); a row that already
+            # declares a deliverable keeps its own — that one is
+            # authoritative and is never second-guessed.
+            if not str(task_dict.get("deliverable") or "").strip():
+                contract = parse_report_deliverable(
+                    task_dict.get("description"),
+                )
+                if contract:
+                    task_dict.update(contract)
             return SubTask(**task_dict)
 
         # Self-heal pass (audit 2026-07-16):
@@ -3623,15 +3623,11 @@ class AutonomousAgent:
                         sub_task_dict.setdefault("depends_on", [])
                         sub_task_dict.setdefault("breakdown_count", 0)
                         sub_task_dict["status"] = status or "pending"
-                        # 2026-11-03: same restoration as the disk
-                        # loader — a root-cause row merged in from
-                        # state.db carries no deliverable contract
-                        # either (``plan_tasks`` has no column for it).
-                        contract = root_cause_report_contract(
-                            sub_task_dict, plan_dir,
-                        )
-                        if contract:
-                            sub_task_dict.update(contract)
+                        # 2026-11-06: the merged orphan's deliverable
+                        # contract is restored by
+                        # ``orphan_rules.merged_subtask_kwargs`` — it
+                        # reads the same marker line the disk loader
+                        # reads (``plan_tasks`` has no column for it).
                         # 2026-09-09: the sentinel value is
                         # self-describing. If the orphan entry did not
                         # include ``files_to_modify``, the SubTask default

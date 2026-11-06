@@ -65,25 +65,12 @@ from verification.failure_triage import (
     disposition_for,
     is_not_looser,
 )
-# 2026-10-27: the fingerprint of a failure, and the decision it feeds.
-# The fingerprint says *whether* the root cause moved; the decision says
-# what the round does about it. Both are pure functions — the loop's
-# bookkeeping must be reproducible from the record alone.
+# 2026-10-27: the fingerprint of a failure — it says *whether* the root
+# cause moved. It is a pure function: the loop's bookkeeping must be
+# reproducible from the record alone.
 from verification.failure_fingerprint import (
     failure_fingerprint,
     fingerprint_rule,
-    needs_root_cause_task,
-)
-# 2026-10-27: the two task shapes the root-cause chain dispatches — the
-# read-only diagnosis and the single implementation task that follows it.
-# The builders own the shape (the id, the ``kind``, the fields each kind
-# must and must not carry); the orchestrator owns *when* they are
-# dispatched.
-from root_cause_task import (
-    build_implementation_task,
-    build_root_cause_task,
-    root_cause_report_absolute_path,
-    root_cause_report_path,
 )
 from verification.triage_agent import VPTriageJudge
 # 2026-11-06: the canonical spelling of a repo-relative path — the ONE
@@ -114,103 +101,6 @@ _LOOP_TRACKING_VERSION = 2
 #: key — the same spelling :func:`verification.failure_triage.decision_key`
 #: uses, so a key reads the same in a log line as it does on disk.
 _DECISION_KEY_SEPARATOR = "|"
-
-#: The marker a repair row carries when the failure's root cause
-#: evolved. 2026-10-27: the repair decision forks on the fingerprint —
-#: a point that failed again *for a different reason* is not the failure
-#: the last repair attempt was aimed at, so its row says so.
-_ROOT_CAUSE_MARK = "【根因演进】"
-
-#: The file the root-cause chain's record is written to.
-#:
-#: The chain outlives a single round: the diagnosis is dispatched in one
-#: round and answered in the next, and every round runs in a **fresh**
-#: orchestrator. So the stage the chain stands at cannot live in memory —
-#: it is the plan's own history, and it goes next to the round payload
-#: that already is (``verification_loop_tracking.json``).
-_ROOT_CAUSE_CHAIN_FILENAME = "verification_root_cause_chain.json"
-
-#: The chain's stages, per point:
-#:
-#: ``root_cause``
-#:     The point's root cause moved. What it owes now is a **diagnosis**:
-#:     a read-only task that delivers a root-cause report.
-#: ``implementation``
-#:     The diagnosis came back with a scope. What the point owes now is
-#:     **exactly one** implementation task — the blind repairs are over.
-#: ``MACHINE_EXHAUSTED``
-#:     The machine's road on this point is walked out: one diagnosis, one
-#:     implementation, and the point still fails. A human takes it from
-#:     here.
-#:
-#: 2026-11-06. The stage used to be spelled ``BLOCKED_ON_USER``, which
-#: said the same thing twice and meant two different things: the chain's
-#: stage said it, and the round's payload said it about "a decision is
-#: waiting for an answer".  The chain's stage says nothing about a
-#: question: the machine can be exhausted **without** anybody having
-#: been asked (the decision may even be ``unroutable``).  The stage is
-#: therefore named after what it says — the machine is out of road.
-_CHAIN_STAGE_ROOT_CAUSE = "root_cause"
-_CHAIN_STAGE_IMPLEMENTATION = "implementation"
-CHAIN_STAGE_MACHINE_EXHAUSTED = "MACHINE_EXHAUSTED"
-
-#: The stage name the chain's record carried before 2026-11-06.
-#:
-#: Read-side only: a record written by an older build still says
-#: ``BLOCKED_ON_USER``, and it must keep meaning "the machine is out of
-#: road" — never "the point is not on the chain" and never "the stage is
-#: unknown".  :func:`_normalise_chain_stage` maps it onto the current
-#: name, so the next write lands the new one.
-_CHAIN_STAGE_LEGACY_BLOCKED_ON_USER = "BLOCKED_ON_USER"
-
-#: The origin every task the root-cause **preflight** generates carries.
-#:
-#: 2026-11-05. The preflight dispatches the chain's work **before** a
-#: round runs, so its tasks are not a round's repair rows — they are the
-#: chain's own next step, dispatched early. The marker says which of the
-#: two it is, so a consumer can tell "the chain continued" from "the
-#: round failed and asked for a fix".
-_ROOT_CAUSE_PREFLIGHT_ORIGIN = "root_cause_preflight"
-
-#: The reason a preflight hands the plan back to a human: every point the
-#: chain owns is already out of road, so there is nothing the machine can
-#: do and nothing a round would change.
-#:
-#: 2026-11-06: the **value** is kept as it is — it is a stable reason
-#: code two callers key on, and renaming it would be a contract change,
-#: not a naming fix.  What it names is the chain's state, not a
-#: question that is waiting for an answer.
-_ROOT_CAUSE_BLOCKED_REASON = "root_cause_blocked_on_user"
-
-#: The headings a root-cause report may put its scope under.
-#:
-#: The report is written by the executor, so its shape is not ours to
-#: dictate — but the *scope* it delivers is not optional: the
-#: implementation task's ``files_to_modify`` is exactly these paths, and
-#: a task without a blast radius is a task that guesses.
-#:
-#: The reader does **not** scan these sections any more — it reads the
-#: author's declaration (see :func:`_root_cause_scope_from_text`). The
-#: headings stay because the author-side template offers one of them as
-#: the human-readable title of the scope section, and the two sides
-#: keep naming the same section.
-_ROOT_CAUSE_SCOPE_HEADINGS = (
-    "改动范围",
-    "修改范围",
-    "涉及文件",
-    "受影响文件",
-    "files_to_modify",
-    "files to modify",
-)
-
-#: The event name the "the root-cause report named no file to change"
-#: warning carries. It is the name an operator greps for, so it must not
-#: change with the wording of the message.
-_ROOT_CAUSE_SCOPE_MISSING_EVENT = "root_cause_scope_missing"
-
-#: Why a point went to a human because its root-cause report named no
-#: file to change. It is also the reason the chain's record carries.
-_ROOT_CAUSE_SCOPE_MISSING_REASON = "root_cause_report_without_scope"
 
 #: The event name the "the same repair task id appeared twice in one
 #: batch" warning carries. It is the name an operator greps for, so it
@@ -324,117 +214,60 @@ _JSON_FENCE_RE = re.compile(
 )
 
 
-def _loads_json(text: str) -> Optional[Any]:
-    """Parse one JSON body, or ``None`` when it is not JSON.
+def _decision_status_value(decision: Any) -> str:
+    """The status of a stored decision, as the plain string it is.
 
-    A report that is not JSON is read as a report, not as broken JSON:
-    the caller moves on to the next candidate.
+    The stored form is a string (``hitl.models.Decision.status``), but a
+    decision handed around as an enum member carries its value inside
+    ``.value`` — and ``str()`` on a ``str``-mixin enum is *not* its
+    value on modern Python.  Both spellings are therefore read the same
+    way, so a status is never mistaken for another one.
     """
-    candidate = (text or "").strip()
-    if not candidate:
-        return None
-    try:
-        return json.loads(candidate)
-    except (ValueError, TypeError):
-        return None
+    status = getattr(decision, "status", "")
+    value = getattr(status, "value", status)
+    return str(value or "")
 
 
-def _json_bodies(text: str) -> List[Any]:
-    """The JSON bodies a report carries, in the order they are tried.
+#:
+#: The chain outlives a single round: the diagnosis is dispatched in one
+#: round and answered in the next, and every round runs in a **fresh**
+#: orchestrator. So the stage the chain stands at cannot live in memory —
+#: it is the plan's own history, and it goes next to the round payload
+#: that already is (``verification_loop_tracking.json``).
+_ROOT_CAUSE_CHAIN_FILENAME = "verification_root_cause_chain.json"
 
-    Two shapes: the whole file is JSON, or a fenced ``json`` block
-    inside a markdown report. A block in another language is not JSON
-    and is not read.
-    """
-    stripped = (text or "").strip()
-    if not stripped:
-        return []
-    bodies: List[Any] = []
-    if stripped.startswith(("{", "[")):
-        body = _loads_json(stripped)
-        if body is not None:
-            bodies.append(body)
-    for block in _JSON_FENCE_RE.findall(stripped):
-        body = _loads_json(block)
-        if body is not None:
-            bodies.append(body)
-    return bodies
+#: The chain's stages, per point:
+#:
+#: ``root_cause``
+#:     The point's root cause moved. What it owes now is a **diagnosis**:
+#:     a read-only task that delivers a root-cause report.
+#: ``implementation``
+#:     The diagnosis came back with a scope. What the point owes now is
+#:     **exactly one** implementation task — the blind repairs are over.
+#: ``MACHINE_EXHAUSTED``
+#:     The machine's road on this point is walked out: one diagnosis, one
+#:     implementation, and the point still fails. A human takes it from
+#:     here.
+#:
+#: 2026-11-06. The stage used to be spelled ``BLOCKED_ON_USER``, which
+#: said the same thing twice and meant two different things: the chain's
+#: stage said it, and the round's payload said it about "a decision is
+#: waiting for an answer".  The chain's stage says nothing about a
+#: question: the machine can be exhausted **without** anybody having
+#: been asked (the decision may even be ``unroutable``).  The stage is
+#: therefore named after what it says — the machine is out of road.
+_CHAIN_STAGE_ROOT_CAUSE = "root_cause"
+_CHAIN_STAGE_IMPLEMENTATION = "implementation"
+CHAIN_STAGE_MACHINE_EXHAUSTED = "MACHINE_EXHAUSTED"
 
-
-def _paths_from_report(body: Any) -> List[str]:
-    """The paths a JSON report body declares.
-
-    The declaration is one of three shapes: a top-level array of
-    paths, a ``paths`` / ``files_to_modify`` array, or the same key
-    nested under ``fix_plan``. A key that is present but empty does
-    not end the search — the next candidate is read.
-    """
-    if isinstance(body, list):
-        return [
-            str(item).strip()
-            for item in body
-            if isinstance(item, str) and item.strip()
-        ]
-    if not isinstance(body, Mapping):
-        return []
-    for key in ("paths", "files_to_modify"):
-        value = body.get(key)
-        if isinstance(value, (list, tuple)):
-            paths = [
-                str(item).strip()
-                for item in value
-                if isinstance(item, str) and item.strip()
-            ]
-            if paths:
-                return paths
-        if isinstance(value, str) and value.strip():
-            return [value.strip()]
-    fix_plan = body.get("fix_plan")
-    if isinstance(fix_plan, Mapping):
-        return _paths_from_report(fix_plan)
-    return []
-
-
-def _root_cause_scope_from_text(text: str) -> List[str]:
-    """The relative paths a root-cause report **declares**.
-
-    The report is the diagnosis's deliverable, and the scope it
-    delivers is what the implementation task is allowed to change. So
-    the scope is read out of the report — never guessed from the
-    failure, and never inferred from prose.
-
-    Prose is not a declaration. A scope section written as bullets, a
-    sentence or a table cannot be read, because nothing in the text
-    says whether a path it names is one this task will really create
-    or one it merely mentions as an example — and reading it wrong
-    locks the wrong files and unlocks the right ones. So the author
-    **declares** the scope in a typed container: the whole report is
-    JSON, or the report carries a ``json`` fenced block. The first
-    candidate that declares a non-empty scope wins.
-
-    A report that declares no scope yields none, and the caller then
-    refuses to build an implementation task rather than invent one.
-    """
-    if not text:
-        return []
-    for body in _json_bodies(text):
-        paths = _paths_from_report(body)
-        if paths:
-            return paths
-    return []
-
-
-# ---------------------------------------------------------------------------
-# The chain's head — "is this chain still about the failure in front of us?"
-# ---------------------------------------------------------------------------
-#
-# 2026-11-05 (arch 决策点 8). The chain's record used to say *where* each
-# point stood and nothing else, so a chain that outlived its failure (a
-# ``reset_rounds`` keeps the chain and its reports) kept describing a
-# failure nobody could still see. The record now carries the commit the
-# diagnosis was dispatched at, and the question "is that still this
-# failure?" has an answer: compare it with the workspace's HEAD.
-
+#: The stage name the chain's record carried before 2026-11-06.
+#:
+#: Read-side only: a record written by an older build still says
+#: ``BLOCKED_ON_USER``, and it must keep meaning "the machine is out of
+#: road" — never "the point is not on the chain" and never "the stage is
+#: unknown".  :func:`_normalise_chain_stage` maps it onto the current
+#: name, so the next write lands the new one.
+_CHAIN_STAGE_LEGACY_BLOCKED_ON_USER = "BLOCKED_ON_USER"
 
 def _recorded_head_sha(value: Any) -> Optional[str]:
     """The commit sha a record carries — or ``None`` when it carries none.
@@ -449,7 +282,6 @@ def _recorded_head_sha(value: Any) -> Optional[str]:
         if sha:
             return sha
     return None
-
 
 def _normalise_chain_stage(stage: Any) -> str:
     """The stage a chain record names, in the current vocabulary.
@@ -468,84 +300,6 @@ def _normalise_chain_stage(stage: Any) -> str:
     if text == _CHAIN_STAGE_LEGACY_BLOCKED_ON_USER:
         return CHAIN_STAGE_MACHINE_EXHAUSTED
     return text
-
-
-def _decision_status_value(decision: Any) -> str:
-    """The status of a stored decision, as the plain string it is.
-
-    The stored form is a string (``hitl.models.Decision.status``), but a
-    decision handed around as an enum member carries its value inside
-    ``.value`` — and ``str()`` on a ``str``-mixin enum is *not* its
-    value on modern Python.  Both spellings are therefore read the same
-    way, so a status is never mistaken for another one.
-    """
-    status = getattr(decision, "status", "")
-    value = getattr(status, "value", status)
-    return str(value or "")
-
-
-def _git_head_sha(project_dir: Any, timeout_sec: int = 10) -> Optional[str]:
-    """The commit ``HEAD`` points at in ``project_dir``.
-
-    ``None`` when git cannot answer: no repository, no commit yet, git
-    missing, or git too slow. Never raises — the caller degrades to "no
-    head", and a chain whose head cannot be read is treated as stale
-    (conservative: a normal round, not a continuation of the chain).
-    """
-    try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(project_dir),
-            capture_output=True,
-            text=True,
-            timeout=timeout_sec,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if proc.returncode != 0:
-        return None
-    return proc.stdout.strip() or None
-
-
-def _chain_is_stale(chain: Mapping[str, Any], head_sha: Optional[str]) -> bool:
-    """Does the chain still describe the failure at ``head_sha``?
-
-    ``True`` means "this chain is about something else (or about
-    something we cannot check) — do not continue it, run an ordinary
-    round instead". ``False`` means the chain may be continued.
-
-    The rules, in the order they are applied:
-
-    * **no chain → not stale.** A record that owns no point and names no
-      commit is not a chain; there is nothing that could be stale, and
-      the caller falls through to an ordinary round anyway.
-    * **no recorded head → stale.** A record written before the chain
-      carried a head does not say which failure it describes, so we
-      cannot claim it is still this one. Conservative on purpose.
-    * **no current head → stale.** Same reasoning: the comparison could
-      not be made, so the chain is not trusted.
-    * **different commits → stale.** The chain describes a failure of
-      another version of the code.
-    * **same commit → not stale.**
-    """
-    if not isinstance(chain, Mapping) or not chain:
-        return False
-    vps = chain.get("vps")
-    owns_points = isinstance(vps, Mapping) and bool(vps)
-    recorded = _recorded_head_sha(chain.get("head_sha"))
-    if not owns_points and recorded is None:
-        # An empty chain — no point, no commit. Nothing to be stale.
-        return False
-    if recorded is None:
-        # A record that does not say which commit it describes.
-        return True
-    current = _recorded_head_sha(head_sha)
-    if current is None:
-        # The current HEAD could not be read: we cannot tell, so we do
-        # not trust the chain.
-        return True
-    return recorded != current
-
 
 def load_root_cause_chain(plan_dir: Any) -> Dict[str, Any]:
     """The chain's record: ``{"version", "stage", "vps", "head_sha"}``.
@@ -638,8 +392,6 @@ def save_root_cause_chain(plan_dir: Any, payload: Mapping[str, Any]) -> None:
             tmp.unlink()
         except OSError:
             pass
-
-
 def _is_counted_failure(key: Tuple[str, str]) -> bool:
     """Whether this failure may move the same-cause counter.
 
@@ -1249,10 +1001,6 @@ def _judged_nothing_cycle_result(report: Mapping) -> dict:
         # 2026-10-31: which phase ran out of budget — the evidence the
         # operator needs to decide what happens next.
         "budget_exhausted_in": _round_budget_exhausted_in(report),
-        # 2026-10-30: a round that judged nothing has no root-cause
-        # report to read — the field is present on every return path so
-        # a consumer can read it without guarding for its absence.
-        "root_cause_scope_missing": [],
     }
 
 
@@ -1360,10 +1108,6 @@ def _infrastructure_unresolved_cycle_result(report: Mapping) -> dict:
         # 2026-10-31: which phase ran out of budget — the evidence the
         # operator needs to decide what happens next.
         "budget_exhausted_in": _round_budget_exhausted_in(report),
-        # 2026-10-30: a round that judged nothing has no root-cause
-        # report to read — the field is present on every return path so
-        # a consumer can read it without guarding for its absence.
-        "root_cause_scope_missing": [],
         # 2026-11-03: the round's own verdict — the environment never
         # let it judge the deliverable, so there is nothing to repair
         # and the chain does not iterate.
@@ -2394,466 +2138,17 @@ class VerificationOrchestrator:
         self._failure_fingerprint_rules = rule_pairs
         return pairs
 
-    def _root_cause_vp_ids(
-        self, current_failed_keys: Set[Tuple[str, str]],
-    ) -> List[str]:
-        """The points whose failure needs a root-cause task, not a repair.
-
-        The decision is :func:`verification.failure_fingerprint.needs_root_cause_task`
-        — a pure function of the failure's history: how many consecutive
-        rounds it has repeated, and what its fingerprint was before and
-        is now. The count comes from the same tally the old key uses, so
-        the two branches read one state and cannot disagree about it.
-
-        The count is read **before** the triage runs, because the triage
-        may reset it (a diverting verdict gives the failure a fresh
-        budget). The transition — "it failed again, and for a different
-        reason" — is the one the triage is asked about, so it has to be
-        read while it is still there.
-        """
-        out: List[str] = []
-        for vp_id, failure_class in sorted(current_failed_keys):
-            pair = self._failure_fingerprints.get(vp_id)
-            if not pair:
-                continue
-            rules = self._failure_fingerprint_rules.get(vp_id) or [None, None]
-            history = {
-                "vp_id": vp_id,
-                "consecutive_failures": self._same_failure_counts.get(
-                    _decision_key_str((vp_id, failure_class)), 0,
-                ),
-                "fp_prev": pair[0],
-                "fp_curr": pair[1],
-                "rule_prev": rules[0] if len(rules) == 2 else None,
-                "rule_curr": rules[1] if len(rules) == 2 else None,
-            }
-            if needs_root_cause_task(history):
-                out.append(vp_id)
-        return out
-
-    def _root_cause_note(self, vp_id: str) -> str:
-        """The note a root-cause row carries in place of a blind repair."""
-        pair = self._failure_fingerprints.get(vp_id) or [None, None]
-        fp_prev, fp_curr = pair[0], pair[1]
-        return (
-            f"【根因演进】{vp_id} 又失败了，但已经不是同一个根因"
-            f"（失败指纹 {fp_prev or '(无)'} → {fp_curr or '(无)'}）。"
-            "先根据本轮证据定位当前根因，再给出修复方案；"
-            "不要重复上一轮针对旧根因的方案。"
-        )
-
-    def _mark_root_cause_task(
-        self, task: Dict[str, Any], vp_id: str,
-    ) -> Dict[str, Any]:
-        """Mark a task as the root-cause task of a point.
-
-        The mark is the same one a re-scoped repair row has always
-        carried: the title says the root cause moved, and the description
-        leads with the fingerprint change and the instruction to find the
-        current root cause first. The executor has to be able to tell
-        this task apart from the blind repairs it has been fed all
-        along — otherwise a diagnosis reads as "fix it again, the same
-        way".
-
-        The task is copied, not mutated: the caller's dict is its own.
-        """
-        row = dict(task)
-        title = str(row.get("title") or "").strip()
-        if not title.startswith(_ROOT_CAUSE_MARK):
-            row["title"] = (
-                f"{_ROOT_CAUSE_MARK}{title}"
-                if title
-                else f"{_ROOT_CAUSE_MARK}[{vp_id}] 根因分析"
-            )
-        note = self._root_cause_note(vp_id)
-        description = str(row.get("description") or "").strip()
-        row["description"] = f"{note}\n\n{description}" if description else note
-        return row
-
     # ------------------------------------------------------------------
-    # The root-cause chain
+    # The verifier provenance check
     # ------------------------------------------------------------------
     #
-    # A point whose root cause moved does not get another blind repair.
-    # It gets a **chain**: one read-only diagnosis, then — if the
-    # diagnosis says what to change — exactly one implementation task,
-    # and if that fails too, a human.
-    #
-    # The stages land on different rounds (the diagnosis is dispatched in
-    # one round and answered in the next), and every round runs in a
-    # fresh orchestrator, so the stage the chain stands at is kept on
-    # disk, next to the round payload that already is.
-
-    def _root_cause_chain_path(self) -> Path:
-        """Where the chain's record lives."""
-        return Path(self.plan_dir) / _ROOT_CAUSE_CHAIN_FILENAME
-
-    def _current_head_sha(self) -> Optional[str]:
-        """The commit the workspace sits on — ``None`` when unreadable.
-
-        2026-11-05: the chain's record is written against this. It is
-        the anchor of "is the chain still about the failure in front of
-        us?" — a reset may leave the workspace on another commit, and
-        then the chain describes a failure of a version of the code that
-        is no longer there.
-        """
-        return _git_head_sha(self.project_dir)
-
-    def _chain_is_stale(
-        self, chain: Mapping[str, Any], head_sha: Optional[str],
-    ) -> bool:
-        """Does the chain still describe the failure at ``head_sha``?
-
-        The same answer as the module-level :func:`_chain_is_stale`, as
-        a method — the chain's own reader asks it this way.
-        """
-        return _chain_is_stale(chain, head_sha)
-
-    def _load_root_cause_chain(self) -> Dict[str, Any]:
-        """The chain's record: ``{"version", "stage", "vps", "head_sha"}``.
-
-        The module-level :func:`load_root_cause_chain` does the reading;
-        this method is the chain's own reader asking the same question
-        the same way, so the two cannot drift.
-        """
-        return load_root_cause_chain(self.plan_dir)
-
-    def _save_root_cause_chain(self, payload: Mapping[str, Any]) -> None:
-        """Write the chain's record.
-
-        The module-level :func:`save_root_cause_chain` does the writing;
-        this method is the chain's own writer asking the same question
-        the same way, so the two cannot drift.
-        """
-        save_root_cause_chain(self.plan_dir, payload)
-
-    def _clear_root_cause_chain(self) -> None:
-        """Forget the chain — the point passed, or the plan moved on."""
-        try:
-            self._root_cause_chain_path().unlink()
-        except OSError:
-            pass
-
-    def _root_cause_report_file(self, vp_id: str) -> Path:
-        """Where the root-cause report of a point lives.
-
-        The path is the one the diagnosis task was handed
-        (:func:`root_cause_task.root_cause_report_absolute_path`, same
-        ``plan_dir`` anchor), so the task and the reader cannot disagree
-        about where the report is — the reader and the writer go through
-        the **same helper**, so they cannot even compute two answers.
-        """
-        return Path(
-            root_cause_report_absolute_path(
-                self.plan_dir.name, vp_id, plan_dir=self.plan_dir,
-            )
-        )
-
-    def _root_cause_scope(self, vp_id: str) -> Tuple[bool, List[str]]:
-        """The scope the root-cause report delivers, and whether it is there.
-
-        Two answers, because they mean different things: a report that
-        is **not there** means the diagnosis has not been delivered yet
-        (the point still owes a diagnosis), while a report that is there
-        but names no path means the diagnosis came back without saying
-        what to change (nobody can act on that — a human has to).
-
-        The paths go through the same normalisation the repair tasks
-        have always used (:func:`repair_generator.normalise_declared_files`),
-        so the scope this reads is exactly the scope the implementation
-        task will carry — an absolute path or a ``..`` walk is not a
-        blast radius, and a report that only names those has not
-        delivered one.
-        """
-        from repair_generator import normalise_declared_files
-
-        try:
-            text = self._root_cause_report_file(vp_id).read_text(
-                encoding="utf-8",
-            )
-        except OSError:
-            return False, []
-        scope = normalise_declared_files(
-            _root_cause_scope_from_text(text),
-        )
-        return True, list(scope)
-
-    def _root_cause_chain_decision(
-        self, escalated_vp_ids: List[str], round_number: int,
-    ) -> Dict[str, Any]:
-        """Where the chain stands, and what this round owes it.
-
-        The decision is per point, because two points can be at two
-        different stages of their own chain:
-
-        * a point whose root cause just moved **joins** the chain at the
-          diagnosis stage;
-        * a point at the diagnosis stage owes a **diagnosis** — unless its
-          report has already been delivered, in which case it owes the
-          **implementation** the report asks for;
-        * a point at the implementation stage has had its implementation
-          run and still fails: the machine's road on it is walked out, so
-          it goes to a **human**.
-
-        Nothing is written here — the caller writes the record once the
-        round has decided what to do with it. A round that stops early
-        must not leave the chain advanced.
-
-        2026-11-05: the record this returns carries the commit the
-        chain describes (``head_sha``), written when a diagnosis is
-        dispatched — see the comment at the write.
-        """
-        chain = self._load_root_cause_chain()
-        vps: Dict[str, Dict[str, Any]] = dict(chain.get("vps") or {})
-
-        # A point whose root cause moved joins the chain.
-        for vp_id in escalated_vp_ids:
-            if vp_id in vps:
-                continue
-            vps[vp_id] = {
-                "stage": _CHAIN_STAGE_ROOT_CAUSE,
-                "round": int(round_number),
-                "report_path": root_cause_report_path(
-                    self.plan_dir.name, vp_id,
-                ),
-            }
-
-        actions: List[Dict[str, Any]] = []
-        blocked: List[str] = []
-        # 2026-10-30: the points whose root-cause report came back
-        # without saying what to change. The machine has no road left on
-        # them — and the round says so, because a stop nobody can see is
-        # a stop nobody can act on.
-        scope_missing: List[str] = []
-        for vp_id in sorted(vps):
-            entry = vps[vp_id]
-            stage = str(entry.get("stage") or _CHAIN_STAGE_ROOT_CAUSE)
-            if stage == CHAIN_STAGE_MACHINE_EXHAUSTED:
-                # The machine's road on this point is walked out — this
-                # round owes it nothing.
-                blocked.append(vp_id)
-                continue
-            if stage == _CHAIN_STAGE_IMPLEMENTATION:
-                # The implementation task ran; the point still fails.
-                # One diagnosis and one implementation, both spent: the
-                # machine has nothing left to try on this point.
-                entry["stage"] = CHAIN_STAGE_MACHINE_EXHAUSTED
-                entry["blocked_round"] = int(round_number)
-                entry["blocked_reason"] = "implementation_still_fails"
-                blocked.append(vp_id)
-                continue
-            # The diagnosis stage: what does this point owe right now?
-            report_exists, scope = self._root_cause_scope(vp_id)
-            if report_exists and not scope:
-                # The report came back without saying what to change.
-                # Guessing the scope is how a repair task ends up
-                # touching the wrong files, so this goes to a human too.
-                entry["stage"] = CHAIN_STAGE_MACHINE_EXHAUSTED
-                entry["blocked_round"] = int(round_number)
-                entry["blocked_reason"] = _ROOT_CAUSE_SCOPE_MISSING_REASON
-                scope_missing.append(vp_id)
-                # 2026-10-30: this branch used to change the in-memory
-                # entry only — no log line, no summary field — so "why
-                # did the chain stop here?" was answerable only by
-                # whoever read the chain record on disk. One event per
-                # point: the stage moves to ``MACHINE_EXHAUSTED``, so the
-                # next round never comes back through this branch.
-                report_path = str(
-                    entry.get("report_path")
-                    or root_cause_report_path(self.plan_dir.name, vp_id)
-                )
-                try:
-                    self._log_audit(
-                        _ROOT_CAUSE_SCOPE_MISSING_EVENT,
-                        f"the root-cause report for {vp_id} names no file "
-                        f"to change — the point goes to a human",
-                        data={
-                            "plan_id": getattr(self.plan_dir, "name", "?"),
-                            "vp_id": vp_id,
-                            "report_path": report_path,
-                            "reason": _ROOT_CAUSE_SCOPE_MISSING_REASON,
-                        },
-                    )
-                except Exception:  # noqa: BLE001
-                    # A log line is never a reason to fail a round.
-                    pass
-                blocked.append(vp_id)
-                continue
-            if scope:
-                entry["stage"] = _CHAIN_STAGE_IMPLEMENTATION
-                entry["implementation_round"] = int(round_number)
-                actions.append({
-                    "vp_id": vp_id,
-                    "action": _CHAIN_STAGE_IMPLEMENTATION,
-                    "scope": list(scope),
-                })
-                continue
-            actions.append({
-                "vp_id": vp_id,
-                "action": _CHAIN_STAGE_ROOT_CAUSE,
-                "scope": [],
-            })
-
-        # 2026-11-05 (arch 决策点 8): the commit the chain's description
-        # belongs to.
-        #
-        # It is written **when a diagnosis is dispatched** — that is the
-        # moment the chain starts describing a failure — and never
-        # otherwise. The implementation the diagnosis asked for lands as
-        # a commit, and refreshing the head then would wash the chain
-        # fresh: a chain describing an old failure would look current
-        # forever, and the staleness check could never fire.
-        if any(
-            action["action"] == _CHAIN_STAGE_ROOT_CAUSE for action in actions
-        ):
-            head_sha = self._current_head_sha()
-        else:
-            head_sha = _recorded_head_sha(chain.get("head_sha"))
-
-        if not vps:
-            # No chain, no record — the round is an ordinary repair round.
-            return {
-                "payload": {
-                    "version": 1,
-                    "stage": "",
-                    "vps": {},
-                    "head_sha": head_sha,
-                    "updated_round": int(round_number),
-                },
-                "actions": [],
-                "blocked": [],
-                # The field is present on every return path, so a
-                # consumer can read it without guarding for its absence.
-                "scope_missing": [],
-                "vp_ids": [],
-                "terminal": False,
-                "active": False,
-            }
-
-        if blocked and len(blocked) == len(vps):
-            stage = CHAIN_STAGE_MACHINE_EXHAUSTED
-        elif any(
-            action["action"] == _CHAIN_STAGE_IMPLEMENTATION
-            for action in actions
-        ):
-            stage = _CHAIN_STAGE_IMPLEMENTATION
-        else:
-            stage = _CHAIN_STAGE_ROOT_CAUSE
-
-        return {
-            "payload": {
-                "version": 1,
-                "stage": stage,
-                "vps": vps,
-                # 2026-11-05: the commit the chain describes — written
-                # when a diagnosis was dispatched, kept otherwise.
-                "head_sha": head_sha,
-                "updated_round": int(round_number),
-            },
-            "actions": actions,
-            "blocked": blocked,
-            # 2026-10-30: the points whose root-cause report named no
-            # file to change. The machine has no road left on them, and
-            # the round says which ones — a stop that is not in the
-            # summary is a stop nobody can see.
-            "scope_missing": list(scope_missing),
-            "vp_ids": sorted(vps),
-            # The round ends here when every point the chain owns is with
-            # a human: there is nothing left to dispatch, and nothing
-            # left the machine can try.
-            "terminal": bool(blocked) and len(blocked) == len(vps),
-            "active": True,
-        }
-
-    def _root_cause_chain_tasks(
-        self,
-        actions: List[Dict[str, Any]],
-        round_number: int,
-        seq_base: int,
-        evidence_by_vp: Mapping[str, Mapping[str, Any]],
-        vp_test_commands: Mapping[str, str],
-    ) -> List[Dict[str, Any]]:
-        """The tasks the chain owes this round.
-
-        The ids come from the same repair sequence the plain rows use
-        (``repair-<seq>``), and they are allocated **before** the plain
-        rows' — so the two never collide. The chain's tasks carry their
-        own ``kind`` and their own fields (a diagnosis has no blast
-        radius; an implementation has exactly one), so they do not go
-        through the repair assembler — that one drops the rows without
-        files to change, and a diagnosis is precisely such a row.
-        """
-        tasks: List[Dict[str, Any]] = []
-        for index, action in enumerate(actions):
-            vp_id = str(action["vp_id"])
-            task_id = format_repair_task_id(seq_base + index)
-            evidence = dict(evidence_by_vp.get(vp_id) or {})
-            # 2026-11-02: the report path handed to the task is the file
-            # the CHAIN reads (:meth:`_root_cause_report_file`), as an
-            # **absolute** path.  Two readers have to name the same file:
-            # the fence, which lets a report task write exactly the path
-            # the task declares (``PDT_REPORT_PATH``), and the chain,
-            # which reads the report back to get the scope.  A repo-
-            # relative path is resolved against the *executor's* working
-            # directory (``backend/``), so the two could name different
-            # files — and a report nobody can read is a report nobody
-            # gets.
-            report_path = str(self._root_cause_report_file(vp_id))
-            if action["action"] == _CHAIN_STAGE_IMPLEMENTATION:
-                report = {
-                    "plan_id": self.plan_dir.name,
-                    "vp_id": vp_id,
-                    "round": int(round_number),
-                    "paths": list(action.get("scope") or []),
-                    "test_command": str(vp_test_commands.get(vp_id) or ""),
-                }
-                task = build_implementation_task(
-                    report,
-                    plan_id=self.plan_dir.name,
-                    vp_id=vp_id,
-                    round_no=round_number,
-                    evidence=evidence,
-                    task_id=task_id,
-                    report_path=report_path,
-                )
-            else:
-                task = build_root_cause_task(
-                    self.plan_dir.name, vp_id, round_number, evidence,
-                    task_id=task_id,
-                    # 2026-11-03 — the report's address is absolute and
-                    # anchored on the **plan's own directory**, so the
-                    # executor resolves the same file the orchestrator
-                    # reads back (``_root_cause_report_file`` goes through
-                    # the same helper with the same anchor). Anchoring it
-                    # on the workspace instead made the two point at two
-                    # different files.
-                    plan_dir=self.plan_dir,
-                    # 2026-11-02 — the address is also handed down
-                    # explicitly, as the **absolute** path of the file the
-                    # chain reads back.  Two readers have to name the same
-                    # file: the fence, which lets a report task write
-                    # exactly the path the task declares
-                    # (``PDT_REPORT_PATH``), and the chain, which reads
-                    # the report back to get the scope.
-                    report_path=report_path,
-                )
-            tasks.append(self._mark_root_cause_task(task, vp_id))
-        return tasks
-
-    # ------------------------------------------------------------------
-    # The preflight — what the chain owes BEFORE a round runs
-    # ------------------------------------------------------------------
-    #
-    # 2026-11-05 (arch 决策点 6/7). A ``reset_rounds`` keeps the chain
-    # and its reports, but the next ``/start`` ran a **whole verification
-    # round** before the chain was read — and the chain is only read when
-    # the round fails again.  So a plan whose chain owed one
-    # implementation task burned a full round (and a full ``max_rounds``
-    # budget) to get to the step it was already at.
-    #
-    # The preflight asks the chain **first**.  The chain's own decision
-    # says what the round would owe; if it owes something, the work is
-    # dispatched and the round does not run at all.
+    # 2026-11-06. Which copy of ``verification_ci_runner`` judges this
+    # round is a fact about the **round**, not about the root-cause
+    # chain: a point can fail twice in a row, byte for byte the same
+    # way, while the file on disk is already fixed — because the round
+    # was graded by another copy of the runner.  The check therefore runs
+    # at the start of every round (see :meth:`start_verification_cycle`),
+    # where a mismatch can still be said out loud.
 
     def _verifier_provenance_preflight(self) -> Dict[str, Any]:
         """Which ``verification_ci_runner`` would judge this round?
@@ -2979,230 +2274,6 @@ class VerificationOrchestrator:
             "under test: %s", payload,
         )
 
-    def _root_cause_preflight(self, round_number: int) -> Dict[str, Any]:
-        """What the chain owes **before** a round runs.
-
-        The four branches (arch 决策点 6):
-
-        * **no chain** (or a chain that owns no point) →
-          ``handled=False``.  There is nothing to continue, so the round
-          runs as usual.
-        * **a stale chain** — the workspace moved on, or the record does
-          not say which commit it describes → ``handled=False``.  The
-          chain describes a failure that is not in front of us, and the
-          round has to look at the code as it is now (arch 决策点 8).
-        * **every point out of road** (the chain's stage is
-          ``MACHINE_EXHAUSTED``) → ``handled=True``,
-          ``blocked=True``.  Nothing is dispatched and the round does not
-          run: the machine's road on these points is walked out.
-        * **the chain owes work** → ``handled=True``.  The tasks are
-          dispatched through the same write path the round uses
-          (:meth:`_persist_repair_tasks`), and the round does not run.
-
-        A point the chain **just demoted** to ``MACHINE_EXHAUSTED`` (its
-        implementation ran and it still fails) is not the preflight's
-        call: that verdict needs the round's own evidence, so the
-        preflight hands the round back (``handled=False``) and the
-        round's own chain decision makes the demotion — with the report
-        to back it.
-
-        The returned dict always carries the same keys, so a consumer can
-        read any of them without guarding for its absence.
-        """
-        decision: Dict[str, Any] = {
-            # Did the preflight take the round over?
-            "handled": False,
-            # Is the chain out of road (nothing the machine can do)?
-            "blocked": False,
-            # What the chain owes (``[]`` when it owes nothing).
-            "actions": [],
-            # The tasks that were dispatched (``[]`` when none were).
-            "tasks": [],
-            # The ids that actually landed in ``state.db``.
-            "task_ids": [],
-            # The points the decision is about.
-            "vp_ids": [],
-            # The phase the plan belongs in once the decision is acted on.
-            "phase": "",
-            # Why the preflight answered the way it did.
-            "reason": "",
-            # 2026-11-05: which ``verification_ci_runner`` would judge
-            # this round, and whether that is the tree under test's own
-            # copy.  The verdict carries it, but the verdict comes
-            # **after** the round has been spent — so the check is here,
-            # where a mismatch can still be said out loud.
-            "verifier_provenance": self._verifier_provenance_preflight(),
-        }
-        self._audit_verifier_provenance(decision["verifier_provenance"])
-
-        try:
-            chain = self._load_root_cause_chain()
-        except Exception as exc:  # noqa: BLE001
-            # A record that cannot be read is an empty chain, not an
-            # error: the worst it can do is send the plan back to the
-            # ordinary round.
-            decision["reason"] = f"chain_unreadable: {exc}"
-            return decision
-
-        vps = chain.get("vps") or {}
-        if not vps:
-            decision["reason"] = "no_root_cause_chain"
-            return decision
-
-        # 2026-11-05 (arch 决策点 8): the chain is only worth continuing
-        # while it still describes the failure in front of us.  A
-        # workspace that moved on — or a record that does not say which
-        # commit it describes — is stale, and a stale chain is not
-        # continued: the round looks at the code as it is now.
-        head_sha = self._current_head_sha()
-        if self._chain_is_stale(chain, head_sha):
-            decision["reason"] = "stale_root_cause_chain"
-            return decision
-
-        try:
-            chain_decision = self._root_cause_chain_decision(
-                [], int(round_number),
-            )
-        except Exception as exc:  # noqa: BLE001
-            decision["reason"] = f"chain_decision_failed: {exc}"
-            return decision
-
-        actions = list(chain_decision.get("actions") or [])
-        blocked = list(chain_decision.get("blocked") or [])
-        # The points that were **already** out of road when the preflight
-        # read the record — as opposed to the ones this decision demoted.
-        already_blocked = {
-            vp_id
-            for vp_id, entry in (vps or {}).items()
-            if str((entry or {}).get("stage") or "")
-            == CHAIN_STAGE_MACHINE_EXHAUSTED
-        }
-        newly_blocked = [
-            vp_id for vp_id in blocked if vp_id not in already_blocked
-        ]
-
-        if not actions:
-            if blocked and not newly_blocked:
-                # Every point the chain owns is already out of road.
-                # Nothing is dispatched and the round does not run.
-                decision.update({
-                    "handled": True,
-                    "blocked": True,
-                    "reason": _ROOT_CAUSE_BLOCKED_REASON,
-                    "vp_ids": sorted(blocked),
-                })
-                return decision
-            # Either the chain owes nothing, or it just demoted a point —
-            # and that verdict belongs to the round, which has the
-            # evidence for it.
-            decision["reason"] = (
-                "root_cause_demoted_to_blocked" if newly_blocked
-                else "no_root_cause_action"
-            )
-            return decision
-
-        # The chain owes work: dispatch it, and do not run the round.
-        try:
-            tasks = self._root_cause_chain_tasks(
-                actions,
-                int(round_number),
-                self._preflight_repair_seq_base(int(round_number)),
-                {},
-                self._preflight_vp_test_commands(),
-            )
-        except Exception as exc:  # noqa: BLE001
-            decision["reason"] = f"chain_task_build_failed: {exc}"
-            return decision
-
-        for task in tasks:
-            task["origin"] = _ROOT_CAUSE_PREFLIGHT_ORIGIN
-
-        try:
-            written = self._persist_repair_tasks(tasks, int(round_number))
-        except Exception as exc:  # noqa: BLE001
-            # 2026-11-05: the write path **raises** on failure (task 9),
-            # and the preflight has to know that nothing landed.  Nothing
-            # landed → the round runs as usual, and the round's own
-            # chain decision dispatches the work with the report behind
-            # it.
-            self._log_audit(
-                "root_cause_preflight_persist_failed",
-                f"the root-cause preflight could not write its tasks: {exc}",
-                data={
-                    "plan_id": getattr(self.plan_dir, "name", "?"),
-                    "round": int(round_number),
-                },
-            )
-            decision["reason"] = f"repair_tasks_not_written: {exc}"
-            return decision
-
-        # The chain's record advances with the work: the point now owes
-        # (or has had) its implementation, so the **next** preflight must
-        # not dispatch the same task again.  The record is written once
-        # the round has decided what to do with it — and here the
-        # preflight is the round that decided.
-        if chain_decision.get("active"):
-            self._save_root_cause_chain(chain_decision["payload"])
-
-        decision.update({
-            "handled": True,
-            "blocked": False,
-            "actions": actions,
-            "tasks": tasks,
-            "task_ids": list(written),
-            "vp_ids": sorted(
-                str(action.get("vp_id") or "") for action in actions
-            ),
-            # The plan is in the repair half of the loop now: the chain's
-            # work is queued and the round did not run.
-            "phase": "verification_repairing",
-            "reason": "root_cause_chain_continued",
-        })
-        return decision
-
-    def _preflight_repair_seq_base(self, round_number: int) -> int:
-        """The next free repair-id number for this plan.
-
-        The same source the round reads (:func:`next_repair_seq_base`
-        over both stores' ids) — one counter for the whole repair chain,
-        so the preflight's ids never collide with the round's.
-        """
-        try:
-            from repair_generator import next_repair_seq_base
-            from verification.failure_history import load_task_titles
-
-            db_titles = load_task_titles(
-                _state_db_path_for_orchestrator(), self.plan_dir.name,
-            )
-            existing = set(db_titles) | set(self._load_disk_task_titles())
-            return int(next_repair_seq_base(existing, round_number))
-        except Exception as exc:  # noqa: BLE001
-            # The id allocation is an integrity improvement, never a
-            # precondition for the preflight.  Falling back to 1
-            # reproduces the pre-2026-09-20 behaviour exactly.
-            print(
-                f"[Verification] round {round_number}: repair-id allocation "
-                f"check skipped ({exc})"
-            )
-            return 1
-
-    def _preflight_vp_test_commands(self) -> Dict[str, str]:
-        """Each point's own command, read from the verification plan.
-
-        The preflight runs before a round, so it has no round report to
-        read the commands out of — the plan file is the only source.
-        """
-        try:
-            from verification.verification_report_reader import (
-                extract_vp_test_commands,
-            )
-
-            return dict(extract_vp_test_commands(
-                self.plan_dir / "verification_plan.json",
-            ))
-        except Exception:  # noqa: BLE001
-            return {}
-
     # ------------------------------------------------------------------
     # The same-failure triage
     # ------------------------------------------------------------------
@@ -3254,9 +2325,7 @@ class VerificationOrchestrator:
             except OSError:
                 pass
 
-    def _stuck_failure_keys(
-        self, exclude_vp_ids: Optional[Set[str]] = None,
-    ) -> List[Tuple[str, str]]:
+    def _stuck_failure_keys(self) -> List[Tuple[str, str]]:
         """The decision keys whose same-cause count has reached the cap.
 
         A key is a ``(verification point, failure class)`` pair, and its
@@ -3272,19 +2341,12 @@ class VerificationOrchestrator:
         again. And a failure that does not count (``infra``,
         ``out_of_scope``) has no count at all, so it can never be here —
         two rounds of an environment blip buy no triage call.
-
-        ``exclude_vp_ids`` takes the points the root-cause chain owns out
-        of it: a point whose root cause **moved** is not the same failure
-        repeating — the counter is counting repeats of a name, and the
-        chain is the loop control for that point now.
         """
         cap = self._MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS
-        excluded = set(exclude_vp_ids or ())
         return sorted(
             key
             for key in self._previous_failed_keys
-            if key[0] not in excluded
-            and self._same_failure_counts.get(_decision_key_str(key), 0) >= cap
+            if self._same_failure_counts.get(_decision_key_str(key), 0) >= cap
         )
 
     def _triage_judge_for(self) -> Any:
@@ -3566,11 +2628,10 @@ class VerificationOrchestrator:
         """Whether this plan has a question that is still waiting.
 
         2026-11-06. "Waiting for a human" is a fact about the
-        **questions**, not about the chain's stage: the machine can be
-        out of road (``MACHINE_EXHAUSTED``) without a single question
-        having reached anybody — the question may even have been settled
-        ``unroutable``, because the plan's outlet names nobody who can
-        be asked.
+        **questions**, not about the machine's road: the repair budget can
+        be spent without a single question having reached anybody — the
+        question may even have been settled ``unroutable``, because the
+        plan's outlet names nobody who can be asked.
 
         So the answer is read from the store: a decision in one of the
         two states the verification loop waits on (``pending`` /
@@ -3947,36 +3008,34 @@ class VerificationOrchestrator:
         self,
         report: Dict[str, Any],
         current_failed_ids: Any,
-        chain_blocked_ids: Any,
     ) -> List[str]:
         """The points the terminal branch calls failed.
 
-        Two sources name the points, and **both** of them can name a
-        point that has since passed:
+        One source names the points, and it can name a point that has
+        since passed:
 
         * ``current_failed_ids`` — the round's failed-id set, which
           :meth:`_extract_failed_ids` builds as the **union** of the
           top-level results and the last round's snapshot.  The
           snapshot is the older reading, so a point that failed last
-          round and passed this round is still in it;
-        * ``chain_blocked_ids`` — the points the root-cause chain left
-          out of road.  The stage a point *reached* is remembered, so
-          a point that was blocked once and passed afterwards is still
-          in it.
+          round and passed this round is still in it.
 
         The 2026-11-05 terminal decision is what this is about: its
         question read ``failed checks: VP-002=FAILED, ... VP-020=PASSED,
         VP-021=PASSED, ...`` — two points that had passed were listed
         as failures.
 
-        So the two sources are merged into one set and the set goes
-        through **one gate**: a point whose newest reading
-        (:meth:`_terminal_entries_by_id` — the freshest entry wins) is
-        one of the non-failure statuses
-        (:data:`_TERMINAL_NON_FAILURE_STATUSES`) is not a failure, no
-        matter which source named it.  Filtering only the blocked side
-        would let a stale snapshot leak a passed point in through the
-        failed-ids side.
+        So the set goes through **one gate**: a point whose newest
+        reading (:meth:`_terminal_entries_by_id` — the freshest entry
+        wins) is one of the non-failure statuses
+        (:data:`_TERMINAL_NON_FAILURE_STATUSES`) is not a failure.
+        Filtering only some of the sources would let a stale snapshot
+        leak a passed point in through the failed-ids side.
+
+        2026-11-06 (the root-cause chain is gone): the chain's own
+        "blocked" points were a second source here.  The chain is
+        deleted, so there is no second source: the round's own failed
+        set is the whole list of what a human has to decide about.
 
         A point the report says nothing about is **kept**: no evidence
         of a pass is no reason to take it out of the list of what a
@@ -3985,7 +3044,7 @@ class VerificationOrchestrator:
         Returns the ids, sorted and without duplicates.
         """
         merged: Set[str] = set()
-        for source in (current_failed_ids, chain_blocked_ids):
+        for source in (current_failed_ids,):
             if not source:
                 continue
             for raw_id in source:
@@ -5485,19 +4544,21 @@ class VerificationOrchestrator:
                 a clean slate" behaviour that protects against stale
                 verdicts from a previous ``verification_plan.json``.
         """
-        # 2026-11-05 (arch 决策点 6/7): the root-cause chain's
-        # **preflight** comes first — before the plan enters
-        # ``verification_running`` and before a single verification point
-        # runs.  A chain that owes work is continued here, so the round
-        # that would have discovered it again is not spent.
+        # 2026-11-06: the verifier provenance check is **not** the
+        # root-cause chain's business — it answers "which copy of
+        # ``verification_ci_runner`` would judge this round?".  It used
+        # to hang off the chain's preflight; the chain is gone, so the
+        # check moves here: the round's very first step, before the plan
+        # enters ``verification_running`` and before a single
+        # verification point runs.
         #
-        # The preflight never raises and never decides on its own: it
-        # either takes the round over (``handled=True``) or hands it back
-        # (``handled=False``), and the original path below runs exactly
-        # as it did before.
-        preflight = self._root_cause_preflight(round_number=round_number)
-        if preflight.get("handled"):
-            return self._root_cause_preflight_report(preflight, round_number)
+        # It never raises and never decides on its own: it only says
+        # (out loud, in the plan's audit) that this round would be
+        # graded by a copy of the runner the tree under test does not
+        # carry.
+        self._audit_verifier_provenance(
+            self._verifier_provenance_preflight(),
+        )
 
         # 2026-08-19 audit: the orchestrator's ``PlanState`` instance
         # is long-lived but its in-memory ``_state`` cache can drift
@@ -5634,43 +4695,6 @@ class VerificationOrchestrator:
         except Exception:
             self.plan_state.verification_failed()
             raise
-
-    def _root_cause_preflight_report(
-        self, preflight: Mapping[str, Any], round_number: int,
-    ) -> Dict[str, Any]:
-        """The round report a preflight-handled cycle returns.
-
-        No verification point ran, so the report says so: it carries the
-        preflight's decision under ``root_cause_preflight`` — the key
-        every consumer reads to learn that the round was replaced by the
-        chain's work — and **no** verdict about the deliverable.
-
-        ``overall_status`` is ``FAILED`` on purpose.  The round did not
-        pass: nothing was verified, so a consumer that ignores the
-        preflight key must not read this as a pass (a pass clears the
-        chain and marks the plan delivered).
-        """
-        tasks = list(preflight.get("tasks") or [])
-        if preflight.get("blocked"):
-            summary = (
-                "the root-cause chain is out of road — no verification "
-                "round ran"
-            )
-        else:
-            summary = (
-                f"the root-cause chain's preflight dispatched "
-                f"{len(tasks)} task(s) — no verification round ran"
-            )
-        return {
-            "overall_status": "FAILED",
-            "verification_results": [],
-            "requirement_deviations": [],
-            "summary": summary,
-            "execution_profile": {"mode": "root_cause_preflight"},
-            # The decision itself — the consumer reads it, it does not
-            # have to guess what the round did.
-            "root_cause_preflight": dict(preflight),
-        }
 
     def _persist_repair_tasks(
         self,
@@ -5851,25 +4875,13 @@ class VerificationOrchestrator:
           the gate gets a bigger budget
         - budget_exhausted_in: Optional[str]   # 2026-10-31: which phase
           ran out of budget, as the gate's evidence recorded it
-        - root_cause_vp_ids: List[str]   # 2026-10-27: the points whose
-          failure repeated under a *changed* fingerprint — the ones
-          whose repair row was re-scoped to a root-cause task
         - failure_fingerprints: Dict[str, List[Optional[str]]]   2026-10-27:
           the round's fingerprint pairs, as they were persisted
-        - root_cause_scope_missing: List[str]   2026-10-30: the points
-          whose root-cause report named no file to change — the ones the
-          chain handed to a human because nobody could act on the
-          diagnosis
         - infrastructure_unresolved: bool   2026-11-03: True when the
           round's failures are all exhausted infra terminals — the
           environment never let the round judge the deliverable, so the
           chain stops instead of iterating.  Mutually exclusive with
           ``environment_blocked``
-        - machine_exhausted: bool   # 2026-11-06: True when the
-          root-cause chain is out of road on every point it owns (the
-          chain's stage is ``MACHINE_EXHAUSTED``) — one diagnosis, one
-          implementation, and the points still fail.  It says nothing
-          about a human being asked anything.
         - blocked_on_user: bool   # 2026-11-06: True when a question is
           actually **waiting for an answer** — a decision in the store
           is ``pending`` or ``paused``.  Read from the store, so a
@@ -5922,10 +4934,6 @@ class VerificationOrchestrator:
             and str(r.get("id") or "").strip() not in void_vp_ids
         )
         deviation_count = len(report.get("requirement_deviations", []))
-        # 2026-10-27: the points whose failure repeated under a changed
-        # fingerprint. Empty until the failure path computes it — the
-        # pass path has no failure to evolve.
-        root_cause_vp_ids: List[str] = []
 
         # 2026-10-27 (R5): a round that judged **nothing** is not a
         # failure of the deliverable.
@@ -6020,11 +5028,6 @@ class VerificationOrchestrator:
             self._failure_fingerprints = {}
             self._failure_fingerprint_rules = {}
             self._save_loop_tracking()
-            # 2026-10-27: the point passed, so the escalation it was on
-            # is over. A chain left on disk would keep owning the point
-            # and would block the *next* failure of it from ever getting
-            # a repair.
-            self._clear_root_cause_chain()
             # All failures resolved — drop the per-VP feedback history
             # so the next plan (if this orchestrator is reused) starts
             # with a clean slate. Persist the empty state too: a later
@@ -6058,17 +5061,7 @@ class VerificationOrchestrator:
                 "void_vp_ids": sorted(void_vp_ids),
                 "undefined_vp_ids": sorted(undefined_vp_ids),
                 "operator_action": operator_action,
-                # 2026-10-27 — a passing round has no root cause to
-                # evolve and no fingerprint to carry. The fields are
-                # present on every return path so a consumer can read
-                # them without guarding for their absence.
-                "root_cause_vp_ids": [],
                 "failure_fingerprints": {},
-                # 2026-10-30 — a passing round has no root-cause report
-                # to read. The field is present on every return path so
-                # a consumer can read it without guarding for its
-                # absence.
-                "root_cause_scope_missing": [],
             }
 
         # --- Failure path ---
@@ -6147,7 +5140,7 @@ class VerificationOrchestrator:
         # current round's view of what repeated.
         self._previous_failed_keys = current_failed_keys
 
-        # 2026-10-27 (root-cause branch): the fingerprint of each
+        # 2026-10-27: the fingerprint of each
         # failure, paired with the previous round's. The count says
         # "it failed again"; the fingerprint says whether it is the SAME
         # failure — and that is the question the old key cannot answer.
@@ -6157,36 +5150,6 @@ class VerificationOrchestrator:
         # failure a fresh budget) — and the transition this branch owns
         # is exactly the one the triage is asked about.
         self._record_round_fingerprints(report, void_vp_ids)
-        root_cause_vp_ids = self._root_cause_vp_ids(current_failed_keys)
-        if root_cause_vp_ids:
-            print(
-                f"[Verification] round {round_number}: "
-                f"{len(root_cause_vp_ids)} failed VP(s) failed again for a "
-                f"DIFFERENT reason (fingerprint changed) — "
-                f"{', '.join(root_cause_vp_ids)}: root-cause task, not "
-                f"another blind repair"
-            )
-
-        # 2026-10-27 (root-cause chain): the chain's stage decides what
-        # this round owes the points it owns — one diagnosis, then one
-        # implementation, then a human. It is read **before** the triage,
-        # because a point the chain owns is not the same failure
-        # repeating: its fingerprint moved, so the same-cause counter is
-        # counting repeats of a *name*, and the chain is that point's
-        # loop control from here on.
-        chain_decision = self._root_cause_chain_decision(
-            root_cause_vp_ids, round_number,
-        )
-        chain_vp_ids: Set[str] = set(chain_decision["vp_ids"])
-        if chain_decision["active"]:
-            print(
-                f"[Verification] round {round_number}: root-cause chain at "
-                f"stage {chain_decision['payload']['stage']} for "
-                f"{', '.join(chain_vp_ids)} — this round owes "
-                f"{len(chain_decision['actions'])} chain task(s), "
-                f"{len(chain_decision['blocked'])} point(s) the machine "
-                f"has no road left on"
-            )
 
         # 2026-10-22 (triage): reaching the cap no longer terminates the
         # chain on its own. It buys ONE semantic triage call, and the
@@ -6207,7 +5170,7 @@ class VerificationOrchestrator:
         # criterion was not replaced instead of finding no replacement
         # and no explanation.
         replacement_rejected_reason: Optional[str] = None
-        stuck_keys = self._stuck_failure_keys(exclude_vp_ids=chain_vp_ids)
+        stuck_keys = self._stuck_failure_keys()
         if stuck_keys:
             decision = self.classify_cycle(
                 stuck_keys[0], report, round_number,
@@ -6267,12 +5230,6 @@ class VerificationOrchestrator:
                     # refused replacement lost the reason.
                     "criterion_replacements": criterion_replacements,
                     "replacement_rejected_reason": replacement_rejected_reason,
-                    # 2026-10-27 — the same two fields every return path
-                    # carries. On this path the round stopped instead of
-                    # repairing, so the list says which points had a
-                    # root cause that moved — the record an operator
-                    # reads when they look at why the chain ended.
-                    "root_cause_vp_ids": sorted(root_cause_vp_ids),
                     "failure_fingerprints": {
                         vp_id: list(pair)
                         for vp_id, pair in sorted(
@@ -6311,7 +5268,7 @@ class VerificationOrchestrator:
                 # to the plan is not one point's owner.
                 stop_reason = stop_reason_code(stop_payload)
                 terminal_failed_ids = self._terminal_failed_vp_ids(
-                    report, current_failed_ids, [],
+                    report, current_failed_ids,
                 )
                 terminal_question = self._terminal_decision_question(
                     report, round_number, terminal_failed_ids,
@@ -6383,12 +5340,6 @@ class VerificationOrchestrator:
                 )
                 stop_payload["waiting_for_user"] = waiting
                 stop_payload["blocked_on_user"] = waiting
-                # The machine's road on this failure is walked out: the
-                # same failure repeated after the repair budget was
-                # spent.  The field keeps the name the chain's terminal
-                # branch used, so a consumer that reads it does not
-                # break.
-                stop_payload["machine_exhausted"] = True
                 return stop_payload
             if decision.get("void_counter"):
                 # The triage decided what this failure is, so the
@@ -6397,188 +5348,6 @@ class VerificationOrchestrator:
                 self._same_failure_counts[
                     _decision_key_str(stuck_keys[0])
                 ] = 0
-        # 2026-10-27 (root-cause chain): every point the chain owns is
-        # out of road.
-        #
-        # The point had its diagnosis, it had its one implementation
-        # task, and it still fails. The machine's road on it is walked
-        # out — another task would only ask the same question again.
-        # So the round ends here, and the verdict says what a human has
-        # to look at.
-        if chain_decision["terminal"]:
-            self._save_root_cause_chain(chain_decision["payload"])
-            # 2026-11-02: the machine's road on this point is walked out,
-            # so the round **asks** what happens next.  Until now the
-            # terminal branch only raised two flags
-            # (``needs_operator_decision`` / ``waiting_for_user``) and
-            # never asked anything: the human was told a hand was
-            # needed, with nothing on the table to decide on.
-            #
-            # The question carries facts, not an adjective — which round
-            # stopped, why, which points failed and with which verdict,
-            # how many repair tasks the round produced.  "The plan
-            # failed, what now?" cannot be answered without going to
-            # read the report; this one can.
-            #
-            # The question is about the **plan**, not about one point
-            # (``vp_id=None``): the person who decides what happens to
-            # the plan is not one point's owner.  ``check_open_question``
-            # is off because the check keys on a point's id, and this
-            # question names none.
-            # 2026-11-05: the failure list is the list of points a human
-            # has to decide about, so it holds the points that did not
-            # pass **this round** and nothing else.  Both sources that
-            # feed it — the round's failed ids and the chain's blocked
-            # points — can name a point that has since passed, so both
-            # go through the same gate.
-            terminal_failed_ids = self._terminal_failed_vp_ids(
-                report,
-                current_failed_ids,
-                chain_decision.get("blocked") or [],
-            )
-            terminal_question = self._terminal_decision_question(
-                report, round_number, terminal_failed_ids,
-            )
-            # 2026-11-06: the round's **analysis** is a fact about this
-            # round, and it is computed whether or not the plan is asked
-            # again — ``_terminal_decision_question`` runs the judge
-            # before the check below.  So the decision id starts empty:
-            # the branch that asks nobody leaves it empty on purpose.
-            decision_id = ""
-            # 2026-11-04: the plan is asked **once**. The question is
-            # about the plan, so the point-keyed check cannot see it,
-            # and without a plan-level check every entry into this
-            # branch wrote a new row: the person who answers it got the
-            # same question once per round. When the plan has already
-            # been asked — the question is still open, or this round
-            # already asked it — the round does not put a second copy
-            # in front of them.
-            #
-            # Only the **asking** is skipped. The phase call, the stop
-            # and the verdict below happen exactly as before: a plan
-            # that was asked already is still a plan that stops, and a
-            # plan that stops still says why.
-            if self._plan_has_terminal_decision(
-                self.plan_dir.name, round_number,
-            ):
-                self._log_audit(
-                    "verification_terminal_decision_already_asked",
-                    f"the plan was already asked what happens next — the "
-                    f"round {round_number} asks once",
-                    data={
-                        "plan_id": self.plan_dir.name,
-                        "round": round_number,
-                    },
-                )
-            else:
-                decision_id = self._ask_a_human_about(
-                    round_number=round_number,
-                    question=terminal_question["question"],
-                    options=terminal_question["options"],
-                    default_option=terminal_question["default_option"],
-                    vp_id=None,
-                    check_open_question=False,
-                )
-                # 2026-11-05: the decision now exists, so the round's
-                # analysis session and the analysis itself have
-                # something to belong to.  They go into the sidecar next
-                # to the plan — the decision row cannot carry them, and
-                # without them the round's reading of its own failure is
-                # lost the moment the round ends.
-                self._record_terminal_decision_session(
-                    decision_id=decision_id,
-                    analysis=self._terminal_last_analysis,
-                    report=report,
-                    round_number=round_number,
-                    failed_vp_ids=terminal_failed_ids,
-                )
-            # 2026-11-06: the analysis is archived **whatever** the
-            # branch above did.  The sidecar is one file per plan and
-            # the next round overwrites it, and the "already asked"
-            # branch wrote the analysis nowhere at all — a model call
-            # that already happened, thrown away.  The archive is a
-            # pair of files per round under ``<plan_dir>/reports/`` and
-            # no write overwrites another, so every round's reading of
-            # its own failure survives.
-            self._save_terminal_cpea_archive(
-                round_number=round_number,
-                stop_reason="repair_execution_failed",
-                question=terminal_question["question"],
-                options=terminal_question["options"],
-                default_option=terminal_question["default_option"],
-                analysis=self._terminal_last_analysis,
-                decision_id=decision_id,
-                failed_vp_ids=terminal_failed_ids,
-            )
-            self._safe_phase_call(
-                "verification_failed", "verification_failed",
-            )
-            try:
-                self.plan_state.stop_verification_loop(
-                    "repair_execution_failed",
-                )
-            except Exception as stop_exc:  # noqa: BLE001
-                # The plan's state machine may refuse the transition
-                # (the phase it stands at may not allow it). The verdict
-                # below is the round's answer either way — losing it
-                # would leave the plan running with nobody looking.
-                print(
-                    f"[Verification] round {round_number}: the plan state "
-                    f"refused the terminal transition ({stop_exc}) — the "
-                    f"verdict still says what happened"
-                )
-            return {
-                "should_continue": False,
-                "should_stop": True,
-                # The machine's road on this point is walked out: one
-                # diagnosis, one implementation, and the point still
-                # fails. The reason is spelled out of the state
-                # machine's closed vocabulary on purpose — the guard in
-                # ``tests/unit/test_verification_terminal_state_machine.py``
-                # reads this function's return literals to prove that
-                # every reason it can return ends the chain.
-                "stop_reason": "repair_execution_failed",
-                "repair_tasks": [],
-                "intent_conflicts": [],
-                # 2026-10-27: the round ends with a person, not with a
-                # task. The two flags say so: the chain's own stage
-                # (``MACHINE_EXHAUSTED``) says where the point stands, and
-                # these say that the round is waiting for a human.
-                "needs_operator_decision": True,
-                "waiting_for_user": True,
-                # 2026-11-06: ``blocked_on_user`` says **a question is
-                # waiting for an answer** — and it is read from the
-                # store, not asserted.  The round asked a question
-                # above; if that question reached nobody (it may have
-                # been settled ``unroutable``), then nobody is waiting
-                # and the flag says so.  The machine being out of road
-                # is a different fact, and it has its own field.
-                "blocked_on_user": self._waiting_for_a_human_answer(),
-                # The machine's road on the chain's points is walked
-                # out: one diagnosis, one implementation, and the points
-                # still fail.  This is the chain's stage, not a claim
-                # about a human.
-                "machine_exhausted": True,
-                "status": "loop_stopped",
-                "void_vp_ids": sorted(void_vp_ids),
-                "undefined_vp_ids": sorted(undefined_vp_ids),
-                "operator_action": operator_action,
-                "root_cause_vp_ids": sorted(root_cause_vp_ids),
-                "failure_fingerprints": {
-                    vp_id: list(pair)
-                    for vp_id, pair in sorted(
-                        self._failure_fingerprints.items()
-                    )
-                },
-                "root_cause_chain": chain_decision["payload"],
-                # 2026-10-30: the points whose root-cause report named
-                # no file to change. They are the reason this round
-                # stopped with a person in the loop — the summary says
-                # which ones, so the stop is not a mystery.
-                "root_cause_scope_missing": list(
-                    chain_decision.get("scope_missing") or []
-                ),
-            }
         # Not yet at the cap — log and continue, generating
         # repair tasks again so the executor can try once more.
         _logger = getattr(self, "logger", None)
@@ -6789,15 +5558,6 @@ class VerificationOrchestrator:
         repair_candidates, vp_splits = self._apply_vp_split_decisions(
             repair_candidates, round_number,
         )
-        # 2026-10-27 (root-cause chain): a point the chain owns gets the
-        # chain's task — a diagnosis, then one implementation — and not a
-        # blind repair. Asking the repair model for a fix on top of that
-        # is asking for the very blind repair this chain exists to stop.
-        if chain_vp_ids:
-            repair_candidates = [
-                candidate for candidate in repair_candidates
-                if str(candidate.get("id") or "") not in chain_vp_ids
-            ]
 
         # 2026-09-14 — a FAILED generation must not masquerade as "no
         # repair tasks needed". ``generate_repair_contents`` now raises
@@ -6917,20 +5677,6 @@ class VerificationOrchestrator:
                     f"{len(failed_vps)} failed VP(s) routed to split — no "
                     f"repair tasks generated"
                 )
-        # 2026-10-27 (root-cause chain): the points the chain owns are
-        # the chain's business now — they get a diagnosis, then one
-        # implementation, then a human. A blind repair row on top of that
-        # is the third repair this chain exists to prevent, so the rows
-        # are dropped here.
-        #
-        # The candidates were already taken out above, so this only
-        # catches a model that named a point it was not offered.
-        if chain_vp_ids and repair_contents:
-            repair_contents = [
-                content for content in repair_contents
-                if not isinstance(content, dict)
-                or str(content.get("failed_vp_id") or "") not in chain_vp_ids
-            ]
         # 2026-10-23 — the intent gate (R4). The model was *asked* whether
         # its fix crosses the plan's own constraint, and the answer is
         # only as good as the model's reading of it; the gate re-checks
@@ -7032,8 +5778,8 @@ class VerificationOrchestrator:
         # allocation therefore no longer filters by it either.
         seq_base = 1
         #: Every repair id the plan already owns, in either shape.  The
-        #: chain's tasks and the plain rows both allocate from this pool,
-        #: so the four writers of the repair chain share one counter.
+        #: plain rows allocate from this pool, so every writer of the
+        #: repair chain shares one counter.
         existing_repair_ids: Set[str] = set()
         try:
             from repair_generator import (
@@ -7086,40 +5832,18 @@ class VerificationOrchestrator:
             seq_base = 1
             existing_repair_ids = set()
         vp_test_commands = extract_vp_test_commands(_plan_file)
-        # 2026-10-27 (root-cause chain): the chain's tasks are allocated
-        # from the repair sequence **before** the plain rows', so the two
-        # can never land on the same id. The chain's tasks do not go
-        # through the repair assembler: a diagnosis has no files to
-        # change (the assembler drops such rows), and an implementation
-        # task carries a ``kind`` the assembler does not know.
-        chain_tasks = self._root_cause_chain_tasks(
-            chain_decision["actions"],
-            round_number,
-            seq_base,
-            round_failed_vps,
-            vp_test_commands,
-        )
         repair_tasks = RepairTaskAssembler(
             round_number=round_number,
             failed_vps=failed_vps,
             vp_test_commands=vp_test_commands,
             plan_path=str(_plan_file),
-            seq_base=seq_base + len(chain_tasks),
+            seq_base=seq_base,
             # 2026-11-02: the assembler allocates from the plan's own id
-            # pool — the ids both stores know about, plus the chain tasks
-            # that were just allocated.  One counter for the whole repair
-            # chain; the local ``seq_base`` above is only what that
-            # counter reads out.
-            existing_task_ids=existing_repair_ids | {
-                str(t.get("id") or "") for t in chain_tasks
-            },
+            # pool — the ids both stores know about.  One counter for the
+            # whole repair chain; the local ``seq_base`` above is only
+            # what that counter reads out.
+            existing_task_ids=existing_repair_ids,
         ).assemble(repair_contents)
-        repair_tasks = chain_tasks + repair_tasks
-        if chain_decision["active"]:
-            # The record is written once the round has decided what to
-            # do: a chain that says "implementation" while the round
-            # dispatched a diagnosis would send the next round back.
-            self._save_root_cause_chain(chain_decision["payload"])
         self._current_repair_tasks = repair_tasks
 
         # 2026-10-11 (W5): retire earlier rounds' duplicate repair rows
@@ -7284,33 +6008,7 @@ class VerificationOrchestrator:
             "void_vp_ids": sorted(void_vp_ids),
             "undefined_vp_ids": sorted(undefined_vp_ids),
             "operator_action": operator_action,
-            # 2026-10-27: the points whose failure repeated under a
-            # changed fingerprint. Their repair rows were re-scoped to a
-            # root-cause task — the round says which ones, so an
-            # operator can see where the loop changed its mind.
-            "root_cause_vp_ids": sorted(root_cause_vp_ids),
-            # 2026-10-27: where the root-cause chain stands, and what it
-            # owes. The chain's own stage says how far the escalation
-            # got (``root_cause`` → ``implementation`` →
-            # ``MACHINE_EXHAUSTED``); the round says whether it ended
-            # with a person in the loop.
-            "root_cause_chain": chain_decision["payload"],
-            # 2026-11-06: the chain's stage and the plan's questions are
-            # two different facts, and they have two different fields.
-            # ``machine_exhausted`` says the machine has no road left on
-            # the chain's points; ``blocked_on_user`` says a question is
-            # actually waiting for an answer (read from the store — an
-            # unreadable store answers ``False``, so the round never
-            # claims a human is waiting when it cannot see one).
-            "machine_exhausted": bool(chain_decision["terminal"]),
             "blocked_on_user": self._waiting_for_a_human_answer(),
-            # 2026-10-30: the points whose root-cause report named no file
-            # to change — the ones the chain handed to a human because
-            # nobody could act on the diagnosis. The round says which
-            # ones, so the summary carries the stop's cause.
-            "root_cause_scope_missing": list(
-                chain_decision.get("scope_missing") or []
-            ),
             # 2026-10-27: the round's fingerprint pairs, exactly as they
             # were persisted. The payload on disk is the record; this is
             # the same record, handed to the caller.

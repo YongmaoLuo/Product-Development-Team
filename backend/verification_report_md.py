@@ -186,25 +186,12 @@ COST_DEFERRED_SECTION_TITLE = "因成本跳过（DEFERRED）"
 #: 长得一模一样：一份 27 条全绿的报告可能只有 7 个验证点真的跑过。
 REUSED_FROM_ROUND_FIELD = "reused_from_round"
 
-#: 修复任务的来源标记：预检（根因链的接续）派发的活。
-PREFLIGHT_ORIGIN = "root_cause_preflight"
-
-#: 报告里装着「预检派发的修复」的字段（执行侧写进报告的那份清单）。
-PREFLIGHT_REPAIRS_FIELD = "preflight_repairs"
-
 #: 「复用」小节的标题（渲染时前面加 ``##``）。
 REUSE_SECTION_TITLE = "复用"
-
-#: 「预检接续」小节的标题（渲染时前面加 ``##``）。
-PREFLIGHT_SECTION_TITLE = "预检接续"
 
 #: 「复用」小节的表头。
 _REUSE_HEADER = ("VP", "状态", "来源")
 
-#: 「预检接续」小节的表头。
-_PREFLIGHT_HEADER = ("修复任务", "验证点", "根因报告", "改动范围")
-
-#: 报告里可能装着验证点结论的字段（按优先级）。
 #:
 #: 三套叫法都真实存在：``verification_results`` 是执行器写回报告的标准字段，
 #: ``results`` 是判断阶段 LLM schema 的字段名，``verification_points`` 是
@@ -498,23 +485,17 @@ def _review_rows(review_state: Mapping[str, Any]) -> List[List[str]]:
 
 def _repair_rows(
     repair_rows: Sequence[Mapping[str, Any]],
-    exclude_ids: Optional[Set[str]] = None,
 ) -> List[List[str]]:
     """修复任务表的数据行（已转义、按任务 id 排序）。
 
     :param repair_rows: 修复行列表（由 :func:`render` 保证是序列）。
-    :param exclude_ids: 这些任务 id 不进本表 —— 预检派发的活单列一节，
-        不重复出现在主表里（见 :func:`_preflight_rows`）。
     :return: 数据行列表。
     """
-    skipped = exclude_ids or set()
     prepared: List[Tuple[str, str, str, str]] = []
     for row in repair_rows:
         if not isinstance(row, Mapping):
             continue
         task_id = _first_text(row, _REPAIR_ID_KEYS)
-        if task_id and task_id in skipped:
-            continue
         prepared.append(
             (
                 task_id,
@@ -526,125 +507,6 @@ def _repair_rows(
 
     prepared.sort(key=lambda row: (row[0], row[1], row[2], row[3]))
     return [[_escape(value or _MISSING_CELL) for value in row] for row in prepared]
-
-
-def _scope_text(row: Mapping[str, Any]) -> str:
-    """一条修复任务要改的范围（文件清单）。
-
-    范围是两个字段里的一个：修复任务用 ``files_to_modify``，预检写进报告的
-    那份清单用 ``scope``。两个都没有就是空 —— 不猜。
-
-    :param row: 一条修复行。
-    :return: 范围文本（可能为空串）。
-    """
-    for key in ("files_to_modify", "scope"):
-        value = row.get(key)
-        if isinstance(value, (list, tuple)):
-            parts = [_text(item) for item in value]
-            parts = [part for part in parts if part]
-            if parts:
-                return ", ".join(parts)
-        elif isinstance(value, str):
-            text = value.strip()
-            if text:
-                return text
-    return ""
-
-
-def _preflight_entry(row: Mapping[str, Any]) -> Dict[str, str]:
-    """一条预检派发的修复，在报告里长什么样。
-
-    只有四样：**谁**（任务 id）、**哪个验证点**、根因报告的**地址**、要改的
-    **范围**。报告正文**不内联** —— 正文是那份文件的事，报告只负责指路：
-    把几千字的根因分析抄进报告，报告就既不是报告也读不动了。
-
-    :param row: 一条修复行（或报告里那份预检清单的一行）。
-    :return: 四格内容。
-    """
-    return {
-        "id": _first_text(row, _REPAIR_ID_KEYS),
-        "vp_id": _first_text(row, _REPAIR_VP_KEYS),
-        "report_path": _text(row.get("report_path")),
-        "scope": _scope_text(row),
-    }
-
-
-def _preflight_entries(
-    report: Mapping[str, Any], repair_rows: Sequence[Mapping[str, Any]],
-) -> List[Dict[str, str]]:
-    """预检派发的修复（接续根因链的活）。
-
-    两个来源，都读：
-
-    * 修复行里带 ``origin == "root_cause_preflight"`` 的那些；
-    * 报告里 ``preflight_repairs[]`` 那份清单（执行侧写进报告的）。
-
-    ``origin`` 是**可选**字段：缺了就是普通修复任务，按普通任务处理 ——
-    本模块不替一条没有标记的行猜它是不是预检派发的。
-
-    :param report: 报告 JSON。
-    :param repair_rows: 修复行列表。
-    :return: 预检修复条目（按出现顺序，任务 id 去重）。
-    """
-    entries: List[Dict[str, str]] = []
-    seen: Set[str] = set()
-
-    def _add(row: Mapping[str, Any]) -> None:
-        entry = _preflight_entry(row)
-        key = entry["id"] or entry["report_path"]
-        if key and key in seen:
-            return
-        if key:
-            seen.add(key)
-        entries.append(entry)
-
-    for row in repair_rows:
-        if not isinstance(row, Mapping):
-            continue
-        if _text(row.get("origin")) != PREFLIGHT_ORIGIN:
-            continue
-        _add(row)
-
-    container = report.get(PREFLIGHT_REPAIRS_FIELD)
-    if isinstance(container, (list, tuple)):
-        for row in container:
-            if not isinstance(row, Mapping):
-                continue
-            _add(row)
-
-    return entries
-
-
-def _preflight_rows(
-    report: Mapping[str, Any], repair_rows: Sequence[Mapping[str, Any]],
-) -> List[List[str]]:
-    """「预检接续」小节的数据行（已转义、按任务 id 排序）。
-
-    :param report: 报告 JSON。
-    :param repair_rows: 修复行列表。
-    :return: 数据行列表（每行四格：修复任务 / 验证点 / 根因报告 / 改动范围）。
-    """
-    prepared: List[Tuple[str, str, str, str]] = [
-        (
-            entry["id"],
-            entry["vp_id"],
-            entry["report_path"],
-            entry["scope"],
-        )
-        for entry in _preflight_entries(report, repair_rows)
-    ]
-
-    prepared.sort(key=lambda row: (row[0], row[1], row[2], row[3]))
-    return [
-        [
-            _escape(row[0] or _MISSING_CELL),
-            _escape(row[1] or _MISSING_CELL),
-            _escape(row[2] or _MISSING_CELL),
-            _escape(row[3] or _MISSING_CELL),
-        ]
-        for row in prepared
-    ]
-
 
 def _cost_deferred_entries(report: Mapping[str, Any]) -> List[Mapping[str, Any]]:
     """报告里状态为 ``DEFERRED`` 的验证点条目（按字段优先级，未去重）。
@@ -1046,9 +908,6 @@ def render(
     与「上一轮跑过、这一轮没动它所以复用了」—— 一份 27 条全绿的报告可能
     只有 7 个验证点真的跑过。
 
-    「预检接续」一节放**预检派发**的修复（接续根因链的活）：它们不重复
-    出现在「修复任务」一节里 —— 混进去就看不出这一轮到底做了什么。预检
-    是可选的（``origin`` 缺失即普通任务），没有预检派发的活就整节省略。
 
     「因成本跳过（DEFERRED）」一节只在**确实有被成本闸挡下的验证点**时
     出现：没被挡下就不该占一节。它单列的原因是 ``DEFERRED`` 是「这轮
@@ -1088,23 +947,9 @@ def render(
     if review_rows:
         sections.append("## 审核状态\n" + _table(_REVIEW_HEADER, review_rows))
 
-    preflight_rows = _preflight_rows(report, repairs)
-    preflight_ids = {
-        entry["id"] for entry in _preflight_entries(report, repairs) if entry["id"]
-    }
-
-    repair_table = _repair_rows(repairs, exclude_ids=preflight_ids)
+    repair_table = _repair_rows(repairs)
     if repair_table:
         sections.append("## 修复任务\n" + _table(_REPAIR_HEADER, repair_table))
-
-    if preflight_rows:
-        sections.append(
-            "## "
-            + PREFLIGHT_SECTION_TITLE
-            + "\n"
-            + _table(_PREFLIGHT_HEADER, preflight_rows)
-        )
-
     if plan_json is not None or parsed is not None:
         issues = traceability_issues(report, plan_json, parsed)
         if issues:
