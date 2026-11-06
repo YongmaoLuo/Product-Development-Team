@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Set, Tuple
 
@@ -1394,6 +1395,42 @@ def _canonical_case_id(case_id: Any) -> str:
     return "schema:{0}:{1}".format(
         match.group("code"), canonical_repo_path(subject),
     )
+
+
+def _parse_utc_timestamp(text: Any) -> Optional[datetime]:
+    """Parse an ISO-8601 stamp into an **aware UTC** datetime.
+
+    2026-11-06（轮次实例起点）：要比较两个时刻，前提是**两边都是同一个
+    时区下的 aware datetime**。直接比字符串会在两种 UTC 写法之间给出
+    错误的答案 —— ``"2026-11-06T18:00:00Z" > "2026-11-06T17:00:00+00:00"``
+    （字典序），可这两串写的是**不同时刻**（差一个小时），而反过来
+    ``"2026-11-06T18:00:00+00:00" < "2026-11-06T17:30:00Z"`` 又是假的那边。
+
+    两种写法都收：``...Z`` 与 ``...+00:00``（Python 3.11 以前的
+    ``fromisoformat`` 不认 ``Z``，所以先把它换成 ``+00:00``）。没有时区的
+    串按 UTC 算 —— 这份代码库里的时刻串都是 UTC。
+
+    解析不了 → ``None``：调用方据此**保持原来的保守行为**，而不是猜一个
+    时刻。猜出来的时刻会让一次比对悄悄变成另一种比对。
+    """
+    moment: Optional[datetime] = None
+    if isinstance(text, datetime):
+        moment = text
+    elif isinstance(text, str):
+        raw = text.strip()
+        if not raw:
+            return None
+        if raw.endswith("Z") or raw.endswith("z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            moment = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+    if moment is None:
+        return None
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
 
 
 class VerificationOrchestrator:
@@ -3419,6 +3456,20 @@ class VerificationOrchestrator:
         calls it "one nobody was ever asked, and it blocks nothing"), so
         a later round asks again — the same rule the point-keyed check
         follows.
+
+        2026-11-06（轮次号 ≠ 轮次实例）："这一轮已经问过了"里的**这一轮**，
+        指的是**这一次尝试**（轮次实例），不是**这个轮次号**。轮次号可以
+        退回（``reset_rounds`` 把计数拨回 1），而决策行留在表里不动 ——
+        于是上一次尝试留下的 round-1 决策会**永久**挡住新的 round-1 终局
+        问题（实证：2026-11-06 17:42:37 ``pdt-backend.log`` 的
+        ``verification_terminal_decision_already_asked: … the round 1 asks
+        once``）。
+
+        判据因此从"轮次号相等"改成**时刻**：同号的那条决策，只有
+        ``created_at`` **晚于本轮起点**（:meth:`_round_instance_started_at`）
+        才算"这一轮问的"。早于起点 → 它是上一次尝试留下的，不挡这一轮。
+        起点拿不到（文件缺失/坏了，内存里也没有）→ 保守：**照旧挡住**。
+        决策自己的 ``created_at`` 缺失/坏了 → 同样保守：照旧挡住。
         """
         from hitl.models import DecisionStatus
         from hitl.service import list_decisions
@@ -3437,6 +3488,11 @@ class VerificationOrchestrator:
                 data={"plan_id": plan_id, "round": round_number},
             )
             return False
+        # 2026-11-06: 本轮起点只在**真的要比时刻**时才需要，所以它在
+        # 第一次遇到同号决策时才读 —— 一次读盘，读不到就是 ``None``
+        # （保守）。
+        round_started_at: Optional[datetime] = None
+        round_started_at_read = False
         for decision in decisions:
             if str(getattr(decision, "source", "") or "") != (
                 VERIFICATION_DECISION_SOURCE
@@ -3455,8 +3511,84 @@ class VerificationOrchestrator:
             except (TypeError, ValueError):
                 same_round = False
             if same_round:
+                if not round_started_at_read:
+                    round_started_at = self._round_instance_started_at(
+                        round_number,
+                    )
+                    round_started_at_read = True
+                if round_started_at is not None:
+                    created_at = _parse_utc_timestamp(
+                        getattr(decision, "created_at", None)
+                    )
+                    if created_at is not None and created_at < round_started_at:
+                        # 这条决策是**本轮开工之前**写的 → 它属于上一次
+                        # 尝试（同一个轮次号），不挡这一轮。
+                        continue
                 return True
         return False
+
+    def _round_instance_started_at(
+        self, round_number: Any,
+    ) -> Optional[datetime]:
+        """When this **round instance** started — aware UTC, or ``None``.
+
+        2026-11-06（轮次号 ≠ 轮次实例）：轮次号可以退回
+        （``reset_rounds`` 把计数拨回 1），而"第几轮"要区分的是**这一次
+        尝试**。判据是**时刻**：上一次尝试留下的东西不该算到这一次头上。
+
+        起点是**现成的**，本方法不另造一套：
+
+        * ``verification_agent.Orchestrator._record_round_started_at``
+          在轮次开工时把它写到
+          ``<plan_dir>/vp_write_scope/rounds/round-<n>.started``（中途重启
+          后端时文件还在 → 起点沿用原来那个）；
+        * ``verification_agent.Orchestrator._clear_round_started_at`` 在轮次
+          收尾时把那个文件删掉 —— 于是同一个轮次号的**下一次尝试**会拿到
+          **新的**起点。
+
+        两条路读**同一个**值（``_record_round_started_at`` 返回的就是它写
+        下去的那一串）：
+
+        * **盘上的标记文件** —— 轮次还在跑的时候它在那儿；
+        * **agent 内存里的起点** —— 轮次方法返回时标记文件**已经被删掉**
+          （``run_full_verification`` 的 ``finally``），而终局决策是在轮次
+          **之后**判的：只读文件的话，这条判读永远拿不到起点，于是永远
+          保守阻断 —— 那个修复就等于没修。内存里那份是同一个值，轮次号
+          对得上才认（不是这一轮的那份不算）。
+
+        两条都拿不到 → ``None``，调用方保持**保守**的老行为。
+        """
+        try:
+            number = int(round_number)
+        except (TypeError, ValueError):
+            return None
+
+        marker = Path(self.plan_dir) / "vp_write_scope" / "rounds" / (
+            f"round-{number}.started"
+        )
+        try:
+            raw = marker.read_text(encoding="utf-8").strip()
+        except Exception:  # noqa: BLE001 — 缺失/读不动/坏编码都不致命
+            raw = ""
+        started = _parse_utc_timestamp(raw)
+        if started is not None:
+            return started
+
+        # 文件已经没了（轮次收尾把它删了）→ 读内存里那一份。
+        agent = getattr(self, "verification_agent", None)
+        if agent is None:
+            return None
+        try:
+            agent_round = int(getattr(agent, "_current_round", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        if agent_round != number:
+            # 不是这一轮的那份起点 —— 不认（认了就是拿上一轮的起点当这一轮
+            # 的，比没有起点更坏）。
+            return None
+        return _parse_utc_timestamp(
+            getattr(agent, "_round_started_at", None)
+        )
 
     def _terminal_decision_question(
         self, report, round_number, failed_vp_ids, repair_task_count=0,
