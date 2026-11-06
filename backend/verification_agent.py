@@ -12,6 +12,7 @@ Phases:
 """
 
 import asyncio
+import functools
 import hashlib
 import json
 import logging
@@ -26,7 +27,7 @@ from dataclasses import dataclass
 # 2026-10-26 (merge): main 的 ``_service_recovery_locks`` / ``_recover_service_port``
 # 用到 ``threading.Lock``，本分支用到 ``uuid`` / ``dataclass`` —— 两边都要。
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Optional, List, Dict, Any, Set, Tuple
 from urllib.parse import urlsplit, urlunsplit
@@ -3527,6 +3528,56 @@ def _health_endpoint_answers(health_url: str, timeout: float = 3.0) -> bool:
         return False
 
 
+def _closes_round_start_marker(method):
+    """把"这一轮结束了"接在轮次方法上。
+
+    2026-11-06（本轮起点）：轮次起点（``_round_started_at``，以及盘上的
+    ``vp_write_scope/rounds/round-<n>.started``）是**这一次尝试**的起点，
+    不是"这个轮次号"的起点。轮次号可以退回（operator 把轮次计数器拨回 1），
+    而 ``round-<n>/`` 下的拒绝记录不会跟着清 —— 于是上一次尝试（可能是昨
+    天、可能是上一次 reset）留下的记录会被当成这一轮的证据，把整轮 VP 误
+    判成 ``verifier_mutated_tree``。
+
+    所以这一轮**结束**（正常结束还是抛异常）就把起点标记收掉：下一次对同一
+    个轮次号的尝试是一次**新**尝试，它有它自己的起点。上一次尝试留下的
+    记录也就不该算进这一次尝试的证据 —— 正是这个改动要修的坑。
+
+    轮次**中途**重启后端不会走到这里（进程被杀了），起点标记留在盘上，接着
+    跑的那一轮因此仍然用原来的起点 —— 那一轮中途已经发生的越权写不会被
+    "起点往前挪"排除掉。
+
+    **为什么不把真身挪到另一个方法名、在这里只留一个壳。** 仓库里有好几处
+    测试**直接读这个方法的源码**（``inspect.getsource`` 与 AST）来钉住"顺序
+    承重"的事实 —— 比如"重建协调器的清理必须在预检之前"、"轮次收尾必须先
+    隔离再重跑"、"预检必须在第一次 ``asyncio.run`` 之前"。真身挪走之后，那
+    些检查就改成看**壳**，钉住的东西悄悄没了（而且仍然是绿的）。
+
+    所以这里只**包**一层，不挪走真身：``functools.wraps`` 保留
+    ``__wrapped__``，``inspect.getsource`` 顺着它回到真身源码，AST 也照样
+    找得到这个 def —— 检查的对象没有变。包装在**类定义之后**做（不在 ``def``
+    上面写 ``@``），理由见类后面的那段注释。
+
+    Args:
+        method: The round method to wrap.
+
+    Returns:
+        The wrapped method.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            # 轮次号从参数里取，不用 ``self._current_round``：轮次方法在
+            # ``start_verification_round`` 之前就可能抛（清缓存失败），那时
+            # ``_current_round`` 还是**上一轮**的值，拿它去收标记会收错。
+            round_number = kwargs.get("round_number", args[0] if args else 1)
+            self._clear_round_started_at(round_number)
+
+    return wrapper
+
+
 class Orchestrator:
     """Three-phase verification orchestrator for quality assurance.
 
@@ -3678,6 +3729,19 @@ class Orchestrator:
 
         # Current round number (will be set when running verification)
         self._current_round = 0
+
+        # 2026-11-06（本轮起点）：本轮**开始**的时刻（ISO-8601 UTC）。
+        #
+        # 轮次可以退回（``reset_rounds`` 把轮次号拨回 1），而
+        # ``round-<n>/`` 下的拒绝记录不会跟着清 —— 于是昨天留下的记录会被
+        # 当成今天的证据，把整轮 VP 误判成 ``verifier_mutated_tree``。
+        # 读拒绝账本时按这个起点过滤掉"本轮开工之前"写的记录。
+        #
+        # 它在**轮次开始时**记下，并落盘到
+        # ``<plan_dir>/vp_write_scope/rounds/round-<n>.started``：中途重启
+        # 后端后，这一轮是**接着跑的**，起点必须还是那个起点，不能因为进程
+        # 换了一个就退化成"全读"。
+        self._round_started_at: Optional[str] = None
 
         # 2026-11-03（arch 决策点 2 —— infra 的跨轮有界重试与 provider
         # 重选）：这一轮的 infra 尝试记在哪个账本上，以及上一次尝试用的
@@ -5507,6 +5571,11 @@ class Orchestrator:
             Path to the new log file
         """
         self._current_round = round_number
+        # 2026-11-06（本轮起点）：本轮开工的时刻 —— 读拒绝账本时用它把
+        # "本轮之前写的记录"（轮次退回后残留的旧证据）剔掉。记在这里，
+        # 因为这里是 ``_current_round`` 被定下来的那一步，也就是"本轮开始"
+        # 的那一步。
+        self._round_started_at = self._record_round_started_at(round_number)
         # 2026-10-25 (repair-r1-26): the environment verdict is a
         # **round** verdict.  Last round's blocked round says nothing
         # about this one — the service may be up now — so the record
@@ -5541,6 +5610,94 @@ class Orchestrator:
         # 造成的改动，不是"本轮开工时相对上一轮"的那批。
         self._record_round_scope(round_number)
         return log_path
+
+    def _record_round_started_at(self, round_number: int) -> Optional[str]:
+        """记下本轮开工的时刻（ISO-8601 UTC），并落盘。
+
+        落盘位置：``<plan_dir>/vp_write_scope/rounds/round-<n>.started``
+        （一行 ISO 串）。
+
+        **文件已存在 → 用文件里的时间。** 那说明这一轮是重启后接着跑的
+        （后端重启、或者同一轮被再次启动）：起点必须还是原来那个起点。
+        换成"现在"会把本轮中途已经发生的拒绝记录排除在本轮之外 —— 起点
+        一旦往前挪，越权写就查不出来了；而且重启之后会退化成"全读"，正是
+        这个改动要修的坑。
+
+        文件不存在 → 写当前时间。
+
+        落盘失败不是致命的：起点退回"这次进程记下的时刻"，内存里仍然可用
+        （只是下次重启后会退化）。返回 ``None`` 表示"完全拿不到起点"，
+        读账本时按全量读处理 —— 与这个参数存在之前的行为一致。
+
+        Args:
+            round_number: The round that is starting.
+
+        Returns:
+            The round's start stamp, or ``None`` when it cannot be
+            determined at all.
+        """
+        try:
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "[verification_write_guard] could not read the clock for "
+                "round %s's start stamp",
+                round_number,
+            )
+            return None
+
+        try:
+            marker = Path(self.plan_dir) / "vp_write_scope" / "rounds" / (
+                f"round-{int(round_number)}.started"
+            )
+            if marker.is_file():
+                existing = marker.read_text(encoding="utf-8").strip()
+                if existing:
+                    # This round is being resumed — keep its original start.
+                    return existing
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(now + "\n", encoding="utf-8")
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "[verification_write_guard] could not persist round %s's "
+                "start stamp",
+                round_number,
+            )
+            return now
+        return now
+
+    def _clear_round_started_at(self, round_number: int) -> None:
+        """收掉这一轮尝试的起点标记。
+
+        这一轮**结束**了 —— 于是"下一个对同一个轮次号的尝试"是一次新的
+        尝试，它该有自己的起点。没有这一步的话，``reset_rounds`` 之后的
+        那一轮会接着用上一次尝试的起点（比上一次还早），上一次尝试留下的
+        拒绝记录就又算进了这一轮的证据里 —— 正是这个改动要修的坑。
+
+        删不掉不算失败：起点标记留着只是让下一次尝试的起点偏早（多算证据，
+        不会少算），而这一轮已经结束、它的裁决已经写完了。
+
+        Args:
+            round_number: The round that just ended.
+        """
+        plan_dir = getattr(self, "plan_dir", None)
+        if plan_dir is None:
+            # 没有 plan 目录的实例（测试里的残缺 stub）没有标记可收。
+            # 这一步跑在轮次方法的 ``finally`` 里 —— 在这里抛会把轮次真正的
+            # 失败原因盖掉，所以拿不到就什么都不做。
+            return
+        try:
+            marker = Path(plan_dir) / "vp_write_scope" / "rounds" / (
+                f"round-{int(round_number)}.started"
+            )
+            if marker.exists():
+                marker.unlink()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "[verification_write_guard] could not clear round %s's "
+                "start stamp",
+                round_number,
+            )
 
     def _record_round_scope(self, round_number: int) -> None:
         """记录本轮的轮次作用域（HEAD / 上一轮 HEAD / 变更集）。
@@ -7282,7 +7439,10 @@ class Orchestrator:
             return None
 
         try:
-            refusals = read_refusals(plan_dir, round_no)
+            refusals = read_refusals(
+                plan_dir, round_no,
+                since=getattr(self, "_round_started_at", None),
+            )
         except Exception:  # pragma: no cover - defensive
             logger.exception(
                 "[verification_quarantine] could not read the round's refusals",
@@ -10636,7 +10796,10 @@ class Orchestrator:
         round_no = getattr(self, "_current_round", 0) or 0
 
         try:
-            refusals = read_refusals(plan_dir, round_no, vp_id)
+            refusals = read_refusals(
+                plan_dir, round_no, vp_id,
+                since=getattr(self, "_round_started_at", None),
+            )
         except Exception:  # pragma: no cover - defensive
             logger.exception(
                 "[verification_write_guard] could not read %s's refusals", vp_id,
@@ -16626,6 +16789,26 @@ class Orchestrator:
             return None
         envelope = row.get("execution_results")
         return envelope if isinstance(envelope, dict) else None
+
+
+# 2026-11-06（本轮起点）：把"这一轮结束了"接在轮次方法上。
+#
+# **为什么在类定义之后包，而不是用 ``@`` 语法写在 def 上面。** 仓库里有好几
+# 处测试**直接读这个方法的源码**来钉住"顺序承重"的事实：``inspect.getsource``
+# + ``ast.parse``，以及 AST 层面的调用点检查（比如"重建协调器的清理必须在预检
+# 之前"、"轮次收尾必须先隔离再重跑"、"预检必须在第一次 ``asyncio.run`` 之前"）。
+#
+# 用 ``@`` 语法时，``inspect.getsource`` 返回的源码会**从装饰器那一行开始**
+# （``co_firstlineno`` 指向装饰器），那些检查于是要么解析失败，要么改成检查
+# 一个空壳。在类定义之后包，``__wrapped__`` 指回原函数，而原函数的
+# ``co_firstlineno`` 仍然指向 ``def`` 那一行 —— 读到的源码与这次改动之前
+# **逐字一致**，检查的对象没有变。
+#
+# ``functools.wraps`` 保留 ``__wrapped__``、``__name__``、``__doc__``、
+# ``__qualname__``：``inspect.getsource`` 会顺着 ``__wrapped__`` 回到真身。
+Orchestrator.run_full_verification = _closes_round_start_marker(
+    Orchestrator.run_full_verification,
+)
 
 
 # ---------------------------------------------------------------------------

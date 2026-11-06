@@ -232,6 +232,105 @@ def test_read_refusals_parses_marker(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 只读「本轮起点之后」的记录（2026-11-06）
+# ---------------------------------------------------------------------------
+def _write_refusal(plan_dir, round_no, vp_id, ts=None, path="/outside/x"):
+    """写一条拒绝记录，返回它的 marker 路径。
+
+    ``ts`` 缺省就不写这个字段 —— "没有时间戳"是一条真实存在过的记录形状
+    （老版本的记录、以及手工补的记录），读的时候必须对它有明确态度。
+    """
+    marker = _marker(plan_dir, round_no=round_no, vp_id=vp_id)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "tool": "Write",
+        "path": path,
+        "reason": "outside_scope",
+        "vp_id": vp_id,
+        "round": round_no,
+    }
+    if ts is not None:
+        record["ts"] = ts
+    with open(marker, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return marker
+
+
+def test_read_refusals_drops_records_written_before_since(tmp_path):
+    """早于 ``since`` 的记录被丢掉，晚于/等于 ``since`` 的留下。"""
+    plan_dir = _plan_dir(tmp_path)
+    _write_refusal(plan_dir, 1, "VP-001", ts="2026-11-04T09:00:00Z")
+    _write_refusal(plan_dir, 1, "VP-001", ts="2026-11-06T09:57:05Z")
+    _write_refusal(plan_dir, 1, "VP-001", ts="2026-11-06T09:57:07Z")
+
+    guard = _guard()
+    records = guard.read_refusals(
+        plan_dir, 1, since="2026-11-06T09:57:06Z",
+    )
+    assert [r["ts"] for r in records] == ["2026-11-06T09:57:07Z"], (
+        "本轮起点之前的记录不是本轮的证据 —— 它得被丢掉"
+    )
+
+
+def test_read_refusals_keeps_a_record_written_exactly_at_since(tmp_path):
+    """等于 ``since`` 的记录留下：起点那一秒写的写也在本轮里。"""
+    plan_dir = _plan_dir(tmp_path)
+    _write_refusal(plan_dir, 1, "VP-001", ts="2026-11-06T09:57:06Z")
+
+    guard = _guard()
+    records = guard.read_refusals(
+        plan_dir, 1, since="2026-11-06T09:57:06Z",
+    )
+    assert [r["ts"] for r in records] == ["2026-11-06T09:57:06Z"], records
+
+
+def test_read_refusals_without_since_reads_everything(tmp_path):
+    """``since=None`` → 全读（回归：既有调用点与测试不变）。"""
+    plan_dir = _plan_dir(tmp_path)
+    _write_refusal(plan_dir, 1, "VP-001", ts="2026-11-04T09:00:00Z")
+    _write_refusal(plan_dir, 1, "VP-001", ts="2026-11-06T09:57:07Z")
+
+    guard = _guard()
+    records = guard.read_refusals(plan_dir, 1)
+    assert len(records) == 2, records
+    assert guard.read_refusals(plan_dir, 1, since=None) == records
+
+
+def test_read_refusals_keeps_records_without_a_usable_timestamp(tmp_path):
+    """缺 ``ts``、或 ``ts`` 不是那个形状的记录 → **保留**。
+
+    宁可多算一条证据，也不要因为一条记录的时间戳长得奇怪就放过一次越权
+    写。
+    """
+    plan_dir = _plan_dir(tmp_path)
+    _write_refusal(plan_dir, 1, "VP-001", ts=None)
+    _write_refusal(plan_dir, 1, "VP-002", ts="2026-11-04")
+    _write_refusal(plan_dir, 1, "VP-003", ts="not-a-timestamp")
+    _write_refusal(plan_dir, 1, "VP-004", ts="2026-11-04T09:00:00+02:00")
+
+    guard = _guard()
+    records = guard.read_refusals(
+        plan_dir, 1, since="2026-11-06T09:57:06Z",
+    )
+    assert sorted(r["vp_id"] for r in records) == [
+        "VP-001", "VP-002", "VP-003", "VP-004",
+    ], records
+
+
+def test_read_refusals_with_an_unusable_since_reads_everything(tmp_path):
+    """``since`` 自己看不懂 → 全读。
+
+    拿一个比较不了的时间戳去删证据，删掉的是**没有依据**该删的证据。
+    """
+    plan_dir = _plan_dir(tmp_path)
+    _write_refusal(plan_dir, 1, "VP-001", ts="2026-11-04T09:00:00Z")
+
+    guard = _guard()
+    records = guard.read_refusals(plan_dir, 1, since="2026-11-06")
+    assert len(records) == 1, records
+
+
+# ---------------------------------------------------------------------------
 # 其余边界
 # ---------------------------------------------------------------------------
 def test_missing_file_path_is_allowed(tmp_path):

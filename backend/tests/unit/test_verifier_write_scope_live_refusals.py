@@ -72,11 +72,13 @@ FAILED）。"改过树"这件事改由**测量**回答：PreToolUse 拍快照、
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Tuple
 
 import pytest
@@ -463,3 +465,306 @@ def test_genuine_in_tree_write_still_flips(
 
     # and the tree itself is untouched — the guard stopped the write
     assert target.read_text(encoding="utf-8") == "VALUE = 1\n"
+
+
+# ---------------------------------------------------------------------------
+# 4. 本轮起点之前的旧记录不再改判（2026-11-06）
+# ---------------------------------------------------------------------------
+#
+# ``POST /api/verification/{id}/reset_rounds`` 把轮次计数器拨回 1，而
+# ``round-1/`` 目录**不清** —— 于是上一次尝试（可能是昨天、可能是上一次
+# reset）留下的拒绝记录还躺在那里，被当成这一轮的证据，把整轮 VP 误判成
+# ``verifier_mutated_tree``。读的时候按"本轮开工的时刻"过滤，旧记录就不
+# 再算数了。
+#
+# 下面两条钉的是**改判路径**本身：起点之前的记录不再改判，起点之后的照旧
+# 改判（护栏没有因此被削弱）。
+
+#: 本轮开工的时刻。
+ROUND_START = "2026-11-06T09:57:06Z"
+
+#: 上一次尝试留下的记录的时间戳（在 ``ROUND_START`` 之前）。
+OLD_TS = "2026-11-04T09:00:00Z"
+
+#: 本轮之内写下的记录的时间戳（在 ``ROUND_START`` 之后）。
+NEW_TS = "2026-11-06T10:00:00Z"
+
+
+def _refusal_record(vp_id: str, path: Path, ts: str) -> Dict[str, Any]:
+    """一条与护栏写出的形状相同的拒绝记录。"""
+    return {
+        "ts": ts,
+        "tool": "Write",
+        "path": str(path),
+        "reason": verification_write_guard.REASON_OUTSIDE_SCOPE,
+        "vp_id": vp_id,
+        "round": ROUND_NO,
+    }
+
+
+def _write_refusal_record(plan_dir: Path, record: Dict[str, Any]) -> Path:
+    """把一条拒绝记录追加进本轮的拒绝账本。"""
+    marker = (
+        verification_write_guard.refusal_dir(plan_dir, ROUND_NO)
+        / f"{record['vp_id']}.jsonl"
+    )
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    with open(marker, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return marker
+
+
+def test_refusal_from_before_the_round_start_does_not_flip_the_verdict(
+    repo_under_verification, plan_dir,
+):
+    """本轮起点**之前**写下的拒绝记录 → verdict 原样成立。
+
+    这条记录落在被验证树里（路径是真的树内路径），所以在没有起点过滤的
+    时候它会把 PASSED 改判成 FAILED —— 那是旧证据在替今天说话。
+    """
+    target = repo_under_verification / "backend" / "app.py"
+    _write_refusal_record(
+        plan_dir, _refusal_record(VP_055, target, OLD_TS),
+    )
+
+    orchestrator, passed, events = _orchestrator(
+        plan_dir, repo_under_verification,
+    )
+    orchestrator._round_started_at = ROUND_START
+
+    verdict = orchestrator._apply_refusal_evidence(passed, VP_055)
+    assert verdict is passed, "本轮起点之前的记录不是本轮的证据"
+    assert verdict.verdict == "PASSED", verdict
+    assert verdict.failure_class == "", verdict
+    assert _events_of(events, MUTATION_EVENT) == [], events
+
+
+def test_refusal_from_after_the_round_start_still_flips(
+    repo_under_verification, plan_dir,
+):
+    """负控：本轮起点**之后**写下的记录照旧改判 —— 护栏没有被削弱。
+
+    两条记录都在案：旧的（起点之前）被忽略，新的（起点之内）照旧改判。
+    """
+    target = repo_under_verification / "backend" / "app.py"
+    _write_refusal_record(
+        plan_dir, _refusal_record(VP_055, target, OLD_TS),
+    )
+    _write_refusal_record(
+        plan_dir, _refusal_record(VP_055, target, NEW_TS),
+    )
+
+    orchestrator, passed, events = _orchestrator(
+        plan_dir, repo_under_verification,
+    )
+    orchestrator._round_started_at = ROUND_START
+
+    verdict = orchestrator._apply_refusal_evidence(passed, VP_055)
+    assert verdict.verdict == "FAILED", verdict
+    assert verdict.failure_class == "infra", verdict
+    assert verdict.reasons[0].startswith("verifier_mutated_tree"), verdict
+
+    mutation = _events_of(events, MUTATION_EVENT)
+    assert len(mutation) == 1, events
+    assert mutation[0][2]["count"] == 1, (
+        "只有本轮起点之后的那一条算证据 —— 起点之前的不算"
+    )
+
+
+def test_refusal_without_a_round_start_still_flips(
+    repo_under_verification, plan_dir,
+):
+    """回归：拿不到起点（``None``）→ 照旧全读，改判照旧发生。
+
+    拿不到起点时退回今天的行为（全读）：宁可能疑，也不能因为读不出起点
+    就放过一次越权写。
+    """
+    target = repo_under_verification / "backend" / "app.py"
+    _write_refusal_record(
+        plan_dir, _refusal_record(VP_055, target, OLD_TS),
+    )
+
+    orchestrator, passed, events = _orchestrator(
+        plan_dir, repo_under_verification,
+    )
+    orchestrator._round_started_at = None
+
+    verdict = orchestrator._apply_refusal_evidence(passed, VP_055)
+    assert verdict.verdict == "FAILED", verdict
+
+
+# ---------------------------------------------------------------------------
+# 5. 轮次起点落盘，并在"重启"之后被采用
+# ---------------------------------------------------------------------------
+class _StubPersistence:
+    """``start_verification_round`` 只要 persistence 开一个新日志文件。"""
+
+    def start_round(self, round_number: int) -> Path:
+        return Path(f"verification_{round_number}.log")
+
+    def update_report(self, report: Any) -> None:
+        """轮次被阻断时，报告会走这条路写回去。"""
+
+
+def _bare_orchestrator(plan_dir: Path, project_dir: Path) -> Orchestrator:
+    """一个只够跑 ``start_verification_round`` 的 orchestrator。"""
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator.plan_dir = plan_dir
+    orchestrator.project_dir = project_dir
+    orchestrator.persistence = _StubPersistence()
+    orchestrator._current_round = 0
+    orchestrator._safe_log_freshness_event = lambda *args, **kwargs: None
+    return orchestrator
+
+
+def _started_marker(plan_dir: Path) -> Path:
+    """本轮起点标记落在哪。"""
+    return (
+        plan_dir / "vp_write_scope" / "rounds" / f"round-{ROUND_NO}.started"
+    )
+
+
+def test_round_start_is_written_when_the_round_starts(
+    repo_under_verification, plan_dir,
+):
+    """轮次开始 → 起点被记下，并落盘成一行 ISO 串。"""
+    orchestrator = _bare_orchestrator(plan_dir, repo_under_verification)
+    orchestrator.start_verification_round(ROUND_NO)
+
+    stamp = orchestrator._round_started_at
+    assert stamp, "轮次开始必须记下起点"
+    assert len(stamp) == 20 and stamp.endswith("Z"), stamp
+
+    marker = _started_marker(plan_dir)
+    assert marker.is_file(), "起点必须落盘 —— 否则重启后会退化成全读"
+    assert marker.read_text(encoding="utf-8").strip() == stamp
+
+
+def test_round_start_survives_a_restart(
+    repo_under_verification, plan_dir,
+):
+    """重启（换一个 agent 实例）→ 接着跑的这一轮仍然用原来的起点。
+
+    这是落盘的意义：进程换了一个，本轮的起点不能跟着换 —— 换了就等于把
+    本轮中途已经写下的越权写排除在本轮之外。
+    """
+    marker = _started_marker(plan_dir)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("2026-11-04T09:00:00Z\n", encoding="utf-8")
+
+    orchestrator = _bare_orchestrator(plan_dir, repo_under_verification)
+    orchestrator.start_verification_round(ROUND_NO)
+
+    assert orchestrator._round_started_at == "2026-11-04T09:00:00Z", (
+        "重启后必须采用盘上的起点，而不是现在"
+    )
+    assert marker.read_text(encoding="utf-8").strip() == "2026-11-04T09:00:00Z", (
+        "采用盘上的起点不等于把它改掉"
+    )
+
+
+def test_a_new_attempt_after_the_round_ends_gets_a_fresh_start(
+    repo_under_verification, plan_dir,
+):
+    """这一轮结束 → 起点标记收掉 → 下一次对同一个轮次号的尝试是新起点。
+
+    没有这一步，``reset_rounds`` 之后的 round 1 会接着用上一次尝试的起点，
+    上一次尝试留下的拒绝记录就又算进了这一轮的证据里 —— 正是这个改动要
+    修的坑。
+    """
+    marker = _started_marker(plan_dir)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("2026-11-04T09:00:00Z\n", encoding="utf-8")
+
+    orchestrator = _bare_orchestrator(plan_dir, repo_under_verification)
+    orchestrator.start_verification_round(ROUND_NO)
+    assert orchestrator._round_started_at == "2026-11-04T09:00:00Z"
+
+    # 这一轮结束
+    orchestrator._clear_round_started_at(ROUND_NO)
+    assert not marker.exists(), "轮次结束就该把起点标记收掉"
+
+    # 下一次对同一个轮次号的尝试：新的起点
+    again = _bare_orchestrator(plan_dir, repo_under_verification)
+    again.start_verification_round(ROUND_NO)
+    assert again._round_started_at != "2026-11-04T09:00:00Z", (
+        "新的一次尝试必须有它自己的起点"
+    )
+
+
+def test_the_round_itself_closes_its_start_marker_when_it_ends(
+    repo_under_verification, plan_dir,
+):
+    """轮次方法自己收尾：轮次期间标记在，轮次结束标记不在。
+
+    上一条测试直接调 ``_clear_round_started_at`` —— 它证明那个方法能用，
+    但不证明**轮次方法**真的调它。接线漏了的话，收尾就成了"看心情"，
+    而 ``reset_rounds`` 之后的 round 1 又会接着用上一次尝试的起点 —— 正是
+    这个改动要修的坑。
+
+    这里让轮次真的跑起来：base drift 预检直接判阻断，轮次在那一步就结束
+    （这是最短的一条"轮次结束"的路），预检那一刻正好是轮次的中途。
+    """
+    marker = _started_marker(plan_dir)
+    seen_during_the_round = []
+
+    orchestrator = _bare_orchestrator(plan_dir, repo_under_verification)
+    orchestrator._clear_verification_state_files = lambda: None
+    orchestrator._freshness_cache = SimpleNamespace(clear=lambda: None)
+    orchestrator._rebuild_coordinator = SimpleNamespace(clear=lambda: None)
+
+    def _blocked():
+        # 轮次的中途：起点标记必须已经在了 —— 证据窗口是开着的。
+        seen_during_the_round.append(marker.is_file())
+        return {"overall_status": "BLOCKED", "summary": "drift"}
+
+    orchestrator._run_base_drift_preflight = _blocked
+
+    report = orchestrator.run_full_verification(ROUND_NO)
+
+    assert report["overall_status"] == "BLOCKED", report
+    assert seen_during_the_round == [True], (
+        "轮次期间起点标记必须在 —— 读账本要靠它"
+    )
+    assert not marker.exists(), (
+        "轮次结束必须把起点标记收掉 —— 否则下一次对同一个轮次号的尝试"
+        "会接着用上一次尝试的起点"
+    )
+
+
+def test_a_round_that_raises_also_closes_its_start_marker(
+    repo_under_verification, plan_dir,
+):
+    """轮次抛异常 → 起点标记同样收掉。
+
+    一次尝试就是一次尝试：它以异常收场也是**结束了**。下一次对同一个轮次号
+    的尝试是新的尝试，它该有自己的起点 —— 否则上一次尝试（崩掉的那次）留下
+    的拒绝记录又算进了这一轮的证据。
+
+    注意区分：**进程被杀掉**（后端重启）走不到收尾，标记留在盘上，接着跑的
+    那一轮因此仍然用原来的起点 —— 那是 brief 要的"重启不丢起点"。
+    """
+    marker = _started_marker(plan_dir)
+    seen_during_the_round = []
+
+    orchestrator = _bare_orchestrator(plan_dir, repo_under_verification)
+    orchestrator._clear_verification_state_files = lambda: None
+    orchestrator._freshness_cache = SimpleNamespace(clear=lambda: None)
+    orchestrator._rebuild_coordinator = SimpleNamespace(clear=lambda: None)
+
+    def _boom():
+        # 轮次的中途：起点标记必须已经在了。
+        seen_during_the_round.append(marker.is_file())
+        raise RuntimeError("轮次崩了")
+
+    orchestrator._run_base_drift_preflight = _boom
+
+    with pytest.raises(RuntimeError):
+        orchestrator.run_full_verification(ROUND_NO)
+
+    assert seen_during_the_round == [True], (
+        "轮次期间起点标记必须在 —— 没有它就没有证据窗口"
+    )
+    assert not marker.exists(), (
+        "崩掉的尝试也是结束了 —— 起点标记必须收掉"
+    )
