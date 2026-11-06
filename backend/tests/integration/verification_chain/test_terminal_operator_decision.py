@@ -19,7 +19,7 @@
    **一条决策也不产生**（负控：接线不能过宽）。
 3. ``test_terminal_round_keeps_its_existing_outcome`` —— 接线**不改变**终局
    轮次原有的结论：``repair_tasks`` 仍为空、仍 ``blocked_on_user``、链路阶段
-   仍是 ``BLOCKED_ON_USER``。
+   仍是 ``MACHINE_EXHAUSTED``。
 
 再加上「同一个计划只问一次」的三份契约
 --------------------------------------
@@ -30,6 +30,33 @@
 6. ``test_point_question_does_not_silence_the_terminal_question`` —— 挂在
    **某一个点**上的未决问题**不吞掉**终局问题（负控：计划级去重不能误伤
    别人的问题；没有未决终局问题时，终局问题照旧要问出来）。
+
+「轮次号」≠「轮次实例」
+---------------------
+上面第 5 条契约里的"同一轮"，指的是**这一次尝试**（轮次实例），不是
+**这个轮次号**：轮次号可以退回（``reset_rounds`` 把计数拨回 1），而决策行
+留在表里不动 —— 于是上一次尝试留下的 round-N 决策会**永久**挡住新的 round-N
+终局问题（实证：2026-11-06 17:42:37 ``pdt-backend.log`` 的
+``verification_terminal_decision_already_asked: … the round 1 asks once``）。
+
+判据因此是**时刻**：同号的那条决策，只有 ``created_at`` **晚于本轮起点**
+才挡这一轮。起点是现成的 —— ``verification_agent`` 在轮次开工时写到
+``<plan_dir>/vp_write_scope/rounds/round-<n>.started``，轮次收尾时删掉它。
+
+于是这里有四份契约：
+
+7. ``test_terminal_question_is_asked_again_after_a_previous_attempt`` ——
+   **修复证明**：同号、已答（``defaulted``）的旧决策 ``created_at`` **早于**
+   本轮起点 → 本轮**必须再问一次**（决策数 +1）。
+8. ``test_same_round_question_after_the_round_started_is_not_asked_again``
+   —— **负控**：同一条决策 ``created_at`` **晚于**本轮起点 → **不得**再问。
+9. ``test_terminal_question_without_a_round_start_keeps_the_old_behaviour``
+   —— **回退**：本轮起点拿不到 → 保持旧行为（不得再问）。
+10. ``test_round_start_from_the_agent_memory_is_used_when_the_marker_is_gone``
+    —— 轮次收尾时标记文件**已经被删掉**（``run_full_verification`` 的
+    ``finally``），而终局决策是在轮次**之后**判的：起点必须能从 agent
+    内存里那份（写文件时**同一个**值）拿到，否则这个修复在生产路径上
+    永远拿不到起点、永远保守阻断 —— 等于没修。
 
 轮次序列
 --------
@@ -98,7 +125,7 @@ FAILURE_CLASS = "deliverable_defect"
 CHAIN_FILENAME = "verification_root_cause_chain.json"
 
 #: The stage the chain reaches when a human has to take over.
-CHAIN_STAGE_BLOCKED_ON_USER = "BLOCKED_ON_USER"
+CHAIN_STAGE_MACHINE_EXHAUSTED = "MACHINE_EXHAUSTED"
 
 #: The file the root cause report lands in (the report the diagnosis
 #: task delivers, and the implementation task reads).
@@ -501,7 +528,7 @@ def test_terminal_round_keeps_its_existing_outcome(
 
     问人是为了让人**接手**，不是为了改掉机器这一侧已经算清楚的结论：
     终局分支仍然不派新任务（``repair_tasks == []``）、仍然等一个人
-    （``blocked_on_user``）、链路仍然停在 ``BLOCKED_ON_USER``。
+    （``waiting_for_user``）、链路仍然停在 ``MACHINE_EXHAUSTED``。
 
     接线如果动了这些，接线就变成了「多加一个任务」，而不是「多问一句」。
     """
@@ -522,17 +549,22 @@ def test_terminal_round_keeps_its_existing_outcome(
     assert r4["repair_tasks"] == [], (
         f"no new task may be dispatched: {r4['repair_tasks']!r}"
     )
-    assert r4["blocked_on_user"] is True
+    # 2026-11-06: 「机器没路了」（``machine_exhausted``）与「有人在等
+    # 回答」（``blocked_on_user``）是两个事实：这个环境里问题被问出来了，
+    # 但没有人接得住它（没有出口），所以没有人在等。
+    assert r4["machine_exhausted"] is True
+    assert r4["blocked_on_user"] is False
     assert r4["waiting_for_user"] is True
     assert r4["needs_operator_decision"] is True
     assert r4["status"] == "loop_stopped"
     assert r4["should_stop"] is True
-    assert r4["root_cause_chain"]["stage"] == CHAIN_STAGE_BLOCKED_ON_USER, (
-        f"the chain stops at the human: {r4['root_cause_chain']!r}"
+    assert r4["root_cause_chain"]["stage"] == CHAIN_STAGE_MACHINE_EXHAUSTED, (
+        f"the chain stops where the machine has no road left: "
+        f"{r4['root_cause_chain']!r}"
     )
 
     chain = _read_chain(plan_dir)
-    assert chain["stage"] == CHAIN_STAGE_BLOCKED_ON_USER, (
+    assert chain["stage"] == CHAIN_STAGE_MACHINE_EXHAUSTED, (
         f"the chain's record says where it stopped: {chain!r}"
     )
 
@@ -543,13 +575,18 @@ def test_terminal_round_keeps_its_existing_outcome(
 
 
 def _seed_terminal_decision(plan_id, round_number, *, status="pending",
-                             vp_id=None):
+                             vp_id=None, created_at=None):
     """Write a terminal question for the plan straight into the store.
 
     The row is seeded, not asked: this is the state the plan is in when
     somebody is already holding its terminal question, and reaching that
     state through the delivery layer would need an outlet to deliver
     to.  ``vp_id`` names a point when the question is about one.
+
+    ``created_at`` says **when** the question was asked — the stamp the
+    round-instance start is compared against.  Left out, the row is
+    stamped "now" (``Decision.from_request``), which is what the older
+    contracts above want.
     """
     from config_paths import resolve_state_db_path
     from hitl.models import Decision, DecisionRequest
@@ -570,6 +607,11 @@ def _seed_terminal_decision(plan_id, round_number, *, status="pending",
     )
     decision = Decision.from_request(request)
     decision.status = status
+    if created_at is not None:
+        decision.created_at = str(created_at)
+        decision.updated_at = str(created_at)
+        decision.answered_at = str(created_at)
+        decision.answer = TERMINAL_DEFAULT_OPTION
     store = HitlStore(resolve_state_db_path())
     try:
         store.insert(decision)
@@ -621,12 +663,14 @@ def test_open_terminal_question_is_not_asked_again(
     # 收尾路径一个字段都没变。
     assert r4["stop_reason"] == "repair_execution_failed"
     assert r4["repair_tasks"] == []
+    # 这个计划**拿着一个未决的问题**，所以确实有人在等回答。
     assert r4["blocked_on_user"] is True
+    assert r4["machine_exhausted"] is True
     assert r4["waiting_for_user"] is True
     assert r4["needs_operator_decision"] is True
     assert r4["status"] == "loop_stopped"
     assert r4["should_stop"] is True
-    assert r4["root_cause_chain"]["stage"] == CHAIN_STAGE_BLOCKED_ON_USER
+    assert r4["root_cause_chain"]["stage"] == CHAIN_STAGE_MACHINE_EXHAUSTED
 
 
 def test_same_round_terminal_question_is_not_asked_again(
@@ -706,3 +750,239 @@ def test_point_question_does_not_silence_the_terminal_question(
     )
     assert {row.vp_id for row in stored} == {VP_ID, None}
 
+
+
+# ---------------------------------------------------------------------------
+# 7-10. 轮次号 ≠ 轮次实例：去重按「本轮起点」，不按轮次号
+# ---------------------------------------------------------------------------
+
+
+#: The round the sequence above ends on — the terminal one.
+TERMINAL_ROUND = 4
+
+#: The round instance's start, as the agent writes it (``...Z``).
+ROUND_START = "2026-11-06T12:00:00Z"
+
+#: A stamp **before** the round instance started — written by the
+#: previous attempt at the same round number.
+BEFORE_ROUND_START = "2026-11-06T10:00:00+00:00"
+
+#: A stamp **after** the round instance started — this round's own row.
+AFTER_ROUND_START = "2026-11-06T12:30:00+00:00"
+
+
+@pytest.fixture
+def agent_instance(repair_mocks):
+    """The verification agent mock, with its round start under control.
+
+    ``repair_mocks`` already replaces the agent with a mock; this
+    fixture replaces it again (nested) so the two attributes that carry
+    the round's start — ``_current_round`` and ``_round_started_at`` —
+    can be set to something meaningful instead of a ``Mock`` that
+    compares equal to nothing.
+
+    The default is "this agent knows no round start at all", which is
+    the state contract 9 (the conservative fallback) needs.
+    """
+    with patch("verification.orchestrator.VerificationAgent") as mock_cls:
+        instance = mock_cls.return_value
+        instance._current_round = None
+        instance._round_started_at = None
+        yield instance
+
+
+def _write_round_started_marker(plan_dir, round_number, stamp):
+    """Write the round-instance start marker, the way the agent writes it.
+
+    ``verification_agent.Orchestrator._record_round_started_at`` writes
+    exactly this: one ISO-8601 UTC line under
+    ``<plan_dir>/vp_write_scope/rounds/round-<n>.started``.  The test
+    writes it by hand because the agent is mocked here — the marker's
+    *content* is the production contract, so the test must not invent a
+    format of its own.
+    """
+    rounds_dir = plan_dir / "vp_write_scope" / "rounds"
+    rounds_dir.mkdir(parents=True, exist_ok=True)
+    marker = rounds_dir / f"round-{int(round_number)}.started"
+    marker.write_text(f"{stamp}\n", encoding="utf-8")
+    return marker
+
+
+def _terminal_round_sequence():
+    """The four rounds that end on the terminal one."""
+    return [
+        ("fail", "aaa"),
+        ("fail", "bbb"),
+        ("root_cause_done", "bbb"),
+        ("fail", "bbb"),
+    ]
+
+
+def test_terminal_question_is_asked_again_after_a_previous_attempt(
+    plan_dir, project_dir, repair_mocks, decision_calls, agent_instance,
+):
+    """上一次尝试留下的同号决策 → 本轮**必须再问一次**（修复证明）。
+
+    轮次号退回 1 之后，上一次尝试留下的 round-1 决策还躺在表里，而旧判据
+    只看"轮次号相等" → 它**永久**挡住新的终局问题（2026-11-06 17:42:37
+    ``pdt-backend.log``：``… the round 1 asks once``）。
+
+    判据改成时刻之后：那条决策的 ``created_at`` **早于**本轮起点 → 它属于
+    **上一次**尝试 → 不挡这一轮 → 这一轮必须**再问一次**（决策数 +1）。
+    """
+    _write_plan_state(plan_dir)
+    _write_plan(plan_dir)
+
+    # 上一次尝试问的那一问：同一个轮次号，已经落到默认值（没人接）。
+    _seed_terminal_decision(
+        plan_dir.name,
+        round_number=TERMINAL_ROUND,
+        status="defaulted",
+        created_at=BEFORE_ROUND_START,
+    )
+    # 本轮实例的起点：晚于上面那条决策。
+    _write_round_started_marker(plan_dir, TERMINAL_ROUND, ROUND_START)
+
+    results = run_orchestrator_rounds(
+        _terminal_round_sequence(), plan_dir, project_dir,
+    )
+    _, r4 = results[3]
+
+    assert r4["stop_reason"] == "repair_execution_failed", (
+        f"the fourth round is the terminal one: {r4!r}"
+    )
+
+    # 再问了一次 —— 上一次尝试的那一问不算数。
+    assert len(decision_calls) == 1, (
+        f"the previous attempt's answer must not silence this round: "
+        f"{decision_calls!r}"
+    )
+    assert decision_calls[0].vp_id is None
+    assert decision_calls[0].round == TERMINAL_ROUND
+
+    from hitl.service import list_decisions
+
+    stored = list_decisions(plan_dir.name)
+    assert len(stored) == 2, (
+        f"the old row stays, the new question is asked as well: {stored!r}"
+    )
+
+
+def test_same_round_question_after_the_round_started_is_not_asked_again(
+    plan_dir, project_dir, repair_mocks, decision_calls, agent_instance,
+):
+    """同号决策晚于本轮起点 → **不得**再问（负控）。
+
+    这一条钉住修复的**另一半**：本轮自己问过的那一问仍然只问一次。判据是
+    "晚于本轮起点"，不是"轮次号相等" —— 把它写成"号相等就挡"，那个修复
+    就把同轮去重弄丢了（操作员每轮都要答一遍一模一样的话）。
+    """
+    _write_plan_state(plan_dir)
+    _write_plan(plan_dir)
+
+    # **这一轮**自己问的那一问：晚于本轮起点。
+    _seed_terminal_decision(
+        plan_dir.name,
+        round_number=TERMINAL_ROUND,
+        status="defaulted",
+        created_at=AFTER_ROUND_START,
+    )
+    _write_round_started_marker(plan_dir, TERMINAL_ROUND, ROUND_START)
+
+    results = run_orchestrator_rounds(
+        _terminal_round_sequence(), plan_dir, project_dir,
+    )
+    _, r4 = results[3]
+
+    assert r4["stop_reason"] == "repair_execution_failed"
+    assert decision_calls == [], (
+        f"one round instance asks the plan once: {decision_calls!r}"
+    )
+
+    from hitl.service import list_decisions
+
+    assert len(list_decisions(plan_dir.name)) == 1
+
+
+def test_terminal_question_without_a_round_start_keeps_the_old_behaviour(
+    plan_dir, project_dir, repair_mocks, decision_calls, agent_instance,
+):
+    """本轮起点拿不到 → 保持旧行为：不得再问（回退）。
+
+    起点拿不到（标记文件缺失/坏了，agent 内存里也没有）意味着"不知道这一轮
+    从哪儿开始" —— 那就**不知道**这条同号决策是不是上一次尝试留下的。
+    这种时候**保守**：照旧挡住。挡住只是少问一次；放行可能让同一个问题在
+    同一轮里问两遍（操作员要答两遍一样的话）。
+
+    agent 内存里也没有起点（``agent_instance`` 的默认状态），所以这一条
+    测的正是"两边都没有"的情形。
+    """
+    _write_plan_state(plan_dir)
+    _write_plan(plan_dir)
+
+    _seed_terminal_decision(
+        plan_dir.name,
+        round_number=TERMINAL_ROUND,
+        status="defaulted",
+        created_at=BEFORE_ROUND_START,
+    )
+    # 故意**不写**标记文件。
+
+    results = run_orchestrator_rounds(
+        _terminal_round_sequence(), plan_dir, project_dir,
+    )
+    _, r4 = results[3]
+
+    assert r4["stop_reason"] == "repair_execution_failed"
+    assert decision_calls == [], (
+        f"without a known round start the old behaviour stands: "
+        f"{decision_calls!r}"
+    )
+
+    from hitl.service import list_decisions
+
+    assert len(list_decisions(plan_dir.name)) == 1
+
+
+def test_round_start_from_the_agent_memory_is_used_when_the_marker_is_gone(
+    plan_dir, project_dir, repair_mocks, decision_calls, agent_instance,
+):
+    """标记文件已经没了 → 起点从 agent 内存里那份拿（生产路径）。
+
+    轮次收尾时标记文件**被删掉**（``run_full_verification`` 的 ``finally``
+    → ``_clear_round_started_at``），而终局决策是在轮次**之后**判的 ——
+    只读文件的话，这条判读永远拿不到起点，于是永远保守阻断，修复等于
+    没修。
+
+    agent 内存里那份（``_round_started_at``）是**写文件时同一个值**
+    （``_record_round_started_at`` 返回的就是它写下去的那一串），所以它
+    就是本轮起点 —— 不是另造的一套。
+    """
+    _write_plan_state(plan_dir)
+    _write_plan(plan_dir)
+
+    _seed_terminal_decision(
+        plan_dir.name,
+        round_number=TERMINAL_ROUND,
+        status="defaulted",
+        created_at=BEFORE_ROUND_START,
+    )
+    # 标记文件已经没了（轮次收尾删的）—— 起点只在 agent 内存里。
+    agent_instance._current_round = TERMINAL_ROUND
+    agent_instance._round_started_at = ROUND_START
+
+    results = run_orchestrator_rounds(
+        _terminal_round_sequence(), plan_dir, project_dir,
+    )
+    _, r4 = results[3]
+
+    assert r4["stop_reason"] == "repair_execution_failed"
+    assert len(decision_calls) == 1, (
+        f"the round start is known (from the agent's memory) → the "
+        f"previous attempt's row must not silence this round: "
+        f"{decision_calls!r}"
+    )
+
+    from hitl.service import list_decisions
+
+    assert len(list_decisions(plan_dir.name)) == 2
