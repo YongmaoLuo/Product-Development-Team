@@ -4066,6 +4066,125 @@ class VerificationOrchestrator:
             )
             return None
 
+    def _save_terminal_cpea_archive(
+        self,
+        *,
+        round_number: int,
+        stop_reason: str,
+        question: str,
+        options: List[str],
+        default_option: str,
+        analysis: Optional[Dict[str, Any]],
+        decision_id: str,
+        failed_vp_ids: List[str],
+    ) -> Optional[Path]:
+        """Archive this round's terminal analysis — best effort.
+
+        The analysis is a model call that already happened: it cannot be
+        reproduced later, and two rounds of the same plan each have their
+        own.  The sidecar next to the plan cannot keep them (one file
+        per plan, the next round overwrites it), and the "already asked"
+        branch wrote the analysis nowhere at all — so every terminal
+        round writes its **own** pair of files under
+        ``<plan_dir>/reports/``.
+
+        **A write that fails is not a failed round** (arch decision
+        point 5).  The decision was created and the question went out
+        before this is called; an archive that could not be written is
+        reported in the audit and the round carries on.
+
+        Only files are written: nothing here touches ``state.db``,
+        changes a table or a column, and nothing here changes who was
+        asked, what was asked or what the round concluded.
+
+        The ``.md`` half is drawn by the **question's own** renderer, so
+        the archive and the question say the same thing about the same
+        round — and an analysis the renderer refuses (one that is not
+        one) is refused here too: the archive keeps the question's
+        factual sentence instead of five sections the human was never
+        shown.  The renderer lives in a module the archive module may
+        not import, so it is drawn here and handed over.
+
+        Parameters
+        ----------
+        round_number:
+            Which round stopped.
+        stop_reason:
+            Why the round stopped.
+        question:
+            The question the round put to a human.
+        options:
+            The answers the question offered.
+        default_option:
+            The answer the question falls back to when nobody replies.
+        analysis:
+            The analysis the round produced, or ``None``.
+        decision_id:
+            The decision the question became — empty when nobody was
+            asked.
+        failed_vp_ids:
+            The verification points that failed.
+
+        Returns
+        -------
+        The path of the archive's ``.md`` file, or ``None`` when
+        nothing could be written.
+        """
+        # The imports are local on purpose, for the same reason
+        # :meth:`_record_terminal_decision_session`'s is: the archive
+        # is a module of its own and the orchestrator is the one that
+        # reaches for it, so keeping the import inside the method
+        # leaves the two modules unable to drift into an import cycle.
+        from verification import terminal_decision_session as session_file
+        from verification.terminal_analysis import render_analysis
+
+        # The archive's body is drawn by the **question's own**
+        # renderer, so the archive and the question say the same thing
+        # about the same round — and an analysis the renderer refuses
+        # (one that is not one) is refused here too: the archive keeps
+        # the question's factual sentence instead of five sections the
+        # human was never shown.  The renderer lives in a module the
+        # archive module may not import (it imports the standard
+        # library only, a pinned property), so it is drawn here and
+        # handed over.
+        rendered = render_analysis(analysis) if isinstance(analysis, Mapping) else ""
+
+        try:
+            written = session_file.save_round_archive(
+                self.plan_dir,
+                round_number=round_number,
+                stop_reason=stop_reason,
+                question=question,
+                options=list(options or []),
+                default_option=default_option,
+                analysis=analysis,
+                decision_id=str(decision_id or ""),
+                failed_vp_ids=list(failed_vp_ids or []),
+                rendered=rendered,
+            )
+        except Exception as exc:  # noqa: BLE001 — the round stands
+            self._log_audit(
+                "verification_terminal_cpea_archive_failed",
+                f"the terminal round's analysis could not be archived "
+                f"({type(exc).__name__}: {exc}) — the round carries on",
+                data={
+                    "plan_id": self.plan_dir.name,
+                    "round": round_number,
+                },
+            )
+            return None
+        if written is None:
+            self._log_audit(
+                "verification_terminal_cpea_archive_failed",
+                f"the terminal round's analysis could not be archived — "
+                f"the round carries on",
+                data={
+                    "plan_id": self.plan_dir.name,
+                    "round": round_number,
+                },
+            )
+        return written
+
     def _read_verification_plan(self) -> Optional[Dict[str, Any]]:
         """The verification plan file's payload — ``None`` when it cannot be read.
 
@@ -5811,6 +5930,12 @@ class VerificationOrchestrator:
             terminal_question = self._terminal_decision_question(
                 report, round_number, terminal_failed_ids,
             )
+            # 2026-11-06: the round's **analysis** is a fact about this
+            # round, and it is computed whether or not the plan is asked
+            # again — ``_terminal_decision_question`` runs the judge
+            # before the check below.  So the decision id starts empty:
+            # the branch that asks nobody leaves it empty on purpose.
+            decision_id = ""
             # 2026-11-04: the plan is asked **once**. The question is
             # about the plan, so the point-keyed check cannot see it,
             # and without a plan-level check every entry into this
@@ -5858,6 +5983,24 @@ class VerificationOrchestrator:
                     round_number=round_number,
                     failed_vp_ids=terminal_failed_ids,
                 )
+            # 2026-11-06: the analysis is archived **whatever** the
+            # branch above did.  The sidecar is one file per plan and
+            # the next round overwrites it, and the "already asked"
+            # branch wrote the analysis nowhere at all — a model call
+            # that already happened, thrown away.  The archive is a
+            # pair of files per round under ``<plan_dir>/reports/`` and
+            # no write overwrites another, so every round's reading of
+            # its own failure survives.
+            self._save_terminal_cpea_archive(
+                round_number=round_number,
+                stop_reason="repair_execution_failed",
+                question=terminal_question["question"],
+                options=terminal_question["options"],
+                default_option=terminal_question["default_option"],
+                analysis=self._terminal_last_analysis,
+                decision_id=decision_id,
+                failed_vp_ids=terminal_failed_ids,
+            )
             self._safe_phase_call(
                 "verification_failed", "verification_failed",
             )
