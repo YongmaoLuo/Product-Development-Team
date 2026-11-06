@@ -352,7 +352,7 @@ def _seed_chain_fixture() -> None:
 
     The ledger is the task's input payload, verbatim; the named report is
     a root-cause report **without** scope (the state that makes a round
-    park on ``BLOCKED_ON_USER``); ``keep-me.md`` is the control — a report
+    park on ``MACHINE_EXHAUSTED``); ``keep-me.md`` is the control — a report
     in the same directory that the ledger does not name.
     """
     _REPORTS_DIR.mkdir(parents=True, exist_ok=True)

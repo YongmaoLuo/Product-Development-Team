@@ -17,7 +17,7 @@
 空链 / 没有点                ``handled=False``    正常验证轮
 老记录（没有 ``head_sha``）   ``handled=False``    正常验证轮
 HEAD 变了（链陈旧）           ``handled=False``    正常验证轮
-全部 ``BLOCKED_ON_USER``     ``handled=True``     不写 repair、不推进轮次
+全部 ``MACHINE_EXHAUSTED``   ``handled=True``     不写 repair、不推进轮次
 链欠着活（动作非空）           ``handled=True``     派活；**不跑**验证轮
 本次刚 demote 成 blocked     ``handled=False``    正常验证轮（证据在轮里）
 ==========================  ===================  ==============================
@@ -33,7 +33,7 @@ HEAD 变了（链陈旧）           ``handled=False``    正常验证轮
 --------
 * **链为空 / 没有动作** → ``{"handled": False}``，继续原路径
   （``run_full_verification`` + ``verification_running``）。
-* **全部 ``BLOCKED_ON_USER``** → ``{"handled": True, "blocked": True,
+* **全部 ``MACHINE_EXHAUSTED``** → ``{"handled": True, "blocked": True,
   "reason": "root_cause_blocked_on_user"}``，**不写 repair**、不推进轮次。
 * **HEAD 变化 / 老记录没有 ``head_sha``** → ``handled=False``（走正常验证轮）。
 * **动作非空** → 不调 ``run_full_verification``、不推进
@@ -72,7 +72,7 @@ for _entry in (BACKEND_DIR, REPO_ROOT):
 from verification.orchestrator import (  # noqa: E402
     _CHAIN_STAGE_IMPLEMENTATION,
     _CHAIN_STAGE_ROOT_CAUSE,
-    CHAIN_STAGE_BLOCKED_ON_USER,
+    CHAIN_STAGE_MACHINE_EXHAUSTED,
     VerificationOrchestrator,
 )
 
@@ -302,7 +302,7 @@ def test_preflight_refuses_blocked_chain(tmp_path):
     orch = _orchestrator(plan_dir, repo)
     _write_chain_record(
         plan_dir,
-        _chain_record(VP_ID, head_sha, stage=CHAIN_STAGE_BLOCKED_ON_USER),
+        _chain_record(VP_ID, head_sha, stage=CHAIN_STAGE_MACHINE_EXHAUSTED),
     )
 
     decision = orch._root_cause_preflight(round_number=2)

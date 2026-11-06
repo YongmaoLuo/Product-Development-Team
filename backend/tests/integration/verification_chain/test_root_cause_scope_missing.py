@@ -5,7 +5,7 @@
 根因链（``_root_cause_chain_decision``）里有一条分支：根因报告回来了，但既
 没有 ``json`` 声明块（整份报告不是 JSON，报告里也没有 ``json`` 围栏块）
 —— 范围是空的。猜范围就是让修复
-任务去动错的文件，所以这一步直接转人工（``BLOCKED_ON_USER`` /
+任务去动错的文件，所以这一步直接转人工（``MACHINE_EXHAUSTED`` /
 ``root_cause_report_without_scope``）。
 
 问题在于：**这件事只改了内存里的 entry**。不写日志，round report 里也没有
@@ -15,7 +15,7 @@
 两份契约
 --------
 1. ``test_report_without_scope_blocks_and_warns`` —— 缺范围的报告让链判
-   blocked（``root_cause_scope_missing == ["VP-3"]``、``blocked_on_user``、
+   blocked（``root_cause_scope_missing == ["VP-3"]``、``machine_exhausted``、
    不派新任务），并且**留下一个可查的告警事件**：事件名稳定，四个字段齐全。
 2. ``test_scope_report_is_not_flagged`` —— 报告用 ``json`` 块声明了范围时，
    **没有**这个告警事件，而且照常派实现任务（负控）。
@@ -77,7 +77,7 @@ FAILURE_CLASS = "deliverable_defect"
 CHAIN_FILENAME = "verification_root_cause_chain.json"
 
 #: The stage the chain reaches when a human has to take over.
-CHAIN_STAGE_BLOCKED_ON_USER = "BLOCKED_ON_USER"
+CHAIN_STAGE_MACHINE_EXHAUSTED = "MACHINE_EXHAUSTED"
 
 #: The file the root cause report lands in (the report the diagnosis
 #: task delivers, and the implementation task reads).
@@ -391,14 +391,20 @@ def test_report_without_scope_blocks_and_warns(
         "the round must say which point is stuck on a scope-less report: "
         f"{r3.get('root_cause_scope_missing')!r}"
     )
-    assert r3["blocked_on_user"] is True, (
-        f"the round ends with a person in the loop: {r3!r}"
+    # 2026-11-06: 「机器没路了」与「有人在等回答」是两个事实：这个
+    # 环境里没有问题被送出去，所以没有人在等。
+    assert r3["machine_exhausted"] is True, (
+        f"the machine is out of road on the chain: {r3!r}"
+    )
+    assert r3["blocked_on_user"] is False, (
+        f"nobody is waiting for an answer: {r3!r}"
     )
     assert r3["repair_tasks"] == [], (
         f"no task may be dispatched: {r3['repair_tasks']!r}"
     )
-    assert r3["root_cause_chain"]["stage"] == CHAIN_STAGE_BLOCKED_ON_USER, (
-        f"the chain stops at the human: {r3['root_cause_chain']!r}"
+    assert r3["root_cause_chain"]["stage"] == CHAIN_STAGE_MACHINE_EXHAUSTED, (
+        f"the chain stops where the machine has no road left: "
+        f"{r3['root_cause_chain']!r}"
     )
 
     # 告警：事件名稳定，四个字段齐全，一个点只告警一次。
@@ -477,7 +483,7 @@ def test_scope_missing_warns_only_once(
 ):
     """同一个点只告警一次 —— 转人工之后下轮不再进这个分支。
 
-    链一旦把点交给人，磁盘上的 stage 就是 ``BLOCKED_ON_USER``：下一轮读
+    链一旦把点交给人，磁盘上的 stage 就是 ``MACHINE_EXHAUSTED``：下一轮读
     到它就直接跳过，不会再走一遍「报告缺范围」的判断。所以告警不会每一
     轮刷一条 —— 一个点一次。
     """
@@ -502,6 +508,6 @@ def test_scope_missing_warns_only_once(
     )
 
     chain = _read_chain(plan_dir)
-    assert chain["stage"] == CHAIN_STAGE_BLOCKED_ON_USER, (
+    assert chain["stage"] == CHAIN_STAGE_MACHINE_EXHAUSTED, (
         f"the chain's record says where it stopped: {chain!r}"
     )
