@@ -57,6 +57,22 @@ The shape of the message
     - **默认答案**：accept（超时未答时采用）
     - **截止时间**：2026-10-26T12:00:00Z
 
+A question that is more than one line is quoted line by line, because
+a quote is a block and a block is a run of lines that all carry the
+marker::
+
+    > ## 背景（C）
+    > 第 3 轮停止
+    >
+    > ## 问题（P）
+    > 无法自愈
+
+The blank line in the middle carries the marker and nothing else, so
+the quote stays one piece.  Quoting the first line only would let the
+rest of the question out of the quote and into the body of the
+message, where it reads as the message rather than as the thing being
+asked.
+
 The message is Markdown, and that is not decoration.  ``cc-connect``
 looks at the content it was handed and decides how to render it: a
 message with no Markdown markers in it arrives as a plain text bubble,
@@ -123,7 +139,19 @@ _HEADER_LINE = "**⏳ HITL 决策待处理** · `{plan_id}`"
 #: The question, as a quote.  It is the one part of the message that is
 #: a sentence rather than a label and a value, and a quote is what
 #: separates it from the fields below.
-_QUESTION_LINE = "> {question}"
+#:
+#: A quote in Markdown is a *block*: every line of it carries the
+#: marker, and a line without the marker ends the block.  A question
+#: of more than one line therefore has to be quoted line by line, or
+#: the lines after the first arrive as body text of the message
+#: rather than as part of what is being asked.
+_QUOTE_PREFIX = "> "
+
+#: The marker on a line of the question that has nothing on it.  It
+#: carries the marker and nothing else: a line with no marker at all
+#: would end the quote and let the rest of the question out into the
+#: body of the message.
+_QUOTE_BLANK = ">"
 
 #: The fields, as a list.  Each label is bold so that a reader can find
 #: the value without reading the line, and the identifiers are code so
@@ -188,7 +216,7 @@ def format_message(event: Mapping[str, Any]) -> str:
         [
             _HEADER_LINE.format(plan_id=plan_id),
             "",
-            _QUESTION_LINE.format(question=question),
+            _quote_question(question),
             "",
             _DECISION_LINE.format(decision_id=decision_id),
             _OPTIONS_LINE.format(options=options),
@@ -196,6 +224,49 @@ def format_message(event: Mapping[str, Any]) -> str:
             _DEADLINE_LINE.format(deadline_at=deadline_at),
         ]
     )
+
+
+def _quote_question(question: str) -> str:
+    """``question`` as a quote — every line of it inside one block.
+
+    A question is often more than one line: a decision that has to
+    explain itself arrives carrying a heading, a paragraph and a
+    second heading.  A quote in Markdown is a block, so the marker
+    goes on *every* line — a marker on the first line alone would let
+    the rest of the question out of the quote and into the body of the
+    message, where it reads as the message rather than as the thing
+    being asked.
+
+    A line with nothing on it gets the bare marker.  It keeps the
+    quote in one piece (a line with no marker at all would end the
+    block) without claiming that the line says something.
+
+    A question of one line comes out as it always did: the marker and
+    the line.  Nothing about the wording a reader has been looking at
+    changes.
+
+    Parameters
+    ----------
+    question:
+        The question as text.  It is the text the event carried, run
+        through :func:`_text` first, so it is never empty and it has
+        been stripped of the whitespace around it.
+
+    Returns
+    -------
+    str
+        The question, quoted line by line.
+    """
+    lines = question.splitlines() or [question]
+
+    quoted = []
+    for line in lines:
+        if line.strip():
+            quoted.append(_QUOTE_PREFIX + line.rstrip())
+        else:
+            quoted.append(_QUOTE_BLANK)
+
+    return "\n".join(quoted)
 
 
 def _text(value: Any) -> str:

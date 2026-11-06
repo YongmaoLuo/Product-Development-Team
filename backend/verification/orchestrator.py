@@ -597,6 +597,24 @@ TERMINAL_OPTIONS = (
 #: moves on.
 TERMINAL_DEFAULT_OPTION = "accept_as_failed"
 
+#: The statuses that are **not** a failure.
+#:
+#: The terminal branch's failure list is the list of points a human has
+#: to decide about, so a point that passed — or was never asked — does
+#: not belong in it:
+#:
+#: * ``PASSED`` — the point was asked and it passed;
+#: * ``SKIPPED`` — the point was done on purpose (a terminal success,
+#:   ``verification_executor._TERMINAL_SUCCESS_STATUSES``);
+#: * ``DEFERRED`` — the point did not run at all; it is counted on its
+#:   own by :meth:`VerificationOrchestrator._terminal_deferred_count`.
+#:
+#: Everything else is a failure, ``SPLIT`` included: the executor calls
+#: it a terminal success, but the failed-id collection has always
+#: counted a split as a failure (it routes the point to repair), and
+#: this list follows that definition rather than inventing a new one.
+_TERMINAL_NON_FAILURE_STATUSES = frozenset({"PASSED", "SKIPPED", "DEFERRED"})
+
 #: The marker that says "the point's own id is the point's id".
 #:
 #: :meth:`VerificationOrchestrator._ask_a_human_about` names the point a
@@ -1400,6 +1418,7 @@ class VerificationOrchestrator:
         coding_tool: Optional[CodingTool] = None,
         verif_repo: Optional[Any] = None,
         triage_judge: Optional[Any] = None,
+        terminal_judge: Optional[Any] = None,
     ):
         self.plan_dir = Path(plan_dir)
         self.project_dir = Path(project_dir)
@@ -1559,6 +1578,20 @@ class VerificationOrchestrator:
         # threshold is reached, so building it lazily keeps the common
         # path free of it).
         self._triage_judge = triage_judge
+        # 2026-11-05: the judge that reads the terminal round's failure
+        # scene and says what it means. Same shape as the triage judge:
+        # injected in tests, built on first use in production — the
+        # terminal round is rare, and the analysis costs one model call,
+        # so the common path must not pay for it.
+        self._terminal_judge = terminal_judge
+        # 2026-11-05: the terminal round's analysis session and the
+        # analysis itself — the two things the decision's sidecar file
+        # carries (see ``_record_terminal_decision_session``).  Both
+        # start empty: a round that has not analysed anything has no
+        # session and no analysis, and saying so is better than
+        # inheriting one.
+        self._terminal_last_session_id: Optional[str] = None
+        self._terminal_last_analysis: Optional[Dict[str, Any]] = None
 
     #: Loop-progress tracking that must outlive a single orchestrator (see
     #: the 2026-09-19 note in ``__init__``).
@@ -3439,6 +3472,23 @@ class VerificationOrchestrator:
         answer without going and reading the report; a human asked this
         can.
 
+        When the failure scene has been **analysed** — the judge read
+        it and said what it means — the analysis is the question: the
+        five sections (背景 / 问题 / 证据 / 建议 / 不确定) a person reads
+        before answering, bounded by
+        :data:`verification.terminal_analysis.TERMINAL_QUESTION_MAX_CHARS`.
+        The facts say what happened; the analysis says what it means.
+        The recommendation is written **in the question only** — the
+        three options and the answer the question falls back to when
+        nobody replies are not the judge's to move.
+
+        The analysis is optional, and its absence is invisible.  The
+        judge is a model call, and a model call that fails must not
+        stop a human from being asked something they can answer: when
+        there is no analysis the factual sentence stands, byte for
+        byte — the question this method asked before the analysis
+        existed.
+
         Parameters
         ----------
         report:
@@ -3459,8 +3509,16 @@ class VerificationOrchestrator:
         Returns:
             The question, the answers on the table and the answer to
             fall back to — the three things
-            :meth:`_ask_a_human_about` takes.
+            :meth:`_ask_a_human_about` takes.  Never ``None``: the
+            decision is created either way.
         """
+        # The import is local on purpose, for the same reason
+        # :meth:`_terminal_judge_for`'s is: ``verification.terminal_analysis``
+        # is a module of its own and the orchestrator is the one that
+        # reaches for it, so keeping the import inside the method leaves
+        # the two modules unable to drift into an import cycle.
+        from verification.terminal_analysis import render_analysis
+
         verdicts: Dict[str, str] = {}
         for entry in self._report_failure_entries(report):
             vp_id = str(entry.get("id") or "")
@@ -3482,11 +3540,531 @@ class VerificationOrchestrator:
             f"repair_execution_failed: {int(repair_task_count)} repair task(s) "
             f"were generated; failed checks: {reported}. Choose how to proceed."
         )
+        # The analysis is what the failure scene **means**, read by the
+        # judge; the sentence above is what **happened**.  When the
+        # analysis is there it is the question; when it is not, the
+        # sentence stands untouched.  A rendering that comes back empty
+        # — an analysis that is not one — counts as no analysis, so the
+        # two ways of having none behave the same way.
+        analysis = self._terminal_analysis(
+            report, round_number, failed_vp_ids, repair_task_count,
+        )
+        if isinstance(analysis, Mapping):
+            rendered = render_analysis(analysis)
+            if rendered:
+                question = rendered
         return {
             "question": question,
             "options": list(TERMINAL_OPTIONS),
             "default_option": TERMINAL_DEFAULT_OPTION,
         }
+
+    def _terminal_entries_by_id(
+        self, report: Dict[str, Any],
+    ) -> Dict[str, Dict[str, Any]]:
+        """The report's result entries, by verification point id.
+
+        The **freshest** entry for a point wins.
+        :meth:`_report_failure_entries` walks the top-level results
+        before the last round's snapshot, so the first entry seen for an
+        id is the newest reading of it — the same "最新在前" contract the
+        verdict collection in :meth:`_terminal_decision_question` relies
+        on.  A point that only appears in the snapshot is still found.
+
+        A point whose entry carries no id is skipped: an entry without an
+        id names nothing, and inventing a key for it would let two
+        nameless entries collide.
+        """
+        entries: Dict[str, Dict[str, Any]] = {}
+        for entry in self._report_failure_entries(report):
+            vp_id = str(entry.get("id") or "").strip()
+            if not vp_id:
+                continue
+            entries.setdefault(vp_id, entry)
+        return entries
+
+    @staticmethod
+    def _terminal_entry_status(entry: Mapping[str, Any]) -> str:
+        """The status one report entry reads as — the empty string if none.
+
+        The reading order is the one
+        :meth:`_terminal_decision_question` uses: the entry's ``status``
+        first, and its ``verdict`` when it carries no status of its own.
+        An entry that carries neither reads as ``""`` — a fact about the
+        report rather than a guess, and a reading that counts as a
+        failure (an empty status is not one of the non-failure
+        statuses).
+
+        The result is upper-cased and stripped, so ``"passed"`` and
+        ``"PASSED "`` are the same reading.
+        """
+        if not isinstance(entry, Mapping):
+            return ""
+        status = entry.get("status")
+        if isinstance(status, str) and status.strip():
+            return status.strip().upper()
+        verdict = entry.get("verdict")
+        if isinstance(verdict, str) and verdict.strip():
+            return verdict.strip().upper()
+        return ""
+
+    def _terminal_failed_vp_ids(
+        self,
+        report: Dict[str, Any],
+        current_failed_ids: Any,
+        chain_blocked_ids: Any,
+    ) -> List[str]:
+        """The points the terminal branch calls failed.
+
+        Two sources name the points, and **both** of them can name a
+        point that has since passed:
+
+        * ``current_failed_ids`` — the round's failed-id set, which
+          :meth:`_extract_failed_ids` builds as the **union** of the
+          top-level results and the last round's snapshot.  The
+          snapshot is the older reading, so a point that failed last
+          round and passed this round is still in it;
+        * ``chain_blocked_ids`` — the points the root-cause chain left
+          with a human.  The stage a point *reached* is remembered, so
+          a point that was blocked once and passed afterwards is still
+          in it.
+
+        The 2026-11-05 terminal decision is what this is about: its
+        question read ``failed checks: VP-002=FAILED, ... VP-020=PASSED,
+        VP-021=PASSED, ...`` — two points that had passed were listed
+        as failures.
+
+        So the two sources are merged into one set and the set goes
+        through **one gate**: a point whose newest reading
+        (:meth:`_terminal_entries_by_id` — the freshest entry wins) is
+        one of the non-failure statuses
+        (:data:`_TERMINAL_NON_FAILURE_STATUSES`) is not a failure, no
+        matter which source named it.  Filtering only the blocked side
+        would let a stale snapshot leak a passed point in through the
+        failed-ids side.
+
+        A point the report says nothing about is **kept**: no evidence
+        of a pass is no reason to take it out of the list of what a
+        human has to decide about.
+
+        Returns the ids, sorted and without duplicates.
+        """
+        merged: Set[str] = set()
+        for source in (current_failed_ids, chain_blocked_ids):
+            if not source:
+                continue
+            for raw_id in source:
+                vp_id = str(raw_id or "").strip()
+                if vp_id:
+                    merged.add(vp_id)
+        if not merged:
+            return []
+        entries = (
+            self._terminal_entries_by_id(report)
+            if isinstance(report, dict) else {}
+        )
+        failed: List[str] = []
+        for vp_id in sorted(merged):
+            entry = entries.get(vp_id)
+            if entry is None:
+                # The report says nothing about this point: there is no
+                # evidence that it passed, so it stays in the list.
+                failed.append(vp_id)
+                continue
+            if self._terminal_entry_status(entry) in (
+                _TERMINAL_NON_FAILURE_STATUSES
+            ):
+                continue
+            failed.append(vp_id)
+        return failed
+
+    @staticmethod
+    def _terminal_reason_text(entry: Dict[str, Any]) -> str:
+        """The verdict text of one report entry — the first thing it said.
+
+        The report spreads the failure's own prose over several fields,
+        and the order below is the order of how much each field says
+        about the failure:
+
+        * ``reason`` — the executor's own summary of the failure;
+        * ``failure_reason`` / ``repair_failure_reason`` — what the
+          failure was, and what a repair attempt could not fix;
+        * ``actual_result`` / ``evidence`` — the run's own output;
+        * ``message`` — the last resort.
+
+        The **first** non-empty one wins: a point that says both
+        ``reason`` and ``evidence`` said the reason first, and quoting
+        the evidence instead would quote the run rather than the
+        failure.
+
+        A field that carries a list (the verdicts carry ``reasons``)
+        contributes its items joined by ``" | "`` — one string, so the
+        analysis prompt reads it as prose rather than as a Python repr.
+        """
+        if not isinstance(entry, dict):
+            return ""
+        for field in (
+            "reason",
+            "failure_reason",
+            "repair_failure_reason",
+            "actual_result",
+            "evidence",
+            "message",
+        ):
+            value = entry.get(field)
+            if isinstance(value, (list, tuple)):
+                parts: List[str] = []
+                for item in value:
+                    if item is None:
+                        continue
+                    text = str(item).strip()
+                    if text:
+                        parts.append(text)
+                text = " | ".join(parts)
+            elif value is None:
+                text = ""
+            else:
+                text = str(value).strip()
+            if text:
+                return text
+        return ""
+
+    def _terminal_repeat_counts(
+        self, report: Dict[str, Any], failed_vp_ids: List[str],
+    ) -> Dict[str, int]:
+        """How many rounds in a row each failed point failed this very way.
+
+        The count comes from the loop's own same-cause counter
+        (:attr:`_same_failure_counts`), keyed by the point **and** the
+        failure class — the very key the counter itself uses, spelled by
+        :func:`_decision_key_str`, so the analysis can never quote a
+        count that belongs to a different failure than the one that
+        repeated.
+
+        A point the counter does not know reads ``0``, and so does a
+        counter holding something that is not a number: the analysis must
+        not quote a count it cannot vouch for.
+        """
+        entries = self._terminal_entries_by_id(report)
+        counts: Dict[str, int] = {}
+        for raw_id in failed_vp_ids or []:
+            vp_id = str(raw_id).strip()
+            if not vp_id:
+                continue
+            entry = entries.get(vp_id) or {}
+            failure_class = self._failure_class_of_entry(vp_id, entry)
+            recorded = self._same_failure_counts.get(
+                _decision_key_str((vp_id, failure_class)), 0,
+            )
+            try:
+                counts[vp_id] = int(recorded)
+            except (TypeError, ValueError):
+                counts[vp_id] = 0
+        return counts
+
+    def _terminal_failed_points(
+        self, report: Dict[str, Any], failed_vp_ids: List[str],
+    ) -> List[Dict[str, Any]]:
+        """The facts the terminal analysis needs about every failed point.
+
+        One record per failed point, carrying exactly six keys: what the
+        point **asked for** (``title`` / ``expected_result``), how it
+        **failed** (``failure_class`` / ``verdict``) and how long the
+        same failure has been **repeating** (``consecutive_rounds``).
+
+        The plan file wins over the report for the two fields that say
+        what the point asked for: the plan is where the criterion was
+        written down, and the report only knows how the run went.  When
+        the plan cannot be read the report's own copy of the fields is
+        used; when neither has one the field is the empty string — a
+        fact about the record rather than a guess.
+
+        A point the report says nothing about still gets a record: it
+        is a point that failed, and the fact that nothing is known about
+        it is part of what the analysis has to explain.
+        """
+        if not failed_vp_ids:
+            return []
+        entries = self._terminal_entries_by_id(report)
+        definitions = self._verification_point_definitions()
+        counts = self._terminal_repeat_counts(report, failed_vp_ids)
+        points: List[Dict[str, Any]] = []
+        for raw_id in failed_vp_ids:
+            vp_id = str(raw_id).strip()
+            if not vp_id:
+                continue
+            entry = entries.get(vp_id) or {}
+            definition = definitions.get(vp_id) or {}
+            points.append({
+                "id": vp_id,
+                "title": str(
+                    definition.get("title") or entry.get("title") or ""
+                ),
+                "expected_result": str(
+                    definition.get("expected_result")
+                    or entry.get("expected_result")
+                    or ""
+                ),
+                "failure_class": self._failure_class_of_entry(vp_id, entry),
+                "consecutive_rounds": counts.get(vp_id, 0),
+                "verdict": self._terminal_reason_text(entry),
+            })
+        return points
+
+    def _terminal_judge_for(self) -> Any:
+        """The judge that reads the terminal round's failure scene.
+
+        The judge is built on **first use**: it costs one model call and
+        the terminal round is the rare case, so the common path must not
+        pay for it.  When it is built it is built on the orchestrator's
+        own coding tool — the same tool the verification path runs on.
+
+        The import is local on purpose.  ``verification.terminal_analysis``
+        is a module of its own and the orchestrator is the one that
+        reaches for it; keeping the import inside the method leaves the
+        two modules unable to drift into an import cycle.
+        """
+        if self._terminal_judge is None:
+            from verification.terminal_analysis import TerminalDecisionJudge
+
+            self._terminal_judge = TerminalDecisionJudge(
+                coding_tool=self.coding_tool,
+            )
+        return self._terminal_judge
+
+    def _terminal_deferred_count(self, report: Dict[str, Any]) -> int:
+        """How many verification points this round did not run.
+
+        **Only** ``DEFERRED`` is "not executed": the gate deferred the
+        point, so it neither passed nor failed.  The other terminal
+        statuses are not "did not run":
+
+        * ``SKIPPED`` and ``SPLIT`` are terminal **successes**
+          (``verification_executor._TERMINAL_SUCCESS_STATUSES``) — the
+          point is done and counts as done;
+        * ``BLOCKED`` is a **failure** (``bucket_for_status`` puts it in
+          the failed bucket) — the point could not be judged, which is
+          exactly what the analysis has to explain.
+
+        The count is per verification point: the same point recorded in
+        two of the report's result lists counts once.
+        """
+        if not isinstance(report, dict):
+            return 0
+        entries: List[Dict[str, Any]] = list(
+            self._report_failure_entries(report)
+        )
+        for field in ("results", "verification_points"):
+            container = report.get(field)
+            if isinstance(container, (list, tuple)):
+                entries.extend(e for e in container if isinstance(e, dict))
+        deferred: Set[str] = set()
+        for entry in entries:
+            status = str(entry.get("status") or "").strip().upper()
+            if status != "DEFERRED":
+                continue
+            vp_id = str(entry.get("id") or "").strip()
+            if not vp_id:
+                # An entry without an id names no point; counting it
+                # would count something nobody can name.
+                continue
+            deferred.add(vp_id)
+        return len(deferred)
+
+    def _terminal_analysis(
+        self,
+        report: Dict[str, Any],
+        round_number: int,
+        failed_vp_ids: List[str],
+        repair_task_count: int = 0,
+    ) -> Optional[Dict[str, Any]]:
+        """What the terminal round's failure scene means — or ``None``.
+
+        The terminal branch asks a human what happens next.  The question
+        carries the facts; this is the **reading** of them: the judge is
+        handed the whole scene — the plan, the round, why the round
+        stopped, how many repair tasks it produced, how many points were
+        deferred, and which points failed with which facts — and answers
+        with what the failure means and which of the three actions it
+        recommends.
+
+        The answer is **optional by construction**.  The judge is a model
+        call: it may raise, or answer with something that is not an
+        answer.  Neither may keep the human from being asked — a missing
+        analysis is a question without an analysis attached, while an
+        exception raised here would swallow the question itself.  So
+        both degrade to ``None``.
+
+        What the call produced **besides** the answer is kept too: the
+        session the answer came out of
+        (:attr:`_terminal_last_session_id`) and the answer itself
+        (:attr:`_terminal_last_analysis`).  The decision's sidecar file
+        carries both (see :meth:`_record_terminal_decision_session`), so
+        without them the round's reading of its own failure is lost the
+        moment the round ends.  Both start empty on every call: a
+        session id left over from an earlier analysis names a
+        *previous* conversation, and writing that next to this round's
+        decision would point at the wrong session.
+        """
+        self._terminal_last_session_id = None
+        self._terminal_last_analysis = None
+        judge = None
+        try:
+            judge = self._terminal_judge_for()
+            answer = judge.analyze(
+                plan_id=self.plan_dir.name,
+                round_number=int(round_number),
+                stop_reason="repair_execution_failed",
+                repair_task_count=int(repair_task_count),
+                deferred_count=self._terminal_deferred_count(report),
+                failed_points=self._terminal_failed_points(
+                    report, failed_vp_ids,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — the question still goes out
+            self._log_audit(
+                "verification_terminal_analysis_failed",
+                f"the terminal round's failure scene could not be "
+                f"analysed: {type(exc).__name__}: {exc}",
+                data={
+                    "plan_id": self.plan_dir.name,
+                    "round": round_number,
+                },
+            )
+            self._terminal_last_session_id = self._terminal_session_id_of(judge)
+            return None
+        # The session the answer came out of is kept even when the
+        # answer is unusable: it was produced inside a session, and
+        # re-asking inside that session is what makes sense.
+        self._terminal_last_session_id = self._terminal_session_id_of(judge)
+        if not isinstance(answer, Mapping):
+            self._log_audit(
+                "verification_terminal_analysis_unusable",
+                "the terminal round's analysis was not an answer — "
+                "the question goes out without it",
+                data={
+                    "plan_id": self.plan_dir.name,
+                    "round": round_number,
+                },
+            )
+            return None
+        analysis = dict(answer)
+        self._terminal_last_analysis = analysis
+        return analysis
+
+    @staticmethod
+    def _terminal_session_id_of(judge: Any) -> Optional[str]:
+        """The session the judge's last call ran in — ``None`` when unknown.
+
+        A judge that does not keep sessions (an old one, a fake in a
+        test) simply has no id to report; nothing here raises.  An empty
+        id reads as no id: a session named by nothing is not a session.
+        """
+        if judge is None:
+            return None
+        value = getattr(judge, "last_session_id", None)
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def _record_terminal_decision_session(
+        self,
+        *,
+        decision_id: str,
+        analysis: Optional[Dict[str, Any]],
+        report: Dict[str, Any],
+        round_number: int,
+        failed_vp_ids: List[str],
+    ) -> Optional[Path]:
+        """Write the terminal decision's session and analysis to the sidecar.
+
+        The decision itself lives in the state database — it is the row
+        the verification loop waits on and the answer lands in.  What the
+        row cannot hold is the **session** the analysis came out of and
+        the **analysis** itself: neither is a decision field, and giving
+        them columns would change the decision storage schema, which
+        this work does not do (arch decision point 8).  So they travel
+        in a sidecar file next to the plan
+        (``verification.terminal_decision_session``), together with the
+        failed points the analysis was read against (arch decision
+        point 2 — the failure scene belongs with the analysis).
+
+        Three boundaries, all of them about not losing the round:
+
+        * **No decision, no record.**  A decision id of ``""`` means no
+          question was created, and a record that names no decision
+          belongs to nothing.  Nothing is written.
+        * **No session is not no analysis.**  A round whose judge
+          produced no session id still writes the analysis in full: the
+          context is worth having even when the conversation cannot be
+          resumed.
+        * **A write that fails is a fact, not a failed round** (arch
+          decision point 5).  The decision was created and the question
+          went out before this is called; a sidecar that could not be
+          written is reported and the round carries on.
+
+        Only the sidecar is written: nothing here touches ``state.db``
+        and nothing here changes the ``plan_decisions`` table.
+
+        Parameters
+        ----------
+        decision_id:
+            The decision the question was created as.
+        analysis:
+            The analysis the question carries, or ``None`` when there
+            was none.
+        report:
+            The round's report — read for the failed points.
+        round_number:
+            Which round stopped.
+        failed_vp_ids:
+            The verification points that failed.
+
+        Returns
+        -------
+        The path the record was written to, or ``None`` when there was
+        no decision to record or the write failed.
+        """
+        # The import is local on purpose, for the same reason
+        # :meth:`_terminal_analysis`'s is: the sidecar is a module of
+        # its own and the orchestrator is the one that reaches for it,
+        # so keeping the import inside the method leaves the two
+        # modules unable to drift into an import cycle.
+        from verification import terminal_decision_session as session_file
+
+        decision = str(decision_id or "").strip()
+        if not decision:
+            # No question was created — there is nothing to attach a
+            # session to, so nothing is written.
+            return None
+
+        try:
+            record = session_file.build_record(
+                decision_id=decision,
+                plan_id=self.plan_dir.name,
+                analysis=analysis,
+                session_id=self._terminal_last_session_id,
+                failed_points=self._terminal_failed_points(
+                    report, failed_vp_ids,
+                ),
+                stop_reason="repair_execution_failed",
+                round_number=int(round_number),
+            )
+            # ``build_record`` normalises a missing analysis to an empty
+            # context so the key's type never changes.  The record this
+            # orchestrator writes keeps the analysis **as it was given**:
+            # "there was no analysis" is ``null``, not an empty context
+            # that reads like "the analysis found nothing".
+            record["analysis"] = analysis
+            return session_file.save(self.plan_dir, record)
+        except Exception as exc:  # noqa: BLE001 — the decision stands
+            print(
+                f"[Verification] the terminal decision's session record "
+                f"could not be written ({type(exc).__name__}: {exc}) — "
+                f"the decision itself still stands"
+            )
+            return None
 
     def _read_verification_plan(self) -> Optional[Dict[str, Any]]:
         """The verification plan file's payload — ``None`` when it cannot be read.
@@ -5219,9 +5797,16 @@ class VerificationOrchestrator:
             # the plan is not one point's owner.  ``check_open_question``
             # is off because the check keys on a point's id, and this
             # question names none.
-            terminal_failed_ids = sorted(
-                set(current_failed_ids)
-                | set(chain_decision.get("blocked") or [])
+            # 2026-11-05: the failure list is the list of points a human
+            # has to decide about, so it holds the points that did not
+            # pass **this round** and nothing else.  Both sources that
+            # feed it — the round's failed ids and the chain's blocked
+            # points — can name a point that has since passed, so both
+            # go through the same gate.
+            terminal_failed_ids = self._terminal_failed_vp_ids(
+                report,
+                current_failed_ids,
+                chain_decision.get("blocked") or [],
             )
             terminal_question = self._terminal_decision_question(
                 report, round_number, terminal_failed_ids,
@@ -5252,13 +5837,26 @@ class VerificationOrchestrator:
                     },
                 )
             else:
-                self._ask_a_human_about(
+                decision_id = self._ask_a_human_about(
                     round_number=round_number,
                     question=terminal_question["question"],
                     options=terminal_question["options"],
                     default_option=terminal_question["default_option"],
                     vp_id=None,
                     check_open_question=False,
+                )
+                # 2026-11-05: the decision now exists, so the round's
+                # analysis session and the analysis itself have
+                # something to belong to.  They go into the sidecar next
+                # to the plan — the decision row cannot carry them, and
+                # without them the round's reading of its own failure is
+                # lost the moment the round ends.
+                self._record_terminal_decision_session(
+                    decision_id=decision_id,
+                    analysis=self._terminal_last_analysis,
+                    report=report,
+                    round_number=round_number,
+                    failed_vp_ids=terminal_failed_ids,
                 )
             self._safe_phase_call(
                 "verification_failed", "verification_failed",

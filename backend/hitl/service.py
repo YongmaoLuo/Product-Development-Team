@@ -134,6 +134,25 @@ plan back to the scheduler through the engine it is given
 the plan was put back at the head of the queue, or it was already
 working and there was nothing to do.
 
+One answer is not a scheduling signal
+-------------------------------------
+The terminal round of the verification loop asks a human what happens
+next, and its three answers are not "go on" — *accept the failure*
+means the plan is closed as failed.  Resuming such a plan would put
+back to work exactly what the human decided to stop, so the terminal
+answers must not go through the scheduler at all.
+
+What tells the two apart is the plan's **sidecar**: the terminal round
+writes a record next to the plan
+(:mod:`verification.terminal_decision_session`), and a record that
+names *this* decision means the answer is one of the terminal options.
+Then the answer is handed to the executor
+(:func:`hitl.terminal_execution.dispatch_terminal_execution`), which
+carries out the action the option names — and the plan is **not**
+resumed.  A plan with no sidecar, a sidecar that cannot be read, or a
+sidecar that names another decision keeps the ordinary behaviour: the
+answer hands the plan back to the scheduler.
+
 Two rules make that safe:
 
 * **the answer is written down first, and the hook never raises.**  The
@@ -157,11 +176,27 @@ import uuid
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 from config_paths import resolve_plans_dir, resolve_state_db_path
 from hitl.models import Decision, DecisionMode, DecisionRequest, DecisionStatus
 from hitl.store import HitlStore
+from hitl.terminal_decision_port import default_port
+from hitl.terminal_execution import (
+    AUDIT_EVENT_FAILED,
+    STATUS_FAILED,
+    dispatch_terminal_execution,
+)
 from hooks.config import load_for_plan
 from hooks.dispatcher import deliverable_hooks, dispatch
 
@@ -698,6 +733,8 @@ def answer_decision(
     plan_id: Optional[str] = None,
     store: Optional[HitlStore] = None,
     engine: Optional[Any] = None,
+    plan_dir: Optional[PathLike] = None,
+    execution: Optional[Callable[..., Any]] = None,
 ) -> Tuple[str, int]:
     """Record a human's answer and report what happened.
 
@@ -737,6 +774,17 @@ def answer_decision(
         taken hands the plan back to the scheduler through it — see
         :func:`_submit_resume`.  Without it the answer is still an
         answer and the scheduling action is skipped.
+    plan_dir:
+        The plan's directory.  It is where the terminal round's
+        sidecar lives, and the sidecar is what tells an ordinary answer
+        from a terminal one — see :func:`_after_answer`.  Without it
+        every answer is an ordinary one.
+    execution:
+        The callable that carries a terminal action out.  It is called
+        with the plan id, the decision id, the option, the note, the
+        plan directory and the sidecar record.  Without one the default
+        hand-off to :func:`hitl.terminal_execution.dispatch_terminal_execution`
+        is used.
 
     Notes
     -----
@@ -757,7 +805,15 @@ def answer_decision(
                 if opened.answer_if_pending(
                     decision_id, option, answered_by, note
                 ):
-                    _submit_resume(decision.plan_id, engine)
+                    _after_answer(
+                        decision,
+                        option,
+                        note,
+                        store=opened,
+                        engine=engine,
+                        plan_dir=plan_dir,
+                        execution=execution,
+                    )
                     return (DecisionStatus.ANSWERED.value, 200)
                 # Somebody else moved it first; look again.
                 continue
@@ -765,7 +821,15 @@ def answer_decision(
                 if _answer_paused(
                     opened, decision, option, answered_by, note
                 ):
-                    _submit_resume(decision.plan_id, engine)
+                    _after_answer(
+                        decision,
+                        option,
+                        note,
+                        store=opened,
+                        engine=engine,
+                        plan_dir=plan_dir,
+                        execution=execution,
+                    )
                     return (DecisionStatus.ANSWERED.value, 200)
                 continue
             return (decision.status, 409)
@@ -865,6 +929,210 @@ def _resume_outcome(result: Any) -> str:
     if outcome == "conflict" and detail.split(":", 1)[0].strip() == "running":
         return ALREADY_RUNNING
     return outcome or UNKNOWN
+
+
+# ---------------------------------------------------------------------------
+# The terminal answer
+# ---------------------------------------------------------------------------
+
+
+def _after_answer(
+    decision: Decision,
+    option: Any,
+    note: str,
+    *,
+    store: HitlStore,
+    engine: Any,
+    plan_dir: Optional[PathLike] = None,
+    execution: Optional[Callable[..., Any]] = None,
+) -> None:
+    """Do what the answer asks for, now that the answer is written down.
+
+    Two shapes, and the plan's sidecar tells them apart.
+
+    **The plan has a terminal record naming this decision.**  The
+    answer is one of the terminal round's options, so it names an
+    *action* — close the plan as failed, reset the round, generate
+    repair tasks.  The action is handed to the executor and the plan
+    is **not** resumed: resuming would put back to work exactly what
+    the human decided to stop (arch decision point 6).
+
+    **The plan has no such record.**  The answer is an ordinary one:
+    the plan was waiting for a human and may go back to work.  The
+    scheduler is asked to resume it, exactly as before — a decision
+    that was never a terminal one must not change its behaviour.
+
+    Either way the answer stands first and the action degrades: a
+    dispatch that raises is audited and swallowed, never turned into a
+    failed answer.
+
+    Parameters
+    ----------
+    decision:
+        The decision that was answered — the row as it was read.
+    option:
+        The answer, as it was given.
+    note:
+        The human's own words, which the free-text action carries to
+        the agent.
+    store:
+        The store the answer was written through.  It is open, and it
+        is what a failed dispatch is audited into.
+    engine:
+        The scheduler engine, used by the ordinary path only.
+    plan_dir:
+        The plan's directory — where the terminal record lives.  A
+        plan without one has no terminal answers.
+    execution:
+        The callable that carries the action out.  The default hand-off
+        to the executor is used when it is not given.
+    """
+    record = _terminal_record(plan_dir)
+    if record is None or not _is_terminal_record(record, decision):
+        # Not a terminal answer: the ordinary path, unchanged.
+        _submit_resume(decision.plan_id, engine)
+        return
+
+    dispatcher = (
+        execution if execution is not None else _dispatch_terminal_execution
+    )
+    try:
+        dispatcher(
+            plan_id=decision.plan_id,
+            decision_id=decision.decision_id,
+            option=option,
+            note=note,
+            plan_dir=plan_dir,
+            record=record,
+        )
+    except Exception as exc:  # noqa: BLE001 - an answer must not fail
+        logger.exception(
+            "hitl terminal execution: plan=%s decision=%s could not be "
+            "dispatched (%s)",
+            decision.plan_id,
+            decision.decision_id,
+            exc,
+        )
+        _audit_execution_failure(store, decision, option, exc)
+
+
+def _is_terminal_record(record: Dict[str, Any], decision: Decision) -> bool:
+    """Whether ``record`` is the terminal record of ``decision``.
+
+    The decision id is the identity: a record that names another
+    decision belongs to another question, and answering this one must
+    not carry out that record's action.
+    """
+    return str(record.get("decision_id") or "") == decision.decision_id
+
+
+def _terminal_record(plan_dir: Optional[PathLike]) -> Optional[Dict[str, Any]]:
+    """The plan's terminal record, when it has one that can be read.
+
+    Read through the sidecar's own reader, which answers ``None`` for a
+    missing, unreadable or foreign file — the same "read it or degrade,
+    never raise" rule the sidecar itself follows (arch decision point
+    5).
+
+    The import is local: the ``verification`` package is heavy, and
+    this module must not pay for it on every import.
+    """
+    if plan_dir is None:
+        return None
+
+    try:
+        from verification import terminal_decision_session
+    except Exception as exc:  # noqa: BLE001 - no reader is no record
+        logger.warning("terminal decision session module unavailable: %s", exc)
+        return None
+
+    try:
+        return terminal_decision_session.load(plan_dir)
+    except Exception as exc:  # noqa: BLE001 - an unreadable sidecar is no record
+        logger.warning("terminal decision session unreadable: %s", exc)
+        return None
+
+
+def _dispatch_terminal_execution(
+    *,
+    plan_id: str,
+    decision_id: str,
+    option: Any,
+    note: str,
+    plan_dir: Optional[PathLike],
+    record: Optional[Dict[str, Any]],
+) -> None:
+    """Hand the action to the executor, with the real port.
+
+    ``audit=None`` on purpose: the audit line is written by the
+    background thread, which opens its own store.  The store this
+    answer's caller holds is about to be closed, and handing a closed
+    store to another thread would fail the write for the wrong reason.
+    """
+    dispatch_terminal_execution(
+        plan_id=plan_id,
+        decision_id=decision_id,
+        option=option,
+        note=note,
+        port=default_port(),
+        plan_dir=plan_dir,
+        record=record,
+        audit=None,
+    )
+
+
+def _audit_execution_failure(
+    store: HitlStore,
+    decision: Decision,
+    option: Any,
+    error: Any,
+) -> None:
+    """Write one ``terminal_execution_failed`` line; never raise.
+
+    The answer is already in the database — what failed is the work
+    the answer asked for.  That is still a fact worth keeping: the
+    audit mirror is where somebody looks to find out what a decision
+    turned into.  A mirror that cannot be written is a log line, not a
+    failed answer.
+
+    The fields are the ones the mirror's whitelist knows: the event,
+    which decision and plan it was, the status the execution ended in,
+    the answer that caused it, the failure as it happened, and the
+    audit sequence number of the decision.
+
+    Reading the decision is part of writing the line — the sequence
+    number has to be the one the answer left the row at — so the read
+    is inside the guard too: a store that cannot even be read is a
+    mirror that cannot be written, and that is a warning, not a failed
+    answer.
+    """
+    note = (
+        f"{type(error).__name__}: {error}"
+        if isinstance(error, BaseException)
+        else str(error)
+    )
+    try:
+        current = store.get(decision.decision_id)
+        audit_seq = (
+            current.audit_seq if current is not None else decision.audit_seq
+        )
+        store.append_audit(
+            {
+                "event": AUDIT_EVENT_FAILED,
+                "decision_id": decision.decision_id,
+                "plan_id": decision.plan_id,
+                "status": STATUS_FAILED,
+                "answer": option,
+                "note": note,
+                "audit_seq": audit_seq,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 - the mirror must never raise
+        logger.warning(
+            "hitl audit mirror write failed for decision %s: %s",
+            decision.decision_id,
+            exc,
+        )
 
 
 def _answer_paused(
