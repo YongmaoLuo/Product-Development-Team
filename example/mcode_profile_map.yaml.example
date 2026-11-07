@@ -1,0 +1,37 @@
+# MiniMax Code Profile Map (provider → account)
+# =============================================================================
+# PDT provider names and MiniMax Code account names are two naming systems.
+# This file translates one into the other, and nothing else: it is read only
+# when the process runs the MiniMax Code backend (PDT_HARNESS=mcode). A
+# Claude Code deployment never opens it.
+#
+#   * The KEY is a PDT provider name — exactly the name PDT knows the
+#     provider by.
+#   * The VALUE is a MiniMax Code profile name — exactly the name
+#     ``mcode-profile list --json`` reports.
+#
+# Matching is EXACT on both sides: a different case or a stray space does not
+# match. A provider that is not listed here runs on the default profile — a
+# miss, not an error.
+#
+# A value that names a profile the tool does not know IS an error: the
+# process refuses to start rather than silently running that provider on the
+# default account. List the accounts this machine actually has with:
+#
+#     mcode-profile list --json
+#
+# A missing file is not an error: no file means no mapping, and every
+# provider runs on the default profile.
+#
+# Copy this file to <repo>/.config/mcode_profile_map.yaml — the local
+# configuration directory, which is gitignored — and edit it there.
+# PDT_MCODE_PROFILE_MAP_FILE overrides the path.
+# =============================================================================
+
+profiles:
+  # Replace the example below with your own provider name and account name.
+  # The provider name on the left, the profile name on the right:
+  #
+  #   profiles:
+  #     shared-account: acc2
+  shared-account: acc2
