@@ -1793,11 +1793,23 @@ def test_a_blocking_registration_must_not_starve_the_child_of_its_prompt(
 
 
 def test_the_prompt_is_written_before_the_dispatch_registration(monkeypatch):
-    """The exact order, pinned: spawn → live register → feed → register.
+    """The exact order, pinned: spawn → feed → live register → register.
 
-    ``register_live_dispatch`` stays ahead of the feed — it is a dict
-    write, no I/O — and the registration, the part that blocks, goes
-    after it.
+    The prompt is fed — and stdin closed — before the **blocking**
+    registration: that registration probes the child's identity in the
+    kernel and writes the plan's process ledger, and both of those go
+    through a global lock and the filesystem.  The child, on the other
+    hand, is the part that can GIVE UP: the CLI waits a short grace
+    period for the first byte on stdin and exits 1 when it does not
+    arrive.
+
+    The live registration — the one that makes the child reachable for a
+    cooperative stop — runs before that blocking registration, so a stop
+    that arrives while the registration is running still reaches the
+    child.  It sits **after** the feed because the runner owns the
+    spawn: the runner writes the prompt to the child's standard input
+    before the dispatch's read step — where the registrations happen —
+    begins.
     """
     order = []
     written = []
@@ -1841,9 +1853,10 @@ def test_the_prompt_is_written_before_the_dispatch_registration(monkeypatch):
     assert any("the prompt" in chunk for chunk in written), (
         f"the prompt must reach the child's stdin; wrote {written!r}"
     )
-    assert order.index("live_register") < order.index("stdin_write"), (
-        "the child must be reachable for a cooperative stop before it is "
-        f"fed; order={order!r}"
+    assert order.index("live_register") < order.index("dispatch_register"), (
+        "the child must be reachable for a cooperative stop before the "
+        "blocking registration runs; "
+        f"order={order!r}"
     )
     assert order.index("stdin_write") < order.index("stdin_close")
     assert order.index("stdin_close") < order.index("dispatch_register"), (
