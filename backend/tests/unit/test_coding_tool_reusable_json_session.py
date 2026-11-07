@@ -54,6 +54,7 @@ argv is covered separately by the provider-switch suite.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -71,6 +72,8 @@ from coding_tool import (  # noqa: E402
     JsonSession,
     query_json_in_session,
 )
+from harness.contract import HarnessConfigError  # noqa: E402
+from harness.session_map import SessionIdNotResumable  # noqa: E402
 
 
 def _tool(monkeypatch, side_effect):
@@ -765,3 +768,186 @@ def test_a_second_plan_starts_a_fresh_session(monkeypatch, tmp_path):
         "neither plan has a previous round to resume"
     )
     assert len(set(seen)) == 2, "each plan gets its own live session"
+
+
+# ---------------------------------------------------------------------------
+# 7. The pinned key and the conversation are two names for one thing
+# ---------------------------------------------------------------------------
+#
+# A backend that mints the id of every conversation it creates makes the
+# two names different things: the key the caller pinned names the WORK,
+# and the id the CLI minted names the CONVERSATION. The dispatch keeps
+# the mapping between them on disk, and the mapping is what a resume
+# reads before it asks the CLI to re-open anything.
+
+#: The key a caller pins: a uuid5 of the plan and the task.
+PINNED_KEY = "5f6b7c8d-1111-2222-3333-444455556666"
+
+#: The id a CLI that mints its own ids reports: the ``mvs_`` prefix and
+#: 32 hex digits.
+MINTED_ID = "mvs_0ecaf7d26ff845a19fbaf6ecd45285e9"
+
+
+def _plan_with_mapping(monkeypatch, tmp_path, plan_id="P-1"):
+    """Point the dispatch at a plan directory; return where its mapping is.
+
+    The mapping lives in the plan's own directory, next to the plan's
+    other per-plan state, so the dispatch has to belong to a plan for
+    there to be somewhere to keep it.
+
+    Args:
+        monkeypatch: The patcher this test owns.
+        tmp_path: The temporary directory of this test.
+        plan_id: The plan the dispatch belongs to.
+
+    Returns:
+        The path of the plan's session mapping.
+    """
+    plans_dir = tmp_path / "plans"
+    (plans_dir / plan_id).mkdir(parents=True)
+    monkeypatch.setenv("PDT_PLANS_DIR", str(plans_dir))
+    monkeypatch.setenv("PDT_PLAN_ID", plan_id)
+    return plans_dir / plan_id / ".pdt-session-map.json"
+
+
+def test_a_resume_uses_the_conversation_the_mapping_names(monkeypatch, tmp_path):
+    """The key names the work; the mapping names the conversation.
+
+    A resume that hands the key to the CLI asks it to re-open a
+    conversation that does not exist. The mapping is what says which
+    conversation the key stands for, and it has to be read BEFORE the
+    resume is attempted.
+
+    Args:
+        monkeypatch: The patcher this test owns.
+        tmp_path: The temporary directory of this test.
+    """
+    mapping_path = _plan_with_mapping(monkeypatch, tmp_path)
+    mapping_path.write_text(
+        json.dumps({PINNED_KEY: MINTED_ID}), encoding="utf-8",
+    )
+
+    tool = _tool(monkeypatch, _ok(json.dumps({"ok": True}), MINTED_ID))
+
+    query_json_in_session(
+        tool, JsonSession(session_id=PINNED_KEY), prompt="round two",
+    )
+
+    assert len(tool._calls) == 1
+    assert tool._calls[0]["resume"] is True
+    assert tool._calls[0]["session_id"] == MINTED_ID, (
+        "the resume must name the conversation the mapping names, not the "
+        "key the caller held"
+    )
+
+
+def test_a_resume_the_backend_cannot_honour_degrades_to_a_create(
+    monkeypatch, tmp_path,
+):
+    """The degradation keeps the key, and says that it happened.
+
+    A backend that mints its own ids cannot re-open a conversation
+    under a key the caller chose. The work continues in a new
+    conversation — but under the SAME key, so a later round that holds
+    the key finds this conversation instead of starting over — and the
+    degradation is audited rather than silent.
+
+    Args:
+        monkeypatch: The patcher this test owns.
+        tmp_path: The temporary directory of this test.
+    """
+    _plan_with_mapping(monkeypatch, tmp_path)  # a plan, but no mapping
+
+    def _side(n, requested, recorded):
+        if recorded[n - 1]["resume"]:
+            return SessionIdNotResumable("no such session")
+        return (json.dumps({"ok": True}), MINTED_ID)
+
+    tool = _tool(monkeypatch, _side)
+    handle = JsonSession(session_id=PINNED_KEY)
+
+    result = query_json_in_session(tool, handle, prompt="round two")
+
+    assert result == {"ok": True}, "the loop still gets an answer"
+    assert len(tool._calls) == 2, "it tried to re-open the old one first"
+    assert tool._calls[0]["resume"] is True
+    assert tool._calls[1]["resume"] is False, (
+        "the work continues in a new conversation"
+    )
+    assert tool._calls[1]["session_id"] == PINNED_KEY, (
+        "the new conversation is opened under the key the caller held, so "
+        "a later round finds it"
+    )
+    assert handle.session_id == MINTED_ID, (
+        "the handle names the conversation that exists"
+    )
+    events = [
+        call for call in tool.logger.warning.call_args_list
+        if call[0] and call[0][0] == "coding_session_degraded_to_create"
+    ]
+    assert events, (
+        "a silent degradation is indistinguishable from reuse that worked"
+    )
+    data = events[0][1]["data"]
+    assert data["pinned_session_id"] == PINNED_KEY
+    assert data["observed_session_id"] == MINTED_ID
+    assert data["degraded_to_create"] is True
+
+
+def test_a_configuration_problem_is_not_answered_with_a_second_dispatch(
+    monkeypatch, tmp_path,
+):
+    """The fresh-session fallback answers a provider, not a misconfiguration.
+
+    A model that names no provider, an MCP configuration that is not
+    JSON — those are failures of the *setup*, not of the call. Answering
+    them with a second dispatch hides the setup problem behind a run
+    that looks like it worked.
+
+    Args:
+        monkeypatch: The patcher this test owns.
+        tmp_path: The temporary directory of this test.
+    """
+    _plan_with_mapping(monkeypatch, tmp_path)
+
+    def _side(n, requested, recorded):
+        return HarnessConfigError("the model names no provider")
+
+    tool = _tool(monkeypatch, _side)
+
+    with pytest.raises(HarnessConfigError):
+        query_json_in_session(
+            tool, JsonSession(session_id=PINNED_KEY), prompt="round two",
+        )
+
+    assert len(tool._calls) == 1, (
+        "the fallback must not have answered the misconfiguration with "
+        "another dispatch"
+    )
+
+
+def test_the_mapping_module_does_not_pull_in_the_mcode_adapter():
+    """The claude path reaches the mapping without the mcode adapter.
+
+    The mapping is used by the layer *above* the adapters, so it cannot
+    live in one of them: a claude dispatch would then have to import the
+    mcode adapter to find out which conversation a key stands for. The
+    check runs in its own interpreter, because in this one the adapter
+    may already be loaded by another test.
+
+    Raises:
+        subprocess.CalledProcessError: The fresh interpreter found the
+            adapter in ``sys.modules``.
+    """
+    import subprocess
+
+    probe = (
+        "import harness.session_map, sys;"
+        "assert 'harness.mcode' not in sys.modules, "
+        "sorted(m for m in sys.modules if m.startswith('harness.'))"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(_BACKEND_DIR)
+    subprocess.run(
+        [sys.executable, "-c", probe], env=env, check=True, timeout=120,
+    )

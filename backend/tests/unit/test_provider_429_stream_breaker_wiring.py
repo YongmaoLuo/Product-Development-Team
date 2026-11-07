@@ -253,10 +253,17 @@ def test_api_error_storm_raises_429_and_reaps_child(monkeypatch):
         "the graceful shutdown must happen with no exception in flight — "
         "i.e. in the breaker itself, not only in the read loop's finally"
     )
-    assert proc.wait.call_args is not None
-    assert proc.wait.call_args.kwargs.get("timeout") == (
-        ClaudeCodingTool.GRACEFUL_STOP_TIMEOUT
-    )
+    # 2026-10-27 (merge) — the graceful shutdown waited with the tool's
+    # own timeout.  It is not necessarily the LAST wait the child saw:
+    # the harness runner reaps the child once the read is over, and
+    # that reap waits with its own (shorter) timeout.  What the
+    # assertion is about is that the breaker's shutdown is the
+    # GRACEFUL one, so it asks whether such a wait happened at all.
+    assert proc.wait.call_args_list, "the child was never waited for"
+    assert any(
+        call.kwargs.get("timeout") == ClaudeCodingTool.GRACEFUL_STOP_TIMEOUT
+        for call in proc.wait.call_args_list
+    ), [call.kwargs for call in proc.wait.call_args_list]
 
     # And the report says how many retries there were and how long the
     # stream produced nothing.
@@ -477,6 +484,21 @@ def test_real_child_is_gone_after_the_breaker_trips(tmp_path, monkeypatch):
 
     tool, _log = _make_tool()
 
+    # 2026-10-27 (merge) — the handle on the child.  The tool's
+    # ``_current_process`` is cleared by the harness runner once it has
+    # reaped the child, so it cannot be the handle here: the spawn is
+    # recorded instead.  The recorder calls the REAL spawn — the child
+    # is the fake ``claude`` above, not a stand-in for it.
+    real_popen = coding_tool.subprocess.Popen
+    spawned: list = []
+
+    def _recording_popen(cmd, **kwargs):
+        proc = real_popen(cmd, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(coding_tool.subprocess, "Popen", _recording_popen)
+
     with pytest.raises(ApiError) as excinfo:
         tool._run_claude_interactive(
             "hello", scene="execution", total_timeout=20, idle_timeout=20,
@@ -484,11 +506,8 @@ def test_real_child_is_gone_after_the_breaker_trips(tmp_path, monkeypatch):
 
     assert excinfo.value.status == "429"
 
-    # ``_current_process`` is left set on this path: the ``ApiError``
-    # leaves the function through the read loop's ``finally`` and never
-    # reaches the line that clears it. That is the handle on the child.
-    proc = tool._current_process
-    assert proc is not None
+    assert spawned, "the dispatch spawned no child at all"
+    proc = spawned[0]
     assert proc.poll() is not None, (
         "the child was left running — the break left an orphan behind"
     )
