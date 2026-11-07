@@ -437,25 +437,27 @@ def test_the_classification_layer_still_says_what_it_always_said():
 #
 # Fixing that channel needs three things at once:
 #
-#   * ``backend/root_cause_task.py`` — ``deliverable`` becomes the string
-#     ``"report"`` and the checklist moves to ``deliverable_items``;
+#   * ``backend/orphan_rules.py`` — the marker that carries the contract
+#     (``report_deliverable_marker`` / ``parse_report_deliverable``) and
+#     the merge that turns a stored row back into a ``SubTask``;
 #   * ``backend/state_machine/db/schema.py`` and
 #     ``backend/state_machine/repositories/plan_task_repository.py`` — the
 #     two fields have to survive the trip through the state database,
 #     which narrows the payload to the fields the table can hold;
 #   * ``backend/verification/orchestrator.py`` — ``report_path`` has to be
-#     the absolute path the orchestrator itself reads the report from;
-#   * ``backend/orphan_rules.py`` — the merge that turns a stored row
-#     back into a ``SubTask`` has to carry the two new fields.
+#     the absolute path the orchestrator itself reads the report from.
 #
-# That is the "L6" layer of the root-cause report, and it is **not**
-# implemented here: it cannot be.  Two of the files above are frozen
-# surfaces (``backend/state_machine/**`` is byte-frozen by
-# ``backend/tests/static_gates/test_verification_mode_scope_gates.py``),
-# and the shape of ``deliverable`` is pinned by two existing suites —
-# ``tests/unit/verification/test_root_cause_task_build.py`` and
-# ``tests/unit/verification/test_root_cause_scope_contract.py`` — which
-# assert the checklist shape.  The report itself allows this layer to be
-# split into its own round ("L6 与 L1~L5 没有共享文件"), and the plan
-# gives that round to a later task that owns all of those files.  This
-# file therefore pins only the layers it can pin.
+# 2026-11-06: the root-cause task builder that used to own this channel
+# is deleted together with the chain — so the contract is **generic**
+# now: it travels in the task's own description (the marker line) and is
+# recovered from there by the orphan merge.  ``tests/unit/
+# test_report_deliverable.py`` pins that channel.
+#
+# The "L6" layer of the root-cause report is still **not** implemented
+# here: it cannot be.  Two of the files above are frozen surfaces
+# (``backend/state_machine/**`` is byte-frozen by
+# ``backend/tests/static_gates/test_verification_mode_scope_gates.py``).
+# The report itself allows this layer to be split into its own round
+# ("L6 与 L1~L5 没有共享文件"), and the plan gives that round to a later
+# task that owns all of those files.  This file therefore pins only the
+# layers it can pin.

@@ -15,8 +15,11 @@ The triage changed that. The same failure repeating for
 semantic triage call, and the triage's verdict decides:
 
 * a **criterion defect** → stop (a human has to fix the criterion);
-* a **deliverable defect** → divert into the repair path, with a fresh
-  budget for that failure;
+* a **deliverable defect** → stop (2026-11-06: the triage only runs
+  **at** the cap, so a conclusion it could check means the repair
+  budget is spent; with the root-cause chain gone there is nothing
+  else that would escalate the failure, and voiding the counter is how
+  the same failure would be repaired over and over);
 * **a triage that ran and could not characterise the failure** → stop,
   with a *structured* reason naming the point, the failure class and
   the triage's words;
@@ -327,11 +330,15 @@ def _run_round(orchestrator, report, round_number):
 def test_threshold_triggers_triage(
     temp_plan_dir, temp_project_dir, mock_coding_tool, repair_mocks,
 ):
-    """Two rounds of the same failure buy exactly one triage call.
+    """Three rounds of the same failure buy exactly one triage call.
 
-    The first round is not a repeat yet, so it buys nothing. The second
-    round repeats the same failure — same point, same class — and that
-    is the threshold: exactly one triage call, no more.
+    The first two rounds are not at the cap yet, so they buy nothing.
+    The third round repeats the same failure — same point, same class —
+    and that is the threshold: exactly one triage call, no more.
+
+    2026-11-06: the threshold is **3** (the repair budget is two
+    rounds), and a triage that names a deliverable defect no longer
+    buys a fresh budget: the loop stops and a human is asked.
     """
     _write_plan_state(temp_plan_dir)
     judge = _FakeJudge(conclusion=_conclusion(failure_class="deliverable_defect"))
@@ -346,16 +353,25 @@ def test_threshold_triggers_triage(
     assert first["should_stop"] is False
 
     second = _run_round(orchestrator, _report(), round_number=2)
+    assert judge.calls == [], (
+        "the cap is three rounds — the second repeat is still inside the "
+        "repair budget"
+    )
+    assert second["should_stop"] is False
+    assert second["repair_tasks"], (
+        "the budget is two repair rounds — the second failure buys the "
+        "second batch"
+    )
+
+    third = _run_round(orchestrator, _report(), round_number=3)
     assert len(judge.calls) == 1, (
         "the threshold buys exactly one triage call, not one per point "
         "and not one per round"
     )
-    # The triage named a deliverable defect: the loop keeps working on
-    # it instead of stopping.
-    assert second["should_stop"] is False
-    assert second["repair_tasks"], (
-        "a triage that says 'the work is wrong' must divert into repair"
-    )
+    # The triage named a deliverable defect and the repair budget is
+    # spent: the loop stops and asks a human.
+    assert third["should_stop"] is True
+    assert third["repair_tasks"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +403,8 @@ def test_completed_inconclusive_stops(
     )
 
     _run_round(orchestrator, _report(), round_number=1)
-    result = _run_round(orchestrator, _report(), round_number=2)
+    _run_round(orchestrator, _report(), round_number=2)
+    result = _run_round(orchestrator, _report(), round_number=3)
 
     assert result["should_stop"] is True, (
         "a triage that could not conclude must not leave the loop running"
@@ -435,7 +452,8 @@ def test_stop_reason_is_a_code_to_the_machine_and_a_verdict_to_a_human(
     )
 
     _run_round(orchestrator, _report(), round_number=1)
-    result = _run_round(orchestrator, _report(), round_number=2)
+    _run_round(orchestrator, _report(), round_number=2)
+    result = _run_round(orchestrator, _report(), round_number=3)
 
     reason = result["stop_reason"]
 
@@ -504,13 +522,14 @@ def test_the_verdict_is_written_to_the_plan_directory(
 
     _run_round(orchestrator, _report(), round_number=1)
     _run_round(orchestrator, _report(), round_number=2)
+    _run_round(orchestrator, _report(), round_number=3)
 
     path = temp_plan_dir / "verification_triage_verdict.json"
     assert path.exists(), (
         "the verdict must be recorded where a human can find it"
     )
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["round"] == 2
+    assert payload["round"] == 3
     assert payload["verdict"] == {
         "reason": "same_failure_no_triage_conclusion",
         "vp_id": VP_ID,
@@ -563,7 +582,8 @@ def test_judge_exception_falls_back_to_repair(
     )
 
     _run_round(orchestrator, _report(), round_number=1)
-    result = _run_round(orchestrator, _report(), round_number=2)
+    _run_round(orchestrator, _report(), round_number=2)
+    result = _run_round(orchestrator, _report(), round_number=3)
 
     assert len(judge.calls) == 1, "the threshold was reached — the judge was asked"
     assert result["should_stop"] is False, (
@@ -779,7 +799,8 @@ def test_a_triage_that_could_not_characterise_still_stops(
     )
 
     _run_round(orchestrator, _report(), round_number=1)
-    result = _run_round(orchestrator, _report(), round_number=2)
+    _run_round(orchestrator, _report(), round_number=2)
+    result = _run_round(orchestrator, _report(), round_number=3)
 
     assert result["should_stop"] is True, (
         "a triage that ran and could not characterise the failure must "
@@ -798,16 +819,22 @@ def test_a_triage_that_could_not_characterise_still_stops(
     }, "the stop reason must be structured, not a bare string"
 
 
-def test_verifiable_conclusion_still_diverts_to_repair(
+def test_verifiable_conclusion_stops_when_the_budget_is_spent(
     temp_plan_dir, temp_project_dir, mock_coding_tool, repair_mocks,
 ):
-    """The control: a triage that worked → the loop repairs, it does not stop.
+    """The control: a triage that worked → the loop stops and asks.
 
     The three tests above say what a *malfunction* does. This one says
     what a working triage does, so the two cannot be confused: a
     conclusion the judge could check is a statement about the failure,
-    and the loop acts on it — here, by diverting into the repair path
-    with a fresh budget for that failure.
+    and the loop acts on it.
+
+    2026-11-06: the action changed. The triage only runs **at** the
+    cap, so a conclusion it could check means the repair budget is
+    spent. With the root-cause chain gone there is nothing else that
+    would escalate the failure, so the loop stops and a human is asked
+    — and the counter is **not** voided: voiding it is how the same
+    failure would be repaired over and over.
     """
     _write_plan_state(temp_plan_dir)
     orchestrator = _real_judge_orchestrator(
@@ -816,19 +843,24 @@ def test_verifiable_conclusion_still_diverts_to_repair(
     )
 
     decision = orchestrator.classify_cycle(
-        (VP_ID, FAILURE_CLASS), _report(), round_number=2,
+        (VP_ID, FAILURE_CLASS), _report(), round_number=3,
     )
 
-    assert decision["should_stop"] is False, (
-        "a triage that named a class is not a reason to stop"
+    assert decision["should_stop"] is True, (
+        "the repair budget is spent — the loop must stop and ask a human"
     )
-    assert decision["stop_reason"] is None
+    assert decision["stop_reason"] == {
+        "reason": "same_failure_repeated_after_max_attempts",
+        "vp_id": VP_ID,
+        "failure_class": FAILURE_CLASS,
+        "triage_rationale": "the deliverable does not do what the point asks",
+    }, "the stop reason must be structured, not a bare string"
     assert decision["reason"] == "deliverable_defect", (
         "the reason is the class the triage named"
     )
-    assert decision["void_counter"] is True, (
-        "the triage decided what this failure is, so the counter starts "
-        "over for it"
+    assert decision["void_counter"] is False, (
+        "the counter must NOT start over — that is how the same failure "
+        "would be repaired over and over"
     )
 
 

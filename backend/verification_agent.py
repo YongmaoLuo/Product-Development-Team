@@ -68,14 +68,6 @@ from verification_ci_runner import (
     ENTRY_COMMAND_FIELD,
 )
 from verification_persistence import VerificationPersistenceManager
-# 2026-11-05（arch 决策点 5）：根因报告的**地址**从根因任务那一份借 ——
-# 报告要写「这份活接的是哪份根因报告」，而根因报告的文件名（``root-cause-<vp>.md``）
-# 是根因任务定的。**同一份常量、不写第二遍**：名字在这里写第二遍，
-# 根因任务改了命名，报告这一节就指着一个不存在的文件。
-from root_cause_task import (
-    root_cause_report_absolute_path,
-    root_cause_report_path,
-)
 from verification_profile import ExecutionProfileGenerator
 from verification_split import SplitDecision
 from verification_subagent import (
@@ -389,13 +381,6 @@ def persist_conflict_repair_task(
 TERMINAL_TASK_STATUSES = frozenset({"completed", "skipped"})
 
 
-#: 来源标记：这条修复是**预检**（根因链的接续）派发的。
-#:
-#: 同一个值在 ``verification/orchestrator.py`` 里叫
-#: ``_ROOT_CAUSE_PREFLIGHT_ORIGIN``、在 ``verification_loop.py`` 里叫
-#: ``ROOT_CAUSE_PREFLIGHT_SCENE`` —— 三层各有各的叫法，但**值必须一样**：
-#: 报告靠它把「接续根因链的活」与「这一轮的修复」分开列。
-ROOT_CAUSE_PREFLIGHT_ORIGIN = "root_cause_preflight"
 
 
 def _read_plan_task_rows(
@@ -8202,119 +8187,6 @@ class Orchestrator:
                 entry[REUSED_FROM_ROUND_FIELD] = self._reused_from_round(source)
         return report_data
 
-    def _preflight_repairs(self) -> List[Dict[str, Any]]:
-        """接续根因链的活（预检派发的修复），报告要写的那几样。
-
-        报告只写四样：**谁**（任务 id）、**哪个验证点**、根因报告的
-        **地址**、要改的**范围**。报告正文**不内联** —— 正文是那份文件的
-        事，报告只负责指路。
-
-        哪些行算「接续根因链的活」，见 :meth:`_is_root_cause_task`：
-        上游持久化把 ``origin`` 丢掉了（``plan_tasks`` 的静态字段白名单里
-        没有它），所以库里那一行只能凭**自己指向哪份根因报告**认出来。
-
-        :return: 预检修复清单（按任务 id 排序）。
-        """
-        plan_dir = getattr(self, "plan_dir", None)
-        plan_id = Path(str(plan_dir)).name if plan_dir else ""
-        if not plan_id:
-            return []
-        rows, error = _read_plan_task_rows(plan_id)
-        if error is not None or not rows:
-            return []
-
-        repairs: List[Dict[str, Any]] = []
-        for task_id in sorted(rows):
-            row = rows.get(task_id)
-            if not isinstance(row, dict):
-                continue
-            if not self._is_root_cause_task(row, plan_id):
-                continue
-            vp_id = str(row.get("failed_vp_id") or "").strip()
-            scope = [
-                str(item)
-                for item in (row.get("files_to_modify") or [])
-                if str(item).strip()
-            ]
-            repairs.append(
-                {
-                    "id": str(row.get("id") or task_id),
-                    "vp_id": vp_id,
-                    "report_path": self._root_cause_report_address(
-                        row, plan_id, vp_id,
-                    ),
-                    "scope": scope,
-                }
-            )
-        return repairs
-
-    @staticmethod
-    def _is_root_cause_task(
-        row: Mapping[str, Any], plan_id: str,
-    ) -> bool:
-        """这一行是**接续根因链**的活吗？
-
-        两个信号各自成立即可：
-
-          * 行上带着 ``origin == "root_cause_preflight"``（来源标记还在时）；
-          * 行**指向一份根因报告** —— 诊断任务与实现任务的描述里都写着
-            那份报告的地址。
-
-        第二个信号是必需的：上游持久化把 ``origin`` 丢掉了
-        （``plan_tasks`` 的静态字段白名单里没有它），库里那一行**没有**
-        来源标记。没有第二个信号，这一节在真跑里永远是空的。
-
-        报告的文件名（``root-cause-<vp>.md``）由根因任务那一份算出来 ——
-        **不写第二遍**：名字漂一次，这里就指着一份不存在的报告。
-
-        :param row: 持久化后的任务行。
-        :param plan_id: 计划 id（根因报告的地址是按它算的）。
-        :return: 是 / 不是。
-        """
-        origin = str(row.get("origin") or "").strip()
-        if origin == ROOT_CAUSE_PREFLIGHT_ORIGIN:
-            return True
-        vp_id = str(row.get("failed_vp_id") or "").strip()
-        if not vp_id:
-            return False
-        try:
-            report_name = Path(root_cause_report_path(plan_id, vp_id)).name
-        except ValueError:
-            return False
-        if not report_name:
-            return False
-        haystack = "\n".join(
-            str(row.get(key) or "")
-            for key in ("description", "report_path")
-        )
-        return report_name in haystack
-
-    def _root_cause_report_address(
-        self, row: Mapping[str, Any], plan_id: str, vp_id: str,
-    ) -> str:
-        """这一行的活接的是**哪份根因报告**。
-
-        行上写着就用行上的（诊断任务落库时带着它）；没写就按根因任务那
-        一份算出来 —— 与链读回的是同一个地址（同一个 helper）。
-
-        :param row: 持久化后的任务行。
-        :param plan_id: 计划 id。
-        :param vp_id: 验证点 id。
-        :return: 根因报告的地址（空串 = 算不出来）。
-        """
-        declared = str(row.get("report_path") or "").strip()
-        if declared:
-            return declared
-        if not vp_id:
-            return ""
-        try:
-            return str(
-                root_cause_report_absolute_path(
-                    plan_id, vp_id, plan_dir=self.plan_dir,
-                )
-            )
-        except (TypeError, ValueError):
-            return ""
 
     # -----------------------------------------------------------------------
     # The cross-round infra retry ledger (2026-11-03, arch decision point 2)
@@ -11785,11 +11657,6 @@ class Orchestrator:
                 report_data["generated_at"] = datetime.now().isoformat()
                 report_data["plan_id"] = self.plan_dir.name
                 report_data["project_dir"] = str(self.project_dir)
-                # 2026-11-05（arch 决策点 5）：预检派发的修复单列一节。
-                # 它们是**接续根因链**的活，不是这一轮的修复 —— 混在主表
-                # 里就看不出这一轮到底做了什么。报告只写根因报告的地址与
-                # 改动范围，正文不内联。
-                report_data["preflight_repairs"] = self._preflight_repairs()
                 # 2026-10-25 (repair-r1-26): the report says out loud
                 # when the round was about the environment rather than
                 # about the product.  The upper layer reads this to

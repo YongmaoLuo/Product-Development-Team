@@ -34,8 +34,13 @@ What these tests pin
    a machine) per write, under ``<plan_dir>/reports/``.
 
 The rounds below are driven through ``check_cycle_conditions`` — the
-production entry — with the root-cause chain's terminal verdict
-supplied, because the terminal branch is reached only through it.
+production entry.
+
+2026-11-06: the terminal branch is no longer the root-cause chain's.
+It is the ordinary repair loop's "same cause, the budget is spent"
+branch — the third same-cause failure stops the round and asks a
+human.  So the rounds below are driven **for real**: the same failing
+report three times, and the third one is the round that stops.
 """
 
 from __future__ import annotations
@@ -44,7 +49,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -72,6 +77,27 @@ class _FakeJudge:
     def analyze(self, **kwargs):
         self.kwargs = kwargs
         return self.analysis
+
+
+class _FakeTriageJudge:
+    """A triage judge that answers "the deliverable is wrong".
+
+    The triage is what decides whether a stuck round stops or repairs
+    itself again.  With the root-cause chain deleted, its answer
+    ``deliverable_defect`` means exactly one thing: the repair budget
+    is spent, so the loop stops and asks a human.
+    """
+
+    def judge(self, vp, failure_history, round_number=0):
+        from verification.triage_agent import TriageConclusion
+
+        return TriageConclusion(
+            vp_id="VP-3",
+            failure_class="deliverable_defect",
+            conclusive=True,
+            evidence_quote="expected 200, got 500",
+            rationale="the deliverable does not do what the point asks",
+        )
 
 
 def _analysis():
@@ -115,6 +141,25 @@ def state_db(tmp_path, monkeypatch):
 def plan_dir(tmp_path):
     path = tmp_path / "plans" / "cpea-archive"
     path.mkdir(parents=True)
+    # The plan's state: the rounds below run the **ordinary** loop, so
+    # the plan has to be in a state where the loop's phases are legal
+    # (the execution phase is behind it).
+    (path / "plan_state.json").write_text(
+        json.dumps({
+            "plan_id": path.name,
+            "current_phase": "executing",
+            "completed_phases": ["execution"],
+            "review_rounds": {"prd": 0, "arch": 0, "test": 0},
+            "flags": {},
+            "verification": {
+                "status": "pending",
+                "round": 0,
+                "max_rounds": 3,
+                "stop_reason": None,
+            },
+        }),
+        encoding="utf-8",
+    )
     return path
 
 
@@ -125,6 +170,33 @@ def project_dir(tmp_path):
     return path
 
 
+@pytest.fixture
+def repair_mocks():
+    """The repair path, mocked so the rounds before the last one run.
+
+    The two repair rounds that come before the terminal one build
+    repair tasks; their collaborators are replaced so the rounds are
+    about the archive, not about how a repair task is assembled.
+    """
+    with patch("verification.orchestrator.VerificationAgent"), \
+         patch("verification.orchestrator.RepairTaskGenerator") as generator, \
+         patch(
+             "verification.verification_report_reader."
+             "extract_failed_vps_with_paths",
+         ) as extract, \
+         patch("repair_generator.RepairTaskAssembler") as assembler:
+        extract.return_value = [
+            {"id": "VP-3", "title": "修 VP-3", "priority": "high"},
+        ]
+        generator.return_value.generate_repair_contents.return_value = [
+            {"failed_vp_id": "VP-3", "title": "修 VP-3"},
+        ]
+        assembler.return_value.assemble.return_value = [
+            {"id": "RP-1", "failed_vp_id": "VP-3", "title": "修 VP-3"},
+        ]
+        yield generator
+
+
 def _make_orchestrator(plan_dir, project_dir, judge=None):
     """An orchestrator whose heavy collaborators are stubbed out."""
     orchestrator = VerificationOrchestrator(
@@ -132,35 +204,32 @@ def _make_orchestrator(plan_dir, project_dir, judge=None):
         project_dir=project_dir,
         coding_tool=Mock(),
         terminal_judge=judge if judge is not None else _FakeJudge(_analysis()),
+        triage_judge=_FakeTriageJudge(),
     )
     orchestrator.verification_agent = Mock()
     orchestrator.repair_generator = Mock()
     return orchestrator
 
 
-def _terminal_chain_decision(root_cause_vp_ids, round_number):
-    """The chain's verdict: the machine's road on the point is walked out."""
-    return {
-        "terminal": True,
-        "active": False,
-        "vp_ids": [],
-        "actions": [],
-        "blocked": [],
-        "scope_missing": [],
-        "payload": {
-            "stage": "BLOCKED_ON_USER",
-            "round": int(round_number),
-            "points": [],
-        },
-    }
+#: How many rounds the loop gives the same failure before it stops.
+#: The third one is the terminal one.
+_BUDGET = 3
 
 
 def _run_terminal_round(orchestrator, report=None, round_number=3):
-    """Drive the orchestrator into the terminal branch and return its verdict."""
-    orchestrator._root_cause_chain_decision = _terminal_chain_decision
-    return orchestrator.check_cycle_conditions(
-        report if report is not None else _report(), round_number,
-    )
+    """Drive the orchestrator into the terminal branch and return its verdict.
+
+    The terminal branch is reached the way production reaches it: the
+    same failure, round after round, until the budget is spent.  The
+    first two rounds buy repair tasks; the third one stops and asks.
+    """
+    body = report if report is not None else _report()
+    verdict = {}
+    for _ in range(_BUDGET):
+        verdict = orchestrator.check_cycle_conditions(body, round_number)
+        if verdict.get("should_stop"):
+            break
+    return verdict
 
 
 def _archives(plan_dir):
@@ -382,7 +451,9 @@ def test_archive_write_failure_returns_none(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_the_round_that_asked_archives_its_analysis(plan_dir, project_dir):
+def test_the_round_that_asked_archives_its_analysis(
+    plan_dir, project_dir, repair_mocks,
+):
     """A round that asked a human archives the analysis it produced."""
     orchestrator = _make_orchestrator(plan_dir, project_dir)
     orchestrator._ask_a_human_about = lambda **kwargs: "dec-asked"
@@ -399,7 +470,9 @@ def test_the_round_that_asked_archives_its_analysis(plan_dir, project_dir):
     assert len(_archives_of(plan_dir, ".json")) == 1
 
 
-def test_the_already_asked_round_archives_its_analysis(plan_dir, project_dir):
+def test_the_already_asked_round_archives_its_analysis(
+    plan_dir, project_dir, repair_mocks,
+):
     """The branch that asks nobody still archives what it read.
 
     The first round asks and leaves a decision behind; the second round
@@ -429,7 +502,9 @@ def test_the_already_asked_round_archives_its_analysis(plan_dir, project_dir):
     assert len(_archives_of(plan_dir, ".md")) == 2
 
 
-def test_an_unroutable_decision_still_archives(plan_dir, project_dir):
+def test_an_unroutable_decision_still_archives(
+    plan_dir, project_dir, repair_mocks,
+):
     """A question nobody was ever asked is still the round's question."""
     orchestrator = _make_orchestrator(plan_dir, project_dir)
 
@@ -450,7 +525,7 @@ def test_an_unroutable_decision_still_archives(plan_dir, project_dir):
 
 
 def test_a_round_without_an_analysis_archives_the_facts(
-    plan_dir, project_dir,
+    plan_dir, project_dir, repair_mocks,
 ):
     """No analysis: the archive keeps the question and says ``null``."""
     orchestrator = _make_orchestrator(
@@ -463,11 +538,14 @@ def test_a_round_without_an_analysis_archives_the_facts(
     payload = _read_json(plan_dir)
     assert payload["analysis"] is None
     text = _archives_of(plan_dir, ".md")[0].read_text(encoding="utf-8")
-    assert "verification round 3 stopped with repair_execution_failed" in text
+    assert (
+        "verification round 3 stopped with "
+        "same_failure_repeated_after_max_attempts"
+    ) in text
 
 
 def test_two_rounds_in_the_same_plan_keep_both_archives(
-    plan_dir, project_dir,
+    plan_dir, project_dir, repair_mocks,
 ):
     """Two rounds, two archives — the second does not overwrite the first."""
     first = _make_orchestrator(plan_dir, project_dir)
@@ -488,7 +566,7 @@ def test_two_rounds_in_the_same_plan_keep_both_archives(
 
 
 def test_an_archive_that_cannot_be_written_does_not_fail_the_round(
-    plan_dir, project_dir,
+    plan_dir, project_dir, repair_mocks,
 ):
     """The round stands: a failed archive is a fact, not a failed round."""
     (plan_dir / "reports").write_text("not a directory", encoding="utf-8")
@@ -504,7 +582,9 @@ def test_an_archive_that_cannot_be_written_does_not_fail_the_round(
     verdict = _run_terminal_round(orchestrator)
 
     assert verdict["should_stop"] is True
-    assert verdict["stop_reason"] == "repair_execution_failed"
+    assert verdict["stop_reason"] == (
+        "same_failure_repeated_after_max_attempts"
+    )
     assert verdict["repair_tasks"] == []
     assert verdict["needs_operator_decision"] is True
     # The round tried to archive and the failure was reported, not raised.
@@ -604,7 +684,7 @@ def test_a_rendering_handed_over_is_the_body(tmp_path):
 
 
 def test_an_analysis_the_renderer_refuses_falls_back_to_the_question(
-    plan_dir, project_dir,
+    plan_dir, project_dir, repair_mocks,
 ):
     """The archive draws its sections with the **question's** renderer.
 
@@ -636,14 +716,17 @@ def test_an_analysis_the_renderer_refuses_falls_back_to_the_question(
     _run_terminal_round(orchestrator)
 
     text = _archives_of(plan_dir, ".md")[0].read_text(encoding="utf-8")
-    assert "verification round 3 stopped with repair_execution_failed" in text
+    assert (
+        "verification round 3 stopped with "
+        "same_failure_repeated_after_max_attempts"
+    ) in text
     assert "建议（A）" not in text
     # The raw analysis is still there — verbatim — in the machine half.
     assert _read_json(plan_dir)["analysis"] == unusable
 
 
 def test_the_archive_body_is_exactly_what_the_question_reads(
-    plan_dir, project_dir,
+    plan_dir, project_dir, repair_mocks,
 ):
     """Through the production entry, one rendering serves both readers.
 

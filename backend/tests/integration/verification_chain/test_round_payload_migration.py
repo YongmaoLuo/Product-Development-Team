@@ -17,9 +17,12 @@ payload、怎么出来、旧 payload 会不会被这个新键炸掉**。
 2. ``test_payload_roundtrip`` —— 新 payload 保存后原样加载回来，而且新旧两个键
    **同源**：同一次读、同一次写。
 3. ``test_same_failure_counts_untouched`` —— 同样的输入，旧键仍然按「重复」计数，
-   循环仍然在该停的那一轮停；同一个失败由旧键负责，新分支不抢它的活。
-4. ``test_repair_decision_forks_on_fingerprint`` —— 修复决策按指纹分叉：指纹变了，
-   修复行被改成「先定位根因」；指纹没变，修复行一字不动（负控）。
+   循环仍然在该停的那一轮停。
+
+2026-11-06：原来还有第四份契约 ——「修复决策按指纹分叉」（指纹变了就把修复行
+改成「先定位根因」）。那是**指纹 → 升级到根因链**那一步，而根因链已经整个
+删除：指纹本身留着（它还在 payload 里往返、还带着规则），但它不再分叉出另一
+条路。所以那份契约跟着它钉的行为一起没了。
 
 边界条件
 --------
@@ -52,7 +55,6 @@ for _entry in (_BACKEND_DIR, _REPO_ROOT):
     if str(_entry) not in sys.path:
         sys.path.insert(0, str(_entry))
 
-from verification.failure_fingerprint import needs_root_cause_task  # noqa: E402
 from verification.orchestrator import VerificationOrchestrator  # noqa: E402
 from verification.triage_agent import TriageConclusion  # noqa: E402
 
@@ -81,9 +83,6 @@ DECISION_KEY = f"{VP_ID}|{FAILURE_CLASS}"
 #: The first error line of round 1's failure.
 FIRST_ERROR = "AssertionError: expected 200, got 401"
 
-#: A *different* first error line — a different failure under the same
-#: name, which is exactly the case the old key cannot see.
-SECOND_ERROR = "AssertionError: expected 200, got 500"
 
 
 # ---------------------------------------------------------------------------
@@ -184,34 +183,6 @@ class _InconclusiveJudge:
             evidence_quote="",
             rationale="the triage could not characterise the failure",
             available=True,
-        )
-
-
-class _MalfunctionedJudge:
-    """A triage that malfunctioned — the loop does not stop on it.
-
-    A broken triage is not a statement about the failure, so the repair
-    path still runs. That is the shape the fork test needs: the round
-    has to reach the repair path, so the row it produced can be read.
-    """
-
-    def __init__(self):
-        self.calls = []
-
-    def judge(self, vp, failure_history, round_number=0):
-        point = vp if isinstance(vp, dict) else {}
-        self.calls.append({
-            "vp": dict(point),
-            "failure_history": list(failure_history or []),
-            "round_number": round_number,
-        })
-        return TriageConclusion(
-            vp_id=str(point.get("id") or ""),
-            failure_class=FAILURE_CLASS,
-            conclusive=False,
-            evidence_quote="",
-            rationale="the triage malfunctioned",
-            available=False,
         )
 
 
@@ -318,20 +289,13 @@ def _run_round(plan_dir, project_dir, report, round_number, judge=None):
     return orch, result
 
 
-def _repair_row(result):
-    """The round's single repair row, or ``{}`` when there is none."""
-    tasks = result.get("repair_tasks") or []
-    assert len(tasks) == 1, f"expected exactly one repair row, got {tasks!r}"
-    return tasks[0]
-
-
 # ---------------------------------------------------------------------------
 # 1. 旧 payload 加载
 # ---------------------------------------------------------------------------
 
 
 def test_legacy_payload_loads(plan_dir, project_dir):
-    """A payload without the new key loads — and buys no root-cause task.
+    """A payload without the new key loads — and knows no fingerprint.
 
     The legacy shape carries the old key and nothing else. It must read
     exactly as it read before the fingerprints existed, and the decision
@@ -359,15 +323,16 @@ def test_legacy_payload_loads(plan_dir, project_dir):
     assert counts == {DECISION_KEY: 2}, "the old count reads as before"
     assert last_round == 1
 
-    # The decision on the history this payload describes.
+    # The history this payload describes: the count is read, the
+    # fingerprints are not there to be read.
     history = {
         "vp_id": VP_ID,
         "consecutive_failures": counts[DECISION_KEY],
         "fp_prev": None,
         "fp_curr": None,
     }
-    assert needs_root_cause_task(history) is False, (
-        "a legacy payload must not buy a root-cause task"
+    assert history["fp_prev"] is None and history["fp_curr"] is None, (
+        "a legacy payload knows no fingerprint — that is not an error"
     )
 
 
@@ -396,13 +361,8 @@ def test_legacy_fixture_payload_loads(plan_dir, project_dir):
     assert counts == {}
     assert last_round == 0
 
-    # The decision degrades too — no count, no fingerprint, no answer.
-    assert needs_root_cause_task({
-        "vp_id": VP_ID,
-        "consecutive_failures": counts.get(DECISION_KEY, 0),
-        "fp_prev": None,
-        "fp_curr": None,
-    }) is False
+    # The history degrades too — no count, no fingerprint, no answer.
+    assert counts.get(DECISION_KEY, 0) == 0
 
 
 def test_malformed_fingerprints_are_dropped(plan_dir, project_dir):
@@ -497,13 +457,11 @@ def test_empty_fingerprints_are_not_written(plan_dir, project_dir):
 
 
 def test_same_failure_counts_untouched(plan_dir, project_dir, repair_mocks):
-    """The old key still counts repeats, and still stops the chain.
+    """The old key still counts repeats, and still stops the loop.
 
     The fingerprint branch is additive: it must not change what the old
-    key counts, nor where the chain stops. The same failure twice is
-    the old key's business — the new branch only claims the *transition*
-    (it repeated **and** it is a different failure), so this round must
-    not be claimed by it.
+    key counts, nor where the loop stops. The same failure twice is
+    the old key's business.
     """
     _write_plan_state(plan_dir)
     _write_plan(plan_dir)
@@ -512,106 +470,24 @@ def test_same_failure_counts_untouched(plan_dir, project_dir, repair_mocks):
     _, r1 = _run_round(plan_dir, project_dir, report, 1, judge=_InconclusiveJudge())
     assert r1["status"] != "loop_stopped", "the first failure is not a repeat"
 
-    orch, r2 = _run_round(plan_dir, project_dir, report, 2, judge=_InconclusiveJudge())
-    assert r2["status"] == "loop_stopped", (
-        "the same failure for a second round still stops the loop"
+    _, r2 = _run_round(plan_dir, project_dir, report, 2, judge=_InconclusiveJudge())
+    assert r2["status"] != "loop_stopped", (
+        "the second failure is still inside the repair budget (2026-11-06: "
+        "the budget is two rounds)"
     )
-    assert orch._same_failure_counts == {DECISION_KEY: 2}, (
+
+    orch, r3 = _run_round(plan_dir, project_dir, report, 3, judge=_InconclusiveJudge())
+    assert r3["status"] == "loop_stopped", (
+        "the same failure for a third round stops the loop"
+    )
+    assert orch._same_failure_counts == {DECISION_KEY: 3}, (
         "the old counter still counts the repeat"
     )
-    assert r2["root_cause_vp_ids"] == [], (
-        "the same failure is the old key's business — the fingerprint "
-        "branch must not claim it"
-    )
+
 
 
 # ---------------------------------------------------------------------------
-# 4. 修复决策按指纹分叉
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "second_error,expect_root_cause",
-    [
-        (SECOND_ERROR, True),
-        (FIRST_ERROR, False),
-    ],
-    ids=["fingerprint-changed", "fingerprint-unchanged"],
-)
-def test_repair_decision_forks_on_fingerprint(
-    plan_dir, project_dir, repair_mocks, second_error, expect_root_cause,
-):
-    """The repair decision forks on the fingerprint — and only on it.
-
-    Round 1 fails one way, round 2 fails *another* way: the same point,
-    the same class, a different cause. The old key cannot see the
-    difference — it says "the same failure, again" either way — so the
-    loop would keep generating repairs aimed at the old cause.
-
-    The fingerprint sees it. When it changed, the repair row is
-    re-scoped: the executor is asked to find the current root cause
-    first. When it did not change, the row is left exactly as it was
-    (the negative control — the branch must not fire on every repeat).
-    """
-    _write_plan_state(plan_dir)
-    _write_plan(plan_dir)
-
-    # Round 1: the first failure. Nothing has repeated yet.
-    orch1, r1 = _run_round(
-        plan_dir, project_dir, _failed_report(FIRST_ERROR), 1,
-        judge=_MalfunctionedJudge(),
-    )
-    assert r1["root_cause_vp_ids"] == [], "nothing has repeated yet"
-    assert not _repair_row(r1)["title"].startswith("【根因演进】"), (
-        "the first failure is not a root-cause task"
-    )
-    assert orch1._failure_fingerprints == {
-        VP_ID: [None, orch1._failure_fingerprints[VP_ID][1]],
-    }, "the first round has no previous fingerprint to compare against"
-
-    # Round 2: the same point fails again — with the failure's first
-    # error line either changed or unchanged.
-    orch2, r2 = _run_round(
-        plan_dir, project_dir, _failed_report(second_error), 2,
-        judge=_MalfunctionedJudge(),
-    )
-    assert orch2._same_failure_counts == {DECISION_KEY: 2}, (
-        "the old counter still counts the repeat, whatever the cause"
-    )
-
-    payload = _read_payload(plan_dir)
-    assert payload["failure_fingerprints"][VP_ID][0] == (
-        orch1._failure_fingerprints[VP_ID][1]
-    ), "the pair spans the two rounds"
-
-    row = _repair_row(r2)
-    if expect_root_cause:
-        assert r2["root_cause_vp_ids"] == [VP_ID], (
-            "a changed fingerprint is a root-cause task, not a blind repair"
-        )
-        assert row["title"].startswith("【根因演进】"), (
-            f"the row must say what it is: {row['title']!r}"
-        )
-        assert "根因" in row["description"], (
-            f"the row must ask for the root cause first: {row['description']!r}"
-        )
-        assert orch2._failure_fingerprints[VP_ID][0] != (
-            orch2._failure_fingerprints[VP_ID][1]
-        ), "the two fingerprints are the point of the branch"
-    else:
-        assert r2["root_cause_vp_ids"] == [], (
-            "the same failure is not a root-cause task"
-        )
-        assert row["title"] == f"fix {VP_ID}", (
-            f"the row must be left alone: {row['title']!r}"
-        )
-        assert orch2._failure_fingerprints[VP_ID][0] == (
-            orch2._failure_fingerprints[VP_ID][1]
-        ), "the same failure has the same fingerprint"
-
-
-# ---------------------------------------------------------------------------
-# 5. 规则跟着指纹一起过一轮
+# 4. 规则跟着指纹一起过一轮
 # ---------------------------------------------------------------------------
 
 def test_the_rule_pair_round_trips_with_the_fingerprints(plan_dir, project_dir):

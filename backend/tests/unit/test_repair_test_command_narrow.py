@@ -39,8 +39,6 @@ What is pinned here
   **unchanged** when the output names no case at all;
 * that the same holds on the live path (through
   ``generate_repair_contents``), not only on the helper;
-* that the root-cause implementation task does not inherit the wide
-  command either;
 * that both prompts carry the rule and the ids.
 """
 
@@ -55,10 +53,6 @@ if str(BACKEND_DIR) not in sys.path:
 import repair_generator as rg  # noqa: E402
 import test_command_quality as tcq  # noqa: E402
 from repair_generator import RepairTaskGenerator  # noqa: E402
-from root_cause_task import (  # noqa: E402
-    ROOT_CAUSE_DELIVERABLE,
-    build_implementation_task,
-)
 
 
 #: The whole-repository gate — the command a ``full_ci`` point carries.
@@ -538,58 +532,6 @@ def test_the_round_run_output_reaches_the_generator(tmp_path, monkeypatch):
     )
     assert "backend/tests/a.py::test_b" in tool.fill_prompts[0]
     assert contents[0].get("test_command") == NARROW
-
-
-# ---------------------------------------------------------------------------
-# The root-cause implementation task
-# ---------------------------------------------------------------------------
-
-
-def test_the_implementation_task_does_not_inherit_the_wide_command():
-    """The chain's implementation task inherits the point's command too.
-
-    It used to take it verbatim, without even the structural check the
-    ordinary repair path runs. A wide command there is the same 45–70
-    minute round.
-    """
-    report = {
-        "plan_id": "P-1",
-        "vp_id": "VP-013",
-        "round": 1,
-        "paths": ["app/core.py"],
-        "test_command": WIDE_GATE,
-    }
-    evidence = {
-        "actual_result": "FAILED backend/tests/a.py::test_b - AssertionError",
-        "evidence": "stdout:\nFAILED backend/tests/a.py::test_b\n",
-    }
-    task = build_implementation_task(report, evidence=evidence)
-    assert task["test_command"] == "", (
-        "the whole-repository gate must not be the implementation task's "
-        "criterion"
-    )
-
-
-def test_the_implementation_task_keeps_a_narrow_command():
-    """A command that selects the failed case is the point of the exercise."""
-    report = {
-        "plan_id": "P-1",
-        "vp_id": "VP-013",
-        "round": 1,
-        "paths": ["app/core.py"],
-        "test_command": NARROW,
-    }
-    evidence = {
-        "actual_result": "FAILED backend/tests/a.py::test_b - AssertionError",
-        "evidence": "stdout:\nFAILED backend/tests/a.py::test_b\n",
-    }
-    task = build_implementation_task(report, evidence=evidence)
-    assert task["test_command"] == NARROW
-
-
-def test_the_root_cause_deliverable_names_the_narrow_scope():
-    """The diagnosis is asked for the criterion the repair will use."""
-    assert "验收方式（只选中这次失败的用例）" in ROOT_CAUSE_DELIVERABLE
 
 
 # ---------------------------------------------------------------------------

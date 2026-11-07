@@ -5,10 +5,10 @@ Why this gate exists
 
 The repository's coverage floor is **one number for the whole tree**, and a
 whole-tree number is diluted by the directories that were already there.
-The seven modules this feature added are about 1400 statements against a
+The modules this feature added are about 1400 statements against a
 repository of tens of thousands, so one of them can sit far below the
 floor while the union still reads above it — and the union says nothing
-about *which* module is the weak one. ``root_cause_task.py`` is the
+about *which* module is the weak one. ``verification/scan.py`` is the
 clearest case: it is a brand-new module that the whole-tree number never
 mentions.
 
@@ -23,7 +23,7 @@ This file is the half of that gate that lives in the repository rather
 than on the runner:
 
 1. :func:`test_targets_match_ci` — the modules CI judges per module and
-   the list pinned here are the same seven. The list is written down in
+   the list pinned here are the same six. The list is written down in
    both places on purpose: CI has to *name* the modules, and a list that
    only CI knows about cannot be reviewed. Changing one without the other
    is the drift this test exists to catch.
@@ -76,18 +76,18 @@ surprise:
   a path and coverage reads it as a module, finds nothing, and reports
   "No data was collected".
 * pytest-cov's ``--cov-fail-under`` is a total over everything it was
-  handed. Hand it the seven modules at once and the threshold is a
+  handed. Hand it the modules at once and the threshold is a
   module-**set** threshold: a strong module carries a weak one, which is
   the dilution this gate removes, moved from the repository level to the
   module-set level. Hand it one module at a time and the suite has to
-  be re-run seven times inside the gate job, each run measuring a
+  be re-run once per module inside the gate job, each run measuring a
   smaller selection than the shards measured.
 
 What the gate uses instead is ``coverage report --include=<module path>
 --fail-under=<n>``, run over the shard data the ``coverage-gate`` job
 already combines. ``--include`` slices the measured data by path, so
-each line is that one module's own number, and the seven lines together
-judge the seven modules separately over one measurement.
+each line is that one module's own number, and the lines together
+judge the modules separately over one measurement.
 
 The reader below accepts both spellings (``--include=`` and
 ``--cov=``), because what is pinned here is *which modules are judged
@@ -119,15 +119,20 @@ COVERAGE_GATE_JOB: str = "coverage-gate"
 #: The step that judges the new kernel one module at a time.
 MODULE_GATE_STEP: str = "Enforce the new-kernel module coverage gate"
 
-#: The seven modules the new kernel added, relative to ``backend/`` (the
+#: The modules the new kernel added, relative to ``backend/`` (the
 #: directory the coverage-gate job runs in).
 #:
 #: Three of them are the verification kernel proper — the pure decision
 #: functions (``verification/topic_relevance.py``,
 #: ``verification/failure_fingerprint.py``) and the deterministic scan
-#: (``verification/scan.py``). The other four are the modules that grew
-#: around them: the context pack, the effect report, the root-cause task
-#: builder and the archive/removal audit.
+#: (``verification/scan.py``). The other three are the modules that grew
+#: around them: the context pack, the effect report and the
+#: archive/removal audit.
+#:
+#: 2026-11-06: the root-cause task builder (``root_cause_task.py``) was
+#: one of them. The root-cause chain is deleted, the module with it, so
+#: it is no longer a target — the module gate judges the modules that
+#: exist.
 #:
 #: Changing this list is a deliberate act: it changes what CI judges, so
 #: the constant and ``ci.yml`` have to move together. That is what
@@ -135,7 +140,6 @@ MODULE_GATE_STEP: str = "Enforce the new-kernel module coverage gate"
 NEW_KERNEL_COVERAGE_TARGETS: Tuple[str, ...] = (
     "context_pack.py",
     "effect_report.py",
-    "root_cause_task.py",
     "verification/failure_fingerprint.py",
     "verification/scan.py",
     "verification/topic_relevance.py",
@@ -170,7 +174,6 @@ DECLARED_COVERAGE_PACKAGES: frozenset[str] = frozenset(
 NEW_KERNEL_COVERAGE_FLOORS: Mapping[str, int] = {
     "context_pack.py": 80,
     "effect_report.py": 72,
-    "root_cause_task.py": 55,
     "verification/failure_fingerprint.py": 87,
     "verification/scan.py": 80,
     "verification/topic_relevance.py": 64,
@@ -406,7 +409,7 @@ def _coverage_packages(names: Set[str]) -> Set[str]:
 
 
 def test_targets_match_ci() -> None:
-    """CI's per-module coverage targets and the pinned list are the same seven.
+    """CI's per-module coverage targets and the pinned list are the same set.
 
     The list is written down twice — here and in ``ci.yml`` — because
     both readers need it: CI has to name the modules it judges, and a
@@ -669,7 +672,7 @@ def test_a_floor_that_moved_is_reported_as_drift() -> None:
                         "name": MODULE_GATE_STEP,
                         "run": (
                             './.venv/bin/python3 -m coverage report '
-                            '--include="root_cause_task.py" --fail-under=1\n'
+                            '--include="verification/scan.py" --fail-under=1\n'
                         ),
                     }
                 ]
@@ -677,7 +680,7 @@ def test_a_floor_that_moved_is_reported_as_drift() -> None:
         }
     }
     drift = floor_drift(ci_cov_fail_under(workflow))
-    assert "root_cause_task.py" in drift, (
+    assert "verification/scan.py" in drift, (
         "a floor that differs from the pinned one was not reported as "
         f"drift; the drift check read {drift}. A floor that can be moved "
         "silently is not a ratchet."

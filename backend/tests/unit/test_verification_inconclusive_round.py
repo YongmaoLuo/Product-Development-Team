@@ -215,7 +215,6 @@ def test_the_cycle_result_marks_the_round_for_the_operator():
     assert result["stop_reason"] is None, result
     assert result["waiting_for_user"] is False, result
     assert result["intent_conflicts"] == [], result
-    assert result["root_cause_scope_missing"] == [], result
 
 
 def test_the_cycle_result_of_a_deferred_round_asks_nobody():
@@ -227,7 +226,6 @@ def test_the_cycle_result_of_a_deferred_round_asks_nobody():
     assert result["repair_tasks"] == [], result
     assert result["status"] == "loop_stopped", result
     assert result["environment_blocked"] is True, result
-    assert result["root_cause_scope_missing"] == [], result
 
 
 def test_the_orchestrator_returns_the_same_exit(tmp_path):

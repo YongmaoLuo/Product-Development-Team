@@ -338,16 +338,20 @@ def test_atomic_write_on_error(plan_dir, project_dir, monkeypatch):
     )
 
 
-def test_same_class_counts_up_to_two(plan_dir, project_dir):
-    """The same failure twice counts up to two and stops the loop.
+def test_same_class_counts_up_to_three(plan_dir, project_dir):
+    """The same failure three times counts up to three and stops the loop.
 
     This is the case v2 has to keep working: the counting is only
     useful if an unchanged failure still accumulates.
 
-    2026-10-23 (VP-019): the threshold no longer stops the chain by
-    itself — it buys one triage call, and the triage's verdict decides.
+    2026-10-23 (VP-019): the threshold does not stop the loop by
+    itself — it buys ONE triage call, and the triage's verdict decides.
     The judge injected here ran and could not name the failure, so the
-    chain stops; the tally the loop keeps is still the one v2 promises.
+    loop stops; the tally the loop keeps is still the one v2 promises.
+
+    2026-11-06 (root-cause chain removed): the cap moved from 2 to 3,
+    so the same failure has to repeat **three** times before the triage
+    runs — that is, at most **two** repair rounds are spent on it.
     """
     _write_plan_state(plan_dir)
     report = _failed_report("VP-007", "criterion_defect")
@@ -357,14 +361,21 @@ def test_same_class_counts_up_to_two(plan_dir, project_dir):
     )
     assert r1["status"] != "loop_stopped", "the first failure is not a repeat"
 
-    orch, r2 = _run_round(
+    _, r2 = _run_round(
         plan_dir, project_dir, report, 2, judge=_StubJudge(),
     )
-    assert r2["status"] == "loop_stopped", (
-        "the same failure for a second round is the documented stop "
+    assert r2["status"] != "loop_stopped", (
+        "the second failure still has one repair round left"
+    )
+
+    orch, r3 = _run_round(
+        plan_dir, project_dir, report, 3, judge=_StubJudge(),
+    )
+    assert r3["status"] == "loop_stopped", (
+        "the same failure for a third round is the documented stop "
         "condition"
     )
-    assert orch._same_failure_counts == {"VP-007|criterion_defect": 2}
+    assert orch._same_failure_counts == {"VP-007|criterion_defect": 3}
 
 
 def test_class_change_resets_count(plan_dir, project_dir):

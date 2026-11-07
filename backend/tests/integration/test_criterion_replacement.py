@@ -387,7 +387,8 @@ def test_confirm_obsoletes_and_replaces(
     )
 
     _run_round(orchestrator, _report(), round_number=1)
-    result = _run_round(orchestrator, _report(), round_number=2)
+    _run_round(orchestrator, _report(), round_number=2)
+    result = _run_round(orchestrator, _report(), round_number=3)
 
     assert len(judge.calls) == 1, "the threshold buys exactly one triage call"
 
@@ -458,7 +459,8 @@ def test_weaker_method_rejected(
     )
 
     _run_round(orchestrator, _report(), round_number=1)
-    result = _run_round(orchestrator, _report(), round_number=2)
+    _run_round(orchestrator, _report(), round_number=2)
+    result = _run_round(orchestrator, _report(), round_number=3)
 
     # Zero writes: the plan file was never even attempted, and what is
     # on disk is byte-for-byte what it was.
@@ -480,14 +482,20 @@ def test_weaker_method_rejected(
         "a refused replacement must not record an OBSOLETE verdict"
     )
 
-    # Downgraded to a deliverable defect: the loop keeps repairing.
-    assert result["should_stop"] is False, (
-        "a refused replacement downgrades the failure — it must not stop "
-        "the loop"
+    # 2026-11-06: a refused replacement **stops** the loop. The triage
+    # only runs once the repair budget is spent, and with the
+    # root-cause chain gone there is nothing else that would escalate
+    # the failure — voiding the counter would repair the same
+    # criterion forever.
+    assert result["should_stop"] is True, (
+        "a refused replacement means the criterion is still broken and "
+        "the repair budget is spent — the loop must stop"
     )
-    assert VP_ID in _repair_vp_ids(result), (
-        "the downgraded failure must be repaired like any other "
-        "deliverable defect"
+    assert result["repair_tasks"] == [], (
+        "a stopped round must not produce a repair task"
+    )
+    assert result["replacement_rejected_reason"] == "weaker_method", (
+        "the round must record why the replacement was not used"
     )
 
 
@@ -525,7 +533,8 @@ def test_persist_failure_no_obsolete_verdict(
     )
 
     _run_round(orchestrator, _report(), round_number=1)
-    result = _run_round(orchestrator, _report(), round_number=2)
+    _run_round(orchestrator, _report(), round_number=2)
+    result = _run_round(orchestrator, _report(), round_number=3)
 
     # The write was attempted — otherwise this test would be proving
     # that something *else* refused the replacement, not that a failed
@@ -547,9 +556,11 @@ def test_persist_failure_no_obsolete_verdict(
     )
     assert not [vp for vp in by_id.values() if vp.get("replacement_for")]
 
-    # Downgraded to a deliverable defect — the loop keeps working.
-    assert result["should_stop"] is False
-    assert VP_ID in _repair_vp_ids(result)
+    # 2026-11-06: a refused replacement stops the loop (the repair
+    # budget is spent and nothing else escalates the failure).
+    assert result["should_stop"] is True
+    assert result["repair_tasks"] == []
+    assert result["replacement_rejected_reason"] == "persist_failed"
 
 
 # ---------------------------------------------------------------------------
@@ -581,7 +592,8 @@ def test_triage_exception_never_obsoletes(
     )
 
     _run_round(orchestrator, _report(), round_number=1)
-    result = _run_round(orchestrator, _report(), round_number=2)
+    _run_round(orchestrator, _report(), round_number=2)
+    result = _run_round(orchestrator, _report(), round_number=3)
 
     assert len(judge.calls) == 1, "the threshold was reached — the judge was asked"
 
@@ -658,7 +670,8 @@ def test_persist_failure_is_audited(
     )
 
     _run_round(orchestrator, _report(), round_number=1)
-    result = _run_round(orchestrator, _report(), round_number=2)
+    _run_round(orchestrator, _report(), round_number=2)
+    result = _run_round(orchestrator, _report(), round_number=3)
 
     # (1) The audit event reached the disk — it names the failure and
     # the reason the proposal was not used.
@@ -686,10 +699,10 @@ def test_persist_failure_is_audited(
         "a failed write must not record an OBSOLETE verdict"
     )
 
-    # (4) The failure is still repaired — the refusal downgrades it, it
-    # does not end the chain.
-    assert result["should_stop"] is False
-    assert VP_ID in _repair_vp_ids(result)
+    # (4) 2026-11-06: the refusal now **stops** the round — the repair
+    # budget is spent and nothing else escalates the failure.
+    assert result["should_stop"] is True
+    assert result["repair_tasks"] == []
 
 
 def test_weaker_method_is_audited(
@@ -712,7 +725,8 @@ def test_weaker_method_is_audited(
     )
 
     _run_round(orchestrator, _report(), round_number=1)
-    result = _run_round(orchestrator, _report(), round_number=2)
+    _run_round(orchestrator, _report(), round_number=2)
+    result = _run_round(orchestrator, _report(), round_number=3)
 
     blob = _plan_dir_blob(temp_plan_dir)
     assert "plan_delta_replacement_rejected" in blob, (
@@ -730,5 +744,7 @@ def test_weaker_method_is_audited(
     assert "obsolete" not in by_id[VP_ID]
     assert not [vp for vp in by_id.values() if vp.get("replacement_for")]
 
-    assert result["should_stop"] is False
-    assert VP_ID in _repair_vp_ids(result)
+    # 2026-11-06: a refused replacement stops the round — the repair
+    # budget is spent and nothing else escalates the failure.
+    assert result["should_stop"] is True
+    assert result["repair_tasks"] == []

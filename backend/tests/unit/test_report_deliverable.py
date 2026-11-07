@@ -1164,17 +1164,23 @@ def test_a_code_task_says_nothing_about_a_report(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 6 — the channel a root-cause task travels through (2026-11-03)
+# 6 — the channel a report task travels through (2026-11-03)
 # ---------------------------------------------------------------------------
 #
-# The repair tasks (and the root-cause chain's tasks) are written
-# straight into ``state.db``; the executor picks them up as DB orphans
-# and rebuilds them through ``orphan_rules.merged_subtask_kwargs``. A
-# row that lost ``deliverable`` / ``report_path`` on the way comes back
-# as ``deliverable="code"`` — and the empty-diff gate then reads a
-# delivered report as "this task produced nothing", which is exactly
-# the ``empty_diff_no_changes`` verdict the root-cause task was
-# wrongly given.
+# The repair tasks are written straight into ``state.db``; the executor
+# picks them up as DB orphans and rebuilds them through
+# ``orphan_rules.merged_subtask_kwargs``. A row that lost ``deliverable``
+# / ``report_path`` on the way comes back as ``deliverable="code"`` — and
+# the empty-diff gate then reads a delivered report as "this task
+# produced nothing".
+#
+# 2026-11-06: the report task's contract is no longer owned by the
+# deleted root-cause chain.  It is **generic** now: the description
+# carries the marker (``orphan_rules.report_deliverable_marker``) and
+# the pair is recovered from it
+# (``orphan_rules.parse_report_deliverable``).  The contract this test
+# pins — the pair survives the write and the orphan merge — is
+# unchanged; only the way the task is built changed.
 
 
 def test_a_report_task_survives_the_state_db_and_the_orphan_merge():
@@ -1182,15 +1188,32 @@ def test_a_report_task_survives_the_state_db_and_the_orphan_merge():
     import sqlite3
 
     from agent import is_report_task
-    from orphan_rules import merged_subtask_kwargs
-    from root_cause_task import build_root_cause_task
+    from orphan_rules import (
+        merged_subtask_kwargs,
+        parse_report_deliverable,
+        report_deliverable_marker,
+    )
     from state_machine.db.schema import migrate
     from state_machine.repositories.plan_task_repository import (
         ALLOWED_STATIC_TASK_FIELDS,
         PlanTaskRepository,
     )
 
-    task = build_root_cause_task(plan_id="p1", vp_id="VP-3", round_no=3)
+    # The generic contract: the description carries the marker, and the
+    # pair is read back out of it.
+    report_path = "/plans/p/reports/VP-3.md"
+    description = (
+        "写一份报告，说明 VP-3 为什么失败。\n"
+        + report_deliverable_marker(report_path)
+    )
+    task = {
+        "id": "repair-01",
+        "title": "写 VP-3 的报告",
+        "description": description,
+        **parse_report_deliverable(description),
+    }
+    assert task["deliverable"] == "report"
+    assert task["report_path"] == report_path
 
     conn = sqlite3.connect(":memory:")
     try:

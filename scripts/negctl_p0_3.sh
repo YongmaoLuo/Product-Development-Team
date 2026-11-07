@@ -13,7 +13,8 @@
 # a wrong deliverable (the work must be redone), so it took the former
 # for the latter and killed the chain.
 #
-# The fix raised the threshold to ``2`` and turned the cap into a
+# The fix raised the threshold (to ``2`` then, to ``3`` in 2026-11-06) and
+# turned the cap into a
 # semantic triage: reaching it buys one ``VPTriageJudge`` call, and
 # the triage's verdict decides between stopping and diverting into the
 # repair path.
@@ -38,7 +39,7 @@
 #   RED   — …and the REAL judge's malfunctions (the provider blew up,
 #           the answer was not a JSON object, the quote did not
 #           verify) stopped the loop in the pre-fix conclusion shape;
-#   GREEN — the current source carries the threshold ``2`` and does
+#   GREEN — the current source carries the threshold ``3`` and does
 #           dispatch a triage;
 #   GREEN — …and the same three malfunctions leave the loop running,
 #           while a triage that ran and could not characterise the
@@ -256,8 +257,9 @@ Facts
 -----
 ``threshold``
     The integer assigned to ``self._MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS``
-    — ``1`` before the fix, ``2`` after it — or ``none`` when the
-    assignment is missing.
+    — ``1`` before the fix, ``3`` after it (2026-11-06: the repair
+    budget is two rounds, so the cap fires on the third same-cause
+    failure) — or ``none`` when the assignment is missing.
 ``empty_repair_tasks_return``
     1 when a ``return`` hands back a payload whose ``repair_tasks`` is
     an empty list — the pre-fix stop shape, where the chain was
@@ -663,8 +665,8 @@ CUR_THRESHOLD="$(fact threshold)"
 CUR_TRIAGE="$(fact triage_dispatch)"
 CUR_GUARDED="$(fact stop_guarded_by_triage)"
 
-if [ "$CUR_THRESHOLD" != "2" ]; then
-    echo "FAIL: $TARGET_REL does not set _MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS = 2 (it is '$CUR_THRESHOLD')" >&2
+if [ "$CUR_THRESHOLD" != "3" ]; then
+    echo "FAIL: $TARGET_REL does not set _MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS = 3 (it is '$CUR_THRESHOLD')" >&2
     echo "      the threshold is what buys the triage a second round to look at" >&2
     exit 1
 fi
@@ -681,7 +683,7 @@ if [ "$CUR_GUARDED" != "1" ]; then
     exit 1
 fi
 
-echo "GREEN: current orchestrator.py has threshold 2 and triage dispatch"
+echo "GREEN: current orchestrator.py has threshold 3 and triage dispatch"
 
 # ---------------------------------------------------------------------------
 # The real judge — the malfunctions the shipped judge actually has

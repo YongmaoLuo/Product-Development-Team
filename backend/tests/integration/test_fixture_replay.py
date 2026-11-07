@@ -153,11 +153,14 @@ _DISPOSITION_BY_ROUTE = {
 #: * ``repair`` — one round: the repair task appears on the round the
 #:   deliverable failed, and a second round would void the counter the
 #:   table asks to see grow;
-#: * ``replace`` — two rounds: the criterion is replaced only once the
-#:   same failure has repeated for the threshold's worth of rounds;
+#: * ``replace`` — three rounds: the criterion is replaced only once the
+#:   same failure has repeated for the threshold's worth of rounds, and
+#:   2026-11-06 (root-cause chain removed) moved that threshold from 2
+#:   to 3 — the repair budget is two rounds, so the triage runs on the
+#:   third same-cause failure;
 #: * ``ask_human`` — one round: the question is asked about the failure
 #:   that raised it, and the counter must not have moved.
-_ROUNDS_BY_ROUTE = {"retry": 2, "repair": 1, "replace": 2, "ask_human": 1}
+_ROUNDS_BY_ROUTE = {"retry": 2, "repair": 1, "replace": 3, "ask_human": 1}
 
 #: The corpus case that stands for each of the four classes, and the
 #: disposition that case has to reach.
@@ -1192,8 +1195,14 @@ def test_a_weaker_replacement_is_refused():
     criterion broken, but the replacement it proposes verifies the
     criterion with a weaker method. The product's strength guard refuses
     it, so the plan is left exactly as it was — no criterion retired, no
-    replacement added, no OBSOLETE verdict — and the failure keeps
-    going with a fresh budget instead of being retired silently.
+    replacement added, no OBSOLETE verdict.
+
+    2026-11-06 (root-cause chain removed): the refusal now **stops**
+    the loop instead of downgrading the failure to a deliverable
+    defect. The triage only runs once the repair budget is spent, and
+    with the chain gone there is nothing left that would escalate the
+    failure — voiding the counter would repair the same criterion
+    forever.
     """
     case = _load_case("criterion_weaker_replacement")
     point = _the_point(case)
@@ -1229,11 +1238,15 @@ def test_a_weaker_replacement_is_refused():
         "the threshold buys exactly one triage call; got "
         f"{result['triage_calls']}"
     )
-    assert all(
-        not round_["should_stop"] for round_ in result["rounds"]
-    ), (
-        "a refused replacement must not stop the chain — the failure is "
-        f"still workable; got {result['rounds']}"
+    assert [round_["should_stop"] for round_ in result["rounds"]] == [
+        False, False, True,
+    ], (
+        "the refusal stops the loop on the third same-cause failure — "
+        f"the repair budget is spent; got {result['rounds']}"
+    )
+    assert result["rounds"][-1]["status"] == "loop_stopped", (
+        "the stopped round must say so; got "
+        f"{result['rounds'][-1]['status']}"
     )
 
 
