@@ -110,7 +110,10 @@ the order a person reads them, with the evidence carried verbatim.
 the cap, the evidence is dropped **from its tail** first — the front of
 the argument is what the recommendation rests on.  Only then is the
 whole 不确定 section dropped, because half an uncertainty is a fact.
-Only then is the text cut, and the cut is marked with ``…``.
+Only then is the 问题 section cut — its head kept, the cut marked with
+``…`` — with the room the 建议 section needs reserved first: **the
+advice survives every cut**, because a question that carries no advice
+asks for a decision nobody can make.
 
 **An analysis that is not one renders as nothing.**  Not a mapping, a
 missing field, a recommendation outside the actions — all of them
@@ -387,6 +390,35 @@ def _section(heading: str, body: str) -> str:
     return f"## {heading}\n{body}"
 
 
+def _cut_head_to_budget(text: str, budget: int) -> str:
+    """Cut ``text`` down to ``budget`` characters, keeping its head.
+
+    The cut is marked with ``…``: an unmarked cut reads as a complete
+    value, and a human reasoning about a verdict it has only seen half
+    of will not know that it is reasoning about half.
+    """
+    if budget <= 0:
+        return ""
+    if len(text) <= budget:
+        return text
+    if budget == 1:
+        return "…"
+    return text[: budget - 1] + "…"
+
+
+def _fit_problem_to_budget(problem: str, budget: int) -> str:
+    """The problem section, fitted into ``budget`` characters.
+
+    The head is kept and the tail is cut.  The problem section opens
+    with the scene the recommendation rests on — what was expected and
+    what actually happened — and its tail is the per-point detail that
+    the recommendation itself summarises.  Cutting the head instead
+    would leave a problem whose beginning is gone, and a recommendation
+    with nothing under it.
+    """
+    return _cut_head_to_budget(problem, budget)
+
+
 def _render_cpea(
     *,
     context: str,
@@ -443,8 +475,16 @@ def render_analysis(
     on, and a judge that wrote six pieces of evidence wrote them in
     order of importance.  Only when dropping evidence was not enough is
     the whole 不确定 section dropped — an uncertainty is either said or
-    not said, and half of one is a fact.  Only when that was not enough
-    either is the text cut, with the cut marked by ``…``.
+    not said, and half of one is a fact.
+
+    What is left after that is the 建议 section, and it is **kept, in
+    full, at any cost**: the advice is what the human is asked to act
+    on, and a question that has no advice in it asks for a decision
+    nobody can make.  So the 问题 section is cut next — its head kept,
+    its tail dropped, the cut marked with ``…`` — with the room the
+    advice needs reserved first.  Only when that was not enough either
+    is the text cut, with the cut marked by ``…``; even then the advice
+    survives, because it is put back after the cut.
 
     The returned string is never longer than ``limit``.
 
@@ -482,10 +522,16 @@ def render_analysis(
     recommendation_reason = validated["recommendation_reason"]
     uncertainty = validated["uncertainty"]
 
+    # The bodies are cleaned once, here: the cut in step 3 measures the
+    # text that is actually rendered, and cleaning is idempotent, so
+    # cleaning them again inside ``_render_cpea`` changes nothing.
+    context_body = _clean_body(context)
+    problem_body = _clean_body(problem)
+
     def build(items: List[str], keep_uncertainty: bool) -> str:
         return _render_cpea(
-            context=context,
-            problem=problem,
+            context=context_body,
+            problem=problem_body,
             evidence=items,
             recommendation=recommendation,
             recommendation_reason=recommendation_reason,
@@ -509,8 +555,72 @@ def render_analysis(
     if len(rendered) <= max_chars:
         return rendered
 
-    # 3. The hard cut, marked so that it does not read as a complete text.
-    return rendered[: max_chars - 1] + "…"
+    # 3. The 问题 section is cut, its head kept, and the room the advice
+    #    needs is reserved first: the advice is what the human is asked
+    #    to act on, and it must survive every cut below.
+    advice_body = f"{recommendation} —— {recommendation_reason}"
+    advice_section = _section("建议（A）", advice_body)
+    context_section = _section("背景（C）", context_body)
+
+    if len(advice_section) + 2 > max_chars:
+        # Even the advice alone does not fit: its reason is cut, its
+        # heading and its recommendation id are not.
+        room = max_chars - len("## 建议（A）") - 1 - 2
+        advice_body = _cut_head_to_budget(advice_body, room)
+        advice_section = _section("建议（A）", advice_body)
+
+    # The sections that will be rendered are 背景 / 问题 / (证据) / 建议,
+    # each pair separated by exactly one blank line — the same join
+    # ``_render_cpea`` uses, so the two renderings are the same text.
+    # Everything but the 问题 body has a fixed size, so the room the
+    # 问题 body gets is what is left of the cap.
+    #
+    # The evidence is gone by now: step 1 leaves evidence behind only
+    # when the text fits, and that case has already returned.  The
+    # branch below is the safety net for that invariant, not the path
+    # this rendering takes.
+    problem_heading = _section("问题（P）", "")
+    evidence_section = (
+        _section("证据（E）", "\n".join(f"- {item}" for item in trimmed))
+        if trimmed
+        else ""
+    )
+    overhead = (
+        len(context_section)
+        + len(problem_heading)
+        + len(advice_section)
+        + 2 * 2
+        + (2 + len(evidence_section) if evidence_section else 0)
+    )
+    budget = max_chars - overhead
+
+    front_sections = [
+        context_section,
+        problem_heading + _fit_problem_to_budget(problem_body, budget),
+    ]
+    if evidence_section:
+        front_sections.append(evidence_section)
+    front = "\n\n".join(front_sections)
+
+    result = f"{front}\n\n{advice_section}"
+    if len(result) <= max_chars:
+        return result
+
+    # 4. The hard cut, marked so that it does not read as a complete
+    #    text — and the advice survives it: the cut takes from the
+    #    front, and the advice is put back after it.
+    allowance = max_chars - len(advice_section) - 2
+    if allowance < 1:
+        return advice_section
+    if len(front) > allowance:
+        front = front[: allowance - 1] + "…"
+
+    result = f"{front}\n\n{advice_section}"
+    if len(result) > max_chars:
+        # Only reachable for a limit too small to hold the advice's own
+        # heading: the length promise wins over the advice.
+        result = result[: max_chars - 1] + "…"
+    return result
 
 
 # ---------------------------------------------------------------------------
