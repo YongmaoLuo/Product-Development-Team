@@ -48,7 +48,7 @@ import contextlib
 import json
 import sqlite3
 from datetime import datetime, timezone
-from typing import Any, Iterator, Optional
+from typing import Any, Dict, Iterator, Optional
 
 __all__ = ["ExecutionRepository", "PlanNotFoundError"]
 
@@ -496,7 +496,12 @@ class ExecutionRepository:
             # Best-effort — never raise into the executor's hot path.
             pass
 
-    def update_status(self, plan_id: str, status: str) -> None:
+    def update_status(
+        self,
+        plan_id: str,
+        status: str,
+        stop_reason: Optional[str] = None,
+    ) -> None:
         """Persist ``status`` to the row's ``exec_status`` column.
 
         Thin convenience wrapper around :meth:`update_fields` for the
@@ -516,6 +521,14 @@ class ExecutionRepository:
         (accident B, 2026-10-23 — the row kept pid 58353 after the plan
         was terminated, and every "is this execution alive?" reader
         believed it).  A non-terminal status leaves the pid alone.
+
+        ``stop_reason`` is optional and is written **only when it is
+        given**: a caller with no reason to report leaves the column
+        exactly as it found it.  Without this, a row kept the reason
+        of whatever wrote it last — the startup reconcile's
+        ``startup_reconcile`` — long after the run had actually ended
+        for a different reason, and every reader of the column read a
+        stale explanation for a finished run.
 
         2026-09-19: this used to call
         ``update_phase(plan_id, current_phase="executing", ...)``, which
@@ -559,12 +572,14 @@ class ExecutionRepository:
                 f"unknown execution status {status!r}; must be one of "
                 f"{sorted(recognised)}"
             )
+        fields: Dict[str, Any] = {"exec_status": status}
         if status in _TERMINAL_EXEC_STATUSES:
             # The run is over — there is no executor process left, so
             # the pid column goes back to NULL (accident B, 2026-10-23).
-            self.update_fields(plan_id, exec_status=status, exec_pid=None)
-        else:
-            self.update_fields(plan_id, exec_status=status)
+            fields["exec_pid"] = None
+        if stop_reason is not None:
+            fields["stop_reason"] = stop_reason
+        self.update_fields(plan_id, **fields)
 
     def update_task_progress(
         self, plan_id: str, progress: dict[str, Any]
