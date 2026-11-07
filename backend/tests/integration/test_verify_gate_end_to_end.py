@@ -2,7 +2,8 @@
 
 背景
 ----
-缺陷 A（改过被验证树的 VP 拿着 PASSED 回轮次）与缺陷 B（成本闸、命令类
+缺陷 A（改过被验证树的 VP 拿着 PASSED 回轮次 —— 2026-11-07 起降级成一条
+warning，改判只保留给护栏**当场拒绝**的写）与缺陷 B（成本闸、命令类
 e2e 的判定路径）改的都是**验证链路自身**。链路自己的单元测试全绿，只能
 证明每个零件没坏，证明不了**零件接起来**还能用 —— 坏掉的常常是接缝，
 而接缝是单元测试看不见的那一段。
@@ -14,9 +15,9 @@ e2e 的判定路径）改的都是**验证链路自身**。链路自己的单元
      断言落在**用户看得见的那个**控件上，不是 DOM 里躺着一个看不见的节点。
   2. ``test_tree_guard_rolls_back_in_real_repo`` —— 在 tmp git 仓库里跑
      **真的钩子脚本**（pre / post 两个独立进程），中间执行真的越权命令，
-     然后断言四件事：patch 落了盘、树被回滚了、账本里有一行、判定层把这条
-     PASSED 改判成 FAILED 并记了 ``verifier_mutated_tree`` 事件（四个字段
-     齐全）。
+     然后断言四件事：patch 落了盘、树被回滚了、账本里有一行、判定层记了
+     一条 ``verifier_mutated_tree`` 事件（四个字段齐全 + ``severity=warning``）
+     而**没有**把这条 PASSED 改判成 FAILED。
   3. ``test_command_e2e_runs_without_llm`` —— 命令类 e2e 的判定由**退出码**
      给出（不开 LLM 会话），``cost=llm_quota`` 的验证点在默认开关下是
      DEFERRED（不执行），报告里单列「因成本跳过」小节。
@@ -43,7 +44,8 @@ lane 没有 —— 标记错了，浏览器在 CI 上必然起不来。文件本
 第 2 条用例里，**子 agent**（要开 LLM 会话的那一半）被替身挡掉了：CI 上
 没有模型。其余每一环 —— 钩子脚本、账本、判定层、持久化 —— 都是真的。
 替身只挡在模型边界上，而那正是生产里本来就有的边界；它交回什么结论不
-影响这条用例要证明的事：有 mutation 记录就改判，没有记录就原样通过。
+影响这条用例要证明的事：有 mutation 记录就记一条 warning（不改判），没
+有记录就原样通过。
 """
 
 from __future__ import annotations
@@ -516,17 +518,20 @@ def test_end_to_end_ui_and_gates(tmp_path, acceptance_summary):
 
 
 # ---------------------------------------------------------------------------
-# 2) 真钩子：改过被验证树的 VP 拿不到 PASSED
+# 2) 真钩子：改过被验证树的 VP 拿不到 PASSED —— 但它也不再因此被改判
+#    （2026-11-07 用户裁定：回滚已经发生了 → 记一条 warning）
 # ---------------------------------------------------------------------------
 
 
 def test_tree_guard_rolls_back_in_real_repo(tmp_path, monkeypatch, acceptance_summary):
-    """真钩子跑一遍：存证 → 回滚 → 记账 → 改判，四个字段齐全。
+    """真钩子跑一遍：存证 → 回滚 → 记账 → 记 warning，四个字段齐全。
 
     钩子是两个独立进程（pre / post），中间那条命令真的改了仓库；post 阶段
     量到改动，存下 patch、把树复原、把这一轮记进账本；判定层读这份账本，
-    把子 agent 交回的 PASSED 改判成 FAILED，并记一条
-    ``verifier_mutated_tree`` 事件。
+    记一条 ``verifier_mutated_tree`` 事件（``severity=warning``），把「这个
+    VP 动过被验证的树」附进 evidence —— 但**不改判**：子 agent 交回的 PASSED
+    仍然是 PASSED（2026-11-07 用户裁定：回滚已经发生了，就没有必要再因为
+    「改了树」去失败这个 VP）。
     """
     repo = _init_repo(tmp_path / "repo")
     plan_dir = tmp_path / "plan"
@@ -598,7 +603,7 @@ def test_tree_guard_rolls_back_in_real_repo(tmp_path, monkeypatch, acceptance_su
     assert row["patch"], row
     assert Path(str(row["patch"])).exists(), row
 
-    # --- 判定层：拿着这份账本改判 ---------------------------------------
+    # --- 判定层：拿着这份账本记一条 warning（不改判） -------------------
     orchestrator = Orchestrator.__new__(Orchestrator)
     orchestrator.plan_dir = plan_dir
     orchestrator.project_dir = repo
@@ -615,11 +620,17 @@ def test_tree_guard_rolls_back_in_real_repo(tmp_path, monkeypatch, acceptance_su
         )
     )
 
-    assert verdict.verdict == "FAILED", verdict
-    assert verdict.failure_class == "infra", verdict
-    assert verdict.failure_class_source == "deterministic", verdict
+    # 2026-11-07（用户裁定）：回滚已经发生了 → 记 warning，不改判。
+    assert verdict.verdict == "PASSED", verdict
+    assert verdict.failure_class == "", verdict
+    assert not any(
+        str(reason).startswith("verifier_mutated_tree:")
+        for reason in verdict.reasons
+    ), verdict.reasons
+    # 事实仍在 evidence 里（可追溯性）。
+    assert "new.txt" in " ".join(verdict.evidence), verdict.evidence
 
-    # 事件：``verifier_mutated_tree``，四个字段齐全。
+    # 事件：``verifier_mutated_tree``，四个字段齐全 + severity=warning。
     events = [
         entry
         for entry in _log_events(plan_dir)
@@ -632,6 +643,7 @@ def test_tree_guard_rolls_back_in_real_repo(tmp_path, monkeypatch, acceptance_su
     assert data.get("deleted") == [], data
     assert data.get("patch"), data
     assert Path(str(data.get("patch"))).exists(), data
+    assert data.get("severity") == "warning", data
 
     acceptance_summary["mutation_rollback"] = True
 
