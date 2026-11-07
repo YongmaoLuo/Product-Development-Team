@@ -535,6 +535,82 @@ def resolve_phase(
     return str(phase or "")
 
 
+# ---------------------------------------------------------------------------
+# The execution verdict a reader may show
+# ---------------------------------------------------------------------------
+
+#: The phase that says the workflow finished successfully.
+COMPLETED_PHASE = "completed"
+
+#: The workflow phases that ARE a verdict, and the verdict each one shows.
+#:
+#: A phase outside this table is not a verdict: it says where the
+#: workflow IS, not how the run ended, so the execution row still speaks.
+_TERMINAL_PHASE_VERDICTS = {
+    COMPLETED_PHASE: COMPLETED_PHASE,
+    "failed": "failed",
+    "stopped": "stopped",
+}
+
+
+def normalize_exec_status(
+    current_phase: Optional[str],
+    exec_status: Optional[str],
+) -> str:
+    """The execution verdict a reader may show for this plan.
+
+    Pure — no I/O, no clock, no environment.
+
+    Two records, two questions.  ``plan_routing.current_phase`` is the
+    WORKFLOW's answer ("where is this plan"); ``plan_execution.exec_status``
+    is the LAST RUN's answer ("how did that run end").  A plan that
+    finished — phase ``completed`` — carries the verdict of a run that
+    was interrupted long before, because nothing rewrites the execution
+    row when the workflow reaches its end.  The reader then says "failed"
+    (or "stopped") about a plan that succeeded, and the operator goes
+    looking for a failure that is not there.
+
+    So the workflow's answer wins whenever it IS an answer: ``completed``
+    / ``failed`` / ``stopped`` are terminal verdicts, and the verdict the
+    phase carries is the verdict that is shown.  A phase that is not
+    terminal says nothing about how the run ended, so the execution row
+    still speaks.
+
+    The rules, one line each:
+
+    ==================  ==============  =======================
+    phase               exec_status     shown
+    ==================  ==============  =======================
+    ``completed``       ``failed``      ``completed``
+    ``completed``       ``stopped``     ``completed``
+    ``completed``       ``running``     ``completed``
+    ``failed``          ``failed``      ``failed``
+    ``failed``          ``completed``   ``failed``
+    ``stopped``         ``stopped``     ``stopped``
+    ``queued``          ``failed``      ``failed``
+    ``completed``       ``not_started`` ``not_started``
+    ==================  ==============  =======================
+
+    Note what this does NOT do: it never turns a real failure into a
+    success.  A plan whose phase is ``failed`` shows ``failed`` whatever
+    its execution row says, a plan whose phase is ``stopped`` shows
+    ``stopped``, and a plan that is still running (a phase that is not
+    terminal) shows what its run is doing.
+
+    ``not_started`` is not a verdict — it says the plan never ran an
+    execution — so it is left alone: a plan whose workflow finished
+    without ever executing still says so about its execution.
+    """
+    phase = _norm(current_phase)
+    verdict = _TERMINAL_PHASE_VERDICTS.get(phase)
+    if verdict is None:
+        return _norm(exec_status)
+    status = _norm(exec_status)
+    if not status or status == "not_started":
+        return status
+    return verdict
+
+
 def find_divergences(status: PlanStatus) -> Tuple[Divergence, ...]:
     """Report the ways ``status``'s stores disagree with one another.
 

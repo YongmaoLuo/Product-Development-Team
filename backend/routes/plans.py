@@ -39,6 +39,12 @@ from plan_artifacts import (  # noqa: E402
     detect,
 )
 
+# The read model for "what may this plan's execution status be shown as".
+# It is pure, and it lives in ``plan_status`` — the module that owns "one
+# plan, one status" — so this module and ``routes.execution`` cannot
+# answer differently about the same plan.
+from plan_status import normalize_exec_status  # noqa: E402
+
 # ``phase_vocabulary`` 是纯词汇模块（只依赖 logging / typing，不 import
 # ``plan_state``），所以这里可以安全地模块级导入：等待相位的历史别名
 # （``ready``）必须在**读路径**上归一化成现行词汇（``queued``），否则列表会
@@ -1929,6 +1935,37 @@ def _execution_row_status(plan_id: str) -> Optional[str]:
     return status or None
 
 
+def _persisted_routing_phase(plan_id: str) -> Optional[str]:
+    """``plan_routing.current_phase`` — the workflow's own answer.
+
+    Read on its own connection, for the callers that have no handle
+    open.  ``None`` means "there is no phase to read" — no routing row,
+    or an unreadable database.
+
+    It is the counterpart of :func:`_execution_row_status`: the row says
+    how the LAST run ended, the routing row says where the plan IS.
+    A reader that shows one without the other shows a stale verdict
+    (see :func:`plan_status.normalize_exec_status`).
+    """
+    try:
+        sm = _server._open_state_machine()
+    except Exception:
+        return None
+    if sm is None:
+        return None
+    try:
+        conn, routing, _execution, _verification, _artifact = sm
+        row = routing.current(plan_id)
+        if not isinstance(row, dict):
+            return None
+        phase = str(row.get("current_phase") or "").strip()
+        return phase or None
+    except Exception:
+        return None
+    finally:
+        _server._close_state_machine(sm)
+
+
 def _degraded_execution_section(plan_id: str) -> Optional[Dict[str, Any]]:
     """The execution section of a plan whose section read failed.
 
@@ -1948,6 +1985,10 @@ def _degraded_execution_section(plan_id: str) -> Optional[Dict[str, Any]]:
     status = _execution_row_status(plan_id)
     if status is None:
         return None
+    # The verdict is reconciled against the workflow's answer, exactly as
+    # the full section does it: a plan that finished must not go on
+    # reporting the verdict of a run that was interrupted long before.
+    status = normalize_exec_status(_persisted_routing_phase(plan_id), status)
     return {
         "plan_id": plan_id,
         "pid": None,
@@ -3537,8 +3578,9 @@ def _get_plan_summary_body(
     # The handle arrives from get_plan_summary, which closes it.
     artifacts_manifest: List[Dict[str, Any]] = []
     execution_row_from_sm: Optional[Dict[str, Any]] = None
+    routing_phase: Optional[str] = None
     if sm is not None:
-        _, _, execution_repo, _verification_repo, artifact_repo = sm
+        _, routing_repo, execution_repo, _verification_repo, artifact_repo = sm
         try:
             artifacts_manifest = artifact_repo.list_for_plan(plan_id)
         except Exception:
@@ -3547,6 +3589,17 @@ def _get_plan_summary_body(
             execution_row_from_sm = execution_repo.summary(plan_id)
         except Exception:
             execution_row_from_sm = None
+        # The workflow's answer about this plan — read on the same handle
+        # as the execution row, so the status shown below can be
+        # reconciled against it.
+        try:
+            routing_row = routing_repo.current(plan_id)
+            if isinstance(routing_row, dict):
+                routing_phase = str(
+                    routing_row.get("current_phase") or ""
+                ).strip() or None
+        except Exception:
+            routing_phase = None
 
         # When the state-machine has a row for this plan, it is
         # authoritative for ``exec_status`` / ``pid`` / ``project_dir``
@@ -3571,6 +3624,14 @@ def _get_plan_summary_body(
                     started_at = execution_row_from_sm.get("started_at")
                 if stop_reason is None:
                     stop_reason = execution_row_from_sm.get("stop_reason")
+
+    # The status shown is reconciled against the WORKFLOW's answer before
+    # it leaves this handler: the execution row records the LAST run, and
+    # a plan that finished keeps the verdict of a run that was interrupted
+    # long before it finished.  Showing that verdict is how a completed
+    # plan reads as "failed" here.  See
+    # ``plan_status.normalize_exec_status``.
+    exec_status = normalize_exec_status(routing_phase, exec_status)
 
     return {
         "plan_id": plan_id,

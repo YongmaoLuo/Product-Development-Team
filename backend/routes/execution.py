@@ -79,6 +79,12 @@ from capacity_wait import WAIT_KIND_FIELD, quota_wait_event_data
 # ``server`` import above follows.
 import execution_log_tail
 
+# The read model for "what may this plan's execution status be shown
+# as".  It is pure, and it lives in ``plan_status`` — the module that
+# owns "one plan, one status" — so the endpoint and the plan listing
+# cannot answer differently about the same plan.
+from plan_status import normalize_exec_status
+
 router = APIRouter()
 
 
@@ -1483,6 +1489,12 @@ class _ExecutionRead(NamedTuple):
     is the state of the database the read tried to use, ``known`` says
     whether the library holds a row of its own for this plan, and
     ``populated`` says whether the library holds rows of its own at all.
+
+    ``phase`` is the plan's WORKFLOW phase (``plan_routing.current_phase``),
+    read on the same connection and the same snapshot as the row.  It is
+    the other half of the answer: the row says how the LAST run ended, the
+    phase says where the plan IS.  A reader that shows the row's verdict
+    without it re-runs the whole "stale verdict" bug on every request.
     """
 
     row: Optional[Dict[str, Any]]
@@ -1490,6 +1502,7 @@ class _ExecutionRead(NamedTuple):
     library: str
     known: bool
     populated: bool
+    phase: str = ""
 
 
 def _utc_now_iso() -> str:
@@ -2069,13 +2082,23 @@ def _read_execution_state(plan_id: str) -> _ExecutionRead:
         # Does the library hold a row of its own for this plan?  A
         # routing row means the library knows the plan — and a plan the
         # library knows but has no run for genuinely never ran.
-        known = bool(routing.current(plan_id))
+        routing_row = routing.current(plan_id)
+        known = bool(routing_row)
+        # The plan's workflow phase, read on the SAME connection and the
+        # SAME snapshot as the execution row.  It is the authority on
+        # where the plan IS; the row is the authority on how the last run
+        # ended.  A reader that shows the row's verdict alone re-runs the
+        # "stale verdict" bug (a completed plan still reporting the
+        # failed/stopped verdict of a run interrupted long ago).
+        phase = str((routing_row or {}).get("current_phase") or "")
         # And does the library hold rows of its own at all?  An empty
         # library and a library that has never heard of this plan are
         # two different situations, and only the second one is a
         # contradiction.
         populated = _library_holds_rows(conn)
-        return _ExecutionRead(row, source, LIBRARY_READABLE, known, populated)
+        return _ExecutionRead(
+            row, source, LIBRARY_READABLE, known, populated, phase,
+        )
     except Exception:  # noqa: BLE001 — a status poll must not 500
         _server.logger.exception(
             "[execution_status] could not read the execution state plan=%s",
@@ -4094,6 +4117,13 @@ def get_execution_status(plan_id: str):
         # answer: they live in this process only, and they are read
         # from the registry when it holds one.
         status, stop_reason = _execution_verdict(row)
+        # The row's verdict is the LAST RUN's answer; the phase is the
+        # workflow's answer.  A plan that finished carries the verdict of
+        # a run that was interrupted long ago, and the row's verdict
+        # alone would report that old failure as if it were the plan's
+        # outcome.  So the phase is consulted before the verdict is
+        # shown — see ``plan_status.normalize_exec_status``.
+        status = normalize_exec_status(read.phase, status)
         return {
             "plan_id": plan_id,
             "status": status,
@@ -4116,6 +4146,9 @@ def get_execution_status(plan_id: str):
         # No row, but this process holds a view of the run: the answer
         # is that view, and it says so — it was not read from the row.
         status = s.get("status", "not_started")
+        # The same rule as the row branch above: the workflow's phase
+        # outranks the last run's verdict when the phase IS a verdict.
+        status = normalize_exec_status(read.phase, status)
         return {
             "plan_id": plan_id,
             "status": status,
@@ -5201,6 +5234,10 @@ def get_execution_progress(plan_id: str):
     runtime: dict = {}
     db_progress: Optional[dict] = None
     exec_row: Optional[dict] = None
+    # The plan's workflow phase — the authority on where the plan IS,
+    # as opposed to the execution row's answer about how the LAST run
+    # ended.  Read on the same connection as the row.
+    routing_phase: str = ""
     try:
         from state_machine.db.connection import open as open_db
         from state_machine.db.schema import migrate
@@ -5209,6 +5246,9 @@ def get_execution_progress(plan_id: str):
         )
         from state_machine.repositories.execution_repository import (
             ExecutionRepository,
+        )
+        from state_machine.repositories.routing_repository import (
+            RoutingRepository,
         )
 
         state_db_path = Path(_server._state_db_path())
@@ -5219,6 +5259,13 @@ def get_execution_progress(plan_id: str):
             # The ``plan_execution`` row — the record that says this
             # plan was configured for execution at all.
             exec_row = exec_repo.summary(plan_id)
+            # The routing row — the workflow's own answer about this
+            # plan.  Read here so the status shown below can be
+            # reconciled against it (a plan that finished must not keep
+            # reporting the verdict of a run that was interrupted long
+            # before).
+            routing_row = RoutingRepository(sm_conn).current(plan_id)
+            routing_phase = str((routing_row or {}).get("current_phase") or "")
             # Per-task runtime overlay (current schema; the fields it
             # carries are listed at ``_RUNTIME_OVERLAY_FIELDS`` below).
             runtime = PlanTaskRepository(sm_conn).load_all(plan_id)
@@ -5591,6 +5638,14 @@ def get_execution_progress(plan_id: str):
             execution_status = "completed"
         else:
             execution_status = "not_started"
+
+    # The status shown is reconciled against the WORKFLOW's answer before
+    # it leaves this handler: the execution row records the LAST run, and
+    # a plan that finished keeps the verdict of a run that was interrupted
+    # long before it finished.  Showing that verdict is how a completed
+    # plan reads as "failed" on the page.  See
+    # ``plan_status.normalize_exec_status``.
+    execution_status = normalize_exec_status(routing_phase, execution_status)
 
     # The plan's outstanding human decisions.  The same block the plan
     # summary carries, so a consumer that polls the progress endpoints
