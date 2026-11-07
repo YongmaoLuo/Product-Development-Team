@@ -148,6 +148,12 @@ def _seed_base_drift_row(db_path: Path, plan_id: str, task_id: str, status: str)
     guard reads rows that look exactly like the ones it will meet in
     production.  Only the status is set afterwards, because that is
     runtime state the write path does not own.
+
+    The title is a **historical** one, in the shape rows written before
+    the base commit joined the title.  It is kept verbatim on purpose:
+    the guard under test looks at statuses and ids, not titles, and
+    rows left over from before the change are exactly what the guard
+    will keep meeting.
     """
     task = {
         "id": task_id,
