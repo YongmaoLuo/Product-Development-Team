@@ -564,6 +564,65 @@ def test_update_status_does_not_touch_routing(
     )
 
 
+def test_update_status_persists_stop_reason_when_given(
+    repo: ExecutionRepository,
+) -> None:
+    """``update_status`` 给了 stop_reason 就把它写进那一列。
+
+    watcher 知道这一轮是怎么结束的（非零退出、进程猝死），但它只把
+    这个信息留在内存里；不落库的话，DB 里挂着的永远是上一次开机
+    reconcile 写的 ``startup_reconcile``，读出来的是一个已经过期的
+    解释。
+    """
+    repo.insert(
+        plan_id="p1",
+        exec_status="running",
+        stop_reason="startup_reconcile",
+    )
+
+    repo.update_status("p1", "failed", "non_zero_exit")
+
+    summary = repo.summary("p1")
+    assert summary["exec_status"] == "failed"
+    assert summary["stop_reason"] == "non_zero_exit"
+
+
+def test_update_status_keeps_existing_stop_reason_when_not_given(
+    repo: ExecutionRepository,
+) -> None:
+    """不传 stop_reason 时，原来那一列一个字都不动。
+
+    ``update_status`` 的旧契约是「只写 exec_status（终态时清
+    exec_pid）」；不传 stop_reason 的调用方必须还是这个契约 ——
+    它不知道原因，就不该顺手把别人写的解释抹掉。
+    """
+    repo.insert(
+        plan_id="p1",
+        exec_status="running",
+        stop_reason="startup_reconcile",
+    )
+
+    repo.update_status("p1", "failed")
+
+    summary = repo.summary("p1")
+    assert summary["exec_status"] == "failed"
+    assert summary["stop_reason"] == "startup_reconcile"
+
+
+def test_update_status_with_stop_reason_still_clears_exec_pid(
+    repo: ExecutionRepository,
+) -> None:
+    """给了 stop_reason 也不能影响终态清 pid 的老行为。"""
+    repo.insert(plan_id="p1", exec_status="running", exec_pid=4242)
+
+    repo.update_status("p1", "failed", "non_zero_exit")
+
+    summary = repo.summary("p1")
+    assert summary["exec_status"] == "failed"
+    assert summary["exec_pid"] is None
+    assert summary["stop_reason"] == "non_zero_exit"
+
+
 def test_update_fields_with_extra_fields(
     repo: ExecutionRepository,
 ) -> None:
