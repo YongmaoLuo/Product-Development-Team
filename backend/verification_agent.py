@@ -16033,9 +16033,13 @@ class Orchestrator:
 
         # 2026-11-05（mutation 账本接入判定）：上面那条管的是「被护栏**拒绝**
         # 的写」；这一条管的是「**已经发生**的改动」—— 树护栏在 post 阶段
-        # 量到树被动过，存证、回滚、记了一笔账，而那条 PASSED 是在一棵被它
-        # 自己动过手脚的树上给出的。所以照样改判（arch 决策点 3，缺陷 A 第 3
-        # 条后半）。
+        # 量到树被动过，存证、回滚、记了一笔账。
+        #
+        # 2026-11-07（用户裁定）：这一条原来也改判（理由是「那条 PASSED 是
+        # 在一棵被自己动过手脚的树上给出的」）。裁定是：**回滚已经发生了，就
+        # 没有必要再因为「改了树」去失败这个 VP、更不能因此停掉迭代**。所以
+        # 它现在只记一条 warning（日志 + freshness 事件），把事实附到
+        # evidence 里，**不改 status**。
         verdict = self._apply_mutation_evidence(verdict, vp_id)
 
         # 2026-11-03（arch 决策点 2）：记下这次尝试真正用的 provider。
@@ -16229,7 +16233,7 @@ class Orchestrator:
         )
 
     def _apply_mutation_evidence(self, verdict: Verdict, vp_id: str) -> Verdict:
-        """A VP that mutated the tree it verified gets no PASSED.
+        """A VP that mutated the tree it verified is recorded, not failed.
 
         2026-11-05（mutation 账本接入判定）：写护栏拒绝的写由
         :meth:`_apply_refusal_evidence` 改判；这一条管的是**没被拒绝、但
@@ -16241,22 +16245,37 @@ class Orchestrator:
           3. **记账** —— 把这一轮发生过什么写进
              ``<plan>/.pdt/vp_write_scope/mutations/round-<n>/<vp>.jsonl``。
 
-        子 agent 读不到这份账本（它只看到一棵**已经复原**的树），所以它
-        照样交回一个 PASSED —— 而那条 PASSED 是在一棵**它自己动过手脚**
-        的树上给出的：结论的依据已经不可采信（arch 决策点 3，缺陷 A 第 3
-        条后半）。所以有 mutation 记录的 VP 一律改判 FAILED。
+        2026-11-07（用户裁定）：这一条原来把有 mutation 记录的 VP **一律改判
+        FAILED**（arch 决策点 3，缺陷 A 第 3 条后半），理由是「那条 PASSED
+        是在一棵被自己动过手脚的树上给出的」。裁定是：**回滚已经发生了，就
+        没有必要再因为「改了树」去失败这个 VP、更不能因此停掉迭代**。实测
+        的后果是 12 个 VP 被改判 FAILED（其中一条账本记录的命令**全是只读
+        命令**），Phase 2 关卡据此把别的 VP 延后，整轮停在第 1 轮。
 
-        改判后的失败分类是 ``infra``：出问题的不是交付物，是这次尝试本身
-        出了 malfunction。来源是 ``deterministic``：这个分类是**按规则推
-        出来的**，不是模型说的。
+        所以这里降级成**一条 warning**：
+
+          - 记一条 WARNING 日志（vp_id / round / created / modified /
+            deleted / patch）；
+          - 继续写 freshness 事件 ``verifier_mutated_tree``（运营靠它对账
+            本），事件里加 ``"severity": "warning"`` —— 让读事件的人知道它
+            **不再是否决**；
+          - 把「本 VP 改过树」这条事实附到 verdict 的 **evidence** 里（保留
+            可追溯性），**不改 status**、不改 reasons、不写失败分类。
+
+        **不动的东西**：round-end 的 ``quarantine_and_restore``（存证 + 回滚）
+        照旧；账本照旧写。
+
+        与 :meth:`_apply_refusal_evidence` 是**两条路径**：护栏**当场拒绝**
+        的写（``verifier_mutated_tree: 尝试写 …``）没有发生、树是干净的，
+        那一条**仍然改判**，本方法不碰它。
 
         只读**本 VP、本轮**的记录 —— 别的 VP 改过树不该算在这个 VP 头上，
         别的轮次的记录也不该算进这一轮。provider / chosen_model /
-        model_complexity 沿用原 verdict：路由是这次尝试的事实，改判结论
-        不改变它。
+        model_complexity 沿用原 verdict：路由是这次尝试的事实。
 
-        账本读不出来 → 原样返回 verdict。账本坏了，不等于这个 VP 越权了；
-        拿一个读不出来的账本去否证一个 VP，比放过它更坏。
+        账本读不出来 → 原样返回 verdict（只记一条 warning，措辞是「路径未
+        记录」）。账本坏了，不等于这个 VP 越权了；拿一个读不出来的账本去
+        否证一个 VP，比放过它更坏。
 
         事件 ``verifier_mutated_tree`` **一条账本记录一条**：事件里的字段
         就是账本那一行的原文，运营拿事件就能对上账本。
@@ -16266,8 +16285,9 @@ class Orchestrator:
             vp_id: The VP the verdict belongs to.
 
         Returns:
-            The rewritten verdict, or the original one when there is no
-            mutation evidence for this VP in this round.
+            The verdict with the mutation fact attached to its evidence, or
+            the original one when there is no mutation evidence for this VP
+            in this round.
         """
         plan_dir = getattr(self, "plan_dir", None)
         if not plan_dir:
@@ -16280,6 +16300,14 @@ class Orchestrator:
         except Exception:  # pragma: no cover - defensive
             logger.exception(
                 "[verification_tree_guard] could not read %s's mutations", vp_id,
+            )
+            # 账本读不出来 → 仍然只是 warning（路径未记录），verdict 原样。
+            # 账本坏了不等于这个 VP 越权了 —— 它更不能变成一次改判。
+            logger.warning(
+                "[verification_tree_guard] vp=%s round=%s — could not read the "
+                "mutation ledger (路径未记录); recorded as a WARNING, the "
+                "verdict is NOT rewritten",
+                vp_id, round_no,
             )
             return verdict
 
@@ -16295,19 +16323,10 @@ class Orchestrator:
                     if path not in changed:
                         changed.append(path)
 
-        reasons = [f"verifier_mutated_tree: 改动 {path}" for path in changed]
-        if not reasons:
-            # 账本里有一条记录，却没记下改了哪个文件 —— 照样不可采信：
-            # 连改了什么都不记得的 VP，更没有理由拿 PASSED。
-            reasons.append("verifier_mutated_tree: 改动被验证树（路径未记录）")
-
-        # 拒绝证据的改判已经在上面发生过了 —— 那是另一条证据、另一个原因，
-        # 不许在这里被抹掉。
-        reasons.extend(
-            reason for reason in verdict.reasons
-            if str(reason).startswith("verifier_mutated_tree:")
-        )
-
+        # 「本 VP 改过树」这条事实进 evidence，不进 reasons —— reasons 是
+        # 判定层对外说的「为什么这个 VP 没过」，而这条 warning 不否决任何
+        # 东西。措辞里保留「路径未记录」的语义：账本记了有这么一笔，却没
+        # 记下改了哪个文件 —— 运营看到的仍是同一件事。
         evidence: List[str] = list(verdict.evidence)
         for record in records:
             tool_use_id = str(record.get("tool_use_id") or "unknown")
@@ -16315,45 +16334,74 @@ class Orchestrator:
             for bucket in ("created", "modified", "deleted"):
                 for path in self._mutation_paths(record, bucket):
                     evidence.append(f"{tool_use_id} → {path}（{command}）")
+        if changed:
+            evidence.append(
+                "verifier_mutated_tree(warning): 本 VP 改过被验证树（已回滚，"
+                f"不改判）：{'、'.join(changed)}",
+            )
+        else:
+            evidence.append(
+                "verifier_mutated_tree(warning): 本 VP 改过被验证树"
+                "（已回滚，路径未记录，不改判）",
+            )
 
         for record in records:
+            created = self._mutation_paths(record, "created")
+            modified = self._mutation_paths(record, "modified")
+            deleted = self._mutation_paths(record, "deleted")
+            patch = record.get("patch")
+
+            # 2026-11-07（用户裁定）：改判降级成 warning —— 记一条日志，
+            # 让运营在日志里就能看见「这个 VP 动过被验证的树」。
+            logger.warning(
+                "[verification_tree_guard] vp=%s round=%s mutated the tree "
+                "under verification (created=%s modified=%s deleted=%s "
+                "patch=%s) — the tree was restored; recorded as a WARNING, "
+                "the verdict is NOT rewritten",
+                vp_id, round_no, created, modified, deleted, patch,
+            )
+
             event: Dict[str, Any] = {
                 "vp_id": vp_id,
                 "round": round_no,
-                "created": self._mutation_paths(record, "created"),
-                "modified": self._mutation_paths(record, "modified"),
-                "deleted": self._mutation_paths(record, "deleted"),
-                "patch": record.get("patch"),
+                "created": created,
+                "modified": modified,
+                "deleted": deleted,
+                "patch": patch,
                 "command": str(record.get("command") or ""),
                 "tool_use_id": str(record.get("tool_use_id") or ""),
                 # How many mutations this VP made in this round — a path
                 # touched twice is one path but two attempts, and the
                 # operator wants both numbers.
                 "count": len(records),
+                # 2026-11-07：这条事件**不再是否决** —— 它只报告「这个 VP
+                # 动过被验证的树」。读事件的人（运营）据此知道它不再改判。
+                "severity": "warning",
             }
             try:
                 self._safe_log_freshness_event(
                     vp_id, "verifier_mutated_tree", event,
                 )
             except Exception:  # pragma: no cover - defensive
-                # The verdict is already rewritten; losing the event is
-                # bad, losing the round over it is worse.
+                # Losing the event is bad, losing the round over it is
+                # worse.
                 logger.exception(
                     "[verification_tree_guard] could not record the mutation event",
                 )
 
+        # 原样交回：status、reasons、失败分类都不动。provider /
+        # chosen_model / model_complexity 沿用原 verdict —— 路由是这次尝试
+        # 的事实，记一条 warning 不改变它。
         return Verdict(
-            verdict="FAILED",
-            reasons=reasons,
+            verdict=verdict.verdict,
+            reasons=list(verdict.reasons),
             evidence=evidence,
             provider=verdict.provider,
             chosen_model=verdict.chosen_model,
             model_complexity=verdict.model_complexity,
-            failure_class=INFRA_FAILURE_CLASS,
-            failure_class_source=DETERMINISTIC_FAILURE_CLASS_SOURCE,
-            # The quote has to appear verbatim in the reason text — it is
-            # the anchor a human reads before acting on the claim.
-            evidence_quote=reasons[0],
+            failure_class=verdict.failure_class,
+            failure_class_source=verdict.failure_class_source,
+            evidence_quote=verdict.evidence_quote,
         )
 
     @staticmethod
