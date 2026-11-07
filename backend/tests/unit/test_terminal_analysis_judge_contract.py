@@ -66,7 +66,7 @@ _PAYLOAD = {
     "context": "第 3 轮终局停止",
     "problem": "0 条修复任务，链路无法自愈",
     "evidence": ["VP-3 连续 3 轮失败"],
-    "recommendation": "accept_as_failed",
+    "recommendation": "revise_criterion",
     "recommendation_reason": "同一失败已重复 3 轮",
     "uncertainty": "无法判断是否环境问题",
 }
@@ -165,7 +165,7 @@ def test_success_accepts_a_json_string_answer():
     analysis = _analyze(judge)
 
     assert analysis is not None, "a JSON string answer was thrown away"
-    assert analysis["recommendation"] == "accept_as_failed"
+    assert analysis["recommendation"] == "revise_criterion"
     assert analysis["evidence"] == _PAYLOAD["evidence"]
 
 

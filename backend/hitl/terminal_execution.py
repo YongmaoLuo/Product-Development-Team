@@ -3,11 +3,11 @@
 Why this module exists
 ======================
 The terminal round of the verification loop stops and asks a human what
-happens next.  :mod:`hitl.terminal_action` gave the three answers a
-name each, so that an answer could be *resolved* to an action.  But a
-name is not an execution: nothing reset the round, nothing started it
-again, nothing closed a plan as failed and nothing generated repair
-tasks.  The answer was written down and the backend carried on as if
+happens next.  :mod:`hitl.terminal_action` gave the answers a name
+each, so that an answer could be *resolved* to an action.  But a name
+is not an execution: nothing reset the round, nothing started it
+again, nothing obsoleted a failed point and nothing closed a plan as
+failed.  The answer was written down and the backend carried on as if
 nobody had been asked.
 
 This module is where an answer becomes a **call**.
@@ -16,10 +16,11 @@ Two failure modes it exists to prevent
 --------------------------------------
 
 **The chosen option was ignored.**  Every answer used to take the same
-path, so *accept the failure* and *rerun this round* were
-indistinguishable downstream.  Here each action calls exactly the port
-method it names, and nothing else: *accept the failure* closes the
-plan and stops — it does not start the round again.
+path, so the options were indistinguishable downstream.  Here each
+action calls exactly the port method it names, and nothing else:
+*revise the criterion* obsoletes the failed points and starts the
+round again — it does not close the plan, and it does not generate
+repair tasks.
 
 **A failed execution lost the answer.**  The answer is already in the
 database by the time this runs.  If executing it raised, the human's
@@ -85,10 +86,11 @@ from typing import Any, Callable, Dict, Optional, Protocol, runtime_checkable
 from config_paths import resolve_state_db_path
 from hitl.store import HitlStore
 from hitl.terminal_action import (
-    TERMINAL_ACTION_AGENT,
     TERMINAL_ACTION_CLOSE_AS_FAILED,
     TERMINAL_ACTION_GENERATE_REPAIR_TASKS,
     TERMINAL_ACTION_RESET_AND_START,
+    TERMINAL_ACTION_REVISE_CRITERION,
+    TERMINAL_ACTION_UNKNOWN,
     resolve_action,
 )
 
@@ -132,7 +134,13 @@ class TerminalExecutionPort(Protocol):
     scheduler, or — in a test — a recorder.
     """
 
-    def reset(self, plan_id: str, *, clear_artifacts: bool = True) -> Any:
+    def reset(
+        self,
+        plan_id: str,
+        *,
+        clear_artifacts: bool = True,
+        clear_root_cause_chain: bool = True,
+    ) -> Any:
         """Reset the round's state so it can run again."""
         ...
 
@@ -148,8 +156,8 @@ class TerminalExecutionPort(Protocol):
         """Turn the failed points into repair tasks; return how many."""
         ...
 
-    def resume_agent(self, plan_id: str, record: Any, note: str) -> Any:
-        """Hand the round back to the agent, with the human's own words."""
+    def revise_criterion(self, plan_id: str, record: Any) -> int:
+        """Obsolete the round's failed points; return how many."""
         ...
 # ---------------------------------------------------------------------------
 # The audit
@@ -256,14 +264,17 @@ def execute_terminal_decision(
     """Carry the action the given answer asks for, and report what happened.
 
     The answer is resolved through
-    :func:`hitl.terminal_action.resolve_action`, so an answer the
-    option table does not contain goes to the agent with the human's
-    own words attached.
+    :func:`hitl.terminal_action.resolve_action`.  An answer that names
+    no option at all is **not** carried out: it is reported as a failed
+    decision, audited, and the plan is left alone.  There is no
+    interpreter any more — a human who wants something the menu does
+    not offer does it outside the framework.
 
     The result always carries ``action`` (what was asked for),
     ``status`` (``"done"`` or ``"failed"``) and ``error`` (``None``, or
-    the failure as it happened).  The *generate repair tasks* action
-    also reports ``count`` — how many tasks were generated.
+    the failure as it happened).  The *revise the criterion* and
+    *generate repair tasks* actions also report ``count`` — how many
+    points were obsoleted, how many tasks were generated.
 
     **This function never raises.**  A step that fails produces a
     ``failed`` result and one audit line; the answer that caused it is
@@ -273,6 +284,27 @@ def execute_terminal_decision(
     audit_fn = audit if audit is not None else _default_audit
     resolved_record: Optional[Mapping[str, Any]] = record
 
+    if action == TERMINAL_ACTION_UNKNOWN:
+        # The human wrote something that is not one of the options.
+        # Nothing is guessed on their behalf: the decision is recorded
+        # as failed, the failure is audited, and the plan is not
+        # touched.
+        error = "answer is not a terminal option"
+        logger.warning(
+            "terminal execution cannot run for plan %s (decision %s): %s",
+            plan_id,
+            decision_id,
+            error,
+        )
+        _audit_failure(
+            audit_fn,
+            plan_id=plan_id,
+            decision_id=decision_id,
+            action=action,
+            error=error,
+        )
+        return {"action": action, "status": STATUS_FAILED, "error": error}
+
     try:
         if port is None:
             raise ValueError("no execution port was supplied")
@@ -280,18 +312,19 @@ def execute_terminal_decision(
         resolved_record = _resolve_record(record, plan_dir)
 
         if action == TERMINAL_ACTION_RESET_AND_START:
-            port.reset(plan_id)
+            # The chain goes with the reset: a round that restarts with
+            # the chain still hanging on it walks straight back into the
+            # terminal branch, which is the state the human asked to
+            # get out of.
+            port.reset(plan_id, clear_root_cause_chain=True)
             port.start(plan_id)
             return {"action": action, "status": STATUS_DONE, "error": None}
 
-        if action == TERMINAL_ACTION_CLOSE_AS_FAILED:
-            # Deliberately terminal: accepting the failure must not
-            # start the round again.
-            port.close_as_failed(plan_id)
-            return {"action": action, "status": STATUS_DONE, "error": None}
-
-        if action == TERMINAL_ACTION_GENERATE_REPAIR_TASKS:
-            count = port.generate_repair_tasks(plan_id, resolved_record)
+        if action == TERMINAL_ACTION_REVISE_CRITERION:
+            # The failed points are obsoleted (the criterion they
+            # carried is wrong; the new one is written outside the
+            # framework), and the round carries on without them.
+            count = port.revise_criterion(plan_id, resolved_record)
             port.start(plan_id)
             return {
                 "action": action,
@@ -300,11 +333,24 @@ def execute_terminal_decision(
                 "count": count,
             }
 
-        # agent_interpret — nobody knows what the human meant, so the
-        # agent reads it, with the record that was written next to it.
-        if action == TERMINAL_ACTION_AGENT:
-            port.resume_agent(plan_id, resolved_record, note)
+        if action == TERMINAL_ACTION_CLOSE_AS_FAILED:
+            # Deliberately terminal: accepting the failure must not
+            # start the round again.  Retired from the menu, but a
+            # decision recorded before 2026-11-06 still names it.
+            port.close_as_failed(plan_id)
             return {"action": action, "status": STATUS_DONE, "error": None}
+
+        if action == TERMINAL_ACTION_GENERATE_REPAIR_TASKS:
+            # Retired from the menu, but a decision recorded before
+            # 2026-11-06 still names it.
+            count = port.generate_repair_tasks(plan_id, resolved_record)
+            port.start(plan_id)
+            return {
+                "action": action,
+                "status": STATUS_DONE,
+                "error": None,
+                "count": count,
+            }
 
         # An action outside the terminal vocabulary is a bug upstream, not
         # something to guess at: it is audited like any other failure.

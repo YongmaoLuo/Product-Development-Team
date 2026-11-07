@@ -21,7 +21,7 @@ What is pinned here
    than ten failed points are cut too, and the count of the ones left out
    is stated — a judge that silently sees ten of twelve failures does not
    know it is missing two.
-4. **The three actions are spelled out.**  The judge is told which
+4. **The actions are spelled out.**  The judge is told which
    answers exist and what each one means, in the language the human who
    reads the result will read.
 5. **The recommendation vocabulary is the orchestrator's.**  The module
@@ -226,31 +226,29 @@ def test_build_prompt_tolerates_missing_and_none_fields():
 
 
 # ---------------------------------------------------------------------------
-# 4. The three actions are spelled out
+# 4. The actions are spelled out
 # ---------------------------------------------------------------------------
 
 
-def test_build_prompt_lists_all_three_actions():
+def test_build_prompt_lists_both_actions():
     """Every recommendation id is offered, with its Chinese meaning."""
     module = _terminal_analysis()
     prompt = _build(_judge(), [_point()])
 
     assert module.RECOMMENDATIONS == (
         "rerun_this_round",
-        "accept_as_failed",
-        "manual_repair_tasks",
+        "revise_criterion",
     )
     for recommendation in module.RECOMMENDATIONS:
         assert recommendation in prompt, (
             f"the prompt does not offer {recommendation!r}"
         )
     assert "重跑本轮" in prompt, "rerun_this_round is not explained in Chinese"
-    assert "接受失败" in prompt, "accept_as_failed is not explained in Chinese"
-    assert "人工修复" in prompt, "manual_repair_tasks is not explained in Chinese"
+    assert "修订判据" in prompt, "revise_criterion is not explained in Chinese"
 
 
 def test_system_prompt_states_its_rules():
-    """The system prompt says: read-only, no invention, three choices, JSON."""
+    """The system prompt says: read-only, no invention, two choices, JSON."""
     system_prompt = _judge().build_system_prompt()
 
     assert "READ ONLY" in system_prompt, "the read-only rule is not stated"

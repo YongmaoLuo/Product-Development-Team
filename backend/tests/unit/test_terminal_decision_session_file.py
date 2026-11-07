@@ -58,7 +58,7 @@ def _analysis():
         "context": "第三轮验证停在登录接口",
         "problem": "登录接口返回 500，不是预期结果",
         "evidence": ["VP-3 失败"],
-        "recommendation": "accept_as_failed",
+        "recommendation": "revise_criterion",
         "recommendation_reason": "缺陷已定性，重跑不会改变结果",
         "uncertainty": "没有看过服务端日志",
     }

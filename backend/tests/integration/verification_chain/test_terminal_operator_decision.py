@@ -14,7 +14,7 @@
 --------
 1. ``test_terminal_round_creates_one_decidable_operator_question`` —— 终局轮次
    **恰一条**决策：问的是这个计划（不是某一个点），问题里带着事实，选项是
-   三个固定语义，``default_option`` 在选项之内。
+   两个固定语义，``default_option`` 在选项之内。
 2. ``test_passing_round_creates_no_operator_question`` —— 全 PASSED 的轮次
    **一条决策也不产生**（负控：接线不能过宽）。
 3. ``test_terminal_round_keeps_its_existing_outcome`` —— 接线**不改变**终局
@@ -108,7 +108,11 @@ for _entry in (_BACKEND_DIR, _REPO_ROOT):
         sys.path.insert(0, str(_entry))
 
 import hitl.service  # noqa: E402
-from verification.orchestrator import VerificationOrchestrator  # noqa: E402
+from verification.orchestrator import (  # noqa: E402
+    TERMINAL_DEFAULT_OPTION as LIVE_TERMINAL_DEFAULT_OPTION,
+    TERMINAL_OPTIONS as LIVE_TERMINAL_OPTIONS,
+    VerificationOrchestrator,
+)
 
 
 pytestmark = pytest.mark.integration
@@ -135,12 +139,18 @@ ROOT_CAUSE_REPORT_NAME = f"root-cause-{VP_ID}.md"
 #: ``files_to_modify`` comes from exactly these paths.
 REPORT_SCOPE = ["backend/app/service.py", "backend/app/handler.py"]
 
-#: The three answers a terminal question offers — the three things that
-#: can happen to a plan whose repair path ran out.
-TERMINAL_OPTIONS = ["rerun_this_round", "accept_as_failed", "manual_repair_tasks"]
+#: The answers a terminal question offers — the two things that can
+#: happen to a plan whose repair path ran out.
+#:
+#: Pinned here **as a literal** on purpose: the assertion that the
+#: question carries this menu is what gives the menu a meaning, and an
+#: assertion that compared the question against the orchestrator's own
+#: constant would prove nothing at all.  The copy cannot go stale
+#: silently — the test below checks it against that constant.
+TERMINAL_OPTIONS = ["rerun_this_round", "revise_criterion"]
 
 #: The answer a terminal question falls back to when nobody replies.
-TERMINAL_DEFAULT_OPTION = "accept_as_failed"
+TERMINAL_DEFAULT_OPTION = "rerun_this_round"
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +400,28 @@ def run_orchestrator_rounds(rounds, plan_dir, project_dir):
 
 
 # ---------------------------------------------------------------------------
+# 0. 抄本不能与编排器悄悄脱节
+# ---------------------------------------------------------------------------
+
+
+def test_the_pinned_menu_is_the_one_the_orchestrator_offers():
+    """抄的菜单必须就是编排器现在发的那一张。
+
+    上面那两个常量是**抄**的：断言要拿它们去钉菜单的内容，抄本才有意义；
+    但抄本会过期，而且过期时最危险的地方是**没人发现**。所以这里把它和
+    编排器自己的常量对一遍——菜单变了而抄本没跟上，这一条先红。
+    """
+    assert list(LIVE_TERMINAL_OPTIONS) == TERMINAL_OPTIONS, (
+        "the pinned menu is not the orchestrator's menu: "
+        f"{list(LIVE_TERMINAL_OPTIONS)!r} != {TERMINAL_OPTIONS!r}"
+    )
+    assert LIVE_TERMINAL_DEFAULT_OPTION == TERMINAL_DEFAULT_OPTION, (
+        "the pinned fallback answer is not the orchestrator's: "
+        f"{LIVE_TERMINAL_DEFAULT_OPTION!r} != {TERMINAL_DEFAULT_OPTION!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 1. 终局轮次创建一条可决策的问题
 # ---------------------------------------------------------------------------
 
@@ -460,9 +492,9 @@ def test_terminal_round_creates_one_decidable_operator_question(
         f"how many repair tasks the round produced: {question!r}"
     )
 
-    # 三个固定语义的选项，默认项在选项之内。
+    # 两个固定语义的选项，默认项在选项之内。
     assert request.options == TERMINAL_OPTIONS, (
-        f"the three answers on the table: {request.options!r}"
+        f"the two answers on the table: {request.options!r}"
     )
     assert request.default_option in request.options, (
         f"the fallback answer must be one of the options: "

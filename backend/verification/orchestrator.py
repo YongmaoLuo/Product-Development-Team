@@ -547,6 +547,99 @@ def _chain_is_stale(chain: Mapping[str, Any], head_sha: Optional[str]) -> bool:
     return recorded != current
 
 
+def load_root_cause_chain(plan_dir: Any) -> Dict[str, Any]:
+    """The chain's record: ``{"version", "stage", "vps", "head_sha"}``.
+
+    ``head_sha`` (2026-11-05) is the commit the chain describes —
+    ``None`` when the record does not say (a record written before the
+    chain carried one).
+
+    A record that cannot be read is an **empty** chain, not an error:
+    the worst a lost record can do is send the plan back to the
+    repair path it came from, and a round must never die because a
+    file is unreadable.
+
+    This is the module-level form of
+    :meth:`VerificationOrchestrator._load_root_cause_chain`, and the
+    two read the same file the same way: the chain is read by more
+    than one caller (the orchestrator itself, and the terminal
+    decision port that takes a point off the chain), and two readers
+    that disagree about the record's shape would be two truths about
+    the same file.
+    """
+    empty = {
+        "version": 1,
+        "stage": "",
+        "vps": {},
+        "head_sha": None,
+    }
+    path = Path(plan_dir) / _ROOT_CAUSE_CHAIN_FILENAME
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return empty
+    if not isinstance(raw, dict):
+        return empty
+    vps = raw.get("vps")
+    clean: Dict[str, Dict[str, Any]] = {}
+    if isinstance(vps, dict):
+        for vp_id, entry in vps.items():
+            if not isinstance(vp_id, str) or not vp_id:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            kept = dict(entry)
+            # 2026-11-06: a record written before the stage rename
+            # still says ``BLOCKED_ON_USER``.  It is normalised **in
+            # memory** — the point stays on the chain and keeps
+            # saying "the machine is out of road" — and the next
+            # write of the record lands the current name.
+            if "stage" in kept:
+                kept["stage"] = _normalise_chain_stage(kept["stage"])
+            clean[vp_id] = kept
+    return {
+        "version": 1,
+        "stage": _normalise_chain_stage(raw.get("stage")),
+        "vps": clean,
+        # 2026-11-05: the commit the chain describes. A record
+        # written before the chain carried one reads as "unknown"
+        # (``None``) — not as an error, and not as some sha.
+        "head_sha": _recorded_head_sha(raw.get("head_sha")),
+    }
+
+
+def save_root_cause_chain(plan_dir: Any, payload: Mapping[str, Any]) -> None:
+    """Write the chain's record.
+
+    Best-effort and atomic, like every other record the orchestrator
+    keeps: a write failure must never abort a round that has already
+    reached its verdict, and a reader must never see half a file.
+
+    2026-11-05: the record always carries ``head_sha`` — the commit
+    the chain describes, or ``None`` when it does not describe one.
+    The field is nullable on purpose: a reader must be able to ask the
+    question without guarding for its absence.
+
+    This is the module-level form of
+    :meth:`VerificationOrchestrator._save_root_cause_chain`; it writes
+    the same file, in the same shape, as the method does.
+    """
+    record = dict(payload)
+    record["head_sha"] = _recorded_head_sha(record.get("head_sha"))
+    path = Path(plan_dir) / _ROOT_CAUSE_CHAIN_FILENAME
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(record, handle, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def _is_counted_failure(key: Tuple[str, str]) -> bool:
     """Whether this failure may move the same-cause counter.
 
@@ -634,24 +727,40 @@ OUT_OF_SCOPE_DEFAULT_OPTION = "skip_the_check"
 #: The answers a terminal question offers.
 #:
 #: The chain's terminal branch stopped — the repair path could not get
-#: the plan further — and a human has to say what happens next.  The
-#: three answers are the three things that can happen to a stuck plan:
-#: try the round again from the start, close the plan out as failed
-#: without blocking anything, or turn the failure into manual repair
-#: tasks for someone to work through.
+#: the plan further — and a human has to say what happens next.  There
+#: are two answers, and they are the two things that are actually
+#: different from each other:
+#:
+#: * ``rerun_this_round`` — try the round again from the start, with
+#:   the chain cleared so the round is not stopped by the same thing
+#:   twice;
+#: * ``revise_criterion`` — the criterion the round failed on is wrong,
+#:   not the deliverable: the failed points are marked obsolete (the
+#:   new criterion is written by the operator, outside the framework)
+#:   and the round carries on without them.
+#:
+#: *Accepting* the failure and *generating repair tasks* used to be on
+#: this list.  Neither was an option: accepting a failure is giving up
+#: rather than choosing, and the repair-task answer differed from
+#: *rerun this round* only by "with or without a task list".  The
+#: decisions recorded before this change still name them, and they
+#: still resolve — see :mod:`hitl.terminal_action`.
 TERMINAL_OPTIONS = (
     "rerun_this_round",
-    "accept_as_failed",
-    "manual_repair_tasks",
+    "revise_criterion",
 )
 
 #: The answer a terminal question falls back to when nobody replies.
 #:
-#: The conservative reading of a stopped chain: the plan does not
-#: finish successfully, but it also does not block on a question nobody
-#: is there to answer.  The round is recorded as failed and the run
-#: moves on.
-TERMINAL_DEFAULT_OPTION = "accept_as_failed"
+#: The conservative reading of a stopped chain: the fallback must not
+#: change what the plan *is*.  *Revise the criterion* obsoletes
+#: acceptance criteria — the plan would carry on with fewer of them,
+#: and could then pass where it had failed — so it is not a fallback
+#: for a question nobody was there to answer.  *Rerun this round*
+#: changes nothing about the plan: the round runs again, and if it
+#: fails the same way the plan is asked again (once per round
+#: attempt).
+TERMINAL_DEFAULT_OPTION = "rerun_this_round"
 
 #: The statuses that are **not** a failure.
 #:
@@ -2377,82 +2486,20 @@ class VerificationOrchestrator:
     def _load_root_cause_chain(self) -> Dict[str, Any]:
         """The chain's record: ``{"version", "stage", "vps", "head_sha"}``.
 
-        ``head_sha`` (2026-11-05) is the commit the chain describes —
-        ``None`` when the record does not say (a record written before
-        the chain carried one).
-
-        A record that cannot be read is an **empty** chain, not an error:
-        the worst a lost record can do is send the plan back to the
-        repair path it came from, and a round must never die because a
-        file is unreadable.
+        The module-level :func:`load_root_cause_chain` does the reading;
+        this method is the chain's own reader asking the same question
+        the same way, so the two cannot drift.
         """
-        empty = {
-            "version": 1,
-            "stage": "",
-            "vps": {},
-            "head_sha": None,
-        }
-        try:
-            raw = json.loads(
-                self._root_cause_chain_path().read_text(encoding="utf-8")
-            )
-        except (OSError, ValueError):
-            return empty
-        if not isinstance(raw, dict):
-            return empty
-        vps = raw.get("vps")
-        clean: Dict[str, Dict[str, Any]] = {}
-        if isinstance(vps, dict):
-            for vp_id, entry in vps.items():
-                if not isinstance(vp_id, str) or not vp_id:
-                    continue
-                if not isinstance(entry, dict):
-                    continue
-                kept = dict(entry)
-                # 2026-11-06: a record written before the stage rename
-                # still says ``BLOCKED_ON_USER``.  It is normalised **in
-                # memory** — the point stays on the chain and keeps
-                # saying "the machine is out of road" — and the next
-                # write of the record lands the current name.
-                if "stage" in kept:
-                    kept["stage"] = _normalise_chain_stage(kept["stage"])
-                clean[vp_id] = kept
-        return {
-            "version": 1,
-            "stage": _normalise_chain_stage(raw.get("stage")),
-            "vps": clean,
-            # 2026-11-05: the commit the chain describes. A record
-            # written before the chain carried one reads as "unknown"
-            # (``None``) — not as an error, and not as some sha.
-            "head_sha": _recorded_head_sha(raw.get("head_sha")),
-        }
+        return load_root_cause_chain(self.plan_dir)
 
     def _save_root_cause_chain(self, payload: Mapping[str, Any]) -> None:
         """Write the chain's record.
 
-        Best-effort and atomic, like every other record the orchestrator
-        keeps: a write failure must never abort a round that has already
-        reached its verdict, and a reader must never see half a file.
-
-        2026-11-05: the record always carries ``head_sha`` — the commit
-        the chain describes, or ``None`` when it does not describe one.
-        The field is nullable on purpose: a reader must be able to ask
-        the question without guarding for its absence.
+        The module-level :func:`save_root_cause_chain` does the writing;
+        this method is the chain's own writer asking the same question
+        the same way, so the two cannot drift.
         """
-        record = dict(payload)
-        record["head_sha"] = _recorded_head_sha(record.get("head_sha"))
-        path = self._root_cause_chain_path()
-        tmp = path.with_name(path.name + ".tmp")
-        try:
-            tmp.parent.mkdir(parents=True, exist_ok=True)
-            with tmp.open("w", encoding="utf-8") as handle:
-                json.dump(record, handle, ensure_ascii=False)
-            os.replace(tmp, path)
-        except OSError:
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
+        save_root_cause_chain(self.plan_dir, payload)
 
     def _clear_root_cause_chain(self) -> None:
         """Forget the chain — the point passed, or the plan moved on."""
