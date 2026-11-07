@@ -202,6 +202,12 @@ ALLOWED_SPAWN_SITES: dict[str, dict[str, str]] = {
             "names; these read the machine, they do not run a harness"
         ),
     },
+    "process_identity.py": {
+        "subprocess.run": (
+            "the process-identity probe asks `ps` about one pid — a "
+            "read-only identity probe, not a harness run"
+        ),
+    },
     "rollback_manager.py": {
         "subprocess.run": "the git commands that roll a change back",
     },
@@ -221,6 +227,12 @@ ALLOWED_SPAWN_SITES: dict[str, dict[str, str]] = {
     "service_restart_agent.py": {
         "subprocess.run": "the restart agent's own probes",
         "subprocess.Popen": "the restart agent's own children",
+    },
+    "tree_snapshot.py": {
+        "subprocess.run": (
+            "the tree snapshot runs `git` against the project to record what "
+            "the working tree looked like — a read-only probe, not a harness run"
+        ),
     },
     "utils/secret_sweep.py": {
         "subprocess.run": "the ps probe that finds the live --settings paths to redact",
@@ -243,8 +255,26 @@ ALLOWED_SPAWN_SITES: dict[str, dict[str, str]] = {
             "rollback manager make, and not a harness run"
         ),
     },
+    "verification_quarantine.py": {
+        "subprocess.run": (
+            "the quarantine bookkeeping runs `git` over the quarantined tree "
+            "— a read-only probe, not a harness run"
+        ),
+    },
+    "verification_round_scope.py": {
+        "subprocess.run": (
+            "the round-scope probe runs `git` to read a round's tree scope — "
+            "a read-only probe, not a harness run"
+        ),
+    },
     "verification_rules.py": {
         "subprocess.run": "the git log a rule is evaluated against",
+    },
+    "verification_tree_guard.py": {
+        "subprocess.run": (
+            "the tree guard runs `git -C <root>` probes and lets each caller "
+            "judge the exit code — a read-only probe, not a harness run"
+        ),
     },
     "vp_split.py": {
         "subprocess.run": "the pytest --collect-only that enumerates the tests to split",

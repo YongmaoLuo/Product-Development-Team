@@ -167,6 +167,11 @@ ALLOWED_MOCK_SITES: dict[str, str] = {
         "child is given can be read back, which is what the temp-sweep "
         "switch assertion is about"
     ),
+    "tests/unit/test_service_spawn_probe_budget.py": (
+        "the budget test replaces Popen with a recorder so the spawn path's "
+        "process count can be asserted without starting a real service; the "
+        "spawn it records is the service manager's own"
+    ),
     "tests/unit/test_service_spawn_tags.py": (
         "the service manager's own child is faked so the marker variables "
         "the child inherits can be read back, which is what the spawn-tag "
@@ -213,6 +218,12 @@ ALLOWED_MOCK_SITES: dict[str, str] = {
     "tests/unit/test_spawn_repro_harness.py": (
         "the service manager's own child is faked so the spawn repro "
         "harness can assert on the argv and the keywords it was given"
+    ),
+    "tests/unit/test_subagent_ledger.py": (
+        "the ledger test wraps Popen so that only the claude spawn raises, "
+        "which is how the 'a failed spawn writes nothing' assertion is made "
+        "without starting the CLI; every other spawn still goes to the real "
+        "Popen, and it predates the harness layer"
     ),
     "tests/unit/test_test_command_rules.py": (
         "a tripwire: the rule must not start a process itself, so any "
