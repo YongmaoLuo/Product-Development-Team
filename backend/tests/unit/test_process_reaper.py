@@ -294,6 +294,105 @@ def test_identity_mismatch_is_reported_and_not_killed(tmp_path):
 # every signal is preceded by its own identity check
 # ---------------------------------------------------------------------------
 
+
+def test_identity_mismatch_event_carries_both_command_lines(tmp_path):
+    """身份对不上时，事件里要同时留下「活着的」和「台账里的」命令行。
+
+    只有 pid / role / reason 的话，事后无法判断这是 pid 被复用，还是
+    bash wrapper exec 换了个名字 —— 两种情况的处理方式不一样，而事件
+    本身不回答这个问题。把两条命令行摆在一起才说得清：活着的进程跑
+    的是什么，台账里记的又是什么。
+
+    判定本身不变：命令行对不上 → 照旧跳过、照旧不发信号。
+    """
+    child = _spawn(["sleep", "30"], cwd=tmp_path)
+    try:
+        ident = _stable_identity(child.pid)
+        assert ident is not None, "the test child has no readable identity"
+
+        # 台账里的命令行故意写成别的：模拟 wrapper exec 之后名字变了。
+        forged_cmdline = ("bash", "-c", "sleep 30")
+        record = ledger.ProcessRecord(
+            plan_id="p1",
+            role="subagent",
+            pid=child.pid,
+            pgid=ident.pgid if ident.pgid else child.pid,
+            create_time=ident.create_time,
+            cmdline=list(forged_cmdline),
+            cwd=ident.cwd or "",
+            owner_pid=os.getpid(),
+            owner_role="backend",
+        )
+        ledger.record_spawn(tmp_path, record)
+
+        outcome = reaper.reap_plan(
+            tmp_path, "p1", reason="stop", grace_seconds=0.5
+        )
+
+        # 判定没变：跳过，不发信号。
+        assert outcome.reaped == []
+        assert outcome.failed == []
+        assert [s["reason"] for s in outcome.skipped] == ["identity_mismatch"]
+        assert child.poll() is None
+
+        events = [
+            e for e in ledger.read_events(tmp_path)
+            if e["event"] == "identity_mismatch"
+        ]
+        assert events, "no identity_mismatch event was written"
+        event = events[0]
+
+        # 两条命令行都在事件里。
+        assert "live_cmdline" in event
+        assert "ledger_cmdline" in event
+        # 活着的进程跑的是它自己的命令行。
+        assert "sleep" in event["live_cmdline"]
+        # 台账里记的是当初写下的那一行。
+        assert event["ledger_cmdline"] == "bash -c sleep 30"
+        # 两者确实不同 —— 这就是身份对不上的原因。
+        assert event["live_cmdline"] != event["ledger_cmdline"]
+        # 事件本身仍然是原来那些字段，没有被这次取证改动。
+        assert event["pid"] == child.pid
+        assert event["role"] == "subagent"
+        assert event["reason"] == "identity_mismatch"
+    finally:
+        _cleanup(child)
+
+
+def test_identity_mismatch_command_lines_are_bounded(tmp_path):
+    """命令行再长，写进事件里也是有界的。"""
+    child = _spawn(["sleep", "30"], cwd=tmp_path)
+    try:
+        ident = _stable_identity(child.pid)
+        assert ident is not None
+
+        long_cmdline = tuple(["x" * 200] * 10)
+        record = ledger.ProcessRecord(
+            plan_id="p1",
+            role="subagent",
+            pid=child.pid,
+            pgid=ident.pgid if ident.pgid else child.pid,
+            create_time=ident.create_time,
+            cmdline=list(long_cmdline),
+            cwd=ident.cwd or "",
+            owner_pid=os.getpid(),
+            owner_role="backend",
+        )
+        ledger.record_spawn(tmp_path, record)
+
+        reaper.reap_plan(tmp_path, "p1", reason="stop", grace_seconds=0.5)
+
+        events = [
+            e for e in ledger.read_events(tmp_path)
+            if e["event"] == "identity_mismatch"
+        ]
+        assert events
+        event = events[0]
+        assert len(event["live_cmdline"]) <= 512
+        assert len(event["ledger_cmdline"]) <= 512
+    finally:
+        _cleanup(child)
+
 def _sigterm_ignoring_child(tmp_path):
     """A child that ignores SIGTERM, so the escalation has to happen.
 

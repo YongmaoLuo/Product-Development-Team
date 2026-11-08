@@ -451,11 +451,11 @@ def test_run_writes_exit_event_after_process_wait(running_plan, monkeypatch):
 
     real_update_status = ExecutionRepository.update_status
 
-    def _spy_update(self, plan_id_arg, status):
+    def _spy_update(self, plan_id_arg, status, stop_reason=None):
         persisted_after.append(
             [e.get("event") for e in ledger.read_events(pdir)]
         )
-        return real_update_status(self, plan_id_arg, status)
+        return real_update_status(self, plan_id_arg, status, stop_reason)
 
     monkeypatch.setattr(ExecutionRepository, "update_status", _spy_update)
 
