@@ -22,11 +22,12 @@ This module pins down the **factual** half of the question:
   the older snapshot's verdict.
 
 And the **analysis** half — the reading of the failure scene, produced
-by the judge and rendered as C/P/E/A/U:
+by the judge and rendered as a decision card:
 
-* **With an analysis the question is the analysis.**  The five
-  sections and the evidence the judge gave replace the one sentence of
-  facts: a person reading the question reads the argument, not a list.
+* **With an analysis the question is the card.**  What has to be
+  decided, the options on the table, the advice and the path of the
+  full report replace the one sentence of facts: a person reading the
+  question reads the decision, not a document.
 * **Without an analysis the question is the old sentence, byte for
   byte.**  The judge is a model call and a model call may fail; a human
   must still be asked something, and what they are asked is exactly
@@ -201,21 +202,28 @@ def test_freshest_entry_wins_when_a_point_appears_twice(orchestrator):
 # ---------------------------------------------------------------------------
 
 
-def test_analysis_success_question_contains_cpea_and_evidence(
+def test_analysis_success_question_is_the_brief_card(
     analysis_orchestrator,
 ):
-    """With an analysis the question carries the five sections and the evidence."""
+    """With an analysis the question is the card a human answers."""
     payload = analysis_orchestrator._terminal_decision_question(
         _report("VP-3"), 2, ["VP-3"], 0,
     )
 
     question = payload["question"]
-    assert question.startswith("## 背景（C）")
-    for heading in (
-        "## 问题（P）", "## 证据（E）", "## 建议（A）", "## 不确定（U）",
-    ):
-        assert heading in question, f"{heading} is missing from the question"
-    assert "VP-3 连续 3 轮失败" in question, "the judge's evidence was dropped"
+    assert question.startswith("【需要你决定】"), (
+        f"the question is not a decision card: {question[:40]!r}"
+    )
+    assert len(question) <= 600, (
+        f"the card is {len(question)} characters, over the cap"
+    )
+    assert len(question.splitlines()) <= 8, (
+        f"the card is {len(question.splitlines())} lines, over the cap"
+    )
+    assert "VP-3" in question, "the failed point is not on the card"
+    assert "rerun_this_round" in question, "the first option is missing"
+    assert "revise_criterion" in question, "the second option is missing"
+    assert "完整分析：" in question, "the card does not point at the report"
 
 
 def test_failure_question_is_byte_identical_golden(orchestrator):
@@ -225,13 +233,15 @@ def test_failure_question_is_byte_identical_golden(orchestrator):
     )
 
     assert payload["question"] == _FACTUAL_QUESTION
-    assert set(payload) == {"question", "options", "default_option"}, (
-        "the fallback payload must still carry the three keys the caller "
+    assert set(payload) == {
+        "question", "options", "default_option", "report_path",
+    }, (
+        "the fallback payload must still carry the four keys the caller "
         "reads — the decision is created either way"
     )
 
 
-def test_question_capped_at_2000_with_twenty_points(analysis_orchestrator):
+def test_question_capped_at_600_with_twenty_points(analysis_orchestrator):
     """Twenty long verdicts still render a question inside the cap."""
     failed_ids = [f"VP-{index}" for index in range(20)]
     analysis_orchestrator._terminal_judge.result = {
@@ -245,7 +255,7 @@ def test_question_capped_at_2000_with_twenty_points(analysis_orchestrator):
         _report(*failed_ids), 2, failed_ids, 0,
     )
 
-    assert len(payload["question"]) <= 2000
+    assert len(payload["question"]) <= 600
 
 
 def test_recommendation_never_changes_default_option(analysis_orchestrator):

@@ -2843,6 +2843,7 @@ class VerificationOrchestrator:
     def _terminal_decision_question(
         self, report, round_number, failed_vp_ids, repair_task_count=0,
         stop_reason: str = "repair_execution_failed",
+        archive_moment: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         """The question the terminal branch puts to a human.
 
@@ -2863,14 +2864,17 @@ class VerificationOrchestrator:
         question about something that did not happen.
 
         When the failure scene has been **analysed** — the judge read
-        it and said what it means — the analysis is the question: the
-        five sections (背景 / 问题 / 证据 / 建议 / 不确定) a person reads
-        before answering, bounded by
-        :data:`verification.terminal_analysis.TERMINAL_QUESTION_MAX_CHARS`.
-        The facts say what happened; the analysis says what it means.
-        The recommendation is written **in the question only** — the
-        three options and the answer the question falls back to when
-        nobody replies are not the judge's to move.
+        it and said what it means — the question is the **decision
+        card**: what has to be decided, the options on the table, the
+        advice and where the full report lives.  The card is bounded by
+        :data:`verification.terminal_analysis.TERMINAL_BRIEF_MAX_CHARS`
+        characters and
+        :data:`verification.terminal_analysis.TERMINAL_BRIEF_MAX_LINES`
+        lines: a person **answers** the question, and nobody answers a
+        document.  The facts say what happened; the card says what to
+        decide about it.  The recommendation is written **in the
+        question only** — the three options and the answer the question
+        falls back to when nobody replies are not the judge's to move.
 
         The analysis is optional, and its absence is invisible.  The
         judge is a model call, and a model call that fails must not
@@ -2900,19 +2904,29 @@ class VerificationOrchestrator:
             machine's vocabulary knows.  It is what the question says
             the round stopped *for*, and what the archive and the
             analysis are recorded under.
+        archive_moment:
+            The clock reading the round's archive is stamped with.
+            ``None`` means "now".  The card quotes the path of the
+            archive **before** the archive is written, so a caller that
+            writes the archive itself hands the same reading to
+            :func:`verification.terminal_decision_session.save_round_archive`
+            and the path on the card is the path the archive lands on.
 
         Returns:
-            The question, the answers on the table and the answer to
-            fall back to — the three things
-            :meth:`_ask_a_human_about` takes.  Never ``None``: the
-            decision is created either way.
+            The question, the answers on the table, the answer to fall
+            back to and the path of the round's archive — the four
+            things the caller reads.  Never ``None``: the decision is
+            created either way.
         """
-        # The import is local on purpose, for the same reason
+        # The imports are local on purpose, for the same reason
         # :meth:`_terminal_judge_for`'s is: ``verification.terminal_analysis``
         # is a module of its own and the orchestrator is the one that
         # reaches for it, so keeping the import inside the method leaves
-        # the two modules unable to drift into an import cycle.
-        from verification.terminal_analysis import render_analysis
+        # the two modules unable to drift into an import cycle.  The
+        # session module is reached for the same reason: the card names
+        # the archive's path, and the archive module owns that path.
+        from verification import terminal_decision_session as session_file
+        from verification.terminal_analysis import render_brief
 
         verdicts: Dict[str, str] = {}
         for entry in self._report_failure_entries(report):
@@ -2935,6 +2949,15 @@ class VerificationOrchestrator:
             f"{str(stop_reason)}: {int(repair_task_count)} repair task(s) "
             f"were generated; failed checks: {reported}. Choose how to proceed."
         )
+        # The card quotes the archive's path, and the card is put to the
+        # human **before** the archive is written — so the path cannot
+        # be read back from the write.  It is computed instead, from the
+        # same round number and the same clock reading the write will
+        # use.  Nothing is written here: the path is a fact about the
+        # round, not a side effect of asking.
+        report_path = session_file.round_archive_path(
+            self.plan_dir, round_number, now=archive_moment,
+        )
         # The analysis is what the failure scene **means**, read by the
         # judge; the sentence above is what **happened**.  When the
         # analysis is there it is the question; when it is not, the
@@ -2946,13 +2969,20 @@ class VerificationOrchestrator:
             stop_reason=stop_reason,
         )
         if isinstance(analysis, Mapping):
-            rendered = render_analysis(analysis)
-            if rendered:
-                question = rendered
+            card = render_brief(
+                analysis,
+                plan_id=self.plan_dir.name,
+                round_number=int(round_number),
+                failed_point_ids=ordered,
+                report_path=str(report_path),
+            )
+            if card:
+                question = card
         return {
             "question": question,
             "options": list(TERMINAL_OPTIONS),
             "default_option": TERMINAL_DEFAULT_OPTION,
+            "report_path": str(report_path),
         }
 
     def _terminal_entries_by_id(
@@ -3485,6 +3515,7 @@ class VerificationOrchestrator:
         analysis: Optional[Dict[str, Any]],
         decision_id: str,
         failed_vp_ids: List[str],
+        now: Optional[datetime] = None,
     ) -> Optional[Path]:
         """Archive this round's terminal analysis — best effort.
 
@@ -3532,6 +3563,13 @@ class VerificationOrchestrator:
             asked.
         failed_vp_ids:
             The verification points that failed.
+        now:
+            The clock reading the archive's file names are stamped with.
+            ``None`` means "now".  The card quotes the archive's path
+            **before** the archive is written, so the branch hands the
+            same reading to the question and to this method: the path on
+            the card is then the path the archive lands on, even when
+            the two straddle a second boundary.
 
         Returns
         -------
@@ -3569,6 +3607,7 @@ class VerificationOrchestrator:
                 decision_id=str(decision_id or ""),
                 failed_vp_ids=list(failed_vp_ids or []),
                 rendered=rendered,
+                now=now,
             )
         except Exception as exc:  # noqa: BLE001 — the round stands
             self._log_audit(
@@ -5270,9 +5309,19 @@ class VerificationOrchestrator:
                 terminal_failed_ids = self._terminal_failed_vp_ids(
                     report, current_failed_ids,
                 )
+                # 2026-11-08: the clock is read **once** for the round.
+                # The card quotes the archive's path before the archive
+                # is written, so the path is computed from a clock
+                # reading — and the write takes its own reading.  Two
+                # readings can straddle a second boundary, and then the
+                # card points at a file that was never written.  One
+                # reading, handed to both, makes the card's path the
+                # path the archive lands on.
+                archive_moment = datetime.now(timezone.utc)
                 terminal_question = self._terminal_decision_question(
                     report, round_number, terminal_failed_ids,
                     stop_reason=stop_reason,
+                    archive_moment=archive_moment,
                 )
                 # 2026-11-06: the round's **analysis** is a fact about
                 # this round, and it is computed whether or not the plan
@@ -5330,6 +5379,7 @@ class VerificationOrchestrator:
                     analysis=self._terminal_last_analysis,
                     decision_id=decision_id,
                     failed_vp_ids=terminal_failed_ids,
+                    now=archive_moment,
                 )
                 # The two flags the round carries are **read**, not
                 # asserted: a question that reached nobody (it may have

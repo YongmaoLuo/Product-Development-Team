@@ -725,15 +725,20 @@ def test_an_analysis_the_renderer_refuses_falls_back_to_the_question(
     assert _read_json(plan_dir)["analysis"] == unusable
 
 
-def test_the_archive_body_is_exactly_what_the_question_reads(
+def test_the_archive_body_is_the_rendered_analysis_not_the_card(
     plan_dir, project_dir, repair_mocks,
 ):
-    """Through the production entry, one rendering serves both readers.
+    """Through the production entry, the archive keeps the report.
 
-    The question a human reads and the archive a reader finds later are
-    one rendering of one analysis — not two renderings that happen to
-    look alike.  Driven through the production entry, because that is
-    where the renderer is.
+    The question a human reads is the **card** — what stopped, what may
+    be chosen, which choice is recommended, and the path of the report.
+    The archive a reader finds later is the **report**: the five CPEA
+    sections, drawn by the report renderer.
+
+    They are two documents, not one.  So the archive's body is the
+    rendered analysis, and it is *not* the card the human was shown: a
+    card kept in the archive would leave the evidence out of the one
+    place the evidence is supposed to live.
     """
     from verification.terminal_analysis import render_analysis
 
@@ -753,4 +758,7 @@ def test_the_archive_body_is_exactly_what_the_question_reads(
     # separates them from the body.
     body = text.split("\n\n", 2)[2].rstrip("\n")
     assert body == render_analysis(_analysis())
-    assert body == asked["question"]
+    assert body != asked["question"], (
+        "the archive's body is the card the human was shown — the card "
+        "is a summary, and the archive is where the whole analysis lives"
+    )

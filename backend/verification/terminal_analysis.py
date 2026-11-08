@@ -120,6 +120,29 @@ missing field, a recommendation outside the actions — all of them
 produce ``""``, and the caller's fallback is the factual question it
 asked before.
 
+What the card guarantees
+========================
+
+**A report and a card are two renderings of one analysis.**
+:func:`render_analysis` is the report: it carries the argument, and it
+is written to the file.  :func:`render_brief` is the card: it is what
+the human reads in the chat window to answer one question — *what do I
+do about this failed round*.  A real analysis is about 3.2KB of CPEA;
+the person reading it had to dig out of it what they were being asked
+to decide.  The card does not shorten the report, it replaces it where
+a question is asked.
+
+**The card is bounded, and it is bounded by what it is for.**  Six
+hundred characters and eight lines: the scene, the options, the advice
+and the path of the report.  The 问题 / 证据 / 不确定 sections go to the
+report, and the card keeps the context's *first sentence*.
+
+**The cut order is the argument order.**  When the card is still too
+long, the *reason* is cut first — it is the one part of the card that
+is an argument rather than a fact.  Only then is the background
+sentence cut.  **The option lines, the recommendation id and the
+report path are never cut**: they are what the human acts on.
+
 What this module deliberately does NOT do
 ==========================================
 
@@ -133,8 +156,9 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+import re
+from collections.abc import Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from coding_tool import JsonSession
@@ -144,11 +168,15 @@ __all__ = [
     "MAX_FAILED_POINTS",
     "MAX_REASON_CHARS",
     "READ_ONLY_TOOLS",
+    "RECOMMENDATION_CONSEQUENCES",
     "RECOMMENDATIONS",
     "RECOMMENDATION_LABELS",
+    "TERMINAL_BRIEF_MAX_CHARS",
+    "TERMINAL_BRIEF_MAX_LINES",
     "TERMINAL_QUESTION_MAX_CHARS",
     "TerminalDecisionJudge",
     "render_analysis",
+    "render_brief",
 ]
 
 logger = logging.getLogger(__name__)
@@ -180,6 +208,19 @@ RECOMMENDATION_LABELS: Dict[str, str] = {
     "revise_criterion": "修订判据（本轮失败的判据作废，由操作者另行补充新判据）",
 }
 
+#: What each recommendation costs, in one sentence.
+#:
+#: The label says what the option *is*; this says what it *does*.  A
+#: person choosing between two options needs the consequence more than
+#: they need the name of the action, and the name alone does not tell
+#: them what they are agreeing to.  Every id in :data:`RECOMMENDATIONS`
+#: has an entry here: an option with no consequence stated is not an
+#: option a person can decide on.
+RECOMMENDATION_CONSEQUENCES: Dict[str, str] = {
+    "rerun_this_round": "环境偶发失败，重跑一轮可能就通过",
+    "revise_criterion": "判据本身有问题，需要人重写判据",
+}
+
 #: The tools the judge may use to investigate.
 #:
 #: **Read-only, on purpose.**  The judge is asked to *understand* a
@@ -207,6 +248,24 @@ MAX_EXPECTED_RESULT_CHARS = 300
 #: is roughly a screen of Chinese prose — enough for the scene, the
 #: problem, the evidence and the uncertainty, and no more.
 TERMINAL_QUESTION_MAX_CHARS = 2000
+
+#: How long the decision card may be, in characters.
+#:
+#: The card is what a human reads in a chat window to answer one
+#: question: *what do I do about this failed round*.  Six hundred
+#: characters is about a screen of Chinese prose — enough for the
+#: scene, the options and the advice, and no more.
+TERMINAL_BRIEF_MAX_CHARS = 600
+
+#: How many lines the decision card may have.
+#:
+#: The card is eight lines by construction: the heading, a blank line,
+#: ``选项：``, one line per option, a blank line, the advice, and the
+#: path of the full report.  A line is a line the reader scans; a card
+#: that scrolls is a report again, which is what the report is for.
+#: Every text that goes on the card is folded into one line first, so
+#: the judge's line breaks cannot make the card longer than this.
+TERMINAL_BRIEF_MAX_LINES = 8
 
 
 # ---------------------------------------------------------------------------
@@ -624,6 +683,320 @@ def render_analysis(
 
 
 # ---------------------------------------------------------------------------
+# The decision card
+# ---------------------------------------------------------------------------
+
+#: The characters a sentence may end with.  The card's first line
+#: carries the *first sentence* of the context and nothing else: the
+#: rest of the context is the report's business, and the report is
+#: where the reader goes when the card is not enough.
+_SENTENCE_BREAKS = re.compile(r"[。！？\n]")
+
+#: The characters a single sentence ends with.  A card renders
+#: sentences, and a sentence on a card does not carry its terminator:
+#: the card is not quoting the analysis, it is naming the scene.
+_SENTENCE_END = "。！？"
+
+
+def _first_sentence(text: str) -> str:
+    """The first sentence of ``text``.
+
+    The cut is at the first sentence break and the break itself is
+    dropped: the card is not quoting the context, it is naming the
+    scene.
+    """
+    cleaned = _clean_body(text)
+    match = _SENTENCE_BREAKS.search(cleaned)
+    if match is not None:
+        cleaned = cleaned[: match.start()]
+    return cleaned.strip()
+
+
+def _as_sentence(text: str) -> str:
+    """The text as one sentence, without its terminator.
+
+    The reason is a sentence the judge wrote; a card that quotes it
+    with the full stop still reads as a quotation of the report, and
+    the report is one click away.
+    """
+    stripped = text.strip()
+    if stripped.endswith(tuple(_SENTENCE_END)):
+        stripped = stripped[:-1].rstrip()
+    return stripped
+
+
+def _option_name(label: str) -> str:
+    """The option's name, without the gloss the label spells out.
+
+    :data:`RECOMMENDATION_LABELS` says what an option *is*, and for
+    one of them it also says what it means in full.  The option list
+    may afford the full spelling — that is where the option is
+    *defined* — but the advice line only has to name the option it
+    recommends, and a name spelled out twice in one card is noise.
+    """
+    name = label.split("（", 1)[0].strip()
+    return name or label
+
+
+def _point_ids(values: Any) -> List[str]:
+    """The failed point ids, cleaned.
+
+    A single id handed over as a string is one id and not a string of
+    characters: the caller may pass either.
+    """
+    if values is None:
+        return []
+    if isinstance(values, str):
+        candidates: Iterable[Any] = (values,)
+    else:
+        try:
+            candidates = list(values)
+        except TypeError:
+            return []
+    ids: List[str] = []
+    for value in candidates:
+        text = _text(value)
+        if text:
+            ids.append(text)
+    return ids
+
+
+def _round_number(value: Any) -> int:
+    """The round number, or zero when it is not one."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return number if number > 0 else 0
+
+
+#: The characters ``str.splitlines()`` cuts a line at.  The card's line
+#: count is measured with ``splitlines()``, so every one of them has to
+#: be folded away before a text is put on the card: a vertical tab is as
+#: much a line break as a newline is.
+_LINE_BREAKS = re.compile(r"[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]+")
+
+
+def _one_line(text: str) -> str:
+    """The text as a single line.
+
+    Every run of line breaks becomes one space, and the edges are
+    stripped: the card is eight lines *by construction*, and a text the
+    judge wrote over several lines must not add lines to it.
+
+    The spaces *inside* the text are left as they are — the text is the
+    judge's, and rewriting it would be paraphrasing it.
+    """
+    return _LINE_BREAKS.sub(" ", text).strip()
+
+
+def _render_brief_card(
+    *,
+    plan_id: str,
+    round_number: int,
+    point_ids: List[str],
+    background: str,
+    reason: str,
+    recommendation: str,
+    report_path: str,
+) -> str:
+    """The card's lines, joined by newlines.
+
+    The shape is fixed: what has to be decided, the options, the advice,
+    and where the whole analysis lives.  Nothing is cut here — the cuts
+    happen before the card is built, so that the parts which are never
+    cut are never cut *in half* either.
+
+    Every text that comes from outside — the plan id, the point ids, the
+    background, the reason, the path of the report — is folded into one
+    line first.  The card's line count is therefore its *shape* and not
+    the judge's line breaks: a reason written over three lines cannot
+    push the card past :data:`TERMINAL_BRIEF_MAX_LINES`.
+    """
+    plan = _one_line(plan_id)
+    points = [point for point in (_one_line(pid) for pid in point_ids) if point]
+    scene = _one_line(background)
+    why = _one_line(reason)
+    path = _one_line(report_path)
+
+    title_parts: List[str] = []
+    if plan:
+        title_parts.append(plan)
+    if round_number:
+        title_parts.append(f"第 {round_number} 轮验证终止")
+    title = " ".join(title_parts)
+
+    heading = "【需要你决定】"
+    if title:
+        heading += title
+    if points:
+        heading += "：" + "、".join(points)
+    if scene:
+        heading += "：" + scene
+
+    lines: List[str] = [heading, "", "选项："]
+    for index, option in enumerate(RECOMMENDATIONS, start=1):
+        label = RECOMMENDATION_LABELS.get(option, option)
+        consequence = RECOMMENDATION_CONSEQUENCES.get(option, "")
+        line = f"{index}. {label}（{option}）"
+        if consequence:
+            line += f"—— {consequence}"
+        lines.append(line)
+
+    lines.append("")
+
+    advice = (
+        f"建议：{_option_name(RECOMMENDATION_LABELS.get(recommendation, recommendation))}"
+        f"（{recommendation}）"
+    )
+    if why:
+        advice += f"—— {why}"
+    lines.append(advice)
+
+    if path:
+        lines.append(f"完整分析：{path}")
+
+    return "\n".join(lines)
+
+
+def _shrink_to_fit(
+    render: Callable[[str], str],
+    text: str,
+    limit: int,
+) -> str:
+    """The longest prefix of ``text`` that ``render`` fits within ``limit``.
+
+    The cut is marked with ``…``: an unmarked cut reads as a complete
+    sentence, and a person acting on half a sentence does not know they
+    are acting on half.
+    """
+    if len(render(text)) <= limit:
+        return text
+    if not text:
+        return ""
+
+    low, high = 0, len(text)
+    best = ""
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = _cut_head_to_budget(text, middle)
+        if len(render(candidate)) <= limit:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best
+
+
+def render_brief(
+    analysis: Mapping[str, Any],
+    *,
+    plan_id: str = "",
+    round_number: int = 0,
+    failed_point_ids: Sequence[str] = (),
+    report_path: str = "",
+    limit: int = TERMINAL_BRIEF_MAX_CHARS,
+) -> str:
+    """Render a six-field analysis into the card a human answers.
+
+    The report (:func:`render_analysis`) is long because a report has to
+    carry the argument.  A *question* has to be answered: the person
+    reading this card has to see what stopped, what they may choose,
+    which choice is recommended and where the full analysis lives —
+    without scrolling, and without reading it twice.
+
+    So the card drops what the card does not need: the problem section,
+    the evidence and the uncertainty go to the report, and the card
+    keeps the context's **first sentence**, the options, the advice and
+    the path of the report.
+
+    **The cut order is the argument order.**  When the card is still
+    too long, the *reason* is cut first — it is the one part of the
+    card that is an argument rather than a fact, and an argument can be
+    shortened without making the card unusable.  Only then is the
+    background sentence cut.  The option lines, the recommendation id
+    and the report path are **never** cut: they are what the human acts
+    on, and a card that omits them asks for a decision nobody can make.
+
+    The card has at most :data:`TERMINAL_BRIEF_MAX_LINES` lines: its
+    shape is fixed, and every text that goes on it is folded into one
+    line first, so the judge's line breaks cannot push the card past
+    the cap.  Its *length* is kept within ``limit`` by cutting the
+    reason first and the background second; when the parts of the card
+    that are never cut are longer than ``limit`` on their own, the card
+    is longer than ``limit`` — those parts are what the human acts on,
+    and a card that omits them asks for a decision nobody can make.
+
+    Args:
+        analysis: The six contracted fields — ``context``, ``problem``,
+            ``evidence``, ``recommendation``, ``recommendation_reason``
+            and ``uncertainty``.
+        plan_id: The plan the round belongs to.
+        round_number: The round that stopped.
+        failed_point_ids: The ids of the points that failed.
+        report_path: Where the full analysis was written.
+        limit: The cap, in characters.
+
+    Returns:
+        The card, or ``""`` when the analysis is not one — not a
+        mapping, missing a field, or a recommendation outside the
+        actions the card offers.  ``""`` means "no card", and the
+        caller's fallback is the factual sentence it asked before, so a
+        human is always asked something.
+    """
+    if not isinstance(analysis, Mapping):
+        return ""
+
+    validated = _validate_analysis(analysis)
+    if validated is None:
+        return ""
+
+    try:
+        max_chars = int(limit)
+    except (TypeError, ValueError):
+        return ""
+    if max_chars <= 0:
+        return ""
+
+    recommendation = validated["recommendation"]
+    # The reason is folded into one line *before* it is measured and
+    # cut: the cut has to count the characters the card actually shows,
+    # and the card shows the reason on one line.
+    reason = _one_line(_as_sentence(validated["recommendation_reason"]))
+    background = _first_sentence(validated["context"])
+    points = _point_ids(failed_point_ids)
+
+    def build(scene: str, why: str) -> str:
+        return _render_brief_card(
+            plan_id=str(plan_id or ""),
+            round_number=_round_number(round_number),
+            point_ids=points,
+            background=scene,
+            reason=why,
+            recommendation=recommendation,
+            report_path=str(report_path or ""),
+        )
+
+    card = build(background, reason)
+    if len(card) <= max_chars:
+        return card
+
+    # 1. The reason goes first.
+    reason = _shrink_to_fit(
+        lambda why: build(background, why), reason, max_chars
+    )
+    card = build(background, reason)
+    if len(card) <= max_chars:
+        return card
+
+    # 2. Then the background sentence.
+    background = _shrink_to_fit(
+        lambda scene: build(scene, reason), background, max_chars
+    )
+    return build(background, reason)
+
+
+# ---------------------------------------------------------------------------
 # The judge
 # ---------------------------------------------------------------------------
 
@@ -713,7 +1086,12 @@ class TerminalDecisionJudge:
             "recommendation / recommendation_reason / uncertainty）和 "
             "recommendation 的取值保持英文原样，其余内容一律中文。\n"
             "6. 只输出 JSON，不要输出解释性文字，不要用 markdown 代码块包裹。"
-            "六个字段一个都不许少。"
+            "六个字段一个都不许少。\n"
+            "7. context 只写一句，recommendation_reason 只写一句。"
+            "这两个字段会被直接贴到给人看的决策卡上，"
+            "写长了卡片就变成一堵墙。"
+            "逐 VP 的细节写进 problem / evidence / uncertainty 三个字段，"
+            "那两个字段里写完整。"
         )
 
     def build_prompt(
@@ -802,12 +1180,12 @@ class TerminalDecisionJudge:
                 "",
                 "## 输出要求",
                 "只输出下面这个 JSON 对象，不要解释、不要 markdown：",
-                '{"context": "<背景：这一轮停在哪里，中文>", "problem": '
+                '{"context": "<背景：这一轮停在哪里，一句话，中文>", "problem": '
                 '"<问题：到底出了什么问题，逐 VP 的预期/实际/为何失败，中文>", '
                 '"evidence": '
                 '["<支撑判断的事实，中文>"], "recommendation": '
                 '"<rerun_this_round|revise_criterion>", '
-                '"recommendation_reason": "<为什么是这个建议，中文>", '
+                '"recommendation_reason": "<为什么是这个建议，一句话，中文>", '
                 '"uncertainty": "<还缺哪一条事实、去哪读，中文>"}',
             ]
         )
