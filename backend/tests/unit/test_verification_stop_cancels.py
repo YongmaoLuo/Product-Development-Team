@@ -171,9 +171,13 @@ def test_stop_sets_the_cancel_flag_and_kills_inflight_work(tmp_path, monkeypatch
     _seed_running_plan(db, plan_id)
 
     killed: list = []
+    # The stop names the round it kills (the token is how the round's
+    # own coding-tool subprocesses are reached), so the stub takes it.
     monkeypatch.setattr(
         server, "_cleanup_dead_verification_processes",
-        lambda pid, vps: killed.append((pid, sorted(vps))),
+        lambda pid, vps, round_token="": killed.append(
+            (pid, sorted(vps), round_token),
+        ),
     )
     # One registered sub-agent so the kill list is non-empty.
     handle = Mock()
@@ -188,7 +192,7 @@ def test_stop_sets_the_cancel_flag_and_kills_inflight_work(tmp_path, monkeypatch
     assert verification_cancel.is_cancelled(plan_id), (
         "the stop must flip the cooperative cancel flag"
     )
-    assert killed == [(plan_id, ["VP-023"])], (
+    assert killed == [(plan_id, ["VP-023"], "")], (
         f"the in-flight sub-agent must be hard-killed; got {killed}"
     )
 
