@@ -409,7 +409,7 @@ def test_returning_true_skips_failed_and_verification(tmp_path, monkeypatch):
 
     status_calls: list[tuple] = []
 
-    def _record_status(self, plan_id_arg, status):
+    def _record_status(self, plan_id_arg, status, stop_reason=None):
         status_calls.append((plan_id_arg, status))
 
     monkeypatch.setattr(ExecutionRepository, "update_status", _record_status)

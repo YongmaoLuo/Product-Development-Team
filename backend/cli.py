@@ -13,6 +13,7 @@ import os
 import signal
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -558,6 +559,42 @@ def _sweep_executor_tree(signum: int) -> None:
                 )
 
 
+def _log_sigterm_entry(signum: int, is_second_signal: bool) -> None:
+    """Write the one line that says the executor was told to stop.
+
+    An executor that dies on a signal leaves no trace by itself: the
+    process is gone, and the only evidence is the moment its children
+    stopped.  This line is that evidence — it is written the first
+    thing the handler does, before anything is stopped, so it survives
+    even a stop sequence that wedges.
+
+    The fields answer the questions a post-mortem asks: which signal
+    (``signum``), when (``ts``), who received it (``pid`` / ``pgid``),
+    how long the executor was willing to wait (``grace_seconds``), and
+    whether this was the *second* signal (``is_second_signal`` — a
+    second one skips the stop sequence and exits at once).
+
+    Never raises: a logging failure must not change what the handler
+    does, and what it does is the whole point of the handler.
+    """
+    try:
+        fields = {
+            "signum": signum,
+            "ts": time.time(),
+            "pid": os.getpid(),
+            "pgid": os.getpgrp(),
+            "grace_seconds": _stop_grace_seconds(),
+            "is_second_signal": bool(is_second_signal),
+        }
+        if is_second_signal:
+            message = "[stop] second SIGTERM received; exiting at once: %s"
+        else:
+            message = "[stop] SIGTERM received; starting the stop sequence: %s"
+        _stop_logger.info(message, fields, extra={"pdt_stop_fields": fields})
+    except Exception:  # noqa: BLE001 - the log must not change the exit
+        pass
+
+
 def _on_sigterm(signum, frame) -> None:
     """Stop the children, then leave.  Installed as the SIGTERM handler.
 
@@ -569,8 +606,14 @@ def _on_sigterm(signum, frame) -> None:
     A second SIGTERM means "stop waiting".  The sequence is already
     running, and running it again would only keep the executor around
     longer — the second signal exits at once.
+
+    The first thing the handler does is write one line saying the
+    signal arrived (see :func:`_log_sigterm_entry`): an executor that
+    leaves on a signal otherwise leaves no trace at all.
     """
     global _stop_in_progress
+
+    _log_sigterm_entry(signum, bool(_stop_in_progress))
 
     if _stop_in_progress:
         _exit_now(_STOP_EXIT_CODE)

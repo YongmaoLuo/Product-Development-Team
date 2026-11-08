@@ -27,9 +27,12 @@ SIGTERM **打不到它**。而 executor（``backend/cli.py``）此前没有任�
 
 from __future__ import annotations
 
+import logging
+import os
 import signal
 import sys
 import threading
+import time
 
 import pytest
 
@@ -182,3 +185,72 @@ def test_main_installs_handler_before_running(monkeypatch, sigterm_slot, tmp_pat
 
     assert observed["called"] is True
     assert observed["handler"] is cli._on_sigterm
+
+
+# ---------------------------------------------------------------------------
+# the signal leaves a trace
+# ---------------------------------------------------------------------------
+
+def _signal_fields(caplog):
+    """The stop fields the handler logged, oldest first."""
+    return [
+        record.pdt_stop_fields
+        for record in caplog.records
+        if hasattr(record, "pdt_stop_fields")
+    ]
+
+
+def test_handler_logs_the_signal_it_received(monkeypatch, caplog):
+    """收到 SIGTERM 的第一条日志要能自证：谁、何时、哪个信号、等多久。
+
+    executor 被信号带走时本来就没什么痕迹 —— 进程没了，能查的只有
+    子进程停止的时间。这条日志就是那个痕迹：它写在下任何东西之前，
+    所以哪怕停止序列卡住，它也已经落在那里了。
+    """
+    monkeypatch.setenv("PDT_STOP_GRACE_SECONDS", "6")
+    monkeypatch.setattr(cli, "_stop_in_progress", False)
+
+    monkeypatch.setattr(cli, "stop_all_live_dispatches", lambda seconds: 0)
+    monkeypatch.setattr(cli, "_exit_now", lambda code: None)
+
+    before = time.time()
+    with caplog.at_level(logging.INFO, logger="cli"):
+        cli._on_sigterm(signal.SIGTERM, None)
+    after = time.time()
+
+    logged = _signal_fields(caplog)
+    assert logged, "the handler logged nothing about the signal"
+
+    fields = logged[0]
+    assert fields["signum"] == signal.SIGTERM
+    assert fields["is_second_signal"] is False
+    assert fields["grace_seconds"] == BUDGET
+    assert fields["pid"] == os.getpid()
+    assert fields["pgid"] == os.getpgrp()
+    assert before <= fields["ts"] <= after
+
+
+def test_second_signal_is_logged_as_the_second(monkeypatch, caplog):
+    """第二个 SIGTERM 走的是「立刻退出」分支 —— 日志里要看得出来是第二次。
+
+    两条信号走的不是同一条路：第一个启动停止序列，第二个直接退。事后
+    只看退出码（都是 143）分不出来，所以标志位得落在日志里。
+    """
+    monkeypatch.setenv("PDT_STOP_GRACE_SECONDS", "6")
+    monkeypatch.setattr(cli, "_stop_in_progress", True)
+
+    exit_calls = []
+    monkeypatch.setattr(cli, "_exit_now", exit_calls.append)
+
+    with caplog.at_level(logging.INFO, logger="cli"):
+        cli._on_sigterm(signal.SIGTERM, None)
+
+    logged = _signal_fields(caplog)
+    assert logged, "the handler logged nothing about the signal"
+
+    fields = logged[0]
+    assert fields["signum"] == signal.SIGTERM
+    assert fields["is_second_signal"] is True
+    assert fields["grace_seconds"] == BUDGET
+    # 第二个信号不重入停止序列，直接退出，退出码不变。
+    assert exit_calls == [143]
