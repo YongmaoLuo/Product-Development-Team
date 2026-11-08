@@ -375,10 +375,28 @@ def persist_conflict_repair_task(
     return True
 
 
-#: The statuses that mean a task is **over**.  Every other status — a
-#: queued task, a running task, a failed task, a row whose status was
-#: never written — still counts as unfinished.
-TERMINAL_TASK_STATUSES = frozenset({"completed", "skipped"})
+#: The statuses that mean a task is **over** for the base-drift
+#: convergence guard.  Every other status — a queued task, a running
+#: task, a failed task, a row whose status was never written — still
+#: counts as unfinished.
+#:
+#: ``voided`` is here because a voided task **will never run again**:
+#: its premise was revoked (a verification reset discarded the verdicts
+#: it was generated from, or a human ran the ``obsolete`` delta action),
+#: and the dispatcher treats it as unschedulable.  It is terminal for
+#: the same reason ``superseded`` is terminal in
+#: :data:`agent._TERMINAL_TASK_STATUSES` — there is nothing left to wait
+#: for.  Leaving it out meant a plan that once had a voided base-drift
+#: merge row could never write a new one: the guard read the voided row
+#: as unfinished, the round got no task id, the loop stopped, and the
+#: plan died in ``base_drift_conflicts`` every round, forever.
+#:
+#: ``failed`` is deliberately **not** here.  A failed merge is not a
+#: finished merge: the conflict is still there and still needs
+#: resolving, and re-dispatching it every round under a new id is
+#: exactly the endless stream of tasks this guard exists to stop.
+#: ``failed`` stays unfinished on purpose.
+TERMINAL_TASK_STATUSES = frozenset({"completed", "skipped", "voided"})
 
 
 
@@ -446,10 +464,23 @@ def has_open_base_drift_merge_task(
     * ``completed`` / ``skipped`` — the merge is over.  If the base
       moves again afterwards that is a *new* conflict, and it deserves
       a task of its own.
+    * ``voided`` — the merge is over too, and for a stronger reason:
+      the task was **cancelled** (its premise was revoked), so it will
+      never run again and nobody is going to resolve that conflict
+      through it.  A voided row is therefore a terminal state for this
+      guard: the conflict that produced it is still live, and the round
+      must be able to write a *new* task for it.  Reading a voided row
+      as unfinished used to wedge the plan: the guard said "already in
+      flight", the round got no task id, the loop stopped, and every
+      round died in ``base_drift_conflicts`` without ever reaching the
+      repair.
     * any other status — including an empty one — counts as unfinished.
       A row that has not reached a terminal state is not a finished
       task, and calling it one would let a stuck merge be replaced by
-      an endless series of new ones.
+      an endless series of new ones.  ``failed`` in particular stays
+      unfinished: a failed merge is not a finished merge, the conflict
+      is still there, and re-dispatching it every round under a new id
+      is precisely the loop this guard exists to stop.
 
     The rows are read **per plan**: another plan's unfinished merge says
     nothing about this one.
