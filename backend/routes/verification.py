@@ -3931,6 +3931,56 @@ def _write_verification_checkpoint(
     return checkpoint
 
 
+def _surviving_vp_ids(handles: List[Any]) -> List[str]:
+    """The VPs whose process is still alive after the stop's hard kill.
+
+    Why this exists
+    ---------------
+    The stop's kill is best-effort, and its log line says what it
+    *intended* to kill, not what it killed: a sub-agent whose process
+    the kill could not reach keeps running, and its verdict lands
+    minutes later.  A production round did exactly that — fifteen VPs
+    were "killed" at 15:14 and produced their verdicts between 15:13
+    and 15:36 — while the routing row said the plan was parked.
+
+    The kill escalates SIGTERM → SIGKILL and waits for the process to
+    go, so a process that is still there afterwards is a process the
+    kill did not reach.  That is the signal this function reports.
+
+    Two things are deliberately NOT survivors:
+
+    * a handle with no process on it — there is nothing running that
+      the handle names;
+    * a liveness that cannot be read — "I could not look" is not
+      evidence that the round is still busy, and refusing to park a
+      plan on a reading failure would strand plans that did stop.
+
+    A pid the kernel handed back to somebody else in the meantime
+    would be a false survivor; the window is the kill's own seconds,
+    and the only process that could take that pid is another
+    sub-agent of the same round — which is still work that did not
+    stop.
+    """
+    survivors: List[str] = []
+    for handle in handles:
+        vp_id = getattr(handle, "vp_id", "") or ""
+        try:
+            pid = int(getattr(handle, "pid", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if pid <= 0:
+            continue
+        try:
+            import process_reaper
+
+            alive = bool(process_reaper._alive(pid))
+        except Exception:  # noqa: BLE001 — an unreadable pid is not a busy one
+            alive = False
+        if alive:
+            survivors.append(vp_id)
+    return survivors
+
+
 @router.post("/api/verification/{plan_id}/stop")
 def stop_verification(plan_id: str):
     """Stop the running verification round and leave a resumable pause behind.
@@ -4159,13 +4209,17 @@ def stop_verification(plan_id: str):
     # The in-flight VPs are read BEFORE the snapshot: the stop's own
     # hard kill removes them, and the snapshot must describe the round
     # as it was when the operator pressed stop.
+    #
+    # The HANDLES are kept, not just their ids: the stop has to be able
+    # to say afterwards whether the work it claimed to kill really
+    # stopped (see ``_surviving_vp_ids``).
     try:
-        _running_vp_ids = [
-            getattr(_h, "vp_id", "") or ""
-            for _h in _server.sub_agent_registry.all_handles(plan_id)
-        ]
+        _stop_handles = list(_server.sub_agent_registry.all_handles(plan_id))
     except Exception:  # noqa: BLE001
-        _running_vp_ids = []
+        _stop_handles = []
+    _running_vp_ids = [
+        getattr(_h, "vp_id", "") or "" for _h in _stop_handles
+    ]
 
     # The VPs the stop cut short: every VP of the round that never
     # reached a verdict. This is what a resume still owes, so it is
@@ -4237,18 +4291,68 @@ def stop_verification(plan_id: str):
         _server.logger.exception(
             "[stop_verification] cancel flag failed plan=%s", plan_id,
         )
+    # 2026-11-08 — the round's OWN processes are killed as well.  The
+    # cleanup takes the round's token, exactly as the watchdog does:
+    # the round's coding-tool subprocesses are the population that keeps
+    # spending while a round is being stopped, and an unnamed round
+    # kills nothing (``_cleanup_dead_verification_processes``: "An
+    # unnamed round kills nothing").  The token is the one the running
+    # round stamped onto the plan's in-memory state.
+    _round_token = ""
+    try:
+        _round_state = _server._verification_state.get(plan_id) or {}
+        _round_token = str(
+            _round_state.get("round_token") or ""
+        ).strip()
+    except Exception:  # noqa: BLE001
+        _round_token = ""
     try:
         _server._cleanup_dead_verification_processes(
             plan_id, [vp for vp in _running_vp_ids if vp],
+            round_token=_round_token,
         )
         _server.logger.warning(
             "[stop_verification] killed in-flight verification work "
-            "plan=%s vps=%s", plan_id, _running_vp_ids,
+            "plan=%s vps=%s round=%s", plan_id, _running_vp_ids,
+            _round_token or "-",
         )
     except Exception:  # noqa: BLE001
         _server.logger.exception(
             "[stop_verification] process kill failed plan=%s", plan_id,
         )
+
+    # 2026-11-08 — the phase has to be TRUE when the stop answers.
+    #
+    # The kill above is best-effort: a sub-agent whose process the kill
+    # could not reach keeps running, and its verdict lands minutes
+    # later.  Parking the routing row at ``verification`` in that case
+    # tells the rest of the system the plan is parked when it is not:
+    # ``/api/system/active`` drops it, capacity sees a free slot, and
+    # the scheduler may hand that slot to somebody else while the
+    # round keeps spending.  A round that is still running therefore
+    # keeps the phase that says so — and the write is conditional, so
+    # it only ever moves the row the stop itself parked.
+    _surviving_vps = _surviving_vp_ids(_stop_handles)
+    _round_still_running = bool(_surviving_vps)
+    if _round_still_running:
+        _server.logger.warning(
+            "[stop_verification] the round is still running plan=%s "
+            "survivors=%s — the phase stays 'verification_running'",
+            plan_id, _surviving_vps,
+        )
+        try:
+            _conn2, _routing2, _ = _open_verification_state()
+            try:
+                _routing2.try_mark_phase(
+                    plan_id, ("verification",), "verification_running",
+                )
+            finally:
+                _conn2.close()
+        except Exception:  # noqa: BLE001
+            _server.logger.exception(
+                "[stop_verification] could not restore the running phase "
+                "plan=%s", plan_id,
+            )
 
     # 2026-09-18 C3: the round is over, so the services it started are
     # no longer needed. This is an operator-initiated exit that does
@@ -4270,6 +4374,12 @@ def stop_verification(plan_id: str):
         "paused": True,
         "round": round_n,
         "interrupted_vp_count": len(_interrupted_vp_ids),
+        # 2026-11-08 — whether the round really stopped.  ``False``
+        # means the work is gone and the plan is parked at
+        # ``verification``; ``True`` means some of the round's
+        # sub-agents survived the kill, so the plan is still running
+        # and its phase says so (``verification_running``).
+        "still_running": _round_still_running,
     }
 
 
