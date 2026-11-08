@@ -19,6 +19,16 @@ Fix
 
 第三个用例是**负控**：既没作废也没被移除、且确实没有结论的 Phase 1 验证点
 **必须**仍然拦得住 Phase 2（否则这个修复就是把门禁整个拆了）。
+
+同样的道理适用于 Phase 2 **内部**的关卡前置：关卡按 ``phase_order`` 串行，
+``_gate_predecessor_reason`` 问的是"排在我前面的关卡都跑完了吗"。一个被
+作废或被移除的更早关卡永远不会被派发，也就永远没有结论 —— 把它算进前置
+集合，较晚的关卡每轮都会被判"更早的全量关卡尚未执行"而 ``DEFERRED``，
+整条 Phase 2 永远跑不到底。两处门禁因此共用同一条判据
+（``_vp_is_not_dispatched``）。
+
+两处各配一个**负控**：既没作废也没被移除、且确实没有结论的那一项**必须**
+仍然拦得住后面的关卡（否则这个修复就是把门禁整个拆了）。
 """
 
 from __future__ import annotations
@@ -52,15 +62,17 @@ def _phase1_vp(vp_id: str, **extra: Any) -> Dict[str, Any]:
     return vp
 
 
-def _phase2_gate_vp(vp_id: str = "VP-GATE") -> Dict[str, Any]:
+def _phase2_gate_vp(vp_id: str = "VP-GATE", **extra: Any) -> Dict[str, Any]:
     """一条 Phase 2 全量关卡（门禁本身，不是前置条件）。"""
-    return {
+    vp: Dict[str, Any] = {
         "id": vp_id,
         "title": "end to end",
         "verification_method": "e2e",
         "verification_phase": 2,
         "phase_order": 1,
     }
+    vp.update(extra)
+    return vp
 
 
 def _executor(
@@ -138,3 +150,73 @@ def test_live_phase1_vp_without_verdict_still_blocks_phase2_gate() -> None:
     reason = executor._blocking_gate_reason()
     assert reason, "没有结论的 Phase 1 验证点必须继续拦着 Phase 2"
     assert "VP-003" in reason
+
+
+# ---------------------------------------------------------------------------
+# 更早的**关卡**（Phase 2 内部的前置关卡）
+# ---------------------------------------------------------------------------
+
+
+def test_obsolete_earlier_gate_does_not_block_later_gate() -> None:
+    """作废的更早关卡不会被派发，不得把较晚关卡永久判 DEFERRED。
+
+    Phase 2 关卡按 ``phase_order`` 串行。如果更早的关卡已被作废，它永远
+    不会被派发、也就永远没有结论——较晚的关卡每轮都被判"更早的全量关卡
+    尚未执行"，于是整条 Phase 2 永远跑不到底。
+    """
+    executor = _executor(
+        [
+            _phase2_gate_vp("VP-GATE-EARLY", phase_order=1, obsolete=True),
+            _phase2_gate_vp("VP-GATE-LATE", phase_order=2, verification_method="e2e"),
+        ]
+    )
+
+    # 前置条件：这条关卡确实不在执行器的工作集里（所以它永远不会有结论）。
+    working_set = [vp["id"] for vp in executor._build_items_from_plan()]
+    assert "VP-GATE-EARLY" not in working_set
+
+    assert executor._gate_predecessor_reason(2) == ""
+
+
+def test_superseded_earlier_gate_does_not_block_later_gate() -> None:
+    """被取代的更早关卡同样不会被派发，不得把较晚关卡永久判 DEFERRED。"""
+    executor = _executor(
+        [
+            _phase2_gate_vp(
+                "VP-GATE-EARLY",
+                phase_order=1,
+                superseded_by=["VP-GATE-EARLY-A", "VP-GATE-EARLY-B"],
+            ),
+            _phase2_gate_vp("VP-GATE-LATE", phase_order=2, verification_method="e2e"),
+        ]
+    )
+
+    working_set = [vp["id"] for vp in executor._build_items_from_plan()]
+    assert "VP-GATE-EARLY" not in working_set
+
+    assert executor._gate_predecessor_reason(2) == ""
+
+
+def test_live_earlier_gate_without_verdict_still_blocks_later_gate() -> None:
+    """负控：活跃的更早关卡没有结论时，较晚关卡仍必须被拦下。
+
+    把作废/被移除的更早关卡从前置集合里摘掉，是为了让 Phase 2 跑得到底；
+    但摘的**只能是**那些永远不会被派发、也就永远没有结论的关卡。既没作废
+    也没被移除的更早关卡照旧会被派发，照旧要出结论 —— 它仍然是较晚关卡的
+    前置条件。否则这个修复就等于把门禁整个拆了：较晚关卡会在更早关卡
+    还没跑过时就开跑。
+    """
+    executor = _executor(
+        [
+            _phase2_gate_vp("VP-GATE-EARLY", phase_order=1),
+            _phase2_gate_vp("VP-GATE-LATE", phase_order=2),
+        ]
+    )
+
+    # 前置条件：这条更早关卡确实在工作集里（所以它会被派发，也就该有结论）。
+    working_set = [vp["id"] for vp in executor._build_items_from_plan()]
+    assert "VP-GATE-EARLY" in working_set
+
+    reason = executor._gate_predecessor_reason(2)
+    assert reason, "没有结论的更早关卡必须继续拦着较晚关卡"
+    assert "VP-GATE-EARLY" in reason
