@@ -144,7 +144,10 @@ def test_non_zero_exit_is_not_marked_clean(monkeypatch, tmp_path, db_path):
     )
     assert state["executor_returncode"] == 3
     assert state["status"] == "failed"
-    assert state["stop_reason"] == "repair_non_zero_exit"
+    # The reason carries the number that ended the round: rc==3, so the
+    # reason is "repair_non_zero_exit:3" (see
+    # ``verification_loop._repair_stop_reason``).
+    assert state["stop_reason"] == "repair_non_zero_exit:3"
 
 
 def test_zero_exit_is_still_marked_clean(monkeypatch, tmp_path, db_path):
