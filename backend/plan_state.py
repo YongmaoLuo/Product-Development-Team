@@ -857,8 +857,19 @@ class PlanState:
     def force_set_phase(self, phase: str):
         """Set phase directly, bypassing transition rules.
 
-        Only for crash recovery (_mark_failed_dead) where the server
-        crashed between writing execution-state sidecar and transitioning plan_state.
+        Two callers, both of which know the current phase cannot be
+        walked forward through a declared edge:
+
+        * crash recovery (_mark_failed_dead), where the server crashed
+          between writing execution-state sidecar and transitioning
+          plan_state;
+        * ``ensure_verification_repairing`` (2026-11-08), which forces the
+          two terminal verification phases (``verification_passed`` and
+          ``verification_loop_stopped``) back into
+          ``verification_repairing`` when the pending repair queue says
+          the chain has not converged.  Neither terminal phase has a
+          forward edge, so the repair dispatch has no legal road out of
+          them — the force is what makes the road exist, and it is logged.
         """
         if phase not in VALID_PHASES:
             raise ValueError(f"Invalid phase: {phase}. Must be one of {VALID_PHASES}")
@@ -1232,6 +1243,37 @@ class PlanState:
                 f"Must be in 'verification_failed' phase."
             )
         self.transition_to("verification_repairing")
+
+    def ensure_verification_repairing(self):
+        """Establish ``verification_repairing`` before dispatching repair work.
+
+        The auto-verification loop may decide to run pending RP-* tasks
+        after a round that ended ``verification_passed`` or
+        ``verification_loop_stopped``.  Those exits never walked the plan
+        into ``verification_repairing``: only the ordinary failure branch
+        of ``check_cycle_conditions`` calls ``start_verification_repair``.
+        ``verification_failed`` has a legal edge into the repair phase;
+        the two terminal phases do not, and the pending repair queue is
+        the authority that the chain has not converged — so the phase is
+        corrected, loudly.  Any other phase is a caller bug and raises.
+        """
+        current = self.get_current_phase()
+        if current == "verification_repairing":
+            return
+        if current == "verification_failed":
+            self.start_verification_repair()
+            return
+        if current in ("verification_passed", "verification_loop_stopped"):
+            logger.warning(
+                "plan_repair_phase_forced plan=%s from=%s to=verification_repairing",
+                self._state.get("plan_id") or self.plan_dir.name,
+                current,
+            )
+            self.force_set_phase("verification_repairing")
+            return
+        raise ValueError(
+            f"Cannot enter verification_repairing from '{current}'."
+        )
 
     # 2026-10-22: ``start_verification_rerun`` is GONE. It was the only
     # writer of ``verification_rerunning``, and it had no callers

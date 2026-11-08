@@ -6240,10 +6240,23 @@ class VerificationOrchestrator:
         subprocess spawned by ``_run_repair_execution_async`` IS
         genuinely running tasks — the state vocabulary should reflect
         that. The corresponding edge is already declared in
-        ``VERIFICATION_PHASE_TRANSITIONS`` at plan_state.py:177, so
-        this method is a pure re-routing of the existing legal edge.
+        ``VERIFICATION_PHASE_TRANSITIONS`` at plan_state.py:177.
+
+        2026-11-08: this is no longer a pure re-routing. The auto-loop
+        may ask for repairs from the ``verification_passed`` and
+        ``verification_loop_stopped`` exits — a round can PASS (or stop)
+        while RP-* tasks are still pending — and neither of those phases
+        has a forward edge into ``verification_repairing``. The phase is
+        therefore established first, by
+        :meth:`plan_state.PlanState.ensure_verification_repairing`:
+        it walks the legal edge out of ``verification_failed``, forces the
+        two terminal phases back into the repair phase (loudly), and
+        raises for any other phase. So a repair dispatch from a phase
+        that cannot host it fails loudly at the phase boundary instead
+        of crashing the round inside ``start_repair_execution``.
         """
         self._waiting_for_user = False
+        self.plan_state.ensure_verification_repairing()
         self.plan_state.start_repair_execution()
 
     def stop_verification(self):
