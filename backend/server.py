@@ -206,6 +206,10 @@ except Exception:  # noqa: BLE001
     _new_owner_token = None
     _register_owner = None
     _release_owner = None
+try:  # pragma: no cover - the repo always ships service_manager.py
+    from service_manager import read_round_liveness as _read_round_liveness
+except Exception:  # noqa: BLE001
+    _read_round_liveness = None
 
 # ---------------------------------------------------------------------------
 # shutdown_checkpoint (the shutdown checkpoint writer) — resolved once, at
@@ -1099,6 +1103,59 @@ class HeartbeatMonitor:
 heartbeat_monitor = HeartbeatMonitor(interval=HEARTBEAT_INTERVAL)
 
 
+def _log_reap_reports(reports, reason: str) -> None:
+    """Say, in this process's own log, what a service sweep decided.
+
+    The two cross-round sweeps — ``startup_sweep`` (a backend booting)
+    and ``server_shutdown`` (a backend going down) — are the same kind
+    of scan over every plan in the plans directory, so they have to
+    report the same way. The shutdown hook used to throw its reports
+    away, which made the decision that hurt the invisible in the log of
+    the process that made it: the plan's own ``api_test`` answered with
+    a bare "connection refused" minutes later, and the server that took
+    the service down had said nothing about it.
+
+    A deferral is a decision, not an absence, so it belongs here too:
+    "the sweep saw that service and left it alone" and "the sweep never
+    saw it" look the same from the outside.
+    """
+    deferred = [d for r in reports for d in r.deferred]
+    if deferred:
+        logger.info(
+            "[service_manager] %s left %d service(s) alone: they are "
+            "leased by rounds that are still running: %s",
+            reason, len(deferred), deferred,
+        )
+    reaped = [r for r in reports if r.reaped or not r.clean]
+    if reaped:
+        logger.warning(
+            "[service_manager] %s: %s",
+            reason, [r.to_dict() for r in reaped],
+        )
+
+
+def _replay_pending_mcp_restores() -> None:
+    """Put back the workspaces a run that was killed left dirty.
+
+    The mcode adapter writes the workspace's ``.mcp.json`` for the
+    length of a run and puts the workspace back afterwards. A run that
+    was killed — a SIGKILL, a crash — could not: the process is gone
+    between the write and the restore, and the workspace keeps the
+    adapter's payload, with its credential, where the user's own file
+    was.
+
+    The server's start-up is one of the moments that repairs it. The
+    failure is not allowed to stop the server: a workspace that could
+    not be put back is worth a log line, not a server that will not
+    start.
+    """
+    try:
+        from harness.mcode import recover_pending_mcp_restores
+        recover_pending_mcp_restores()
+    except Exception:
+        logger.exception(
+            "the pending MCP restores could not be replayed; continuing"
+        )
 # ---------------------------------------------------------------------------
 # The scheduler engine
 # ---------------------------------------------------------------------------
@@ -1943,12 +2000,12 @@ def _run_boot_sweeps() -> None:
                 adopt_scheduler_runs=True,
                 caller="server.startup_sweep",
             )
-            _swept_reaped = [r for r in _swept if r.reaped or not r.clean]
-            if _swept_reaped:
-                logger.warning(
-                    "[service_manager] startup sweep: %s",
-                    [r.to_dict() for r in _swept_reaped],
-                )
+            # 2026-10-27 (merge) — the sweep's reports go through the
+            # shared helper, so the boot sweep says the same thing the
+            # shutdown sweep says: a deferral is a decision and is
+            # logged as one (the branch's ``_log_reap_reports``), and
+            # the reaped entries are still a warning.
+            _log_reap_reports(_swept, "startup_sweep")
         except Exception:
             logger.exception(
                 "[service_manager] startup orphan sweep failed; continuing"
@@ -2288,6 +2345,14 @@ async def _lifespan(app):
         dynamic_tracker=ActiveConcurrencyTracker(),
     )
     app.state.runtime_state = runtime_state
+
+    # 2026-10-25 — a workspace a run that was killed left holding the
+    # adapter's MCP configuration. The run that wrote the file is
+    # gone, and the boot is the one moment when nothing of ours can
+    # legitimately be running: the same argument the two sweeps below
+    # rest on. The workspace is put back before the server takes on any
+    # work of its own.
+    _replay_pending_mcp_restores()
 
     # 2026-10-29: the two boot sweeps — the ledger sweep and the
     # credential-residue sweep — run on their own thread now.
@@ -4407,7 +4472,6 @@ def _atexit_shutdown_sweep() -> None:
         return
     _shutdown_all_executions()
 
-
 # Ensure subprocess cleanup even on abrupt process exit (SIGKILL bypasses
 # this, but SIGTERM / unhandled exception / sys.exit all trigger atexit).
 #
@@ -4696,6 +4760,29 @@ def _release_service_owner(plan_dir: Path, owner_token: str) -> None:
         logger.exception(
             "[service_manager] owner release failed for %s", owner_token,
         )
+def _round_owner(plan_dir: Path) -> str:
+    """The owner token of the round that is running in this plan.
+
+    The round writes the marker before its services start, so it names
+    the round whose services a reap is about to end. It is read
+    **before** the reap: the round-end reap deletes the marker (that
+    round is over), and after that the plan no longer says whose round
+    this was.
+
+    The empty string when the marker is missing or unreadable: the
+    reap then decides ownership from the lease's own process, which is
+    the same answer in every case where the marker is gone because the
+    round is over.
+    """
+    if _read_round_liveness is None:
+        return ""
+    try:
+        marker = _read_round_liveness(plan_dir)
+    except Exception:  # noqa: BLE001 - a missing marker is not an error
+        return ""
+    if not isinstance(marker, dict):
+        return ""
+    return str(marker.get("owner") or "")
 
 
 def _reap_managed_services(
@@ -4734,6 +4821,20 @@ def _reap_managed_services(
     plan's kill event stream before each signal goes out, so a service
     that dies during a reap says on the record that a reap stopped it
     (2026-10-26, repair-r1-49).
+    A **cross-round** reason (``server_shutdown`` / ``startup_sweep``)
+    changes one thing: the plan named here may be in use by a round
+    that runs in *another* backend process, so the decision is made per
+    ledger entry from that entry's lease instead of from "this plan is
+    mine". The services of a live round are left alone and the
+    deferral is recorded; everything else is collected as usual.
+
+    The same rule holds for the round's own exit: the reap may only
+    stop what **this round** owns. A ledger entry whose lease names
+    another round that is still running is left alone (and the lease
+    with it) — on 2026-10-25 a round-exit reap stopped the api
+    service of a round that was still using it, and that round's own
+    ``api_test`` failed minutes later with a bare "connection
+    refused".
     """
     token = owner_token if owner_token else _new_service_owner_token(reason)
     try:
@@ -4744,8 +4845,10 @@ def _reap_managed_services(
             )
             return
         report = _reap_services(
-            plan_dir, plan_id, reason=reason, owner_token=token,
+            plan_dir, plan_id, reason=reason,
+            owner_token=token,
             caller=caller,
+            owner=_round_owner(plan_dir),
         )
     except Exception:  # pragma: no cover - reap never raises by design
         logger.exception(
@@ -4757,6 +4860,19 @@ def _reap_managed_services(
         logger.info(
             "[service_manager] reap plan=%s reason=%s %s",
             plan_id, reason, report.to_dict(),
+        )
+    if report.deferred:
+        logger.info(
+            "[service_manager] reap plan=%s reason=%s left %d service(s) "
+            "alone: they are leased by rounds that are still running: %s",
+            plan_id, reason, len(report.deferred), report.deferred,
+        )
+    if report.mismatched:
+        logger.info(
+            "[service_manager] reap plan=%s reason=%s left %d service(s) "
+            "alone: they belong to another round's lease, not to the "
+            "round being ended: %s",
+            plan_id, reason, len(report.mismatched), report.mismatched,
         )
 
 
