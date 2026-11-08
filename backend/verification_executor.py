@@ -2459,6 +2459,21 @@ class VerificationExecutor(BaseExecutor):
             return False
         return str(vp.get("id") or "").strip() in self._removed_vp_ids
 
+    def _vp_is_not_dispatched(self, vp: Any) -> bool:
+        """这个验证点**不会被派发**吗（因此永远不会产生结论）。
+
+        门禁只能向执行器真会跑的验证点要结论。计划自己作废的
+        （``obsolete`` / ``superseded_by``）与被移除的（主题外移除）都在
+        :meth:`_build_items_from_plan` 的工作集之外 —— 永远不会被派发，也就
+        永远产生不了结论。
+
+        这条判据是 :meth:`_blocking_gate_reason` 与
+        :meth:`_gate_predecessor_reason` **共用**的：两处都在问"这一项的结论
+        从哪来"，答案必须是同一个集合 —— 执行器实际派发的工作集。两处各写
+        一份判据，早晚会漂成"一处跳过、一处照问"，把门禁锁死或放过头。
+        """
+        return bool(self._vp_retired_marker(vp)) or self._is_removed_vp(vp)
+
     def _plan_vps(self) -> List[Any]:
         """The plan's VP list, in whichever schema the caller supplied."""
         return (
@@ -3558,7 +3573,7 @@ class VerificationExecutor(BaseExecutor):
             # （obsolete / superseded_by）或被移除的验证点根本不会被派发，永远
             # 产生不了结论——要了就把 Phase 2 永久锁死。判据与
             # :meth:`_build_items_from_plan` 一致。
-            if self._vp_retired_marker(vp) or self._is_removed_vp(vp):
+            if self._vp_is_not_dispatched(vp):
                 continue
             vp_id = vp.get("id")
             status = self._terminal_status_of(vp_id)
@@ -3571,13 +3586,27 @@ class VerificationExecutor(BaseExecutor):
     def _gate_predecessor_reason(
         self, gate_order: Optional[int],
     ) -> str:
-        """该关卡之前是否有更早的关卡未通过。"""
+        """该关卡之前是否有更早的关卡未通过。
+
+        Phase 2 的关卡按 ``phase_order`` 串行，所以一个关卡要问的是"排在
+        我前面的关卡都跑完了吗"。这个"前面"必须是**执行器真会派发的关卡**：
+
+        被计划作废（``obsolete`` / ``superseded_by``）或被移除的关卡不在
+        工作集里，永远不会被派发，也就永远产生不了结论。若把它们也算进
+        前置集合，较晚的关卡每轮都会被判"更早的全量关卡尚未执行"而
+        ``DEFERRED`` —— 整条 Phase 2 就永远跑不到底。
+
+        判据与 :meth:`_blocking_gate_reason` 共用
+        :meth:`_vp_is_not_dispatched`：门禁的前置集合 = 执行器实际派发的
+        工作集。
+        """
         if gate_order is None:
             return ""
         earlier = [
             vp for vp in self._plan_points()
             if isinstance(vp, dict) and is_final_gate(vp)
             and infer_phase_order(vp) < gate_order
+            and not self._vp_is_not_dispatched(vp)
         ]
         for vp in earlier:
             vp_id = vp.get("id")
