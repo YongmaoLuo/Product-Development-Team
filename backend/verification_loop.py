@@ -9436,11 +9436,18 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                         # ``verification_passed`` is a terminal stage with
                         # no forward edges.
                         #
-                        # Override the status so the downstream
-                        # ``verification_failed`` → ``start_verification_repair``
-                        # path in :class:`VerificationOrchestrator` runs and
-                        # walks the plan into ``verification_repairing``
-                        # before :meth:`confirm_repair_and_rerun` is called.
+                        # Override the status so this function takes the
+                        # repair exit below. The override does NOT make the
+                        # orchestrator's ``verification_failed`` →
+                        # ``start_verification_repair`` path run: the
+                        # orchestrator already returned from
+                        # ``check_cycle_conditions`` before this point.
+                        # The plan's phase is established by
+                        # :meth:`confirm_repair_and_rerun` →
+                        # ``ensure_verification_repairing``, which forces the
+                        # terminal ``verification_passed`` phase back into
+                        # ``verification_repairing`` (loudly) before the
+                        # repair execution starts.
                         # The same override applies to the
                         # ``same_failure_repeated`` branch below.
                         result = dict(result)
@@ -9702,8 +9709,13 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                     # So an empty repair queue is not a convergence verdict — it
                     # is the signal to go RUN whatever execution work remains.
                     # ``check_cycle_conditions`` has already put the plan in
-                    # ``verification_repairing`` (``_safe_phase_call`` runs
-                    # before any repair content is generated), and
+                    # ``verification_repairing`` on the ordinary failure
+                    # branch (``_safe_phase_call`` runs before any repair
+                    # content is generated). On the other exits (a round that
+                    # ended ``verification_passed`` / ``verification_failed``
+                    # with repair tasks still pending) the phase is
+                    # established by ``ensure_verification_repairing``
+                    # instead. Either way
                     # ``verification_repairing → executing`` is a declared edge,
                     # so this is a normal transition rather than a forced state
                     # write.
