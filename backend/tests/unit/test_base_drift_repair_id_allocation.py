@@ -216,6 +216,12 @@ def _seed_base_drift_row(db_path: Path, plan_id: str, task_id: str, status: str)
     :func:`verification_agent.persist_conflict_repair_task` the preflight
     uses — so the allocator reads rows that look exactly like the ones
     it will meet in production.
+
+    The title is a **historical** one, in the shape rows written before
+    the base commit joined the title.  The allocator hands out ids and
+    never reads titles, so the row is kept verbatim on purpose — rows
+    left over from before the change are exactly what it will keep
+    meeting.
     """
     task = {
         "id": task_id,
@@ -488,7 +494,9 @@ def test_reusing_a_finished_id_keeps_it_finished(monkeypatch, tmp_path):
     db_path = _use_db(tmp_path, monkeypatch)
     _seed_base_drift_row(db_path, PLAN_ID, PRIOR_TASK_ID, "completed")
 
-    # The same id, written again, through the same writer.
+    # The same id, written again, through the same writer.  The title
+    # is the historical shape and is not what this test reads — the
+    # allocator is about ids, not titles.
     task = {
         "id": PRIOR_TASK_ID,
         "task_group": "repair",
