@@ -783,8 +783,13 @@ FROZEN_SCHEDULER_SURFACE_SHA256: dict[str, str] = {
 #: approved change, and this gate stops reporting any *other* change
 #: to the same file.
 FROZEN_CAPACITY_WAIT_SURFACE_SHA256: dict[str, str] = {
+    # 2026-11-08：`update_status` 增加可选的 `stop_reason`（executor 死亡取证）——
+    # 只在调用方给了理由时才写这一列，没给就原样保留；这是已批准的改动，
+    # 按本 gate 的既定流程重新钉住该文件的哈希。这是「移动冻结」而不是
+    # 「放松门禁」：被钉文件的范围、逐字节比对的强度都不变，该文件此后
+    # 仍被逐字节钉住，任何再编辑照样红。
     "backend/state_machine/repositories/execution_repository.py": (
-        "88475ca878e79ab198dd9ca2fa21e3f4b0cc0148ac4e29f0c92e4e2d969811b8"
+        "b001a889523b17840c35a4dd859e1d5bcc07894c58c39ca25d53d4831c149e68"
     ),
 }
 
