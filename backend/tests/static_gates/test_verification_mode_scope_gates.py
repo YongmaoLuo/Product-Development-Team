@@ -735,8 +735,18 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 2026-11-06（续）：根因链整条删除——本文件删掉 `_handle_root_cause_preflight`
     # 与其调用链（链的预检不再存在），其余轮次逻辑一字未动；按本 gate 的既定流程
     # 把冻结基线前移到删除后的批准态。这是「移动冻结」而不是「放松门禁」。
+    # 2026-11-08：修「确认修复时相位不是 verification_repairing 导致验证轮崩溃」
+    # ——本文件**只改注释**：把「覆盖 status 就会让 orchestrator 的
+    # `verification_failed` → `start_verification_repair` 路径跑起来」这句
+    # 与事实不符的说明改成真相（覆盖只让本函数走修复出口，相位由
+    # `confirm_repair_and_rerun` → `ensure_verification_repairing` 建立），
+    # 并在空修复队列的分支补上「`check_cycle_conditions` 只在普通失败分支
+    # 才会把计划放进 `verification_repairing`」这一限定。一行可执行代码都
+    # 未改动；按本 gate 的既定流程重新钉住该文件。这是「移动冻结」而不是
+    # 「放松门禁」：断言（mismatched == []）、被钉文件的范围与 sha256 逐字节
+    # 比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
     "backend/verification_loop.py": (
-        "842ffb824b864e122f07b3639386bd52bd9be2407f93fb962c6c2ce5ced792f0"
+        "3fa8684b1ed4c2f9bdf0b9a27daf46c0c2df9310e07928bf91210bb84f4ab3e0"
     ),
 }
 
@@ -783,8 +793,13 @@ FROZEN_SCHEDULER_SURFACE_SHA256: dict[str, str] = {
 #: approved change, and this gate stops reporting any *other* change
 #: to the same file.
 FROZEN_CAPACITY_WAIT_SURFACE_SHA256: dict[str, str] = {
+    # 2026-11-08：`update_status` 增加可选的 `stop_reason`（executor 死亡取证）——
+    # 只在调用方给了理由时才写这一列，没给就原样保留；这是已批准的改动，
+    # 按本 gate 的既定流程重新钉住该文件的哈希。这是「移动冻结」而不是
+    # 「放松门禁」：被钉文件的范围、逐字节比对的强度都不变，该文件此后
+    # 仍被逐字节钉住，任何再编辑照样红。
     "backend/state_machine/repositories/execution_repository.py": (
-        "88475ca878e79ab198dd9ca2fa21e3f4b0cc0148ac4e29f0c92e4e2d969811b8"
+        "b001a889523b17840c35a4dd859e1d5bcc07894c58c39ca25d53d4831c149e68"
     ),
 }
 

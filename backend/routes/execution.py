@@ -3795,7 +3795,14 @@ def start_execution(
                 try:
                     migrate(persist_conn)
                     ExecutionRepository(persist_conn).update_status(
-                        plan_id, state.get("status", "running")
+                        plan_id,
+                        state.get("status", "running"),
+                        # The reason the run ended is known here and
+                        # nowhere else: the watcher put it in the
+                        # in-memory state, and without this the row
+                        # kept the reason of whatever wrote it last
+                        # (the startup reconcile's).
+                        stop_reason=state.get("stop_reason"),
                     )
                 finally:
                     persist_conn.close()

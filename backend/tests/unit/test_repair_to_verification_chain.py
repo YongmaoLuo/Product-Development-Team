@@ -95,7 +95,7 @@ def fake_state(monkeypatch, tmp_path):
         def update_fields(self, plan_id, **kwargs):
             fs.plan_execution_writes.append((plan_id, kwargs))
 
-        def update_status(self, plan_id, status):
+        def update_status(self, plan_id, status, stop_reason=None):
             fs.plan_execution_writes.append((plan_id, {"status": status}))
 
     import state_machine.repositories.verification_repository as _vr_mod

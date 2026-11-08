@@ -185,6 +185,13 @@ _KILL_GRACE_SECONDS = 2.0
 #: How often liveness is polled while waiting.
 _POLL_INTERVAL = 0.05
 
+#: How much of a command line is kept in a ledger event.
+#:
+#: The command line is evidence, not content: enough of it to tell two
+#: invocations apart is all a reader needs.  The bound keeps one
+#: pathological command line from turning an event line into a page.
+_CMDLINE_FIELD_MAX_CHARS = 512
+
 
 _psutil_module: Optional[Any] = None
 _psutil_loaded = False
@@ -615,7 +622,21 @@ def _signal_if_vouched(
     if not _identity_matches(identity, record, allow_self=include_self):
         # The pid is alive but it is not the process we recorded. Send
         # nothing: "not known to be ours" is not a licence to kill.
-        _skip(plan_dir, record, outcome, "identity_mismatch")
+        #
+        # The two command lines go into the event so a reader can see
+        # *why* the identity check failed: a wrapper that ``exec``'d
+        # under a different name looks exactly like a recycled pid.
+        # This is evidence only — nothing below signals anything.
+        _skip(
+            plan_dir,
+            record,
+            outcome,
+            "identity_mismatch",
+            detail={
+                "live_cmdline": _cmdline_text(identity.cmdline),
+                "ledger_cmdline": _cmdline_text(record.cmdline),
+            },
+        )
         return None
 
     own_pgid = os.getpgrp()
@@ -787,13 +808,37 @@ def _identity_matches(
     )
 
 
+def _cmdline_text(cmdline: Optional[Sequence[str]]) -> str:
+    """Render a command line as one bounded string.
+
+    The kernel reports a command line as a sequence of arguments; a
+    reader comparing two of them wants them side by side, so they are
+    joined into one line and cut to a length that cannot swamp the
+    event.  A missing command line is an empty string, not ``None`` —
+    "we could not read it" is different from "there was none", and the
+    ledger line stays one shape either way.
+    """
+    if not cmdline:
+        return ""
+    text = " ".join(str(part) for part in cmdline)
+    return text[:_CMDLINE_FIELD_MAX_CHARS]
+
+
 def _skip(
     plan_dir: Path,
     record: ledger.ProcessRecord,
     outcome: ReapOutcome,
     reason: str,
+    *,
+    detail: Optional[Mapping[str, Any]] = None,
 ) -> None:
-    """Record a process that was deliberately not signalled."""
+    """Record a process that was deliberately not signalled.
+
+    ``detail`` is extra forensics written into the ledger event — the
+    caller decides what is worth keeping.  It never changes *whether*
+    anything is signalled; it only says more about a process that was
+    left alone.
+    """
     outcome.skipped.append({
         "pid": record.pid,
         "role": record.role,
@@ -803,15 +848,15 @@ def _skip(
         EVENT_IDENTITY_MISMATCH if reason == "identity_mismatch"
         else EVENT_SKIPPED
     )
-    ledger.record_event(
-        plan_dir,
-        event,
-        terminal=False,
-        pid=record.pid,
-        role=record.role,
-        plan_id=outcome.plan_id,
-        reason=reason,
-    )
+    fields: Dict[str, Any] = {
+        "pid": record.pid,
+        "role": record.role,
+        "plan_id": outcome.plan_id,
+        "reason": reason,
+    }
+    if detail:
+        fields.update(detail)
+    ledger.record_event(plan_dir, event, terminal=False, **fields)
 
 
 def _fail(
