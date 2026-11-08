@@ -94,10 +94,15 @@ def test_title_names_the_base_and_file_count():
     is what makes the queue readable — and it is what makes the task
     mergeable at all: a row without a title is replaced by a
     content-free placeholder instead of being executed.
+
+    The base is named by **ref and commit**: the commit is what tells
+    two drifts of the same ref apart (see
+    ``test_base_drift_repair_title_uniqueness.py`` — the dispatcher
+    decides a task is a repeat by comparing titles).
     """
     task = _task()
 
-    assert task["title"] == "合并 origin/main：解决 2 个文件的冲突"
+    assert task["title"] == "合并 origin/main@abc123：解决 2 个文件的冲突"
 
 
 def test_title_falls_back_to_sha_then_base():

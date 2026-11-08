@@ -1379,8 +1379,37 @@ def _conflict_repair_title(
     than any other repair.  The ref is the friendlier name; a report
     that only carries a commit still names the base by that commit, and
     a report that carries neither still says "base" rather than nothing.
+
+    **The base commit is part of the name, and it has to be.**  The
+    downstream dispatcher decides "this repair was already done and the
+    problem came back" by comparing titles for equality
+    (``TaskManager.find_completed_duplicate``); a title match is what
+    stops the run with ``loop_detected``.  Merging a drifting base is a
+    *repeatable* maintenance action: the same base ref drifts again and
+    again, and the number of conflicting files is often the same both
+    times.  A title of "the ref plus the file count" therefore cannot
+    tell "the same merge, still broken" from "a new merge against a
+    base that moved on" — and the second one is stopped before it runs
+    a single line, while the conflict is still in the working tree.
+
+    Naming the base commit makes the two cases distinguishable: the same
+    merge against the same commit keeps the same name, a later drift
+    against a later commit gets a different one.  The commit is
+    abbreviated because the title is read by humans in a queue; eight
+    hex digits are enough to tell two bases apart and short enough to
+    keep the line readable.
     """
-    base = (base_ref or "").strip() or (base_sha or "").strip() or "base"
+    ref = (base_ref or "").strip()
+    sha = (base_sha or "").strip()
+    short_sha = sha[:8]
+    if ref and sha:
+        base = f"{ref}@{short_sha}"
+    elif ref:
+        base = ref
+    elif sha:
+        base = short_sha
+    else:
+        base = "base"
     return f"合并 {base}：解决 {file_count} 个文件的冲突"
 
 

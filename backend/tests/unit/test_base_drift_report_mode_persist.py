@@ -192,7 +192,7 @@ def test_report_mode_task_lands_in_state_db(monkeypatch, tmp_path):
     assert list(rows) == [TASK_ID], rows
     row = rows[TASK_ID]
     assert row["status"] == "pending", row
-    assert row["title"] == "合并 origin/main：解决 1 个文件的冲突", row
+    assert row["title"] == "合并 origin/main@abc1234：解决 1 个文件的冲突", row
     assert row["test_command"] == (
         'git merge-base --is-ancestor abc1234 HEAD '
         '&& test -z "$(git ls-files -u)"'
