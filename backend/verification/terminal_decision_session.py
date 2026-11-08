@@ -104,6 +104,7 @@ __all__ = [
     "SESSION_FILENAME",
     "build_record",
     "load",
+    "round_archive_path",
     "save",
     "save_round_archive",
     "session_path",
@@ -526,6 +527,47 @@ def _write_archive_pair(
         for target in renamed:
             _discard(target)
         raise
+
+
+def round_archive_path(
+    plan_dir: Any,
+    round_number: int,
+    now: Optional[datetime] = None,
+) -> Path:
+    """The ``.md`` path :func:`save_round_archive` will write for this round.
+
+    The decision card quotes the archive's path as its "完整分析" link,
+    but the card is put to the human **before** the archive is written —
+    so the path cannot be read back from the write.  This computes it
+    instead: the same round number, the same clock reading and the same
+    step-aside rule, so a caller that asks first hands out a link that
+    resolves to the file the round actually wrote.
+
+    **Nothing is written here.**  No directory is created and no file is
+    touched; the function only *reads* what is already on disk, to know
+    whether a name is already taken.
+
+    Parameters
+    ----------
+    plan_dir:
+        The plan directory.  The archive goes into its ``reports/``
+        subdirectory — which is **not** created here.
+    round_number:
+        Which round stopped.
+    now:
+        The clock reading the file name is stamped with; the current UTC
+        time when it is not given.  Hand the same reading to
+        :func:`save_round_archive` to land on the same name.
+
+    Returns
+    -------
+    The path of the ``.md`` file the round's archive will be written to.
+    """
+    moment = _utc_now(now)
+    stamp = moment.strftime("%Y%m%dT%H%M%SZ")
+    reports_dir = Path(plan_dir) / REPORTS_DIRNAME
+    stem = _archive_stem(reports_dir, round_number, stamp)
+    return reports_dir / f"{stem}.md"
 
 
 def save_round_archive(

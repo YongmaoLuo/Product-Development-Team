@@ -1,16 +1,16 @@
 """The terminal question, when there is an analysis to put in it.
 
 The terminal branch's question used to be one sentence of facts.  It is
-now the **analysis** of the failure scene when there is one — the five
-sections a person reads before answering — and that one sentence of
-facts when there is not.
+now the **decision card** of the failure scene when there is one — what
+has to be decided, the options, the advice and the path of the full
+report — and that one sentence of facts when there is not.
 
 This module is the wiring smoke test for that switch.  It asks the one
 question a wiring bug answers wrongly: *which of the two is the
-question?*  The detail of the switch — the sections, the evidence, the
-cap, the default option, and the byte-identical fallback — is pinned in
-``tests/unit/test_terminal_decision_question.py``; this file only asks
-whether the analysis path is wired at all.
+question?*  The detail of the switch — the card's shape, the cap, the
+default option, the archive path and the byte-identical fallback — is
+pinned in ``tests/unit/test_terminal_decision_question.py``; this file
+only asks whether the analysis path is wired at all.
 
 The judge is a fake: the real one is a model call, and what is pinned
 here is the wiring, not the model.
@@ -40,4 +40,4 @@ def test_analysis_path_is_wired_not_the_factual_sentence(analysis_orchestrator):
         "the question is still the old factual sentence — the analysis "
         "never reached it"
     )
-    assert payload["question"].startswith("## 背景（C）")
+    assert payload["question"].startswith("【需要你决定】")

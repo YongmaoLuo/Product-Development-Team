@@ -4,17 +4,25 @@ The judge (see ``test_terminal_analysis_judge.py``) produces a six-field
 dict — ``context``, ``problem``, ``evidence``, ``recommendation``,
 ``recommendation_reason``, ``uncertainty``.  The human who answers the
 terminal question does not read a dict; they read a question.  This
-module covers the pure function that turns the dict into that question:
-five C/P/E/A/U sections, bounded.
+module covers the pure function that turns the dict into that question.
+
+There are **two** renderings, and they answer two different questions:
+
+* ``render_analysis`` writes the **report** — five C/P/E/A/U sections,
+  bounded, carrying the whole argument.  It is what the round's
+  archive is made of.
+* ``render_brief`` writes the **card** — what has to be decided, the
+  options, the advice and the path of the report.  It is what the
+  human is actually asked, and it is bounded far tighter.
 
 What is pinned here
 -------------------
 
-1. **The rendering has the five C/P/E/A/U sections**, and the evidence
+1. **The report has the five C/P/E/A/U sections**, and the evidence
    the judge produced is carried verbatim — a section that paraphrases
    the evidence is not evidence.
-2. **The question is bounded.**  ``TERMINAL_QUESTION_MAX_CHARS`` is the
-   cap, and a rendered question never exceeds it, however long the
+2. **The report is bounded.**  ``TERMINAL_QUESTION_MAX_CHARS`` is the
+   cap, and a rendered report never exceeds it, however long the
    evidence is.
 3. **The truncation order is the argument order.**  Evidence is dropped
    from its **tail** first (the front of the argument is what the
@@ -40,7 +48,7 @@ import pytest
 
 # The production path: the terminal branch's question is built by
 # ``VerificationOrchestrator._terminal_decision_question``, which renders
-# the judge's analysis through ``render_analysis``.  The orchestrator
+# the judge's analysis through ``render_brief``.  The orchestrator
 # fixture is borrowed from the wiring test, the same way
 # ``tests/unit/test_terminal_decision_analysis_question.py`` borrows it.
 from tests.unit.test_terminal_decision_question import (  # noqa: F401
@@ -467,9 +475,10 @@ def test_terminal_question_on_the_production_path_keeps_the_advice(
 
     ``VerificationOrchestrator._terminal_decision_question`` is the
     production entry: it renders the judge's analysis through
-    ``render_analysis`` and hands the result to the human as the
-    question.  This is the same path the failure of 2026-11-07 went
-    through, and the advice was missing from it.
+    ``render_brief`` and hands the result to the human as the
+    question.  The question is a **card** now — a person answers it, so
+    it is short — and the advice is the one thing on it that must never
+    be cut away.
     """
     analysis = _long_analysis()
     analysis_orchestrator._terminal_judge.result = analysis
@@ -482,11 +491,22 @@ def test_terminal_question_on_the_production_path_keeps_the_advice(
     )
 
     question = payload["question"]
-    assert len(question) <= 2000, (
-        f"the question is {len(question)} characters, over the cap"
+    assert len(question) <= 600, (
+        f"the card is {len(question)} characters, over the cap"
     )
-    assert "## 建议（A）" in question, (
-        "the advice did not survive into the question the human is asked"
+    assert len(question.splitlines()) <= 8, (
+        f"the card is {len(question.splitlines())} lines, over the cap"
     )
-    assert analysis["recommendation"] in question
-    assert analysis["recommendation_reason"] in question
+    advice_lines = [
+        line for line in question.splitlines() if line.startswith("建议：")
+    ]
+    assert advice_lines, (
+        "the card does not carry an advice line — the human is asked to "
+        "choose without being told which choice is recommended"
+    )
+    assert analysis["recommendation"] in advice_lines[0], (
+        "the recommendation id is not on the advice line"
+    )
+    assert "## 建议（A）" not in question, (
+        "the card is still the report — the question is a card now"
+    )
