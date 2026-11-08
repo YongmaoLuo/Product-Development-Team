@@ -7082,6 +7082,7 @@ class ClaudeCodingTool(CodingTool):
         allowed_tools: Optional[list],
         scene: Optional[str],
         fresh_session_on_retry: bool = True,
+        fresh_prompt: Optional[str] = None,
     ) -> tuple:
         """``_run_claude_interactive`` with a fresh-session retry on empty output.
 
@@ -7101,12 +7102,23 @@ class ClaudeCodingTool(CodingTool):
         Callers that need a *format* retry (parse failed on non-empty
         prose) still do their own ``--resume`` follow-up; this helper is
         orthogonal to that and only guards the empty case.
+
+        ``fresh_prompt`` is the task book for the fresh-session retry:
+        the new session has no history, so a continuation cue
+        (:data:`RESUME_CONTINUATION_PROMPT`) describes a conversation it
+        cannot see and the sub-agent is left guessing the task. When it
+        is supplied, the retry that opens the new session sends it
+        instead of the caller's prompt. It applies to the fresh-session
+        retry only — a resumed retry (``fresh_session_on_retry=False``)
+        still sends the caller's prompt, because that session does hold
+        the turn the cue refers to.
         """
+        sent_prompt = prompt
         attempt = 0
         while True:
             try:
                 result_text, resolved_session_id, result_meta = self._run_claude_interactive(
-                    prompt,
+                    sent_prompt,
                     system_instruction,
                     session_id=session_id,
                     resume=resume,
@@ -7197,6 +7209,12 @@ class ClaudeCodingTool(CodingTool):
                     # can succeed.
                     session_id = str(uuid.uuid4())
                     resume = False
+                    if fresh_prompt is not None:
+                        # The new session has no history: a continuation
+                        # cue would point at a conversation it cannot
+                        # see, so the task book travels with the retry
+                        # instead of the cue.
+                        sent_prompt = fresh_prompt
                 # else: the session DOES exist (attempt 1 replied with
                 # unparseable prose), so keep resuming it — a fresh
                 # session would throw away the conversational context
@@ -7288,6 +7306,15 @@ class ClaudeCodingTool(CodingTool):
                 total_timeout=total_timeout,
                 allowed_tools=allowed_tools,
                 scene=scene,
+                # 2026-11-08 — the resume can come back EMPTY, and the
+                # empty-response retry then opens a NEW session. That
+                # session has no history, so the continuation cue it
+                # would otherwise be sent describes a conversation it
+                # cannot see, and the sub-agent is left guessing the
+                # task — which for a verification round means it may
+                # answer a different verification point than the one it
+                # was given. The task book travels with the retry.
+                fresh_prompt=fresh_prompt,
             )
         except HardTimeoutError:
             # The resumed session is fine; the provider is slow. That is
