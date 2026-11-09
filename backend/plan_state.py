@@ -181,9 +181,19 @@ VALID_PHASES = [
     "completed",
     "failed",
     "stopped",
+    # 2026-11-09: ``archived`` —— 「我们主动归档、永远别再跑」。
+    #
+    # 一批历史测试计划（**从没跑过**）之前一律被置成 ``stopped``，但 ``stopped``
+    # 在调度面板里是**可操作**相位（``resume`` / ``start``），于是它们被展示成
+    # 「可恢复/可启动」—— 与「主动归档、永远别再跑」的意图正好相反。
+    #
+    # ``archived`` 与 ``completed`` 是**两个**相位：``completed`` 表示「真的做
+    # 完了」，``archived`` 表示「我们把它收起来了，别再跑它」。两者都留在词表
+    # 里，不合并 —— 合并就抹掉了「做完」和「收起来」的区别。
+    "archived",
 ]
 
-TERMINAL_PHASES = {"completed", "failed", "stopped"}
+TERMINAL_PHASES = {"completed", "failed", "stopped", "archived"}
 
 #: 稳定标签映射：阶段名 → 展示用的稳定标签。
 #:
@@ -199,6 +209,8 @@ PHASE_LABELS: Dict[str, str] = {
     # 2026-10-25 (R10): 等待相位合并成 ``queued`` 之后，等待中的计划在
     # 列表接口里有一个**显式桶**（「排队中」），不再靠启发式猜它属于哪一桶。
     "queued": "排队中",
+    # 2026-11-09: ``archived``（已归档）—— 主动归档、永远别再跑的计划。
+    "archived": "已归档",
 }
 
 #: Historical phase values that are no longer written anywhere, mapped
@@ -332,7 +344,24 @@ PHASE_TRANSITIONS = {
     # stop has to be able to park it.
     "failed": ["executing", "ready", "stopped", "queued"],
     "stopped": ["executing", "ready", "queued"],
+    # 2026-11-09: ``archived`` 的**唯一出边**是 ``queued``。
+    #
+    # 归档是终态：归档的计划永远不会被调度器捡起来，所以出边只有一条，而且
+    # 它的作用是**显式恢复** —— 误归档了，操作者把它放回 ``queued``（等待相位）
+    # 重来一次。出边不写成「归档之后还能继续跑」的样子（``executing`` 之类），
+    # 因为那就等于归档没有归档住。
+    "archived": ["queued"],
 }
+
+#: 相位 ``archived`` 的**通用目标**规则里，唯一不能作为源相位的那些。
+#:
+#: 2026-11-09: ``completed``（真的做完了）不能被改写成 ``archived`` —— 那会把
+#: 「它完成过」这个事实抹掉，而「完成」与「归档」正是本相位要分开的两件事。
+#: ``stopped`` / ``failed`` 是「没做成」，把它们收起来正是本相位的用途。
+#:
+#: 这张表只管**源**相位；``archived`` 自己的出边只有 ``queued``（见
+#: :data:`PHASE_TRANSITIONS`）。
+_ARCHIVE_EXCLUDED_SOURCES = frozenset({"completed"})
 
 VERIFICATION_PHASE_TRANSITIONS = {
     "ready": ["verification", "verification_running"],
@@ -937,6 +966,23 @@ class PlanState:
         allowed.update(VERIFICATION_PHASE_TRANSITIONS.get(current, []))
         if extra_allowed:
             allowed.update(extra_allowed)
+        # 2026-11-09: ``archived`` 是**通用目标** —— 任何相位都可以直接被
+        # 归档，所以这里补一条判断，而不是往三十多条相位边里逐条加
+        # ``"archived"``。
+        #
+        # 为什么是通用目标：归档是一个**操作者的动作**（把一条计划收起来，
+        # 永远别再跑它），不是工作流的一个步骤。它要能从任何地方发生 ——
+        # 访谈中就黄了的历史计划、排队中等着的计划、停下了的计划、跑挂了的
+        # 计划，全都可能被归档。逐条加边的话，任何一条新相位都会**漏掉**这条
+        # 边，于是「归档一条新相位的计划」会炸成「非法转移」。
+        #
+        # 唯一的例外是 ``completed``：它表示「真的做完了」，把它改写成
+        # ``archived`` 会抹掉「它完成过」这个事实 —— 而「完成」与「归档」正是
+        # 本相位要与 ``completed`` 区分开的两件事。``stopped`` / ``failed``
+        # 则是「没做成」，把它们收起来正是本相位存在的意义（历史上那批从没跑过
+        # 的旧计划就是这么从 ``stopped`` 迁过来的）。
+        if phase == "archived" and current not in _ARCHIVE_EXCLUDED_SOURCES:
+            allowed.add("archived")
         if current and phase not in allowed:
             raise ValueError(
                 f"Illegal transition from '{current}' to '{phase}'. "
@@ -989,7 +1035,17 @@ class PlanState:
             self._state["completed_phases"].append("execution")
 
         # Auto-append 'execution' to completed_phases for terminal states (idempotent)
-        if phase in TERMINAL_PHASES and "execution" not in self._state["completed_phases"]:
+        #
+        # 2026-11-09: ``archived`` 被排除在外。归档的对象恰恰是**从没跑过**的
+        # 计划 —— 给它补一条 ``execution`` 等于在相位历史里记下一件它没做过
+        # 的事。``completed`` / ``failed`` / ``stopped`` 的行为一个字没动。
+        # （routing_repository 里同一条规则必须一模一样 —— 两层的相位历史要
+        # 对得上，见那里的注释。）
+        if (
+            phase in TERMINAL_PHASES
+            and phase != "archived"
+            and "execution" not in self._state["completed_phases"]
+        ):
             self._state["completed_phases"].append("execution")
 
         # Update verification status when transitioning to verification phases

@@ -3859,7 +3859,10 @@ def _record_watchdog_action(plan_id: str, stop_reason: str) -> None:
     _WATCHDOG_STATS["per_plan_last_action_ts"][plan_id] = now
 
 # Terminal plan_state phases that should not be transitioned away from
-_TERMINAL_PHASES = ("completed", "failed", "stopped")
+# 2026-11-09: ``archived`` is one of them — an archived plan is shelved for
+# good, so nothing may pull it back out (the one explicit way back is the
+# operator's own ``archived -> queued`` transition).
+_TERMINAL_PHASES = ("completed", "failed", "stopped", "archived")
 
 #: Routing phases ``POST /api/execution/{id}/start`` may CAS FROM.
 #:

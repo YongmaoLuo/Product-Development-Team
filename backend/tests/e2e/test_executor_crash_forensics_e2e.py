@@ -371,7 +371,16 @@ with sync_playwright() as driver:
                 });
                 last = await res.json();
                 const status = last && last.status;
-                if (status && status !== 'running' && status !== 'not_started') {
+                // The backend writes the terminal status and its stamp
+                // (ended_at / stop_reason) in two steps, so a terminal
+                // status alone may still be a half-written row: wait for
+                // ended_at, the stamp that says the row is fully written.
+                if (
+                    status &&
+                    status !== 'running' &&
+                    status !== 'not_started' &&
+                    last.ended_at
+                ) {
                     return last;
                 }
                 await new Promise((resolve) => setTimeout(resolve, 250));

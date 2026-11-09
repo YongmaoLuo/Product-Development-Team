@@ -78,7 +78,10 @@ _MISSING = object()
 # Terminal phases — the same set as ``plan_state.TERMINAL_PHASES``;
 # deliberately duplicated here to avoid a circular import (plan_state
 # sits above the state-machine layer, which imports this repository).
-_TERMINAL_PHASES = {"completed", "failed", "stopped"}
+#
+# 2026-11-09: ``archived`` is terminal too — an archived plan is shelved
+# for good and never runs again.
+_TERMINAL_PHASES = {"completed", "failed", "stopped", "archived"}
 
 
 def _decode_completed_phases(raw: Any) -> list[str]:
@@ -117,6 +120,17 @@ def _next_completed_phases(
       3. entering a terminal phase completes ``execution``.
 
     Every append is idempotent — the list never gains a duplicate.
+
+    2026-11-09: rule 3 does **not** apply to ``archived``.  The
+    archived plan is precisely the plan that **never ran** (a batch of
+    old plans we shelved for good), so stamping ``execution`` onto its
+    history would record something that did not happen — and it would
+    make an archived plan indistinguishable from a plan that really
+    executed and then failed.  ``completed`` / ``failed`` / ``stopped``
+    keep the rule word for word; only ``archived`` is let through
+    without an execution record.  ``plan_state.PlanState._transition_to``
+    carries the same exclusion, so the two layers keep agreeing on the
+    history.
     """
     result = list(completed)
     if current_phase and current_phase not in result:
@@ -127,7 +141,11 @@ def _next_completed_phases(
         and "execution" not in result
     ):
         result.append("execution")
-    if new_phase in _TERMINAL_PHASES and "execution" not in result:
+    if (
+        new_phase in _TERMINAL_PHASES
+        and new_phase != "archived"
+        and "execution" not in result
+    ):
         result.append("execution")
     return result
 
