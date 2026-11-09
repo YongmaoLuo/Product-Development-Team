@@ -633,22 +633,29 @@ def _upstream_browser_executable() -> Optional[str]:
 _BROWSER_DRIVER = r'''
 """Drive the dashboard the way an operator does, and report what it shows.
 
-argv: <base_url> <plan_id> <screenshot_path> <chromium_executable>
+argv: <base_url> <plan_id> <screenshot_path> <chromium_executable> [resume]
 
 Every step is a click on the page, so the frontend's own handlers run.
 Nothing here reaches into the application's internals to make a panel
 show up or a badge change.
 
+``resume`` is the second attempt: the browser went away in the first
+one, and the round that attempt started is still running -- so this
+attempt watches that round instead of starting another one.
+
 The report is one JSON object on stdout.
 """
 import json
+import os
 import sys
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
 
-base_url, plan_id, screenshot_path, chromium = sys.argv[1:5]
+args = sys.argv[1:6]
+base_url, plan_id, screenshot_path, chromium = args[:4]
+resume = len(args) > 4 and args[4] == "resume"
 
 #: How long the browser waits for each of the things it needs.
 timeout_ms = 30000
@@ -659,7 +666,10 @@ death_timeout_ms = 150000
 report = {"page_errors": [], "console_errors": [], "dialogs": []}
 
 with sync_playwright() as driver:
-    browser = driver.chromium.launch(executable_path=chromium)
+    browser = driver.chromium.launch(
+        executable_path=chromium,
+        args=["--disable-dev-shm-usage", "--disable-gpu"],
+    )
     page = browser.new_page(viewport={"width": 1280, "height": 900})
 
     page.on("pageerror", lambda exc: report["page_errors"].append(str(exc)))
@@ -701,8 +711,11 @@ with sync_playwright() as driver:
     )
     report["verification_panel_visible"] = page.is_visible("#verification-panel")
 
-    # The round has not started yet, so the badge still carries its
-    # initial value and the start button is on offer.
+    # What the page shows before the start: on the first attempt the
+    # round has not started yet, so the badge still carries its initial
+    # value and the start button is on offer; on the resumed attempt the
+    # round is already running, so the badge says so and the button is
+    # gone.
     report["badge_before_start"] = (
         page.inner_text("#verification-status-badge") or ""
     ).strip()
@@ -714,26 +727,45 @@ with sync_playwright() as driver:
     )
 
     # --- 3: the user starts the verification ---------------------------
-    page.click("#btn-start-verification")
+    #
+    # The resumed attempt does **not** start a second round: the first
+    # attempt already started this one, so the page is no longer
+    # offering the button -- the round it already started is the one
+    # this attempt watches.
+    if resume and report["badge_before_start"] != "未开始":
+        report["resumed"] = True
+        report["badge_after_start"] = report["badge_before_start"]
+        report["round_after_start"] = report["round_before_start"]
+    else:
+        report["resumed"] = False
+        page.click("#btn-start-verification")
 
-    # The round started: the badge leaves its initial value.
-    page.wait_for_function(
-        """() => {
-            const badge = document.querySelector('#verification-status-badge');
-            if (!badge) return false;
-            const text = (badge.textContent || '').trim();
-            return text !== '' && text !== '未开始';
-        }""",
-        timeout=timeout_ms,
-    )
-    report["badge_after_start"] = (
-        page.inner_text("#verification-status-badge") or ""
-    ).strip()
-    report["round_after_start"] = (
-        page.inner_text("#verification-round") or ""
-    ).strip()
+        # The round started: the badge leaves its initial value.
+        page.wait_for_function(
+            """() => {
+                const badge = document.querySelector('#verification-status-badge');
+                if (!badge) return false;
+                const text = (badge.textContent || '').trim();
+                return text !== '' && text !== '未开始';
+            }""",
+            timeout=timeout_ms,
+        )
+        report["badge_after_start"] = (
+            page.inner_text("#verification-status-badge") or ""
+        ).strip()
+        report["round_after_start"] = (
+            page.inner_text("#verification-round") or ""
+        ).strip()
 
     # --- 4: the round is judged dead ----------------------------------
+    #
+    # Fault injection (off by default): the browser disappears right
+    # after the start was confirmed -- the shape of the 2026-11-10
+    # failure.  It only ever fires on the first attempt (never on the
+    # resumed one) and only after the start really happened.
+    if not resume and os.environ.get("PDT_DEATH_E2E_CRASH_ONCE") == "1":
+        page.close()
+
     page.wait_for_function(
         """() => {
             const badge = document.querySelector('#verification-status-badge');
@@ -847,10 +879,37 @@ def _drive_in_subprocess(
     return _parse_report(result.stdout)
 
 
+#: The signatures of "the browser went away".  **Only** these count: a
+#: timeout, a failed assertion or a driver that printed nothing are real
+#: failures, and they are raised as they are.
+BROWSER_GONE_SIGNATURES = (
+    "TargetClosedError",
+    "Target page, context or browser has been closed",
+    "Target closed",
+)
+
+
+def _browser_went_away(exc: BaseException) -> bool:
+    """True when the exception says the browser (or its page) is gone."""
+    text = f"{type(exc).__name__}: {exc}"
+    return any(signature in text for signature in BROWSER_GONE_SIGNATURES)
+
+
 def _drive(
     base_url: str, plan_id: str, screenshot_path: Path, work: Path,
 ) -> Dict[str, Any]:
-    """Drive the page and return what it showed."""
+    """Drive the page and return what it showed.
+
+    The browser occasionally goes away under load — 2026-11-10 saw the
+    page die while it was waiting for the round to be judged dead.  That
+    is not a verdict on the product, it is the browser leaving: so a
+    driver run that failed **because the browser went away** is retried
+    **once**, and the retry resumes the round the first attempt had
+    already started instead of starting another one.
+
+    Every other failure — a timeout, a failed assertion, a driver that
+    printed nothing — is raised as it is.
+    """
     pytest.importorskip(
         "playwright.sync_api",
         reason="playwright is not installed — the browser half is skipped",
@@ -862,11 +921,24 @@ def _drive(
         )
 
     argv = [base_url, plan_id, str(screenshot_path), chromium]
-    if _current_interpreter_has_playwright():
-        return _drive_in_process(argv)
-    raise AssertionError(
-        "the interpreter running this test cannot import playwright.sync_api"
-    )
+    if not _current_interpreter_has_playwright():
+        raise AssertionError(
+            "the interpreter running this test cannot import playwright.sync_api"
+        )
+
+    try:
+        report = _drive_in_process(argv)
+    except Exception as exc:
+        if not _browser_went_away(exc):
+            raise
+        # The browser left; give it a moment before opening a new one.
+        time.sleep(2)
+        report = _drive_in_process(argv + ["resume"])
+        report["browser_relaunches"] = 1
+        report["relaunched_after"] = f"{type(exc).__name__}: {exc}"
+    else:
+        report["browser_relaunches"] = 0
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -1154,18 +1226,33 @@ def test_e2e_dashboard_shows_failed_after_death(death_env, tmp_path):
         f"the verification panel did not open: {report!r}"
     )
 
-    assert report.get("start_button_visible_before_start") is True, (
-        f"the page offered no way to start the verification: {report!r}"
-    )
-    assert report.get("badge_before_start") == "未开始", (
-        f"the badge read {report.get('badge_before_start')!r} before the "
-        f"round was started: {report!r}"
-    )
+    if report.get("resumed"):
+        # The first attempt started the round and the browser went away
+        # before the death could be watched.  The resumed attempt finds
+        # that round already running — it does not start a second one.
+        assert report.get("badge_before_start") in ("验证中", "验证失败", "失败"), (
+            f"the resumed attempt found no round to resume: {report!r}"
+        )
+        assert report.get("start_button_visible_before_start") is False, (
+            f"the page still offers 「启动验证」 for a round already running: "
+            f"{report!r}"
+        )
+        assert report.get("badge_after_start") in ("验证中", "验证失败", "失败"), (
+            f"the resumed attempt did not find the running round: {report!r}"
+        )
+    else:
+        assert report.get("start_button_visible_before_start") is True, (
+            f"the page offered no way to start the verification: {report!r}"
+        )
+        assert report.get("badge_before_start") == "未开始", (
+            f"the badge read {report.get('badge_before_start')!r} before the "
+            f"round was started: {report!r}"
+        )
 
-    assert report.get("badge_after_start") == "验证中", (
-        f"the round did not start: the badge read "
-        f"{report.get('badge_after_start')!r}: {report!r}"
-    )
+        assert report.get("badge_after_start") == "验证中", (
+            f"the round did not start: the badge read "
+            f"{report.get('badge_after_start')!r}: {report!r}"
+        )
     assert report.get("dialogs") == [], (
         f"the page refused the start with a dialog: {report.get('dialogs')!r}"
     )
@@ -1206,3 +1293,22 @@ def test_e2e_dashboard_shows_failed_after_death(death_env, tmp_path):
         f"the page raised uncaught JavaScript exceptions: "
         f"{report.get('page_errors')!r}"
     )
+
+    print(
+        f"[e2e] browser relaunches={report.get('browser_relaunches')!r} "
+        f"resumed={report.get('resumed')!r} "
+        f"relaunched_after={report.get('relaunched_after')!r}"
+    )
+
+    # With the fault injected, the browser really did go away -- so the
+    # driver has to have relaunched it and resumed the round the first
+    # attempt had already started.  Without the retry these two fail.
+    if os.environ.get("PDT_DEATH_E2E_CRASH_ONCE") == "1":
+        assert report.get("browser_relaunches") == 1, (
+            f"the browser was not relaunched after the injected crash: "
+            f"{report!r}"
+        )
+        assert report.get("resumed") is True, (
+            f"the relaunched driver did not resume the running round: "
+            f"{report!r}"
+        )
