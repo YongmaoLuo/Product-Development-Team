@@ -85,6 +85,19 @@ import execution_log_tail
 # cannot answer differently about the same plan.
 from plan_status import normalize_exec_status
 
+# The crash scene.  These are the pure functions that build, write and
+# read back the report of a run that ended badly; the route's own job
+# is only to decide *when* one is owed and to say so in the plan's
+# flags (see ``_finalize_executor_forensics`` below).
+from crash_forensics import (
+    build_crash_report,
+    describe_exit,
+    derive_active_task_id,
+    latest_crash_report,
+    tail_execution_events,
+    write_crash_report,
+)
+
 router = APIRouter()
 
 
@@ -1005,6 +1018,353 @@ def _ledger_write_exit(
         )
 
 
+# ---------------------------------------------------------------------------
+# The crash scene — written by the parent, for a run that could not
+# ---------------------------------------------------------------------------
+#
+# A SIGKILLed executor never gets to write anything down: the process is
+# gone between one instruction and the next.  ``plan_execution.flags``
+# comes back empty, ``logs/executor_*.log`` stops half way through a
+# sentence, and the questions that follow ("which task was running?",
+# "how long had it been up?", "was it killed or did it fail?") have no
+# answer — the answer is not reconstructed from the plan afterwards,
+# because the evidence was never written down.
+#
+# The parent is the one process that outlives the executor, so it is the
+# parent that writes the fallback.  Two rules shape it:
+#
+# * **The executor's own report wins.**  When the executor managed to
+#   write one, that report carries what only it knows (the traceback,
+#   the stack) and a second file next to it would be a second, poorer
+#   answer to the same question.
+# * **Nothing here may fail a run.**  The caller has just watched a
+#   process die; a report that cannot be written is a missing report,
+#   not a second failure.  Every function below answers "I have
+#   nothing" rather than raising.
+
+#: The name pattern of a crash report, as written by
+#: ``crash_forensics.write_crash_report``.
+#:
+#: The prefix itself lives in ``crash_forensics``; it is spelled out
+#: here because the flags column has to *name* the file it points at,
+#: and a report carries no path of its own — a report has to stay
+#: readable on a machine that is not the one that wrote it.
+_CRASH_REPORT_GLOB = "executor_crash_*.json"
+
+
+def _crash_report_relpath(plan_dir: Path) -> Optional[str]:
+    """The newest crash report under ``plan_dir``, as a plan-relative path.
+
+    The path is relative to the plan directory on purpose: the flags
+    column is read by other tools (the plan card, the API, a reader on
+    another machine), and a path that starts with ``/Users/...`` means
+    nothing to them — and leaks the layout of this machine into a row
+    that is shared.
+
+    ``None`` means there is no report to name: no directory, no
+    report, or no report that could be read.
+    """
+    try:
+        logs_dir = Path(plan_dir) / "logs"
+        candidates = sorted(
+            logs_dir.glob(_CRASH_REPORT_GLOB), key=lambda item: item.name
+        )
+    except (OSError, TypeError, ValueError):
+        return None
+    for candidate in reversed(candidates):
+        try:
+            parsed = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(parsed, dict):
+            return f"logs/{candidate.name}"
+    return None
+
+
+def _same_pid(left: Any, right: Any) -> bool:
+    """Do two pids name the same process?
+
+    The report's pid is a number the executor wrote; the handle's pid
+    is a number the parent holds.  They are compared as numbers when
+    both can be read as numbers, because a pid that was written as a
+    string still names the same process.
+    """
+    if left is None or right is None:
+        return False
+    try:
+        return int(left) == int(right)
+    except (TypeError, ValueError):
+        return str(left) == str(right)
+
+
+def _uptime_seconds(
+    started_at: Optional[str], now: datetime
+) -> Optional[float]:
+    """How long the run had been going when it ended, in seconds.
+
+    ``None`` when the start time is unknown or unreadable: "the run's
+    age is unknown" and "the run's age was zero" are different
+    statements, and only the first one is true when the start time is
+    missing.
+    """
+    if not started_at:
+        return None
+    try:
+        moment = datetime.fromisoformat(
+            str(started_at).replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError):
+        return None
+    if moment.tzinfo is None:
+        # A naive stamp is read as UTC — the convention the log writer
+        # uses when it stamps a line.
+        moment = moment.replace(tzinfo=timezone.utc)
+    try:
+        seconds = (now - moment).total_seconds()
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds > 0 else 0.0
+
+
+def _persist_crash_flags(
+    plan_id: str,
+    report: Dict[str, Any],
+    *,
+    plan_dir: Optional[Path] = None,
+) -> None:
+    """Record the crash in the plan's ``flags`` column.
+
+    The flags column is the one place a reader of the plan — the card,
+    the API, an operator with nothing but SQL — can see that the run
+    ended badly and what it looked like when it did.  It was empty
+    before this, and it stays empty for every run that has not
+    crashed.
+
+    The write is a **merge**, not a replacement: the keys the flags
+    already had (``arch_enabled`` and its friends) are kept, and the
+    crash is one more key among them.  The reason the run ended is not
+    touched — that is the watcher's to write, and this path knows
+    nothing about it.
+
+    ``plan_dir`` is where the report was written.  It is optional so
+    that the caller can be the one who knows; when it is not given the
+    plan's own directory is resolved from the id.
+
+    Nothing here raises.  A flag that could not be written is a
+    missing flag, and a missing flag is much better than a second
+    failure on the way out of a run that has already died.
+    """
+    from state_machine.db.connection import open as open_db
+    from state_machine.db.schema import migrate
+    from state_machine.repositories.execution_repository import (
+        ExecutionRepository,
+        PlanNotFoundError as ExecPlanNotFoundError,
+    )
+
+    conn = None
+    try:
+        conn = open_db(_server._state_db_path())
+        migrate(conn)
+        repository = ExecutionRepository(conn)
+        summary = repository.summary(plan_id) or {}
+        existing = summary.get("flags")
+        flags = dict(existing) if isinstance(existing, dict) else {}
+
+        directory = plan_dir
+        if directory is None:
+            try:
+                directory = _server._plan_dir(plan_id)
+            except Exception:  # noqa: BLE001 — a missing path is not a crash
+                directory = None
+        relpath = (
+            _crash_report_relpath(directory) if directory is not None else None
+        )
+        if relpath is None:
+            # Nothing to name: keep whatever the row already says rather
+            # than replacing a known path with nothing.
+            previous = flags.get("crash")
+            if isinstance(previous, dict):
+                relpath = previous.get("report")
+
+        flags["crash"] = {
+            "exit_code": report.get("exit_code"),
+            "signal": report.get("signal"),
+            "signal_name": report.get("signal_name"),
+            "killed_by": report.get("killed_by"),
+            "report": relpath,
+            "crashed_at": report.get("crashed_at"),
+        }
+        repository.update_flags(plan_id, flags)
+    except ExecPlanNotFoundError:
+        # No row: there is nothing to write the flags into, and no run
+        # to write them for.
+        _server.logger.warning(
+            "crash_flags_persist_skipped plan=%s reason=plan_not_found",
+            plan_id,
+        )
+    except Exception:  # noqa: BLE001 — a missing flag must not fail a run
+        _server.logger.warning(
+            "crash_flags_persist_failed plan=%s", plan_id, exc_info=True,
+        )
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 — closing must not raise either
+                pass
+
+
+def _clear_crash_flags(plan_id: str) -> None:
+    """Take the previous round's crash out of the plan's ``flags``.
+
+    The crash of a run lives in the plan's ``flags`` column (see
+    :func:`_persist_crash_flags`).  Nothing ever took it out again, so
+    a plan that crashed in one round and ran in the next carried the
+    old crash through the new round — and a reader of the row could
+    not tell which round the crash belonged to.
+
+    The boundary between the rounds is the start: the new round takes
+    the old crash with it.  Only the ``crash`` key is removed; the
+    keys the flags already had (``arch_enabled`` and its friends) are
+    kept exactly as they are, and no key is added.
+
+    A round that has nothing to clear writes nothing at all: the
+    flags are left alone rather than written back unchanged, which
+    would only move the row's ``updated_at`` for no reason.
+
+    Nothing here raises.  A crash that could not be cleared is a
+    leftover flag, and a leftover flag is much better than a start
+    that fails over it.
+    """
+    from state_machine.db.connection import open as open_db
+    from state_machine.db.schema import migrate
+    from state_machine.repositories.execution_repository import (
+        ExecutionRepository,
+        PlanNotFoundError as ExecPlanNotFoundError,
+    )
+
+    conn = None
+    try:
+        conn = open_db(_server._state_db_path())
+        migrate(conn)
+        repository = ExecutionRepository(conn)
+        summary = repository.summary(plan_id) or {}
+        existing = summary.get("flags")
+        flags = dict(existing) if isinstance(existing, dict) else {}
+        if "crash" not in flags:
+            # Nothing to clear: do not write.
+            return
+        flags.pop("crash")
+        repository.update_flags(plan_id, flags)
+    except ExecPlanNotFoundError:
+        # No row: there is nothing to clear the crash from, and no run
+        # to clear it for.
+        _server.logger.warning(
+            "crash_flags_clear_skipped plan=%s reason=plan_not_found",
+            plan_id,
+        )
+    except Exception:  # noqa: BLE001 — a leftover flag must not fail a start
+        _server.logger.warning(
+            "crash_flags_clear_failed plan=%s", plan_id, exc_info=True,
+        )
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 — closing must not raise either
+                pass
+
+
+def _finalize_executor_forensics(
+    plan_id: str,
+    plan_dir: Path,
+    process: Any,
+    *,
+    started_at: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Write down the scene of a bad end, if the executor could not.
+
+    ``process`` is the handle the parent holds on the executor: the
+    facts only the parent knows — the return code, the pid, the command
+    line — are read off it.  ``started_at`` is the moment the run
+    began, as the state machine wrote it.
+
+    What happens, in order:
+
+    * **A clean exit writes nothing.**  ``returncode == 0`` is not a
+      crash: no file, no flags, nothing said about a run that ended
+      well.
+    * **The executor's own report is reused.**  If there is already a
+      report under the plan directory and it names *this* pid, the
+      executor wrote it before it died, and that report — which carries
+      the traceback and the stack — is better than anything the parent
+      can guess.  No second file is written.
+    * **Otherwise the parent writes the fallback.**  The return code is
+      turned into a description (a signal is named, not numbered), the
+      tail of ``execution.log`` is copied in raw, the task that was
+      running is read out of it, and the report says where it came
+      from (``source='parent'``).
+
+    A report left over from an earlier run names a different pid and is
+    treated as absent — reusing it would answer "what happened to
+    *this* run" with the story of the previous one.
+
+    The report is also recorded in the plan's flags, so a reader with
+    nothing but the database can find it.
+
+    Nothing here raises.  The caller has just watched a process die.
+    """
+    try:
+        if process is None:
+            return None
+        returncode = getattr(process, "returncode", None)
+        if returncode is None:
+            # The process has not been reaped yet: there is no end to
+            # describe.
+            return None
+        if returncode == 0:
+            return None
+
+        existing = latest_crash_report(plan_dir)
+        if isinstance(existing, dict) and _same_pid(
+            existing.get("pid"), getattr(process, "pid", None)
+        ):
+            report = existing
+        else:
+            described = describe_exit(returncode)
+            last_events = tail_execution_events(plan_dir)
+            now = datetime.now(timezone.utc)
+            report = build_crash_report(
+                plan_dir=plan_dir,
+                plan_id=plan_id,
+                pid=getattr(process, "pid", None),
+                argv=list(getattr(process, "args", []) or []),
+                started_at=started_at,
+                crashed_at=now.isoformat(),
+                uptime_seconds=_uptime_seconds(started_at, now),
+                last_events=last_events,
+                active_task_id=derive_active_task_id(last_events),
+                # The traceback and the stack are the executor's to
+                # write; the parent has neither.
+                traceback=None,
+                faulthandler=None,
+                source="parent",
+                exit_code=described.get("exit_code"),
+                signal=described.get("signal"),
+                signal_name=described.get("signal_name"),
+                killed_by=described.get("killed_by"),
+            )
+            write_crash_report(plan_dir, report)
+
+        _persist_crash_flags(plan_id, report, plan_dir=plan_dir)
+        return report
+    except Exception:  # noqa: BLE001 — a missing report must not fail a run
+        _server.logger.warning(
+            "executor_forensics_failed plan=%s", plan_id, exc_info=True,
+        )
+        return None
+
+
 #: The environment variable that replaces the executor's command line.
 #:
 #: It exists so that a deterministic stand-in can be put where the real
@@ -1416,6 +1776,71 @@ _QUOTA_WAIT_STOP_REASON = "waiting_for_quota"
 #: is the reason every later reader sees — a restart included.
 _CRASH_STOP_REASON = "process_died_unexpectedly"
 
+
+def _crash_stop_reason(returncode: int) -> str:
+    """The reason a run ended, carrying the number that ended it.
+
+    ``non_zero_exit`` and ``process_died_unexpectedly`` are both true
+    and both useless: an operator reading the row cannot tell exit 1
+    from exit 7, and cannot tell a SIGKILL from a SIGTERM — the two
+    crashes that need opposite responses look identical in the column.
+    The reason has to carry the fact that ended the run.
+
+    * a positive code is the executor's own exit code —
+      ``non_zero_exit:7``;
+    * a negative code is a signal death (the kernel reports a signal
+      as ``-signum``) — ``signal:9``;
+    * a zero carries no number at all, so the reason it always had
+      stands: the run died and nobody can say how.
+
+    One place decides the wording, so the watcher and anything that
+    reads a row cannot answer the same death differently.
+    """
+    if returncode > 0:
+        return f"non_zero_exit:{returncode}"
+    if returncode < 0:
+        return f"signal:{abs(returncode)}"
+    return _CRASH_STOP_REASON
+
+
+#: The prefix of the reason a death by signal gets.  A signal death
+#: is a crash: the process is gone, and the number that killed it is
+#: part of the reason.
+_SIGNAL_STOP_REASON_PREFIX = "signal:"
+
+
+def _is_crash_verdict(stop_reason: Optional[str]) -> bool:
+    """Does this reason say the *process* is gone?
+
+    A crash is not a verdict about the run — it is a verdict about the
+    process: the executor died, so the pid it left behind belongs to a
+    process that no longer exists, and every "is this execution alive?"
+    reader believes a pid means alive.  Two reasons say that:
+
+    * the plain crash (``process_died_unexpectedly``) — a death that
+      carries no number at all;
+    * a death by signal (``signal:9``) — the same death, with the
+      signal that caused it named.
+
+    An exit code is NOT one of them.  ``non_zero_exit:7`` is the
+    executor's own verdict: the process said so before it exited, so
+    the pid stays a fact about the run ("this plan was executed by
+    that process").  That is what it was before the reason carried the
+    number, and it stays that way.
+
+    The wording of a reason is therefore not free: a reader that
+    judges a crash by its spelling has to ask this question, not
+    compare against one literal.  A reason that *is* a crash but does
+    not match the literal would leave a dead pid on the record, and a
+    lost verdict would never be healed.
+    """
+    if not stop_reason:
+        return False
+    if stop_reason == _CRASH_STOP_REASON:
+        return True
+    return stop_reason.startswith(_SIGNAL_STOP_REASON_PREFIX)
+
+
 #: The execution statuses that mean the run is over.  A run that is
 #: over has an end time; a parked run (``waiting_for_quota``) and a
 #: live one have not ended yet.  The same set the repository uses to
@@ -1763,14 +2188,21 @@ def _adopt_row_verdict(plan_id: str, row: Optional[Dict[str, Any]]) -> None:
         # ran" — a claim about the process boundary that is false.
         # Liveness is answered by ``execution_in_flight`` and by the
         # row's own verdict, not by the presence of a pid.
-        if stop_reason == _CRASH_STOP_REASON:
+        #
+        # "Is this a crash" is asked of the reason, not of its
+        # spelling: a death by signal (``signal:9``) is a crash too,
+        # and an exit code (``non_zero_exit:7``) is not.
+        if _is_crash_verdict(stop_reason):
             state["pid"] = None
     # Runtime-only, like ``sync_targets``: the row's stamp is the
     # durable copy of it.
     state["verdict_persisted_at"] = _verdict_stamp(row)
 
 
-def _write_crash_verdict(plan_id: str) -> Optional[Dict[str, Any]]:
+def _write_crash_verdict(
+    plan_id: str,
+    stop_reason: str = _CRASH_STOP_REASON,
+) -> Optional[Dict[str, Any]]:
     """Write a process death to the row — the whole verdict, at once.
 
     The verdict goes to the row through ``ExecutionRepository``: the
@@ -1783,6 +2215,12 @@ def _write_crash_verdict(plan_id: str) -> Optional[Dict[str, Any]]:
     already carries a verdict is the run's end — terminal, or parked
     on capacity — and a verdict is never re-judged.  That is what
     keeps a quota pause from being read as a crash.
+
+    ``stop_reason`` is the reason the crash is known by.  It defaults
+    to the plain crash, but a caller that knows *how* the process died
+    (a signal death, say) passes that reason on: healing a lost write
+    with vaguer words than the ones that were lost would throw away
+    the fact the reason exists to carry.
 
     Returns the row as it stands after the write, or ``None`` when
     the row was not judged (no row at all, or a row that carries a
@@ -1809,7 +2247,7 @@ def _write_crash_verdict(plan_id: str) -> Optional[Dict[str, Any]]:
             ExecutionRepository(persist_conn).update_fields(
                 plan_id,
                 exec_status="failed",
-                stop_reason=_CRASH_STOP_REASON,
+                stop_reason=stop_reason,
                 # The executor is gone; a pid left on a row that says
                 # ``failed`` reads as a live execution to every reader.
                 exec_pid=None,
@@ -3297,6 +3735,30 @@ def start_execution(
             except Exception:
                 pass
 
+    # --- Step 4: the new round takes the old crash with it -----------
+    # The crash of the previous round lives in the plan's ``flags``
+    # column, and nothing took it out again — so a plan that crashed
+    # in one round and ran in the next carried the old crash through
+    # the new round, and a reader of the row could not tell which
+    # round the crash belonged to.  The boundary between the rounds is
+    # this start, so this is where the old crash is cleared.
+    #
+    # It runs *after* the spawn succeeded: a start that never got an
+    # executor up did not begin a round, so it must not clear the
+    # previous round's crash.
+    #
+    # Clearing never blocks this start: the helper swallows its own
+    # failures, and this guard covers the ones it cannot see (an import
+    # that does not resolve, a helper that was replaced by something
+    # that raises).  A leftover flag is much better than a start that
+    # fails over it — the run is already up.
+    try:
+        _clear_crash_flags(plan_id)
+    except Exception:  # noqa: BLE001 — a leftover flag must not fail a start
+        _server.logger.warning(
+            "crash_flags_clear_failed plan=%s", plan_id, exc_info=True,
+        )
+
     def _run():
         try:
             # 2026-09-06:
@@ -3338,6 +3800,25 @@ def start_execution(
                 process.pid,
                 process.returncode,
                 detail="executor_finished",
+            )
+            # 2026-11-08: the executor may have been killed before it
+            # could write anything down — a SIGKILL leaves nothing
+            # behind, and the questions that follow ("which task was
+            # running?", "how long had it been up?") have no answer
+            # unless somebody writes it down.  The parent is the one
+            # process that outlives the executor, so the parent writes
+            # the fallback and records it in the plan's flags.
+            #
+            # It is written *before* the status branches below: the
+            # scene of the death is evidence about the run, and the
+            # branches are what decide what the run's status becomes.
+            # Nothing here touches ``state["stop_reason"]`` — the
+            # reason the run ended is the watcher's to write.
+            _finalize_executor_forensics(
+                plan_id,
+                plan_dir,
+                process,
+                started_at=state.get("started_at"),
             )
             # 2026-11-03: the hand-off used to hang off a *mutable
             # in-memory* status.  ``state["status"]`` is written by
@@ -3699,7 +4180,11 @@ def start_execution(
                     _server._settle_phase_after_verification_loop(plan_dir, loop_outcome)
                 elif process.returncode > 0:
                     state["status"] = "failed"
-                    state["stop_reason"] = "non_zero_exit"
+                    # The reason carries the exit code: ``non_zero_exit``
+                    # alone cannot tell exit 1 from exit 7.
+                    state["stop_reason"] = _crash_stop_reason(
+                        process.returncode
+                    )
                     state["ended_at"] = datetime.now().isoformat()
                     _server.PlanState(plan_dir).transition_to("failed")
                 elif _shutdown_interrupted_this_run(
@@ -3733,7 +4218,12 @@ def start_execution(
                         )
                 else:
                     state["status"] = "failed"
-                    state["stop_reason"] = "process_died_unexpectedly"
+                    # A death by signal carries the signal number
+                    # (``signal:9``); a death that carries no number at
+                    # all keeps the reason it always had.
+                    state["stop_reason"] = _crash_stop_reason(
+                        process.returncode
+                    )
                     state["ended_at"] = datetime.now().isoformat()
                     _server.PlanState(plan_dir).transition_to("failed")
             else:
@@ -4097,15 +4587,21 @@ def get_execution_status(plan_id: str):
         read = _read_execution_state(plan_id)
         row = read.row or row
 
+    memory_reason = _memory_verdict(plan_id)[1]
     if (
-        _memory_verdict(plan_id)[1] == _CRASH_STOP_REASON
+        _is_crash_verdict(memory_reason)
         and str((row or {}).get("exec_status") or "") == "running"
     ):
         # The crash was reached, but the row does not carry it: the
         # write was lost.  A ``running`` row is the only row that may
         # still be judged, so this is the one moment the verdict may be
         # written — and it is written whole.
-        row = _write_crash_verdict(plan_id) or row
+        #
+        # The reason the crash is known by is written back as it was
+        # lost: a death by signal says ``signal:9``, and healing the
+        # row with vaguer words would throw away the fact the reason
+        # exists to carry.
+        row = _write_crash_verdict(plan_id, stop_reason=memory_reason) or row
         _adopt_row_verdict(plan_id, row)
         # Same here: the row changed, so the provenance is read again.
         read = _read_execution_state(plan_id)

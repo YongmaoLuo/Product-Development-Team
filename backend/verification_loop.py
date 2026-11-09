@@ -3223,6 +3223,40 @@ def _handle_stuck_sub_agent(plan_id: str, handle) -> None:
     )
 
 
+def _repair_stop_reason(exit_code: int) -> str:
+    """Say HOW the repair round ended, not just that it ended badly.
+
+    2026-11-09:
+
+    ``repair_non_zero_exit`` said one thing about two different
+    events.  A round that exited 3 and a round that was SIGKILLed —
+    the OOM killer, a stray ``kill -9``, a container that ran out of
+    memory — both wrote the same word, so the record could not tell a
+    failure from a killing.  The killing is exactly the case where the
+    operator wants to know what happened.
+
+    The reason carries the fact now:
+
+    * a positive code is the code the executor chose:
+      ``repair_non_zero_exit:3``;
+    * a negative code is the signal that killed it: ``repair_signal:9``.
+
+    The verdict does not change — the status is still ``failed``, and
+    what ends the chain is the STATUS, not the reason (see
+    :data:`_TERMINAL_VERIFICATION_STATUSES`).  Only the description
+    of the verdict is refined, so nothing that keyed off the bare
+    spelling has to be found and fixed.
+    """
+    if exit_code is None:
+        # Defensive: a round that ended without a return code has no
+        # fact to carry.  The caller only reaches this with a code.
+        return "repair_non_zero_exit:unknown"
+    if exit_code < 0:
+        # A negative return code is a signal, not an exit code.
+        return f"repair_signal:{abs(exit_code)}"
+    return f"repair_non_zero_exit:{exit_code}"
+
+
 def _repair_exit_writer(
     plan_id: str,
     plan_dir: Path,
@@ -3243,6 +3277,30 @@ def _repair_exit_writer(
     * the ledger is evidence, not a gate. A read-only plan directory
       or a full disk must not cost the operator the repair round they
       asked for. The failure is logged and the round continues.
+
+    2026-11-09 — the scene of a bad end:
+
+    The ledger says *that* a process ended and with which code; it
+    does not say what the round was doing when it died, and it does
+    not survive as a readable report.  A repair round that was
+    SIGKILLed left the operator with a pid and a code and nothing
+    else.  The main execution path already writes the scene down (the
+    parent's fallback report — see
+    ``routes.execution._finalize_executor_forensics``); the repair
+    path did not, and a repair round that died was a round nobody
+    could investigate.
+
+    So the writer writes the scene too, once, for a round that ended
+    badly:
+
+    * only a *finished* round with a non-zero code has a scene to
+      write — a clean exit is not a crash, and a round that blew up
+      before it had a return code (``repair_aborted``) has no end to
+      describe;
+    * the scene is written after the ledger exit, and each of the two
+      is guarded on its own: a report that cannot be written must not
+      cost the operator the ledger entry, and a ledger that cannot be
+      written must not cost the operator the report.
     """
     written = False
 
@@ -3273,6 +3331,22 @@ def _repair_exit_writer(
         except Exception:  # noqa: BLE001 — the ledger must never break a round
             _server.logger.warning(
                 "repair_executor_exit_ledger_write_failed plan=%s pid=%s",
+                plan_id,
+                pid,
+                exc_info=True,
+            )
+        if detail != "repair_finished":
+            return
+        if exit_code is None or exit_code == 0:
+            # Nothing to describe: either the round never produced a
+            # return code, or it ended well.  Neither is a crash.
+            return
+        try:
+            from routes.execution import _finalize_executor_forensics
+            _finalize_executor_forensics(plan_id, plan_dir, process)
+        except Exception:  # noqa: BLE001 — a missing report must not fail a round
+            _server.logger.warning(
+                "repair_executor_forensics_write_failed plan=%s pid=%s",
                 plan_id,
                 pid,
                 exc_info=True,
@@ -3901,7 +3975,12 @@ def _run_repair_execution_async(
                     # yielding over this crash.
                     state["executor_finished_cleanly"] = False
                     state["status"] = "failed"
-                    state["stop_reason"] = "repair_non_zero_exit"
+                    # The reason says HOW the round ended — an exit
+                    # code the executor chose, or a signal that
+                    # killed it.  See :func:`_repair_stop_reason`.
+                    state["stop_reason"] = _repair_stop_reason(
+                        process.returncode
+                    )
                 # A parked round is not over — ``ended_at`` stays None so
                 # the readers that ask "did this run end?" are not told
                 # it did.  Every other outcome (completed, failed) ends
