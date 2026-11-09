@@ -3,7 +3,7 @@
 背景
 ----
 executor 非零退出时，watcher 是知道原因的：它把
-``state["stop_reason"] = "non_zero_exit"`` 放进内存里的状态。但那个
+``state["stop_reason"] = "non_zero_exit:1"`` 放进内存里的状态。但那个
 理由一直只活在内存里 —— 最终落库的那一步调的是
 ``update_status(plan_id, status)``，没有带理由，于是
 ``plan_execution.stop_reason`` 那一列一直挂着上一次开机 reconcile
@@ -11,7 +11,7 @@ executor 非零退出时，watcher 是知道原因的：它把
 
 这里钉的是**接线**，不是仓储的方法：走真正的生产入口
 （``start_execution`` → watcher → 数据库），断言那一列里最后是
-``non_zero_exit``。只测 ``ExecutionRepository.update_status`` 的话，
+``non_zero_exit:1``。只测 ``ExecutionRepository.update_status`` 的话，
 watcher 忘了传理由，测试照样是绿的 —— 而那正是这个 bug 的形状。
 
 另外钉住的是「不传就不覆盖」：watcher 没有理由可报时（正常完成，
@@ -247,16 +247,17 @@ def _drive_watcher(
 
 
 def test_non_zero_exit_reason_reaches_the_database_row(tmp_path, monkeypatch):
-    """executor 非零退出 → 数据库那一列里是 ``non_zero_exit``。
+    """executor 非零退出 → 数据库那一列里是 ``non_zero_exit:1``。
 
     落库之前那一列挂着开机 reconcile 写的 ``startup_reconcile`` ——
-    一个和这一轮毫无关系的解释。
+    一个和这一轮毫无关系的解释。理由里带着退出码：``non_zero_exit``
+    只说了「非零退出」，退出 1 和退出 7 在这一列里长得一模一样。
     """
     db_path = _drive_watcher(tmp_path, monkeypatch, returncode=1)
 
     row = _read_execution_row(db_path, _PLAN_ID)
     assert row["exec_status"] == "failed"
-    assert row["stop_reason"] == "non_zero_exit", (
+    assert row["stop_reason"] == "non_zero_exit:1", (
         "the row still carries the reason of whatever wrote it last"
     )
 

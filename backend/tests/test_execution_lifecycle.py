@@ -186,7 +186,7 @@ class TestExecutionLifecycle:
         assert ps_data["current_phase"] == "completed"
 
     def test_nonzero_exit(self, monkeypatch, state_db_reader):
-        """returncode=1 → status='failed', stop_reason='non_zero_exit'."""
+        """returncode=1 → status='failed', stop_reason='non_zero_exit:1'."""
         plan_id = "test-fail"
         plan_dir = _setup_plan_dir(plan_id)
 
@@ -203,7 +203,7 @@ class TestExecutionLifecycle:
 
         row = _wait_for_db_status(state_db_reader, plan_id, "failed")
         assert row is not None, "plan_execution exec_status never became 'failed'"
-        assert _execution_state[plan_id]["stop_reason"] == "non_zero_exit"
+        assert _execution_state[plan_id]["stop_reason"] == "non_zero_exit:1"
         assert _execution_state[plan_id]["ended_at"] is not None
 
         ps = PlanState(plan_dir)

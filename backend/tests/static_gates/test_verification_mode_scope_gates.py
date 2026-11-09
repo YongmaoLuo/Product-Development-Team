@@ -758,8 +758,19 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 未改动；按本 gate 的既定流程重新钉住该文件。这是「移动冻结」而不是
     # 「放松门禁」：断言（mismatched == []）、被钉文件的范围与 sha256 逐字节
     # 比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-09：本计划 task-7「修复轮的同步/异步路径也写兜底现场」已批准，
+    # 改动本文件——新增 `_repair_stop_reason`（正数退出码写成
+    # `repair_non_zero_exit:3`，负数信号写成 `repair_signal:9`），
+    # `_repair_exit_writer` 在修复轮以非零码结束时补写崩溃现场（与主执行路径
+    # 的父进程兜底报告同一套写入器），`_run_repair_execution_async` 改用新助手
+    # 写 `stop_reason`。改动范围是相对上一版冻结基线（144d07b8）的 +80/-1、
+    # 四处 hunk，全部落在本文件，未改动任何既有分支的语义；按本 gate 的既定
+    # 流程把冻结基线前移到本分支的批准态哈希。
+    # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的
+    # 范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
+    # 任何再编辑照样红。
     "backend/verification_loop.py": (
-        "3fa8684b1ed4c2f9bdf0b9a27daf46c0c2df9310e07928bf91210bb84f4ab3e0"
+        "3e61e552d6aa943e4b1036ba915373cabac2ba50dc778c40fcfe8adbb66112c5"
     ),
 }
 
