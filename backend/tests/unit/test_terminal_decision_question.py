@@ -3,19 +3,18 @@
 When the chain's terminal branch cannot repair its way out, it stops
 and asks a human how to proceed.  The question has to carry facts the
 human can check, not an adjective: which round stopped, why it stopped,
-how many repair tasks were produced, and which verification points
-failed with which verdict.
+and which verification points failed with which verdict.
 
 This module pins down the **factual** half of the question:
 
-* **The facts are in the question.**  Round number, stop reason,
-  repair-task count and every failed point's verdict are all named, so
-  the answer does not depend on the human going and reading the report.
-* **A point without a verdict reads ``unknown``.**  The report may
-  name a point that carries no status at all; that is a fact about the
-  report, and the question says so rather than guessing.
-* **No failed points reads ``none``.**  An empty list is stated, not
-  left as a blank.
+* **The facts are in the question.**  Which round stopped, why it
+  stopped and every failed point's verdict are all named, so the answer
+  does not depend on the human going and reading the report.
+* **A point without a verdict is named without one.**  The report may
+  name a point that carries no status at all; the card lists the point
+  and claims no verdict for it, rather than inventing one.
+* **No failed points is written down.**  An empty list is stated
+  (``（无失败点记录）``), not left as a blank.
 * **The freshest entry wins.**  The same point can appear twice — once
   in the top-level results, once in the last round's snapshot — and the
   top-level one is the newer reading, so the question must not quote
@@ -28,10 +27,11 @@ by the judge and rendered as a decision card:
   decided, the options on the table, the advice and the path of the
   full report replace the one sentence of facts: a person reading the
   question reads the decision, not a document.
-* **Without an analysis the question is the old sentence, byte for
-  byte.**  The judge is a model call and a model call may fail; a human
-  must still be asked something, and what they are asked is exactly
-  what they were asked before the analysis existed.
+* **Without an analysis the question is the fallback card.**  The judge
+  is a model call and a model call may fail; a human must still be
+  asked something, and what they are asked is the **same decision
+  shape** — the failed points written out by hand instead of by a
+  model — with the reason there is no analysis said on the card.
 * **The analysis never moves the default.**  The judge recommends; the
   human decides.  The answer the question falls back to when nobody
   replies does not change because a model had an opinion.
@@ -67,12 +67,23 @@ _ANALYSIS = {
     "uncertainty": "无法判断是否环境问题",
 }
 
-#: The question the terminal branch asked before the analysis existed —
-#: the one the analysis replaces, and the one it falls back to.
-_FACTUAL_QUESTION = (
-    "verification round 2 stopped with repair_execution_failed: "
-    "0 repair task(s) were generated; failed checks: VP-3=FAILED. "
-    "Choose how to proceed."
+#: The card the terminal branch puts to a human when the judge has no
+#: analysis to offer — the fallback card, byte for byte.  The archive's
+#: path is stamped with the clock, so it is the one part that cannot be
+#: a constant: the test fills it in from the payload.
+#:
+#: The plan id is the fixture's plan directory name (``plan``), and the
+#: failed point is the one the report below carries.
+_FALLBACK_CARD = (
+    "【需要你决定】plan 第 2 轮验证终止：repair_execution_failed\n"
+    "\n"
+    "失败点：\n"
+    "1. VP-3 FAILED\n"
+    "选项：\n"
+    "1. 重跑本轮验证（rerun_this_round）—— 环境偶发失败，重跑一轮可能就通过\n"
+    "2. 修订判据（revise_criterion）—— 判据本身有问题，需要人重写判据\n"
+    "建议：（本次没有生成分析，无推荐）\n"
+    "完整分析：{report_path}（分析未生成：analysis_empty）"
 )
 
 
@@ -130,7 +141,12 @@ def _report(*vp_ids):
 
 
 def test_question_carries_round_stop_reason_verdicts_and_count(orchestrator):
-    """The question names the round, the reason, the count and the verdicts."""
+    """The question names the round, the reason and the verdicts.
+
+    The repair-task count is no longer part of the question: the card
+    is a decision, not a log of the round, and a terminal round
+    produces no repair tasks by construction anyway.
+    """
     report = {
         "verification_results": [
             {"id": "VP-3", "status": "FAILED"},
@@ -143,11 +159,10 @@ def test_question_carries_round_stop_reason_verdicts_and_count(orchestrator):
     )
 
     question = payload["question"]
-    assert "round 2" in question
+    assert "第 2 轮验证终止" in question
     assert "repair_execution_failed" in question
-    assert "0 repair task(s)" in question
-    assert "VP-3=FAILED" in question
-    assert "VP-4=FAILED" in question
+    assert "VP-3 FAILED" in question
+    assert "VP-4 FAILED" in question
     assert payload["options"] == [
         "rerun_this_round",
         "revise_criterion",
@@ -157,8 +172,8 @@ def test_question_carries_round_stop_reason_verdicts_and_count(orchestrator):
     assert payload["default_option"] == TERMINAL_DEFAULT_OPTION
 
 
-def test_missing_verdict_reads_unknown(orchestrator):
-    """A point the report gives no verdict for reads ``unknown``."""
+def test_missing_verdict_lists_the_point_without_inventing_one(orchestrator):
+    """A point the report gives no verdict for is named, with no verdict."""
     report = {
         "verification_results": [
             {"id": "VP-9"},
@@ -169,14 +184,17 @@ def test_missing_verdict_reads_unknown(orchestrator):
         report, 1, ["VP-9"], 0,
     )
 
-    assert "VP-9=unknown" in payload["question"]
+    question = payload["question"]
+    assert "VP-9" in question, "the point is not on the card at all"
+    assert "VP-9 FAILED" not in question, "a verdict was invented for it"
+    assert "VP-9 PASSED" not in question, "a verdict was invented for it"
 
 
-def test_no_failed_points_says_none(orchestrator):
-    """An empty list of failed points is stated as ``none``."""
+def test_no_failed_points_says_no_failure_point_recorded(orchestrator):
+    """An empty list of failed points is written down, not left blank."""
     payload = orchestrator._terminal_decision_question({}, 1, [], 0)
 
-    assert "failed checks: none" in payload["question"]
+    assert "（无失败点记录）" in payload["question"]
 
 
 def test_freshest_entry_wins_when_a_point_appears_twice(orchestrator):
@@ -194,7 +212,7 @@ def test_freshest_entry_wins_when_a_point_appears_twice(orchestrator):
         report, 1, ["VP-3"], 0,
     )
 
-    assert "VP-3=FAILED" in payload["question"]
+    assert "VP-3 FAILED" in payload["question"]
 
 
 # ---------------------------------------------------------------------------
@@ -227,17 +245,33 @@ def test_analysis_success_question_is_the_brief_card(
 
 
 def test_failure_question_is_byte_identical_golden(orchestrator):
-    """No analysis — the question is the old sentence, byte for byte."""
+    """No analysis — the question is the fallback card, byte for byte.
+
+    The golden is the card the renderer writes for this round: the
+    same decision shape as the analysis card, with the failed point
+    written out by hand and the reason there is no analysis said on
+    the card.  The archive's path is stamped with the clock, so it is
+    the one part the golden takes from the payload.
+    """
     payload = orchestrator._terminal_decision_question(
         _report("VP-3"), 2, ["VP-3"], 0,
     )
 
-    assert payload["question"] == _FACTUAL_QUESTION
+    assert payload["question"] == _FALLBACK_CARD.format(
+        report_path=payload["report_path"],
+    ), (
+        "the fallback card is not the card the renderer writes — the "
+        "question a human is asked changed shape"
+    )
     assert set(payload) == {
         "question", "options", "default_option", "report_path",
+        "analysis_error",
     }, (
-        "the fallback payload must still carry the four keys the caller "
+        "the fallback payload must still carry the five keys the caller "
         "reads — the decision is created either way"
+    )
+    assert payload["analysis_error"] == "analysis_empty", (
+        "the payload must say why there is no analysis to read"
     )
 
 

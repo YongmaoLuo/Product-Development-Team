@@ -92,7 +92,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -132,6 +132,13 @@ REPORTS_DIRNAME = "reports"
 #: The archive file's stem.  The round number and the UTC timestamp are
 #: appended to it: ``terminal-decision-round-3-20261106T173200Z``.
 ARCHIVE_STEM = "terminal-decision-round"
+
+#: The four fields one failed point's detail carries.
+#:
+#: The same four the fallback card renders — the point's ``id``, its
+#: ``status``, its ``title`` and the ``actual_result`` that came back —
+#: so the card and the report say the same thing about the same point.
+_FAILED_POINT_DETAIL_FIELDS = ("id", "status", "title", "actual_result")
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +449,47 @@ def _render_cpea(analysis: Mapping[str, Any]) -> str:
     return "\n\n".join(sections)
 
 
+def _detail_text(value: Any) -> str:
+    """One field of a failed point's detail, as the archive writes it.
+
+    A missing field is the empty string rather than ``None``: the
+    report is read by a person, and ``None`` is a Python repr, not a
+    fact about a failure.  A field that carries text keeps it **whole**
+    — the actual result is evidence, and evidence is not trimmed.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _failed_point_details(
+    details: Optional[Sequence[Mapping[str, Any]]],
+) -> List[Dict[str, str]]:
+    """The failed points' details, as the archive keeps them.
+
+    One record per failed point, carrying exactly the four fields of
+    :data:`_FAILED_POINT_DETAIL_FIELDS`.  The order is the order they
+    were handed over in, and nothing is cut or summarised: the card the
+    human was shown names a few points and sends the reader to the
+    report for the rest, so the report is the only place the whole
+    failure scene can live.
+
+    A record that is not a mapping carries nothing and is dropped: a
+    detail that is not a detail cannot be written down.
+    """
+    records: List[Dict[str, str]] = []
+    for record in details or ():
+        if not isinstance(record, Mapping):
+            continue
+        records.append({
+            field: _detail_text(record.get(field))
+            for field in _FAILED_POINT_DETAIL_FIELDS
+        })
+    return records
+
+
 def _render_archive_markdown(
     *,
     round_number: int,
@@ -451,6 +499,7 @@ def _render_archive_markdown(
     question: str,
     analysis: Optional[Mapping[str, Any]],
     rendered: Optional[str] = None,
+    failed_point_details: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> str:
     """The archive's human-readable half.
 
@@ -459,6 +508,11 @@ def _render_archive_markdown(
     that failed.  Then the analysis itself: the five CPEA sections, or
     — when the round had no analysis to render — the factual sentence
     that was put to the human, verbatim.
+
+    The failed points' **detail** — one line per point, right after the
+    ids — is written when the caller hands it over.  The ids alone say
+    *which* points failed and nothing about *what* they were, and the
+    card the human was shown sends the reader to this file for the rest.
 
     ``rendered`` is the analysis as the **question's** renderer drew it,
     handed over by the caller.  It is preferred over anything drawn
@@ -476,8 +530,13 @@ def _render_archive_markdown(
         f"- decision_id: {decision_id}",
         "- failed points: "
         + (", ".join(str(vp_id) for vp_id in failed_vp_ids) or "none"),
-        "",
     ]
+    for detail in _failed_point_details(failed_point_details):
+        lines.append(
+            f"- {detail['id']} {detail['status']} — {detail['title']}："
+            f"{detail['actual_result']}"
+        )
+    lines.append("")
     body = ""
     if rendered is not None:
         # The caller's rendering wins, including when it is empty: an
@@ -582,6 +641,8 @@ def save_round_archive(
     decision_id: str,
     failed_vp_ids: List[str],
     rendered: Optional[str] = None,
+    analysis_error: str = "",
+    failed_point_details: Optional[Sequence[Mapping[str, Any]]] = None,
     now: Optional[datetime] = None,
 ) -> Optional[Path]:
     """Archive one terminal round's analysis; return the ``.md`` path.
@@ -636,6 +697,36 @@ def save_round_archive(
         :func:`verification.terminal_analysis.render_analysis` itself.
         ``None`` means "nobody drew one", and the copy kept here is
         used instead; see the module docstring.
+    analysis_error:
+        **Why there is no analysis** — ``analysis_empty``, or
+        ``analysis_rejected:<reason>``; empty when the round had one.
+
+        The card the human was asked says this (arch decision point 2),
+        but the card is a chat message and the chat is gone.  The
+        archive is the round's record, so the reason is written there
+        as well — otherwise the file that outlives the card says
+        ``analysis: null`` and nothing else, and a reader cannot tell
+        "nothing is known" from "the answer was refused, and here is
+        what refused it".
+
+        The key is **added** when there is a reason and **absent**
+        when there is none: a round that had an analysis writes the
+        eight keys it always wrote, so a reader that knows the old
+        shape reads the new one without changing a line.
+    failed_point_details:
+        The failed points' **detail** — one record per failed point,
+        carrying its ``id``, ``status``, ``title`` and ``actual_result``.
+
+        The ids in ``failed_points`` say *which* points failed and
+        nothing about *what* they were; the card the human was shown
+        names a few of them and sends the reader to this report for the
+        rest (arch decision point 2).  So the report keeps the whole
+        failure scene: one line per point in the ``.md`` header, one
+        record per point in the ``.json``.
+
+        The key is **added** when there is a detail and **absent**
+        when there is none, and the detail is written **whole** — not
+        cut, not summarised — because it is evidence.
     now:
         The clock reading the file names and ``written_at`` are stamped
         with; the current UTC time when it is not given.
@@ -654,6 +745,11 @@ def save_round_archive(
         md_target = reports_dir / f"{stem}.md"
         json_target = reports_dir / f"{stem}.json"
 
+        # The failed points' detail, normalised once: the ``.md`` header
+        # writes one line per point and the ``.json`` keeps one record
+        # per point, and they have to be the same points.
+        details = _failed_point_details(failed_point_details)
+
         md_text = _render_archive_markdown(
             round_number=round_number,
             stop_reason=str(stop_reason),
@@ -662,6 +758,7 @@ def save_round_archive(
             question=str(question or ""),
             analysis=analysis,
             rendered=rendered,
+            failed_point_details=details,
         )
         payload = {
             "round": int(round_number),
@@ -673,6 +770,17 @@ def save_round_archive(
             "analysis": dict(analysis) if isinstance(analysis, Mapping) else None,
             "written_at": moment.isoformat(),
         }
+        # The failed points' detail is **added**, never substituted: a
+        # round that has one writes the eight keys it always wrote, plus
+        # the detail of every failed point.
+        if details:
+            payload["failed_point_details"] = details
+        # The reason there is no analysis is **added**, never
+        # substituted: a round that has one writes the eight keys it
+        # always wrote.
+        reason = str(analysis_error or "").strip()
+        if reason:
+            payload["analysis_error"] = reason
         json_text = json.dumps(payload, ensure_ascii=False, indent=2)
 
         _write_archive_pair(md_target, md_text, json_target, json_text)

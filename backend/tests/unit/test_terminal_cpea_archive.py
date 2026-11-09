@@ -527,7 +527,16 @@ def test_an_unroutable_decision_still_archives(
 def test_a_round_without_an_analysis_archives_the_facts(
     plan_dir, project_dir, repair_mocks,
 ):
-    """No analysis: the archive keeps the question and says ``null``."""
+    """No analysis: the archive keeps the card and says ``null``.
+
+    There is no analysis to render, so the round's question is the
+    **fallback card** — the same decision shape as the analysis card,
+    with the failed points written out by hand (arch decision point 2).
+    The archive keeps that card, so the two documents say the same
+    thing about the same round: the heading a human was shown, the
+    reason the round stopped, and ``analysis: null`` in the machine
+    half — never a report nobody made.
+    """
     orchestrator = _make_orchestrator(
         plan_dir, project_dir, judge=_FakeJudge(None),
     )
@@ -538,10 +547,12 @@ def test_a_round_without_an_analysis_archives_the_facts(
     payload = _read_json(plan_dir)
     assert payload["analysis"] is None
     text = _archives_of(plan_dir, ".md")[0].read_text(encoding="utf-8")
-    assert (
-        "verification round 3 stopped with "
-        "same_failure_repeated_after_max_attempts"
-    ) in text
+    assert "【需要你决定】" in text, (
+        f"the archive does not keep the card the human was asked:\n{text}"
+    )
+    assert "same_failure_repeated_after_max_attempts" in text, (
+        f"the archive does not say why the round stopped:\n{text}"
+    )
 
 
 def test_two_rounds_in_the_same_plan_keep_both_archives(
@@ -694,9 +705,11 @@ def test_an_analysis_the_renderer_refuses_falls_back_to_the_question(
     the renderer would show five sections the human was never shown,
     which is a claim about the round that nobody made.
 
-    So the refusal is honoured: the ``.md`` falls back to the factual
-    question, exactly as the question itself did.  The raw analysis is
-    still kept verbatim in the ``.json`` — nothing is thrown away.
+    So the refusal is honoured: the ``.md`` falls back to the question
+    the human was asked — the **fallback card**, since the analysis is
+    not one — rather than to five sections the human never saw.  The
+    raw analysis is still kept verbatim in the ``.json`` — nothing is
+    thrown away.
 
     Driven through the production entry, because that is where the
     renderer is: the archive module cannot reach it itself.
@@ -708,18 +721,26 @@ def test_an_analysis_the_renderer_refuses_falls_back_to_the_question(
         "this test needs an analysis the renderer refuses"
     )
 
+    asked = {}
+
+    def _capture(**kwargs):
+        asked["question"] = kwargs["question"]
+        return "dec-asked"
+
     orchestrator = _make_orchestrator(
         plan_dir, project_dir, judge=_FakeJudge(unusable),
     )
-    orchestrator._ask_a_human_about = lambda **kwargs: "dec-asked"
+    orchestrator._ask_a_human_about = _capture
 
     _run_terminal_round(orchestrator)
 
     text = _archives_of(plan_dir, ".md")[0].read_text(encoding="utf-8")
-    assert (
-        "verification round 3 stopped with "
-        "same_failure_repeated_after_max_attempts"
-    ) in text
+    assert "【需要你决定】" in text, (
+        f"the archive does not keep the card the human was asked:\n{text}"
+    )
+    assert asked["question"] in text, (
+        "the archive's body is not the question the human was shown"
+    )
     assert "建议（A）" not in text
     # The raw analysis is still there — verbatim — in the machine half.
     assert _read_json(plan_dir)["analysis"] == unusable

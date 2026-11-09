@@ -16,9 +16,8 @@ the round's own failed set is the whole list of what a human has to
 decide about.)
 
 The 2026-11-05 terminal decision is what this is about: its question
-read ``failed checks: VP-002=FAILED, VP-004=FAILED, VP-017=DEFERRED,
-VP-020=PASSED, VP-021=PASSED, VP-022=FAILED, VP-023=FAILED`` — two
-points that had **passed** were listed as failed.
+listed all seven points with their verdicts, and two of them — VP-020
+and VP-021 — had **passed** and were listed as failed.
 
 The rule this module pins down:
 
@@ -47,7 +46,7 @@ from verification.orchestrator import VerificationOrchestrator
 
 
 class _FakeJudge:
-    """A judge with no analysis to offer — the factual question stands."""
+    """A judge with no analysis to offer — the fallback card stands."""
 
     def analyze(self, **kwargs):
         return None
@@ -94,7 +93,7 @@ def test_only_failed_points_survive_a_mixed_report(orchestrator):
     question = orchestrator._terminal_decision_question(report, 3, ids)[
         "question"
     ]
-    assert "VP-001=FAILED" in question
+    assert "VP-001 FAILED" in question
     assert "VP-002" not in question, "a passed point was listed as failed"
     assert "VP-003" not in question, "a deferred point was listed as failed"
 
@@ -124,7 +123,7 @@ def test_passed_point_is_excluded_from_question_and_failed_points(
         "question"
     ]
     assert "VP-009" not in question
-    assert "VP-001=FAILED" in question
+    assert "VP-001 FAILED" in question
 
     points = orchestrator._terminal_failed_points(report, ids)
     assert [point["id"] for point in points] == ["VP-001"]
@@ -167,7 +166,8 @@ def test_real_terminal_decision_regression(orchestrator):
 
     Seven points: four failed, one deferred, two passed — and the
     failed-id set named all seven.  Only the four failures belong in
-    the question.
+    the question; the card writes three of them out and counts the
+    fourth.
     """
     report = {
         "verification_results": [
@@ -192,10 +192,17 @@ def test_real_terminal_decision_regression(orchestrator):
     question = orchestrator._terminal_decision_question(report, 3, ids)[
         "question"
     ]
-    assert "VP-002=FAILED" in question
-    assert "VP-004=FAILED" in question
-    assert "VP-022=FAILED" in question
-    assert "VP-023=FAILED" in question
+    assert "VP-002 FAILED" in question
+    assert "VP-004 FAILED" in question
+    assert "VP-022 FAILED" in question
+    # The card shows the failed points it has room for and **counts** the
+    # rest, so the fourth failure is named by the count, not by a line.
+    assert "VP-023" not in question, (
+        "the fourth failure is counted on the card, not written out"
+    )
+    assert "另有 1 个失败点" in question, (
+        "the failure the card did not write out is counted"
+    )
     assert "VP-017" not in question, "a deferred point was listed as failed"
     assert "VP-020" not in question, "a passed point was listed as failed"
     assert "VP-021" not in question, "a passed point was listed as failed"

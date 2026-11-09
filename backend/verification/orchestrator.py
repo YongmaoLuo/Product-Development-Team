@@ -1563,6 +1563,19 @@ class VerificationOrchestrator:
         # inheriting one.
         self._terminal_last_session_id: Optional[str] = None
         self._terminal_last_analysis: Optional[Dict[str, Any]] = None
+        # 2026-11-08: why the terminal round has no analysis — the
+        # reason the judge gives, carried over from it (see
+        # :meth:`_terminal_analysis`).  A round that has not analysed
+        # anything has no analysis either, so it starts by saying so.
+        #
+        # The import is local for the same reason the judge's is: the
+        # analysis module is a module of its own and the orchestrator is
+        # the one that reaches for it, so keeping the import inside the
+        # method leaves the two modules unable to drift into an import
+        # cycle.
+        from verification.terminal_analysis import ANALYSIS_ERROR_EMPTY
+
+        self._terminal_last_analysis_error: str = ANALYSIS_ERROR_EMPTY
 
     #: Loop-progress tracking that must outlive a single orchestrator (see
     #: the 2026-09-19 note in ``__init__``).
@@ -2896,12 +2909,33 @@ class VerificationOrchestrator:
         question only** — the three options and the answer the question
         falls back to when nobody replies are not the judge's to move.
 
-        The analysis is optional, and its absence is invisible.  The
-        judge is a model call, and a model call that fails must not
-        stop a human from being asked something they can answer: when
-        there is no analysis the factual sentence stands, byte for
-        byte — the question this method asked before the analysis
-        existed.
+        The analysis is optional, and its absence is **not** invisible.
+        The judge is a model call, and a model call that fails must not
+        stop a human from being asked something they can answer — so
+        when there is no analysis the question is the **fallback
+        card**: the same decision shape as the analysis card, with the
+        failed points written out by hand instead of by a model.
+
+        The bare sentence of facts it used to be is not good enough
+        (2026-11-08): it named the failed checks and nothing else —
+        not which point, not what it was checking, not what came
+        back — and it did not say that the analysis was missing, so a
+        reader could not tell "nothing is known" from "the analysis is
+        on its way".  The fallback card names every failed point and
+        says **why** there is no analysis.
+
+        Why there is no analysis is one of two things, and the two ask
+        the reader different questions:
+
+        * ``analysis_empty`` — there was no answer to judge at all (the
+          call raised, or the answer was not JSON);
+        * ``analysis_rejected:<reason>`` — there was an answer and it
+          did not hold the contract; ``<reason>`` names the check that
+          refused it.
+
+        The reason travels in the payload (:attr:`analysis_error`) as
+        well as on the card, so the round's own record says why it has
+        no analysis to read.
 
         Parameters
         ----------
@@ -2934,9 +2968,9 @@ class VerificationOrchestrator:
 
         Returns:
             The question, the answers on the table, the answer to fall
-            back to and the path of the round's archive — the four
-            things the caller reads.  Never ``None``: the decision is
-            created either way.
+            back to, the path of the round's archive and the reason
+            there is no analysis — the five things the caller reads.
+            Never ``None``: the decision is created either way.
         """
         # The imports are local on purpose, for the same reason
         # :meth:`_terminal_judge_for`'s is: ``verification.terminal_analysis``
@@ -2946,7 +2980,13 @@ class VerificationOrchestrator:
         # session module is reached for the same reason: the card names
         # the archive's path, and the archive module owns that path.
         from verification import terminal_decision_session as session_file
-        from verification.terminal_analysis import render_brief
+        from verification.terminal_analysis import (
+            ANALYSIS_ERROR_EMPTY,
+            ANALYSIS_ERROR_REJECTED,
+            render_brief,
+            render_fallback_brief,
+            validate_analysis_with_reason,
+        )
 
         verdicts: Dict[str, str] = {}
         for entry in self._report_failure_entries(report):
@@ -2981,13 +3021,17 @@ class VerificationOrchestrator:
         # The analysis is what the failure scene **means**, read by the
         # judge; the sentence above is what **happened**.  When the
         # analysis is there it is the question; when it is not, the
-        # sentence stands untouched.  A rendering that comes back empty
-        # — an analysis that is not one — counts as no analysis, so the
-        # two ways of having none behave the same way.
+        # fallback card is — the same decision shape, with the failed
+        # points written out by hand.
         analysis = self._terminal_analysis(
             report, round_number, failed_vp_ids, repair_task_count,
             stop_reason=stop_reason,
         )
+        # ``analysis_error`` is why there is no analysis to read.  It
+        # stays empty for a round that has one, and says which of the
+        # two ways of having none this round had otherwise.
+        analysis_error = ""
+        card = ""
         if isinstance(analysis, Mapping):
             card = render_brief(
                 analysis,
@@ -2996,14 +3040,124 @@ class VerificationOrchestrator:
                 failed_point_ids=ordered,
                 report_path=str(report_path),
             )
-            if card:
-                question = card
+            if not card:
+                # The answer is not one the analysis card can render.
+                # The reason is the check that refused it — the judge's
+                # own reason says nothing here, because an answer that
+                # never held the contract was never judged.
+                _, reason = validate_analysis_with_reason(analysis)
+                analysis_error = (
+                    ANALYSIS_ERROR_REJECTED + reason
+                    if reason else ANALYSIS_ERROR_EMPTY
+                )
+                # The orchestrator's own record of the round says the
+                # same thing the card says: an answer that does not
+                # hold the contract was **refused**, and the reason it
+                # was refused is the check that refused it.
+                self._terminal_last_analysis_error = analysis_error
+        else:
+            # There was no answer at all.  The judge says which way it
+            # was none — the call raised, or the answer was not JSON.
+            analysis_error = (
+                self._terminal_last_analysis_error or ANALYSIS_ERROR_EMPTY
+            )
+        if not card:
+            card = render_fallback_brief(
+                plan_id=self.plan_dir.name,
+                round_number=int(round_number),
+                stop_reason=str(stop_reason),
+                points=self._terminal_fallback_points(report, ordered),
+                report_path=str(report_path),
+                analysis_error=analysis_error,
+            )
+        if card:
+            question = card
         return {
             "question": question,
             "options": list(TERMINAL_OPTIONS),
             "default_option": TERMINAL_DEFAULT_OPTION,
             "report_path": str(report_path),
+            "analysis_error": analysis_error,
         }
+
+    def _terminal_fallback_points(
+        self, report: Dict[str, Any], failed_vp_ids: Any,
+    ) -> List[Dict[str, str]]:
+        """The failed points as the fallback card reads them.
+
+        One record per failed point, carrying exactly four keys: the
+        point's ``id``, its ``status``, its ``title`` and the
+        ``actual_result`` — what actually came back.
+
+        The **status** is read the way
+        :meth:`_terminal_entry_status` reads it: the entry's own
+        status, its verdict when it carries no status of its own,
+        upper-cased and stripped.  The card writes it next to the id,
+        and a card that said ``VP-3 failed`` in one place and
+        ``VP-3 FAILED`` in another would hold two vocabularies.
+
+        The **title** comes from the plan when the plan knows it and
+        from the report when it does not — the order
+        :meth:`_terminal_failed_points` uses, for the same reason: the
+        plan is where the criterion was written down, and the report
+        only knows how the run went.
+
+        A point the report says nothing about still gets a record: the
+        id and an empty status say that a point failed and that nothing
+        is known about it, which is a fact about the record rather
+        than a guess.
+
+        A point with no title or no actual result leaves that part of
+        the line empty — the rest of the line is still worth reading,
+        and nothing here raises.
+        """
+        if not failed_vp_ids:
+            return []
+        entries = self._terminal_entries_by_id(report)
+        definitions = self._verification_point_definitions()
+        points: List[Dict[str, str]] = []
+        for raw_id in failed_vp_ids:
+            vp_id = str(raw_id or "").strip()
+            if not vp_id:
+                continue
+            entry = entries.get(vp_id) or {}
+            definition = definitions.get(vp_id) or {}
+            points.append({
+                "id": vp_id,
+                "status": self._terminal_entry_status(entry),
+                "title": self._terminal_fallback_text(
+                    definition.get("title") or entry.get("title"),
+                ),
+                "actual_result": self._terminal_fallback_text(
+                    entry.get("actual_result"),
+                ),
+            })
+        return points
+
+    @staticmethod
+    def _terminal_fallback_text(value: Any) -> str:
+        """One field of a fallback point, as the card writes it.
+
+        A missing field is the empty string — the card leaves that part
+        of the line out rather than writing ``None`` on a card a human
+        reads.  A field that carries a list contributes its items joined
+        by ``" | "``: one string, so the card reads it as prose rather
+        than as a Python repr.
+        """
+        if value is None:
+            return ""
+        if isinstance(value, (list, tuple)):
+            parts: List[str] = []
+            for item in value:
+                if item is None:
+                    continue
+                text = str(item).strip()
+                if text:
+                    parts.append(text)
+            return " | ".join(parts)
+        if isinstance(value, str):
+            return value.strip()
+        return str(value).strip()
 
     def _terminal_entries_by_id(
         self, report: Dict[str, Any],
@@ -3356,9 +3510,21 @@ class VerificationOrchestrator:
         session id left over from an earlier analysis names a
         *previous* conversation, and writing that next to this round's
         decision would point at the wrong session.
+
+        **Why** the answer is missing is kept as well
+        (:attr:`_terminal_last_analysis_error`), 2026-11-08: the judge
+        names the reason — ``analysis_empty`` when there was no answer to
+        judge, ``analysis_rejected:<reason>`` when the answer was
+        refused — and the orchestrator carries it over.  A card that
+        replaces the analysis has to say *why* there is nothing to read;
+        without the reason the human is asked a question whose silence
+        they cannot interpret.
         """
         self._terminal_last_session_id = None
         self._terminal_last_analysis = None
+        from verification.terminal_analysis import ANALYSIS_ERROR_EMPTY
+
+        self._terminal_last_analysis_error = ANALYSIS_ERROR_EMPTY
         judge = None
         try:
             judge = self._terminal_judge_for()
@@ -3394,7 +3560,16 @@ class VerificationOrchestrator:
         # answer is unusable: it was produced inside a session, and
         # re-asking inside that session is what makes sense.
         self._terminal_last_session_id = self._terminal_session_id_of(judge)
+        # 2026-11-08: so is the reason the answer is missing — the
+        # judge names it, the orchestrator carries it over, and the card
+        # that replaces the analysis can say *why* there is nothing to
+        # read.  A judge that cannot be asked (an old one, a fake in a
+        # test) has no reason to give, so it reads as "no analysis".
+        reason = self._terminal_analysis_error_of(judge)
         if not isinstance(answer, Mapping):
+            self._terminal_last_analysis_error = (
+                reason or ANALYSIS_ERROR_EMPTY
+            )
             self._log_audit(
                 "verification_terminal_analysis_unusable",
                 "the terminal round's analysis was not an answer — "
@@ -3407,7 +3582,32 @@ class VerificationOrchestrator:
             return None
         analysis = dict(answer)
         self._terminal_last_analysis = analysis
+        self._terminal_last_analysis_error = reason
         return analysis
+
+    @staticmethod
+    def _terminal_analysis_error_of(judge: Any) -> str:
+        """Why the judge's answer is missing — as the judge says it.
+
+        The judge keeps the reason on itself
+        (:attr:`TerminalDecisionJudge.last_analysis_error`): ``""``
+        when the answer holds the contract, ``analysis_empty`` when there
+        was no answer to judge, and ``analysis_rejected:<reason>`` when
+        the answer was refused.
+
+        A judge that does not keep a reason — an old one, a fake in a
+        test — simply has none to report: nothing here raises, and the
+        reason reads as "there was no analysis", which is what a round
+        that produced no analysis can honestly say.
+        """
+        from verification.terminal_analysis import ANALYSIS_ERROR_EMPTY
+
+        if judge is None:
+            return ANALYSIS_ERROR_EMPTY
+        value = getattr(judge, "last_analysis_error", None)
+        if not isinstance(value, str):
+            return ANALYSIS_ERROR_EMPTY
+        return value.strip()
 
     @staticmethod
     def _terminal_session_id_of(judge: Any) -> Optional[str]:
@@ -3535,6 +3735,8 @@ class VerificationOrchestrator:
         analysis: Optional[Dict[str, Any]],
         decision_id: str,
         failed_vp_ids: List[str],
+        failed_point_details: Optional[List[Dict[str, str]]] = None,
+        analysis_error: str = "",
         now: Optional[datetime] = None,
     ) -> Optional[Path]:
         """Archive this round's terminal analysis — best effort.
@@ -3583,6 +3785,23 @@ class VerificationOrchestrator:
             asked.
         failed_vp_ids:
             The verification points that failed.
+        failed_point_details:
+            The failed points' **detail** — one record per failed point,
+            carrying its ``id``, ``status``, ``title`` and
+            ``actual_result``.
+
+            The ids say *which* points failed and nothing about *what*
+            they were.  The card the human was shown names a few of them
+            and sends the reader to the report for the rest (arch
+            decision point 2), so the report keeps the whole failure
+            scene — one line per point in the ``.md``, one record per
+            point in the ``.json``.
+        analysis_error:
+            **Why there is no analysis** — ``analysis_empty``, or
+            ``analysis_rejected:<reason>``; empty when the round had
+            one.  The card said this already; the archive says it too,
+            because the card is a chat message and the archive is the
+            round's own record.
         now:
             The clock reading the archive's file names are stamped with.
             ``None`` means "now".  The card quotes the archive's path
@@ -3627,6 +3846,8 @@ class VerificationOrchestrator:
                 decision_id=str(decision_id or ""),
                 failed_vp_ids=list(failed_vp_ids or []),
                 rendered=rendered,
+                analysis_error=str(analysis_error or ""),
+                failed_point_details=failed_point_details,
                 now=now,
             )
         except Exception as exc:  # noqa: BLE001 — the round stands
@@ -5390,6 +5611,13 @@ class VerificationOrchestrator:
                 # 2026-11-06: the analysis is archived **whatever** the
                 # branch above did — a model call that already happened
                 # must not be thrown away.
+                # 2026-11-08: and so is **why** there is none: the card
+                # the human was asked says it, and the archive is the
+                # round's own record — a file that outlives the chat.
+                # 2026-11-08: and so is the **detail of every failed
+                # point** — the card names a few of them and sends the
+                # reader to this file for the rest, so the file has to
+                # hold all of them.
                 self._save_terminal_cpea_archive(
                     round_number=round_number,
                     stop_reason=stop_reason,
@@ -5399,6 +5627,10 @@ class VerificationOrchestrator:
                     analysis=self._terminal_last_analysis,
                     decision_id=decision_id,
                     failed_vp_ids=terminal_failed_ids,
+                    failed_point_details=self._terminal_fallback_points(
+                        report, terminal_failed_ids,
+                    ),
+                    analysis_error=terminal_question.get("analysis_error", ""),
                     now=archive_moment,
                 )
                 # The two flags the round carries are **read**, not
