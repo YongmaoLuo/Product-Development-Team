@@ -61,6 +61,9 @@ from coding_tool import (
     WorkClock,
 )
 from utils.secret_files import private_dir, write_private_json
+# 2026-11-09（VP-023）：浏览器方法的证据产物文件名与
+# ``verification_evidence`` 读的是同一个常量 —— 同一个定义，不复制字符串。
+from verification_evidence import CHECKPOINTS_FILENAME
 # 2026-10-23（缺陷 4 要求 2）：BLOCKED 留在失败桶，但 reason 必须带
 # ``BLOCKED — `` 前缀 —— 读报告的人要一眼看出「验不下去」而不是「验了没过」。
 # 前缀由 :mod:`verification_buckets` 统一给出，四个 BLOCKED 产出点共用同一份。
@@ -476,6 +479,50 @@ _TIME_BUDGET_AND_PROGRESS_BLOCK = (
 )
 
 
+# The browser methods have no pytest run to tee, so the progress
+# channel above has nothing to report for them: a walk that observes
+# twenty things prints nothing at all, and the framework cannot tell a
+# finished walk from a hung one.
+#
+# 2026-11-09 (VP-023): the stuck-sub-agent fallback read that empty
+# channel and degraded a walk whose every checkpoint had passed into
+# "no test output captured" — the observations were thrown away and a
+# green walk scored zero. The three rules below give the browser
+# methods the same observable-progress contract the other methods get,
+# and they are what keeps the verdict coming back inside the budget.
+_BROWSER_EVIDENCE_PROGRESS_BLOCK = (
+    "<BROWSER-EVIDENCE-AND-PROGRESS>\n"
+    "You drive a real browser; there is no pytest run to tee. Three\n"
+    "rules give this method the same observable-progress contract the\n"
+    "other methods get.\n\n"
+    "Rule B1 — write checkpoints.json INCREMENTALLY.\n"
+    "The moment you observe one checkpoint, add it to the file and\n"
+    "rewrite the file with every checkpoint you have observed SO FAR.\n"
+    "Never wait until the whole walk is over: a run that is cut short\n"
+    "must still leave the observations it actually made. The path is\n"
+    "the one the EVIDENCE CONTRACT below names.\n\n"
+    "Rule B2 — append ONE line per checkpoint to the progress log.\n"
+    "For every checkpoint you record, append one line to the progress\n"
+    "file the framework reads:\n"
+    "    echo \"checkpoint <n>/<total> <passed|failed>: <selector> -> "
+    "<actual>\" >> /tmp/vp_<id>_progress.log\n"
+    "(<id> is this verification point's id — the same path the\n"
+    "TIME-BUDGET block above uses.) The generic progress channel is\n"
+    "blind for a browser walk: without these lines the framework sees\n"
+    "an empty log and cannot tell a finished walk from a hung one.\n\n"
+    "Rule B3 — return the verdict the moment the required checkpoints\n"
+    "are recorded.\n"
+    "As soon as every checkpoint this verification point asks for is\n"
+    "in checkpoints.json, return the verdict JSON and STOP. Do NOT\n"
+    "spend the remaining budget on optional corroboration (asset\n"
+    "hashes, a line-by-line server-log comparison, extra screenshots,\n"
+    "extra endpoints). Those extras are worth nothing next to a\n"
+    "verdict that never arrives: an unfinished walk scores zero, a\n"
+    "finished one scores on its checkpoints.\n"
+    "</BROWSER-EVIDENCE-AND-PROGRESS>\n\n"
+)
+
+
 # Each template is a system-prompt string for a verification sub-agent.
 # Templates follow Superpowers-style bulletproofing: HARD-GATE block,
 # method-specific Rationalization Red Flags, and a Match-the-Form-to-
@@ -511,6 +558,7 @@ _TEMPLATES: Dict[str, str] = {
         "You are a UI validation verification agent. Inspect puppeteer "
         "checkpoints and report whether all of them actually passed.\n\n"
         + _TIME_BUDGET_AND_PROGRESS_BLOCK
+        + _BROWSER_EVIDENCE_PROGRESS_BLOCK
         + "<HARD-GATE>\n"
         "- DO NOT mark PASSED unless every checkpoint has passed=True.\n"
         "- DO NOT infer UI state from code review — only trust the puppeteer checkpoints.\n"
@@ -551,6 +599,7 @@ _TEMPLATES: Dict[str, str] = {
         "job is to drive the real user-facing flow end to end and report "
         "what you actually observed.\n\n"
         + _TIME_BUDGET_AND_PROGRESS_BLOCK
+        + _BROWSER_EVIDENCE_PROGRESS_BLOCK
         + "<HARD-GATE>\n"
         "- DO NOT reason about the code — open the real page/service and interact with it.\n"
         "- DO NOT mark PASSED on a flow you did not actually walk through in this run.\n"
@@ -1996,6 +2045,139 @@ class VerificationSubAgent:
                     # Unregister failure must never bleed out of VP code.
                     pass
 
+    #: The methods whose evidence is a browser walk.  Their evidence
+    #: artifact is ``checkpoints.json`` — there is no pytest log behind
+    #: them, which is exactly why the stuck fallback used to throw
+    #: their observations away (2026-11-09, VP-023).
+    _BROWSER_EVIDENCE_METHODS = ("ui_validation", "e2e")
+
+    def _verdict_from_checkpoint_artifact(
+        self,
+        vp_node: Dict[str, Any],
+    ) -> Optional["Verdict"]:
+        """Grade a browser verification point from the artifact it left.
+
+        2026-11-09 (VP-023): a browser walk (``ui_validation`` / ``e2e``)
+        leaves its evidence in ``<evidence_artifact_dir>/checkpoints.json``
+        — there is no pytest run and therefore no log to summarize.  The
+        stuck-sub-agent fallback used to degrade such a walk into
+        "no test output captured" and threw the observations away, even
+        when every checkpoint had passed.
+
+        The rule here is the same all-or-nothing one the in-band path
+        uses (:meth:`_compute_puppeteer_verdict`): every checkpoint must
+        be ``passed=true``.  A missing or malformed artifact is a FAILED
+        that **names the artifact** — it must never claim that a test log
+        was read, because a browser walk does not produce one.
+
+        Returns ``None`` for a method that does not keep its evidence in
+        a checkpoint artifact (the caller then falls back to the log).
+        """
+        method = str(
+            vp_node.get("verification_method") or self.method or ""
+        ).strip()
+        if method not in self._BROWSER_EVIDENCE_METHODS:
+            return None
+        artifact_dir = str(
+            vp_node.get("evidence_artifact_dir") or ""
+        ).strip()
+        if not artifact_dir:
+            # No artifact directory was handed to this VP — there is
+            # nothing to read, so the log path stays in charge.
+            return None
+
+        path = Path(artifact_dir) / CHECKPOINTS_FILENAME
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return self._checkpoint_artifact_failure(
+                path, "the evidence artifact is missing"
+            )
+        except OSError as e:
+            return self._checkpoint_artifact_failure(
+                path, f"the evidence artifact could not be read: {e}"
+            )
+        try:
+            payload = json.loads(raw)
+        except ValueError as e:
+            return self._checkpoint_artifact_failure(
+                path, f"the evidence artifact is not valid JSON: {e}"
+            )
+
+        checkpoints = (
+            payload.get("checkpoints") if isinstance(payload, dict) else None
+        )
+        if not isinstance(checkpoints, list):
+            return self._checkpoint_artifact_failure(
+                path, "the evidence artifact carries no 'checkpoints' list"
+            )
+        if not checkpoints:
+            return self._checkpoint_artifact_failure(
+                path, "the evidence artifact carries an empty checkpoint list"
+            )
+
+        failed = [
+            c for c in checkpoints
+            if not (isinstance(c, dict) and bool(c.get("passed")))
+        ]
+        passed_count = len(checkpoints) - len(failed)
+        summary = f"{passed_count}/{len(checkpoints)} checkpoints passed"
+        if not failed:
+            return Verdict(
+                verdict="PASSED",
+                reasons=[
+                    f"stuck sub-agent: every checkpoint in {path} passed "
+                    f"({summary}) — graded from the evidence artifact, "
+                    f"not from a test log"
+                ],
+                evidence=[f"{path}: {summary}"],
+                model_complexity=self.model_complexity,
+            )
+
+        reasons = [
+            f"stuck sub-agent: {summary} — {len(failed)} checkpoint(s) "
+            f"failed in {path}"
+        ]
+        for checkpoint in failed:
+            selector = (
+                str(checkpoint.get("selector") or "")
+                if isinstance(checkpoint, dict) else ""
+            )
+            expected = (
+                str(checkpoint.get("expected") or "")
+                if isinstance(checkpoint, dict) else ""
+            )
+            actual = (
+                str(checkpoint.get("actual") or "")
+                if isinstance(checkpoint, dict) else ""
+            )
+            reasons.append(
+                f"checkpoint failed: selector={selector!r} "
+                f"expected={expected!r} actual={actual!r}"
+            )
+        return Verdict(
+            verdict="FAILED",
+            reasons=reasons,
+            evidence=[f"{path}: {summary}"],
+            model_complexity=self.model_complexity,
+        )
+
+    def _checkpoint_artifact_failure(
+        self,
+        path: Path,
+        detail: str,
+    ) -> "Verdict":
+        """A FAILED that names the evidence artifact it could not use."""
+        return Verdict(
+            verdict="FAILED",
+            reasons=[
+                f"stuck sub-agent: {detail} — {path} carries no usable "
+                f"checkpoint evidence, so the walk cannot be graded"
+            ],
+            evidence=[str(path)],
+            model_complexity=self.model_complexity,
+        )
+
     async def _summarize_vp_result(
         self,
         vp_node: Dict[str, Any],
@@ -2035,6 +2217,23 @@ class VerificationSubAgent:
         summarizer produces one JSON object and exits.
         """
         vp_id = str(vp_node.get("id", "unknown"))
+
+        # 2026-11-09 (VP-023): a browser walk leaves its evidence in
+        # checkpoints.json, NOT in a pytest log. Decide from the
+        # artifact BEFORE reading a log: the no-log branch below used
+        # to degrade a walk whose every checkpoint had passed into
+        # "no test output captured", and an LLM asked to summarize a
+        # log that a browser walk never produces can only disagree
+        # with the artifact that actually holds the observations.
+        artifact_verdict = self._verdict_from_checkpoint_artifact(vp_node)
+        if artifact_verdict is not None:
+            self._write_log(log_path, "summarizer_verdict_from_artifact", {
+                "vp_id": vp_id,
+                "verdict": artifact_verdict.verdict,
+                "reasons": artifact_verdict.reasons,
+            })
+            return artifact_verdict
+
         if coding_tool is None:
             from coding_tool import ClaudeCodingTool
             coding_tool = ClaudeCodingTool(scene="summarizer")

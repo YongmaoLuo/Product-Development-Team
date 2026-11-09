@@ -999,3 +999,234 @@ def test_agent_delta_allocates_fresh_ids_across_rounds(tmp_path: Path) -> None:
         "the ledger of issued ids must outlive the round and must never "
         "lose an id that was already handed out"
     )
+
+
+# ---------------------------------------------------------------------------
+# full_ci 的判据载荷：ci_entry（2026-11-08，repair-04 / VP-024）
+# ---------------------------------------------------------------------------
+#
+# VP-024 是 round 2 用来替换已废弃的 VP-022 时新增的那条 full_ci 验证点，
+# 它**没有 ci_entry** —— 替换时漏抄了这个字段。于是整仓门禁（连同既有
+# 500+ 用例的回归）一次都没跑过：那条 VP 在 schema 校验阶段就被拒了
+# （``schema:ci_entry_missing``），一个用例都没派发。
+#
+# 根因在代码层：``vp_definition_gaps`` 只看 title 与 method，不看**方法自己
+# 必需的字段**。于是这条没有 ci_entry 的 full_ci VP 在 ``apply_delta`` 里照样
+# 拿到 id、落进计划 —— 判据没表达完整的条目进了计划。
+#
+# 下面这几条钉的是：full_ci 缺 ci_entry 就是**产不出完整定义**，它在发号之前
+# 就该被拒（落进 ``rejected_definitionless``），而不是带着一个空壳 id 进计划。
+
+#: 操作者重新声明时建议用的本地复刻入口（不外推探针分支、不外发）。
+LOCAL_CI_ENTRY = "bash scripts/run_ci_lanes_in_container.sh unit e2e wallclock"
+
+
+def test_full_ci_without_ci_entry_is_definitionless() -> None:
+    """full_ci 缺 ci_entry = 产不出完整定义。
+
+    整仓门禁的判定依据**就是**这条入口的退出码：没有入口，这条 VP 跑不出
+    任何结论 —— 重做交付物也救不了它，只能由操作者重新表达。
+
+    三种"没给入口"的写法都算没给：字段缺失、空串、纯空白；给了非空入口的
+    同款条目仍然是完整定义（判据不能把合法的也拒掉）。
+    """
+    from verification_plan_delta import vp_definition_gaps
+
+    without_entry = {
+        "id": "VP-024",
+        "title": "整仓门禁在 CI 复刻容器内全量跑绿",
+        "verification_method": "full_ci",
+    }
+
+    gaps = vp_definition_gaps(dict(without_entry))
+
+    assert gaps, (
+        "a full_ci point without a ci_entry cannot be executed, so it is "
+        "not a complete definition"
+    )
+    assert any("ci_entry" in gap for gap in gaps), (
+        f"the gap must name the missing field; got {gaps!r}"
+    )
+    assert any("整仓门禁的判定依据" in gap for gap in gaps), (
+        f"the gap must say why the entry is the criterion; got {gaps!r}"
+    )
+
+    for blank in ("", "   "):
+        blank_gaps = vp_definition_gaps(dict(without_entry, ci_entry=blank))
+        assert any("ci_entry" in gap for gap in blank_gaps), (
+            f"ci_entry={blank!r} is not a usable entry; got {blank_gaps!r}"
+        )
+
+    with_entry = vp_definition_gaps(
+        dict(without_entry, ci_entry=LOCAL_CI_ENTRY)
+    )
+    assert with_entry == [], (
+        f"a full_ci point that names its entry is complete; got "
+        f"{with_entry!r}"
+    )
+
+
+@pytest.mark.parametrize("entry", [None, 123, ["bash x.sh"]])
+def test_a_non_string_ci_entry_is_a_gap_too(entry) -> None:
+    """非字符串的 ci_entry 也算"没给入口"。
+
+    ``verification_ci_runner.validate_vp`` 判的是同一件事（非空字符串）——
+    两处口径必须一致，否则同一条 VP 在一处被判不可运行、在另一处被判完整。
+    """
+    from verification_plan_delta import vp_definition_gaps
+
+    gaps = vp_definition_gaps({
+        "id": "VP-024",
+        "title": "整仓门禁",
+        "verification_method": "full_ci",
+        "ci_entry": entry,
+    })
+
+    assert any("ci_entry" in gap for gap in gaps), (
+        f"ci_entry={entry!r} is not a usable entry; got {gaps!r}"
+    )
+
+
+def test_apply_delta_rejects_full_ci_addition_without_ci_entry() -> None:
+    """没有 ci_entry 的 full_ci 新增：**连号都拿不到**。
+
+    以前它照样拿到 id、落进计划（``rejected_definitionless`` 是空的）——
+    于是计划里多了一条永远跑不出结论的整仓门禁，而门禁一次都没跑过。
+    """
+    from verification_plan_delta import apply_delta, parse_delta_payload
+
+    plan = _plan(_vp("VP-001"))
+    delta = parse_delta_payload({
+        "add": [{
+            "title": "整仓门禁全量跑绿", "reason": "PRD 第4节的整仓验收",
+            "verification_method": "full_ci",
+            "verification_phase": 2,
+        }],
+        "obsolete": [],
+    }, plan)
+
+    summary = apply_delta(plan, delta, round_number=2)
+
+    assert summary["added"] == [], (
+        "a full_ci addition without an entry cannot be executed, so it must "
+        "not land in the plan"
+    )
+    assert [vp["id"] for vp in plan["verification_points"]] == ["VP-001"], (
+        "a definition-less addition must not consume a VP id"
+    )
+    assert summary["allocated_vp_ids"] == [], (
+        "the id ledger must not record an id that was never handed out"
+    )
+    assert len(summary["rejected_definitionless"]) == 1, (
+        f"the rejection must leave a trace; got "
+        f"{summary['rejected_definitionless']!r}"
+    )
+    gaps = summary["rejected_definitionless"][0]["gaps"]
+    assert any("ci_entry" in gap for gap in gaps), (
+        f"the rejection must say which field was missing; got {gaps!r}"
+    )
+
+
+def test_definition_gaps_existing_rules_unchanged() -> None:
+    """加 ci_entry 这条判据**不能误伤**原有规则。
+
+    空标题、非法 method 照旧是 gap；api_test / code_review、以及给了入口的
+    full_ci 照旧是完整定义（gaps == []）。
+    """
+    from verification_plan_delta import vp_definition_gaps
+
+    empty_title = vp_definition_gaps({
+        "id": "VP-900", "title": "  ", "verification_method": "api_test",
+    })
+    assert any("title" in gap for gap in empty_title), (
+        f"an empty title is still a gap; got {empty_title!r}"
+    )
+
+    illegal_method = vp_definition_gaps({
+        "id": "VP-901", "title": "整仓门禁", "verification_method": "retired_method",
+    })
+    assert any("verification_method" in gap for gap in illegal_method), (
+        f"an unsupported method is still a gap; got {illegal_method!r}"
+    )
+
+    for method in ("api_test", "code_review"):
+        gaps = vp_definition_gaps({
+            "id": "VP-902", "title": "一条普通验证点", "verification_method": method,
+        })
+        assert gaps == [], (
+            f"{method} needs no extra payload; got {gaps!r}"
+        )
+
+    full_ci = vp_definition_gaps({
+        "id": "VP-903", "title": "整仓门禁", "verification_method": "full_ci",
+        "ci_entry": LOCAL_CI_ENTRY,
+    })
+    assert full_ci == [], (
+        f"a full_ci point that names its entry is complete; got {full_ci!r}"
+    )
+
+
+def test_added_full_ci_keeps_the_ci_entry_it_declared() -> None:
+    """增量写了 ci_entry，它就必须**原样**落进计划。
+
+    不透传它，落地的新 VP 就是一条空壳：``vp_definition_gaps`` 会说
+    "缺 ci_entry"，而增量 LLM 明明写了 —— 那条 gap 就是一句假话，操作者照着
+    它重声明多少次都过不去。
+    """
+    from verification_ci_runner import validate_vp
+    from verification_plan_delta import apply_delta, parse_delta_payload
+
+    plan = _plan(_vp("VP-001"))
+    delta = parse_delta_payload({
+        "add": [{
+            "title": "整仓门禁全量跑绿", "reason": "PRD 第4节的整仓验收",
+            "verification_method": "full_ci",
+            "verification_phase": 2,
+            "ci_entry": LOCAL_CI_ENTRY,
+        }],
+        "obsolete": [],
+    }, plan)
+
+    summary = apply_delta(plan, delta, round_number=2)
+
+    assert len(summary["added"]) == 1, (
+        f"a full_ci addition that names its entry is runnable; got "
+        f"{summary!r}"
+    )
+    new_vp = plan["verification_points"][-1]
+    assert new_vp["verification_method"] == "full_ci"
+    assert new_vp["ci_entry"] == LOCAL_CI_ENTRY, (
+        "the declared entry must survive the delta; otherwise the landed "
+        "point is an empty shell that can never run"
+    )
+    assert validate_vp(
+        new_vp, project_dir=None, require_single_entry=False,
+    ) == [], (
+        "the landed point must pass the same schema check the runner uses"
+    )
+
+
+def test_the_dispatch_guard_also_refuses_a_hollow_full_ci_point() -> None:
+    """分派前的护栏（``vp_dispatch_gaps``）走的是同一个判据。
+
+    两条路径必须说同一件事：``apply_delta`` 在**发号之前**拒掉它，
+    ``vp_dispatch_gaps`` 在**分派之前**拒掉它 —— 否则一条空壳 full_ci 仍
+    能被派给执行器（2026-10-24 的 VP-031：空壳被按缺省方法派了出去）。
+    """
+    from verification_agent import vp_dispatch_gaps
+
+    hollow = {
+        "id": "VP-024",
+        "title": "整仓门禁在 CI 复刻容器内全量跑绿",
+        "verification_method": "full_ci",
+    }
+
+    gaps = vp_dispatch_gaps(dict(hollow), {"VP-024": dict(hollow)})
+
+    assert gaps, (
+        "a hollow full_ci point must not be dispatched: the framework would "
+        "invent a criterion for it"
+    )
+    assert any("ci_entry" in gap for gap in gaps), (
+        f"the gap must name the missing field; got {gaps!r}"
+    )
