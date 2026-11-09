@@ -2165,6 +2165,12 @@ function renderSchedulerCapacity(snapshot) {
     const select = $("#scheduler-capacity-select");
     if (select) {
         const value = String(total);
+        // The server's number is recorded next to the pick.  It is
+        // what the control falls back to once the pick is dropped
+        // (see schedulerClearCapacityDraft), and it is written on
+        // every read — the poll included — so it always holds the
+        // number the server last reported.
+        select.dataset.serverValue = value;
         let option = select.querySelector(`option[value="${value}"]`);
         if (!option) {
             option = document.createElement("option");
@@ -2185,6 +2191,40 @@ function renderSchedulerCapacity(snapshot) {
     }
 }
 
+/** End the draft — the pick the operator has not applied — and put the
+    server's number back on the control.
+
+    A pick is **the operator's** while it waits to be written: the
+    five-second poll leaves the control alone while the mark is
+    there, so the pick survives until it is applied or rejected.  That
+    is the whole of its life — three paths end it: the pick is
+    applied, the configured capacity is put back, and the operator
+    leaves the view.
+
+    Leaving the view is the one that used to leak.  The mark stayed
+    on the control across the switch, so coming back showed the
+    operator a number the scheduler was **not** running with, and the
+    pick could be applied long after the operator had gone.  So the
+    switch ends the draft too, and the control goes back to the
+    number the server last reported — the number in force.
+
+    Nothing to end is nothing to do: with no pick held the control
+    already shows the server's number, and it is left alone.  With no
+    number recorded (the first read failed, say) the mark goes and
+    the number on screen stays — there is nothing to put back. */
+function schedulerClearCapacityDraft() {
+    const select = $("#scheduler-capacity-select");
+    if (!select) return;
+    const held = select.dataset.pending === "1";
+    delete select.dataset.pending;
+    // No pick was held: the control is the server's already.
+    if (!held) return;
+    // The server's number was never recorded: the mark goes, the
+    // number on screen stays.
+    if (select.dataset.serverValue === undefined) return;
+    select.value = select.dataset.serverValue;
+}
+
 /** Write the capacity that was picked — or put the configured one back.
 
     ``total`` is the number to run with; ``null`` (or no number at all)
@@ -2200,17 +2240,59 @@ function renderSchedulerCapacity(snapshot) {
 
     Either way the pick is **settled** — applied or rejected — so the
     pending mark is cleared here and the control follows the server
-    again.  Until then the mark keeps the poll from wiping the pick. */
+    again: the same routine that ends the draft when the operator
+    leaves the view puts the server's number back.  Until then the
+    mark keeps the poll from wiping the pick.
+
+    The answer is read before the state is, because the answer is the
+    server's own word about what it took: the server may take a number
+    other than the pick — the override may be refused, the number may
+    be capped — and the panel must show the number that is really in
+    force.  So the answer's number is recorded on the control, and a
+    server that changed the number says so, so the operator can tell
+    the number they asked for from the number the scheduler runs
+    with. */
 async function schedulerApplyCapacity(total) {
     const reset = total === null || total === undefined;
     const body = reset ? {"reset": true} : {total: total};
     try {
         const result = await api("/scheduler/capacity", {method: "POST", body: JSON.stringify(body)});
-        // The pick is settled: it is the server's number now, so the
-        // control stops holding it and follows the server again.
+        // The answer says which number is in force now — not the
+        // number that was asked for.
+        const answer = (result && result.capacity) || {};
+        const serverTotal = Number(answer.total);
         const select = $("#scheduler-capacity-select");
-        if (select) delete select.dataset.pending;
+        const notice = $("#scheduler-capacity-notice");
+        if (answer.total !== undefined && answer.total !== null) {
+            // The number in force is recorded on the control: it is
+            // what the control falls back to once the draft is
+            // dropped, so the pick must never be recorded in its
+            // place.
+            if (select) select.dataset.serverValue = String(serverTotal);
+            // The answer is news only when it is not the pick.  A
+            // server that regularizes the pick says so; a server that
+            // took the pick as it was leaves no message, so a message
+            // from an earlier write does not outlive it.
+            if (notice) {
+                if (!reset && serverTotal !== Number(total)) {
+                    notice.textContent = `服务端规整为 ${serverTotal}`;
+                } else {
+                    notice.textContent = "";
+                }
+            }
+        }
+        // The pick is settled: it is the server's number now, so the
+        // control stops holding it and follows the server again.  The
+        // draft ends first, so the control goes back on the number the
+        // server just named — the same routine that ends the draft
+        // when the operator leaves the view.
+        schedulerClearCapacityDraft();
+        // The state is read once more, and the control goes back on the
+        // number that read brought.
         await loadSchedulerState();
+        // The mark must not outlive the write: it is what holds the
+        // poll off the control, and the write is done.
+        if (select) delete select.dataset.pending;
         return result;
     } catch (err) {
         // The pick failed: read the state again so the control is
@@ -2218,9 +2300,10 @@ async function schedulerApplyCapacity(total) {
         // wrong.  The mark is cleared here too — the rejected pick
         // must not stay on the control as if it were the capacity in
         // force.
+        await loadSchedulerState();
+        schedulerClearCapacityDraft();
         const select = $("#scheduler-capacity-select");
         if (select) delete select.dataset.pending;
-        await loadSchedulerState();
         renderSchedulerError(err);
         throw err;
     }
@@ -2455,16 +2538,43 @@ function schedulerClearPollError(source) {
     delete _schedulerPollErrors[key];
 }
 
+/** The number the state reads are given.
+
+    Two reads can be in flight at once — the poll's read and the read
+    that follows a write — and they do not come back in the order they
+    were started.  The read that comes back **last** is not the newest
+    read: a read that was started before a write carries the snapshot
+    from before that write, and painting it puts back the number the
+    write has just moved past.
+
+    So every read takes a number, and only the read with the newest
+    number paints.  The counter is module-level because the reads are
+    module-level: two reads that do not share one counter cannot be
+    told apart. */
+let schedulerStateSeq = 0;
+
 /** Read the read model.  A scheduler that is not running answers an
     empty document, so there is nothing to catch here but a transport
     failure — and that one is shown rather than thrown away.
 
     A quiet read is the poll's read.  It keeps the last good frame
     instead of painting over it, and says what went wrong in the
-    console rather than on the operator's screen. */
+    console rather than on the operator's screen.
+
+    Only the newest read paints.  A read that a newer read has
+    superseded returns without painting anything, so a snapshot taken
+    before a write cannot undo that write. */
 async function loadSchedulerState(options = {}) {
+    // The number is taken before the read goes out: a read started
+    // later is the newer one, and this read has to be able to say so
+    // once the answer comes back.
+    const seq = ++schedulerStateSeq;
     try {
         const snapshot = await api("/scheduler/state");
+        // A newer read has been started since: this one carries the
+        // older snapshot, and painting it would put back a number that
+        // has already been applied.
+        if (seq !== schedulerStateSeq) return null;
         renderScheduler(snapshot);
         if (options.quiet) schedulerClearPollError("state");
         // The parallel-agent count is a second, optional read: it rides
@@ -2761,6 +2871,11 @@ function goHome() {
     interviewStarted = false;
     renderSteps(false, false);
     setStep("interview");
+    // Leaving the scheduler view ends the pick the operator never
+    // applied: the control goes back to the number the server last
+    // reported, so what it shows is always what the scheduler runs
+    // with.  Every way back to the plan list comes through here.
+    schedulerClearCapacityDraft();
     show("plans-view");
     loadInBackground(loadPlans, "plans");
     loadInBackground(loadSchedulerState, "scheduler state");
@@ -3041,7 +3156,14 @@ function init() {
     // silently wiped before 「应用」 is pressed.
     safeBind("#scheduler-capacity-select", "change", (e) => {
         const select = e.target;
-        if (select) select.dataset.pending = "1";
+        if (!select) return;
+        // The pick is the operator's from here on.  The mark holds
+        // it against the five-second poll; it lives until one of
+        // three paths settles it — the pick is applied, the
+        // configured capacity is put back, or the operator leaves
+        // the view — and on each of them the control goes back to
+        // the server's number.
+        select.dataset.pending = "1";
     });
     safeBind("#scheduler-capacity-apply", "click", async () => {
         const select = $("#scheduler-capacity-select");

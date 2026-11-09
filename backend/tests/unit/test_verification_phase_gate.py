@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import pytest
 
@@ -45,8 +45,23 @@ def _plan(*vps: Dict[str, Any]) -> Dict[str, Any]:
     return {"vps": list(vps)}
 
 
-def _make_executor(plan: Dict[str, Any], tmp_path: Path, verdicts: Dict[str, str]):
-    """Executor whose runner returns ``verdicts[vp_id]`` as the status."""
+def _make_executor(
+    plan: Dict[str, Any],
+    tmp_path: Path,
+    verdicts: Dict[str, str],
+    *,
+    round_no: Optional[int] = None,
+):
+    """Executor whose runner returns ``verdicts[vp_id]`` as the status.
+
+    ``round_no`` pins the round the executor believes it is in — the
+    round every verdict it writes gets stamped with.  Omitted → the
+    executor asks the state store, which knows nothing here → round 0
+    ("unknown").  Two executors built from the same ``tmp_path`` share
+    one ``plan_dir``, so the second one hydrates the first one's
+    verdicts back from the state file — that is how a second round
+    sees what the first round concluded.
+    """
     from verification_executor import VerificationExecutor
 
     plan_dir = tmp_path / "plan"
@@ -68,6 +83,7 @@ def _make_executor(plan: Dict[str, Any], tmp_path: Path, verdicts: Dict[str, str
         plan_dir=plan_dir,
         sub_agent_runner=runner,
         verif_repo=None,
+        round_no=round_no,
     )
     return executor, calls
 
@@ -225,3 +241,125 @@ def test_schema_accepts_deferred(tmp_path: Path) -> None:
         "status": "DEFERRED", "reasons": ["延后"], "evidence": {},
     })
     assert "VP-010" in executor._deferred_vps
+
+
+# ---------------------------------------------------------------------------
+# 轮次作用域：被拦下的关卡，每一轮都要留下**本轮**自己的结论
+# ---------------------------------------------------------------------------
+
+def test_deferred_gate_is_recorded_again_in_every_round(tmp_path: Path) -> None:
+    """被门禁拦下的关卡，每一轮都要重新落一条带本轮轮次戳的 DEFERRED。
+
+    2026-11-09：账本只取**本轮**的裁决（``_current_round_verdicts`` /
+    ``_build_execution_results_from_executor``），所以「这一轮被拦下了」
+    这件事必须每一轮都重新落账。写侧原来的判据是「这条验证点有裁决就
+    跳过」—— 那是**跨轮**的判据：上一轮留下的 DEFERRED 让本轮一条结论
+    都不写，于是这个关卡从本轮账本里消失，报告只能对「没有记录」猜一个
+    FAILED（"未获得执行结果"），修复环于是去修一条从没跑过的关卡。
+
+    与 ``_mark_layer_skipped`` 的轮次语义对齐：整层跳过每一轮都落一条
+    本轮结论（它走 ``_stamp_round``）。
+    """
+    plan = _plan(
+        _vp("VP-001"),
+        _vp("VP-010", verification_phase=2, phase_order=1, title="全量 Nightly CI"),
+    )
+
+    # 第 1 轮：Phase 1 失败 → 关卡延后
+    executor1, calls1 = _make_executor(
+        plan, tmp_path, {"VP-001": "FAILED"}, round_no=1,
+    )
+    asyncio.run(executor1.run(max_parallel=1))
+    assert calls1 == ["VP-001"], "Phase 1 失败时全量关卡不得执行"
+    assert executor1._verdicts["VP-010"]["status"] == "DEFERRED"
+    assert executor1._verdicts["VP-010"]["round"] == 1
+
+    # 第 2 轮：同一个 plan_dir → 上一轮的结论从状态文件带过来；
+    # Phase 1 又失败 → 关卡再次延后
+    executor2, calls2 = _make_executor(
+        plan, tmp_path, {"VP-001": "FAILED"}, round_no=2,
+    )
+    asyncio.run(executor2.run(max_parallel=1))
+    assert calls2 == ["VP-001"], "Phase 1 失败时全量关卡不得执行"
+
+    # 本轮必须有一条**自己的** DEFERRED 结论
+    this_round = executor2._verdicts_by_round.get(2, {})
+    assert "VP-010" in this_round, (
+        "被拦下的关卡在第 2 轮必须重新落一条 DEFERRED —— "
+        "上一轮的结论不替本轮说话"
+    )
+    assert this_round["VP-010"]["status"] == "DEFERRED"
+
+    # 本轮视图（账本的来源）里必须看得见它
+    current = executor2._current_round_verdicts()
+    assert current.get("VP-010", {}).get("status") == "DEFERRED"
+
+    # 上一轮的结论不许被抹掉（审计痕迹）
+    assert executor2._verdicts_by_round[1]["VP-010"]["status"] == "DEFERRED"
+
+
+def test_deferred_gate_keeps_the_conclusion_of_the_same_round(tmp_path: Path) -> None:
+    """同一轮内不覆盖既有结论。
+
+    跨轮要重落一条本轮结论（上一轮的结论不替本轮说话）；同一轮里已经有
+    结论了就以那条为准 —— 一轮里反复落账只会把「本轮为什么延后」改写成
+    最后一次的理由。
+    """
+    plan = _plan(
+        _vp("VP-010", verification_phase=2, phase_order=1, title="全量 Nightly CI"),
+    )
+    executor, _ = _make_executor(plan, tmp_path, {}, round_no=1)
+    executor.record_verdict("VP-010", {
+        "status": "DEFERRED",
+        "reasons": ["本轮已经落过账"],
+        "evidence": {},
+    })
+
+    executor._mark_layer_deferred(plan["vps"], "又一个理由")
+
+    assert executor._verdicts["VP-010"]["reasons"] == ["本轮已经落过账"]
+    assert executor._verdicts_by_round[1]["VP-010"]["reasons"] == ["本轮已经落过账"]
+
+
+def test_deferred_gate_reaches_the_round_ledger_as_deferred(tmp_path: Path) -> None:
+    """本轮账本里必须看得见那条 DEFERRED。
+
+    账本是 Phase 3 判定与报告的唯一输入：关卡在里面缺席 → 报告只能对
+    「没有记录」猜一个 FAILED，修复环于是去修一条从没跑过的全量关卡。
+    """
+    from unittest.mock import Mock
+
+    from verification_agent import VerificationAgent
+
+    plan = _plan(
+        _vp("VP-001"),
+        _vp("VP-010", verification_phase=2, phase_order=1, title="全量 Nightly CI"),
+    )
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    # 第 1 轮：Phase 1 失败 → 关卡延后
+    executor1, _ = _make_executor(
+        plan, tmp_path, {"VP-001": "FAILED"}, round_no=1,
+    )
+    asyncio.run(executor1.run(max_parallel=1))
+
+    # 第 2 轮：又被门禁拦下 → 必须在本轮账本里留下 DEFERRED
+    executor2, _ = _make_executor(
+        plan, tmp_path, {"VP-001": "FAILED"}, round_no=2,
+    )
+    asyncio.run(executor2.run(max_parallel=1))
+
+    agent = VerificationAgent(
+        plan_dir=tmp_path / "plan",
+        project_dir=project_dir,
+        coding_tool=Mock(),
+    )
+    envelope = agent._build_execution_results_from_executor(
+        {"verification_points": plan["vps"]}, executor2,
+    )
+    by_id = {r["id"]: r for r in envelope["execution_results"]}
+    assert "VP-010" in by_id, (
+        "被拦下的关卡必须出现在本轮账本里 —— 缺席等于让报告去猜一个 FAILED"
+    )
+    assert by_id["VP-010"]["status"] == "DEFERRED"

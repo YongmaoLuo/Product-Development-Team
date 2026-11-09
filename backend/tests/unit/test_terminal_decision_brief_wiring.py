@@ -1,6 +1,6 @@
 """The terminal question is the **decision card**, and the card knows the report.
 
-Two things are pinned here, and they are the two things the human on the
+Three things are pinned here, and they are the three things the human on the
 other end of the decision actually sees:
 
 * **The question is a card, not a report.**  When the judge has read the
@@ -14,12 +14,12 @@ other end of the decision actually sees:
   and the same clock reading the write will use.  A card that says
   "see the full analysis" without saying where is a card that sends
   the reader looking.
-
-And the contract that survives both: **without an analysis the question
-is still the old factual sentence, byte for byte.**  The judge is a
-model call and a model call may fail; a human must still be asked
-something, and what they are asked is exactly what they were asked
-before the card existed.
+* **Without an analysis the question is still a card.**  The judge is a
+  model call and a model call may fail; a human must still be asked
+  something, and what they are asked is the **fallback card** — the
+  same decision shape, with the failed points written out by hand
+  instead of by a model, and the reason there is no analysis said on
+  the card.
 
 The judge is a fake: the real one is a model call, and what is pinned
 here is the wiring, not the model.
@@ -28,15 +28,6 @@ here is the wiring, not the model.
 from tests.unit.test_terminal_decision_question import (  # noqa: F401
     analysis_orchestrator,
     orchestrator,
-)
-
-
-#: The question the terminal branch asked before the card existed —
-#: the one the card replaces, and the one it falls back to.
-_FACTUAL_QUESTION = (
-    "verification round 2 stopped with repair_execution_failed: "
-    "0 repair task(s) were generated; failed checks: VP-3=FAILED. "
-    "Choose how to proceed."
 )
 
 
@@ -86,18 +77,35 @@ def test_payload_carries_the_archive_path(analysis_orchestrator):
     )
 
 
-def test_no_analysis_keeps_the_factual_sentence(orchestrator):
-    """No analysis — the old sentence stands, byte for byte."""
+def test_no_analysis_renders_the_fallback_card(orchestrator):
+    """No analysis — the question is the fallback card."""
     payload = orchestrator._terminal_decision_question(
         _report("VP-3"), 2, ["VP-3"], 0,
     )
 
-    assert payload["question"] == _FACTUAL_QUESTION, (
-        "the factual sentence was not kept byte for byte"
+    question = payload["question"]
+    assert question.startswith("【需要你决定】"), (
+        f"the question is not a decision card: {question[:40]!r}"
+    )
+    assert "第 2 轮验证终止" in question, (
+        f"the card does not say which round stopped: {question!r}"
+    )
+    assert "失败点：" in question, (
+        f"the card does not write the failed points down: {question!r}"
+    )
+    assert "VP-3 FAILED" in question, (
+        f"the failed point is not on the card: {question!r}"
+    )
+    assert "完整分析：" in question, (
+        f"the card does not point at the report: {question!r}"
     )
     assert set(payload) == {
         "question", "options", "default_option", "report_path",
+        "analysis_error",
     }, (
-        "the fallback payload must still carry the four keys the caller "
+        "the fallback payload must still carry the five keys the caller "
         "reads — the decision is created either way"
+    )
+    assert payload["analysis_error"] == "analysis_empty", (
+        "the payload must say why there is no analysis to read"
     )

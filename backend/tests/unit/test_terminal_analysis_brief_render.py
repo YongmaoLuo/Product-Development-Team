@@ -18,10 +18,11 @@ What is pinned here
    point id, every option, the recommendation id and the report path.
    A card that is short but incomplete is not a decision card — it is a
    teaser.
-2. **The cut order is the argument order.**  An over-long
-   ``recommendation_reason`` is cut first; the option lines, the
-   recommendation id and the report path are cut *not at all*, because
-   they are what the human acts on.
+2. **The cut order keeps the argument whole.**  An over-long
+   ``recommendation_reason`` is reduced to its **first sentence**
+   first; only then is the background sentence cut; the option lines,
+   the recommendation id and the report path are cut *not at all*,
+   because they are what the human acts on.
 3. **An invalid analysis renders as nothing.**  Not a mapping, a
    missing field, a recommendation outside the vocabulary — all of them
    produce ``""``, and the caller's fallback is the factual sentence it
@@ -253,8 +254,8 @@ def test_brief_carries_every_option_on_its_own_line():
 # ---------------------------------------------------------------------------
 
 
-def test_brief_cuts_the_reason_first():
-    """An over-long reason is cut; the options and the id are not."""
+def test_brief_keeps_the_reasons_first_sentence_and_cuts_the_rest():
+    """An over-long reason keeps its first sentence; the rest is cut."""
     module = _module()
     render_brief = _render_brief()
 
@@ -277,9 +278,16 @@ def test_brief_cuts_the_reason_first():
         f"the card has {len(card.splitlines())} lines, over the cap"
     )
 
-    # The reason is the part that was cut.
+    # The argument's opening is kept: the decision rests on it.
+    assert "同一失败连续 3 轮，重跑不会再产生新信息" in card, (
+        f"the reason's first sentence was cut: {card!r}"
+    )
+
+    # The rest of the argument is not.
     assert long_reason not in card, "the over-long reason was not cut"
-    assert "…" in card, "the cut is not marked"
+    assert "细节论证" not in card, (
+        f"the reason's tail was not cut: {card!r}"
+    )
 
     # The options are cut not at all.
     for index, recommendation in enumerate(module.RECOMMENDATIONS, start=1):
@@ -301,13 +309,15 @@ def test_brief_cuts_the_reason_first():
 
 
 def test_brief_cuts_the_background_when_the_reason_is_not_enough():
-    """When the reason alone is not enough, the background sentence goes."""
+    """When the first sentence is not enough, the background sentence goes."""
     module = _module()
     render_brief = _render_brief()
 
     analysis = _long_analysis()
-    analysis["context"] = "背景句子没有句号所以整段都是背景。" * 40
-    analysis["recommendation_reason"] = "理由也没有句号所以整段都是理由。" * 40
+    # One sentence: there is no second sentence to fall back on, so the
+    # background can only be cut short — and it is.
+    analysis["context"] = "背景" + ("很长的背景细节" * 200)
+    analysis["recommendation_reason"] = "第一句理由。" + ("后续论证" * 300)
 
     card = render_brief(
         analysis,
@@ -320,11 +330,98 @@ def test_brief_cuts_the_background_when_the_reason_is_not_enough():
     assert len(card) <= module.TERMINAL_BRIEF_MAX_CHARS, (
         f"the card is {len(card)} characters, over the cap"
     )
-    assert "…" in card, "the cut is not marked"
-    for recommendation in module.RECOMMENDATIONS:
-        assert recommendation in card, (
-            f"the option {recommendation!r} was cut"
+    assert len(card.splitlines()) <= module.TERMINAL_BRIEF_MAX_LINES, (
+        f"the card has {len(card.splitlines())} lines, over the cap"
+    )
+
+    # The reason's first sentence is kept.
+    assert "第一句理由" in card, (
+        f"the reason's first sentence was cut: {card!r}"
+    )
+    # The reason's tail is not.
+    assert "后续论证" not in card, (
+        f"the reason's tail was not cut: {card!r}"
+    )
+    # The background is the part that was cut, and the cut is marked.
+    assert "…" in card, f"the cut is not marked: {card!r}"
+
+    # The options are cut not at all.
+    for index, recommendation in enumerate(module.RECOMMENDATIONS, start=1):
+        expected = (
+            f"{index}. {module.RECOMMENDATION_LABELS[recommendation]}"
+            f"（{recommendation}）—— "
+            f"{module.RECOMMENDATION_CONSEQUENCES[recommendation]}"
         )
+        assert expected in card.splitlines(), (
+            f"the option line {expected!r} was cut"
+        )
+
+
+def test_brief_keeps_the_first_sentence_of_an_english_reason():
+    """An English reason has a first sentence too, and it is kept."""
+    module = _module()
+    render_brief = _render_brief()
+
+    analysis = _long_analysis()
+    analysis["recommendation_reason"] = (
+        "Rerunning will not add information. " + ("More argument. " * 100)
+    )
+
+    card = render_brief(
+        analysis,
+        plan_id="demo-plan",
+        round_number=4,
+        failed_point_ids=["VP-3"],
+        report_path=_REPORT_PATH,
+    )
+
+    assert len(card) <= module.TERMINAL_BRIEF_MAX_CHARS, (
+        f"the card is {len(card)} characters, over the cap"
+    )
+    assert len(card.splitlines()) <= module.TERMINAL_BRIEF_MAX_LINES, (
+        f"the card has {len(card.splitlines())} lines, over the cap"
+    )
+
+    assert "Rerunning will not add information" in card, (
+        f"the reason's first sentence was cut: {card!r}"
+    )
+    assert "More argument" not in card, (
+        f"the reason's tail was not cut: {card!r}"
+    )
+
+
+def test_brief_does_not_split_on_decimal_points_or_abbreviations():
+    """A decimal point and an abbreviation are not sentence ends."""
+    module = _module()
+    render_brief = _render_brief()
+
+    analysis = _long_analysis()
+    analysis["recommendation_reason"] = (
+        "version 1.2 stays untouched and e.g. this stays too. "
+        "The second sentence goes on and on. " + ("More. " * 100)
+    )
+
+    card = render_brief(
+        analysis,
+        plan_id="demo-plan",
+        round_number=4,
+        failed_point_ids=["VP-3"],
+        report_path=_REPORT_PATH,
+    )
+
+    assert len(card) <= module.TERMINAL_BRIEF_MAX_CHARS, (
+        f"the card is {len(card)} characters, over the cap"
+    )
+    assert len(card.splitlines()) <= module.TERMINAL_BRIEF_MAX_LINES, (
+        f"the card has {len(card.splitlines())} lines, over the cap"
+    )
+
+    # The first sentence is whole: the decimal point and the
+    # abbreviation did not cut it.
+    assert "version 1.2 stays untouched and e.g. this stays too" in card, (
+        f"the first sentence was cut at a decimal point or an "
+        f"abbreviation: {card!r}"
+    )
 
 
 # ---------------------------------------------------------------------------

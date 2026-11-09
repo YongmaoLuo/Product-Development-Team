@@ -92,6 +92,16 @@ one, or whose recommendation is not one of the actions, is
 rejected whole rather than half-used: a half-analysis in front of a
 human is worse than none, because it reads as an analysis.
 
+**One string of evidence is still evidence.**  The contract asks for an
+array of strings, and a judge that found a *single* fact may write it
+as a sentence instead of a one-element array.  That answer is not
+thrown away over the shape of one field: the string is taken as the
+one-element list it means, and the text is kept **verbatim** — it is
+the judge's own evidence, and trimming or paraphrasing it would be
+rewriting it.  Every other breach of the contract is still refused
+whole, and the refusal now says **which** check failed
+(:func:`validate_analysis_with_reason`).
+
 **Every failure is a downgrade, never an exception.**  A provider that
 raises, an answer that is not JSON, a payload that is not an object, a
 recommendation outside the vocabulary — each of them produces ``None``.
@@ -137,11 +147,40 @@ hundred characters and eight lines: the scene, the options, the advice
 and the path of the report.  The 问题 / 证据 / 不确定 sections go to the
 report, and the card keeps the context's *first sentence*.
 
-**The cut order is the argument order.**  When the card is still too
-long, the *reason* is cut first — it is the one part of the card that
-is an argument rather than a fact.  Only then is the background
-sentence cut.  **The option lines, the recommendation id and the
+**The cut order keeps the argument whole.**  When the card is still too
+long, the *reason* is reduced to its **first sentence** first — it is
+the one part of the card that is an argument rather than a fact, and
+its opening is what the decision rests on.  Only then is the background
+sentence cut, and only after that is the reason shortened past its
+first sentence.  **The option lines, the recommendation id and the
 report path are never cut**: they are what the human acts on.
+
+What the fallback card guarantees
+=================================
+
+**A round that stopped without an analysis is still a decision.**
+:func:`render_fallback_brief` is the card the human is asked when the
+judge produced nothing usable — no answer at all, or an answer that
+failed the contract.  It has the **same decision shape** as
+:func:`render_brief`, with the failed points written out by hand
+instead of by a model, and it says **why** there is no analysis
+(``analysis_empty``, or ``analysis_rejected:<reason>``).
+
+**The failed points are named, and the ones that do not fit are
+counted.**  Three points are written out with their id, their status
+and their title; the rest are counted on the card, so a reader who is
+told "there were seven more" can go and read the report.
+
+**The cut order is the argument order.**  The *actual result* is cut
+first — it is evidence, and a shorter evidence still names the failure
+— and only then is a failed point dropped.  **The point ids, the
+statuses, the option lines, the advice and the report path are never
+cut**: they are what the human acts on.
+
+**The fallback card has its own bounds.**  Twelve lines and nine
+hundred characters: it is longer than the analysis card because it
+has to name the failed points, but it is still a card and not a
+report.
 
 What this module deliberately does NOT do
 ==========================================
@@ -164,6 +203,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from coding_tool import JsonSession
 
 __all__ = [
+    "ANALYSIS_ERROR_EMPTY",
+    "ANALYSIS_ERROR_REJECTED",
     "MAX_EXPECTED_RESULT_CHARS",
     "MAX_FAILED_POINTS",
     "MAX_REASON_CHARS",
@@ -173,10 +214,15 @@ __all__ = [
     "RECOMMENDATION_LABELS",
     "TERMINAL_BRIEF_MAX_CHARS",
     "TERMINAL_BRIEF_MAX_LINES",
+    "TERMINAL_FALLBACK_BRIEF_MAX_CHARS",
+    "TERMINAL_FALLBACK_BRIEF_MAX_LINES",
+    "TERMINAL_FALLBACK_MAX_POINTS",
     "TERMINAL_QUESTION_MAX_CHARS",
     "TerminalDecisionJudge",
     "render_analysis",
     "render_brief",
+    "render_fallback_brief",
+    "validate_analysis_with_reason",
 ]
 
 logger = logging.getLogger(__name__)
@@ -269,6 +315,37 @@ TERMINAL_BRIEF_MAX_LINES = 8
 
 
 # ---------------------------------------------------------------------------
+# The fallback card's own caps
+# ---------------------------------------------------------------------------
+
+#: How long the fallback card may be, in characters.
+#:
+#: The fallback card is longer than the analysis card because it has to
+#: name the failed points: the analysis card may point at a report and
+#: let the reader go there, the fallback card has no analysis to point
+#: at, so the points themselves are what the reader has.  Nine hundred
+#: characters is about a screen and a half of Chinese prose — the
+#: failed points, the options, the advice and the path of the report.
+TERMINAL_FALLBACK_BRIEF_MAX_CHARS = 900
+
+#: How many lines the fallback card may have.
+#:
+#: Twelve lines by construction: the heading, a blank line,
+#: ``失败点：``, three failed points, the count of the ones that did not
+#: fit, ``选项：``, the two options, the advice and the path of the
+#: report.  A line is a line the reader scans; a card that scrolls is a
+#: report again, which is what the report is for.
+TERMINAL_FALLBACK_BRIEF_MAX_LINES = 12
+
+#: How many failed points the fallback card names.
+#:
+#: The rest are counted, not dropped: a reader who is told "there were
+#: seven more" can go and read the report, a reader who is told nothing
+#: cannot.
+TERMINAL_FALLBACK_MAX_POINTS = 3
+
+
+# ---------------------------------------------------------------------------
 # The answer's contract
 # ---------------------------------------------------------------------------
 
@@ -282,6 +359,34 @@ _ANALYSIS_TEXT_FIELDS: Tuple[str, ...] = (
     "recommendation_reason",
     "uncertainty",
 )
+
+#: The reason an answer is refused for its evidence.
+#:
+#: It is a phrase, not a sentence: the caller carries it into a card as
+#: ``analysis_rejected:<reason>``, and it has to read as the name of the
+#: check that failed.  Every way of getting the evidence wrong — an
+#: empty string, a blank string, an empty array, an array holding an
+#: empty or a non-string item — is the same breach: *the evidence is
+#: not a list of strings*.
+_EVIDENCE_REASON = "evidence must be a list of strings"
+
+#: The reason an answer is missing **altogether**.
+#:
+#: It is a phrase, not a sentence: the caller carries it into a card as
+#: ``analysis_empty``, and it has to read as the name of the situation
+#: rather than as a report of it.  There is no answer to hold against
+#: a check — the call raised, the answer was not a JSON object, or
+#: there was no answer at all — so the reason names exactly that, and
+#: names no check it cannot name.
+ANALYSIS_ERROR_EMPTY = "analysis_empty"
+
+#: The prefix a refusal carries: ``analysis_rejected:<reason>``.
+#:
+#: The reason behind the prefix is the one
+#: :func:`validate_analysis_with_reason` gives: the name of the check
+#: that failed.  The prefix says *that* the answer was refused, and
+#: the reason says *which* check refused it.
+ANALYSIS_ERROR_REJECTED = "analysis_rejected:"
 
 
 # ---------------------------------------------------------------------------
@@ -316,37 +421,67 @@ def _validate_analysis(payload: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     section, or whose recommendation is not one of the actions the
     question offers, is not an analysis the caller can put in front of a
     human — so it is rejected whole rather than half-used.
+
+    Callers that need to know *which* check failed use
+    :func:`validate_analysis_with_reason` instead; this entry point
+    keeps its old signature, because a caller that only wants the
+    analysis has no use for the reason.
+    """
+    analysis, _reason = validate_analysis_with_reason(payload)
+    return analysis
+
+
+def validate_analysis_with_reason(
+    payload: Mapping[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """The answer as the six contracted fields, and why it was refused.
+
+    The same contract as :func:`_validate_analysis`, plus the reason
+    the answer was refused.  A bare ``None`` says *that* the answer was
+    no good; it does not say *which* part of it was not, and a caller
+    that renders a fallback for a human has to name the part.  So the
+    reason is a short phrase naming the check that failed — the caller
+    can carry it into a card (``analysis_rejected:evidence must be a
+    list of strings``) without parsing anything.
+
+    Args:
+        payload: The answer as a mapping, as
+            :func:`_parse_payload` read it.
+
+    Returns:
+        ``(analysis, "")`` when the answer holds the contract, and
+        ``(None, reason)`` when it does not.  The reason is never empty
+        on a refusal, and it is always about the *answer* — not about
+        the model, the provider or the round.
     """
     recommendation = payload.get("recommendation")
     if not isinstance(recommendation, str):
-        return None
+        return None, "recommendation must be a string"
     recommendation = recommendation.strip()
     if recommendation not in RECOMMENDATIONS:
-        return None
+        return None, (
+            "recommendation must be one of: " + ", ".join(RECOMMENDATIONS)
+        )
 
     text_fields: Dict[str, str] = {}
     for name in _ANALYSIS_TEXT_FIELDS:
+        if name not in payload:
+            return None, f"missing required field: {name}"
         value = payload.get(name)
         if not isinstance(value, str):
-            return None
+            return None, f"field {name} must be a string"
         text = value.strip()
         if not text:
             # Present but empty: a section that says nothing is a
             # section that is not there.
-            return None
+            return None, f"field {name} must not be empty"
         text_fields[name] = text
 
-    raw_evidence = payload.get("evidence")
-    if not isinstance(raw_evidence, (list, tuple)) or not raw_evidence:
-        return None
-    evidence: List[str] = []
-    for item in raw_evidence:
-        if not isinstance(item, str):
-            return None
-        text = item.strip()
-        if not text:
-            return None
-        evidence.append(text)
+    if "evidence" not in payload:
+        return None, "missing required field: evidence"
+    evidence, reason = _normalize_evidence(payload.get("evidence"))
+    if evidence is None:
+        return None, reason
 
     return {
         "context": text_fields["context"],
@@ -355,7 +490,44 @@ def _validate_analysis(payload: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         "recommendation": recommendation,
         "recommendation_reason": text_fields["recommendation_reason"],
         "uncertainty": text_fields["uncertainty"],
-    }
+    }, ""
+
+
+def _normalize_evidence(raw: Any) -> Tuple[Optional[List[str]], str]:
+    """The evidence as a list of strings, or ``None`` and the reason.
+
+    The contract asks for an **array of strings**.  A judge that found
+    exactly one fact may write it as a sentence instead of a
+    one-element array — and that answer is right in every other field.
+    Refusing it over the shape of one field is how a terminal round
+    ended up with no analysis at all, so a string is taken as the
+    one-element array it means.
+
+    The text is kept **verbatim**: it is the judge's own evidence, and
+    trimming it would be rewriting it.  Only the emptiness test looks
+    at the trimmed form — a string that says nothing is not evidence,
+    however it is padded.
+
+    An array (or tuple) is normalised exactly as it always was: each
+    item is trimmed, and an array holding an empty or a non-string
+    item is refused.
+    """
+    if isinstance(raw, str):
+        if not raw.strip():
+            return None, _EVIDENCE_REASON
+        return [raw], ""
+
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return None, _EVIDENCE_REASON
+    evidence: List[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            return None, _EVIDENCE_REASON
+        text = item.strip()
+        if not text:
+            return None, _EVIDENCE_REASON
+        evidence.append(text)
+    return evidence, ""
 
 
 # ---------------------------------------------------------------------------
@@ -712,6 +884,22 @@ def _first_sentence(text: str) -> str:
     return cleaned.strip()
 
 
+#: The reason's sentence breaks: the CJK breaks the card already uses,
+#: plus an ASCII terminator only when a new sentence visibly starts after
+#: it (whitespace + uppercase).  The lookahead is what keeps ``v1.2``,
+#: ``0.5`` and ``e.g. something`` in one piece.
+_REASON_SENTENCE_BREAKS = re.compile(r"[。！？]|(?<=[.!?])\s+(?=[A-Z])")
+
+
+def _first_sentence_of_reason(text: str) -> str:
+    """The reason's first sentence, CJK or ASCII, without its terminator."""
+    match = _REASON_SENTENCE_BREAKS.search(text)
+    head = (text[: match.start()] if match is not None else text).strip()
+    if head.endswith((".", "!", "?")):
+        head = head[:-1].rstrip()
+    return head
+
+
 def _as_sentence(text: str) -> str:
     """The text as one sentence, without its terminator.
 
@@ -910,22 +1098,25 @@ def render_brief(
     keeps the context's **first sentence**, the options, the advice and
     the path of the report.
 
-    **The cut order is the argument order.**  When the card is still
-    too long, the *reason* is cut first — it is the one part of the
-    card that is an argument rather than a fact, and an argument can be
-    shortened without making the card unusable.  Only then is the
-    background sentence cut.  The option lines, the recommendation id
-    and the report path are **never** cut: they are what the human acts
-    on, and a card that omits them asks for a decision nobody can make.
+    **The cut order keeps the argument whole.**  When the card is still
+    too long, the *reason* is reduced to its **first sentence** first —
+    the reason is the one part of the card that is an argument rather
+    than a fact, and the argument's opening is what the decision rests
+    on.  Only then is the background sentence cut, and only after that
+    is the reason shortened past its first sentence.  The option lines,
+    the recommendation id and the report path are **never** cut: they
+    are what the human acts on, and a card that omits them asks for a
+    decision nobody can make.
 
     The card has at most :data:`TERMINAL_BRIEF_MAX_LINES` lines: its
     shape is fixed, and every text that goes on it is folded into one
     line first, so the judge's line breaks cannot push the card past
-    the cap.  Its *length* is kept within ``limit`` by cutting the
-    reason first and the background second; when the parts of the card
-    that are never cut are longer than ``limit`` on their own, the card
-    is longer than ``limit`` — those parts are what the human acts on,
-    and a card that omits them asks for a decision nobody can make.
+    the cap.  Its *length* is kept within ``limit`` by reducing the
+    reason to its first sentence, then cutting the background, and only
+    then cutting the reason further; when the parts of the card that are
+    never cut are longer than ``limit`` on their own, the card is longer
+    than ``limit`` — those parts are what the human acts on, and a card
+    that omits them asks for a decision nobody can make.
 
     Args:
         analysis: The six contracted fields — ``context``, ``problem``,
@@ -981,19 +1172,249 @@ def render_brief(
     if len(card) <= max_chars:
         return card
 
-    # 1. The reason goes first.
-    reason = _shrink_to_fit(
-        lambda why: build(background, why), reason, max_chars
+    # 1. The reason is an argument: keep its first sentence, the facts keep their place.
+    lead = _first_sentence_of_reason(reason)
+    if lead and lead != reason:
+        reason = lead
+        card = build(background, reason)
+        if len(card) <= max_chars:
+            return card
+
+    # 2. The background sentence goes next.
+    background = _shrink_to_fit(
+        lambda scene: build(scene, reason), background, max_chars
     )
     card = build(background, reason)
     if len(card) <= max_chars:
         return card
 
-    # 2. Then the background sentence.
-    background = _shrink_to_fit(
-        lambda scene: build(scene, reason), background, max_chars
+    # 3. Only then is the reason shortened past its first sentence.
+    reason = _shrink_to_fit(
+        lambda why: build(background, why), reason, max_chars
     )
     return build(background, reason)
+
+
+# ---------------------------------------------------------------------------
+# The fallback card
+# ---------------------------------------------------------------------------
+
+
+def _fallback_point(record: Any) -> Dict[str, str]:
+    """One failed point, as the four fields the card renders.
+
+    A point that is not a mapping renders as an empty point rather than
+    raising: the card is a rendering of a recorded scene, and a scene
+    with one unreadable entry in it is still a scene.
+    """
+    mapping: Mapping[str, Any] = record if isinstance(record, Mapping) else {}
+    return {
+        "id": _one_line(_text(mapping.get("id"))),
+        "status": _one_line(_text(mapping.get("status"))),
+        "title": _one_line(_text(mapping.get("title"))),
+        "actual_result": _one_line(_text(mapping.get("actual_result"))),
+    }
+
+
+def _fallback_point_line(
+    point: Mapping[str, str], detail_limit: Optional[int],
+) -> str:
+    """One failed point, as the card's line for it.
+
+    The line reads ``<id> <status> —— <title>：<the actual result>``.
+    A missing title or a missing actual result leaves its own part
+    empty — the rest of the line is still worth reading.
+    """
+    line = " ".join(
+        part for part in (point.get("id", ""), point.get("status", "")) if part
+    )
+    title = point.get("title", "")
+    if title:
+        line += f" —— {title}"
+    detail = _first_sentence(point.get("actual_result", ""))
+    if detail_limit is not None:
+        detail = _cut_head_to_budget(detail, detail_limit)
+    if detail:
+        line += f"：{detail}"
+    return line
+
+
+def _render_fallback_card(
+    *,
+    plan_id: str,
+    round_number: int,
+    stop_reason: str,
+    points: List[Dict[str, str]],
+    remaining: int,
+    report_path: str,
+    analysis_error: str,
+    detail_limit: Optional[int],
+) -> str:
+    """The fallback card's lines, joined by newlines.
+
+    The shape is the decision card's shape — what has to be decided,
+    the options, the advice, where the report lives — with the failed
+    points written out by hand where the analysis card would have
+    quoted the judge.
+    """
+    title_parts: List[str] = []
+    if plan_id:
+        title_parts.append(plan_id)
+    if round_number:
+        title_parts.append(f"第 {round_number} 轮验证终止")
+    title = " ".join(title_parts)
+
+    heading = "【需要你决定】"
+    if title:
+        heading += title
+    if stop_reason:
+        heading += f"：{stop_reason}"
+
+    lines: List[str] = [heading, "", "失败点："]
+    if not points:
+        lines.append("（无失败点记录）")
+    else:
+        for index, point in enumerate(points, start=1):
+            lines.append(f"{index}. {_fallback_point_line(point, detail_limit)}")
+        if remaining > 0:
+            lines.append(f"另有 {remaining} 个失败点，见完整报告")
+
+    lines.append("选项：")
+    for index, option in enumerate(RECOMMENDATIONS, start=1):
+        label = RECOMMENDATION_LABELS.get(option, option)
+        consequence = RECOMMENDATION_CONSEQUENCES.get(option, "")
+        line = f"{index}. {_option_name(label)}（{option}）"
+        if consequence:
+            line += f"—— {consequence}"
+        lines.append(line)
+
+    lines.append("建议：（本次没有生成分析，无推荐）")
+
+    suffix = f"（分析未生成：{analysis_error}）" if analysis_error else "（分析未生成）"
+    lines.append(f"完整分析：{report_path}{suffix}")
+
+    return "\n".join(lines)
+
+
+def render_fallback_brief(
+    *,
+    plan_id: str = "",
+    round_number: int = 0,
+    stop_reason: str = "",
+    points: Sequence[Any] = (),
+    report_path: str = "",
+    analysis_error: str = "",
+    limit: int = TERMINAL_FALLBACK_BRIEF_MAX_CHARS,
+) -> str:
+    """Render the card for a round that stopped **without** an analysis.
+
+    When the judge produced no analysis — no answer at all, or an
+    answer that failed the contract — there is nothing for
+    :func:`render_brief` to render, and the human used to be asked a
+    bare sentence of facts that named no failure point.  This is the
+    card that replaces it: the same decision shape as the analysis
+    card, with the failed points spelled out by hand.
+
+    **The cut order is the argument order.**  When the card is too
+    long, the *actual result* is cut first — it is the one part of a
+    point that is evidence rather than a fact about the failure, and a
+    shorter evidence still names the failure.  Only then is a failed
+    point dropped, and the ones that are dropped are **counted** on
+    the card rather than lost.  The heading, the statuses, the option
+    lines, the advice and the report path are cut **not at all**:
+    they are what the human acts on, and a card that omits them asks
+    for a decision nobody can make.
+
+    The returned string is never longer than ``limit``, and never has
+    more than :data:`TERMINAL_FALLBACK_BRIEF_MAX_LINES` lines — unless
+    the parts that are never cut do not fit on their own, in which case
+    the smallest card this function can write is returned rather than
+    no card at all: a human still has to be asked something.
+
+    Args:
+        plan_id: The plan the round belongs to.
+        round_number: The round that stopped.
+        stop_reason: Why the round stopped.
+        points: The failed points — mappings carrying ``id``,
+            ``status``, ``title`` and ``actual_result``.
+        report_path: Where the full report was written.
+        analysis_error: Why there is no analysis — ``analysis_empty``,
+            or ``analysis_rejected:<reason>``.
+        limit: The cap, in characters.
+
+    Returns:
+        The card.  It is never empty: a round that stopped without an
+        analysis is still a round somebody has to decide about.
+    """
+    try:
+        max_chars = int(limit)
+    except (TypeError, ValueError):
+        return ""
+    if max_chars <= 0:
+        return ""
+
+    cleaned: List[Dict[str, str]] = []
+    for record in points or ():
+        point = _fallback_point(record)
+        if any(point.values()):
+            # A point with nothing in it says nothing; a card that
+            # counts it would promise a failure that is not there.
+            cleaned.append(point)
+
+    total = len(cleaned)
+    max_shown = min(TERMINAL_FALLBACK_MAX_POINTS, total)
+    min_shown = 1 if total else 0
+
+    def build(shown: int, detail_limit: Optional[int]) -> str:
+        return _render_fallback_card(
+            plan_id=_one_line(_text(plan_id)),
+            round_number=_round_number(round_number),
+            stop_reason=_one_line(_text(stop_reason)),
+            points=cleaned[:shown],
+            remaining=total - shown,
+            report_path=_one_line(_text(report_path)),
+            analysis_error=_one_line(_text(analysis_error)),
+            detail_limit=detail_limit,
+        )
+
+    def fits(card: str) -> bool:
+        return (
+            len(card) <= max_chars
+            and len(card.splitlines()) <= TERMINAL_FALLBACK_BRIEF_MAX_LINES
+        )
+
+    for shown in range(max_shown, min_shown - 1, -1):
+        whole = build(shown, None)
+        if fits(whole):
+            return whole
+
+        # The details are cut to whatever fits: the longest detail is
+        # the upper bound, and the card only gets shorter as the
+        # budget grows, so the largest fitting budget is found by
+        # bisection.
+        longest = max(
+            (
+                len(_first_sentence(point["actual_result"]))
+                for point in cleaned[:shown]
+            ),
+            default=0,
+        )
+        low, high = 0, longest
+        best: Optional[str] = None
+        while low <= high:
+            middle = (low + high) // 2
+            candidate = build(shown, middle)
+            if fits(candidate):
+                best = candidate
+                low = middle + 1
+            else:
+                high = middle - 1
+        if best is not None:
+            return best
+
+    # Nothing fits: the points are cut to the bone and one is kept.
+    # The card is returned anyway — a human has to be asked something.
+    return build(min_shown, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -1039,6 +1460,16 @@ class TerminalDecisionJudge:
         # no session, and saying so is better than inheriting one.
         self.last_session: Optional["JsonSession"] = None
         self.last_session_id: Optional[str] = None
+        # Why the last answer is missing — "" when there is an answer.
+        #
+        # The judge swallows the reason for a bad answer on purpose:
+        # the caller must not depend on it, and a failure to analyse is
+        # not a failure of the round.  But the card that replaces the
+        # analysis has to *name* the reason — "the provider call
+        # raised" and "the evidence was not a list of strings" ask a
+        # human different questions — so the judge keeps the reason
+        # where the orchestrator can read it and carry it over.
+        self.last_analysis_error: str = ""
 
     # ------------------------------------------------------------------
     # The tool
@@ -1091,7 +1522,10 @@ class TerminalDecisionJudge:
             "这两个字段会被直接贴到给人看的决策卡上，"
             "写长了卡片就变成一堵墙。"
             "逐 VP 的细节写进 problem / evidence / uncertainty 三个字段，"
-            "那两个字段里写完整。"
+            "那两个字段里写完整。\n"
+            "8. evidence 必须是字符串数组：JSON 数组，元素是字符串。"
+            "只找到一条证据时也写成单元素数组（[\"…\"]），"
+            "不要写成一段话 —— 一段话不是数组。"
         )
 
     def build_prompt(
@@ -1179,6 +1613,8 @@ class TerminalDecisionJudge:
             [
                 "",
                 "## 输出要求",
+                "evidence 必须是字符串数组：只有一条证据时也写成单元素数组"
+                '（["<支撑判断的事实，中文>"]），不要写成一段话。',
                 "只输出下面这个 JSON 对象，不要解释、不要 markdown：",
                 '{"context": "<背景：这一轮停在哪里，一句话，中文>", "problem": '
                 '"<问题：到底出了什么问题，逐 VP 的预期/实际/为何失败，中文>", '
@@ -1364,6 +1800,10 @@ class TerminalDecisionJudge:
         # would be worse than resuming none at all.
         self.last_session = None
         self.last_session_id = None
+        # The reason for a missing answer belongs to *this* call: a
+        # refusal left over from the previous one would name a check
+        # that has nothing to do with the answer at hand.
+        self.last_analysis_error = ""
 
         try:
             from coding_tool import JsonSession, query_json_in_session
@@ -1392,6 +1832,7 @@ class TerminalDecisionJudge:
                 type(exc).__name__,
                 exc,
             )
+            self.last_analysis_error = ANALYSIS_ERROR_EMPTY
             return None
 
         self.last_session = handle
@@ -1402,14 +1843,17 @@ class TerminalDecisionJudge:
             logger.warning(
                 "[terminal-analysis] the answer is not a JSON object"
             )
+            self.last_analysis_error = ANALYSIS_ERROR_EMPTY
             return None
 
-        analysis = _validate_analysis(payload)
+        analysis, reason = validate_analysis_with_reason(payload)
         if analysis is None:
             logger.warning(
                 "[terminal-analysis] the answer does not carry the six "
-                "contracted fields"
+                "contracted fields: %s",
+                reason,
             )
+            self.last_analysis_error = ANALYSIS_ERROR_REJECTED + reason
             return None
 
         logger.info(

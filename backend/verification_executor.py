@@ -3184,6 +3184,28 @@ class VerificationExecutor(BaseExecutor):
             and self._verdict_round_of(verdict) == current
         )
 
+    def _verdict_exists_in_round(self, item_id: str, round_no: int) -> bool:
+        """这条验证点在**这一轮**有没有结论。
+
+        与 :meth:`_is_current_round_verdict` 的区别：那一条问的是「它手上
+        最新的那条结论是不是本轮的」，**轮次未知时一律当"是"**（读侧用，
+        宽松是对的）；这一条问的是「本轮有没有为它落过账」，**轮次未知时
+        按 0 号桶算**（写侧用：轮次都分不出来，就分不出「上一轮」和
+        「这一轮」，于是沿用旧口径 —— 有结论就不重写）。
+
+        两张表都查：轮次作用域表（``_verdicts_by_round``）是本轮账本的
+        真相，而 ``_verdicts`` 里那一条带着它自己的轮次戳 —— 装载路径
+        （``_adopt_loaded_verdicts`` / ``_hydrate_verdicts``）两张表一起
+        写，两边不会差。
+        """
+        if item_id in self._verdicts_by_round.get(round_no, {}):
+            return True
+        existing = self._verdicts.get(item_id)
+        return (
+            isinstance(existing, dict)
+            and self._verdict_round_of(existing) == round_no
+        )
+
     def _seed_reused_verdicts(self, prev_round: int) -> Set[str]:
         """把上一轮**可以复用**的结论搬进本轮（返回复用的验证点 id）。
 
@@ -3677,10 +3699,28 @@ class VerificationExecutor(BaseExecutor):
         layer: List[Dict[str, Any]],
         reason: str,
     ) -> None:
-        """把整层 Phase 2 VP 标为 ``DEFERRED``（本轮延后，下轮重跑）。"""
+        """把整层 Phase 2 VP 标为 ``DEFERRED``（本轮延后，下轮重跑）。
+
+        2026-11-09（轮次作用域 · DEFERRED）：判据是「**本轮**已有裁决」，
+        不是「这条验证点有裁决」。
+
+        原来的判据（``item_id in self._verdicts``）是**跨轮**的：``_verdicts``
+        里每个验证点只留最新一条（跨轮继承靠它），上一轮留下的 DEFERRED
+        让本轮一条结论都不写 —— 于是「这一轮被门禁拦下了」这件事在本轮
+        没有留下任何记录。下游的账本只取**本轮**的裁决
+        （``_current_round_verdicts`` /
+        ``verification_agent._build_execution_results_from_executor``），那个
+        关卡就从账本里消失，Phase 3 只能对「没有记录」猜一个 FAILED，报告
+        于是把它写成「未获得执行结果」，修复环去修一条从没跑过的关卡。
+
+        同一轮内不覆盖既有结论；跨轮必须重新落一条带本轮轮次戳的
+        DEFERRED —— 与 :meth:`_mark_layer_skipped` 的轮次语义一致（整层
+        跳过每一轮都走 ``_stamp_round`` 落一条本轮结论）。
+        """
+        current_round = self._verdict_round_no()
         for item in layer:
             item_id = self._derive_item_id(item)
-            if item_id in self._verdicts:
+            if self._verdict_exists_in_round(item_id, current_round):
                 continue
             verdict = {
                 "status": "DEFERRED",
