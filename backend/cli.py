@@ -17,7 +17,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 from agent import autonomous_coding
 import credentials
@@ -25,6 +25,7 @@ from rollback_manager import RollbackManager
 from config_registry import ConfigRegistry
 from config_loader import load_config_by_name
 from coding_tool import stop_all_live_dispatches
+from crash_forensics import CrashGuard
 from execution_logger import get_logger
 from executor_lock import LOCK_FILENAME, ExecutorLock, acquire
 from process_reaper import EXECUTOR_SIGNALS, reap_plan
@@ -423,6 +424,18 @@ _executor_plan_dir: Optional[Path] = None
 _executor_plan_id: str = ""
 _executor_lock: Optional[ExecutorLock] = None
 
+#: The crash guard of the run that is going on, if one is going on.
+#:
+#: The guard is what writes down the scene of a bad end: an exception
+#: that was not handled, a non-zero exit, a signal.  It lives in a
+#: module slot rather than in a local because the stop handler is a
+#: *signal* handler — it runs in a context that has no access to the
+#: locals of :func:`main`, and it is the one path that ends the
+#: process with ``os._exit`` before any ``finally`` can run.  The slot
+#: is empty whenever no run is going on, and a handler that finds it
+#: empty has nothing to write and says so.
+_crash_guard: Optional[CrashGuard] = None
+
 #: Whether the handler is installed.  Installing twice must not stack a
 #: second handler on top of the first — the second would call the first,
 #: and the stop sequence would run twice over the same children.
@@ -595,6 +608,35 @@ def _log_sigterm_entry(signum: int, is_second_signal: bool) -> None:
         pass
 
 
+def _write_crash_scene(signum: int) -> None:
+    """Write the crash scene of a signal.  Never raises.
+
+    A signal is the one bad end with nothing left behind: the process
+    is torn down by the kernel, no ``finally`` runs, and the exit code
+    says only *that* it was signalled, not *where* it was.  The scene is
+    what answers the second question -- the stack the process was in
+    when the signal arrived is the evidence, and it is gone a moment
+    later.
+
+    The guard is the module slot :data:`_crash_guard`, because a signal
+    handler runs where the locals of :func:`main` are not: the slot is
+    the only way the handler can reach the guard of the run that is
+    going on.  An empty slot means there is no run to speak of -- a
+    test, or a tool calling the handler directly -- and then there is
+    nothing to write and nothing to say.
+
+    Never raises: a failure to write the scene must not change what the
+    handler does, and what the handler does is to leave the process.
+    """
+    guard = _crash_guard
+    if guard is None:
+        return
+    try:
+        guard.on_signal(signum)
+    except Exception:  # noqa: BLE001 — the exit below must still happen
+        pass
+
+
 def _on_sigterm(signum, frame) -> None:
     """Stop the children, then leave.  Installed as the SIGTERM handler.
 
@@ -610,6 +652,10 @@ def _on_sigterm(signum, frame) -> None:
     The first thing the handler does is write one line saying the
     signal arrived (see :func:`_log_sigterm_entry`): an executor that
     leaves on a signal otherwise leaves no trace at all.
+
+    The last thing it does before leaving is write the crash scene
+    (see :func:`_write_crash_scene`): the line says the signal
+    arrived, the scene says where the executor was when it did.
     """
     global _stop_in_progress
 
@@ -644,6 +690,16 @@ def _on_sigterm(signum, frame) -> None:
     # executor that started it.
     _sweep_executor_tree(signum)
 
+    # The scene is written here -- after the cleanup, before the exit.
+    #
+    # After the cleanup, because that cleanup is the branch's own
+    # order (sweep, release, exit) and the scene is a witness, not a
+    # step of it: putting the scene first would push "collect the
+    # plan's tree" down to second place.  Before the exit, because the
+    # exit is ``os._exit`` -- nothing after it runs, so a scene asked
+    # for later is a scene that is never written.
+    _write_crash_scene(signum)
+
     _exit_now(_STOP_EXIT_CODE)
 
 
@@ -654,7 +710,7 @@ def _on_sigint(signum, frame) -> None:
     so whatever watches the executor can tell an interrupt from a
     termination.  The work is the same work: the dispatches are
     stopped, the plan's tree is collected out of the ledger, the lock
-    is released, and the process leaves.
+    is released, the crash scene is written, and the process leaves.
     """
     global _stop_in_progress
 
@@ -681,6 +737,11 @@ def _on_sigint(signum, frame) -> None:
         )
 
     _sweep_executor_tree(signum)
+
+    # The scene, for the same reason SIGTERM writes one: the stack the
+    # executor was in when the interrupt arrived is the only evidence
+    # an interrupt leaves behind.
+    _write_crash_scene(signum)
 
     _exit_now(_STOP_SIGINT_EXIT_CODE)
 
@@ -714,9 +775,45 @@ def install_stop_handler() -> None:
     _stop_handler_installed = True
 
 
+def _system_exit_code(code: object) -> Optional[int]:
+    """The exit code a ``SystemExit`` carries -- or ``None`` when it has none.
+
+    ``SystemExit()`` and ``SystemExit(0)`` are a clean exit: nothing
+    went wrong, so nothing is written down.  ``SystemExit("boom")`` is
+    how Python says "print this and leave with 1", so a message *is* an
+    exit code of one.  Anything else is the number it says it is.
+    """
+    if code is None:
+        return None
+    if isinstance(code, str):
+        return 1
+    try:
+        number = int(code)
+    except (TypeError, ValueError):
+        return 1
+    if number == 0:
+        return None
+    return number
+
+
+def _write_scene(write: Callable[[], None]) -> None:
+    """Ask the crash guard to write the scene.  Never raises.
+
+    The guard's own methods do not raise, but they are called from a
+    process that is already unwinding, and a failure on this path must
+    not replace the outcome being reported -- the exit code, the
+    traceback, the signal.  So the call is wrapped: the worst a failed
+    scene can do is leave no scene.
+    """
+    try:
+        write()
+    except Exception:  # noqa: BLE001 — the scene is best-effort by construction
+        pass
+
+
 def main():
     """Main entry point for CLI."""
-    global _executor_plan_dir, _executor_plan_id, _executor_lock
+    global _executor_plan_dir, _executor_plan_id, _executor_lock, _crash_guard
     from env_config import load_env
 
     load_env()
@@ -850,24 +947,74 @@ def main():
     # still can.
     install_stop_handler()
 
+    # The crash guard for this run.
+    #
+    # Installed HERE — after the lock, with the stop handler — so that
+    # every way the run can end badly has a witness.  An exception that
+    # was not handled bubbled up and left nothing on disk; a
+    # ``sys.exit(7)`` left a code and no explanation; and the stop
+    # handler ends the process with ``os._exit``, before any ``finally``
+    # could run.  The guard is what writes down the scene in all three
+    # cases, and it writes one scene and stops: a process that trips two
+    # triggers has died once, not twice.
+    crash_guard = CrashGuard(plan_dir=plan_dir, plan_id=plan_id, argv=sys.argv)
+    crash_guard.install()
+    _crash_guard = crash_guard
+
     try:
-        autonomous_coding(
-            requirement=args.requirement,
-            project_dir=workspace_dir,
-            recover=args.recover,
-            max_tasks=args.max_tasks,
-            config_name=args.config,
-            tool=args.tool,
-            logger=logger,
-            tasks_file=tasks_file,
-            # ``args.verification_tasks`` is intentionally NOT forwarded
-            # to ``autonomous_coding``: server.py's ``_run_repair_execution``
-            # already merges the verification round's repair tasks into the
-            # canonical tasks.json before spawning this subprocess (audit
-            # 2026-08-26). The flag is accepted on the CLI for backwards
-            # compatibility with operators that pass it manually.
-        )
+        try:
+            autonomous_coding(
+                requirement=args.requirement,
+                project_dir=workspace_dir,
+                recover=args.recover,
+                max_tasks=args.max_tasks,
+                config_name=args.config,
+                tool=args.tool,
+                logger=logger,
+                tasks_file=tasks_file,
+                # ``args.verification_tasks`` is intentionally NOT forwarded
+                # to ``autonomous_coding``: server.py's ``_run_repair_execution``
+                # already merges the verification round's repair tasks into the
+                # canonical tasks.json before spawning this subprocess (audit
+                # 2026-08-26). The flag is accepted on the CLI for backwards
+                # compatibility with operators that pass it manually.
+            )
+        except SystemExit as exc:
+            # ``sys.exit(n)`` is the executor's own way of saying how the
+            # run ended.  It is a crash only when n is not zero, and the
+            # code it carries is the code the process leaves with — the
+            # scene is written *beside* that outcome, never instead of it.
+            code = _system_exit_code(exc.code)
+            if code is not None:
+                _write_scene(lambda: crash_guard.on_exit_code(code))
+            raise
+        except KeyboardInterrupt:
+            # The stop handler owns SIGINT, so this path is reached only
+            # when that handler was not in place (or was replaced by
+            # something else).  The scene is asked for anyway: a process
+            # that dies here dies with nothing on disk otherwise.
+            _write_scene(lambda: crash_guard.on_signal(signal.SIGINT))
+            raise
+        except BaseException as exc:
+            # The traceback is the evidence, and the guard is the only
+            # thing that can still write it down while the process is
+            # unwinding.  The exception is re-raised unchanged: the
+            # report is a witness, not a substitute.
+            _write_scene(lambda: crash_guard.on_exception(exc))
+            raise
     finally:
+        # The guard goes first: it holds a temporary file for the stack
+        # dump, and a process that leaves with the file open has left
+        # something behind.  A failure here must not keep the lock from
+        # being released, so it is swallowed.
+        try:
+            crash_guard.close()
+        except Exception:  # noqa: BLE001 — the lock matters more than the scene
+            pass
+        # The run is over, so the guard belongs to it and to nothing
+        # else.  (The signal path never reaches this block — it ends the
+        # process with ``os._exit``.)
+        _crash_guard = None
         # Released on every way out, including a crash: a lock held by
         # a process that died on its way through would need somebody to
         # clear it. The lock *file* stays — deleting it would let the

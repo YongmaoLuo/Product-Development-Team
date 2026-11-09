@@ -226,15 +226,24 @@ def test_failed_tasks_alone_do_not_trigger_the_unfinished_gate(
 def test_non_zero_exit_still_reports_repair_non_zero_exit(
     monkeypatch, tmp_path, db_path,
 ):
+    """A non-zero exit fails the round, and the reason says which code.
+
+    The verdict has not changed — the status is still ``failed`` — but
+    the stop reason now carries the return code, so a reader can tell
+    a round that exited 1 from one that exited 3 without going back to
+    the ledger.  (A round killed by a signal writes
+    ``repair_signal:<n>`` instead; see
+    ``test_repair_exit_forensics.py``.)
+    """
     disk = [{"id": "1"}]
     runtime = [_repair_row("1", "completed", None, None)]
     _seed_plan(tmp_path, "p-w4-rc", disk, runtime, db_path)
 
     state = _run_repair(
-        monkeypatch, tmp_path, "p-w4-rc", db_path, returncode=3,
+        monkeypatch, tmp_path, "p-w4-rc", db_path, returncode=1,
     )
     assert state["status"] == "failed"
-    assert state["stop_reason"] == "repair_non_zero_exit"
+    assert state["stop_reason"] == "repair_non_zero_exit:1"
 
 
 # ---------------------------------------------------------------------------
