@@ -78,6 +78,7 @@ would be a guess.
 from __future__ import annotations
 
 import ast
+import fnmatch
 import re
 from collections.abc import Mapping
 from typing import Any, Callable, List, Optional, Sequence, Set, Tuple
@@ -86,6 +87,7 @@ __all__ = [
     "collect_only_probe",
     "derive_files_to_modify",
     "is_empty_shell_test",
+    "paths_named_by_command",
 ]
 
 
@@ -321,6 +323,200 @@ def _string_entries(value: Any) -> List[str]:
     if isinstance(value, (list, tuple, set, frozenset)):
         return [item for item in value if isinstance(item, str)]
     return []
+
+
+# ---------------------------------------------------------------------------
+# paths_named_by_command
+# ---------------------------------------------------------------------------
+
+#: Directory prefixes whose files a command names but a task never
+#: changes.
+#:
+#: * ``plans/`` — the plan's own bookkeeping.  A plan writes its
+#:   context, its task list and its logs there; the runtime owns them.
+#: * ``tmp/`` — scratch space.  A command that writes a temporary
+#:   fixture names a file it throws away.
+#: * ``.pdt/`` — the runtime's state directory.  It holds the state
+#:   files the executor reads and writes while it runs.
+#: * ``backend/.venv/`` and ``.venv/`` — a virtualenv.  The
+#:   interpreter and the packages installed into it live there; no task
+#:   is asked to change the environment it runs in.
+#:
+#: A command that names one of these says nothing about what the task
+#: is supposed to change, so the path is dropped.
+_READ_ONLY_PREFIXES: Tuple[str, ...] = (
+    "plans/",
+    "tmp/",
+    ".pdt/",
+    "backend/.venv/",
+    ".venv/",
+)
+
+#: File names that name a read-only file wherever they sit.
+#:
+#: * ``run_tests.sh`` — the entry script the command runs.  The gate's
+#:   own starting point: the command executes it, the task does not
+#:   change it.
+#: * ``pytest.ini``, ``tox.ini``, ``setup.cfg`` — the runner
+#:   configuration.  It says how the command runs, not what it changes.
+#: * ``pyproject.toml``, ``package.json``, ``Cargo.toml`` — the
+#:   project manifest.  Naming it names the project the command runs
+#:   in.
+#: * ``tsconfig.json`` — the compiler configuration, the same kind of
+#:   "how it runs" file as the runner configuration above.
+#:
+#: The name is what makes the file read-only, not where it sits: an
+#: entry script named ``run_tests.sh`` is the same file wherever the
+#: repository keeps it.
+_READ_ONLY_BASENAMES: Tuple[str, ...] = (
+    "run_tests.sh",
+    "pytest.ini",
+    "pyproject.toml",
+    "setup.cfg",
+    "tox.ini",
+    "package.json",
+    "Cargo.toml",
+    "tsconfig.json",
+)
+
+#: Glob patterns for read-only files whose name carries a suffix.
+#:
+#: * ``vitest.config.*`` and ``playwright.config.*`` — the runner
+#:   configurations that name a suffix the way ``pytest.ini`` names
+#:   none (``vitest.config.ts``, ``playwright.config.js``).
+#: * ``*.lock`` and ``*.log`` — the runtime's own artefacts wherever
+#:   they are written.  A lock file records the state of a dependency
+#:   tree; a log file records what happened.  Neither is a deliverable.
+_READ_ONLY_GLOBS: Tuple[str, ...] = (
+    "vitest.config.*",
+    "playwright.config.*",
+    "*.lock",
+    "*.log",
+)
+
+
+def paths_named_by_command(command: str) -> List[str]:
+    """The repo-relative source files a command names.
+
+    A task carries a ``test_command`` and a ``files_to_modify`` list,
+    and the two have to agree: a command that names a file of the
+    repository says which file the task is about, so that file belongs
+    in the declared list.  This rule reads the paths out of the command
+    so that both sides can be compared.
+
+    The paths are reported **as the command wrote them**.  A ``cd`` in
+    the command is not resolved, no path is checked against the
+    filesystem and no path is invented: this rule reads a command, it
+    does not run one, and the caller is the one that knows where the
+    repository lives.
+
+    What is not a path inside the repository is dropped rather than
+    reported — an absolute path, a path reached through ``~`` or
+    ``$``, and a path carrying ``..``.
+
+    **Read-only paths are dropped too.**  A command names more than
+    the files it wants changed: it names the entry script it runs, the
+    runner configuration it reads, the plan directory it works in, the
+    scratch directory it writes into.  None of those is a file a task
+    is expected to modify, and reporting one would hand the caller a
+    declaration the task never had to honour.  A path is read-only
+    when it falls in one of three groups:
+
+    * a **prefix** in :data:`_READ_ONLY_PREFIXES` — ``plans/`` (the
+      plan's own bookkeeping), ``tmp/`` (scratch space), ``.pdt/`` (the
+      runtime's state), ``backend/.venv/`` and ``.venv/`` (the
+      interpreter and its installed packages).  These are written by
+      the runtime, not by the task.
+    * a **basename** in :data:`_READ_ONLY_BASENAMES` — ``run_tests.sh``
+      (the entry script the command runs), ``pytest.ini``,
+      ``tox.ini``, ``setup.cfg`` (the runner configuration),
+      ``pyproject.toml``, ``package.json``, ``Cargo.toml`` (the
+      project manifest), ``tsconfig.json`` (the compiler
+      configuration).  These say how the command runs and which project
+      it runs in, never what the task changes.
+    * a **glob** in :data:`_READ_ONLY_GLOBS` — ``vitest.config.*`` and
+      ``playwright.config.*`` (the runner configurations that carry a
+      suffix), ``*.lock`` and ``*.log`` (the runtime's own artefacts).
+
+    The list is deliberately narrow, and a script that is *not* on it
+    stays reported.  The script a task really is about
+    (``scripts/ci_gate.sh`` in the incident this rule was written for)
+    is a file the task has to change; an allow-list that swallowed
+    every shell script would have made this rule report nothing at all.
+
+    Returns an empty list when the command names no source file: a
+    guessed path is worse than an empty answer.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return []
+
+    ordered: List[str] = []
+    seen: Set[str] = set()
+    for candidate in _paths_from_text(_mask_home_and_env_paths(command)):
+        # The suffix check is re-applied here so that the contract of
+        # this rule does not depend on what the tokeniser happens to
+        # keep: only a source file is a file this rule reports.
+        if not _is_source_path(candidate):
+            continue
+        if not _is_repo_relative_path(candidate):
+            continue
+        if _is_read_only_path(candidate):
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        ordered.append(candidate)
+    return ordered
+
+
+def _is_read_only_path(path: str) -> bool:
+    """Whether a path names a file the task is not expected to change.
+
+    Three groups, checked in the order the docstring of
+    :func:`paths_named_by_command` lists them: a directory prefix, a
+    file name, a glob on the file name.  A path in any one of them is
+    read-only.
+    """
+    if path.startswith(_READ_ONLY_PREFIXES):
+        return True
+    name = path.rsplit("/", 1)[-1]
+    if name in _READ_ONLY_BASENAMES:
+        return True
+    # ``fnmatchcase`` rather than ``fnmatch``: the latter folds case on
+    # some platforms, and this rule reads POSIX-shaped paths, where a
+    # name matches itself and nothing else.
+    return any(fnmatch.fnmatchcase(name, pattern) for pattern in _READ_ONLY_GLOBS)
+
+
+def _mask_home_and_env_paths(command: str) -> str:
+    """Blank out the paths a command reaches through ``~`` or ``$``.
+
+    ``~`` and ``$`` are not path characters, so the tokeniser that
+    reads a command splits ``$HOME/x.py`` into the bare ``HOME/x.py`` —
+    a relative path that looks perfectly repo-shaped.  Blanking the
+    whole run, prefix included, keeps such a path from being reported
+    as a file of the project.
+    """
+    chars = list(command)
+    for match in _PATH_RUN_RE.finditer(command):
+        start = match.start()
+        if start == 0 or command[start - 1] not in "~$":
+            continue
+        for index in range(start - 1, match.end()):
+            chars[index] = " "
+    return "".join(chars)
+
+
+def _is_repo_relative_path(path: str) -> bool:
+    """True when ``path`` can be a path inside the repository.
+
+    An absolute path points somewhere else on this machine, and a path
+    carrying ``..`` leaves the directory it was written in.  Neither
+    names a file of the project, so neither is reported.
+    """
+    if path.startswith("/"):
+        return False
+    return ".." not in path
 
 
 # ---------------------------------------------------------------------------
