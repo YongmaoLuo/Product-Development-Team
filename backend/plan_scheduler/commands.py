@@ -63,6 +63,23 @@ The phase is the state machine's to move, and the executor only ever
 writer of the plan's workflow state, and it would be a write that skips
 the edge table — the very table that says which moves are legal.
 
+The execution verdict
+---------------------
+There is one row the executor writes itself, and it writes it only when
+a plan gives way: the **execution** row.  The verdict says the
+execution is over — ``stopped``, with the pid cleared — and the reason
+names the plan that took the place.  The row is the only place that says
+"this plan is not working any more": the ledger reads it, the panel
+reads it, and a row that still says ``running`` keeps a plan that gave
+way counted as working, holding the room.
+
+The write goes through the state machine's own repository — the owner of
+the row, and of the rules that go with it (a terminal status clears the
+pid; a missing row is not a row that was left behind) — so the executor
+imports that repository at the top of the module rather than only to
+recognise an exception.  The statement is the repository's; this module
+runs no SQL of its own.
+
 The outcomes
 ------------
 The command answers with one of five words, and the set is closed:
@@ -123,21 +140,30 @@ database, so the executor **never holds a write transaction across one**
 the lifecycle calls are therefore separate transactions, in that order:
 the facts are changed first, and the ledger is reconciled afterwards so
 that "who holds compute" says what the plan facts say.
+
+The eviction's own writes are **one** transaction: the verdict on the
+execution row, the queue row and the spent promotion.  Either the plan
+gave way and kept its place in the line, or none of it happened.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import sqlite3
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Iterator, Optional, Tuple
 
 from .capacity import CapacityLedger
 from .config import DEFAULT_CAPACITY, DEFAULT_MIN_RUNTIME_SECONDS
 from .facts import IMPORT_FAILED_PHASE, QUEUED_PHASE
 from .policy import select_victim
 from .store import SqliteSchedulerStore
+from state_machine.repositories.execution_repository import (
+    ExecutionRepository,
+    PlanNotFoundError,
+)
 
 log = logging.getLogger(__name__)
 
@@ -176,6 +202,12 @@ NOT_FOUND = "not_found"
 OUTCOMES = frozenset(
     {APPLIED, STARTED, BLOCKED_BY_CAPACITY, CONFLICT, NOT_FOUND}
 )
+
+#: The lifecycle's verdict when the plan's process is **still alive**:
+#: the stop did not complete, so the plan did not stop.  There is
+#: nothing to record, nothing to re-queue and no promotion to spend —
+#: the eviction did not happen.
+_KILL_INCOMPLETE = "kill_incomplete"
 
 
 class CommandRejected(Exception):
@@ -328,6 +360,47 @@ def _connection_of(source: Any) -> Optional[sqlite3.Connection]:
         if isinstance(conn, sqlite3.Connection):
             return conn
     return None
+
+
+# ---------------------------------------------------------------------------
+# Joining the transaction that is already open
+# ---------------------------------------------------------------------------
+
+
+class _JoiningExecutionRepository(ExecutionRepository):
+    """The execution repository, writing inside the transaction that is open.
+
+    The repository opens a transaction of its own for every write
+    (``BEGIN IMMEDIATE`` … ``COMMIT``), and SQLite refuses to nest
+    transactions — the second ``BEGIN`` is an error, not a no-op.  The
+    eviction writes its verdict **inside** the scheduler's own
+    transaction, because the verdict, the queue row and the promotion
+    are one fact: either the plan gave way and its place in the line
+    was kept, or none of it happened.
+
+    So the write joins the transaction that is already open.  Everything
+    the repository knows how to do is kept — the whitelist of columns
+    that may be written, the rule that a terminal status clears the
+    pid, the ``updated_at``, the state-change hook — and only the
+    transaction boundary is taken away: the boundary belongs to the
+    store, which is the one that opens it, and the store's boundary
+    rolls the work back when the body raises.
+
+    The statement is still the repository's, too: it is assembled
+    there, from the repository's own whitelist.  This module runs no
+    SQL of its own, so no statement in it has a shape that depends on
+    anything it was handed.
+    """
+
+    @contextlib.contextmanager
+    def _txn(self) -> Iterator[sqlite3.Connection]:
+        """Yield the connection without opening a transaction of its own.
+
+        The transaction is already open — the store opened it — so
+        there is nothing to begin, nothing to commit and nothing to
+        roll back here.  The store's boundary does all three.
+        """
+        yield self._conn
 
 
 # ---------------------------------------------------------------------------
@@ -672,7 +745,14 @@ class CommandExecutor:
             # has not had its turn yet.
             return BLOCKED_BY_CAPACITY, "no_eligible_victim"
 
-        self._evict(victim)
+        if not self._evict(victim, plan_id):
+            # The eviction did not happen: the victim is still working —
+            # the process did not go away — so the room is not free and
+            # the plan that asked keeps waiting.  The detail names the
+            # plan that is still holding the room, because "the
+            # capacity is full" on its own is not something the
+            # operator can act on.
+            return BLOCKED_BY_CAPACITY, "eviction_incomplete:{0}".format(victim)
         return STARTED, "evicted:{0}".format(victim)
 
     # ------------------------------------------------------------------
@@ -707,7 +787,7 @@ class CommandExecutor:
         candidates = self._ledger.evictable(now, min_runtime)
         return select_victim({"running": candidates}, min_runtime)
 
-    def _evict(self, victim: str) -> None:
+    def _evict(self, victim: str, requester: str) -> bool:
         """Interrupt a running plan so that the plan that asked may run.
 
         The victim is stopped through the lifecycle's own stop path with
@@ -717,12 +797,44 @@ class CommandExecutor:
         promotion is spent, so an interrupted plan does not keep jumping
         the queue after it was interrupted.
 
+        The stop is not a fact: the lifecycle answers with a **verdict of
+        its own**, and the two verdicts mean two different things.
+
+        * ``kill_incomplete`` — the process is still alive, so the plan
+          did **not** stop.  Nothing is recorded, nothing is re-queued
+          and no promotion is spent: the eviction did not happen, and
+          the caller has to say so.  The plan that asked keeps waiting.
+        * ``idle`` — there was nothing running here to stop, and the
+          stop did not move the phase either.  The plan is not working,
+          but it is not waiting either, and a plan that waits nowhere is
+          a plan the panel cannot show.  So the plan goes back to
+          waiting, through the lifecycle's own edge.
+
+        The **verdict** is written on the victim's execution row: the
+        execution is over (``stopped``, with the pid cleared) and the
+        reason names the plan that took the place.  The row is the only
+        place that says "this plan is not working any more" — the
+        ledger reads it, the panel reads it — so a row that still says
+        ``running`` keeps the plan counted as working and keeps its
+        slot, and a plan that gave way is still holding the room.
+
         The victim's slot is **not** freed here.  A slot is released
         when the ledger observes that the plan is no longer working, and
-        the ledger is the only thing that says who is working.
+        the ledger is the only thing that says who is working — the
+        observation is the last thing the eviction does.
+
+        Args:
+            victim: the plan that gives way.
+            requester: the plan that asked for the room.  It is named
+                in the reason the victim's row carries.
+
+        Returns:
+            ``True`` — the eviction happened.  ``False`` — it did not:
+            the victim is still working, and the caller has to answer
+            the plan that asked accordingly.
         """
         try:
-            self._lifecycle.stop_plan(victim, requeue=True)
+            result = self._lifecycle.stop_plan(victim, requeue=True)
         except Exception as exc:  # noqa: BLE001 — the type decides
             rejection = self._as_rejection(exc)
             if rejection is not None:
@@ -730,10 +842,68 @@ class CommandExecutor:
                 # lifecycle's answer, and it travels on as it came.
                 raise rejection from exc
             raise
+
+        detail = str(getattr(result, "detail", "") or "")
+        if detail == _KILL_INCOMPLETE:
+            # The process is still alive: the plan did not stop.  There
+            # is no verdict to write, no place in the line to keep and
+            # no promotion to spend — the eviction did not happen.
+            return False
+
+        if self._phase_of(victim) != QUEUED_PHASE:
+            # The stop did not put the plan back into the waiting phase
+            # — the ``idle`` branch leaves the phase where it was,
+            # because there was nothing running here to stop.  The
+            # lifecycle owns that edge, so ask it: a plan that is not
+            # working and not waiting waits nowhere.
+            try:
+                requeued = self._lifecycle.requeue_plan(victim)
+            except Exception as exc:  # noqa: BLE001 — the type decides
+                rejection = self._as_rejection(exc)
+                if rejection is not None:
+                    raise rejection from exc
+                raise
+            if not getattr(requeued, "ok", True):
+                # The lifecycle refused the edge: the plan is where it
+                # was, and the eviction did not happen.
+                return False
+
         with self._store.transaction(self._conn):
+            # The verdict, the place in the line and the spent
+            # promotion are one fact: either the plan gave way and its
+            # place was kept, or none of it happened.
+            self._write_eviction_verdict(victim, requester)
             self._ensure_queued(victim)
             self._store.consume_promotion(self._conn, victim)
         self._ledger.reconcile()
+        return True
+
+    def _write_eviction_verdict(self, victim: str, requester: str) -> None:
+        """Write the eviction's verdict on the victim's execution row.
+
+        The row says that the execution is over and why: ``stopped``,
+        with the pid cleared — a terminal status means there is no
+        executor process any more — and the reason naming the plan that
+        took the place.
+
+        A plan that has **no** execution row is not working either, and
+        there is nothing to record the verdict on: the row is simply not
+        there, and that is not a failure.  The write does not create
+        one — a row that was never there is not a row that was left
+        behind by a plan that gave way.
+        """
+        repository = _JoiningExecutionRepository(self._conn)
+        try:
+            repository.update_fields(
+                victim,
+                create_if_missing=False,
+                exec_status="stopped",
+                stop_reason="evicted:{0}".format(requester),
+            )
+        except PlanNotFoundError:
+            # No row: there is nothing to write the verdict on, and a
+            # plan without a row is not holding compute.
+            return
 
     # ------------------------------------------------------------------
     # The settings the decision runs with

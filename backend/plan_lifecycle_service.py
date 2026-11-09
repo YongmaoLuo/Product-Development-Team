@@ -15,7 +15,10 @@
 --------
 1. 验证在飞 → ``stop_verification(plan_id)``；
 2. 否则执行在飞 → ``stop_execution(plan_id, discard=False)``；
-3. 否则什么都不派发（idle），相位保持原样。
+3. 否则**执行行还说着「在跑」且那个 pid 还活着**（重启之后留下的孤儿，
+   这个进程没有它的句柄）→ 把它停到 ``stopped``（不派发处理器），再按
+   requeue 处理；
+4. 否则什么都不派发（idle），相位保持原样。
 
 验证优先于执行。一个计划同时被验证轮次与执行轮次占用是**异常态**
 （``detail='both'``），但真到了那一步必须先停验证 —— 验证是外层循环，
@@ -67,6 +70,33 @@ requeue 的前提是**处理器把计划停在了 ``'stopped'``**（执行 stop 
 的）。处理器停在别处时（验证 stop 把相位停在 ``'verification'``），迁移
 就是非法的 —— 于是走上面那条「迁移失败不外抛」的边界：记 warning，最终
 相位回落 ``'stopped'``。门面不替处理器改相位：停到哪儿是处理器的事。
+
+裁决：停到底有没有停成
+----------------------
+门面派发完处理器之后**不假设**停成了 —— 处理器知道进程到底死没死透
+（``routes/execution.py`` 的 stop 响应里带着 ``status``；杀不掉时它是
+``kill_incomplete``，并把幸存的 pid 一起带回来）。
+
+* **``kill_incomplete`` → 不算停**：相位一个字节都不动，不写 checkpoint，
+  不迁回队列。相位说「stopped」而进程还在跑，是同一个谎的高一级版本：
+  slot 被提前释放，第二个执行器接手同一个计划。
+* **幸存的 pid 写进一条 WARNING** —— 操作员要看得见「到底是谁没死」。
+* **处理器没给结论（返回 ``None``）→ 照旧当成停成了**：结论缺失不是
+  「没停成」—— 那会让每一次停止都变成一次谎报。
+
+孤儿执行行
+----------
+进程重启之后，执行行还说着「在跑」，那个进程确实也还活着，但**这个进程
+没有它的句柄**（句柄随进程一起没了）。门面原来走 idle 分支：相位一字节
+不动，计划既没真停也没回队列 —— 一个还在跑的计划在队列里排着号，谁也
+不知道它还在跑。
+
+这一支的判据是**执行行 + pid 探针**：行上说 ``running`` 且行上的 pid 还
+活着（``plan_scheduler.facts`` 的 ``_pid_is_alive``），才是孤儿。行不存
+在、不是 ``running``、或者 pid 已经没了 → 不是孤儿，走 idle 原路径。
+
+孤儿被停到 ``stopped``（``detail='orphan_stop'``），再按 requeue 处理；
+停不下去（迁移被拒）时按 idle 返回 —— 相位原样不动。
 
 start
 -----
@@ -160,9 +190,21 @@ logger = logging.getLogger(__name__)
 #: 什么」。
 CONFLICT_DETAIL = "conflict"
 
+#: 处理器说「没杀干净」时结果里的 ``detail``（处理器那边的
+#: ``routes.execution.STOP_STATUS_KILL_INCOMPLETE`` 是同一个名字）。
+#:
+#: 进程还活着就不算停：相位一个字节都不动，也不迁回队列。
+KILL_INCOMPLETE_DETAIL = "kill_incomplete"
+
+#: 孤儿执行行被停到 ``stopped`` 时结果里的 ``detail``。请求了 requeue 时
+#: 追加 ``'+requeue'``（与既有那几种 detail 同一个形状）。
+ORPHAN_STOP_DETAIL = "orphan_stop"
+
 __all__ = [
     "CONFLICT_DETAIL",
+    "KILL_INCOMPLETE_DETAIL",
     "LifecycleResult",
+    "ORPHAN_STOP_DETAIL",
     "PlanLifecycleService",
     "PlanNotFoundError",
     "StartPlanSpec",
@@ -214,7 +256,9 @@ class LifecycleResult:
       ``'stop_execution'`` / ``'both'`` / ``'idle'``；start 侧是
       ``'start_verification(resume)'`` / ``'start_execution(resume)'`` /
       ``'start_execution(fresh)'``；pause / requeue 侧是
-      ``'pause_queued'`` / ``'requeue'`` / ``'conflict'``）。请求了
+      ``'pause_queued'`` / ``'requeue'`` / ``'conflict'``）。stop 侧还有
+      两个**裁决**：``'kill_incomplete'``（进程还活着，不算停）与
+      ``'orphan_stop'``（孤儿执行行被停到了 ``stopped``）。请求了
       requeue 时追加 ``'+requeue'``（如 ``'stop_execution+requeue'``）——
       它说的是**动作**，最终相位落在哪儿看 ``final_phase``。
 
@@ -279,9 +323,19 @@ class PlanLifecycleService:
     def stop_plan(self, plan_id: str, requeue: bool = False) -> LifecycleResult:
         """按实时状态把「停这个计划」派给验证或执行。
 
+        两种「没停成」的答案：
+
+        * ``detail='kill_incomplete'`` —— 处理器说进程还活着（幸存者的 pid
+          写进一条 WARNING）。相位原样不动，不写 checkpoint，不迁回队列。
+        * ``detail='orphan_stop'`` —— 这个进程没有那个执行的句柄，但执行行
+          还说着「在跑」且那个 pid 还活着。相位被停到 ``stopped``，再按
+          requeue 处理（停不下去时按 idle 返回）。
+
         :param plan_id: 目标计划。
         :param requeue: 停完之后是否把计划迁回等待相位（``queued``）。
-            idle 时被忽略（没有东西可停，也就没有「停完之后」可言）。
+            idle 时被忽略（没有东西可停，也就没有「停完之后」可言）；
+            ``kill_incomplete`` 时也被忽略（进程还活着，迁回队列等于把
+            一个还在跑的计划排进下一次执行）。
         :return: :class:`LifecycleResult`。
         :raises PlanNotFoundError: 计划不存在。
         :raises fastapi.HTTPException: 处理器抛出的异常原样透传。
@@ -294,6 +348,9 @@ class PlanLifecycleService:
 
         verification_alive = self._verification_alive(plan_id)
         execution_alive = self._execution_alive(plan_id)
+        # 处理器的**结论**。它是 ``None``（旧假实现）或一个 dict；只有
+        # 结论说了「没杀干净」，门面才敢说「没停成」。
+        verdict: Any = None
 
         if verification_alive:
             self._stop_verification(plan_id)
@@ -302,12 +359,17 @@ class PlanLifecycleService:
             if execution_alive:
                 # 异常态：两边都在飞。验证是外层循环，它不停就会在执行
                 # 被停之后又拉起新一轮 —— 所以先停验证，再停执行。
-                self._stop_execution(plan_id)
+                verdict = self._stop_execution(plan_id)
                 detail = "both"
         elif execution_alive:
-            self._stop_execution(plan_id)
+            verdict = self._stop_execution(plan_id)
             dispatched = "execution"
             detail = "stop_execution"
+        elif self._persisted_execution_running(plan_id):
+            # 孤儿：这个进程没有那个执行的句柄（重启之后留下的），但执行
+            # 行还说着「在跑」，而行上的 pid 确实还活着。原来的 idle 分支
+            # 让它既没停也没回队列 —— 一个还在跑的计划在队列里排着号。
+            return self._stop_orphan(plan_id, plan_dir, requeue)
         else:
             # idle：没有在跑的东西可停，派发本身就是错的。相位保持原样，
             # requeue 也被忽略 —— 把一个 idle 的计划塞进队列等于凭空多出
@@ -321,6 +383,12 @@ class PlanLifecycleService:
                 checkpoint=None,
                 detail="idle",
             )
+
+        if self._kill_incomplete(verdict):
+            # 进程还活着 → 不算停。相位原样不动，不写 checkpoint，也不
+            # 迁回队列：迁回队列等于把这个还在跑的计划排进下一次执行。
+            return self._kill_incomplete_result(plan_id, plan_dir, verdict,
+                                                dispatched)
 
         # 停完了。停泊相位恒为 'stopped'：把相位停到那儿是处理器的事，
         # 门面不自己改相位。
@@ -347,6 +415,102 @@ class PlanLifecycleService:
             berth_phase=berth_phase,
             final_phase=final_phase,
             checkpoint=checkpoint,
+            detail=detail,
+        )
+
+    @staticmethod
+    def _kill_incomplete(verdict: Any) -> bool:
+        """处理器的结论是不是「没杀干净」。
+
+        结论是 ``routes/execution.py`` 的 stop 响应（一个 dict），里面
+        带着 ``status``；杀不掉时它是 ``kill_incomplete``，并把幸存的 pid
+        放在 ``surviving_pids`` 里。
+
+        **没有结论不算「没杀干净」**：处理器返回 ``None``（旧假实现的形状）
+        或返回的不是 dict（归档计划的响应）时，这一支按「停成了」走 ——
+        结论缺失不是「没停成」，那会让每一次停止都变成一次谎报。
+        """
+        if not isinstance(verdict, dict):
+            return False
+        return str(verdict.get("status") or "") == KILL_INCOMPLETE_DETAIL
+
+    def _kill_incomplete_result(
+        self, plan_id: str, plan_dir, verdict: Any, dispatched: Optional[str],
+    ) -> LifecycleResult:
+        """一个「没停成」的结果：相位原样不动，checkpoint 没有，队列不进。
+
+        幸存的 pid 写进一条 WARNING：操作员要看得见「到底是谁没死」——
+        一次静默的失败只会让操作员以为已经停了，然后看着 slot 被释放、
+        第二个执行器接手同一个计划。
+
+        ``checkpoint`` 是 ``None``：恢复点挨着一个还在跑的进程，就是一个
+        二次执行的入口（真实 stop 在 ``kill_incomplete`` 那条路上也不写
+        checkpoint —— 同一个理由，同一处）。
+        """
+        surviving = list(verdict.get("surviving_pids") or [])
+        logger.warning(
+            "plan_lifecycle_kill_incomplete: plan=%s the executor's tree "
+            "survived the stop (pids=%s); the phase is left where it was, "
+            "no checkpoint is written and the plan is not requeued",
+            plan_id,
+            surviving,
+        )
+        phase = self._current_phase(plan_dir)
+        return LifecycleResult(
+            plan_id=plan_id,
+            dispatched=dispatched,
+            berth_phase=phase,
+            final_phase=phase,
+            checkpoint=None,
+            detail=KILL_INCOMPLETE_DETAIL,
+        )
+
+    def _stop_orphan(self, plan_id: str, plan_dir, requeue: bool) -> LifecycleResult:
+        """孤儿执行行：进程还活着，但这个进程没有它的句柄。
+
+        判据是执行行加上 pid 探针（见 :meth:`_persisted_execution_running`）：
+        行上说 ``running`` 且那个 pid 还活着，才是孤儿。
+
+        这一支**不派发处理器**：没有句柄可停（句柄随旧进程一起没了），
+        门面能做的、也必须做的，是把相位停到 ``stopped`` —— 否则一个还
+        在跑的计划既没停也没回队列，队列里排着号，谁也不知道它还在跑。
+
+        停不下去（迁移被拒）时按 idle 返回：相位原样不动，操作没有发生。
+
+        ``dispatched`` 报 ``'execution'``：确实有一个执行在飞（只是这个
+        进程看不见它），说 idle 会让暂停路径以为「没有在跑的东西」。
+        """
+        phase = self._current_phase(plan_dir)
+        if not self._transition_to_phase(plan_dir, "stopped",
+                                         label=ORPHAN_STOP_DETAIL):
+            # 迁移被拒（相位在读与写之间变了，或那条边不合法）：按 idle
+            # 返回 —— 相位原样不动，操作没有发生。
+            return LifecycleResult(
+                plan_id=plan_id,
+                dispatched=None,
+                berth_phase=phase,
+                final_phase=phase,
+                checkpoint=None,
+                detail="idle",
+            )
+
+        detail = ORPHAN_STOP_DETAIL
+        final_phase = "stopped"
+        if requeue:
+            detail = f"{detail}+requeue"
+            if self._requeue_to_queued(plan_dir):
+                final_phase = "queued"
+                # 迁回队列之后，执行行上那条终态裁决必须一起清掉 ——
+                # 否则两个裁决互相矛盾，计划会从列表里消失（见
+                # ``_clear_terminal_exec_verdict``）。
+                self._clear_terminal_exec_verdict(plan_id)
+
+        return LifecycleResult(
+            plan_id=plan_id,
+            dispatched="execution",
+            berth_phase="stopped",
+            final_phase=final_phase,
+            checkpoint=None,
             detail=detail,
         )
 
@@ -739,6 +903,63 @@ class PlanLifecycleService:
         return bool(_server._plan_execution_in_flight(plan_id))
 
     @staticmethod
+    def _persisted_execution_running(plan_id: str) -> bool:
+        """执行行是不是还说着「在跑」，而且那个 pid 还活着。
+
+        这是**孤儿判定的唯一依据**：进程重启之后，进程内的执行表是空的
+        （句柄随旧进程一起没了），但执行行还留着 ``running`` 与那个 pid，
+        而那个 pid 确实还活着。内存表答不了这个问题 —— 它只知道自己这
+        一个进程。
+
+        两条都要满足：
+
+        * ``exec_status == 'running'`` —— 行上记着的那一轮还在跑；
+        * 行上的 pid 还活着（``plan_scheduler.facts`` 的
+          ``_pid_is_alive``）。
+
+        行不存在、不是 ``running``、或者 pid 已经没了 → ``False``：那不是
+        孤儿，只是一个没有在跑的计划（走 idle 原路径）。
+
+        **pid 探针用 ``plan_scheduler.facts`` 那一个**，不自己重写一份：
+        两个「pid 是不是活着」的判据迟早对不上，而对不上的那一次就是
+        一个被当成活着的死 pid（或者反过来）。
+
+        读不到行时（数据库打不开）也答 ``False`` 并记一条 warning：这一支
+        只是「有没有孤儿」的判断，判不出来时按 idle 走 —— 相位原样不动，
+        比猜一个答案安全。
+        """
+        import server as _server
+        from plan_scheduler.facts import _pid_is_alive
+        from state_machine.db.connection import open as open_db
+        from state_machine.db.schema import migrate
+        from state_machine.repositories.execution_repository import (
+            ExecutionRepository,
+        )
+
+        try:
+            conn = open_db(_server._state_db_path())
+            try:
+                migrate(conn)
+                row = ExecutionRepository(conn).summary(plan_id)
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001 — 判不出来就当没有孤儿
+            logger.warning(
+                "plan_lifecycle_orphan_check_failed: plan=%s the execution "
+                "row could not be read; the plan is treated as idle",
+                plan_id,
+                exc_info=True,
+            )
+            return False
+
+        if not row:
+            return False
+        status = str(row.get("exec_status") or "").strip().lower()
+        if status != "running":
+            return False
+        return bool(_pid_is_alive(row.get("exec_pid")))
+
+    @staticmethod
     def _current_phase(plan_dir) -> str:
         """读计划当前相位（idle 分支要如实回显「相位不变」）。"""
         return PlanState(plan_dir).get_current_phase()
@@ -755,11 +976,17 @@ class PlanLifecycleService:
         _routes_verification.stop_verification(plan_id)
 
     @staticmethod
-    def _stop_execution(plan_id: str) -> None:
-        """停执行轮次（``discard=False``：停是暂停，不是丢弃）。"""
+    def _stop_execution(plan_id: str) -> Any:
+        """停执行轮次（``discard=False``：停是暂停，不是丢弃）。
+
+        **把处理器的结论带回来**：``routes/execution.py`` 的 stop 响应说
+        了「进程到底死没死透」（杀不掉时是 ``kill_incomplete``，并带着
+        幸存的 pid）。丢了它，门面就永远只能假设自己停成了 —— 那正是
+        这个模块要回答的问题。
+        """
         from routes import execution as _routes_execution
 
-        _routes_execution.stop_execution(plan_id, discard=False)
+        return _routes_execution.stop_execution(plan_id, discard=False)
 
     @staticmethod
     def _start_verification(plan_id: str, spec: StartPlanSpec) -> None:
