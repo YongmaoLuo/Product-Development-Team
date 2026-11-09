@@ -111,11 +111,12 @@ def checkout(tmp_path):
     exist, and the import route runs that gate — so a fixture pointing
     at a made-up path would be testing the 422 branch on the happy path.
 
-    The checkout also carries an executable ``scripts/ci_gate.sh``: the
-    import lane refuses a project that has no CI adapter (2026-11-05), so
-    a fixture without one would be testing the *refusal* branch on the
-    happy path.  The execute bit is set explicitly — a file without it
-    counts as "no adapter" just as much as a missing file does.
+    The checkout also carries an executable ``scripts/ci_gate.sh``: which
+    script is a project's CI entry is its own decision, so the framework
+    no longer requires this file to exist.  The fixture ships one anyway
+    because that is what a real project looks like — and the execute bit
+    is set explicitly, so the file is a real, runnable script rather
+    than a stray text file.
     """
     path = tmp_path / "checkout"
     (path / "backend").mkdir(parents=True)
