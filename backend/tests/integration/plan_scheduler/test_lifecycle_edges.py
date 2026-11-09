@@ -116,6 +116,11 @@ _PHASES_BEFORE = [
     "completed",
     "failed",
     "stopped",
+    # 2026-11-09: 新增——「主动归档、永远别再跑」的终态相位。它与
+    # ``completed`` 分开：``completed`` 是「真的做完了」，``archived`` 是
+    # 「我们把它收起来了」。归档的对象常常是**从没跑过**的计划，所以它与
+    # ``completed`` 的语义不能合并。
+    "archived",
 ]
 
 _MAIN_EDGES_BEFORE = {
@@ -178,6 +183,10 @@ _MAIN_EDGES_BEFORE = {
     "completed": ["verification"],
     "failed": ["executing", "ready", "stopped", "queued"],
     "stopped": ["executing", "ready", "queued"],
+    # 2026-11-09: ``archived`` 的唯一出边是 ``queued``（误归档后的显式
+    # 恢复）。**进** ``archived`` 的那条边不在表里 —— 归档是通用目标，由
+    # ``PlanState._transition_to`` 的判定接住，所以任何相位都能归档。
+    "archived": ["queued"],
 }
 
 _VERIFICATION_EDGES_BEFORE = {
@@ -241,7 +250,7 @@ _DEDICATED_EDGES_BEFORE = {
     "prd_review": ["tasks_generation"],
 }
 
-_TERMINAL_PHASES_BEFORE = ["completed", "failed", "stopped"]
+_TERMINAL_PHASES_BEFORE = ["archived", "completed", "failed", "stopped"]
 
 
 # ---------------------------------------------------------------------------

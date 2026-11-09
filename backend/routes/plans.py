@@ -350,10 +350,18 @@ LIST_PLANS_DIR_HEADERS = (
 #: The phases that end a plan.  ``waiting_for_quota`` is NOT one of
 #: them: a plan parked for capacity is alive, and it resumes when the
 #: quota window opens.
+#:
+#: 2026-11-09: ``archived`` is one of them — an archived plan is
+#: shelved for good, so the default listing (which drops terminal
+#: plans) must drop it too.  It is a *phase*, not the ``archived``
+#: flag this module derives for directory-archived plans: that flag
+#: says "this plan's directory was moved out of the tree", this phase
+#: says "we archived this plan and it never runs again".
 TERMINAL_PHASES = frozenset({
     "completed", "failed", "stopped",
     "verification_passed",
     "verification_failed",
+    "archived",
 })
 
 #: The execution verdicts that end a plan even when the routing phase
@@ -2911,6 +2919,10 @@ def _list_plans_body(
         "completed", "failed", "stopped",
         "verification_passed",
         "verification_failed",
+        # 2026-11-09: ``archived`` — an archived plan is shelved for
+        # good, so the default listing drops it (it stays reachable
+        # through ``?include_terminal=true``).
+        "archived",
     }
 
     plans: List[Dict[str, Any]] = []
