@@ -111,23 +111,23 @@ def test_prompt_example_uses_adapter_script():
 
 
 def test_prompt_says_project_owns_the_adapter():
-    """The prompt says the adapter script belongs to the project.
+    """The prompt says the CI entry is the project's own decision.
 
-    The framework only checks that the script exists and honours the
-    exit-code contract; it does not parse the script and does not judge
-    where it runs.  The model has to know that, otherwise it keeps
+    The framework does not require any particular script (not even
+    ``scripts/ci_gate.sh``); it only runs the entry the plan names and
+    reads its exit code.  The model has to know that, otherwise it keeps
     inventing inline commands.
     """
     mod = _import_fresh_prompts_module()
     prompt = mod.VERIFICATION_PLAN_SYSTEM_PROMPT
-    assert "适配脚本由项目提供" in prompt, (
-        "提示词必须说明适配脚本由项目提供 —— 否则模型会以为框架自带一个"
+    assert "入口由项目自己决定" in prompt, (
+        "提示词必须说明 CI 入口由项目自己决定 —— 否则模型会以为框架自带一个"
     )
     assert "框架不解析" in prompt, (
         "提示词必须说明框架不解析脚本内容"
     )
     assert "容器" in prompt, (
-        "提示词必须说明框架不判断适配脚本在本地 / 云端 / 容器里怎么跑"
+        "提示词必须说明框架不判断 CI 入口在本地 / 云端 / 容器里怎么跑"
     )
 
 
