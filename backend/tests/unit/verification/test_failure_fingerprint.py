@@ -482,3 +482,167 @@ def test_the_identity_fingerprint_of_the_reported_nine_cases_is_pinned():
         "canonical form moved, and every stored fingerprint becomes "
         "incomparable with the next round's"
     )
+
+
+# ---------------------------------------------------------------------------
+# 6. 身份态对「裁判散文」免疫（2026-11-06）
+# ---------------------------------------------------------------------------
+def test_the_identity_ignores_how_the_report_words_the_failure():
+    """同一次 schema 拒绝，裁判换个说法 —— 指纹必须不变。
+
+    根因报告（2026-11-04）记的那件事：同一条缺陷，报告里第一行证据换个措辞
+    （一个以「schema_issues 原文：」开头，一个以「框架记录原文：」开头），
+    旧五段式指纹就变了，循环于是把「散文换了个说法」读成「根因演进」，白白
+    多派了一轮根因任务。
+
+    身份态就是治这一条的：``failed_cases`` 给的是**机器写的**失败集合，散文
+    描述的是这一轮**跑起来的样子**，不属于缺陷的身份。
+    """
+    machine_written = ["schema:ci_entry_path_missing:backend/.venv"]
+
+    first = failure_fingerprint(
+        vp_id="VP-022",
+        failure_class="deliverable_defect",
+        failed_cases=machine_written,
+        first_error_line="schema_issues 原文：ci_entry 引用的路径不存在：backend/.venv)",
+    )
+    second = failure_fingerprint(
+        vp_id="VP-022",
+        failure_class="deliverable_defect",
+        failed_cases=machine_written,
+        first_error_line=(
+            "框架记录原文：{\"vp_id\":\"VP-022\",\"schema_issues\":[…]}。"
+            "该条目没有 exit_code、没有 stdout/stderr。"
+        ),
+    )
+
+    assert first == second, (
+        f"the same defect worded two ways must fingerprint the same; got "
+        f"{first} vs {second}"
+    )
+
+
+def test_a_different_defect_still_fingerprints_differently():
+    """散文免疫不等于「什么都一样」—— 不同的缺陷必须能分开。"""
+    first = failure_fingerprint(
+        vp_id="VP-022",
+        failure_class="deliverable_defect",
+        failed_cases=["schema:ci_entry_path_missing:backend/.venv"],
+    )
+    second = failure_fingerprint(
+        vp_id="VP-022",
+        failure_class="deliverable_defect",
+        failed_cases=["schema:ci_entry_compound:&&,||"],
+    )
+
+    assert first != second, (
+        "two different schema defects must not share a fingerprint — "
+        "otherwise the loop can no longer tell 'the defect changed' from "
+        "'the report reworded it'"
+    )
+
+
+def test_the_machine_written_identity_survives_the_report_rewording():
+    """同一个缺陷换一种措辞，身份态规范输入逐字节不变。
+
+    身份态的规范输入里**根本没有散文** —— 段名固定三段。这条钉的是形状：
+    将来有人往身份态里加 ``first_error_line``，这一条会红。
+    """
+    sep = "\x1f"
+    canon = canonical_fingerprint_input(
+        vp_id="VP-022",
+        failure_class="deliverable_defect",
+        failed_cases=["schema:ci_entry_path_missing:backend/.venv"],
+        first_error_line="随便换一句说法",
+    )
+    assert canon == sep.join(
+        [
+            "vp_id=vp-022",
+            "failure_class=deliverable_defect",
+            "failed_cases=schema:ci_entry_path_missing:backend/.venv",
+        ]
+    ), (
+        "the identity input grew a prose segment — the fingerprint would "
+        f"follow the report's wording again; got {canon!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# L3 · 证据层：schema 拒绝的第一行证据来自 artifact，不来自报告散文
+# ---------------------------------------------------------------------------
+#
+# 2026-11-05（VP-022）：入口被 schema 拒绝的那一轮，artifact 里只有
+# ``schema_issues``（机器写的），没有 ``junit_failures``（门禁没跑过）。
+# ``_artifact_first_error_line`` 只认 ``junit_failures``，于是它返回 None，
+# 第一行证据落回**报告散文** —— 而散文每轮都在改写。
+#
+# 指纹在身份态下不受影响（``failed_cases`` 才是身份），但
+# ``first_error_line`` 会进失败历史、进报告、也进旧五段式指纹的兜底路径。
+# 它必须跟着**缺陷**走，而不是跟着裁判的措辞走。
+
+
+def _orchestrator_with_artifact(tmp_path: Path, payload: dict):
+    """An orchestrator whose plan dir holds exactly one gate artifact.
+
+    Built without ``__init__`` on purpose: the method under test reads
+    one file off the plan dir, and constructing the whole orchestrator
+    would drag in a live coding tool and a state DB for nothing.
+    """
+    from verification.orchestrator import VerificationOrchestrator
+
+    plan_dir = tmp_path / "plan"
+    artifact_dir = plan_dir / "vp_artifacts" / "VP-022"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "ci_output.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8",
+    )
+    orch = VerificationOrchestrator.__new__(VerificationOrchestrator)
+    orch.plan_dir = plan_dir
+    return orch
+
+
+def test_the_first_error_line_comes_from_the_schema_issue(tmp_path: Path):
+    """schema 拒绝：artifact 里的机器原文优先于报告散文。"""
+    detail = (
+        "ci_entry 含 shell 操作符（&&, ||, (, )）："
+        "整仓门禁必须由项目适配脚本执行，不能是内联复合命令"
+    )
+    orch = _orchestrator_with_artifact(tmp_path, {
+        "vp_id": "VP-022",
+        "schema_issues": [
+            {
+                "vp_id": "VP-022",
+                "detail": detail,
+                "code": "ci_entry_compound",
+                "subject": "&&,||,(,)",
+            },
+        ],
+        "failed_cases": ["schema:ci_entry_compound:&&,||,(,)"],
+    })
+
+    line = orch._first_error_line({
+        "id": "VP-022",
+        "evidence": "框架记录原文：该条目没有 exit_code、没有 stdout/stderr。",
+    })
+
+    assert line == detail, (
+        f"the first error line must be the machine-written schema detail; "
+        f"got {line!r}"
+    )
+
+
+def test_the_first_error_line_still_reads_the_junit_failures(tmp_path: Path):
+    """门禁真跑过的那一轮：还是读 junit_failures —— 不回归。"""
+    orch = _orchestrator_with_artifact(tmp_path, {
+        "vp_id": "VP-022",
+        "junit_failures": [
+            {"node_id": "tests/test_a.py::test_x", "first_line": "boom: 1 != 2"},
+        ],
+    })
+
+    line = orch._first_error_line({"id": "VP-022", "evidence": "跑过了"})
+
+    assert line == "boom: 1 != 2", (
+        f"a real gate run must still report the gate's own first line; "
+        f"got {line!r}"
+    )

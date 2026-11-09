@@ -1995,6 +1995,18 @@ class VerificationOrchestrator:
         The gate's own first line says what broke; the report entry's
         ``evidence`` says how the run looked. The fingerprint's text
         field wants the former.
+
+        Two machine-written sources, in the order the gate writes them:
+
+        1. ``schema_issues`` — the entry was **rejected** and never ran.
+           The detail says which rule fired; that is the defect.
+        2. ``junit_failures`` — the gate ran and some case failed; the
+           case's first line says why.
+
+        Reading only ``junit_failures`` used to mean that a rejected
+        entry produced **no** machine-written first line at all, so the
+        text field fell back to the report's wording — and the wording is
+        rewritten every round (2026-11-05, VP-022).
         """
         if not vp_id:
             return None
@@ -2007,6 +2019,14 @@ class VerificationOrchestrator:
             return None
         if not isinstance(payload, dict):
             return None
+        schema_issues = payload.get("schema_issues")
+        if isinstance(schema_issues, list):
+            for issue in schema_issues:
+                if not isinstance(issue, dict):
+                    continue
+                detail = str(issue.get("detail") or "").strip()
+                if detail:
+                    return detail.splitlines()[0].strip()
         failures = payload.get("junit_failures")
         if not isinstance(failures, list):
             return None
