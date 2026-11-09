@@ -182,6 +182,53 @@ def alive(pid: int) -> bool:
     return probe(pid) is not None
 
 
+def parent_pid(pid: int) -> Optional[int]:
+    """The pid of ``pid``'s parent, as the kernel currently reports it.
+
+    This is the kernel's own answer to "who owns this process right
+    now" — a child that was orphaned has been reparented to ``init``
+    (pid 1) or to a subreaper, so a parent of 1 means nobody owns it
+    any more.
+
+    ``None`` means the parent could **not be determined** — the pid is
+    unreadable, ``ps`` failed, or the answer was empty. It never means
+    "no parent". A caller that gets ``None`` must therefore skip the
+    process conservatively rather than guess: treating an unknown
+    parent as a dead one is how a sweep kills a stranger.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+
+    try:
+        completed = subprocess.run(
+            ["ps", "-o", "ppid=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception as exc:  # noqa: BLE001 - a probe is best-effort
+        logger.debug("[process_identity] ps ppid failed for pid=%s: %s", pid, exc)
+        return None
+
+    if isinstance(completed, str):
+        output = completed
+    else:
+        if getattr(completed, "returncode", 0):
+            return None
+        output = getattr(completed, "stdout", "") or ""
+    text = str(output).strip()
+    if not text:
+        return None
+    try:
+        return int(text.splitlines()[0].strip())
+    except (IndexError, ValueError):
+        return None
+
+
 def matches(
     identity: Optional[ProcessIdentity],
     *,
