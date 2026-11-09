@@ -475,3 +475,161 @@ def test_a_forced_start_still_collects_a_record_whose_owner_is_alive(
         )
     finally:
         _cleanup(owner, target)
+
+
+# ---------------------------------------------------------------------------
+# the cascade: an owner that this sweep kills takes its children with it
+# ---------------------------------------------------------------------------
+
+#: A process that starts a child of its own and writes both pids down.
+#:
+#: ``<script> <depth> <pidfile>`` — the process writes "own_pid
+#: child_pid" to ``pidfile`` and, when ``depth`` is above zero, starts
+#: a copy of itself with one depth less, whose pidfile is
+#: ``pidfile + ".child"``.  The child gets a session of its own, so a
+#: sweep has to kill it by name: a group kill of the parent's group
+#: would take it down without the cascade being exercised at all.
+_CHILD_SOURCE = """
+import os
+import subprocess
+import sys
+import time
+
+depth = int(sys.argv[1])
+pidfile = sys.argv[2]
+child = 0
+if depth > 0:
+    subprocess.Popen(
+        [sys.executable, "-u", os.path.abspath(__file__), str(depth - 1),
+         pidfile + ".child"],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    childfile = pidfile + ".child"
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if os.path.exists(childfile):
+            text = open(childfile).read().strip()
+            if text:
+                child = int(text.split()[0])
+                break
+        time.sleep(0.05)
+with open(pidfile, "w") as handle:
+    handle.write("%d %d" % (os.getpid(), child))
+time.sleep(300)
+"""
+
+
+class _Pid:
+    """The smallest thing :func:`_record_for` needs: a pid."""
+
+    def __init__(self, pid):
+        self.pid = pid
+
+
+def _pid_alive(pid):
+    """True when the pid names a process that is still there.
+
+    A zombie still answers ``kill(pid, 0)``, so the test waits for its
+    own child before asking: the process is finished, only the parent's
+    bookkeeping is outstanding.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _spawn_chain(tmp_path, depth):
+    """Start a chain of ``depth + 1`` processes and return their pids.
+
+    The first one is a child of the test process; every one below it is
+    a child of the one above.  Returns ``([pid, ...], first_proc)``.
+    """
+    script = tmp_path / "chain.py"
+    script.write_text(_CHILD_SOURCE, encoding="utf-8")
+    pidfile = tmp_path / "pid.txt"
+    first = subprocess.Popen(
+        [sys.executable, "-u", str(script), str(depth), str(pidfile)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    pids = []
+    current = pidfile
+    for _ in range(depth + 1):
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if current.exists():
+                text = current.read_text(encoding="utf-8").strip()
+                if text:
+                    pids.append(int(text.split()[0]))
+                    break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("the chain never wrote its pid")
+        current = Path(str(current) + ".child")
+    return pids, first
+
+
+def test_the_sweep_collects_the_children_of_an_owner_it_kills(tmp_path):
+    """A -> B -> C: killing A has to take B and C with it, in one sweep.
+
+    This is the cascade the owner gate used to break.  The gate asked
+    "is the owner alive *now*", so the sweep decided that B and C
+    belonged to a live owner, skipped them, and then killed their
+    owner - leaving two orphans behind that nothing would ever
+    collect.  The question is "will the owner still be alive after
+    this sweep", and for B and C the answer is no: their owner is
+    being killed by this very sweep.
+
+    A is owned by the test process (our own tree), B is owned by A and
+    C by B, so one sweep has to end all three.
+    """
+    pids, first = _spawn_chain(tmp_path, 2)
+    try:
+        assert len(pids) == 3, pids
+        a_pid, b_pid, c_pid = pids
+        assert len({a_pid, b_pid, c_pid}) == 3, pids
+
+        _record_for(tmp_path, "executor", _Pid(a_pid), owner_pid=os.getpid())
+        _record_for(tmp_path, "subagent", _Pid(b_pid), owner_pid=a_pid)
+        _record_for(tmp_path, "tool", _Pid(c_pid), owner_pid=b_pid)
+
+        outcome = reaper.reap_plan(
+            tmp_path, "p1", reason="startup_sweep", grace_seconds=2.0
+        )
+
+        assert outcome.skipped == [], (
+            f"the sweep skipped {outcome.skipped!r}; the owner of B and C "
+            "is being killed by this very sweep, so they are not "
+            "somebody else's tree"
+        )
+        for pid in (a_pid, b_pid, c_pid):
+            assert pid in outcome.reaped, (
+                f"pid {pid} was not collected; the sweep reaped "
+                f"{outcome.reaped!r} and failed {outcome.failed!r}"
+            )
+        # The first process is this test's own child: wait for it, so
+        # that a zombie does not read as "still running".
+        first.wait(timeout=20)
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if not any(_pid_alive(pid) for pid in (a_pid, b_pid, c_pid)):
+                break
+            time.sleep(0.1)
+        for pid in (a_pid, b_pid, c_pid):
+            assert not _pid_alive(pid), (
+                f"pid {pid} is still running after the sweep"
+            )
+    finally:
+        for pid in pids:
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+        _cleanup(first)

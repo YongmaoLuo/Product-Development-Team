@@ -1078,16 +1078,23 @@ def test_n1_backend_sigkill_orphans_reaped_within_30s(tmp_path):
 
 
 def test_n1_subagent_transcript_stops_growing(tmp_path):
-    """A sub-agent whose parent died stops writing once it is collected.
+    """A sub-agent whose owner died stops writing once it is collected.
 
     The sub-agent writes a line every 0.2 s into its transcript.  While
     it runs, the file grows — that is the clock this control reads.
 
-    Killing the executor (the sub-agent's parent) leaves the sub-agent
-    running: every layer of PDT's tree detaches on purpose, so the
-    parent's death is not the child's death.  What ends it is the
-    collection — and the proof that the collection happened is that the
-    transcript stopped growing.
+    Killing the backend that owns the tree leaves the tree running:
+    every layer of PDT's tree detaches on purpose, so the owner's death
+    is not the children's death.  What ends it is the collection — and
+    the proof that the collection happened is that the transcript
+    stopped growing.
+
+    The owner is what has to die first.  A sweep may not touch the tree
+    of a backend that is still running: a record whose owner is alive
+    and is not being collected by this sweep belongs to somebody else,
+    and the collector is a *different* backend here.  So the scenario
+    starts from the owner being gone — then every record below it is an
+    orphan, and one sweep collects the whole chain.
     """
     plan_id = _plan_id("n1b")
     plans_dir = tmp_path / "plans"
@@ -1113,16 +1120,22 @@ def test_n1_subagent_transcript_stops_growing(tmp_path):
             "control reads is not running"
         )
 
-        # The sub-agent's parent dies.
-        os.kill(pids["executor"], signal.SIGKILL)
+        # The owner dies: the backend that owns the tree is gone.
+        tree.backend.kill()
+        tree.backend.wait(timeout=15)
 
-        # The orphan is still running: the parent's death is not its own.
+        # The orphans are still running: the owner's death is not their
+        # own.
+        assert _ALIVE(pids["executor"]), (
+            "the executor died with the backend that owned it; the whole "
+            "point of the ledger is that it does not"
+        )
         assert _ALIVE(pids["subagent"]), (
-            "the sub-agent died with its parent; the whole point of the "
-            "ledger is that it does not"
+            "the sub-agent died with the backend that owned it; the whole "
+            "point of the ledger is that it does not"
         )
 
-        # The collection is what stops it.
+        # The collection is what stops them.
         run_sweeper(plans_dir, plan_dir, plan_id, marker=tree.marker)
         assert _wait_until_gone([pids["subagent"], pids["tool"]], 30), (
             "the orphaned sub-agent was not collected"
