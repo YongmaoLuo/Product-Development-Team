@@ -25,10 +25,12 @@ What these tests pin
 1. **The card is brief, the archive is complete.**  One round, two
    documents: the question starts with 「【需要你决定】」 and carries no
    CPEA heading at all, while the archive's body carries all five.
-2. **A round without an analysis keeps the fact.**  With no analysis
-   there is no card to draw, so the question is the factual sentence —
-   and the archive keeps that same sentence, so the archive is never
-   empty and never claims an analysis nobody made.
+2. **A round without an analysis keeps the card.**  With no analysis
+   there is nothing to summarise, so the question is the **fallback
+   card** — the same decision shape as the analysis card, with the
+   failed points written out by hand — and the archive keeps that same
+   card, so the archive is never empty and never claims an analysis
+   nobody made.
 
 The rounds below are driven through ``check_cycle_conditions`` — the
 production entry — because that is where the two renderings are chosen.
@@ -319,15 +321,17 @@ def test_question_is_brief_while_the_archive_keeps_cpea(
         )
 
 
-def test_a_round_without_an_analysis_keeps_the_fact_sentence(
+def test_a_round_without_an_analysis_keeps_the_card(
     plan_dir, project_dir, repair_mocks,
 ):
-    """No analysis: no card, and the archive keeps what really happened.
+    """No analysis: the question is the card, and the archive keeps it.
 
     There is nothing to summarise and nothing to report, so the question
-    is the factual sentence and the archive keeps that same sentence.
-    The archive is never empty, and it never claims an analysis nobody
-    made.
+    is the **fallback card** — the same decision shape as the analysis
+    card, with the failed points written out by hand (arch decision
+    point 2).  The archive keeps that same card, so the two documents
+    say the same thing about the same round: the archive is never
+    empty, and it never claims an analysis nobody made.
     """
     orchestrator = _make_orchestrator(
         plan_dir, project_dir, judge=_FakeJudge(None),
@@ -338,13 +342,18 @@ def test_a_round_without_an_analysis_keeps_the_fact_sentence(
 
     assert asked, "the terminal round asked nobody"
     question = asked[-1]
-    assert not question.startswith("【需要你决定】"), (
-        f"a round without an analysis drew a card anyway:\n{question}"
+    assert question.startswith("【需要你决定】"), (
+        f"a round without an analysis did not draw the fallback card:\n"
+        f"{question}"
+    )
+    assert "VP-3 FAILED" in question, (
+        f"the card does not name the failed point:\n{question}"
     )
 
     body = _archive_body(plan_dir)
-    assert "verification round 3 stopped with " in body, (
-        f"the archive does not keep the factual sentence:\n{body}"
+    assert body == question, (
+        "the archive's body is not the card the human was shown:\n"
+        f"{body}\n\n---- the card ----\n{question}"
     )
     for heading in _CPEA_HEADINGS:
         assert heading not in body, (

@@ -220,11 +220,10 @@ class _FakeTriageJudge:
 class _FakeTerminalJudge:
     """The terminal analysis judge -- it finds **no** analysis.
 
-    The question the plan is asked is the **factual** sentence ("which
-    round stopped, why, how many tasks, which checks failed") unless
-    the analysis judge produced a reading of the failure scene; a
-    reading that is not an answer counts as no reading, and the
-    factual sentence stands byte for byte.
+    The question the plan is asked is the **fallback card** (which
+    round stopped, why, which points failed) unless the analysis judge
+    produced a reading of the failure scene; a reading that is not an
+    answer counts as no reading, and the fallback card stands.
 
     This judge is here to pin that fallback down -- the facts must be
     in the question whether or not a model was reachable.  (The
@@ -422,11 +421,11 @@ def test_terminal_round_creates_one_decidable_operator_question(
     机器这一侧的路走完了（两轮修复都没修好同一个失败），该人来看。
     人要看的不是「请人工介入」四个字，而是**能据此决定的事实**：
 
-    * 停在哪一轮（第 3 轮）；
+    * 停在哪一轮（``第 3 轮验证终止``）；
     * 为什么停（``same_failure_repeated_after_max_attempts``）；
-    * 哪个点挂了、挂成什么（``VP-3=FAILED``）；
-    * 这一轮造了几个修复任务（``0 repair task(s)`` —— 终局分支按构造
-      不造任务，所以 0 是事实而不是占位符）。
+    * 哪个点挂了、挂成什么（``VP-3 FAILED``）；
+    * 挂了哪些点写下来了（``失败点：`` —— 没有分析时这张**兜底卡**把
+      挂掉的点逐个列出来，而不是让读卡的人自己去翻报告）。
 
     问题问的是**这个计划**，不是某一个点：终局时该决定「这个计划接下来
     怎么办」的人不是某个点的负责人。
@@ -465,13 +464,13 @@ def test_terminal_round_creates_one_decidable_operator_question(
         f"the question says which round stopped: {request.round!r}"
     )
 
-    # 问题带着四件事实。
+    # 问题带着三件事实。
     question = request.question
-    assert "round 3" in question, f"which round stopped: {question!r}"
+    assert "第 3 轮验证终止" in question, f"which round stopped: {question!r}"
     assert STOP_REASON in question, f"why it stopped: {question!r}"
-    assert "VP-3=FAILED" in question, f"which point failed: {question!r}"
-    assert "0 repair task(s)" in question, (
-        f"how many repair tasks the round produced: {question!r}"
+    assert "VP-3 FAILED" in question, f"which point failed: {question!r}"
+    assert "失败点：" in question, (
+        f"the failed points are written down: {question!r}"
     )
 
     # 两个固定语义的选项，默认项在选项之内。
@@ -601,9 +600,10 @@ def _seed_terminal_decision(plan_id, round_number, *, status="pending",
         vp_id=vp_id,
         round=round_number,
         question=(
-            f"verification round {int(round_number)} stopped with "
-            f"{STOP_REASON}: 0 repair task(s) were generated; "
-            f"failed checks: {VP_ID}=FAILED. Choose how to proceed."
+            f"【需要你决定】第 {int(round_number)} 轮验证终止：{STOP_REASON}\n"
+            f"\n"
+            f"失败点：\n"
+            f"1. {VP_ID} FAILED"
         ),
         options=list(TERMINAL_OPTIONS),
         default_option=TERMINAL_DEFAULT_OPTION,
