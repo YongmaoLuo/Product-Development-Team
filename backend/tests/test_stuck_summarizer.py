@@ -525,3 +525,245 @@ async def test_summarize_vp_result_uses_hard_cap_as_timeout(tmp_path: Path):
     )
     call_kwargs = fake_tool.query_json.call_args.kwargs
     assert call_kwargs["timeout"] == 3600  # HARD_WALL_CLOCK_CAP_SECONDS
+
+# ---------------------------------------------------------------------------
+# 8. Browser methods — the artifact decides, not the (absent) pytest log
+# ---------------------------------------------------------------------------
+#
+# 2026-11-09 (VP-023): a browser walk (``ui_validation`` / ``e2e``) leaves
+# its evidence in ``<evidence_artifact_dir>/checkpoints.json``. There is no
+# pytest run to tee, so the stuck-sub-agent fallback found an empty log and
+# degraded a walk whose every checkpoint had passed into "no test output
+# captured" — the observations were thrown away and a green walk scored
+# zero.
+#
+# The rule is the same all-or-nothing one the in-band path uses
+# (``_compute_puppeteer_verdict``): every checkpoint must be
+# ``passed=true``.
+
+#: The console flow VP-023 walks, as checkpoint data. The selectors and
+#: the texts are the verification point's own acceptance criteria — the
+#: empty-state copy, the page title, the scheduler capacity figures.
+VP023_CONSOLE_FLOW_CHECKPOINTS = [
+    {
+        "selector": "document.title",
+        "expected": "Spec-Driven Dev System",
+        "actual": "Spec-Driven Dev System",
+        "passed": True,
+    },
+    {
+        "selector": "#sidebar",
+        "expected": "visible",
+        "actual": "visible (display=flex)",
+        "passed": True,
+    },
+    {
+        "selector": "#plans-list",
+        "expected": "暂无计划 / 点击「新建计划」开始",
+        "actual": "暂无计划 / 点击「新建计划」开始",
+        "passed": True,
+    },
+    {
+        "selector": "#scheduler-view-capacity-used",
+        "expected": "0",
+        "actual": "0",
+        "passed": True,
+    },
+    {
+        "selector": "#btn-scheduler-back-home",
+        "expected": "clicked; #plans-view visible again",
+        "actual": "clicked; #plans-view visible again",
+        "passed": True,
+    },
+]
+
+
+def _write_checkpoints(artifact_dir: Path, checkpoints: Any) -> Path:
+    """Write the evidence artifact a browser walk is required to leave."""
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    path = artifact_dir / "checkpoints.json"
+    path.write_text(
+        json.dumps({"checkpoints": checkpoints}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _browser_vp(artifact_dir: Path) -> Dict[str, Any]:
+    """A VP node shaped like the console-flow one the framework hands out."""
+    return {
+        "id": "VP-023",
+        "title": "控制台既有用户链路",
+        "verification_method": "e2e",
+        "expected_result": "计划列表渲染与调度视图切换均正常",
+        "test_command": "",
+        "evidence_artifact_dir": str(artifact_dir),
+    }
+
+
+@pytest.mark.asyncio
+async def test_browser_stuck_verdict_is_decided_by_the_checkpoint_artifact(
+    tmp_path: Path,
+):
+    """A walk whose every checkpoint passed is PASSED — decided from the
+    artifact, with no LLM summarizer involved.
+
+    The sub-agent that got stuck never returned a verdict JSON and never
+    produced a pytest log (a browser walk does not run pytest). Its
+    observations live in checkpoints.json, and those observations are
+    what the verification point asked for.
+    """
+    artifact_dir = tmp_path / "vp_artifacts" / "VP-023"
+    path = _write_checkpoints(artifact_dir, VP023_CONSOLE_FLOW_CHECKPOINTS)
+
+    vp = _browser_vp(artifact_dir)
+    log_path = tmp_path / "vp_attempt.log"
+    agent = _make_summarizer_agent()
+
+    fake_tool = MagicMock()
+    fake_tool.query_json.side_effect = AssertionError(
+        "the artifact decides; the summarizer must NOT call the LLM"
+    )
+
+    verdict = await agent._summarize_vp_result(
+        vp_node=vp,
+        output_file=str(tmp_path / "no_such_pytest.log"),
+        coding_tool=fake_tool,
+        log_path=log_path,
+    )
+    assert verdict.verdict == "PASSED"
+    assert str(path) in verdict.reasons[0]
+    fake_tool.query_json.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_browser_stuck_verdict_names_the_failed_checkpoint(
+    tmp_path: Path,
+):
+    """One failed checkpoint is a FAILED that names the selector and the
+    expectation that was not met — not a generic "no output"."""
+    artifact_dir = tmp_path / "vp_artifacts" / "VP-023"
+    checkpoints = [dict(c) for c in VP023_CONSOLE_FLOW_CHECKPOINTS]
+    checkpoints[3] = dict(checkpoints[3], passed=False, actual="—")
+    path = _write_checkpoints(artifact_dir, checkpoints)
+
+    vp = _browser_vp(artifact_dir)
+    agent = _make_summarizer_agent()
+    fake_tool = MagicMock()
+
+    verdict = await agent._summarize_vp_result(
+        vp_node=vp,
+        output_file=str(tmp_path / "no_such_pytest.log"),
+        coding_tool=fake_tool,
+        log_path=tmp_path / "vp_attempt.log",
+    )
+    assert verdict.verdict == "FAILED"
+    joined = " ".join(verdict.reasons)
+    assert "#scheduler-view-capacity-used" in joined
+    assert str(path) in joined
+
+
+@pytest.mark.asyncio
+async def test_browser_stuck_verdict_names_the_missing_artifact(
+    tmp_path: Path,
+):
+    """A missing artifact is a FAILED that NAMES THE ARTIFACT.
+
+    It must not claim that a test log was read — a browser walk never
+    produces one, and the old wording ("no test output captured") sent
+    the reader looking for a pytest run that did not exist.
+    """
+    artifact_dir = tmp_path / "vp_artifacts" / "VP-023"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    expected_path = artifact_dir / "checkpoints.json"
+
+    vp = _browser_vp(artifact_dir)
+    agent = _make_summarizer_agent()
+    fake_tool = MagicMock()
+
+    verdict = await agent._summarize_vp_result(
+        vp_node=vp,
+        output_file=str(tmp_path / "no_such_pytest.log"),
+        coding_tool=fake_tool,
+        log_path=tmp_path / "vp_attempt.log",
+    )
+    assert verdict.verdict == "FAILED"
+    joined = " ".join(verdict.reasons)
+    assert str(expected_path) in joined
+    assert "no test output captured" not in joined
+    # The wording must not claim a test log was read. The path is
+    # stripped first: pytest's own tmp_path contains the word.
+    wording = joined.replace(str(expected_path), "")
+    assert "pytest" not in wording.lower()
+
+
+@pytest.mark.asyncio
+async def test_browser_stuck_verdict_names_a_malformed_artifact(
+    tmp_path: Path,
+):
+    """A malformed artifact is a FAILED that names the artifact path."""
+    artifact_dir = tmp_path / "vp_artifacts" / "VP-023"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    path = artifact_dir / "checkpoints.json"
+    path.write_text("{not json at all", encoding="utf-8")
+
+    vp = _browser_vp(artifact_dir)
+    agent = _make_summarizer_agent()
+    fake_tool = MagicMock()
+
+    verdict = await agent._summarize_vp_result(
+        vp_node=vp,
+        output_file=str(tmp_path / "no_such_pytest.log"),
+        coding_tool=fake_tool,
+        log_path=tmp_path / "vp_attempt.log",
+    )
+    assert verdict.verdict == "FAILED"
+    joined = " ".join(verdict.reasons)
+    assert str(path) in joined
+    # The wording must not claim a test log was read. The path is
+    # stripped first: pytest's own tmp_path contains the word.
+    wording = joined.replace(str(path), "")
+    assert "pytest" not in wording.lower()
+
+
+@pytest.mark.asyncio
+async def test_browser_stuck_verdict_rejects_an_empty_checkpoint_list(
+    tmp_path: Path,
+):
+    """An artifact with no checkpoints carries no evidence — FAILED, named."""
+    artifact_dir = tmp_path / "vp_artifacts" / "VP-023"
+    path = _write_checkpoints(artifact_dir, [])
+
+    vp = _browser_vp(artifact_dir)
+    agent = _make_summarizer_agent()
+
+    verdict = await agent._summarize_vp_result(
+        vp_node=vp,
+        output_file=str(tmp_path / "no_such_pytest.log"),
+        coding_tool=MagicMock(),
+        log_path=tmp_path / "vp_attempt.log",
+    )
+    assert verdict.verdict == "FAILED"
+    assert str(path) in " ".join(verdict.reasons)
+
+
+def test_browser_templates_state_the_evidence_and_progress_contract():
+    """The browser templates must say the three things a stuck walk needs.
+
+    2026-11-09 (VP-023): the sub-agent wrote its checkpoints at the very
+    end of the walk, never appended a line to the progress log the
+    framework reads, and spent the rest of its budget on optional
+    corroboration instead of returning the verdict. All three are
+    template-level instructions, so they belong in the template.
+    """
+    from verification_subagent import MethodTemplateRegistry
+
+    for method in ("e2e", "ui_validation"):
+        template = MethodTemplateRegistry.get_template(method)
+        # 1. the artifact is written incrementally, not at the end
+        assert "checkpoints.json" in template, method
+        assert "incrementally" in template.lower(), method
+        # 2. one progress-log line per checkpoint
+        assert "/tmp/vp_<id>_progress.log" in template, method
+        # 3. the verdict comes back as soon as the checkpoints are in
+        assert "return the verdict JSON" in template, method

@@ -188,3 +188,23 @@ CLAUDE.md
 # history of every commit that carried it, and clearing that is a history
 # rewrite, which is a separate decision with a separate owner.
 KEYCHAIN_STRICT_LANE_RECORD.md
+
+# PDT 运行期要求文件（部署级）。
+#
+# PDT.md 家族由操作者在本机填写，写满 provider 选择、额度与目录约定 ——
+# 对这台机器是对的，对公开仓是错的：一次 `git add -A` 就能把它们提交进去。
+# 所以这里把 base 层（PDT.md）与三个 stage 层（PDT.<stage>.md）一起挡住。
+#
+# 样例不受影响：它们在 example/ 下且以 .example 结尾，两条规则都匹配不到，
+# 所以新部署者拿得到起点模板。机制文档 docs/development/pdt-requirements.md
+# 同样匹配不到。
+PDT.md
+PDT.*.md
+
+# 防止 `git diff` 的输出被当成源码入库。
+#
+# 事故形态：有人把 `git diff > <文件名>` 的重定向目标当作真实文件提交了，
+# 于是仓里多出一份内容是裸 unified diff 的"源码文件"（本分支曾出现过
+# `backend/coding_tool.py  (diff vs HEAD~1)`）。文件名里带 "(diff vs "
+# 的路径永远不是源码，挡住它就不会再被 `git add -A` 带进索引。
+*(diff vs *

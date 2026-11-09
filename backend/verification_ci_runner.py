@@ -1057,10 +1057,15 @@ def validate_vp(
     if require_single_entry:
         operators = compound_operators(entry)
         if operators:
+            # 身份必须是**机器写的**：形态违规只有一条「detail」散文时，
+            # 指纹分不出「哪种操作符」这一类缺陷与「哪一条入口」这一条缺陷
+            # —— 循环于是把两者混成一次「根因演进」。
             issues.append(SchemaIssue(
                 vp_id,
                 f"{CI_ENTRY_FIELD} 含 shell 操作符（{', '.join(operators)}）："
                 f"整仓门禁必须由项目适配脚本执行，不能是内联复合命令",
+                code="ci_entry_compound",
+                subject=",".join(operators),
             ))
             return issues
 

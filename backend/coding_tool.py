@@ -43,6 +43,11 @@ from config_paths import resolve_plans_dir
 # Sub-agent sandbox wrapping (2026-10-06). Dependency-free (stdlib only)
 # and it imports nothing from this module, so a top-level import is safe.
 import claude_sandbox
+# 2026-11-04 — the deployment-level operator requirements (``PDT.md``
+# family).  Dependency-free at module scope (stdlib only); it reaches for
+# ``server`` lazily *inside* a function, so a top-level import here carries
+# no cycle risk even though ``server`` imports this module.
+import pdt_requirements
 # Capacity gating for scene-routed dispatch (2026-09-17). This module is
 # dependency-free (stdlib only), so a top-level import carries no cycle
 # risk — unlike ``provider_routing`` / ``provider_order``, which pull in
@@ -2133,6 +2138,90 @@ class CodingTool(ABC):
             AI response as dict
         """
         pass
+
+    def _apply_pdt_requirements(
+        self,
+        system_instruction: Optional[str],
+        scene: Optional[str] = None,
+    ) -> Optional[str]:
+        """把部署级「操作者要求」注入到 system 提示的**最前**。
+
+        统一入口：四个实现（Claude / Vendor C 的 ``query`` 与
+        ``query_json``）都走这里，所以"注进去的那块"在任何一条路径上都是
+        同一块 —— 逐个实现各写一遍，迟早有一处漏。
+
+        scene 的取法：**per-call scene 优先**，否则回落到实例上的
+        ``self.scene``，两者都没有时按 base 层注入（未知 scene 只吃 base，
+        不报错）。Vendor C 没有 per-call scene 形参（签名不许变），所以它
+        只读实例值。
+
+        没有生效的要求文件时逐字节原样返回入参 —— 机制在没有要求文件时
+        不该在 system 提示上留下任何痕迹，连一个多余换行都不加。
+        """
+        effective_scene = scene if scene is not None else getattr(self, "scene", None)
+        return pdt_requirements.inject(system_instruction, effective_scene)
+
+    @staticmethod
+    def _estimate_tokens(text: Optional[str]) -> int:
+        """Roughly estimate token count from text length.
+
+        Uses a blended heuristic: English ~4 chars/token, CJK ~1.5 chars/token.
+        Falls back to len/3 for mixed content. This is intentionally fast
+        (no tiktoken dependency) and good enough for log diagnostics.
+
+        2026-11-04 — 从 ``ClaudeCodingTool`` 上移到基类：日志钩子是所有
+        provider 共用的观测点，长在子类上就别家 provider 用不了。
+        """
+        if not text:
+            return 0
+        # Fast heuristic: average ~3 chars per token for mixed content
+        return max(1, len(text) // 3)
+
+    def _log_query_context(self, prompt: str, system_instruction: Optional[str],
+                          phase: str = "query", scene: Optional[str] = None) -> None:
+        """Log prompt + system context size in tokens for diagnostics.
+
+        2026-11-04 — 从 ``ClaudeCodingTool`` 上移到基类，并带上**本轮生效的
+        要求文件**。
+
+        为什么上移：可见性是每个 provider 都需要的观测点，日志钩子原先只长
+        在 ``ClaudeCodingTool`` 上 —— 别家 provider 想记同一件事就得再复制
+        一遍，复制出来的版本迟早漏字段。
+
+        为什么带 scene：注入用的是**本轮**的 scene。日志里的哈希必须与真正
+        注入的那一块一致，否则"可见性"只是看着像可见。取法与注入一致：
+        per-call scene 优先，否则回落到实例上的 ``self.scene``；基类没有
+        ``scene`` 属性，所以用 ``getattr`` 回落而不是直接 ``self.scene``。
+
+        没有生效的要求文件时**不写**那两个键 —— 不写一对空值，因为空值会被
+        读成"生效了，只是空的"。
+        """
+        logger = getattr(self, "logger", None)
+        if not logger:
+            return
+        prompt_tokens = self._estimate_tokens(prompt)
+        sys_tokens = self._estimate_tokens(system_instruction)
+        total_tokens = prompt_tokens + sys_tokens
+        data = {
+            "phase": phase,
+            "prompt_tokens_est": prompt_tokens,
+            "system_tokens_est": sys_tokens,
+            "total_tokens_est": total_tokens,
+            "prompt_chars": len(prompt),
+            "system_chars": len(system_instruction) if system_instruction else 0,
+        }
+
+        effective_scene = scene if scene is not None else getattr(self, "scene", None)
+        described = pdt_requirements.describe(effective_scene)
+        if described:
+            data["pdt_requirements_files"] = described.get("files", [])
+            data["pdt_requirements_sha256"] = described.get("sha256", "")
+
+        logger.info(
+            f"coding_{phase}_context",
+            f"Context size: prompt={prompt_tokens} sys={sys_tokens} total={total_tokens} tokens (~{len(prompt)} chars)",
+            data=data,
+        )
 
 
 #: HTTP-ish statuses that mean "this provider cannot serve the call right
@@ -6760,18 +6849,9 @@ class ClaudeCodingTool(CodingTool):
 
         return result_text, resolved_session_id, result_meta
 
-    @staticmethod
-    def _estimate_tokens(text: Optional[str]) -> int:
-        """Roughly estimate token count from text length.
-
-        Uses a blended heuristic: English ~4 chars/token, CJK ~1.5 chars/token.
-        Falls back to len/3 for mixed content. This is intentionally fast
-        (no tiktoken dependency) and good enough for log diagnostics.
-        """
-        if not text:
-            return 0
-        # Fast heuristic: average ~3 chars per token for mixed content
-        return max(1, len(text) // 3)
+    # 2026-11-04 — ``_estimate_tokens`` 与 ``_log_query_context`` 上移到
+    # ``CodingTool`` 基类（可见性是四个 provider 共用的观测点）。继承而来，
+    # 既有调用语法不变。
 
     def _compact_prompt(self, prompt: str, system_instruction: Optional[str] = None) -> str:
         """Compress prompt to stay under MAX_PROMPT_TOKENS.
@@ -6881,27 +6961,6 @@ class ClaudeCodingTool(CodingTool):
                 data={"after_tokens": total_tokens, "files_truncated": files_truncated, "files_dropped": files_dropped},
             )
         return compacted
-
-    def _log_query_context(self, prompt: str, system_instruction: Optional[str],
-                          phase: str = "query") -> None:
-        """Log prompt + system context size in tokens for diagnostics."""
-        if not self.logger:
-            return
-        prompt_tokens = self._estimate_tokens(prompt)
-        sys_tokens = self._estimate_tokens(system_instruction)
-        total_tokens = prompt_tokens + sys_tokens
-        self.logger.info(
-            f"coding_{phase}_context",
-            f"Context size: prompt={prompt_tokens} sys={sys_tokens} total={total_tokens} tokens (~{len(prompt)} chars)",
-            data={
-                "phase": phase,
-                "prompt_tokens_est": prompt_tokens,
-                "system_tokens_est": sys_tokens,
-                "total_tokens_est": total_tokens,
-                "prompt_chars": len(prompt),
-                "system_chars": len(system_instruction) if system_instruction else 0,
-            },
-        )
 
     def _graceful_shutdown(self, process: subprocess.Popen) -> None:
         """Three-phase shutdown: stdin EOF → wait → SIGTERM group → SIGKILL group.
@@ -8079,6 +8138,14 @@ class ClaudeCodingTool(CodingTool):
             scene: Optional per-call workflow scene override for provider
                    routing (e.g. ``"refiner"`` → high-tier chain).
         """
+        # 2026-11-04 — the deployment-level operator requirements go in
+        # FIRST, before anything in this method can return.  The scripted
+        # early-return below spends no provider call, but the block still
+        # has to be there: a scripted run and a live run must see the same
+        # requirements, or the requirement's reach depends on which mode
+        # the deployment happens to be in.
+        system_instruction = self._apply_pdt_requirements(system_instruction, scene)
+
         # 2026-10-24 — the scripted double answers from a fixture file.
         # Checked FIRST, before any part of the dispatch can spend a real
         # provider call: in scripted mode the CLI is never spawned.  An
@@ -8098,7 +8165,9 @@ class ClaudeCodingTool(CodingTool):
 
         start_time = time.monotonic()
         prompt_len = len(prompt) if prompt else 0
-        self._log_query_context(prompt, system_instruction, phase="query")
+        # 2026-11-04 — 把**本轮**的 scene 原样交给日志：注入用的是这个 scene，
+        # 日志里的哈希必须跟真正注入的那块一致，否则可见性就成了假象。
+        self._log_query_context(prompt, system_instruction, phase="query", scene=scene)
 
         # 2026-09-13: per-call model_type no longer swaps the model —
         # model management is delegated to CC Switch. The scene kwarg
@@ -8138,6 +8207,11 @@ class ClaudeCodingTool(CodingTool):
         and an empty collection both mean "exclude nobody" — the
         behaviour every existing caller sees.
         """
+        # 2026-11-04 — the deployment-level operator requirements go in
+        # FIRST, before anything in this method can return — see the
+        # note in ``query``.
+        system_instruction = self._apply_pdt_requirements(system_instruction, scene)
+
         # 2026-10-24 — the scripted double answers from a fixture file.
         # Checked FIRST, before any part of the dispatch can spend a real
         # provider call: in scripted mode the CLI is never spawned.  The
@@ -8204,7 +8278,8 @@ class ClaudeCodingTool(CodingTool):
                 session_handle.session_id = sid
 
         start_time = time.monotonic()
-        self._log_query_context(prompt, system_instruction, phase="query_json")
+        # 2026-11-04 — 同 ``query``：本轮的 scene 原样传给日志。
+        self._log_query_context(prompt, system_instruction, phase="query_json", scene=scene)
 
         # Compact prompt before sending to prevent context overflow
         compacted_prompt = self._compact_prompt(prompt, system_instruction)
@@ -8860,8 +8935,14 @@ class ClaudeCodingTool(CodingTool):
 class VendorCCodingTool(CodingTool):
     """Vendor C Code CLI tool — runs `vendor-c -y -p <prompt>`."""  # kebab-case test_provider marker
 
-    def __init__(self, model: Optional[str] = None):
+    def __init__(self, model: Optional[str] = None, scene: Optional[str] = None):
         self.model = model
+        # 2026-11-04 — the scene this instance belongs to.  Vendor C has
+        # no per-call ``scene`` parameter (its entry signatures are not
+        # allowed to change), so the instance value is the only place the
+        # scene can come from — which is why ``create_coding_tool`` has to
+        # forward it instead of dropping it.
+        self.scene = scene
 
     def _run_vendor_c(self, prompt: str, system_instruction: Optional[str] = None) -> str:  # kebab-case test_provider marker
         import re
@@ -8887,6 +8968,12 @@ class VendorCCodingTool(CodingTool):
 
     def query(self, prompt: str, system_instruction: Optional[str] = None,
               retries: int = 3, timeout: Optional[int] = None) -> str:
+        # 2026-11-04 — the deployment-level operator requirements go in
+        # FIRST, before anything in this method can return.  The closure
+        # below captures ``system_instruction`` late-bound, so it picks up
+        # the injected value.
+        system_instruction = self._apply_pdt_requirements(system_instruction)
+
         def _query_internal():
             return self._run_vendor_c(prompt, system_instruction)  # kebab-case test_provider marker
 
@@ -8950,6 +9037,11 @@ class VendorCCodingTool(CodingTool):
 
     def query_json(self, prompt: str, system_instruction: Optional[str] = None,
                    retries: int = 3, timeout: Optional[int] = None) -> dict:
+        # 2026-11-04 — the deployment-level operator requirements go in
+        # FIRST, before anything in this method can return — see the note
+        # in ``query``.
+        system_instruction = self._apply_pdt_requirements(system_instruction)
+
         json_prompt = prompt + "\n\nIMPORTANT: Return ONLY the JSON object requested, no markdown fencing."
 
         def _query_json_internal():
@@ -8998,8 +9090,13 @@ class VendorCCodingTool(CodingTool):
 class OpenCodeCodingTool(CodingTool):
     """OpenCode AI coding tool using opencode CLI."""
 
-    def __init__(self):
-        pass
+    def __init__(self, scene: Optional[str] = None):
+        # 2026-11-04 — the scene this instance belongs to.  OpenCode's
+        # entry signatures are not allowed to change (they have no per-call
+        # ``scene`` parameter), so the instance value is the only place the
+        # scene can come from — which is why ``create_coding_tool`` has to
+        # forward it instead of dropping it.
+        self.scene = scene
 
     def _run_opencode(self, prompt: str) -> str:
         """Run opencode CLI."""
@@ -9016,6 +9113,12 @@ class OpenCodeCodingTool(CodingTool):
     def query(self, prompt: str, system_instruction: Optional[str] = None,
               retries: int = 3, timeout: Optional[int] = None) -> str:
         """Query OpenCode AI."""
+        # 2026-11-04 — the deployment-level operator requirements go in
+        # FIRST, before anything in this method can return — see the note
+        # in ``VendorCCodingTool.query``.  OpenCode has no per-call
+        # ``scene`` parameter, so the instance value is what gets used.
+        system_instruction = self._apply_pdt_requirements(system_instruction)
+
         def _query_internal():
             full_prompt = prompt
             if system_instruction:
@@ -9063,6 +9166,10 @@ class OpenCodeCodingTool(CodingTool):
     def query_json(self, prompt: str, system_instruction: Optional[str] = None,
                  retries: int = 3, timeout: Optional[int] = None) -> dict:
         """Query OpenCode AI and expect JSON response."""
+        # 2026-11-04 — the deployment-level operator requirements go in
+        # FIRST, before anything in this method can return — see the note
+        # in ``query``.
+        system_instruction = self._apply_pdt_requirements(system_instruction)
 
         def _query_json_internal():
             full_prompt = prompt
@@ -9346,6 +9453,13 @@ class ScriptedCodingTool(CodingTool):
         self.settings = None
         self.hook_stdin = {}
         self.current_call_model = None
+        # 2026-11-04 — the system instruction the double was **told**, i.e.
+        # after the deployment requirements have been injected into it.
+        # The double has no provider to observe, so this attribute is the
+        # only window into what the model would have seen; it is the
+        # assertion surface for the injection mechanism under scripted
+        # mode.  ``None`` until the first call.
+        self.last_system_instruction: Optional[str] = None
 
     def query(self, prompt: str, system_instruction: Optional[str] = None,
               retries: int = 3, timeout: Optional[int] = None,
@@ -9356,6 +9470,15 @@ class ScriptedCodingTool(CodingTool):
         The keyword surface matches ``ClaudeCodingTool.query``, so a
         caller cannot tell the two apart by the call it makes.
         """
+        # 2026-11-04 — the deployment-level operator requirements go in
+        # FIRST, before the answer is read — see the note in
+        # ``VendorCCodingTool.query``.  A scripted run must see the same
+        # requirements a live run would, or the requirement's reach would
+        # depend on which mode the deployment happens to be in.
+        system_instruction = self._apply_pdt_requirements(system_instruction, scene)
+        # 2026-11-04 — recorded **after** the injection: what is recorded
+        # has to be what the model would have been told.
+        self.last_system_instruction = system_instruction
         return self.registry.response(prompt)
 
     def query_json(self, prompt: str, system_instruction: Optional[str] = None,
@@ -9378,6 +9501,11 @@ class ScriptedCodingTool(CodingTool):
         that passes it from blowing up on the double instead of on the
         answer.
         """
+        # 2026-11-04 — the injection happens first and the result is
+        # recorded, so ``query_json`` observes the same thing ``query``
+        # does — see the note in ``query``.
+        system_instruction = self._apply_pdt_requirements(system_instruction, scene)
+        self.last_system_instruction = system_instruction
         from utils.json_repair import parse_llm_json
         return parse_llm_json(self.registry.response(prompt))
 
@@ -9402,7 +9530,8 @@ def create_coding_tool(tool_type: Optional[str] = None, cwd: Optional[str] = Non
         cwd: Working directory for the tool.
         logger: Optional logger for structured logging.
         scene: Workflow scene for provider routing (2026-09-13). Forwarded
-            to ``ClaudeCodingTool``; ignored by the vendor-c/opencode branches.
+            to ``ClaudeCodingTool`` and (2026-11-04) to
+            ``VendorCCodingTool`` and ``OpenCodeCodingTool``.
 
         In scripted mode (``PDT_LLM_MODE=scripted``) the strict double
         replaces the tool entirely: the scripted mode answers every LLM
@@ -9420,9 +9549,17 @@ def create_coding_tool(tool_type: Optional[str] = None, cwd: Optional[str] = Non
         tool_type = os.environ.get("PDT_DEFAULT_CODING_TOOL", "claude").lower()
 
     if tool_type == "vendor-c":  # kebab-case test_provider marker
-        return VendorCCodingTool()
+        # 2026-11-04 — the scene used to be dropped here.  Vendor C has no
+        # per-call ``scene`` parameter, so the instance value is the only
+        # place it can live; dropping it made the vendor-c path the one
+        # provider that never saw the deployment's requirements.
+        return VendorCCodingTool(scene=scene)
     elif tool_type == "opencode":
-        return OpenCodeCodingTool()
+        # 2026-11-04 — the scene used to be dropped here.  OpenCode has no
+        # per-call ``scene`` parameter, so the instance value is the only
+        # place it can live; dropping it made the opencode path the one
+        # provider that never saw the deployment's requirements.
+        return OpenCodeCodingTool(scene=scene)
     else:
         return ClaudeCodingTool(cwd=cwd, logger=logger, scene=scene)
 
