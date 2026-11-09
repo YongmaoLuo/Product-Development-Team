@@ -63,7 +63,7 @@ from test_command_quality import (
     inspect_command,
 )
 from verification_cancel import VerificationCancelled
-from test_command_rules import derive_files_to_modify
+from test_command_rules import derive_files_to_modify, paths_named_by_command
 from verification_persistence import VerificationPersistenceManager
 
 
@@ -1949,6 +1949,13 @@ class RepairTaskAssembler:
                 failed_vp_id, content,
             )
             files_to_modify = self._resolve_files_to_modify(content)
+            # The command and the scope have to agree — see
+            # :meth:`_reconcile_command_scope`.  This runs *before* the
+            # empty-scope gate below, and it deliberately leaves an empty
+            # declaration empty, so that gate still refuses the row.
+            files_to_modify, test_command = self._reconcile_command_scope(
+                content, test_command, files_to_modify,
+            )
 
             # --------------------------------------------------------------
             # 2026-10-11 generation-time gates. Both run BEFORE ``emitted_seq``
@@ -2432,6 +2439,98 @@ class RepairTaskAssembler:
         against the plan's constraints.
         """
         return normalise_declared_files(content.get("files_to_modify"))
+
+    def _reconcile_command_scope(
+        self,
+        content: Dict[str, Any],
+        test_command: str,
+        files_to_modify: Optional[List[str]],
+    ) -> Tuple[Optional[List[str]], str]:
+        """``(files_to_modify, test_command)`` with the two sides in step.
+
+        A repair task carries a command and a file scope, and the two
+        have to agree.  The command is what proves the repair worked —
+        it is the objective signal the completion gate re-runs — and the
+        scope is what that gate compares the actual changes against
+        (``agent.excess_declared_paths``).  When the command names a
+        file the scope does not cover, a repair that touched that file
+        is judged an *undeclared write* and the task fails for the
+        wrong reason: the repair was right and the declaration was
+        short.
+
+        **The strategy is to merge** — the paths the command names are
+        appended to the declaration, and the command itself is left
+        exactly as it is (material R2, option 1).  The two alternatives
+        were worse:
+
+        * *Rewriting the command* would replace the objective signal
+          with one the generator made up.  The command is the proof
+          that the deviation is gone; a task whose acceptance criterion
+          was invented by the generator proves nothing.
+        * *Refusing the task* would drop a repair that is perfectly
+          repairable, because the two sides disagreed about a file name
+          — not because the repair was impossible.
+
+        Merging keeps both properties that matter: the command stays
+        the proof, and the declaration covers the files the proof runs
+        on.
+
+        What is merged is what
+        :func:`test_command_rules.paths_named_by_command` reports — the
+        repo-relative source files the command names, with the
+        read-only allow-list already applied (the entry script a
+        command merely *runs* is not a file the task has to change).
+        Those paths are reported as the command wrote them: no ``cd`` is
+        resolved, and the paths are not checked against the filesystem.
+
+        A path the declaration already carries is not added twice; the
+        comparison normalises a leading ``./``, so ``./a.py`` and
+        ``a.py`` are one path.  The declaration itself is left as it
+        was written — rewriting it is not this rule's business.
+
+        Three cases leave the scope exactly as it was:
+
+        * **No workspace.**  The plan's execution row is what says where
+          the repair runs (:meth:`_resolve_task_project_dir`); without
+          it there is no repository the command's paths could be read
+          against, and the scope is left alone rather than guessed at.
+        * **No command, or a command that names no source file.**
+          There is nothing to merge.
+        * **Nothing declared.**  An empty scope is "scope unknown", and
+          the assembler refuses such a task
+          (``dropped_empty_files_to_modify``).  Widening it from the
+          command would replace that refusal with a scope that names
+          only the file the command runs — narrower than what the
+          repair has to change, and a scope the undeclared-write gate
+          would then hold the repair to.
+        """
+        declared = (
+            None if files_to_modify is None
+            else normalise_declared_files(files_to_modify)
+        )
+        if not self._resolve_task_project_dir(content):
+            return declared, test_command
+        if not declared:
+            return declared, test_command
+        command = str(test_command or "").strip()
+        if not command:
+            return declared, test_command
+        command_paths = paths_named_by_command(command)
+        if not command_paths:
+            return declared, test_command
+        declared_keys = {_declared_scope_key(path) for path in declared}
+        missing = [
+            path for path in command_paths
+            if _declared_scope_key(path) not in declared_keys
+        ]
+        if not missing:
+            return declared, test_command
+        merged = list(declared) + missing
+        print(
+            "[Repair] Declaring the paths the acceptance command needs: "
+            + ", ".join(missing)
+        )
+        return merged, test_command
 
     def _fallback_description(
         self, failed_vp_id: str, vp_plan: Dict[str, Any]
@@ -3531,6 +3630,18 @@ def normalise_declared_files(raw: Any) -> List[str]:
         if path not in cleaned:
             cleaned.append(path)
     return cleaned
+
+
+def _declared_scope_key(path: str) -> str:
+    """The key a declared path is compared under.
+
+    ``./a.py`` and ``a.py`` are the same path.  The paths a command
+    names never carry a leading ``./`` — ``paths_named_by_command``
+    normalises it away — so the declared side has to be normalised the
+    same way before the two are compared, or one path would be declared
+    twice under two spellings.
+    """
+    return path[2:] if path.startswith("./") else path
 
 
 def _constraint_sentences(texts: Any) -> List[str]:
