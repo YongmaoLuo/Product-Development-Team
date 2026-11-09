@@ -17,7 +17,7 @@ import logging
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Mapping, Optional, List, Dict, Any, Set, Union
+from typing import Mapping, Optional, List, Dict, Any, Set, Union, Iterable
 
 # Module-level logger — surfaces provider-fallback resolution to
 # backend.log (or any Python logging handler). Distinct from
@@ -1475,6 +1475,273 @@ def _declared_modification_files(task) -> Optional[list[str]]:
     ):
         return None
     return list(files)
+
+
+#: Directory prefixes that hold runtime artefacts rather than task
+#: deliverables: plan bookkeeping, scratch space, PDT's own state. A
+#: task that writes one of these is not making an undeclared write — it
+#: is doing what the runtime always does. Flagging them would make the
+#: gate fire on the runtime's own bookkeeping, and a gate that always
+#: fires is a gate that gets switched off.
+_RUNTIME_ARTIFACT_PREFIXES = ("plans/", "tmp/", ".pdt/")
+
+#: File suffixes that mark runtime artefacts whatever directory they
+#: live in.
+_RUNTIME_ARTIFACT_SUFFIXES = (".lock", ".log")
+
+
+def _normalise_repo_path(path: str) -> str:
+    """Repo-relative POSIX form of ``path``.
+
+    ``./a.py`` and ``a.py`` are the same file, and a path that came
+    back from a shell on the other side of a Windows-style separator
+    arrives with ``\\`` in it. Both spellings have to land on the same
+    key, or the comparison against the declaration compares strings
+    instead of files.
+    """
+    if not isinstance(path, str):
+        return ""
+    norm = path.strip().replace("\\", "/")
+    while norm.startswith("./"):
+        norm = norm[2:]
+    return norm
+
+
+def _is_runtime_artifact(path: str) -> bool:
+    """Whether ``path`` is a runtime artefact rather than a deliverable."""
+    norm = _normalise_repo_path(path)
+    if not norm:
+        return False
+    if norm.startswith(_RUNTIME_ARTIFACT_PREFIXES):
+        return True
+    return norm.endswith(_RUNTIME_ARTIFACT_SUFFIXES)
+
+
+# ---------------------------------------------------------------------------
+# Reading HEAD without starting a process
+# ---------------------------------------------------------------------------
+#
+# The undeclared-write gate takes a baseline before every attempt, and it
+# used to take it with ``git rev-parse HEAD`` — a subprocess.  A quota
+# park is a path that must start NO subprocess (a park waits and stops;
+# it does not spawn), and the baseline is taken on that path, so the
+# read has to happen in pure Python.
+#
+# The layout this has to understand:
+#
+#   <repo>/.git/            a normal repository — ``.git`` is a
+#                           DIRECTORY and ``HEAD`` lives inside it
+#   <repo>/.git             a linked worktree — ``.git`` is a FILE whose
+#                           content is ``gitdir: <path>``, and that path
+#                           is ``<main>/.git/worktrees/<name>``
+#   <gitdir>/commondir      a worktree's pointer back to the main
+#                           repository (``../..``): the REFS live there,
+#                           while ``HEAD`` lives in the worktree's own
+#                           gitdir
+#
+# Anything unreadable, missing, or not shaped like a commit id answers
+# ``""`` — the same answer the old subprocess path gave when git failed,
+# and the answer every caller already knows how to handle.
+
+_GIT_SHA_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def _read_git_text(path: str) -> str:
+    """The content of ``path``, or ``""`` when it cannot be read."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    except Exception:
+        return ""
+
+
+def _git_sha(value: str) -> str:
+    """``value`` when it is a commit id, ``""`` otherwise."""
+    text = (value or "").strip()
+    if _GIT_SHA_RE.fullmatch(text):
+        return text
+    return ""
+
+
+def _resolve_git_dir(start: str) -> str:
+    """The git directory of the repository that contains ``start``.
+
+    "" when there is none — not a repository, or a ``.git`` that points
+    at something unreadable.
+    """
+    current = os.path.abspath(str(start))
+    while True:
+        candidate = os.path.join(current, ".git")
+        if os.path.isdir(candidate):
+            return candidate
+        if os.path.isfile(candidate):
+            content = _read_git_text(candidate).strip()
+            if not content.startswith("gitdir:"):
+                return ""
+            target = content[len("gitdir:"):].strip()
+            if not target:
+                return ""
+            if not os.path.isabs(target):
+                target = os.path.join(current, target)
+            return os.path.normpath(target)
+        parent = os.path.dirname(current)
+        if parent == current:
+            return ""
+        current = parent
+
+
+def _git_common_dir(git_dir: str) -> str:
+    """Where the refs live for the repository at ``git_dir``.
+
+    A worktree keeps its own ``HEAD`` but shares the refs with the main
+    repository; the ``commondir`` file says where that is.  Without the
+    file the git directory IS the common directory.
+    """
+    content = _read_git_text(os.path.join(git_dir, "commondir")).strip()
+    if not content:
+        return git_dir
+    if not os.path.isabs(content):
+        content = os.path.join(git_dir, content)
+    return os.path.normpath(content)
+
+
+def _read_packed_ref(refs_root: str, ref: str) -> str:
+    """The commit id ``ref`` has in the packed table, or ``""``."""
+    packed = os.path.join(refs_root, "packed-refs")
+    try:
+        with open(packed, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#") or line.startswith("^"):
+                    continue
+                parts = line.split(None, 1)
+                if len(parts) != 2:
+                    continue
+                sha, name = parts
+                if name.strip() != ref:
+                    continue
+                return _git_sha(sha)
+    except Exception:
+        return ""
+    return ""
+
+
+def _read_ref(refs_root: str, ref: str, depth: int = 5) -> str:
+    """The commit id ``ref`` points at, or ``""``.
+
+    A loose ref first (``<refs_root>/<ref>``), then the packed table
+    (``<refs_root>/packed-refs``) — the order git reads them in.  A ref
+    that is itself symbolic (``ref: refs/heads/other``) is followed.
+    """
+    if depth <= 0 or not ref:
+        return ""
+    content = _read_git_text(os.path.join(refs_root, ref)).strip()
+    if content.startswith("ref:"):
+        return _read_ref(refs_root, content[len("ref:"):].strip(), depth - 1)
+    sha = _git_sha(content)
+    if sha:
+        return sha
+    return _read_packed_ref(refs_root, ref)
+
+
+def _read_git_head_sha(repo_dir) -> str:
+    """The commit id ``HEAD`` points at in ``repo_dir``, or ``""``.
+
+    Pure Python — no subprocess — so a path that must not spawn can
+    still ask for the baseline.
+    """
+    try:
+        git_dir = _resolve_git_dir(str(repo_dir))
+        if not git_dir:
+            return ""
+        common_dir = _git_common_dir(git_dir)
+        head = _read_git_text(os.path.join(git_dir, "HEAD")).strip()
+        if not head:
+            return ""
+        if head.startswith("ref:"):
+            return _read_ref(common_dir, head[len("ref:"):].strip())
+        return _git_sha(head)
+    except Exception:
+        return ""
+
+
+class _DeclaredFilesView:
+    """Stand-in task object exposing only ``files_to_modify``.
+
+    :func:`_declared_modification_files` is the single source of truth
+    for "does this task carry a usable declaration". This view lets the
+    pure rule below ask that question about a bare list of paths
+    without re-implementing the sentinel handling — the sentinels are
+    exactly the kind of thing that has to stay in one place.
+    """
+
+    __slots__ = ("files_to_modify",)
+
+    def __init__(self, files_to_modify):
+        self.files_to_modify = (
+            None if files_to_modify is None else list(files_to_modify)
+        )
+
+
+def excess_declared_paths(
+    actual_changes: Iterable[str],
+    files_to_modify: Optional[Iterable[str]],
+) -> list[str]:
+    """The changed paths that the task's declaration does not cover.
+
+    The rule behind material R1: before a task may complete, the set of
+    files git actually reports as changed is compared against the
+    task's ``files_to_modify``, and anything outside the declaration is
+    an undeclared write. The Edit/Write guard cannot answer that — it
+    only sees tool calls, so a write performed by a shell command slips
+    past it entirely.
+
+    Pure by construction: no git, no filesystem, no IO. The caller
+    supplies the change set; this function only judges it.
+
+    Parameters
+    ----------
+    actual_changes:
+        The paths that actually changed (repo-relative).
+    files_to_modify:
+        The task's declaration. ``None``, an empty collection or either
+        sentinel means "no usable declaration".
+
+    Returns
+    -------
+    list[str]
+        The normalised, deduplicated, sorted paths that changed and were
+        not declared — empty when there is nothing to report.
+
+    Notes
+    -----
+    A declaration that cannot be used disables the check and returns
+    ``[]``. "The task declared nothing" and "the task declared the
+    empty set" are different statements: only the second one would make
+    every changed path an excess path, and treating them alike would
+    make the gate fire on every task whose ``files_to_modify`` was
+    never filled in — the exact task shape the runtime already treats
+    as read-only.
+
+    Runtime artefacts (plan bookkeeping, scratch space, lock and log
+    files) are never reported: they belong to the runtime, not to the
+    task's deliverable.
+    """
+    declared = _declared_modification_files(_DeclaredFilesView(files_to_modify))
+    if not declared:
+        return []
+    declared_paths = {
+        norm for norm in (_normalise_repo_path(p) for p in declared) if norm
+    }
+    excess: set[str] = set()
+    for raw in actual_changes or []:
+        norm = _normalise_repo_path(raw)
+        if not norm or norm in declared_paths:
+            continue
+        if _is_runtime_artifact(norm):
+            continue
+        excess.add(norm)
+    return sorted(excess)
 
 
 #: Hard ceiling on how much of a report file is handed to the reviewer.
@@ -6835,6 +7102,13 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
 """
                 context += test_instruction
 
+                # 2026-11-08 — the baseline for the undeclared-write gate
+                # (material R1). Taken BEFORE the sub-agent runs, so the
+                # change set this attempt is judged by is the change set
+                # THIS attempt produced. The baseline is the existing
+                # checkpoint HEAD — see ``_capture_attempt_baseline``.
+                baseline_sha = self._capture_attempt_baseline(task)
+
                 print("Coding tool is coding...")
                 coder_response = None
 
@@ -7234,6 +7508,51 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                     ai_reason=ai_reason,
                     coder_response=coder_response,
                 )
+
+                # 2026-11-08 — the undeclared-write gate (material R1).
+                #
+                # The Edit/Write guard only sees TOOL CALLS, so a write
+                # the sub-agent performed with a shell (``cat >
+                # scripts/ci_gate.sh``) reached the repository without
+                # anyone ever comparing the change set against the
+                # task's declaration. The task was then recorded
+                # ``completed`` with an undeclared file in the tree.
+                #
+                # This is the executor side of the rule that
+                # :func:`excess_declared_paths` owns: the ACTUAL change
+                # set (what git reports since this attempt's baseline)
+                # against ``files_to_modify``. It runs only when the
+                # tests passed — a task that already failed keeps its
+                # own failure text, which describes the code rather
+                # than the write contract.
+                #
+                # A task whose declaration is unusable, or whose
+                # repository offers no baseline, is not judged here: the
+                # helpers return no paths and the task completes exactly
+                # as it did before.
+                if tests_passed:
+                    undeclared = self._undeclared_writes_this_attempt(
+                        task, baseline_sha,
+                    )
+                    if undeclared:
+                        tests_passed = False
+                        test_reason = (
+                            "undeclared_write: " + ", ".join(undeclared[:5])
+                        )
+                        if self.logger:
+                            self.logger.warning(
+                                "task_undeclared_write",
+                                (
+                                    f"Task [{task.id}] wrote "
+                                    f"{len(undeclared)} file(s) it never "
+                                    f"declared; failing the task."
+                                ),
+                                task_id=task.id,
+                                data={
+                                    "attempt": attempt + 1,
+                                    "paths": undeclared[:20],
+                                },
+                            )
 
                 # 2026-08-24 dual-criterion rule, second-pass audit
                 # (the project's CLAUDE.md). For audit-style tasks
@@ -10134,6 +10453,109 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
             return paths
         except Exception:
             return []
+
+    def _capture_attempt_baseline(self, task) -> str:
+        """The commit this attempt started from, or ``""`` when unknown.
+
+        The baseline is the HEAD the attempt started on — the checkpoint
+        commit the previous task's ``_commit_task_changes`` wrote
+        (``[task-<id>]``), or whatever the repository was sitting on
+        before this task ran. It is taken from the checkpoint mechanism
+        that already exists; this gate adds no state of its own.
+
+        ``""`` means "there is no baseline": a directory that is not a
+        git repository, or a repository whose HEAD cannot be read as a
+        commit id. Every caller reads that as "the comparison cannot be
+        made" and lets the task through — a gate that cannot answer must
+        not become a gate that blocks everything.
+
+        The HEAD is read in pure Python — see :func:`_read_git_head_sha`.
+        It used to be read with ``git rev-parse HEAD``, but that starts a
+        subprocess, and this baseline is taken on the quota-park path,
+        which must start none.
+        """
+        project_dir = getattr(task, "project_dir", None) or self.project_dir
+        if not project_dir:
+            return ""
+        return _read_git_head_sha(project_dir)
+
+    def _changed_paths_since(self, task, baseline) -> list[str]:
+        """The repo-relative paths that changed since ``baseline``.
+
+        Two questions, one answer:
+
+        * ``git diff --name-only <baseline> --`` — what changed in the
+          files git already tracks (modified, added, deleted);
+        * ``git ls-files --others --exclude-standard`` — what is new
+          and untracked.
+
+        The second question is not optional. A shell redirection creates
+        an UNTRACKED file, and ``git diff`` does not mention untracked
+        files at all — a gate that only asked ``git diff`` would miss
+        exactly the write this gate exists for.
+
+        ``[]`` when the baseline is unknown, when the directory is not a
+        repository, or when git cannot be run or does not finish inside
+        15 seconds. An empty answer means "no evidence of a write",
+        which is the same statement the gate makes about a task that
+        changed nothing.
+        """
+        if not baseline:
+            return []
+        project_dir = getattr(task, "project_dir", None) or self.project_dir
+        if not project_dir:
+            return []
+        try:
+            diff = subprocess.run(
+                ["git", "diff", "--name-only", baseline, "--"],
+                cwd=str(project_dir),
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            if diff.returncode != 0:
+                return []
+            untracked = subprocess.run(
+                ["git", "ls-files", "--others", "--exclude-standard"],
+                cwd=str(project_dir),
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            if untracked.returncode != 0:
+                return []
+        except Exception:
+            return []
+        paths: list[str] = []
+        for raw in (
+            (diff.stdout or "").splitlines()
+            + (untracked.stdout or "").splitlines()
+        ):
+            path = raw.strip()
+            if path:
+                paths.append(path)
+        return paths
+
+    def _undeclared_writes_this_attempt(self, task, baseline) -> list[str]:
+        """The paths this attempt changed that the task never declared.
+
+        The comparison itself is :func:`excess_declared_paths` — the
+        pure rule, together with the exclusions it owns (runtime
+        artefacts are never undeclared writes, and an unusable
+        declaration disables the check entirely). This method supplies
+        the two inputs and nothing else: the real change set, and the
+        task's declaration.
+
+        ``[]`` when there is no baseline to compare against.
+        """
+        if not baseline:
+            return []
+        return excess_declared_paths(
+            self._changed_paths_since(task, baseline),
+            _declared_modification_files(task),
+        )
 
     def _lineage_id(self, task_id: str) -> str:
         """Root task id of a (possibly already split) task.
