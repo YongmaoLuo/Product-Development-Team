@@ -1,13 +1,14 @@
-"""The planning prompt must point ``ci_entry`` at the project's CI adapter.
+"""The planning prompt must point ``ci_entry`` at the project's own CI entry.
 
 Architecture context
 --------------------
 The CI acceptance contract (2026-11-05) is a **single script call**:
-every project ships ``<project>/scripts/ci_gate.sh`` and the framework
-only checks that the script exists and honours the exit-code contract
-(``0`` = green, ``1`` = red, ``3`` = "the machine cannot decide").  The
-framework neither parses the script nor cares whether it runs the gate
-locally, in the cloud, or inside a container.
+``ci_entry`` names one script the project runs, and the framework only
+reads that script's exit code (``0`` = green, ``1`` = red, ``3`` = "the
+machine cannot decide").  *Which* script it is, and where it lives, is
+the project's own decision — the framework neither parses the script nor
+cares whether it runs the gate locally, in the cloud, or inside a
+container, and it does not require any particular file to exist.
 
 The planning prompt used to say "写**仓库的 CI 总入口**" and demonstrated
 an inline compound command (``cargo test --workspace && pytest tests/``),
@@ -18,7 +19,7 @@ non-conforming ``ci_entry``.
 These tests pin the two halves of the fix:
 
   1. the worked example writes ``bash scripts/ci_gate.sh``;
-  2. the prompt states that the adapter script is provided by the project.
+  2. the prompt says the CI entry is the project's own decision.
 
 The rest of the contract is pinned here too — the 0/1/3 exit codes, the
 ``ci_timeout_seconds`` floor of 7200, the "入口不得收窄" rule and the set
@@ -95,10 +96,12 @@ def _full_ci_example(prompt: str) -> dict:
 
 
 def test_prompt_example_uses_adapter_script():
-    """The worked example points at the project's CI adapter script.
+    """The worked example points at one concrete CI entry script.
 
     Not "any CI entry" — the *one* form the runtime accepts: a single
-    call to the adapter script the project provides.
+    call to a script the project provides.  The example names
+    ``scripts/ci_gate.sh`` because that is what this repository's own
+    projects use; it is an example, not a requirement.
     """
     mod = _import_fresh_prompts_module()
     prompt = mod.VERIFICATION_PLAN_SYSTEM_PROMPT
@@ -111,23 +114,23 @@ def test_prompt_example_uses_adapter_script():
 
 
 def test_prompt_says_project_owns_the_adapter():
-    """The prompt says the adapter script belongs to the project.
+    """The prompt says the CI entry is the project's own decision.
 
-    The framework only checks that the script exists and honours the
-    exit-code contract; it does not parse the script and does not judge
-    where it runs.  The model has to know that, otherwise it keeps
+    The framework does not require any particular script (not even
+    ``scripts/ci_gate.sh``); it only runs the entry the plan names and
+    reads its exit code.  The model has to know that, otherwise it keeps
     inventing inline commands.
     """
     mod = _import_fresh_prompts_module()
     prompt = mod.VERIFICATION_PLAN_SYSTEM_PROMPT
-    assert "适配脚本由项目提供" in prompt, (
-        "提示词必须说明适配脚本由项目提供 —— 否则模型会以为框架自带一个"
+    assert "入口由项目自己决定" in prompt, (
+        "提示词必须说明 CI 入口由项目自己决定 —— 否则模型会以为框架自带一个"
     )
     assert "框架不解析" in prompt, (
         "提示词必须说明框架不解析脚本内容"
     )
     assert "容器" in prompt, (
-        "提示词必须说明框架不判断适配脚本在本地 / 云端 / 容器里怎么跑"
+        "提示词必须说明框架不判断 CI 入口在本地 / 云端 / 容器里怎么跑"
     )
 
 

@@ -71,10 +71,10 @@ class FakeCodingTool:
 
     ``on_query`` is an optional hook fired while the synthesis is being
     *asked*. It exists for the one case where the world has to change
-    during the import: the CI adapter gate runs before the model is asked
-    and the hardening gate runs after, so a case that wants the second
-    gate to see a checkout that is gone has to take the checkout away
-    here. See ``test_a_generated_task_pointing_nowhere_is_refused``.
+    during the import: the hardening gate runs after the model is asked,
+    so a case that wants that gate to see a checkout that is gone has to
+    take the checkout away here. See
+    ``test_a_generated_task_pointing_nowhere_is_refused``.
     """
 
     def __init__(self, reply, on_query=None):
@@ -114,11 +114,12 @@ def checkout(tmp_path):
     exist, and the route runs that gate — so a fixture that pointed at a
     made-up path would be testing the 422 branch on the happy path.
 
-    The checkout also carries an executable ``scripts/ci_gate.sh``: the
-    import lane refuses a project that has no CI adapter (2026-11-05), so
-    a fixture without one would be testing the *refusal* branch on the
-    happy path.  The execute bit is set explicitly — a file without it
-    counts as "no adapter" just as much as a missing file does.
+    The checkout also carries an executable ``scripts/ci_gate.sh``: which
+    script is a project's CI entry is its own decision, so the framework
+    no longer requires this file to exist.  The fixture ships one anyway
+    because that is what a real project looks like — and the execute bit
+    is set explicitly, so the file is a real, runnable script rather
+    than a stray text file.
     """
     path = tmp_path / "checkout"
     (path / "backend").mkdir(parents=True)
@@ -518,12 +519,12 @@ def test_a_generated_task_pointing_nowhere_is_refused(
     refuse at start, and finding it out at import is the point of the lane.
 
     The checkout is taken away **while the model is being asked**, not
-    before the request: the CI adapter gate runs first and the project has
-    to be complete for it, and the hardening gate runs last and the
-    project has to be gone for it.  Taking it away up front would be
-    refused by the adapter gate instead — a different gate, saying a
-    different thing, and the case would stop testing the one it is named
-    after.
+    before the request: the hardening gate runs last, and the project has
+    to be gone by the time it runs.  Taking it away up front would be
+    refused by the same gate anyway, but with the checkout missing from
+    the very first moment the case would stop being about *the model
+    pointing at a checkout that vanished mid-import* — which is what it
+    is named after.
     """
     _install(
         monkeypatch,

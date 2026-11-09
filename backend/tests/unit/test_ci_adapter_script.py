@@ -1,16 +1,18 @@
-"""The CI adapter entry point the framework looks for.
+"""This repository's own CI entry point, ``scripts/ci_gate.sh``.
 
-The gate framework only knows one thing about a project's CI: it looks for
-an *executable* ``scripts/ci_gate.sh`` and runs it. It never parses the
-file, so the contract has to be pinned here instead.
+The framework does not look for this file -- which script is a project's
+CI entry is the project's own decision, and the framework only runs the
+entry the plan names and reads its exit code.  What the framework does
+not do is parse the script, so the contract has to be pinned here
+instead.
 
 This repository already carries the implementation -- ``scripts/ci_gha.sh``
 dispatches the ``ci.yml`` workflow and turns its conclusion into the
 verdict (0 green / 1 red / 3 inconclusive). What was missing was the
-uniform entry point the framework asks for, so this module pins the three
-properties that entry point has to keep:
+uniform entry point this repository's own plans point at, so this module
+pins the three properties that entry point has to keep:
 
-* it exists and is executable (the framework refuses to run anything else),
+* it exists and is executable,
 * it is valid bash (a syntax error would only surface at gate time),
 * it hands over to ``ci_gha.sh`` -- the file that owns the verdict and the
   exit codes.
@@ -27,7 +29,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
-#: The uniform entry point the framework looks for.
+#: This repository's own CI entry point.
 SCRIPT = PROJECT_ROOT / "scripts" / "ci_gate.sh"
 
 #: The implementation the entry point delegates to.

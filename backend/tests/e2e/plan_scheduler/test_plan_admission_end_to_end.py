@@ -835,12 +835,13 @@ def scripted_model(monkeypatch):
     return _install
 
 
-def _install_ci_adapter(project_dir: Path) -> Path:
-    """Give the checkout an executable CI adapter script.
+def _install_ci_gate_script(project_dir: Path) -> Path:
+    """Give the checkout an executable CI entry script.
 
-    The adapter is the project's own CI entry: exit 0 means green. The
-    import route only looks at the file and its execute bit, so a
-    one-line stub is enough here.
+    Which script is the CI entry is the project's own decision — the
+    framework does not require ``scripts/ci_gate.sh`` to exist. The
+    fixture ships one anyway (exit 0 = green) so the checkout looks like
+    a project that does have a CI entry.
     """
     scripts_dir = project_dir / "scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)
@@ -859,15 +860,14 @@ def checkout(tmp_path):
     testing the 422 branch on the happy path.
 
     The checkout also carries an **executable** ``scripts/ci_gate.sh``:
-    the import route refuses a project that has no CI adapter
-    (2026-11-05), so a checkout without one would be testing the 422
-    branch instead of the admission this file is about.
+    which script is the CI entry is the project's own decision, so this
+    is just what a real project looks like.
     """
     path = tmp_path / "checkout"
     (path / "backend").mkdir(parents=True)
     for name in ("chart.py", "reporting_view.py", "loader.py", "a.py", "b.py"):
         (path / "backend" / name).write_text("# existing\n", encoding="utf-8")
-    _install_ci_adapter(path)
+    _install_ci_gate_script(path)
     return path
 
 
