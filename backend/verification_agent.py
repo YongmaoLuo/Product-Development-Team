@@ -161,6 +161,13 @@ from verification_round_scope import (  # noqa: E402
 # plan 目录里躺着的是验证计划书还是任务清单。判定收敛在
 # ``plan_artifacts`` 里（纯函数、只读目录、每次重算），这里只消费结果。
 from plan_artifacts import is_verification_branch  # noqa: E402
+# 2026-11-09（计划去重 R3）：验证计划**生成后、落盘前**跑一次重复检测 ——
+# 有重复组就把报告写到计划目录里并 WARNING。检测是**只读**的：不改计划里
+# 任何验证点的编号与内容，是否删除由人或后续任务决定。
+#
+# 判定在 :mod:`plan_dedup`（纯函数），落盘与开关在 :mod:`plan_dedup_report`
+# —— 这里只消费那个写盘入口，不在这里重写判据。
+from plan_dedup_report import write_verification_dedup_report  # noqa: E402
 # 2026-10-23（工作树指纹）：依据核对读的是**活的**工作树。多个验证进程
 # 可以共用同一个 worktree，读取 citations/checkpoints 期间可能有并发写入
 # （"变异负控"）——那时核对读到的是一棵不属于这个 VP 的树。指纹让"树动过
@@ -4633,6 +4640,34 @@ class Orchestrator:
     # Phase 1: Planning
     # -----------------------------------------------------------------------
 
+    def _persist_verification_plan(self, plan_data: dict) -> None:
+        """把验证计划落盘，落盘**前**先跑一次重复检测（R3）。
+
+        这是验证计划落盘的**唯一**入口 —— ``generate_verification_plan``
+        收口在这里。落盘前的那次检测回答的是一个很具体的问题："这一轮
+        生成出来的计划里有没有重复的验证点"。此刻计划还没写下去，判出来
+        的重复就是**这一轮生成出来的**重复，而不是从磁盘上读回来的旧货。
+
+        检测是**只读**的：``plan_data`` 一个字节都不动（R3：「不改变已有
+        验证点的编号与内容」）。有重复组时报告落到计划**旁边**
+        （``verification_plan_dedup.json`` + 一行摘要），日志里打一条
+        WARNING。
+
+        开关（``PDT_PLAN_DEDUP``）**默认开启**；关闭时行为与今天**完全
+        一致** —— 只写计划文件，目录里不多出任何报告文件，计划字节不变。
+
+        报告写盘的异常**不吞**：写盘失败要让人看见。悄悄吞掉等于"以为查
+        过了"，而这条检查的失败模式恰恰是"没人看"。
+        """
+        plan_dir = self.verification_plan_file.parent
+
+        # R3：检测在**落盘前**跑 —— 计划刚生成完、还没写下去。
+        write_verification_dedup_report(plan_data, plan_dir)
+
+        plan_dir.mkdir(parents=True, exist_ok=True)
+        with open(self.verification_plan_file, "w", encoding="utf-8") as f:
+            json.dump(plan_data, f, indent=2, ensure_ascii=False)
+
     def generate_verification_plan(self, retry_llm: int = 3) -> dict:
         """
         Phase 1: Generate verification plan from PRD/arch/test documents.
@@ -5107,9 +5142,7 @@ class Orchestrator:
                     )
 
                 # Save plan
-                self.verification_plan_file.parent.mkdir(parents=True, exist_ok=True)
-                with open(self.verification_plan_file, "w", encoding="utf-8") as f:
-                    json.dump(plan_data, f, indent=2, ensure_ascii=False)
+                self._persist_verification_plan(plan_data)
 
                 # NOTE: legacy double-write to
                 # ``plan_dir/project/verification_plan.json`` was removed

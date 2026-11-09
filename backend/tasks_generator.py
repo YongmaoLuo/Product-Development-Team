@@ -31,6 +31,7 @@ from self_review import run_doc_self_review, write_self_review_report
 from execution_logger import get_logger
 from plan_state import MIGRATION_AUDIT_SCHEMA as _MIGRATION_AUDIT_SCHEMA
 from plan_state import migration_audit as _migration_audit
+from plan_dedup_report import write_tasks_dedup_report
 
 
 # Re-export the shared schema constant under the local name so
@@ -1276,11 +1277,55 @@ class TasksGenerator:
         ``_defer_tasks_writes`` set, the file is left alone and only the
         in-memory dict moves, which is what lets a failed revision leave
         the plan's list byte-for-byte as it was.
+
+        The same single funnel is where the task-side dedup report is
+        emitted (R4): one place to write the list means one place to
+        write its report, so no write path can silently skip it.
         """
         if self._defer_tasks_writes:
             return
         with open(self.tasks_file, "w", encoding=encoding) as f:
             json.dump(payload, f, indent=2, ensure_ascii=False)
+        self._write_tasks_dedup_report(payload)
+
+    def _write_tasks_dedup_report(self, payload: Dict[str, Any]) -> None:
+        """Write the task-side dedup report next to ``tasks.json``.
+
+        R4: two tasks that touch the same files and run the same command
+        are the same work written twice — on the task side that is just as
+        wasteful as on the verification side, so the report lands in the
+        plan directory (``tasks_dedup.json``) whenever the list is
+        written.
+
+        What this deliberately does **not** do:
+
+        * **It never changes ``tasks.json``.** The report is additive;
+          the list itself is byte-for-byte what it was.
+        * **It does not report on an error payload.** A payload carrying
+          ``error`` is a *failed* generation, not a task list — and the
+          E2E-gate failure path writes the tasks it had alongside the
+          error, so judging that as "the plan's task list" would report
+          duplicates for a plan that never made it out of the generator.
+        * **It does not report on a payload without a usable task list.**
+          Missing / empty / non-list ``tasks`` is not a list to judge.
+        * **It does not fail the generation.** The report is a side
+          artifact; if writing it breaks, the task list still stands and
+          the operator gets a warning instead of a lost plan.
+        """
+        if not isinstance(payload, dict):
+            return
+        if "error" in payload:
+            return
+        tasks = payload.get("tasks")
+        if not isinstance(tasks, list) or not tasks:
+            return
+        try:
+            write_tasks_dedup_report(payload, self.plan_dir)
+        except Exception as exc:  # noqa: BLE001 — best-effort degrade
+            _logger.warning(
+                "tasks_generator dedup report write failed: %s: %s",
+                type(exc).__name__, exc,
+            )
 
     def _generate_with_prompt(
         self,
