@@ -179,6 +179,22 @@ _MAX_ANCESTRY = 32
 #: Default grace window between SIGTERM and SIGKILL.
 DEFAULT_GRACE_SECONDS = 10.0
 
+#: The one sweep that keeps the owner gate out of its way.
+#:
+#: A forced start is the operator naming **one** plan and asking for its
+#: tree back: "clear what the previous backend left behind".  The owner
+#: check cannot answer that question, because the owner-alive probe
+#: answers "alive" for an owner that died long ago whenever the host
+#: recycles pids quickly — and a forced start that skipped on that
+#: answer would not clear the tree, it would start a *second* executor
+#: next to the first one.  Every other sweep (a shutdown, a startup
+#: sweep, a stop, a service sweep) asks the tree-wide question, and
+#: there "a live owner still owns it" is the right answer.
+#:
+#: The same string the start endpoint uses
+#: (``routes/execution.py`` — ``START_FORCE_REAP_REASON``).
+FORCE_REAP_REASON = "start_force"
+
 #: How long to wait for a SIGKILLed process to disappear.
 _KILL_GRACE_SECONDS = 2.0
 
@@ -292,6 +308,134 @@ class _Anchor:
     pgid: Optional[int]
 
 
+def _owner_alive(pid: int) -> bool:
+    """True when ``pid`` still names a process.
+
+    The kernel's own answer, asked the same way the ledger asked it:
+    ``kill(pid, 0)`` succeeds for a process that exists, whether or not
+    this process is allowed to signal it.  A zombie still answers — it
+    is finished, but its parent's bookkeeping is outstanding — so a
+    zombie owner counts as alive here.  That is deliberate: the owner
+    question is "is somebody still there", and the parent that has not
+    yet reaped the corpse is somebody who is still there.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True         # it exists; we are simply not allowed to signal it
+    except OSError:
+        return False
+    return True
+
+
+def _protection_reason(
+    record: Any,
+    collectable: Set[int],
+    own: int,
+) -> Optional[str]:
+    """Why this record must not be collected — or ``None`` if it may be.
+
+    The question is not "is the owner alive *now*" but "will the owner
+    still be alive *after this sweep*".  A record whose owner this
+    sweep is going to kill is ours to collect as well: that is the
+    cascade — the executor goes, and its sub-agent goes with it, in the
+    same sweep, instead of being skipped as "owned by a live process"
+    and surviving its own parent's death.
+
+    Args:
+        record: The ledger record under consideration.
+        collectable: The pids this sweep may still collect.  An owner
+            that is in this set is going to be killed by this sweep, so
+            it cannot protect its children.
+        own: The pid of the process doing the sweeping — our own tree.
+
+    Returns:
+        The reason to skip the record (``owner_alive``,
+        ``parent_alive``, ``owner_unknown``), or ``None`` when the
+        record may be collected.
+    """
+    owner = getattr(record, "owner_pid", 0) or 0
+    if isinstance(owner, int) and owner > 0:
+        if owner == own:
+            return None          # our own tree — reap it as usual
+        if owner in collectable:
+            return None          # the owner goes in this sweep — so does this
+        if _owner_alive(owner):
+            return "owner_alive"  # somebody is still serving it
+        return None              # owner is gone — its tree is an orphan
+
+    # No owner on record (an old record, or one the ledger could not
+    # attribute): ask the kernel who the parent is *now*.  A parent
+    # that is still alive owns the process.
+    if not _alive(record.pid):
+        return None              # the process is gone already
+    parent = process_identity.parent_pid(record.pid)
+    if parent is None:
+        # The answer could not be read.  Guessing is how a sweep
+        # kills a stranger, so the record is left alone.
+        return "owner_unknown"
+    if parent > 1:
+        if parent in collectable:
+            return None          # the parent goes in this sweep — so does this
+        if _alive(parent):
+            return "parent_alive"
+    # The parent is init (the process was orphaned) or the parent
+    # is gone: nobody owns this any more — it is an orphan, and an
+    # orphan is what a sweep is for.
+    return None
+
+
+def _apply_owner_guard(
+    plan_path: Path,
+    records: Dict[int, Any],
+    outcome: "ReapOutcome",
+    own: int,
+) -> None:
+    """Take the records this sweep must not collect out of ``records``.
+
+    The records that survive the guard are the ones this sweep may
+    collect; the ones taken out are skipped, each with the reason it
+    was left alone.
+
+    The decision is a **fixed point**, not a single pass.  A record is
+    protected when its owner is alive *and* the sweep is not going to
+    collect that owner.  Deciding that in one pass would get the
+    cascade wrong in both directions: a child of an owner that this
+    sweep kills would be skipped ("its owner is alive") and survive its
+    own parent's death, and an owner that is itself skipped would
+    still be treated as a live owner.  So the set of collectable
+    records starts as "all of them" and shrinks, and the shrinking is
+    repeated until it stops changing.
+
+    The set only ever shrinks, and a record's verdict can only go from
+    "collectable" to "protected" (a protected record's owner can never
+    come back into the collectable set), so the iteration terminates.
+    """
+    collectable: Set[int] = set(records)
+    protected: Dict[int, str] = {}
+    changed = True
+    while changed:
+        changed = False
+        for pid, record in list(records.items()):
+            if pid in protected:
+                continue
+            reason = _protection_reason(record, collectable, own)
+            if reason is None:
+                continue
+            protected[pid] = reason
+            collectable.discard(pid)
+            changed = True
+
+    for pid, record in list(records.items()):
+        reason = protected.get(pid)
+        if reason is None:
+            continue
+        _skip(plan_path, record, outcome, reason)
+        records.pop(pid, None)
+
+
 @dataclass
 class _Vouched:
     """The live facts a signal was authorised on.
@@ -371,25 +515,23 @@ def reap_plan(
         # than the ledger actually says.
         records = dict(live)
 
-    # A shutdown sweep may only collect what the departing process owned.
-    # A record whose owner is a *different, live* process is not an orphan:
-    # it belongs to a backend that is still running.  Only the shutdown
-    # reason is scoped this way — a forced start must still be able to
-    # clear a stale executor whose owner is alive.
-    if reason == "server_shutdown":
-        own = os.getpid()
-        for pid, record in list(records.items()):
-            owner = getattr(record, "owner_pid", 0) or 0
-            if not isinstance(owner, int) or owner <= 0 or owner == own:
-                continue
-            try:
-                os.kill(owner, 0)
-            except ProcessLookupError:
-                continue          # owner is gone — its tree is an orphan
-            except PermissionError:
-                pass              # exists but not ours to inspect — treat as alive
-            _skip(plan_path, record, outcome, "owner_alive")
-            records.pop(pid, None)
+    # A sweep may only collect what nobody else is still serving.
+    #
+    # A record whose owner is a *different, live* process is not an
+    # orphan: it belongs to a backend that is still running, and a
+    # sweep that collects it takes another process's tree down.  The
+    # gate is **not** scoped to a reason — a shutdown, a startup sweep
+    # and a stop all have to leave another process's tree alone.  It
+    # used to be scoped to ``server_shutdown``, which left every other
+    # sweep free to kill a tree that a live backend was still serving.
+    #
+    # The one sweep the gate does not speak to is the forced start
+    # (``FORCE_REAP_REASON``): that one is asked for one plan by name,
+    # and skipping on an owner that the host has recycled would leave
+    # the old executor running and start a second one beside it.
+    own = os.getpid()
+    if reason != FORCE_REAP_REASON:
+        _apply_owner_guard(plan_path, records, outcome, own)
 
     handled: Set[int] = set()
     killed: List[_Anchor] = []
