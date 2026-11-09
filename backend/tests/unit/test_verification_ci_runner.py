@@ -57,6 +57,19 @@ def _vp(entry, **extra):
     return vp
 
 
+#: VP-022 冻结入口的**形状**（逐字取自
+#: ``plans/<plan-id>/verification_plan.json`` 里那条
+#: ``full_ci`` 验证点的 ``ci_entry``）。
+#:
+#: 绝对路径换成了 ``/opt/shared/venv``：入口里那条路径**本机专属**，而门禁
+#: 对绝对路径不做存在性检查（``_looks_like_path`` 主动跳过）—— 换掉它不
+#: 影响任何一条断言，留在测试里反而会把一台机器的目录结构写进仓里。
+VP022_FROZEN_ENTRY = (
+    "(test -e backend/.venv || ln -sfn /opt/shared/venv backend/.venv) && "
+    "bash scripts/run_tests.sh"
+)
+
+
 # ---------------------------------------------------------------------------
 # looks_narrowed — the anti-degeneration check
 # ---------------------------------------------------------------------------
@@ -401,6 +414,23 @@ class TestValidateVpShellGroupingAndSelfCreatedPaths:
             _vp(entry), project_dir=tmp_path, require_single_entry=False,
         ) == []
 
+    def test_the_vp022_entry_against_the_real_worktree_has_no_issue(self):
+        """U2 —— 同一条入口，project_dir = **真实工作树**：零 issue。
+
+        这是 L1（路径读取层）的收口证据：VP-022 那条入口在真实树上跑之前
+        就被判不可运行，代价是整整一轮门禁。真实树里 ``scripts/run_tests.sh``
+        存在、``backend/.venv`` 由入口自己建 —— 零 issue 才是正确答案。
+        """
+        repo_root = Path(__file__).resolve().parents[3]
+        assert (repo_root / "scripts" / "run_tests.sh").is_file(), (
+            "the repo must still ship the gate script the entry names"
+        )
+        assert validate_vp(
+            _vp(VP022_FROZEN_ENTRY),
+            project_dir=repo_root,
+            require_single_entry=False,
+        ) == []
+
     def test_created_path_exemption_keeps_the_existence_check_for_consumed_paths(
         self, tmp_path,
     ):
@@ -477,6 +507,78 @@ class TestValidateVpShellGroupingAndSelfCreatedPaths:
         # 目标位置是生产者 —— 不报。
         assert not any("scripts/out.sh" in i.detail for i in issues), issues
         assert not any("scripts/out2.sh" in i.detail for i in issues), issues
+
+
+# ---------------------------------------------------------------------------
+# 规划期的入口形态契约（2026-11-06）
+# ---------------------------------------------------------------------------
+#
+# 2026-11-05 的 arch 决策点 2：整仓门禁必须由**项目适配脚本**执行，一条
+# ``ci_entry`` 是对那条脚本的**一次调用**，不是内联复合命令。于是
+# ``validate_vp`` 有两种形态：
+#
+# * ``require_single_entry=True``（缺省）—— **规划期**的契约。一条内联复合
+#   命令在计划期就该被退回重写，而不是写进计划、被整份复用、每一轮都在执行期
+#   第一次被看见。
+# * ``require_single_entry=False`` —— **执行期**的契约。历史计划里的复合入口
+#   照旧要能跑，所以执行期不做形态检查（VP-022 冻结的那条入口就是这种）。
+#
+# 规划期的那条拒绝必须留下**机器写的身份**：否则「内联复合命令」这一类缺陷的
+# 身份是 ``schema:unknown`` —— 所有形态违规共用一个身份，指纹分不出缺陷，
+# 循环又会把「同一类缺陷」和「同一个缺陷」混成一谈。
+
+
+#: VP-022 冻结入口的形状见文件头的 ``VP022_FROZEN_ENTRY``。
+
+
+class TestPlanTimeEntryShape:
+    """规划期：内联复合入口被退回；执行期：同一条入口照旧能跑。"""
+
+    def test_a_compound_entry_is_an_issue_at_plan_time(self):
+        issues = validate_vp(_vp(VP022_FROZEN_ENTRY))
+
+        assert [i.code for i in issues] == ["ci_entry_compound"], (
+            f"the plan-time shape contract must reject the compound entry; "
+            f"got {[i.to_dict() for i in issues]!r}"
+        )
+
+    def test_the_rejection_carries_a_machine_written_identity(self):
+        issues = validate_vp(_vp(VP022_FROZEN_ENTRY))
+
+        assert issues[0].failure_id() == "schema:ci_entry_compound:&&,||,(,)", (
+            f"the identity must name the rule and its subject — a generic "
+            f"'schema:unknown' makes every shape violation one defect; got "
+            f"{issues[0].failure_id()!r}"
+        )
+
+    def test_two_different_compound_entries_are_two_different_defects(self):
+        first = validate_vp(_vp(VP022_FROZEN_ENTRY))[0].failure_id()
+        second = validate_vp(
+            _vp("bash scripts/ci_gate.sh && bash scripts/ci_gate.sh"),
+        )[0].failure_id()
+
+        assert first != second, (
+            "two entries with different operators must not share one "
+            "failure identity"
+        )
+
+    def test_the_adapter_entry_is_accepted_at_plan_time(self, tmp_path):
+        # 闸门不能报它自己教的那条入口 —— 否则重生成回路是死循环。
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "ci_gate.sh").write_text("#!/bin/sh\n")
+        assert validate_vp(
+            _vp("bash scripts/ci_gate.sh"), project_dir=tmp_path,
+        ) == []
+
+    def test_the_same_entry_is_accepted_at_execution_time(self, tmp_path):
+        # 执行期不做形态检查：历史计划里的复合入口照旧要能跑。
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "run_tests.sh").write_text("#!/bin/sh\n")
+        assert validate_vp(
+            _vp(VP022_FROZEN_ENTRY),
+            project_dir=tmp_path,
+            require_single_entry=False,
+        ) == []
 
 
 # ---------------------------------------------------------------------------

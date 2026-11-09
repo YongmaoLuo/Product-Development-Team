@@ -1219,6 +1219,15 @@ UI_VALIDATION_SKIP_REASON = "no_ui_surface"
 #: 只裁这一轮用不上的验证点。
 _UI_VALIDATION_METHOD = "ui_validation"
 
+#: 计划顶层记录"复用路径上 ``ci_entry`` 不合规"的字段名（2026-11-06）。
+#:
+#: 只标注、不阻断 —— 与 :class:`ApiTestSchemaViolation` 的强度**不同**，
+#: 原因见 :meth:`Orchestrator._annotate_reused_ci_entry_violations`。
+CI_ENTRY_VIOLATION_FIELD = "ci_entry_violations"
+
+#: VP 级记录"这一条 VP 的 ``ci_entry`` 不合规"的字段名（2026-11-06）。
+CI_ENTRY_ISSUES_FIELD = "ci_entry_issues"
+
 
 def _render_ui_validation_skip_note(
     files: Tuple[str, ...], dropped_ids: List[str],
@@ -4213,6 +4222,114 @@ class Orchestrator:
             })
         return report
 
+    def _ci_entry_report(self, plan_data: dict) -> List[Dict[str, Any]]:
+        """``full_ci`` VPs whose ``ci_entry`` cannot be run as written.
+
+        Shaped like :meth:`_api_schema_report` so both ride the same
+        regeneration loop.  Without this a plan can carry an entry that
+        was never going to work — an inline compound command, an entry
+        that narrows the gate, an entry pointing at a script the repo
+        does not have — and the defect only shows up in the **execution**
+        phase, where it costs a whole round.
+
+        ``verification_ci_runner.validate_vp`` promised to be "called at
+        plan-generation time" since 2026-11-05; this method is that call
+        site.  The **shape** contract (one call to the project's adapter
+        script) is what makes it worth wiring: the entry a planner
+        writes is the thing the whole-repo gate is judged by.
+
+        ``project_dir`` is passed so the existence check is real: an
+        entry naming a repo script that does not exist cannot pass, and
+        finding that out now is far cheaper than finding it out after a
+        40-minute round.
+
+        The **execution**-time contract is deliberately different:
+        ``run_ci_verification`` calls ``validate_vp`` with
+        ``require_single_entry=False`` so that historical plans with a
+        compound entry still run.  Plan time rejects the shape; run time
+        accepts it.
+        """
+        if not isinstance(plan_data, dict):
+            return []
+        try:
+            from verification_ci_runner import validate_vp
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("[ci_runner] schema validator unavailable: %s", exc)
+            return []
+        report: List[Dict[str, Any]] = []
+        vps = plan_data.get("verification_points")
+        if not isinstance(vps, list):
+            return report
+        for vp in vps:
+            if not isinstance(vp, dict):
+                continue
+            if str(vp.get("verification_method") or "") != "full_ci":
+                continue
+            try:
+                issues = validate_vp(vp, project_dir=self.project_dir)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "[ci_runner] could not validate %s: %s",
+                    vp.get("id"), exc,
+                )
+                continue
+            if not issues:
+                continue
+            report.append({
+                "id": str(vp.get("id", "unknown")),
+                "title": str(vp.get("title", "")),
+                "issues": [i.detail for i in issues],
+            })
+        return report
+
+    def _annotate_reused_ci_entry_violations(
+        self, plan_data: dict,
+    ) -> List[Dict[str, Any]]:
+        """Write the ``ci_entry`` violations onto a reused plan (in place).
+
+        The reuse path **annotates, never blocks** — same intent as
+        :meth:`_annotate_gate_completeness`, opposite strength from
+        :class:`ApiTestSchemaViolation`.
+
+        Why the strength differs: an ``api_test`` VP whose assertions the
+        runner cannot parse is judged FAILED no matter what the service
+        does — the runner will never be able to decide it, so refusing
+        to reuse the plan is the only honest move.  A ``ci_entry`` that
+        breaks the *shape* contract is different: the frozen entry on
+        disk **runs** (the execution-time contract does not check the
+        shape), so blocking it would fail this round for a defect the
+        runner can actually work around.  The gap must be visible, but
+        it must not stop the round.
+        """
+        violations = self._ci_entry_report(plan_data)
+        if not violations:
+            return []
+        vps = plan_data.get("verification_points")
+        if isinstance(vps, list):
+            by_id = {}
+            for vp in vps:
+                if isinstance(vp, dict):
+                    by_id.setdefault(str(vp.get("id", "unknown")), vp)
+            for violation in violations:
+                vp = by_id.get(str(violation.get("id")))
+                if vp is not None:
+                    vp[CI_ENTRY_ISSUES_FIELD] = list(violation["issues"])
+        plan_data[CI_ENTRY_VIOLATION_FIELD] = {"violations": violations}
+        logger.warning(
+            "[Verification] reused plan has %d full_ci VP(s) whose ci_entry "
+            "does not meet the plan contract (annotated, not blocking): %s",
+            len(violations),
+            [v["id"] for v in violations],
+        )
+        # 注解只在内存里 —— 复用路径不写盘。缺口要**看得见**，就得进那一轮
+        # 的日志（与 ``_annotate_gate_completeness`` 同一套路）。
+        self._safe_log_freshness_event(
+            "__plan__",
+            "ci_entry_violation_on_reused_plan",
+            {"violations": violations},
+        )
+        return violations
+
     def _collect_prd_acceptance(self) -> List[str]:
         """The PRD's acceptance criteria, as plain strings.
 
@@ -4239,6 +4356,7 @@ class Orchestrator:
         service_violations: List[Dict[str, Any]],
         api_schema_violations: Optional[List[Dict[str, Any]]] = None,
         gate_gaps: Optional[List[Dict[str, Any]]] = None,
+        ci_entry_violations: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """The "how to fix it" half of the regeneration prompt.
 
@@ -4296,7 +4414,77 @@ class Orchestrator:
                 "`target_url` 用服务占位符写。\n"
                 "  **只补缺的那几条关卡，其余 VP 原样保留。**"
             )
+        if ci_entry_violations:
+            parts.append(
+                "对「整仓门禁入口不合规」的那些：`ci_entry` 必须是**一条命令** —— "
+                "对项目门禁脚本的**一次调用**（示例：`bash scripts/ci_gate.sh`，"
+                "即项目提供的 CI 适配脚本）。\n"
+                "  · **不要写内联复合命令**：`&&` / `||` / `;` / 管道 / 重定向 "
+                "一律判为计划不合规 —— 整仓门禁只能由那条适配脚本执行；\n"
+                "  · **不要写绝对路径**：入口要写成**仓库内、相对仓库根**的路径"
+                "（绝对路径不可移植，而框架对绝对路径不做存在性检查，写错了"
+                "不会有人告诉你）；\n"
+                "  · **不要在入口里自己造环境**（`ln -sfn` / `mkdir` 之类）："
+                "环境由 harness 的 service 启动脚本准备，`ci_entry` 只写仓库里"
+                "那条门禁入口；\n"
+                "  · 入口不得收窄（点名单个测试文件 / `-k` 选择器 / `::` 节点 "
+                "都是 Phase 1 的粒度）。\n"
+                "  如果项目里的门禁脚本不叫 `scripts/ci_gate.sh`，就写它自己的"
+                "路径（同样必须是仓库内的相对路径），但**只能调用一次**。"
+                + self._detected_ci_entry_hints()
+            )
         return "".join("\n\n" + p for p in parts)
+
+    def _detected_ci_entry_hints(self) -> str:
+        """The gate scripts this repo actually has, as a hint for the planner.
+
+        Without it the guidance can only say "call the adapter script",
+        which is useless for a repo whose adapter is called something
+        else — the planner would re-emit the same unusable entry on every
+        attempt and the regeneration loop would spin.  Never raises: a
+        hint is not worth failing a plan over.
+        """
+        try:
+            entries = [
+                e for e in detect_full_gate_entries(self.project_dir)
+                if e.kind == "ci"
+            ]
+        except Exception:  # pragma: no cover - defensive
+            return ""
+        paths: List[str] = []
+        for entry in entries:
+            evidence = str(entry.evidence)
+            if "*" in evidence:
+                # 探测到的是**模式**（`scripts/*nightly*`），不是具体文件 ——
+                # 把通配符交给规划 LLM，它只会再写一条跑不起来的入口。
+                evidence = self._resolve_gate_glob(evidence) or ""
+            # 只列**可以直接调用**的门禁脚本：CI workflow 文件不是入口。
+            if not evidence.startswith("scripts/"):
+                continue
+            if evidence not in paths:
+                paths.append(evidence)
+        if not paths:
+            return ""
+        return (
+            "\n  本仓库里探测到的门禁脚本（入口必须调用其中一条，且只调一次）："
+            + "、".join(f"`{p}`" for p in paths)
+            + "。"
+        )
+
+    def _resolve_gate_glob(self, pattern: str) -> Optional[str]:
+        """Resolve a detected gate *pattern* to the file it stands for."""
+        try:
+            root = Path(self.project_dir)
+            prefix, _, tail = pattern.rpartition("/")
+            base = root / prefix if prefix else root
+            if not base.is_dir():
+                return None
+            for hit in sorted(base.glob(tail)):
+                if hit.is_file():
+                    return str(hit.relative_to(root))
+        except Exception:  # pragma: no cover - defensive
+            return None
+        return None
 
     def _normalize_legacy_methods(self, plan_data: dict) -> dict:
         """Retire VPs whose ``verification_method`` no longer exists.
@@ -4812,6 +5000,15 @@ class Orchestrator:
                             f"{_ids}. First issues: {_first_issues}",
                             violations=_disk_api_violations,
                         )
+                    # 2026-11-06：复用路径上的 ``ci_entry`` 形态检查 ——
+                    # **只标注、不阻断**。
+                    #
+                    # 强度与上面那条**故意不同**：``api_test`` 断言不合规 =
+                    # 运行器永远判不了（无论服务怎么答都会 FAILED），所以必须
+                    # 拒绝落盘；而 ``ci_entry`` 不合规 ≠ 永远判不了 —— 盘上那条
+                    # 冻结入口在运行器修好之后**是能跑的**（执行期不做形态检查），
+                    # 阻断它等于让这一轮原地失败。缺口必须可见，轮次必须能跑完。
+                    self._annotate_reused_ci_entry_violations(disk_plan)
                     return disk_plan
             except (OSError, json.JSONDecodeError) as e:
                 print(f"[Verification] Disk plan unreadable, regenerating: {e}")
@@ -4930,6 +5127,11 @@ class Orchestrator:
                 # 2026-09-18（VP 判定重构）：api_test 由框架执行，断言不合规
                 # 的计划跑起来只会烧掉一轮。跟上面两类走同一条重生成回路。
                 _api_schema_violations = self._api_schema_report(plan_data)
+                # 2026-11-06：整仓门禁的入口形态（第 5 类违规）。
+                # 入口是整仓门禁**唯一的判定依据** —— 它不合法，VP 就跑不成；
+                # 而它在执行期第一次被看见的代价是整整一轮。计划期打回，
+                # 比第 4 轮才发现便宜一个数量级。
+                _ci_entry_violations = self._ci_entry_report(plan_data)
                 # 2026-09-18（D5）：项目里有全量 CI / E2E 入口，计划里却没有
                 # 对应的 Phase 2 关卡 —— that run's Nightly CI 关卡就是这么丢的。
                 _gate_gaps = find_missing_gates(plan_data, _gate_entries)
@@ -4944,7 +5146,8 @@ class Orchestrator:
                 )
                 _violation_count = (
                     len(_service_violations) + len(_api_schema_violations)
-                    + len(_gate_gaps) + len(_ac_gaps)
+                    + len(_ci_entry_violations) + len(_gate_gaps)
+                    + len(_ac_gaps)
                 )
                 if _violation_count:
                     _sections: List[str] = []
@@ -4970,6 +5173,17 @@ class Orchestrator:
                                 for f in _api_schema_violations
                             )
                         )
+                    if _ci_entry_violations:
+                        _sections.append(
+                            "### 整仓门禁入口不合规\n"
+                            + "\n".join(
+                                f"  - {f['id']}「{f['title']}」"
+                                + "".join(
+                                    f"\n      · {d}" for d in f["issues"]
+                                )
+                                for f in _ci_entry_violations
+                            )
+                        )
                     if _gate_gaps:
                         _sections.append(
                             render_gap_feedback(_gate_gaps)
@@ -4984,7 +5198,8 @@ class Orchestrator:
                         f"point(s) violate the plan contract "
                         f"({len(_service_violations)} service reference "
                         f"issue(s), {len(_api_schema_violations)} api_test "
-                        f"schema issue(s), {len(_gate_gaps)} missing "
+                        f"schema issue(s), {len(_ci_entry_violations)} ci_entry "
+                        f"issue(s), {len(_gate_gaps)} missing "
                         f"Phase-2 gate(s), {len(_ac_gaps)} uncovered PRD "
                         f"acceptance criterion/criteria):\n{_report}"
                     )
@@ -5008,7 +5223,7 @@ class Orchestrator:
                             + "（其余部分保持不变）。"
                             + self._violation_fix_guidance(
                                 _service_violations, _api_schema_violations,
-                                _gate_gaps,
+                                _gate_gaps, _ci_entry_violations,
                             )
                         )
                         continue

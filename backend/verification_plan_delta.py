@@ -124,12 +124,20 @@ _ID_RE = re.compile(r"^VP-(\d+)$")
 #: 2026-10-21：``replacement_for`` 也在这里 —— 替换 VP 与被它替换掉的那条
 #: VP 之间的指向关系必须落到计划文件里，否则"作废"在审计时是断的链：磁盘上
 #: 只看得到一条被作废的判据，看不到接替它的是哪条。
+#:
+#: 2026-11-08（repair-04）：``ci_entry`` 也在这里 —— 它是 ``full_ci`` 的
+#: **判据载荷**（整仓门禁的判定依据就是这条入口的退出码），与 ``request``
+#: 对 ``api_test`` 是同一类东西。不透传它，增量写下的入口落地即消失：落地
+#: 的是一条没有入口的空壳 ``full_ci``，被 :func:`vp_definition_gaps` 判成
+#: "缺 ci_entry" —— 而增量 LLM 明明写了。那条 gap 就是一句假话，操作者照着
+#: 它重声明多少次都过不去。
 ADD_THROUGH_FIELDS: Tuple[str, ...] = (
     "request",
     "assertions",
     "target_url",
     "timeout_seconds",
     "execution_group",
+    "ci_entry",
     REPLACEMENT_FOR_FIELD,
 )
 
@@ -264,13 +272,24 @@ def vp_definition_gaps(vp: Dict[str, Any]) -> List[str]:
     """这条 VP 还差什么才能算一条**完整**的定义（空列表 = 完整）。
 
     "完整"是执行器能判它的最低要求：**有标题**（说清要断言什么），
-    **方法在 ``SUPPORTED_METHODS`` 里**（框架会照它跑）。缺任何一样，
-    这条 VP 就跑不出结论 —— 重做交付物也救不了它，只能由操作者重新表达。
+    **方法在 ``SUPPORTED_METHODS`` 里**（框架会照它跑），**方法自己必需的
+    判据载荷在场**（``full_ci`` 的 ``ci_entry``）。缺任何一样，这条 VP 就
+    跑不出结论 —— 重做交付物也救不了它，只能由操作者重新表达。
 
     2026-10-24（VP-031）：这个判据以前只存在于护栏
     （``verification_agent._plan_delta_guard``），也就是**发号之后**才检查：
     号已经发出去了，条目却被整条丢掉，于是分配账本上留下一个没有定义的
     占位 id。把判据提到发号之前，缺定义的条目连号都拿不到。
+
+    2026-11-08（repair-04 / VP-024）：判据只看 title 与 method，于是
+    **方法自己必需的字段**没人管 —— 一条 ``verification_method`` 是
+    ``full_ci`` 却**没有 ``ci_entry``** 的 VP 在 ``apply_delta`` 里照样拿到
+    id、落进计划（VP-024 就是这么进的计划，round 2 替换 VP-022 时漏抄了
+    这个字段）。它跑起来在 schema 校验阶段就被拒（``ci_entry_missing``），
+    整仓门禁连同既有 500+ 用例的回归**一次都没跑过**，而计划看上去是齐的。
+
+    口径与 ``verification_ci_runner.validate_vp`` 一致：入口必须是一个
+    **非空字符串**（空串、纯空白、非字符串都算没给）。
 
     只读词汇表，不改任何东西 —— VP 的声明字段不可变：判据写错或缺失时由
     操作者重新表达，执行器不替它发明。
@@ -287,6 +306,16 @@ def vp_definition_gaps(vp: Dict[str, Any]) -> List[str]:
             f"verification_method {method or '(missing)'} 不在 "
             f"{list(SUPPORTED_METHODS)} 里"
         )
+    elif method == "full_ci":
+        # 整仓门禁的判定依据**就是**这条入口的退出码：没有入口，这条 VP
+        # 跑不出任何结论 —— 与 ``verification_ci_runner.validate_vp`` 的
+        # ``ci_entry_missing`` 口径保持一致。
+        entry = vp.get("ci_entry")
+        if not isinstance(entry, str) or not entry.strip():
+            gaps.append(
+                "full_ci 必须给出 ci_entry"
+                "（整仓门禁的判定依据就是这条入口的退出码）"
+            )
     return gaps
 
 
@@ -392,6 +421,11 @@ DELTA_SYSTEM_PROMPT = f"""你是资深测试架构师，负责维护一份**已�
    掉，同时在 `add` 里给出表达正确的那一条（`request` 与 `assertions` 写全）。
    作废是标记不是删除，审计痕迹要留着。
 
+10. **`full_ci` 必须自带 `ci_entry`**。整仓门禁的判定依据**就是**这条入口的
+    退出码 —— 没有入口的 `full_ci` 跑不出任何结论，框架会在**发号之前**就
+    把它整条拒掉（"缺 ci_entry"），连一个 id 都拿不到。写一条对项目 CI
+    适配脚本的调用（例如 `bash scripts/ci_gate.sh`），不要写内联复合命令。
+
 输出必须是**纯 JSON**（不要 markdown 代码块）：
 
 {{
@@ -414,7 +448,8 @@ DELTA_SYSTEM_PROMPT = f"""你是资深测试架构师，负责维护一份**已�
       "assertions": [                    // api_test 必填
         {{"name": "状态码", "status": 200}},
         {{"name": "响应类型是 JSON", "header": "content-type", "contains": "json"}}
-      ]
+      ],
+      "ci_entry": "bash scripts/ci_gate.sh"   // full_ci 必填
     }}
   ],
   "obsolete": [
