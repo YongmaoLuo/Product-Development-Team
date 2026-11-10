@@ -109,9 +109,17 @@ def plan_env(tmp_path, monkeypatch):
     )
     # Reset the per-plan dedup clock so the lazy check always acts.
     server_mod._WATCHDOG_STATS["per_plan_last_action_ts"].pop(PLAN, None)
+    # 2026-11-10: the thread-death branch now asks whether a background
+    # execution is outstanding before it declares a death (a hand-off
+    # ends the thread too).  The answer comes from the process-global
+    # ``_execution_state``, so the plan's entry is cleared here — a
+    # leftover from another test would make a dead thread look like a
+    # hand-off.
+    server_mod._execution_state.pop(PLAN, None)
     server_mod._verification_state[PLAN] = _running_state()
     yield plan_dir, tmp_root
     server_mod._verification_state.pop(PLAN, None)
+    server_mod._execution_state.pop(PLAN, None)
     sub_agent_registry.cleanup_for_plan(PLAN)
 
 
@@ -357,4 +365,41 @@ def test_live_process_suppresses_stale_flag(plan_env, monkeypatch):
     persist.assert_not_called(), (
         "a live process referencing the VP's /tmp artifacts proves the "
         "VP is running — never flag or kill it"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-10: the hand-off's own log file
+# ---------------------------------------------------------------------------
+
+def test_a_fresh_repair_log_suppresses_the_stale_flag(plan_env):
+    """A hand-off runs the repair round in ANOTHER process, and that
+    round's progress lands in ``logs/repair_*.log``.
+
+    The verification log is then legitimately silent — the verification
+    thread handed off and returned — while the repair round is healthy
+    and writing.  The staleness set did not read the repair log, so the
+    silence of the verification log read as a death: production,
+    2026-11-10, a plan was stamped ``failed / verification_log_stale``
+    while its repair executor was still running.
+
+    Same shape as the ``vp_attempts`` and ``execution.log`` globs that
+    already fix this class of bug: the progress is already being
+    written, the watchdog simply was not looking at the file it lands
+    in.  So this adds the file to the set — nothing else.
+    """
+    plan_dir, _ = plan_env
+    # The verification log is silent — the round handed off.
+    _write_round_log(plan_dir, mtime_age=3000.0)
+    # The repair round is alive and writing.
+    logs = plan_dir / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    repair = logs / "repair_20261110_101500.log"
+    repair.write_text("repair executor running\n", encoding="utf-8")
+
+    persist = _run_lazy_check()
+
+    persist.assert_not_called(), (
+        "a fresh repair log is proof the hand-off's repair round is "
+        "alive — the silent verification log must not kill it"
     )

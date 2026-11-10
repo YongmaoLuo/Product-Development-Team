@@ -427,5 +427,62 @@ class TestStripControlCharacters(unittest.TestCase):
         self.assertTrue(result["ok"])
 
 
+class TestVerdictObjectNotStolenByProseBrackets(unittest.TestCase):
+    """Regression for the 2026-11-10 VP-001 incident.
+
+    The model's last message carried a Markdown evidence table whose
+    cells contain literal ``[]`` (missing / extra column lists), and
+    prose that quotes a pseudo-object ``{round, round_source}``.
+    The real verdict object came *after* that, inside a ```json
+    fence.
+
+    The old locator tried only the FIRST ``{`` and the FIRST ``[``:
+    the pseudo-object failed to decode, the fallback latched onto
+    the table's empty array, and the caller received ``[]`` — so a
+    correct verdict was reported as "unparseable" three times in a
+    row.
+    """
+
+    REPLY = (
+        "| check | expected | actual |\n"
+        "| --- | --- | --- |\n"
+        "| api.get | (missing `[]`, extra `[]`) | ok |\n"
+        "\n"
+        "The trace shows `update({round, round_source})` for each row.\n"
+        "\n"
+        "```json\n"
+        '{"verdict": "PASSED", "reasons": ["all checks green"], "evidence": []}\n'
+        "```\n"
+    )
+
+    def test_returns_the_verdict_object_not_the_prose_empty_array(self):
+        result = parse_llm_json(self.REPLY)
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["verdict"], "PASSED")
+        self.assertEqual(result["reasons"], ["all checks green"])
+        self.assertEqual(result["evidence"], [])
+
+    def test_slice_starts_at_the_verdict_object(self):
+        # The extracted slice must be the object itself — not the
+        # ``[]`` from the table, not the pseudo-object in the prose.
+        slice_ = _extract_json_slice(self.REPLY)
+        self.assertIsNotNone(slice_)
+        self.assertTrue(slice_.startswith('{"verdict"'))
+        self.assertEqual(json.loads(slice_)["verdict"], "PASSED")
+
+    def test_negative_control_empty_array_only(self):
+        """Negative control: no decodable object anywhere → ``[]``.
+
+        Proves the fix is not "always return an object".
+        """
+        text = (
+            "| check | expected | actual |\n"
+            "| --- | --- | --- |\n"
+            "| api.get | (missing `[]`, extra `[]`) | ok |\n"
+        )
+        result = parse_llm_json(text)
+        self.assertEqual(result, [])
+
+
 if __name__ == "__main__":
     unittest.main()
