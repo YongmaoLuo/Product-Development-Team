@@ -14,6 +14,7 @@ Phases:
 import asyncio
 import functools
 import hashlib
+import inspect
 import json
 import logging
 
@@ -3608,6 +3609,89 @@ def _closes_round_start_marker(method):
             self._clear_round_started_at(round_number)
 
     return wrapper
+
+
+def _runner_accepts_round(runner: Any) -> bool:
+    """Can this runner be handed a ``round_no`` keyword?
+
+    2026-11-10（生产者轮次传递）：``run_ci_verification`` 认 ``round_no``
+    —— 它据此把本轮的 ``ci_output.json`` 另存一份
+    ``ci_output.round-<n>.json``（证据目录跨轮复用，不另存就会被下一轮覆盖）。
+
+    但**判分的那份 runner 不一定是本框架这份**：加载器每轮重新加载**被测树**
+    里的 ``verification_ci_runner``，所以一棵还没升级的树会给回一份**旧
+    runner**，签名里没有 ``round_no``。硬传就是 ``TypeError`` —— 而
+    ``_run_full_ci_vp`` 把调用包在 ``try``/``except`` 里，进程不会崩，
+    **每个 full_ci VP 都会变成 FAILED**（``full_ci runner crashed:
+    TypeError``）：一份旧判分器会伪装成一份坏产品。
+
+    所以这里只读**签名**，不猜：
+
+    * 签名里有 ``round_no``（位置或关键字均可）→ 接受；
+    * 签名里有 ``**kwargs`` → 接受（它什么都收）；
+    * 签名**读不出来**（``TypeError`` / ``ValueError``）→ **不接受** ——
+      读不出来的签名不是猜的许可证；
+    * ``*args`` 里的 ``round_no`` 不算：那个位置传不进去。
+
+    Args:
+        runner: The callable that will be invoked as the runner.
+
+    Returns:
+        True when ``round_no`` can be passed as a keyword.
+    """
+    try:
+        signature = inspect.signature(runner)
+    except (TypeError, ValueError):
+        return False
+
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if parameter.name != "round_no":
+            continue
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+    return False
+
+
+def _ci_runner_kwargs(
+    *,
+    runner: Any,
+    project_dir: Any,
+    artifact_dir: Any,
+    round_no: Any,
+) -> Dict[str, Any]:
+    """The keyword arguments to call the CI runner with.
+
+    2026-11-10（生产者轮次传递）：轮次号只在两个条件都成立时才传 ——
+    **这一轮有号**（正整数），且**这份 runner 收得下**。少一个都不传：
+    传了旧 runner 收不下的参数会把每个 full_ci VP 打成 FAILED，而传了
+    第 0 轮会写出一份契约里没有名字的 ``ci_output.round-0.json``。
+
+    Args:
+        runner: The runner that will be invoked.
+        project_dir: The project the gate runs in.
+        artifact_dir: Where the artifacts are written.
+        round_no: The round this run belongs to.
+
+    Returns:
+        The keyword arguments for the runner call.
+    """
+    kwargs: Dict[str, Any] = {
+        "project_dir": project_dir,
+        "artifact_dir": artifact_dir,
+    }
+    if isinstance(round_no, bool) or not isinstance(round_no, int):
+        return kwargs
+    if round_no <= 0:
+        return kwargs
+    if not _runner_accepts_round(runner):
+        return kwargs
+    kwargs["round_no"] = round_no
+    return kwargs
 
 
 class Orchestrator:
@@ -10397,6 +10481,15 @@ class Orchestrator:
 
         Never raises — :func:`verification_ci_runner.run_ci_verification`
         turns every failure mode into a FAILED verdict carrying its reason.
+
+        The round is handed to the runner **only when the runner can take
+        it** (2026-11-10): the runner writes this round's copy of the
+        artifact under its own name (``ci_output.round-<n>.json``), but
+        the tree under test may still carry an **older** runner whose
+        signature has no ``round_no`` — passing it anyway would raise
+        ``TypeError`` and turn every ``full_ci`` VP into a FAILED verdict
+        reading ``full_ci runner crashed``.  See
+        :func:`_ci_runner_kwargs`.
         """
         vp_id = str(vp.get("id", "unknown"))
         provenance: Dict[str, Any] = {}
@@ -10423,8 +10516,12 @@ class Orchestrator:
         try:
             result = run_ci_verification(
                 vp,
-                project_dir=self.project_dir,
-                artifact_dir=self.plan_dir / "vp_artifacts",
+                **_ci_runner_kwargs(
+                    runner=run_ci_verification,
+                    project_dir=self.project_dir,
+                    artifact_dir=self.plan_dir / "vp_artifacts",
+                    round_no=getattr(self, "_current_round", 0),
+                ),
             )
         except Exception as exc:  # noqa: BLE001 - runner never raises
             logger.exception(
