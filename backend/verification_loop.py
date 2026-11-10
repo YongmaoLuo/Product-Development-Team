@@ -2644,6 +2644,47 @@ def _lazy_check_verification(plan_id: str) -> None:
             # doesn't crash or rewrite the state.
             thread_alive = True
         if not thread_alive:
+            # 2026-11-10: an ended thread is NOT proof of death.  The
+            # verification loop has two exits (see
+            # :class:`_VerificationLoopOutcome`): a *terminal* verdict, and
+            # a *hand-off* — the loop dispatched a background repair
+            # execution (:func:`_run_repair_execution_async`, which spawns
+            # and returns immediately) and will resume from its
+            # ``on_complete`` callback.  The hand-off ends the thread
+            # exactly like a verdict does, so "the thread is gone" cannot
+            # tell the two apart.  It used to be read as a death, and a
+            # healthy repair round was written off 26 seconds after it
+            # started while the repair executor was still running.
+            #
+            # ``_plan_execution_in_flight`` is the ONE answer in the
+            # process to "is a background execution outstanding for this
+            # plan" — the same predicate the loop's own hand-off
+            # recording uses.  So the ladder asks it BEFORE declaring a
+            # death, and the two criteria stay in one place.
+            #
+            # A failure to read the record is treated as "not a
+            # hand-off" — the conservative direction: a real hand-off we
+            # failed to see is judged dead (the plan stops, loudly), and
+            # a real death is never mistaken for a hand-off (which would
+            # leave a dead round holding the plan forever, silently).
+            try:
+                _handed_off = bool(_server._plan_execution_in_flight(plan_id))
+            except Exception:
+                _handed_off = False
+                _server.logger.exception(
+                    "[verification_watchdog] the in-flight execution record "
+                    "could not be read — treating the thread end as a death "
+                    "plan=%s", plan_id,
+                )
+            if _handed_off:
+                _server.logger.info(
+                    "[verification_watchdog] thread ended in a hand-off — "
+                    "a repair execution is still in flight plan=%s", plan_id,
+                )
+                # Not a death: no stop_reason, no death sequence, no
+                # lease release, no phase change.  The plan stays as it
+                # is and the repair round keeps running.
+                return
             stop_reason = "verification_thread_died_unexpectedly"
             _server.logger.warning(
                 "[verification_watchdog] thread dead plan=%s", plan_id,
@@ -2776,6 +2817,19 @@ def _lazy_check_verification(plan_id: str) -> None:
                         "logs/verification_*.log",
                         "logs/vp_attempts/*.log",
                         "execution.log",
+                        # 2026-11-10: a hand-off runs the repair round in
+                        # ANOTHER process, and its progress lands in
+                        # ``logs/repair_*.log`` — a file this set did not
+                        # read.  So during a hand-off the verification log
+                        # is legitimately silent and the repair round
+                        # healthy, and the watchdog read the silence as a
+                        # death.  Same shape as the ``vp_attempts`` and
+                        # ``execution.log`` globs above: busy, but written
+                        # to a file this watchdog was not looking at.
+                        # Nothing new is invented here — the repair round
+                        # already writes its own progress; the watchdog
+                        # simply has to look at the same file.
+                        "logs/repair_*.log",
                     ),
                     "verification_log_stale",
                 ),

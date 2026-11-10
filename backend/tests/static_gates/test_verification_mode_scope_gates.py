@@ -777,8 +777,18 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的
     # 范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
     # 任何再编辑照样红。
+    # 2026-11-10：「交棒不得被判成线程死亡」这一已批准改动修改了
+    # `verification_loop.py`——死亡阶梯的 `not thread_alive` 分支先问
+    # `_plan_execution_in_flight(plan_id)`（交棒时返回 True → 记 INFO 后直接返回，
+    # 不判死；读记录抛异常按「不是交棒」处理），新鲜度 glob 集合加入
+    # `logs/repair_*.log`（修复轮在另一个进程里跑，进度写在那个文件里）。
+    # 改动全部落在本文件，相对上一版冻结基线（7b4385a3…）为 +54/-0，
+    # 没有夹带别的改动；按本 gate 的既定流程把冻结基线前移到本分支的批准态哈希。
+    # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的
+    # 范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
+    # 任何再编辑照样红。
     "backend/verification_loop.py": (
-        "7b4385a324cc52efe76d73a54eda3c133fb49cc1d49ec8c512bd277904e49acb"
+        "dc4b2d8816092d8880b8edeb9e445b855733cf79bffff185e4b8a8f642db5d2e"
     ),
 }
 

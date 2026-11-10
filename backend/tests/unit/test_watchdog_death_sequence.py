@@ -214,6 +214,7 @@ def death_env(tmp_path, monkeypatch):
     }
 
     server_mod._verification_state.pop(PLAN_ID, None)
+    server_mod._execution_state.pop(PLAN_ID, None)
     server_mod._WATCHDOG_STATS["per_plan_last_action_ts"].pop(PLAN_ID, None)
 
 
@@ -536,3 +537,149 @@ def test_a_failing_cleanup_still_writes_the_terminal_state(death_env):
     assert _phase(death_env["db_path"], PLAN_ID) == "failed", (
         "a cleanup that raised must not stop the terminal state"
     )
+
+
+# ---------------------------------------------------------------------------
+# 6. A hand-off is not a death (2026-11-10)
+# ---------------------------------------------------------------------------
+#
+# The verification loop has TWO exits (see ``_VerificationLoopOutcome``):
+#
+#   * terminal  — the loop reached a verdict; nothing will pick it up;
+#   * hand-off  — the loop dispatched a background repair execution
+#     (``_run_repair_execution_async``, which spawns and returns
+#     immediately) and will resume from its ``on_complete`` callback.
+#
+# The hand-off ENDS THE THREAD, exactly like a verdict does.  So "the
+# thread is gone" cannot tell the two apart, and the watchdog read it
+# as a death: production, 2026-11-10, a healthy repair round was stamped
+# ``failed / verification_thread_died_unexpectedly`` 26 seconds after the
+# repair executor was spawned, while the executor was still running.
+#
+# What a hand-off leaves behind is a live execution record — the repair
+# execution is outstanding — and ``_plan_execution_in_flight`` is the ONE
+# answer in the process to "is a background execution outstanding for this
+# plan".  The watchdog asks it BEFORE declaring a death.
+
+
+def _running_execution_record() -> Dict[str, Any]:
+    """The record a hand-off leaves behind: a repair execution in flight.
+
+    This is the shape ``_run_repair_execution_async`` seeds: ``status``
+    ``running``, ``ended_at`` unset (it is cleared by the watcher thread
+    once ``process.wait()`` returns).
+    """
+    return {
+        "status": "running",
+        "ended_at": None,
+        "pid": 4242,
+        "project_dir": "/tmp/example-project",
+        "started_at": "2026-11-10T10:15:00",
+        "log_path": "logs/repair_20261110_101500.log",
+    }
+
+
+def test_a_hand_off_is_not_a_thread_death(death_env):
+    """An ended thread plus a live repair execution is a HAND-OFF.
+
+    The plan must not be written off: the repair round is still running,
+    so there is nothing to clean up, no lease to release, no round to
+    invalidate and no phase to move.  The plan stays exactly as it is.
+    """
+    server_mod._execution_state[PLAN_ID] = _running_execution_record()
+    # The fixture must really look like a hand-off — otherwise the test
+    # would pass for the wrong reason.
+    assert server_mod._plan_execution_in_flight(PLAN_ID) is True, (
+        "the fixture must leave a live execution record behind"
+    )
+
+    with patch.object(
+        server_mod, "_cleanup_dead_verification_processes",
+    ) as cleanup, patch.object(
+        vl, "force_release_verification_workflow_lease",
+    ) as release, patch.object(
+        vl.zombie_rounds, "invalidate",
+    ) as invalidate, patch.object(
+        server_mod, "_persist_verification_terminal",
+    ) as persist:
+        _run_watchdog()
+
+    persist.assert_not_called(), (
+        "a hand-off must not be terminalised — the repair round is still "
+        "running and the loop will resume in its on_complete callback"
+    )
+    cleanup.assert_not_called(), (
+        "a hand-off must not kill anything: the repair executor is a "
+        "different process and is not this round's leftovers"
+    )
+    release.assert_not_called(), (
+        "a hand-off must not release the lease — the workflow is still "
+        "running and still owns the plan"
+    )
+    invalidate.assert_not_called(), (
+        "a hand-off must not invalidate the round — it is the round that "
+        "is about to be resumed"
+    )
+    assert server_mod._verification_state[PLAN_ID]["verification_status"] == (
+        "running"
+    ), "the round must still read as running"
+    assert _phase(death_env["db_path"], PLAN_ID) == "verification_running", (
+        "the plan's phase must not move — nothing about this plan died"
+    )
+
+
+def test_a_dead_thread_without_a_hand_off_is_still_a_death(death_env):
+    """NEGATIVE CONTROL: with no execution in flight, the death stands.
+
+    The hand-off check must not be a way of switching the death
+    judgement off.  A thread that ended with nothing outstanding behind
+    it is a thread that died, and it is written off exactly as before.
+    """
+    with patch.object(
+        server_mod, "_plan_execution_in_flight", return_value=False,
+    ), patch.object(
+        server_mod, "_cleanup_dead_verification_processes",
+    ), patch.object(
+        vl, "force_release_verification_workflow_lease", return_value=True,
+    ):
+        _run_watchdog()
+
+    assert _phase(death_env["db_path"], PLAN_ID) == "failed", (
+        "a dead thread with no repair execution in flight must still be "
+        "written off"
+    )
+    assert zombie_rounds.is_invalidated(
+        death_env["plan_dir"], DEAD_TOKEN,
+    ), "the dead round must still be marked dead"
+    mark = zombie_rounds.invalidated_round(death_env["plan_dir"])
+    assert mark is not None and mark["reason"] == (
+        "verification_thread_died_unexpectedly"
+    ), f"the mark must still name the thread death: {mark!r}"
+
+
+def test_an_unreadable_execution_record_is_treated_as_a_death(death_env):
+    """NEGATIVE CONTROL: a failed read is judged as a death, not a hand-off.
+
+    The conservative direction.  If the record cannot be read we cannot
+    know that a repair execution is outstanding, and a real death must
+    never be mistaken for a hand-off — that would leave a dead round
+    holding the plan forever, silently.  A real hand-off we failed to
+    see is written off loudly, which is the recoverable mistake.
+    """
+    with patch.object(
+        server_mod, "_plan_execution_in_flight",
+        side_effect=RuntimeError("the record could not be read"),
+    ), patch.object(
+        server_mod, "_cleanup_dead_verification_processes",
+    ), patch.object(
+        vl, "force_release_verification_workflow_lease", return_value=True,
+    ):
+        _run_watchdog()
+
+    assert _phase(death_env["db_path"], PLAN_ID) == "failed", (
+        "an unreadable execution record must not be read as a hand-off"
+    )
+    mark = zombie_rounds.invalidated_round(death_env["plan_dir"])
+    assert mark is not None and mark["reason"] == (
+        "verification_thread_died_unexpectedly"
+    ), f"the mark must still name the thread death: {mark!r}"
