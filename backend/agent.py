@@ -10538,6 +10538,112 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                 paths.append(path)
         return paths
 
+    def _paths_owned_by_other_tasks(self, task, baseline, paths) -> set[str]:
+        """The subset of ``paths`` demonstrably written by other tasks.
+
+        Two independent signals:
+          1. commits in ``<baseline>..HEAD`` whose subject matches
+             ``[task-<id>]``, where ``<id>``'s lineage root is not this
+             task's;
+          2. paths currently locked by another task
+             (``FileLockBroker.holders()``).
+
+        Conservative: a path is returned only when every signal that
+        mentions it points at another task. Untagged commits and mixed
+        ownership keep the path in this task's change set.
+        """
+        if not baseline or not paths:
+            return set()
+        project_dir = getattr(task, "project_dir", None) or self.project_dir
+        if not project_dir:
+            return set()
+
+        wanted: dict[str, str] = {}
+        for raw in paths:
+            norm = _normalise_repo_path(raw)
+            if norm:
+                wanted.setdefault(norm, raw)
+
+        my_lineage = self._lineage_id(getattr(task, "id", "") or "")
+
+        # -- signal 1: commit attribution -----------------------------
+        commit_lineages: dict[str, set[str]] = {}
+        untagged_paths: set[str] = set()
+        try:
+            log = subprocess.run(
+                [
+                    "git",
+                    "log",
+                    "--format=%x01%s",
+                    "--name-only",
+                    f"{baseline}..HEAD",
+                    "--",
+                ],
+                cwd=str(project_dir),
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except Exception:
+            log = None
+        if log is None or log.returncode != 0:
+            # Git could not answer. Filtering on a partial answer would
+            # be a guess, so nothing is filtered at all — the behaviour
+            # is exactly what it was before this filter existed.
+            return set()
+        for chunk in (log.stdout or "").split("\x01"):
+            lines = chunk.split("\n")
+            if not lines:
+                continue
+            subject = lines[0].strip()
+            match = re.match(r"^\[task-([^\]]+)\]", subject)
+            lineage = self._lineage_id(match.group(1)) if match else None
+            for raw in lines[1:]:
+                norm = _normalise_repo_path(raw.strip())
+                if not norm:
+                    continue
+                if lineage is None:
+                    untagged_paths.add(norm)
+                else:
+                    commit_lineages.setdefault(norm, set()).add(lineage)
+
+        # -- signal 2: lock ownership ---------------------------------
+        lock_owner: dict[str, str] = {}
+        broker = None
+        try:
+            broker = self._active_lock_broker()
+        except Exception:
+            broker = None
+        if broker is not None:
+            try:
+                holders = broker.holders()
+            except Exception:
+                holders = {}
+            for tid, keys in (holders or {}).items():
+                lineage = self._lineage_id(tid)
+                for key in keys or []:
+                    norm = _normalise_repo_path(key)
+                    if norm and norm not in lock_owner:
+                        lock_owner[norm] = lineage
+
+        other: set[str] = set()
+        for norm in wanted:
+            if norm in untagged_paths:
+                continue
+            lineages = commit_lineages.get(norm, set())
+            commit_says_other = bool(lineages) and my_lineage not in lineages
+            commit_says_mine = my_lineage in lineages
+            lock_lineage = lock_owner.get(norm)
+            lock_says_other = lock_lineage is not None and lock_lineage != my_lineage
+            lock_says_mine = lock_lineage == my_lineage
+            if not (commit_says_other or lock_says_other):
+                continue
+            if commit_says_mine or lock_says_mine:
+                continue
+            other.add(norm)
+        return other
+
     def _undeclared_writes_this_attempt(self, task, baseline) -> list[str]:
         """The paths this attempt changed that the task never declared.
 
@@ -10552,8 +10658,20 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
         """
         if not baseline:
             return []
+        changed = self._changed_paths_since(task, baseline)
+        other = self._paths_owned_by_other_tasks(task, baseline, changed)
+        if other and self.logger:
+            self.logger.info(
+                "task_undeclared_write_attributed",
+                (
+                    f"Task [{task.id}]: {len(other)} changed path(s) belong to "
+                    f"other tasks; excluded from the undeclared-write check."
+                ),
+                task_id=task.id,
+                data={"paths": sorted(other)[:20]},
+            )
         return excess_declared_paths(
-            self._changed_paths_since(task, baseline),
+            [p for p in changed if _normalise_repo_path(p) not in other],
             _declared_modification_files(task),
         )
 
