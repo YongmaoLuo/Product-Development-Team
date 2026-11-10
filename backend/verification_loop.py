@@ -106,46 +106,18 @@ from hitl.waiter import wait_for_decision
 #: it would kill a healthy call) and BELOW the 3600 s watchdog hard
 #: cap (otherwise the outer watchdog would fire first and this cap
 #: would be decoration).
-VERIFICATION_LLM_QUERY_CAP_SECONDS: float = 2700.0
-
-#: The environment variable that overrides the cap.
-VERIFICATION_LLM_QUERY_CAP_ENV = "PDT_VERIFICATION_LLM_TIMEOUT_SECONDS"
-
-
-def _verification_query_cap_seconds() -> float:
-    """The wall cap for one verification LLM query, in seconds.
-
-    The environment override wins over the default.  A value that is
-    not a number, or that is not positive, falls back to the default
-    rather than to a dispatch that dies on its first tick.
-    """
-    raw = os.environ.get(VERIFICATION_LLM_QUERY_CAP_ENV)
-    if raw is None or not str(raw).strip():
-        return VERIFICATION_LLM_QUERY_CAP_SECONDS
-    try:
-        value = float(str(raw).strip())
-    except (TypeError, ValueError):
-        return VERIFICATION_LLM_QUERY_CAP_SECONDS
-    if value <= 0:
-        return VERIFICATION_LLM_QUERY_CAP_SECONDS
-    return value
-
-
-def _apply_verification_query_cap(tool: Any) -> None:
-    """Give a verification coding tool the wall cap for its queries.
-
-    A cap nobody sets is a cap nobody has: without this the
-    verification dispatches are unbounded, exactly as they were before.
-
-    A tool that is ``None`` is left alone — the round has no coding
-    tool at all, and that is a failure the round reports in its own
-    way.  Crashing here instead would take the round down with an
-    ``AttributeError`` that says nothing about what actually went
-    wrong.
-    """
-    if tool is None:
-        return
-    tool.query_wall_cap_seconds = _verification_query_cap_seconds()
+#:
+#: 2026-11-10: the cap and its resolver LIVE in ``coding_tool`` now,
+#: and they are re-exported here so that
+#: ``import verification_loop.VERIFICATION_LLM_QUERY_CAP_SECONDS``
+#: keeps working.  The cap is applied by the tool itself, at
+#: construction time, when the scene is ``verification`` — so every
+#: way of building a verification tool inherits it, and no call site
+#: has to remember to set it.
+from coding_tool import (  # noqa: F401
+    VERIFICATION_LLM_QUERY_CAP_SECONDS,
+    VERIFICATION_LLM_QUERY_CAP_ENV,
+)
 
 
 def _verification_event_logger(plan_dir: Path):
@@ -8373,7 +8345,10 @@ def _make_repair_on_complete(
                     # capped like every other verification query: a
                     # dispatch that outstays the ceiling is killed and
                     # fails with a HardTimeoutError.
-                    _apply_verification_query_cap(_coding_tool)
+                    # 2026-11-10: the cap now comes from the tool
+                    # itself — ``create_coding_tool`` builds a
+                    # verification-scene tool, and that tool carries
+                    # the ceiling from its own constructor.
                     _register_round_tool(plan_dir, round_token, _coding_tool)
                     _verif_repo = None
                     try:
@@ -9068,7 +9043,9 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
             # The heartbeat says "still here"; this says "and not past
             # this".  A dispatch that outstays it has its process group
             # killed and fails with a HardTimeoutError.
-            _apply_verification_query_cap(coding_tool)
+            # 2026-11-10: the cap is the tool's own construction-time
+            # default now — there is no second place that has to
+            # remember to set it, so there is no way to lose it.
             # 2026-11-01: the tool is the orchestrator's own, and its
             # ``coding_query_*`` child is the one process the old cleanup
             # could not reach — a tool is not a registry handle, so

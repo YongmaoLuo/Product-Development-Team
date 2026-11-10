@@ -1499,6 +1499,9 @@ class VerificationSubAgent:
                     "elapsed": e.elapsed,
                     "threshold": e.threshold,
                     "output_file": e.output_file,
+                    # 2026-11-10: whether the in-flight dispatch was
+                    # actually ended when the outer cap fired.
+                    "killed": bool(getattr(e, "killed", False)),
                 })
                 summarizer_verdict = await self._summarize_vp_result(
                     vp_node=vp_node,
@@ -1883,6 +1886,30 @@ class VerificationSubAgent:
                 # ``ui_validation`` / ``e2e``) — the log line says which
                 # budget actually ran out.
                 outer_cap = float(self.wall_clock_cap())
+                # 2026-11-10: the outer cap fired, and the dispatch it
+                # was watching is STILL RUNNING.  Logging and handing
+                # the VP to the summarizer did not end it — and the
+                # ``finally`` below unregisters the only handle that
+                # could reach the process.  So the in-flight dispatch is
+                # ended HERE, by the one action that ends it, BEFORE
+                # the exception (and the unregister) travel on.
+                #
+                # ``getattr`` because a test double need not carry the
+                # method: a stand-in without it must not turn the outer
+                # cap into a crash.
+                kill_fn = getattr(scoped_tool, "kill_in_flight_dispatch", None)
+                killed = False
+                if kill_fn is not None:
+                    try:
+                        killed = bool(
+                            kill_fn(f"vp_outer_cap:{vp_id_log}"),
+                        )
+                    except Exception:
+                        # The kill is best-effort here: the outer cap
+                        # has already fired, and refusing to report the
+                        # stuck agent would lose the summarizer route
+                        # as well.
+                        killed = False
                 self.logger.warning(
                     "[STUCK SUB-AGENT] vp_id=%s outer_cap=%.0fs "
                     "(wall_clock_cap=%d) "
@@ -1890,12 +1917,17 @@ class VerificationSubAgent:
                     vp_id_log, outer_cap,
                     self.wall_clock_cap(), output_file,
                 )
-                raise StuckAgentError(
+                stuck_error = StuckAgentError(
                     elapsed=outer_cap,
                     threshold=outer_cap,
                     vp_id=vp_id_log,
                     output_file=output_file,
                 )
+                # Whether the in-flight dispatch was actually ended —
+                # the log below says so, so an operator can tell "the
+                # CLI was killed" from "there was nothing to kill".
+                stuck_error.killed = killed
+                raise stuck_error
             except Exception as e:
                 # 2026-09-07: distinguish watchdog kills from
                 # genuine coding-tool failures. Read the per-handle
@@ -2895,6 +2927,9 @@ class StuckAgentError(Exception):
             ``None`` if pytest never produced one (in which case the
             summarizer degrades to ``FAILED, reasons=["no test
             output captured"]``).
+        killed: Whether the in-flight dispatch was actually ended when
+            the outer cap fired (2026-11-10).  ``False`` means there
+            was nothing to kill, or the kill could not be attempted.
     """
 
     def __init__(
@@ -2908,6 +2943,10 @@ class StuckAgentError(Exception):
         self.threshold = threshold
         self.vp_id = vp_id
         self.output_file = output_file
+        # 2026-11-10 — the outer cap ends the in-flight dispatch
+        # before it raises; this carries the answer ("was there
+        # something to kill?") to the log that reports the routing.
+        self.killed: bool = False
         super().__init__(
             f"stuck sub-agent for vp_id={vp_id}: query_json ran for "
             f"{elapsed:.1f}s (threshold={threshold:.1f}s); routing to "

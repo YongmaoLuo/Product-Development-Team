@@ -3709,6 +3709,46 @@ STREAM_BREAKER_TEXT = (
 )
 
 
+#: The wall-clock cap for ONE verification LLM query (2026-11-01).
+#:
+#: The heartbeat makes a waiting dispatch VISIBLE — one
+#: ``coding_query_progress`` line per interval — but visible is not
+#: bounded: a dispatch could keep a healthy heartbeat for hours and the
+#: operator watching the log would see nothing wrong.  This is the
+#: ceiling that ends it: a query that outstays the cap has its process
+#: group killed and fails with ``HardTimeoutError``, the class the
+#: verification layer routes into auto-split / auto-refine.
+#:
+#: The number is not arbitrary.  It sits ABOVE the 900 s silence
+#: threshold (a dispatch that keeps printing is not silent, and killing
+#: it would kill a healthy call) and BELOW the 3600 s watchdog hard
+#: cap (otherwise the outer watchdog would fire first and this cap
+#: would be decoration).
+VERIFICATION_LLM_QUERY_CAP_SECONDS: float = 2700.0
+
+#: The environment variable that overrides the cap.
+VERIFICATION_LLM_QUERY_CAP_ENV = "PDT_VERIFICATION_LLM_TIMEOUT_SECONDS"
+
+
+def _verification_query_cap_seconds() -> float:
+    """The wall cap for one verification LLM query, in seconds.
+
+    The environment override wins over the default.  A value that is
+    not a number, or that is not positive, falls back to the default
+    rather than to a dispatch that dies on its first tick.
+    """
+    raw = os.environ.get(VERIFICATION_LLM_QUERY_CAP_ENV)
+    if raw is None or not str(raw).strip():
+        return VERIFICATION_LLM_QUERY_CAP_SECONDS
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return VERIFICATION_LLM_QUERY_CAP_SECONDS
+    if value <= 0:
+        return VERIFICATION_LLM_QUERY_CAP_SECONDS
+    return value
+
+
 class ClaudeCodingTool(CodingTool):
     """Claude Code CLI tool using stdin/stdout stream-json protocol.
 
@@ -3932,6 +3972,20 @@ class ClaudeCodingTool(CodingTool):
         # scene chain via ``provider_routing.resolve_provider_chain``
         # (hot-reload friendly) and uses its candidates exclusively.
         self.scene = scene
+        # 2026-11-10 — the wall cap for a verification query is a
+        # CONSTRUCT-TIME default, not something a caller has to
+        # remember to set.  It used to be applied by a helper in the
+        # verification loop, at two call sites, which meant every
+        # OTHER way of building a verification tool (the scoped clone
+        # the sub-agent builds per VP, for one) silently lost the cap:
+        # a tool with no cap never expires, and a dispatch that never
+        # expires is the thing this cap exists to prevent.
+        #
+        # Only the ``verification`` scene is capped.  Every other scene
+        # keeps the class default ``None`` — "no ceiling" — so a tool
+        # outside verification does not grow a kill path it never had.
+        if self.scene == "verification":
+            self.query_wall_cap_seconds = _verification_query_cap_seconds()
         # current_call_model: the ANTHROPIC_MODEL env value stamped on
         # the child process for the in-flight call (usage-registry
         # metadata). Set per dispatch inside _run_claude_interactive.
@@ -7077,18 +7131,32 @@ class ClaudeCodingTool(CodingTool):
 
     # -- the wall cap (2026-11-01) ---------------------------------------
 
-    def _kill_query_for_wall_cap(self) -> bool:
-        """Kill the in-flight dispatch because the wall cap expired.
+    def kill_in_flight_dispatch(self, reason: str = "wall_cap_expired") -> bool:
+        """End the in-flight dispatch: kill the process group it owns.
+
+        This is THE one action that ends a dispatch that is still
+        running.  Two callers need it — the wall-cap reporter, whose
+        timer fires when a query outstays its ceiling, and the
+        verification layer's outer cap, which used to log and hand the
+        VP to the summarizer while the CLI kept running (and then
+        unregistered the only handle that could reach it).
 
         Returns True when a process group was killed, False when there
         was nothing to kill — no process, or a process that had already
         exited.  The difference matters: killing a corpse is not a
-        kill, and the caller has to be able to tell "the cap ended the
-        dispatch" from "the cap found nothing to end".
+        kill, and the caller has to be able to tell "the dispatch was
+        ended" from "there was nothing to end".
+
+        ``reason`` names WHY the dispatch was ended; it rides along in
+        the log so the operator can tell a wall-cap expiry from an
+        outer-cap expiry without reading the code.  The default names
+        the case this action was born for — the query wall cap — and
+        every other caller says its own reason out loud.
         """
         with self._process_lock:
             proc = self._current_process
         if proc is None:
+            self._log_dispatch_kill(reason, False, None)
             return False
         try:
             already_gone = proc.poll() is not None
@@ -7098,6 +7166,7 @@ class ClaudeCodingTool(CodingTool):
             with self._process_lock:
                 if self._current_process is proc:
                     self._current_process = None
+            self._log_dispatch_kill(reason, False, proc)
             return False
         try:
             # ``wait_timeout=0``: the reporter's thread runs this, and a
@@ -7109,7 +7178,36 @@ class ClaudeCodingTool(CodingTool):
         with self._process_lock:
             if self._current_process is proc:
                 self._current_process = None
+        self._log_dispatch_kill(reason, True, proc)
         return True
+
+    def _log_dispatch_kill(
+        self, reason: str, killed: bool, proc: Any,
+    ) -> None:
+        """Say in the log that an in-flight dispatch was ended.
+
+        A kill nobody can see is a kill nobody can audit: the process
+        ledger records the signals the ROUND cleanup sent, and this
+        line is what tells the operator which dispatch died and why.
+        Never fatal — a logger that raises must not take the kill path
+        down with it.
+        """
+        if self.logger is None:
+            return
+        try:
+            pid = getattr(proc, "pid", None)
+            self.logger.info(
+                "coding_query_dispatch_killed",
+                f"in-flight dispatch ended (killed={killed} reason={reason or 'unspecified'})",
+                data={
+                    "killed": killed,
+                    "reason": reason or "unspecified",
+                    "pid": pid,
+                    "scene": self.scene,
+                },
+            )
+        except Exception:
+            pass
 
     def _query_wall_timeout_error(self) -> Optional["HardTimeoutError"]:
         """The failure for a wall-cap expiry, or ``None``.
@@ -8324,7 +8422,7 @@ class ClaudeCodingTool(CodingTool):
                 # place the cap can be enforced from.  ``None`` (the
                 # default) means "no ceiling" and changes nothing.
                 wall_cap_seconds=self.query_wall_cap_seconds,
-                on_wall_timeout=self._kill_query_for_wall_cap,
+                on_wall_timeout=self.kill_in_flight_dispatch,
             )
             # The tool remembers the reporter watching this dispatch:
             # the cap is enforced by the reporter, but the FAILURE has
