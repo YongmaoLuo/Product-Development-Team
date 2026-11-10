@@ -539,6 +539,11 @@ class FileLockBroker:
         with self._cond:
             return sorted(self._held.get(task_id, {}))
 
+    def holders(self) -> Dict[str, List[str]]:
+        """Snapshot of task_id -> currently held canonical keys."""
+        with self._cond:
+            return {tid: sorted(keys) for tid, keys in self._held.items() if keys}
+
     def waiting(self, key: str) -> List[str]:
         """Task ids queued for an already-canonical ``key``."""
         with self._cond:
