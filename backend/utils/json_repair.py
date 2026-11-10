@@ -169,6 +169,12 @@ def _extract_json_slice(text: str) -> Optional[str]:
       Handles "JSON wrapped in conversational prose" and
       "primary-JSON + trailing-JSON" by keeping only the first.
 
+      Every position of the opener is tried (not just the first
+      one), and the ``{`` pass runs to exhaustion before the ``[``
+      pass starts — so an object further down the text wins over an
+      array earlier in it, even when the earlier array is a
+      decodable value.
+
     * **Open-ended** (likely truncation): if no closing bracket
       exists but a bracket opener does, returns the substring
       from the opener to the end of ``text``. The repair walker
@@ -176,15 +182,42 @@ def _extract_json_slice(text: str) -> Optional[str]:
     """
     decoder = json.JSONDecoder()
     # Try to find a complete top-level value anywhere in the text.
+    #
+    # Every *position* of the opener is tried, in order of appearance
+    # — not just the first one. The first ``{`` in an LLM reply is
+    # often a pseudo-object quoted in prose (e.g. ``{round,
+    # round_source}``) and the first ``[`` is often a literal empty
+    # array in a Markdown table (e.g. ``(missing `[]`, extra
+    # `[]`)``). Under the old "first occurrence only" rule the
+    # pseudo-object failed to decode, the fallback latched onto the
+    # empty array, and the caller got ``[]`` instead of the real
+    # verdict object that appeared further down the reply.
+    #
+    # ``{`` is still preferred over ``[``: the whole ``{`` pass runs
+    # to exhaustion before the ``[`` pass starts, so a decodable
+    # object anywhere in the text beats an array.
     for opener in ("{", "["):
-        opener_pos = text.find(opener)
-        if opener_pos == -1:
-            continue
-        try:
-            obj, end = decoder.raw_decode(text, opener_pos)
-            return text[opener_pos:end]
-        except json.JSONDecodeError:
-            pass
+        start = 0
+        while True:
+            opener_pos = text.find(opener, start)
+            if opener_pos == -1:
+                break
+            try:
+                obj, end = decoder.raw_decode(text, opener_pos)
+                return text[opener_pos:end]
+            except json.JSONDecodeError as exc:
+                # A failure *at* the end of the text (or an unterminated
+                # string) means the value that starts here runs off the
+                # end of the reply — it is truncated, not merely
+                # malformed. Everything after this point is *inside*
+                # that truncated value, so scanning further positions
+                # would hand back a nested fragment (e.g. the inner
+                # ``{"severity": "low", ...}`` of a truncated
+                # ``{"findings": [ ... ``). Stop here and let the
+                # open-ended (repair) path below close the value.
+                if exc.pos >= len(text) or exc.msg.startswith("Unterminated string"):
+                    break
+                start = opener_pos + 1
 
     # No complete value parsed. Try open-ended (truncation case).
     for opener in ("{", "["):
