@@ -769,8 +769,16 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的
     # 范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
     # 任何再编辑照样红。
+    # 2026-11-10：「查询墙钟上限与判死击杀各收敛到一个点」这一已批准改动修改了
+    # `verification_loop.py`——删掉了 `_apply_verification_query_cap` 及其两个调用点
+    # （修复轮构造工具处、主循环调度处），常量 `VERIFICATION_LLM_QUERY_CAP_SECONDS`
+    # 与 `VERIFICATION_LLM_QUERY_CAP_ENV` 改为从 `coding_tool` 重新导出；
+    # 按本 gate 的既定流程把冻结基线前移到本分支的批准态哈希。
+    # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的
+    # 范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
+    # 任何再编辑照样红。
     "backend/verification_loop.py": (
-        "3e61e552d6aa943e4b1036ba915373cabac2ba50dc778c40fcfe8adbb66112c5"
+        "7b4385a324cc52efe76d73a54eda3c133fb49cc1d49ec8c512bd277904e49acb"
     ),
 }
 
