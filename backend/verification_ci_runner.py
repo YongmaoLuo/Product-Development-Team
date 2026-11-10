@@ -162,9 +162,51 @@ XML 解析不了 → 记 ``junit_error`` 并继续，绝不抛异常、绝不影
 ``junit_phases`` / ``junit_failures`` 是**读** XML 读出来的结构化证据。
 它们并列写在同一份 evidence 里，但**没有一条参与判定**：verdict 只由
 退出码（及其 signal）决定，junit 读不出来只记 ``junit_error``。
+
+轮次副本（2026-11-09）
+---------------------
+VP 的证据目录是**跨轮复用**的：``<plan>/vp_artifacts/<vp_id>/`` 在第 1 轮
+和第 2 轮是同一个目录。所以 runner 在第 2 轮写 ``ci_output.json`` 时，
+**覆盖**掉了第 1 轮写的那一份 —— 而「第 1 轮的门禁当时说了什么」正是
+两轮结论不一致时唯一能查的东西。
+
+所以每轮写**两个**文件：
+
+* ``ci_output.json`` —— runner 写出的产物本身。**不含**轮次字段：契约里
+  没有 ``round``，产物就不能有。
+* ``ci_output.round-<n>.json`` —— 同一份证据，外加 ``round``（第几轮）与
+  ``round_source``（轮次号从哪来：调用方 ``parameter``，还是上下文包
+  ``context_pack``）。
+
+轮次号优先取调用方给的正整数；没给（或给了 0 / 负数）就从
+``<plan>/context/round-<n>.json`` 里取**最大**的 n（``<plan>`` =
+``Path(artifact_dir).resolve().parent``）；两处都没有就**不写副本** ——
+「第 0 轮」不是一轮。
+
+副本用**硬链接**落地而不是 replace：链接不会落在已经被占用的名字上，
+所以前一轮的副本**原样保留**（这是副本存在的全部理由）。副本写失败
+**不改判决** —— 判决在写副本之前就定了，磁盘的问题不是代码的问题；
+``.tmp`` 一定回收（残留对孤儿扫描是不可见的，只会跨轮悄悄堆积）。
+
+契约从**自己脚下**解析（2026-11-10）
+----------------------------------
+产物契约 (``ci_artifact``) 由 runner 在写产物之前校验。它**不是**平铺
+import —— 解析建立在 **runner 自己所在目录**上。
+
+原因在加载器：``verification_ci_runner_loader`` 加载的是**被测树那份**
+runner（从它的路径加载，名字是自己的），而 ``sys.path`` 上只有 **harness 的**
+``backend/``。平铺 import 于是向 harness 要一个它未必带着的模块 ——
+2026-11-09 的整仓门禁就是这么判的：被测树那份 runner 加载不了，回落成
+harness 自己那份（``fallback_reason="ModuleNotFoundError: No module named
+'ci_artifact'"``），分支上的交付物**一次都没被执行过**。
+
+所以「跟 runner 一起发布的那份契约」就是 runner 用的那份。找不到就报错，
+不静默降级成「不校验」。
 """
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -173,17 +215,87 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from bounded_subprocess import run_bounded
 from credentials import _FD_ENV_PREFIX as _SECRET_FD_ENV_PREFIX
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# The contract for the CI artifact — resolved next to this file
+# ---------------------------------------------------------------------------
+#
+# ``ci_artifact`` is the one copy of the contract for ``ci_output.json``
+# (see :mod:`ci_artifact`), and the runner checks its payload against it
+# before writing it down.
+#
+# It is resolved from **this file's own directory**, not by a flat import.
+# The reason is the loader: ``verification_ci_runner_loader`` loads the
+# **tree under test's** runner from its path, under a name of its own, and
+# puts only the **harness'** ``backend/`` on ``sys.path``.  A flat
+# ``from ci_artifact import ...`` therefore asks the harness for a module it
+# need not carry — and 2026-11-09's whole-repository gate judged a round
+# with the **harness'** runner, because the tree under test's runner could
+# not be loaded at all:
+# ``fallback_reason="ModuleNotFoundError: No module named 'ci_artifact'"``.
+# The contract that ships with the runner is the contract the runner uses.
+
+
+def _load_ci_artifact_validator() -> Callable[..., List[str]]:
+    """The validator, taken from the file that ships next to this one.
+
+    The module is loaded under a name of its own (the digest convention
+    ``verification_agent._load_service_manager`` uses) and is **not** kept
+    in ``sys.modules`` afterwards: a long-lived process must not judge a
+    later round by a contract that has changed on disk since.
+
+    Never degrades.  When the file is not next to the runner either, the
+    flat import is tried once — and if that fails too, the ImportError
+    propagates and the round does not judge at all.  A validator that
+    cannot be found has to stop the round: a round that quietly stopped
+    checking its artifact is worse than one that says it cannot.
+    """
+    module_path = Path(__file__).resolve().parent / "ci_artifact.py"
+    if module_path.is_file():
+        digest = hashlib.sha1(
+            str(module_path).encode("utf-8"),
+        ).hexdigest()[:12]
+        module_name = f"pdt_ci_artifact_{digest}"
+        spec = importlib.util.spec_from_file_location(
+            module_name, str(module_path),
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"no loader for {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        # Registered while it executes, so a module that looks itself up
+        # by ``__name__`` finds itself; removed again afterwards, so the
+        # registry keeps describing the modules that are really there.
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.modules.pop(module_name, None)
+        validator = getattr(module, "validate_ci_artifact", None)
+        if not callable(validator):
+            raise ImportError(
+                f"{module_path} does not offer validate_ci_artifact",
+            )
+        return validator
+
+    from ci_artifact import validate_ci_artifact  # noqa: PLC0415
+
+    return validate_ci_artifact
+
+
+validate_ci_artifact = _load_ci_artifact_validator()
 
 STATUS_PASSED = "PASSED"
 STATUS_FAILED = "FAILED"
@@ -223,6 +335,25 @@ E2E_KIND_COMMAND = "command"
 
 #: The field a ``command`` sub-class declares its entry in.
 ENTRY_COMMAND_FIELD = "entry_command"
+
+#: The directory the per-round context packs live in, under the plan's
+#: own directory (``<plan>/context/round-<n>.json``).
+#:
+#: The pack is written by :mod:`context_pack` and read by every
+#: sub-agent of the round; it is the one file that says which round is
+#: running.  The runner asks it for the round number when its caller
+#: does not know it.
+CONTEXT_PACK_DIRNAME = "context"
+
+#: The file name one round's context pack has.  A file that does not
+#: match is not a pack: it is somebody else's file.
+_CONTEXT_PACK_FILENAME_RE = re.compile(r"^round-(\d+)\.json$")
+
+#: The round number came from the caller.
+ROUND_SOURCE_PARAMETER = "parameter"
+
+#: The round number came from the plan's context pack.
+ROUND_SOURCE_CONTEXT_PACK = "context_pack"
 
 #: Ceiling for a full CI gate. A whole-repo nightly run is measured in
 #: tens of minutes (a whole workspace build plus the full test suite), so
@@ -1828,6 +1959,7 @@ def run_ci_verification(
     *,
     project_dir: Path,
     artifact_dir: Optional[Path] = None,
+    round_no: Optional[int] = None,
 ) -> CiRunResult:
     """Run one ``full_ci`` gate (or one ``e2e`` command entry) and grade it
     on the exit code.
@@ -1840,6 +1972,14 @@ def run_ci_verification(
     thing: **a command whose exit code is the verdict**.  A ``full_ci`` VP
     runs its ``ci_entry``; an ``e2e`` command point runs its
     ``entry_command`` — and neither of them opens an LLM session.
+
+    ``round_no`` names the round this run belongs to.  It is **not** part
+    of the artifact the runner writes — the artifact stays exactly what
+    the contract describes — but it names the **copy** the runner writes
+    beside it (``ci_output.round-<n>.json``), because the evidence
+    directory is reused across rounds and the next round would otherwise
+    overwrite this round's evidence.  A caller that does not know its
+    round gets it from the plan's context pack; see :func:`_resolve_round`.
     """
     vp_id = str(vp.get("id", "unknown"))
     result = CiRunResult()
@@ -1865,7 +2005,9 @@ def run_ci_verification(
             # not tell "which file judged me" from "what did it say".
             "verifier_source": verifier_source(project_dir),
         }
-        _write_artifact(artifact_dir, vp_id, result.evidence)
+        _write_ci_artifacts(
+            artifact_dir, vp_id, result.evidence, round_no=round_no,
+        )
         return result
 
     entry = _entry_of(vp)
@@ -2115,7 +2257,9 @@ def run_ci_verification(
             result.reasons.append(f"输出尾部：{tail[-600:]}")
 
     result.evidence = evidence
-    _write_artifact(artifact_dir, vp_id, evidence)
+    _write_ci_artifacts(
+        artifact_dir, vp_id, evidence, round_no=round_no,
+    )
     return result
 
 
@@ -2290,3 +2434,187 @@ def _write_artifact(
         logger.warning(
             "[ci_runner] could not write artifact for %s: %s", vp_id, exc,
         )
+
+
+def _resolve_round(
+    round_no: Optional[int], artifact_dir: Optional[Path],
+) -> Tuple[Optional[int], Optional[str]]:
+    """Which round is this run, and where does the number come from?
+
+    Two sources, in this order:
+
+    * the **caller** knows the round — it is the orchestrator, and it
+      counts the rounds.  A positive integer is taken as it is, and the
+      number is reported as coming from the ``parameter``.
+    * the **context pack** knows the round too: the plan writes one
+      pack per round (``<plan>/context/round-<n>.json``) and the
+      **largest** ``n`` is the round that is running now.
+
+    ``0``, a negative number and ``None`` all mean "not given" — round 0
+    is not a round, and a copy named after it would be a lie.  When
+    neither source knows, the answer is ``(None, None)`` and no copy is
+    written at all.
+
+    The plan directory is derived from the artifact directory's parent
+    (``<plan>/vp_artifacts`` → ``<plan>``), because that is where the
+    runner's caller puts the artifact directory.
+    """
+    if (
+        isinstance(round_no, int)
+        and not isinstance(round_no, bool)
+        and round_no > 0
+    ):
+        return round_no, ROUND_SOURCE_PARAMETER
+
+    from_pack = _round_from_context_pack(artifact_dir)
+    if from_pack is not None:
+        return from_pack, ROUND_SOURCE_CONTEXT_PACK
+    return None, None
+
+
+def _round_from_context_pack(artifact_dir: Optional[Path]) -> Optional[int]:
+    """The largest round number the plan's context packs name.
+
+    ``None`` when there is no pack to ask — no artifact directory, no
+    context directory, or no file in it that is a pack.  A directory that
+    cannot be read is not an error here: the round is a convenience, and
+    a directory that cannot be listed simply leaves the question
+    unanswered.
+    """
+    if artifact_dir is None:
+        return None
+    try:
+        plan_dir = Path(artifact_dir).resolve().parent
+        context_dir = plan_dir / CONTEXT_PACK_DIRNAME
+        if not context_dir.is_dir():
+            return None
+        rounds = [
+            int(match.group(1))
+            for match in (
+                _CONTEXT_PACK_FILENAME_RE.match(entry.name)
+                for entry in context_dir.iterdir()
+            )
+            if match is not None
+        ]
+    except OSError:
+        return None
+    return max(rounds) if rounds else None
+
+
+def _write_ci_artifacts(
+    artifact_dir: Optional[Path],
+    vp_id: str,
+    payload: Dict[str, Any],
+    *,
+    round_no: Optional[int] = None,
+) -> None:
+    """Check the payload against the contract, then write it down.
+
+    2026-11-09: the runner wrote the artifact straight from the
+    evidence dictionary it had just built, and nobody looked at that
+    payload again.  So the contract for ``ci_output.json`` was written
+    down three times — once by the producer, once by the consumer, once
+    by the tests — and when the producer's copy drifted (``round`` /
+    ``round_source``), the drift was found by the whole-repository
+    gate, long after the thing that drifted had been written.
+
+    :func:`ci_artifact.validate_ci_artifact` is the one copy of the
+    contract now, and **this** is where the producer asks it.  A
+    payload that breaks the contract is reported **by name** at ERROR
+    level, so the log says which key is wrong rather than that
+    something is.
+
+    The report changes nothing else: no exception, no different
+    verdict, and the artifact is still written.  A broken contract is a
+    fact about the producer, and losing the evidence because of it would
+    make the incident impossible to investigate.  ``artifact_dir=None``
+    means "no audit copy wanted" — the payload is still checked,
+    because the report is about the payload, not about the disk.
+
+    The writer underneath stays a pure writer: it does not know the
+    contract exists, it does not add a key and it does not drop one.
+
+    The **round copy** is a second file, written beside the artifact:
+    the evidence directory is reused across rounds, so the next round
+    would overwrite this round's artifact.  The copy carries the round
+    bookkeeping; the artifact does not — see :func:`_write_round_copy`.
+    """
+    for issue in validate_ci_artifact(payload):
+        logger.error("[ci_artifact] %s", issue)
+    _write_artifact(artifact_dir, vp_id, payload)
+
+    resolved_round, round_source = _resolve_round(round_no, artifact_dir)
+    if resolved_round is not None and round_source is not None:
+        _write_round_copy(
+            artifact_dir,
+            vp_id,
+            payload,
+            round_no=resolved_round,
+            round_source=round_source,
+        )
+
+
+def _write_round_copy(
+    artifact_dir: Optional[Path],
+    vp_id: str,
+    payload: Dict[str, Any],
+    *,
+    round_no: int,
+    round_source: str,
+) -> None:
+    """Write this round's copy of the artifact, beside the artifact.
+
+    Why a copy at all: the evidence directory of a VP is **reused
+    across rounds**, so ``ci_output.json`` of round 2 overwrites the one
+    of round 1 — and the round-1 evidence is exactly what a reader needs
+    when the rounds disagree.  So each round also writes
+    ``ci_output.round-<n>.json``.
+
+    The copy carries two bookkeeping keys on top of the evidence —
+    ``round`` (which round it is) and ``round_source`` (where the number
+    came from).  They are **not** part of the artifact the runner
+    writes, so the copy is checked with ``allow_round_fields=True``.
+
+    The copy is written with a **hard link**, not a replace: a link
+    refuses to land on a name that is already taken, so a copy from an
+    earlier round is kept exactly as it is.  Overwriting it would undo
+    the only thing the copy is for.  The runner says so at WARNING
+    level, because a reader who wonders why the file did not change has
+    to be able to find the answer.
+
+    A copy that cannot be written changes **nothing** about the verdict:
+    the verdict was decided before this ran, and it is not about the
+    disk.  The temp file is removed either way — a ``.tmp`` left behind
+    is invisible to the orphan sweep and grows silently across rounds.
+    """
+    if artifact_dir is None:
+        return
+
+    copy_payload = {**payload, "round": round_no, "round_source": round_source}
+    for issue in validate_ci_artifact(copy_payload, allow_round_fields=True):
+        logger.error("[ci_artifact] %s", issue)
+
+    tmp_name: Optional[str] = None
+    try:
+        target_dir = Path(artifact_dir) / vp_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / f"ci_output.round-{round_no}.json"
+        fd, tmp_name = tempfile.mkstemp(dir=str(target_dir), suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(copy_payload, handle, indent=2, ensure_ascii=False)
+        try:
+            os.link(tmp_name, target)
+        except FileExistsError:
+            logger.warning(
+                "[ci_runner] round copy %s already exists; keeping it", target,
+            )
+    except Exception as exc:  # noqa: BLE001 - the copy is best-effort
+        logger.warning(
+            "[ci_runner] could not write round copy for %s: %s", vp_id, exc,
+        )
+    finally:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass

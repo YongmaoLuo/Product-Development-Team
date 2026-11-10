@@ -1313,19 +1313,103 @@ def test_spawn_http_server_reports_the_port_it_actually_bound():
         holder.close()
 
 
+# ---------------------------------------------------------------------------
+# The anchor a runtime records for a stub the spawn helper started
+# ---------------------------------------------------------------------------
+#
+# The runtime says when its process started: that is the anchor the stop
+# path's identity gate compares the live process against, and a runtime
+# that cannot place its own pid is not signalled (2026-11-03, VP-018, L2).
+#
+# The gate (:func:`service_manager._pid_reused`) compares that recorded
+# value with the **kernel's** own reading of the live process' start time
+# and tolerates two seconds.  So the recorded value has to come from the
+# same source — the kernel's — and not from the **caller's** clock: the
+# spawn helper waits for the child to bind its port before it hands the
+# pid back, so a caller that stamped the runtime with ``time.time()``
+# recorded a time seconds *after* the child started.  On a busy host that
+# gap passed the gate's tolerance, the gate called **our own** service
+# "recycled", and the reap skipped it (2026-11-09, unit-08:
+# ``reap did not clear the ledger`` / ``recorded pid was recycled``).
+
+#: The gate's own tolerance, in seconds.  It is **not** widened here:
+#: what changes is where the recorded value comes from.
+ANCHOR_TOLERANCE_SECONDS = 2.0
+
+
+def _kernel_anchor(pid: int) -> float:
+    """When the process started, according to the kernel.
+
+    Production records this through :func:`service_manager._spawn_anchor`
+    — the same source the identity gate compares against — so a fixture
+    that records anything else is not measuring what the gate measures.
+    """
+    anchor = sm._spawn_anchor(pid)
+    assert anchor is not None, f"the kernel could not place pid {pid}"
+    return float(anchor)
+
+
+def _runtime_for_a_spawned_stub(
+    pid: int,
+    port: int,
+    tmp_path: Path,
+    *,
+    name: str = "stub",
+) -> sm.ServiceRuntime:
+    """The runtime a caller builds for a stub the spawn helper started.
+
+    One place builds it, so the **anchor** it records is one place too.
+    """
+    return sm.ServiceRuntime(
+        name=name, port=port, pid=pid, pgid=sm._process_group_of(pid),
+        start_cmd="stub", cwd=str(tmp_path),
+        origin="spawned",
+        start_epoch=_kernel_anchor(pid),
+    )
+
+
+def test_the_reap_runtime_is_anchored_by_the_kernel(tmp_path, monkeypatch):
+    """The runtime the reap path judges carries the **kernel's** anchor.
+
+    The identity gate (:func:`service_manager._pid_reused`) compares a
+    recorded ``start_epoch`` with the kernel's reading of the live
+    process' start time, and it tolerates two seconds.  An anchor taken
+    from the **caller's** clock is not comparable with it: the spawn
+    helper waits for the child to bind its port before it hands the pid
+    back, so the caller's clock already reads seconds past the child's
+    start, and the gate then calls **our own** service "recycled" and
+    refuses to stop it — the ledger is never cleared.
+
+    The caller's clock is skewed five seconds ahead here, so the pin does
+    not depend on how busy the host happened to be: an anchor taken from
+    it would miss the kernel's by five seconds, and the gate does not
+    forgive that.
+    """
+    stub = _spawn_http_server(_free_port())
+    try:
+        caller_clock = time.time
+        monkeypatch.setattr(time, "time", lambda: caller_clock() + 5.0)
+        runtime = _runtime_for_a_spawned_stub(stub.pid, stub.port, tmp_path)
+        live = sm._process_start_epoch(stub.pid)
+        assert live is not None, "the kernel could not place the process"
+        drift = float(runtime.start_epoch) - float(live)
+        assert abs(drift) <= ANCHOR_TOLERANCE_SECONDS, (
+            f"the runtime recorded the caller's clock, not the kernel's: "
+            f"recorded={runtime.start_epoch} live={live} "
+            f"drift={drift:+.2f}s, and the identity gate only tolerates "
+            f"{ANCHOR_TOLERANCE_SECONDS}s — it would call our own service "
+            f"recycled and leave it running."
+        )
+    finally:
+        _force_cleanup(stub.pid)
+
+
 @pytest.mark.timeout(120)
-def test_stop_service_releases_a_real_port():
+def test_stop_service_releases_a_real_port(tmp_path):
     stub = _spawn_http_server(_free_port())
     pid, port = stub.pid, stub.port
     try:
-        runtime = sm.ServiceRuntime(
-            name="stub", port=port, pid=pid, pgid=sm._process_group_of(pid),
-            # The runtime says when its process started: that is the
-            # anchor the stop path's identity gate compares the live
-            # process against, and a runtime that cannot place its own
-            # pid is not signalled (2026-11-03, VP-018, L2).
-            start_epoch=time.time(),
-        )
+        runtime = _runtime_for_a_spawned_stub(pid, port, tmp_path)
         result = sm.stop_service(runtime, grace_seconds=10.0)
         assert result["port_free"] is True
         assert not sm.probe_port(port).listening
@@ -1392,18 +1476,12 @@ def test_spawn_http_server_waits_for_its_own_child_to_bind(monkeypatch):
 
 
 @pytest.mark.timeout(180)
-def test_stop_service_escalates_when_sigterm_is_ignored():
+def test_stop_service_escalates_when_sigterm_is_ignored(tmp_path):
     stub = _spawn_http_server(_free_port(), ignore_sigterm=True)
     pid, port = stub.pid, stub.port
     try:
-        runtime = sm.ServiceRuntime(
-            name="stubborn", port=port, pid=pid,
-            pgid=sm._process_group_of(pid),
-            # The runtime says when its process started: that is the
-            # anchor the stop path's identity gate compares the live
-            # process against, and a runtime that cannot place its own
-            # pid is not signalled (2026-11-03, VP-018, L2).
-            start_epoch=time.time(),
+        runtime = _runtime_for_a_spawned_stub(
+            pid, port, tmp_path, name="stubborn",
         )
         result = sm.stop_service(runtime, grace_seconds=2.0)
         assert result["port_free"] is True
@@ -2423,14 +2501,7 @@ def test_stop_reports_the_port_free_despite_a_lingering_client(tmp_path):
     client = socket.create_connection(("127.0.0.1", port), timeout=5)
     client_port = client.getsockname()[1]
     try:
-        runtime = sm.ServiceRuntime(
-            name="stub", port=port, pid=pid, pgid=sm._process_group_of(pid),
-            # The runtime says when its process started: that is the
-            # anchor the stop path's identity gate compares the live
-            # process against, and a runtime that cannot place its own
-            # pid is not signalled (2026-11-03, VP-018, L2).
-            start_epoch=time.time(),
-        )
+        runtime = _runtime_for_a_spawned_stub(pid, port, tmp_path)
         result = sm.stop_service(runtime, grace_seconds=10.0)
         assert result["port_free"] is True, (
             f"stop reported the port held: {result.get('detail')!r}. "
@@ -2448,15 +2519,15 @@ def test_reap_clears_the_ledger_despite_a_lingering_client(tmp_path):
     pid, port = stub.pid, stub.port
     client = socket.create_connection(("127.0.0.1", port), timeout=5)
     try:
-        runtime = sm.ServiceRuntime(
-            name="stub", port=port, pid=pid, pgid=sm._process_group_of(pid),
-            start_cmd="stub", cwd=str(tmp_path),
-            origin="spawned",
-            # The runtime says when its process started: that is the
-            # anchor the stop path's identity gate compares the live
-            # process against, and a runtime that cannot place its own
-            # pid is not signalled (2026-11-03, VP-018, L2).
-            start_epoch=time.time(),
+        runtime = _runtime_for_a_spawned_stub(pid, port, tmp_path)
+        # What the identity gate compares the recorded anchor with: the
+        # kernel's own reading of the same process.  Read it **before**
+        # the reap — afterwards the process is gone and the kernel has
+        # nothing to say.
+        live = sm._process_start_epoch(pid)
+        drift = (
+            float(runtime.start_epoch) - float(live)
+            if live is not None else None
         )
         # The ledger is written directly: a pin means "a live round is
         # using this process", and this test is about the reaping of an
@@ -2467,7 +2538,10 @@ def test_reap_clears_the_ledger_despite_a_lingering_client(tmp_path):
         assert report.reaped == ["stub"], (
             f"reap did not clear the ledger: {report.to_dict()}. Our own "
             f"client was in CLOSE_WAIT on this port; the probe read it as "
-            f"a listener and the service looked foreign."
+            f"a listener and the service looked foreign. The recorded "
+            f"anchor sits {drift}s from the kernel's reading of the same "
+            f"process (recorded={runtime.start_epoch}, live={live}), and "
+            f"the identity gate only tolerates {ANCHOR_TOLERANCE_SECONDS}s."
         )
         assert report.foreign_ports == []
     finally:

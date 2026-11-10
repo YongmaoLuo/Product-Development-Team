@@ -207,6 +207,120 @@ def _run_output_text(items: Any) -> str:
     return "\n".join(parts)
 
 
+def _read_artifact_failed_cases(
+    plan_dir: Any, vp_id: Any,
+) -> Optional[List[str]]:
+    """``failed_cases`` off a verification point's CI artifact.
+
+    The artifact lives at ``<plan_dir>/vp_artifacts/<vp_id>/ci_output.json``
+    — the path the CI runner writes it to — and carries the ids of the
+    cases that failed, taken from the junit XML rather than read out of a
+    line of prose.
+
+    ``None`` means the artifact **did not answer**: it is missing,
+    unreadable, not JSON, not a dict, or it carries no ``failed_cases``
+    list.  An **empty list** means something else — the machine looked
+    and found no failing case, which is an answer rather than a silence.
+    The two are kept apart because they lead to opposite actions: a
+    silence falls back to the round's text, an answer does not.
+
+    Every way of failing to read is swallowed.  An artifact that cannot
+    be parsed is not a repair's problem; it is a reason to use the
+    fallback.
+    """
+    name = str(vp_id or "").strip()
+    if not plan_dir or not name:
+        return None
+    try:
+        path = Path(plan_dir) / "vp_artifacts" / name / "ci_output.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # ``ValueError`` is the base of ``json.JSONDecodeError``.
+        return None
+    if not isinstance(payload, dict):
+        return None
+    cases = payload.get("failed_cases")
+    if not isinstance(cases, list):
+        return None
+    ids: List[str] = []
+    for case in cases:
+        if not isinstance(case, str):
+            continue
+        candidate = case.strip()
+        if not candidate:
+            continue
+        ids.append(candidate)
+    return ids
+
+
+def _artifact_failed_cases(plan_dir: Any, vp_id: Any) -> List[str]:
+    """The machine-written failing-case ids of one verification point.
+
+    The reader that knows where the artifact lives.  An artifact that
+    cannot answer yields an empty list — the caller that needs to tell
+    "the machine said nothing failed" from "the machine said nothing"
+    reads :func:`_read_artifact_failed_cases` instead.
+    """
+    return _read_artifact_failed_cases(plan_dir, vp_id) or []
+
+
+def _failing_case_ids_for(items: Any, plan_dir: Any) -> List[str]:
+    """The failing case ids of a round: the machine's first, the text second.
+
+    The CI runner has been writing the answer down **as data** —
+    ``vp_artifacts/<vp_id>/ci_output.json`` carries ``failed_cases``,
+    the node ids of the cases that failed, taken from the junit XML.  That
+    is the machine's own answer to the question the repair loop is asking,
+    and it is the same field the failure fingerprint reads, so the repair
+    loop and the fingerprint can no longer disagree about which defect this
+    round hit.  So it is read **first**.
+
+    The round's run output is the fallback, and it stays the fallback for
+    the case it was written for: an artifact that does not answer.  The
+    output is prose the runner happened to write — which field carries the
+    summary depends on the runner, a killed run prints no summary at all,
+    and the text is reworded every round.
+
+    The fallback is **per verification point**, not per round: one point's
+    artifact can answer while another's is missing, and the one whose
+    artifact answered must not have the other's text ids mixed into it —
+    the two are answers to different questions, and taking both would
+    tell the repair agent to turn green a case that is not red.
+
+    The ids that are not node ids are dropped.  The CI runner names a
+    schema rejection ``schema:ci_entry_missing`` — the machine's identity
+    of the defect, not the name of a test.  No command can select such a
+    string, so measuring a candidate command against it would make every
+    candidate look wide.
+
+    Several verification points are merged into one list: ordered by
+    appearance, without repeats.
+    """
+    merged: List[str] = []
+    seen: Set[str] = set()
+
+    def _add(case_ids: Sequence[str]) -> None:
+        for case_id in case_ids:
+            candidate = str(case_id or "").strip()
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            merged.append(candidate)
+
+    for item in items or ():
+        if not isinstance(item, dict):
+            continue
+        # The failed-VP dicts carry ``id``; the evidence dicts the
+        # resolver reads carry ``vp_id`` — the same point, named two ways.
+        vp_id = str(item.get("id") or item.get("vp_id") or "").strip()
+        structured = _read_artifact_failed_cases(plan_dir, vp_id)
+        if structured is None:
+            _add(failing_case_ids(_run_output_text([item])))
+            continue
+        _add(case_id for case_id in structured if "::" in case_id)
+    return merged
+
+
 #: The narrowing rule, carried by **both** prompts that can end up
 #: producing a criterion: the one that writes the repair task and the one
 #: that re-asks for its command. Same words in both places — a rule that
@@ -764,7 +878,7 @@ class RepairTaskGenerator:
         service that never came up — there is nothing to narrow towards
         and the behaviour is exactly what it was.
         """
-        case_ids = failing_case_ids(_run_output_text(evidence_items))
+        case_ids = _failing_case_ids_for(evidence_items, self.plan_dir)
         command = str(task.get("test_command") or "").strip()
         if command:
             issues = inspect_command(command)
@@ -2741,7 +2855,7 @@ def _build_test_command_fill_prompt(
         "",
     ]
     parts.extend(_narrow_criterion_section(
-        failing_case_ids(_run_output_text(failed_vps)),
+        _failing_case_ids_for(failed_vps, plan_dir),
     ))
     for vp in failed_vps:
         vp_id = str(vp.get("id", "") or "")
@@ -2870,10 +2984,11 @@ def _build_repair_contents_prompt(
         parts.append("")
     # 2026-10-30 — the ids of the cases that failed this round, as their
     # own section: the repair has to turn *these* cases green, and it
-    # must not weaken them. The ids are read out of the round's run
-    # output, which the orchestrator attaches (and, for a whole-repo
-    # gate, fills from the gate's own ``ci_output.json``).
-    case_ids = failing_case_ids(_run_output_text(failed_vps))
+    # must not weaken them. The ids come from the machine's own answer
+    # first — the ``failed_cases`` of each point's ``ci_output.json`` —
+    # and from the round's run output only where the artifact does not
+    # answer.
+    case_ids = _failing_case_ids_for(failed_vps, plan_dir)
     parts.extend(_failing_cases_section(case_ids))
     if previous_failure_feedback:
         # Filter to VPs that still appear in this round's failures —
