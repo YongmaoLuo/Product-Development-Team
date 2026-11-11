@@ -96,11 +96,12 @@ def _make_plan(plan_id: str, phase: str) -> Path:
     """Create a plan directory whose phase is ``phase``.
 
     The phase is written as the legacy ``plan_state.json`` snapshot and
-    then read once, which is what migrates it into ``plan_routing`` —
-    the same path a plan that was bootstrapped by the API takes.  The
-    migration is not optional here: the scheduler reads the phase from
-    ``plan_routing``, and a plan whose row was never written is a plan
-    the scheduler does not know.
+    then materialised into ``plan_routing`` — the same path a plan
+    that was bootstrapped by the API takes.  The row is not optional
+    here: the scheduler reads the phase from ``plan_routing``, and a
+    plan whose row was never written is a plan the scheduler does not
+    know.  Since 2026-11-11 constructing a ``PlanState`` writes
+    nothing, so the row is created explicitly via ``ensure_row()``.
     """
     from plan_state import PlanState
 
@@ -110,8 +111,9 @@ def _make_plan(plan_id: str, phase: str) -> Path:
         json.dumps({"plan_id": plan_id, "current_phase": phase}),
         encoding="utf-8",
     )
-    # The first read migrates the legacy file into the routing row.
-    PlanState(plan_dir)
+    # Constructing a ``PlanState`` writes nothing (2026-11-11), so the
+    # routing row is created explicitly rather than as a side effect.
+    PlanState(plan_dir).ensure_row()
     return plan_dir
 
 

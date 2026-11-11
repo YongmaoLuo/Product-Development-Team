@@ -488,8 +488,9 @@ def test_registered_plan_unaffected(world: Any) -> None:
         json.dumps({"plan_id": stopped_id, "current_phase": "stopped"}),
         encoding="utf-8",
     )
-    # The first read migrates the legacy file into the routing row.
-    PlanState(stopped_dir)
+    # Constructing a ``PlanState`` writes nothing (2026-11-11), so the
+    # routing row is created explicitly rather than as a side effect.
+    PlanState(stopped_dir).ensure_row()
 
     status, body = world.resume(stopped_id)
 
@@ -519,7 +520,7 @@ def test_registered_plan_unaffected(world: Any) -> None:
         json.dumps({"plan_id": queued_id, "current_phase": "queued"}),
         encoding="utf-8",
     )
-    PlanState(queued_dir)
+    PlanState(queued_dir).ensure_row()
 
     status, body = world.resume(queued_id)
 

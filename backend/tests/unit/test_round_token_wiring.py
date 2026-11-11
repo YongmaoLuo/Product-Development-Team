@@ -88,6 +88,11 @@ class _FakePlanState:
     def __init__(self, plan_dir: Path) -> None:
         self.plan_dir = plan_dir
 
+    def ensure_row(self) -> None:
+        # 2026-11-11: the loop asks for the routing row to exist before
+        # its CAS (constructing a PlanState no longer creates it).
+        pass
+
     def set_verification_max_rounds(self, max_rounds: int) -> None:
         pass
 

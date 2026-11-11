@@ -2666,10 +2666,13 @@ def seed_plan_sqlite(
 
     What it does
     ------------
-    1. Constructs ``PlanState(plan_dir)`` once — the documented one-shot
-       migration path — so the plan's ``plan_state.json`` contents
+    1. Writes the plan's ``plan_state.json`` contents
        (``current_phase`` / ``completed_phases`` / ``review_rounds`` /
-       ``flags`` / ``verification``) land in a ``plan_routing`` row.
+       ``flags`` / ``verification``) into a ``plan_routing`` row — an
+       explicit ``PlanState._save_state()``.  (Constructing a
+       ``PlanState`` no longer writes: the constructor's one-shot
+       migration was removed on 2026-11-11, so the row is created by
+       the first real write.)
     2. Re-asserts ``current_phase`` from ``phase`` if given (see the
        1b note in the body for why a session-scoped DB needs it).
     3. Optionally upserts a ``plan_execution`` row carrying
@@ -2692,9 +2695,18 @@ def seed_plan_sqlite(
     from config_paths import resolve_plans_dir  # noqa: F401  (documents the anchor)
     from plan_state import PlanState
 
-    # 1. legacy plan_state.json -> plan_routing row (one-shot migration).
+    # 1. legacy plan_state.json -> plan_routing row.
+    #
+    # 2026-11-11: constructing a ``PlanState`` no longer writes — the
+    # constructor used to run a one-shot migration that INSERTed the
+    # legacy file's contents into ``plan_routing``, which made every
+    # read-only use of ``PlanState`` a write.  The row is now created by
+    # the first real write, so the fixture states that write out loud
+    # (``_save_state()``) instead of relying on a constructor side
+    # effect.  Same row, same columns, same phase.
     if (plan_dir / "plan_state.json").exists():
-        PlanState(plan_dir)
+        _ps = PlanState(plan_dir)
+        _ps._save_state()
 
     from state_machine.db.connection import open as _open_db
     from state_machine.db.schema import migrate as _migrate
@@ -2707,8 +2719,8 @@ def seed_plan_sqlite(
         _migrate(conn)
 
         # 1b. Re-assert ``plan_routing.current_phase`` from ``phase``.
-        # ``PlanState``'s migration is one-shot — it only writes the
-        # ``plan_routing`` row when none exists — and the hermetic state
+        # The write above only seeds a row that does not exist yet, and
+        # the hermetic state
         # DB is session-scoped, so a fixture reusing a plan_id inherited
         # whatever the *previous* test left behind. After a ``/start``
         # test the phase is ``verification_running``, so the next test's

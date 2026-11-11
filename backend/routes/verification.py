@@ -1197,6 +1197,14 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
     except (sqlite3.OperationalError, OSError) as exc:
         raise HTTPException(404, {"error": "Plan not found", "detail": str(exc)})
 
+    # 2026-11-11: the routing CAS further down needs a ``plan_routing``
+    # row to move — a plan that has only a legacy ``plan_state.json``
+    # has none, and the CAS would answer ``PlanNotFoundError`` (404).
+    # Constructing a ``PlanState`` no longer creates the row (that was
+    # an accidental write every read-only use paid for), so the need is
+    # stated here and asked for explicitly.
+    _server.PlanState(plan_dir).ensure_row()
+
     # -----------------------------------------------------------------
     # 2026-10-22: a plan parked in the REPAIR half of the loop is
     # RESUMED, not re-verified.

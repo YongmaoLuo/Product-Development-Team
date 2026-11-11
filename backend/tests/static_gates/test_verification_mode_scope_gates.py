@@ -810,6 +810,9 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 这些新增都只是**复用既有拼写**：`failed` / `verification_failed` /
     # `verification_repairing` / `coding_query_progress` 这几个词在本文件里本来
     # 就，没有引入任何新的相位词汇；比较方式也一律是「先归一化，再比较」。
+    # 合并 origin/main 时同时带入 PR #143「构造 PlanState 不再写库」：自动验证
+    # 回路的「让行存在」一处改为 `PlanState(plan_dir).ensure_row()`（构造函数
+    # 不再有建行副作用）。两侧改动合并后，冻结基线前移到合并态哈希。
     # 按本 gate 的既定流程把冻结基线前移到本分支的批准态哈希 —— 先例见 PR #138
     # （`fix/watchdog-handoff-not-death`）的「移动冻结」：那一次同样是
     # `verification_loop.py` 的已批准改动进入冻结面，走的正是这一条流程。
@@ -817,7 +820,7 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
     # 任何再编辑照样红。
     "backend/verification_loop.py": (
-        "194df065d3743fbbe950ac4cbff8379a8f0dcff1e39314f5a4a86423c8cc4995"
+        "4cb12a8761b9a3567a8149dd3ebd90f32879b21f1ecd53d47a86e2956e7122de"
     ),
 }
 

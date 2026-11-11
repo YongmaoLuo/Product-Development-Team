@@ -118,9 +118,12 @@ def state_db(tmp_path, monkeypatch):
         whatever an earlier test left behind. Autouse, so no test in this
         module can leak into — or inherit from — another.
 
-    ``_write_plan_state`` is still used to bootstrap: ``PlanState``
-    migrates a legacy ``plan_state.json`` into SQLite on first read, and
-    that is exactly how a real pre-retrofit plan is picked up.
+    ``_write_plan_state`` is still used to bootstrap: the legacy
+    ``plan_state.json`` is read by ``PlanState`` when no routing row
+    exists (the read fallback), and that is exactly how a real
+    pre-retrofit plan is picked up.  Constructing a ``PlanState`` no
+    longer writes (2026-11-11): the row is created by the first real
+    write.
     """
     db = tmp_path / "state.db"
     monkeypatch.setenv("PDT_STATE_DB_PATH", str(db))
