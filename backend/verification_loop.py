@@ -61,6 +61,16 @@ import zombie_rounds
 # effective. ``server`` seeds ``sys.modules['server']`` before importing
 # this module (see the wiring at the bottom of server.py).
 import server as _server
+# 2026-11-11: the phase vocabulary's compatibility shim.  A
+# ``plan_routing`` row written before 2026-10-22 still carries the
+# historical ``verification_rerunning`` value, and the READ path maps it
+# onto the phase that replaced it (``verification_repairing``).  Every
+# decision that reads a phase has to normalize it FIRST — a comparison
+# against the literal string misses the historical value, and a plan
+# parked at that phase is then closed while it is legally continuing.
+# ``plan_state`` imports nothing from ``server`` / this module, so a
+# top-level import carries no cycle risk.
+import plan_state
 # 2026-10-22: the type a cancelled round raises. Dependency-free (stdlib
 # only), so a top-level import carries no cycle risk — and the auto-loop
 # has to be able to name it in an ``except`` clause, which a lazy
@@ -858,6 +868,445 @@ def _recover_verification_states(plans_dir: Path) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Divergent verification verdicts (2026-11-11)
+# ---------------------------------------------------------------------------
+#
+# A verification round can reach its verdict and still leave the plan's own
+# row saying ``running``:
+#
+#   * the auto-loop stamps the round's verdict into the in-memory
+#     ``_verification_state`` (``verification_status =
+#     "verification_failed"``) while the plan's ``plan_verification`` row
+#     keeps the ``running`` value stamped at round start;
+#   * the watchdog's death mark writes its side-channel snapshot
+#     (``.verification_runtime.json``) and the process dies before the
+#     terminal write lands.
+#
+# Either way the two disagree — and the disagreement is SILENT.  The
+# watchdog's detection ladder only inspects plans whose memory says
+# ``running``, so it never revisits the plan; the startup sweep only
+# converges rows whose ``verification_status`` is ALREADY terminal, so it
+# never converges this one either.  The plan hangs at "verifying" for
+# ever, and nothing in the log says why.
+#
+# The reconciliation below closes the gap.  It writes the terminal state
+# the round ALREADY decided on, and nothing else: no death sequence, no
+# orphan kill, no zombie mark, no lease touch.  A round that reached a
+# verdict owns none of those — they belong to a round that was judged
+# DEAD, and this one was not.
+
+#: The ``verification_status`` values that mean a round has already
+#: reached a verdict, whatever the plan's own row says.
+#:
+#: ``verification_failed`` is the orchestrator's own spelling for a
+#: failed round (see ``backend/verification/orchestrator.py``), and
+#: ``failed`` is the spelling the watchdog's death mark writes.  Both
+#: mean the same thing: the round is over, and the plan's row is the
+#: only thing that does not know it yet.
+_VERIFICATION_DIVERGENT_MEMORY_STATUSES = frozenset(
+    {"verification_failed", "failed"}
+)
+
+#: The reason a round that recorded none gets.  An empty reason would
+#: write an empty ``stop_reason`` into the row and leave the operator
+#: with nothing to go on; this names what the write was.
+_DIVERGENT_FALLBACK_STOP_REASON = "verification_round_verdict_unrecorded"
+
+
+def _read_plan_verification_status(plan_id: str) -> Optional[str]:
+    """The plan's own ``plan_verification.verification_status``, as it is
+    on disk right now.
+
+    ``None`` means "there is no row, or the row could not be read" — the
+    caller must then treat the plan's verdict as UNKNOWN and leave the
+    plan alone rather than guess at it.
+
+    Deliberately NO ``migrate()`` here, for the same reason
+    :func:`_reconcile_orphaned_verification_stages` does not migrate: a
+    reader must not upgrade a legacy / hand-rolled schema it happens to
+    open.  A table that is not there raises, and the raise is swallowed
+    into ``None``.
+    """
+    row = _read_plan_verification_row(plan_id)
+    if row is None:
+        return None
+    return row.get("verification_status")
+
+
+def _read_plan_verification_row(
+    plan_id: str,
+) -> Optional[Dict[str, Any]]:
+    """The plan's own ``plan_verification`` row: its status and its round.
+
+    ``None`` means "there is no row, or the row could not be read" — the
+    caller must then treat the plan's verdict as UNKNOWN and leave the
+    plan alone rather than guess at it.
+
+    Deliberately NO ``migrate()`` here, for the same reason
+    :func:`_reconcile_orphaned_verification_stages` does not migrate: a
+    reader must not upgrade a legacy / hand-rolled schema it happens to
+    open.  A table that is not there raises, and the raise is swallowed
+    into ``None``.
+    """
+    try:
+        db_path = Path(_server._state_db_path())
+    except Exception:  # noqa: BLE001 — an unreadable path is "no answer"
+        return None
+    if not db_path.exists():
+        return None
+    conn = None
+    try:
+        from state_machine.db.connection import open as open_db
+        conn = open_db(db_path)
+        row = conn.execute(
+            "SELECT verification_status, round FROM plan_verification "
+            "WHERE plan_id = ?",
+            (plan_id,),
+        ).fetchone()
+    except Exception:  # noqa: BLE001 — a failed read is "no answer"
+        _server.logger.exception(
+            "[verification_divergence] the plan's verification row could "
+            "not be read plan=%s", plan_id,
+        )
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    if row is None:
+        return None
+    return {"verification_status": row[0], "round": row[1]}
+
+
+def _read_plan_current_phase(plan_id: str) -> Optional[str]:
+    """The plan's own ``plan_routing.current_phase``, as it is on disk.
+
+    ``None`` means "there is no row, or the row could not be read" —
+    the caller must then treat the plan's phase as UNKNOWN and leave
+    the plan's own gates in charge rather than guess at it.
+
+    Deliberately NO ``migrate()`` here, for the same reason
+    :func:`_read_plan_verification_row` does not migrate: a reader must
+    not upgrade a legacy / hand-rolled schema it happens to open.  A
+    table that is not there raises, and the raise is swallowed into
+    ``None``.
+
+    The read path is the one the startup sweep already uses
+    (:func:`_reconcile_orphaned_verification_stages`): the same table,
+    the same column, the same no-migrate rule.
+    """
+    try:
+        db_path = Path(_server._state_db_path())
+    except Exception:  # noqa: BLE001 — an unreadable path is "no answer"
+        return None
+    if not db_path.exists():
+        return None
+    conn = None
+    try:
+        from state_machine.db.connection import open as open_db
+        conn = open_db(db_path)
+        row = conn.execute(
+            "SELECT current_phase FROM plan_routing WHERE plan_id = ?",
+            (plan_id,),
+        ).fetchone()
+    except Exception:  # noqa: BLE001 — a failed read is "no answer"
+        _server.logger.exception(
+            "[verification_divergence] the plan's current phase could not be "
+            "read plan=%s", plan_id,
+        )
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    if row is None:
+        return None
+    return row[0]
+
+
+def _read_runtime_snapshot_file(
+    plan_id: str,
+) -> Optional[Dict[str, Any]]:
+    """The verdict the last round wrote down, as it survived a restart.
+
+    This is the side-channel snapshot the failed-round mark writes
+    (:func:`_mark_verification_failed_dead`), kept at
+    ``plans/{id}/.verification_runtime.json``.  It is the only trace a
+    round that died between its mark and its terminal write leaves
+    behind, which is exactly the shape this reconciliation exists for.
+
+    ``None`` means "no snapshot": the file is missing, unreadable or
+    unparseable.
+    """
+    try:
+        plan_dir = _server._plan_dir(plan_id)
+        path = plan_dir / ".verification_runtime.json"
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                return loaded
+    except Exception:  # noqa: BLE001 — an unreadable snapshot is "none"
+        _server.logger.exception(
+            "[verification_divergence] the runtime snapshot could not be "
+            "read plan=%s", plan_id,
+        )
+    return None
+
+
+def _divergent_stop_reason(snapshot: Dict[str, Any]) -> str:
+    """The reason the round recorded, or a named placeholder."""
+    for key in ("stop_reason", "verification_stop_reason"):
+        value = snapshot.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return _DIVERGENT_FALLBACK_STOP_REASON
+
+
+def _snapshot_belongs_to_an_earlier_round(
+    snapshot: Dict[str, Any], row: Optional[Dict[str, Any]],
+) -> bool:
+    """True iff the snapshot was written by a round the plan has left.
+
+    The side-channel snapshot is NOT cleared when a new round starts —
+    it is the last verdict the plan ever wrote down, and it stays on
+    disk.  So a snapshot from round 1 next to a row that says "round 2
+    is running" is not a divergence: it is an old verdict, and closing
+    the plan on it would fail a round that has only just begun.
+
+    The round NUMBER is what tells them apart: the snapshot carries the
+    round it belonged to, and the row carries the round that is live.
+    A snapshot without a round number cannot be placed, and is left to
+    the other gates.
+    """
+    if not row:
+        return False
+    snapshot_round = snapshot.get("verification_round")
+    row_round = row.get("round")
+    if not isinstance(snapshot_round, int) or not isinstance(row_round, int):
+        return False
+    return snapshot_round < row_round
+
+
+def _divergence_thread_is_gone(state: Optional[Dict[str, Any]]) -> bool:
+    """True iff the round's own thread is not running any more.
+
+    A missing thread counts as "not running" (a recovered entry never
+    had one).  A thread that cannot answer is treated as ALIVE — the
+    conservative direction: a round we cannot see may still be working,
+    and closing the plan under it is the worse mistake.
+    """
+    if not state:
+        return True
+    thread = state.get("thread")
+    if thread is None:
+        return True
+    try:
+        return not thread.is_alive()
+    except AttributeError:
+        return False
+
+
+def _divergence_gates_pass(
+    plan_id: str, state: Optional[Dict[str, Any]],
+) -> bool:
+    """The gates every divergence convergence has to pass.
+
+    Four of them, and each one stands for a way the plan could still be
+    alive:
+
+    * the round's own thread must be gone — a live thread means the
+      round is still working, and it owns the plan until it says
+      otherwise;
+    * no background execution may be outstanding for the plan.
+      ``_plan_execution_in_flight`` is the ONE answer in the process to
+      that question (the hand-off criterion the detection ladder already
+      uses), and a repair execution in flight owns the plan right now;
+    * the plan's own row must still say ``running``.  A row that already
+      carries a terminal verdict must not be written again: the write
+      would fire a SECOND ``plan_closed`` for a plan that is already
+      closed;
+    * the plan's own PHASE must not say that the chain is legally
+      continuing.  ``verification_repairing`` is the user-gated pause
+      between rounds: the round finished, its repair tasks wait for the
+      user, and the plan is mid-way through its chain — so the first
+      three gates are ALL true for it (no next round has started, hence
+      no thread and no background execution, and the previous round's
+      ``running`` row is exactly what is on disk).  Converging such a
+      plan writes off a plan that is still going.
+
+    The phase is read LAST on purpose: a candidate the first three
+    gates already rejected must not cost an extra database read, and the
+    existing negative controls have to keep behaving exactly as they
+    did before this gate existed.
+
+    The phase is NORMALIZED before it is compared — a row written
+    before 2026-10-22 still carries the historical value
+    ``verification_rerunning``, which the read path maps onto
+    ``verification_repairing`` (see
+    :func:`plan_state.normalize_phase`).  Comparing against the literal
+    string would miss it and close a legally continuing plan.
+    """
+    if not _divergence_thread_is_gone(state):
+        return False
+    try:
+        in_flight = bool(_server._plan_execution_in_flight(plan_id))
+    except Exception:  # noqa: BLE001 — a failed read is not "in flight"
+        in_flight = False
+        _server.logger.exception(
+            "[verification_divergence] the in-flight execution record could "
+            "not be read — treating the plan as free plan=%s", plan_id,
+        )
+    if in_flight:
+        return False
+    if _read_plan_verification_status(plan_id) != "running":
+        return False
+    try:
+        phase = _read_plan_current_phase(plan_id)
+    except Exception:  # noqa: BLE001 — a failed read is not "continuing"
+        phase = None
+        _server.logger.exception(
+            "[verification_divergence] the plan's current phase could not be "
+            "read — treating the plan as not repairing plan=%s", plan_id,
+        )
+    if phase is not None and plan_state.normalize_phase(phase) == (
+        "verification_repairing"
+    ):
+        return False
+    return True
+
+
+def _reconcile_divergent_verdict(
+    plan_id: str, state: Dict[str, Any],
+) -> bool:
+    """Converge a plan whose round has a verdict and whose row does not.
+
+    Returns True when the plan was converged (one terminal write), False
+    when it was left alone.
+
+    The write is the verdict the round already decided on, with the
+    reason the round recorded.  It is NOT a death: the round finished,
+    so there is nothing to kill, no lease to take and no round to
+    invalidate — and saying otherwise would take the plan's processes
+    and its lease away from a round that had already let go of them.
+    """
+    if state.get("verification_status") not in (
+        _VERIFICATION_DIVERGENT_MEMORY_STATUSES
+    ):
+        return False
+    if not _divergence_gates_pass(plan_id, state):
+        return False
+    reason = _divergent_stop_reason(state)
+    _server.logger.warning(
+        "[verification_divergence] plan=%s status=%s — the round's verdict "
+        "never reached the row; converging to failed reason=%s",
+        plan_id, state.get("verification_status"), reason,
+    )
+    try:
+        _server._persist_verification_terminal(
+            plan_id, "failed", reason, chain_ending=True,
+        )
+    except Exception:  # noqa: BLE001 — a failed write is retried next tick
+        _server.logger.exception(
+            "[verification_divergence] the terminal write failed plan=%s",
+            plan_id,
+        )
+        return False
+    # The plan's own memory settles on the terminal verdict: a divergent
+    # memory is exactly what kept the watchdog from ever looking at the
+    # plan again.
+    state["verification_status"] = "failed"
+    state["stop_reason"] = reason
+    return True
+
+
+def _reconcile_divergent_at_startup(plan_id: str) -> bool:
+    """Converge a plan whose round left a verdict behind on disk.
+
+    The startup sweep converges rows whose ``verification_status`` is
+    ALREADY terminal.  A row that says ``running`` while the round's own
+    snapshot says otherwise is the shape this handles: the round reached
+    its verdict, the row never heard about it, and the restart took the
+    round's memory with it.  Without this the plan is invisible to both
+    the watchdog (no in-memory entry) and the sweep (no terminal row) —
+    it hangs at "verifying" for ever.
+
+    Returns True when the plan was converged, False when it was left
+    alone.
+
+    Two places can hold the round's verdict, and both are read here —
+    the first one that carries a verdict wins:
+
+    * ``plans/{id}/.verification_runtime.json`` — the side-channel
+      snapshot the failed-round mark writes.  It is the decisive one:
+      it is the only trace a round that died between its mark and its
+      terminal write leaves behind, which is exactly the shape this
+      reconciliation exists for.
+    * the state machine's own runtime record, read through
+      :func:`_load_verification_runtime_state` — the same reader the
+      startup recovery uses.  Its ``verification_status`` is the ROW's
+      own status, so on its own it can never carry a verdict the row
+      lacks; it is read so that both readers see the same runtime
+      state, and so that a runtime record which one day does carry a
+      verdict is picked up without another change here.
+    """
+    snapshot = _read_runtime_snapshot_file(plan_id)
+    if not isinstance(snapshot, dict):
+        try:
+            record = _server._load_verification_runtime_state(plan_id)
+        except Exception:  # noqa: BLE001 — an unreadable record is "none"
+            _server.logger.exception(
+                "[startup_reconcile] the runtime record could not be read "
+                "plan=%s", plan_id,
+            )
+            record = None
+        if not isinstance(record, dict):
+            return False
+        snapshot = record
+    if snapshot.get("verification_status") not in (
+        _VERIFICATION_DIVERGENT_MEMORY_STATUSES
+    ):
+        return False
+    if snapshot.get("verification_status") not in (
+        _VERIFICATION_DIVERGENT_MEMORY_STATUSES
+    ):
+        return False
+    row = _read_plan_verification_row(plan_id)
+    if _snapshot_belongs_to_an_earlier_round(snapshot, row):
+        # The snapshot is an OLD round's verdict: the plan has moved on
+        # since, and the row says the current round is running.  Closing
+        # the plan on the old verdict would fail a round that has only
+        # just begun.
+        return False
+    state = _server._verification_state.get(plan_id)
+    if not _divergence_gates_pass(plan_id, state):
+        return False
+    reason = _divergent_stop_reason(snapshot)
+    _server.logger.warning(
+        "[startup_reconcile] plan=%s stranded at the verification stage "
+        "with a recorded verdict=%s — converging to failed reason=%s",
+        plan_id, snapshot.get("verification_status"), reason,
+    )
+    try:
+        _server._persist_verification_terminal(
+            plan_id, "failed", reason, chain_ending=True,
+        )
+    except Exception:  # noqa: BLE001 — a failed write is not a convergence
+        _server.logger.exception(
+            "[startup_reconcile] the terminal write failed plan=%s", plan_id,
+        )
+        return False
+    # Drop any in-memory entry recovered from the runtime state file so
+    # /status cannot report "running" for a plan whose chain has ended.
+    _server._verification_state.pop(plan_id, None)
+    return True
+
+
 def _reconcile_orphaned_verification_stages() -> None:
     """CAS routing rows stranded at ``verification_running`` whose
     ``plan_verification`` row is already terminal (2026-09-13 飞书卡片
@@ -1033,6 +1482,12 @@ def _reconcile_orphaned_verification_stages() -> None:
 
     for plan_id, v_status, v_reason in rows:
         if v_status not in {"passed", "failed", "loop_stopped"}:
+            if v_status == "running" and _reconcile_divergent_at_startup(
+                plan_id,
+            ):
+                # The round's verdict WAS decided and only the row missed
+                # it — the convergence above closed the gap.
+                continue
             # Genuinely still running — leave it to the watchdog.
             continue
         reason = v_reason or "startup_reconciliation_orphaned_stage"
@@ -1373,6 +1828,18 @@ def _mark_verification_failed_dead(
 
     The fallback is the thread-death reason: a caller that passes no
     reason is the thread-death path, and its behaviour must not change.
+
+    2026-11-11: the latch used to demand ``running`` and refuse
+    every other in-memory state.  A round whose verdict was already
+    in memory (``verification_failed`` — the orchestrator's spelling —
+    or ``failed`` — the death mark's own) was therefore never marked:
+    the side-channel snapshot was not written and the plan's own row
+    stayed at ``running`` for ever, with nothing saying why.  Both
+    spellings mean the round is over, so both are accepted now.  A
+    state that already carries the death mark's own spelling
+    (``failed``) keeps the record it has — the reason that was
+    detected is the reason on record — while the side-channel
+    snapshot is still written.
     """
     from datetime import datetime
 
@@ -1385,12 +1852,30 @@ def _mark_verification_failed_dead(
     lock = _server._verification_locks.setdefault(plan_id, threading.Lock())
     with lock:
         state = _server._verification_state.get(plan_id)
-        if not state or state.get("verification_status") != "running":
+        if not state:
             return
-        state["verification_status"] = "failed"
-        state["stop_reason"] = effective_reason
-        state["updated_at"] = datetime.now().isoformat()
-        state["ended_at"] = state["updated_at"]
+        status = state.get("verification_status")
+        # 2026-11-11: a memory that already reached a verdict is
+        # ACCEPTED here.  The old latch demanded ``running`` and
+        # refused everything else, so a round whose verdict was
+        # already in memory (``verification_failed`` — the
+        # orchestrator's spelling — or ``failed`` — the death mark's
+        # own) never got its death terminal state: the side-channel
+        # snapshot was not written and the plan's own row stayed at
+        # ``running`` for ever.  A round that reached a verdict is
+        # finished, not running, and the row is what hangs the plan.
+        if status not in ({"running"} | _VERIFICATION_DIVERGENT_MEMORY_STATUSES):
+            return
+        if status != "failed":
+            # ``failed`` is the death mark's OWN spelling: the verdict
+            # it wrote is on record already, and rewriting that record
+            # would replace the reason that was detected with a later
+            # one.  So an already-terminal state is left exactly as it
+            # is — only the side-channel snapshot below is written.
+            state["verification_status"] = "failed"
+            state["stop_reason"] = effective_reason
+            state["updated_at"] = datetime.now().isoformat()
+            state["ended_at"] = state["updated_at"]
         # 2026-07-19 / 2026-08-25: capture a side-channel snapshot of
         # the in-memory state for persistence. We must write it
         # *outside* this ``with`` block — any helper that re-acquires
@@ -2508,6 +2993,291 @@ def _run_verification_death_sequence(
     return record
 
 
+#: The event the dispatch writes into ``execution.log`` once per interval
+#: while it waits on a provider (2026-11-01).
+#:
+#: It is a HEARTBEAT, not progress.  It says "the query is still in
+#: flight" and nothing more: a round whose only evidence is this
+#: heartbeat has not been seen to make progress — it has only been seen
+#: to be waiting.  So the heartbeat may not keep such a round alive
+#: forever (2026-11-11).
+_PROGRESS_HEARTBEAT_EVENT = "coding_query_progress"
+
+#: How much of the tail of ``execution.log`` is read at a time.  The
+#: watchdog wants the log's LAST lines, and a plan's execution log runs
+#: to megabytes over a long round — reading it whole on every tick
+#: would cost the server more than the watchdog's verdict is worth.
+_EXECUTION_LOG_TAIL_CHUNK_BYTES = 256 * 1024
+
+#: The files the round writes its progress to.  The newest mtime among
+#: them is the round's last real ACTIVITY — the moment a progress
+#: heartbeat's span is measured from (see ``_execution_log_anchor``).
+#:
+#: 2026-11-11: the round's OWN files joined the anchor.  A long coding
+#: query writes nothing but its heartbeat while it waits, and that
+#: heartbeat's span used to be measured from the round's own start: a
+#: round that had been running for two hours was therefore measured as
+#: "no activity for two hours" the moment it had nothing but a
+#: heartbeat, its heartbeat was discounted for sitting outside the hard
+#: ceiling, and a healthy round was written off while its query was
+#: still in flight.  The round's own log says when it last really did
+#: something, and that is the moment the heartbeat must be measured
+#: from.  The ceiling itself is untouched: past it the heartbeat still
+#: stops renewing the round's life.
+_ROUND_ACTIVITY_GLOBS: Tuple[str, ...] = (
+    "logs/verification_*.log",
+    "logs/vp_attempts/*.log",
+    "logs/repair_*.log",
+    "verification_execution_results.json",
+)
+
+
+def _execution_log_entry_ts(entry: Dict[str, Any]) -> Optional[float]:
+    """The epoch an ``execution.log`` entry carries, or ``None``.
+
+    The logger writes ``datetime.utcnow().isoformat()`` — a NAIVE UTC
+    stamp — so a stamp without a zone is read as UTC.  Reading it as
+    local time would move every timestamp by the machine's offset (this
+    one runs at UTC+8), and the watchdog would then measure the age of
+    the wrong moment.
+    """
+    raw = entry.get("ts")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = raw.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.timestamp()
+
+
+def _iter_execution_log_lines_backwards(path: Path) -> Iterable[str]:
+    """The lines of ``path``, NEWEST first.
+
+    The log is appended to and never rewritten, so its last lines are
+    the ones that were written last — and they are the only ones the
+    watchdog needs.  Reading from the end keeps the cost of the verdict
+    proportional to the tail rather than to the size of the log.
+    """
+    try:
+        handle = open(path, "rb")
+    except OSError:
+        return
+    with handle:
+        try:
+            handle.seek(0, os.SEEK_END)
+        except OSError:
+            return
+        position = handle.tell()
+        remainder = b""
+        while position > 0:
+            read_size = min(_EXECUTION_LOG_TAIL_CHUNK_BYTES, position)
+            position -= read_size
+            handle.seek(position)
+            try:
+                remainder = handle.read(read_size) + remainder
+            except OSError:
+                return
+            pieces = remainder.split(b"\n")
+            # The first piece may be a partial line: it belongs to the
+            # chunk before this one, so it is carried over.
+            remainder = pieces[0]
+            for raw_line in reversed(pieces[1:]):
+                yield raw_line.decode("utf-8", errors="replace")
+        if remainder:
+            yield remainder.decode("utf-8", errors="replace")
+
+
+def _execution_log_liveness_ts(
+    plan_dir: Path,
+    round_started_ts: Optional[float],
+) -> Tuple[Optional[float], Optional[float]]:
+    """The two timestamps ``execution.log`` carries about the round.
+
+    Returns ``(last_non_progress_ts, last_progress_ts)`` — the epoch of
+    the newest line that is NOT a progress heartbeat, and the epoch of
+    the newest progress heartbeat.  Either may be ``None``.
+
+    The log is read from the back and the walk stops as soon as both
+    kinds have been seen: the newest line of each kind is the one that
+    was written last, and a log with a hundred thousand lines must not
+    cost the watchdog a tick to read.
+
+    ``round_started_ts`` is the round's own start.  It does NOT filter
+    the lines — a line says what it says, and the caller decides what
+    to make of it.  It is the anchor's fallback (the point a
+    heartbeat's span is measured from when the log carries no real
+    event of its own), and it is taken here so that the anchor chain
+    lives in one place.
+
+    A log that is missing, empty, or made of lines that cannot be read
+    reports nothing, and the caller falls back to the evidence it used
+    before this function existed.
+    """
+    last_non_progress_ts: Optional[float] = None
+    last_progress_ts: Optional[float] = None
+    for raw_line in _iter_execution_log_lines_backwards(
+        plan_dir / "execution.log",
+    ):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        ts = _execution_log_entry_ts(entry)
+        if ts is None:
+            continue
+        if entry.get("event") == _PROGRESS_HEARTBEAT_EVENT:
+            if last_progress_ts is None:
+                last_progress_ts = ts
+        elif last_non_progress_ts is None:
+            last_non_progress_ts = ts
+        if last_non_progress_ts is not None and last_progress_ts is not None:
+            break
+    return (last_non_progress_ts, last_progress_ts)
+
+
+def _round_activity_ts(plan_dir: Path) -> Optional[float]:
+    """The moment the round last really did something.
+
+    The newest mtime among the files the round writes its progress to
+    (``_ROUND_ACTIVITY_GLOBS``): its own round log, the per-VP attempt
+    logs, the repair round's log and the execution results.  ``None``
+    when the round has written none of them — the anchor then falls
+    back to the round's own start.
+
+    This is the round's own account of its activity, and it is measured
+    BEFORE the watchdog's staleness ladder reads the same files, so the
+    heartbeat is measured against it (see ``_execution_log_anchor``).
+    """
+    mtimes = [
+        mtime for mtime in (
+            _server._latest_mtime(plan_dir, pattern)
+            for pattern in _ROUND_ACTIVITY_GLOBS
+        ) if mtime is not None
+    ]
+    return max(mtimes) if mtimes else None
+
+
+def _execution_log_anchor(
+    last_non_progress_ts: Optional[float],
+    activity_ts: Optional[float],
+    round_started_ts: Optional[float],
+) -> float:
+    """The point a progress heartbeat's span is measured from.
+
+    The round's last REAL activity: the newest of the round's last
+    non-progress event in ``execution.log``, the moment the round last
+    wrote one of its own files (``activity_ts``) and the round's own
+    start.  The round's start is the FLOOR rather than the sole
+    fallback: a round that has begun has done something, and an event
+    left in ``execution.log`` by an earlier round says nothing about
+    this one.
+
+    With none of them, now — which lets the heartbeat count for as
+    long as it lasts: nothing is known about the round, so nothing may
+    be concluded against it.
+    """
+    candidates = [
+        ts for ts in (last_non_progress_ts, activity_ts, round_started_ts)
+        if ts is not None
+    ]
+    if candidates:
+        return max(candidates)
+    return time.time()
+
+
+def _execution_log_evidence_ts(
+    plan_dir: Path,
+    round_started_ts: Optional[float],
+) -> Optional[float]:
+    """The moment ``execution.log`` last proved that the round was alive.
+
+    ``None`` when the log says nothing at all (missing, unreadable) —
+    the caller then decides on its other evidence, exactly as it did
+    before this function existed.
+
+    The file's mtime is the moment the file was last written, and a
+    write is evidence — UNLESS the last write was the progress
+    heartbeat.  The heartbeat writes the file every 60 s for as long as
+    the dispatch is in flight, and a dispatch waiting on a provider is
+    in flight for hours, so an mtime that a heartbeat refreshed says
+    "the request is still in flight" and nothing about whether the
+    ROUND is going anywhere.  On 2026-11-09 that is exactly what a
+    48274 s round looked like: alive, because its heartbeat kept
+    touching the file, and stuck, because nothing else ever did.
+
+    So the heartbeat is MEASURED rather than trusted: it counts as
+    evidence only while it is within the hard ceiling of the round's
+    last real activity.  Past the ceiling it stops renewing the
+    round's life, and the round falls back on the age it had when it
+    last really did something.
+
+    2026-11-11: that ceiling is measured from the round's last real
+    ACTIVITY, not from the round's start alone — the newest of the
+    round's last non-progress event in ``execution.log``, the newest of
+    the files the round writes to (``_round_activity_ts``) and the
+    round's own start.  Measuring it from the start alone condemned
+    healthy rounds: a round that had been running for two hours and had
+    written its own log 33 minutes earlier was measured as "nothing at
+    all for two hours", its heartbeat was discounted for sitting
+    outside the hard ceiling, and the round was written off while its
+    query was still in flight.  The ceiling is untouched: past the
+    round's last real activity the heartbeat still stops renewing the
+    round's life.
+    """
+    last_non_progress_ts, last_progress_ts = _execution_log_liveness_ts(
+        plan_dir, round_started_ts,
+    )
+    try:
+        mtime: Optional[float] = (plan_dir / "execution.log").stat().st_mtime
+    except OSError:
+        mtime = None
+
+    # Did the LAST write come from a heartbeat?  The newer of the two
+    # timestamps is the newer write, so the heartbeat wrote last when it
+    # is the newer of the two (or when it is the only one there is).
+    heartbeat_wrote_last = (
+        last_progress_ts is not None
+        and (
+            last_non_progress_ts is None
+            or last_progress_ts >= last_non_progress_ts
+        )
+    )
+
+    evidence: Optional[float] = None
+    if mtime is not None and not heartbeat_wrote_last:
+        # The last write was a real event: the file's mtime is that
+        # event's write, and it is evidence as it always was.
+        evidence = mtime
+    if last_progress_ts is not None:
+        anchor = _execution_log_anchor(
+            last_non_progress_ts,
+            _round_activity_ts(plan_dir),
+            round_started_ts,
+        )
+        if last_progress_ts - anchor <= _server.VERIFICATION_HARD_STALE_SECONDS:
+            evidence = (
+                last_progress_ts if evidence is None
+                else max(evidence, last_progress_ts)
+            )
+        elif evidence is None:
+            # The heartbeat is outside the ceiling: it no longer renews
+            # the round's life, and the round is as old as the last
+            # thing it really did.
+            evidence = anchor
+    return evidence
+
+
 def _lazy_check_verification(plan_id: str) -> None:
     """Probe a single running verification by inspecting its background thread
     AND the freshness of its log / results files.
@@ -2594,7 +3364,21 @@ def _lazy_check_verification(plan_id: str) -> None:
     paused_decision_id = _handle_hitl_strict_timeout(plan_id, now)
 
     state = _server._verification_state.get(plan_id)
-    if not state or state.get("verification_status") != "running":
+    if not state:
+        return
+    status = state.get("verification_status")
+    if status in _VERIFICATION_DIVERGENT_MEMORY_STATUSES:
+        # 2026-11-11: the round already reached its verdict, but the
+        # plan's own row may still say "running" (the divergence).  The
+        # detection ladder below judges DEAD rounds, and this one is
+        # not dead — it is finished.  So the ladder must not run: it
+        # would either re-judge a finished round as dead (a second
+        # death sequence, a second ``plan_closed``) or miss the verdict
+        # entirely.  The reconciliation writes the verdict the round
+        # decided on, and the tick ends there.
+        _reconcile_divergent_verdict(plan_id, state)
+        return
+    if status != "running":
         return
 
     if paused_decision_id is not None:
@@ -2805,30 +3589,60 @@ def _lazy_check_verification(plan_id: str) -> None:
             # (a process-global in ``quota_watchdog``, which has no notion
             # of a plan at all — see ``waiting_dispatches``), so a waiter
             # wedged mid-wait would still report itself as waiting. Here the
-            # evidence is a write that stops when the work stops: nothing
-            # writes ``execution.log`` while a round is wedged, so a real
+            # evidence is a write that stops when the work stops: a
+            # wedged round writes nothing new of its own, so a real
             # stall still goes quiet and is still caught — at the 1h hard
             # ceiling instead of the 15-min threshold.
+            #
+            # 2026-11-11: EXCEPT for the progress heartbeat, which does
+            # write ``execution.log`` while the round is wedged — the
+            # dispatch writes it once a minute for as long as it is in
+            # flight, and a dispatch waiting on a provider is in flight
+            # for hours.  So the heartbeat is MEASURED rather than
+            # trusted: it counts as evidence only while it is inside the
+            # hard ceiling of the round's last real ACTIVITY (see
+            # ``_execution_log_evidence_ts``).  Past the ceiling it stops
+            # renewing the round's life, and a wedged round is caught by
+            # the same ladder that catches everything else.
+            #
+            # 2026-11-11: and that ACTIVITY is the round's last real
+            # activity, not the round's start: the newest of the files
+            # the round writes to — the very globs below — plus the
+            # round's last non-progress event in ``execution.log``.  It
+            # is measured HERE, before the ladder reads those files
+            # below, because the heartbeat is measured against it: a
+            # round whose own log says it did something 33 minutes ago
+            # is not a round that has done nothing for the two hours it
+            # has been running.
             plan_dir = _server._plan_dir(plan_id)
+            # ``execution.log`` is NOT one of the globs below any more:
+            # its mtime is refreshed by that heartbeat, so an mtime a
+            # heartbeat touched cannot be read as "the round is going
+            # somewhere".  Its liveness is measured instead, and folded
+            # into the same group — it is another file the round writes
+            # to, and the newest of them is what says how long the round
+            # has been quiet.
+            _execution_evidence_ts = _execution_log_evidence_ts(
+                plan_dir, started_at_ts,
+            )
             stale_latest: Optional[float] = None
             for glob_pattern, reason in (
                 (
                     (
                         "logs/verification_*.log",
                         "logs/vp_attempts/*.log",
-                        "execution.log",
                         # 2026-11-10: a hand-off runs the repair round in
                         # ANOTHER process, and its progress lands in
                         # ``logs/repair_*.log`` — a file this set did not
                         # read.  So during a hand-off the verification log
                         # is legitimately silent and the repair round
                         # healthy, and the watchdog read the silence as a
-                        # death.  Same shape as the ``vp_attempts`` and
-                        # ``execution.log`` globs above: busy, but written
-                        # to a file this watchdog was not looking at.
-                        # Nothing new is invented here — the repair round
-                        # already writes its own progress; the watchdog
-                        # simply has to look at the same file.
+                        # death.  Same shape as the ``vp_attempts`` glob
+                        # above: busy, but written to a file this watchdog
+                        # was not looking at.  Nothing new is invented
+                        # here — the repair round already writes its own
+                        # progress; the watchdog simply has to look at
+                        # the same file.
                         "logs/repair_*.log",
                     ),
                     "verification_log_stale",
@@ -2836,6 +3650,14 @@ def _lazy_check_verification(plan_id: str) -> None:
                 ("verification_execution_results.json", "verification_results_stale"),
             ):
                 latest = _server._latest_mtime(plan_dir, glob_pattern)
+                if (
+                    reason == "verification_log_stale"
+                    and _execution_evidence_ts is not None
+                ):
+                    latest = (
+                        _execution_evidence_ts if latest is None
+                        else max(latest, _execution_evidence_ts)
+                    )
                 if latest is not None and (
                     time.time() - latest
                 ) > _server.VERIFICATION_WATCHDOG_STALENESS_SECONDS:
@@ -5627,6 +6449,135 @@ def _record_verification_terminal(
         plan_id, status, stop_reason or "", chain_ending=chain_ending,
         round_token=round_token,
     )
+
+
+#: 2026-11-10: the round-verdict vocabulary, and the spellings that
+#: mean one of its words.
+#:
+#: The orchestrator names its own failure verdict ``verification_failed``
+#: (see ``backend/verification/orchestrator.py``), and the auto-loop
+#: forwards that status verbatim — ``status = result.get("status",
+#: "failed")`` — so the recorder was handed a spelling it did not know.
+#: The recorder's guard accepted exactly three spellings
+#: (``passed`` / ``failed`` / ``loop_stopped``) and returned SILENTLY
+#: for anything else, so the round's verdict was dropped with no log
+#: line and no write: the row kept the ``running`` value stamped at
+#: round start, and every "failed -> dispatch the repairs" round left
+#: the plan looking like it was still verifying.
+#:
+#: The alias maps the orchestrator's spelling onto the one the column
+#: already speaks.  It is a table rather than an ``if`` so that the next
+#: vocabulary drift is one entry, and so the accepted spellings stay
+#: readable in one place.
+_ROUND_VERDICT_STATUS_ALIASES = {"verification_failed": "failed"}
+
+
+def _record_round_verdict_persist(
+    plan_id: str,
+    round_token: Any,
+    status: str,
+    stop_reason: Optional[str],
+    result: Optional[dict],
+) -> None:
+    """Write the round's verdict to ``plan_verification`` and nothing else.
+
+    Module-level (2026-11-10) so the write can be exercised on its own.
+    The auto-loop's closure binds ``plan_id`` and ``round_token``, and a
+    recorder that can only be reached through the loop cannot be told
+    apart from one that never runs.
+
+    Distinct from :func:`_persist_verification_terminal`, which
+    additionally advances the plan-level state machine and fires
+    ``plan_closed``.  This is the half a REPAIR round needs: the round
+    is over and has a verdict, but the plan is not finished — an
+    executor is about to run the repairs and another round will follow.
+    Firing the terminal path there would publish ``plan_closed`` and
+    evict the notifier's in-memory plan state for a plan that is still
+    very much running.
+
+    The status is NORMALISED first (see
+    :data:`_ROUND_VERDICT_STATUS_ALIASES`): the orchestrator names its
+    failure verdict ``verification_failed`` and the column speaks
+    ``failed``.  Without the alias the write was dropped, and the round
+    left the plan behind.
+
+    Three kinds of status are refused rather than written:
+
+    * ``running`` — a live round's status, not a verdict.  Silent: it
+      is not an anomaly.
+    * anything else that is not a known verdict — a spelling nobody can
+      read.  Loud: a WARNING naming the plan, the status and the round,
+      because a typo must not look like a spelling nobody ever
+      produced.
+    * a round that was declared dead — ``plan_verification`` is the
+      PLAN's column, and a round the watchdog wrote off does not get to
+      speak for the plan.
+
+    Best-effort, like every other state write here: a failed write
+    must not abort a repair round that is otherwise ready to run.  The
+    read-side reconciliation in ``routes.plans._build_plan_status``
+    covers the case where this one does not land, and
+    ``plan_status.find_divergences`` reports it when it happens.
+    """
+    if status == "running":
+        # A live round's status, not a verdict.  Nothing to persist and
+        # nothing to say about it.
+        return
+
+    normalized_status = _ROUND_VERDICT_STATUS_ALIASES.get(status, status)
+    if normalized_status not in {"passed", "failed", "loop_stopped"}:
+        _server.logger.warning(
+            "[verification_terminal] unknown round verdict plan=%s "
+            "status=%s round=%s stop_reason=%s",
+            plan_id, status, round_token, stop_reason,
+        )
+        return
+
+    if _round_is_invalidated(plan_id, round_token):
+        _server.logger.warning(
+            "[verification_terminal] REFUSED plan=%s status=%s "
+            "stop_reason=%s round=%s — the round was declared dead; "
+            "its verdict is not the plan's to accept",
+            plan_id, status, stop_reason, round_token,
+        )
+        return
+    try:
+        from state_machine.db.connection import open as _open_db
+        from state_machine.db.schema import migrate as _migrate
+        from state_machine.repositories.verification_repository import (
+            VerificationRepository as _VerifRepo,
+        )
+
+        conn = _open_db(_server._state_db_path())
+        try:
+            _migrate(conn)
+            _VerifRepo(conn).complete_round(
+                plan_id,
+                {
+                    "status": normalized_status,
+                    "stop_reason": stop_reason,
+                    "recorded_by": "_record_round_verdict",
+                    "results": (result or {}).get("results"),
+                },
+                status=normalized_status,
+                stop_reason=stop_reason,
+                # The round is over; the plan is not. Announcing a
+                # terminal here would tell every subscriber the plan
+                # is closed seconds before an executor starts on it.
+                publish_closed=False,
+            )
+        finally:
+            conn.close()
+        _server.logger.info(
+            "[verification_terminal] round verdict recorded plan=%s "
+            "status=%s stop_reason=%s (repair path)",
+            plan_id, normalized_status, stop_reason,
+        )
+    except Exception:
+        _server.logger.exception(
+            "[verification_terminal] round verdict write failed plan=%s "
+            "status=%s", plan_id, status,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -9023,58 +9974,20 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
         have a live round writing to the same row.  The round's token is
         the one captured by this loop (the enclosing ``round_token``),
         not the one the in-memory state happens to carry.
-        """
-        if status not in {"passed", "failed", "loop_stopped"}:
-            # A non-verdict ("running" during an in-place update, or an
-            # unexpected spelling) is not something to persist as a round
-            # outcome. Leave the row alone rather than writing a value
-            # nothing else in the codebase knows how to read.
-            return
-        if _round_is_invalidated(plan_id, round_token):
-            _server.logger.warning(
-                "[verification_terminal] REFUSED plan=%s status=%s "
-                "stop_reason=%s round=%s — the round was declared dead; "
-                "its verdict is not the plan's to accept",
-                plan_id, status, stop_reason, round_token,
-            )
-            return
-        try:
-            from state_machine.db.connection import open as _open_db
-            from state_machine.db.schema import migrate as _migrate
-            from state_machine.repositories.verification_repository import (
-                VerificationRepository as _VerifRepo,
-            )
 
-            conn = _open_db(_server._state_db_path())
-            try:
-                _migrate(conn)
-                _VerifRepo(conn).complete_round(
-                    plan_id,
-                    {
-                        "status": status,
-                        "stop_reason": stop_reason,
-                        "recorded_by": "_record_round_verdict",
-                        "results": (result or {}).get("results"),
-                    },
-                    status=status,
-                    stop_reason=stop_reason,
-                    # The round is over; the plan is not. Announcing a
-                    # terminal here would tell every subscriber the plan
-                    # is closed seconds before an executor starts on it.
-                    publish_closed=False,
-                )
-            finally:
-                conn.close()
-            _server.logger.info(
-                "[verification_terminal] round verdict recorded plan=%s "
-                "status=%s stop_reason=%s (repair path)",
-                plan_id, status, stop_reason,
-            )
-        except Exception:
-            _server.logger.exception(
-                "[verification_terminal] round verdict write failed plan=%s "
-                "status=%s", plan_id, status,
-            )
+        2026-11-10: the body moved to the module-level
+        :func:`_record_round_verdict_persist`, and this closure became a
+        one-line delegation.  The recorder used to accept exactly three
+        spellings and return SILENTLY for anything else — but the
+        orchestrator names its failure verdict ``verification_failed``,
+        so every "failed -> dispatch the repairs" round had its verdict
+        dropped: no write, no log line, and the row kept the ``running``
+        value stamped at round start.  The alias that fixes it lives with
+        the implementation, next to the write it guards.
+        """
+        _record_round_verdict_persist(
+            plan_id, round_token, status, stop_reason, result,
+        )
 
     # Create the orchestrator ONCE so its _previous_failed_ids state
     # persists across rounds — otherwise same_failure_repeated detection

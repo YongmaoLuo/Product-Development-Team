@@ -787,18 +787,40 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的
     # 范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
     # 任何再编辑照样红。
-    # 2026-11-11：「构造 PlanState 不再写库」这一已批准改动修改了
-    # `verification_loop.py`——自动验证回路里「让行存在」的那一句从
-    # `PlanState(plan_dir)` 改成 `PlanState(plan_dir).ensure_row()`，
-    # 因为构造函数不再有建行这个副作用（它曾让每一次只读访问都变成写入）。
-    # 相对上一版冻结基线（58f8063f 的 dc4b2d88…）只有一个 hunk：那一行替换
-    # 加 5 行注释，没有夹带别的改动；按本 gate 的既定流程把冻结基线前移到
-    # 本分支的批准态哈希。
+    # 2026-11-11：本分支已批准的改动落在 `verification_loop.py` 上，进入冻结面的
+    # 关键新增有三处 ——
+    #   * 任务 1「验证轮判决落盘」新增 `_ROUND_VERDICT_STATUS_ALIASES`：把
+    #     orchestrator 自己的拼写 `verification_failed` 映射成列本来就说的
+    #     `failed`（判决表此前只认 `passed` / `failed` / `loop_stopped`，别的拼写
+    #     被静默丢弃，轮次的判决就没落盘，计划的行一直停在 `running`）。
+    #   * 任务 2「看门狗与启动期：内存/DB 分叉状态收敛」新增
+    #     `_VERIFICATION_DIVERGENT_MEMORY_STATUSES`：`verification_failed` 与
+    #     `failed` 两个拼写都表示「这一轮已经有判决」，内存里的状态与盘上的行
+    #     分叉时按这个集合判，而不是按某一个字符串。
+    #   * 任务 8「看门狗分叉收敛：排除 repairing 相位」给 `_divergence_gates_pass`
+    #     追加第 4 道门：相位先经 `plan_state.normalize_phase` 归一化，再与
+    #     `verification_repairing` 比较（历史别名 `verification_rerunning` 一并
+    #     排除），正在合法续跑的计划不被误收敛为终态。
+    # 与此同时，任务 6「陈旧检测：进度心跳不能无限期掩盖卡死」把心跳的计量搬进
+    # 本文件（`_PROGRESS_HEARTBEAT_EVENT` / `_execution_log_liveness_ts` /
+    # `_execution_log_evidence_ts`），本任务「心跳的计量锚点按轮次最后一次真实活动
+    # 计」又把它从「轮次起始」改成「轮次最后一次真实活动」
+    # （`_ROUND_ACTIVITY_GLOBS` 的最新 mtime 与 `execution.log` 最后一条非进度事件
+    # 取 max，再与轮次起始取 max）。
+    # 这些新增都只是**复用既有拼写**：`failed` / `verification_failed` /
+    # `verification_repairing` / `coding_query_progress` 这几个词在本文件里本来
+    # 就，没有引入任何新的相位词汇；比较方式也一律是「先归一化，再比较」。
+    # 合并 origin/main 时同时带入 PR #143「构造 PlanState 不再写库」：自动验证
+    # 回路的「让行存在」一处改为 `PlanState(plan_dir).ensure_row()`（构造函数
+    # 不再有建行副作用）。两侧改动合并后，冻结基线前移到合并态哈希。
+    # 按本 gate 的既定流程把冻结基线前移到本分支的批准态哈希 —— 先例见 PR #138
+    # （`fix/watchdog-handoff-not-death`）的「移动冻结」：那一次同样是
+    # `verification_loop.py` 的已批准改动进入冻结面，走的正是这一条流程。
     # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的
     # 范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
     # 任何再编辑照样红。
     "backend/verification_loop.py": (
-        "1c2af3f71f20841c8b898fbf4d86e0a85241b926be13f36da05b3dc3796c9b79"
+        "4cb12a8761b9a3567a8149dd3ebd90f32879b21f1ecd53d47a86e2956e7122de"
     ),
 }
 

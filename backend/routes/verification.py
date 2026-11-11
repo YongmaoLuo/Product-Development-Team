@@ -1017,6 +1017,65 @@ def _materialise_verification_workspace(
     return None
 
 
+def _persist_auto_loop_crash(plan_id: str, exc: BaseException) -> None:
+    """把 auto-loop 的崩溃落成 ``plan_verification`` 的 failed 终态。
+
+    2026-11-10（silent-stop 修复轮）：``start_verification`` 的
+    auto-fix 分支里，auto-loop 崩溃时**只**改内存
+    （``_verification_state``），从不调用
+    ``_persist_verification_terminal``。内存是**进程内**的事实 ——
+    线程一结束、进程一重启它就没了，而 ``plan_verification`` 的
+    ``verification_status`` 还停在 ``running``。运维看到的就是一个
+    「静默停止」的 plan：没有终态、没有失败原因、没有卡片。
+
+    顺序是有讲究的：先改内存（UI 立刻读的那份），再落盘（线程结束
+    之后唯一还站得住的事实）。
+
+    落盘失败不能外抛 —— 这一段跑在 verification 线程里，抛出去只
+    会换一个地方炸，而内存里的 failed 已经是运维看得见的事实了。
+    """
+    reason = f"auto_loop_crash: {exc}"
+    state = _server._verification_state.get(plan_id)
+    if state:
+        state.update({
+            "verification_status": "failed",
+            "stop_reason": reason,
+            "updated_at": datetime.now().isoformat(),
+        })
+    try:
+        _server._persist_verification_terminal(plan_id, "failed", reason)
+    except Exception:  # noqa: BLE001 — best-effort：落盘失败也不能外抛
+        _server.logger.exception(
+            "failed to persist auto-loop crash for %s", plan_id
+        )
+
+
+def _run_auto_loop_with_crash_persistence(
+    plan_id: str,
+    plan_dir: Path,
+    project_dir: Path,
+    max_rounds: int,
+    tool_type: Optional[str],
+    start_round: int,
+) -> None:
+    """跑 auto-loop；崩了就把它落成 failed 终态。
+
+    这是 ``_run_auto_verification_loop`` 外面唯一的一层壳：正常返回
+    时它什么都不做（终态由 auto-loop 自己写），抛异常时它把 failed
+    落进 ``plan_verification`` —— 崩溃不再等于「静默停止」。
+    """
+    try:
+        _server._run_auto_verification_loop(
+            plan_id, plan_dir, project_dir,
+            max_rounds=max_rounds,
+            tool=tool_type,
+            start_round=start_round,
+        )
+    except Exception as exc:  # noqa: BLE001 — 崩溃也要落盘，不能只记日志
+        _server.logger.exception("verification auto-loop crashed for %s", plan_id)
+        _persist_auto_loop_crash(plan_id, exc)
+
+
 @router.post("/api/verification/{plan_id}/start")
 def start_verification(plan_id: str, req: _server.StartVerificationRequest = None):
     """Start verification via the routing/verification repositories."""
@@ -1461,23 +1520,18 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
         # same_failure_repeated / no_repair_tasks / user_stopped).
         # Under ``auto_fix=False``, keep the legacy single-round
         # semantics so operators can manually drive each round.
+        #
+        # 2026-11-10 (silent-stop): the delegation goes through
+        # ``_run_auto_loop_with_crash_persistence`` — a crash of the
+        # auto-loop has to land in ``plan_verification`` as ``failed``,
+        # not only in the in-memory state (which dies with the thread).
         if auto_fix:
-            try:
-                _server._run_auto_verification_loop(
-                    plan_id, plan_dir, project_dir,
-                    max_rounds=max_rounds,
-                    tool=tool_type,
-                    start_round=next_round,
-                )
-            except Exception as exc:
-                _server.logger.exception("verification auto-loop crashed for %s", plan_id)
-                state = _server._verification_state.get(plan_id)
-                if state:
-                    state.update({
-                        "verification_status": "failed",
-                        "stop_reason": f"auto_loop_crash: {exc}",
-                        "updated_at": datetime.now().isoformat(),
-                    })
+            _run_auto_loop_with_crash_persistence(
+                plan_id, plan_dir, project_dir,
+                max_rounds=max_rounds,
+                tool_type=tool_type,
+                start_round=next_round,
+            )
             return
 
         try:
