@@ -1,30 +1,37 @@
-"""VP 的 ``covers_paths`` 由**任务声明**确定性派生（2026-11-05）。
+"""VP 的 ``covers_paths``：**作者声明优先**，任务派生兜底（2026-11-05）。
 
 背景
 ----
 一条验证点能不能在下一轮复用，取决于它声明的范围（``covers_paths``）——
 范围与本轮变更集不相交、且上一轮 PASSED，才允许复用（见
-:mod:`verification_round_scope`）。范围如果由模型自由发明，"范围"就成了模型
-说了算的事，复用判据随之失效。
+:mod:`verification_round_scope`）。
 
-所以范围**只能**来自它对应任务声明的 ``files_to_modify``：取文件所在的目录
-前缀（``backend/verification/``、``backend/tests/unit/``），去重保序，不跨目录
-合并。模型自己写的 ``covers_paths`` 一律被覆盖 —— 模型能声明范围，但范围
-的**内容**由框架从任务清单派生。
+VP 是对一个**功能点**的黑盒综合验证，任务可以拆得很细 —— 一条 VP 常常
+横跨好几条任务，一条任务也可能涉及好几条 VP。VP 与任务**不是**绑定关系，
+所以范围不能只由任务派生。
+
+范围的口径是"宁宽勿窄"：范围偏宽只是多跑几条；范围偏窄会让**本不该复用的
+结论被复用** —— 那才是错的方向。因此：
+
+* 验证点自己声明了非空 ``covers_paths`` → **保留它**（只归一化 + 去重），
+  不被任务派生结果覆盖；
+* 没声明 / 声明为空 → 从它对应任务声明的 ``files_to_modify`` 派生（文件所在
+  的目录前缀）：去重保序，不跨目录合并；
+* 两者都得不到 → 空（该 VP 每轮重跑，安全的一侧）。
 
 这份文件钉住派生口径与四条边界：
 
-* 任务 id 不存在 / ``source_task_ids`` 缺失 → 范围为空（该 VP 每轮重跑）；
-* ``files_to_modify`` 只含哨兵（"这个任务不改文件"）→ 范围为空；
-* 没有 ``tasks.json`` / JSON 解析失败 → 读不到任务行 → 范围为空；
-* 模型自带 ``covers_paths`` → 一律被派生结果覆盖。
+* 任务 id 不存在 / ``source_task_ids`` 缺失 → 派生不出范围（该 VP 每轮重跑）；
+* ``files_to_modify`` 只含哨兵（"这个任务不改文件"）→ 派生不出范围；
+* 没有 ``tasks.json`` / JSON 解析失败 → 读不到任务行 → 派生不出范围；
+* 作者自带 ``covers_paths`` → 保留（归一化去重），派生结果不参与。
 
 TDD contract — 4 个必测用例
 ----------------------------
 1. ``test_attach_covers_paths_from_tasks`` —— 按任务声明派生范围。
 2. ``test_unknown_task_id_yields_empty`` —— 任务 id 未知 / 字段缺失 → 空范围。
 3. ``test_sentinel_files_ignored`` —— 哨兵不是路径 → 空范围。
-4. ``test_model_supplied_paths_overwritten`` —— 模型自带范围被覆盖。
+4. ``test_authored_paths_are_preserved`` —— 作者声明的范围被保留。
 
 另附 ``test_load_task_rows_*``：读任务行的那一步自身的边界（缺文件 /
 坏 JSON / 两种载荷形状）；以及 ``test_generate_verification_plan_*`` /
@@ -239,12 +246,16 @@ def test_sentinel_mixed_with_real_files_keeps_real_ones():
 
 
 # ---------------------------------------------------------------------------
-# 4. 模型自带的范围一律被覆盖
+# 4. 作者自己声明的范围：保留（不被派生覆盖）
 # ---------------------------------------------------------------------------
 
 
-def test_model_supplied_paths_overwritten():
-    """模型自己写的 ``covers_paths`` 被派生结果覆盖（模型不能自己划范围）。"""
+def test_authored_paths_are_preserved():
+    """验证点自己声明的 ``covers_paths`` 被保留，不被任务派生结果覆盖。
+
+    VP 管的是一个功能点，任务可以拆得很细 —— 二者不是绑定关系，所以范围
+    以作者声明为准：偏宽只是多跑几条，偏窄会让不该复用的结论被复用。
+    """
     plan = [
         {
             "id": "VP-001",
@@ -261,12 +272,12 @@ def test_model_supplied_paths_overwritten():
 
     result = _attach_covers_paths(plan, tasks)
 
-    assert result[0]["covers_paths"] == ["backend/verification/"]
-    assert "frontend/src/" not in result[0]["covers_paths"]
+    assert result[0]["covers_paths"] == ["frontend/src"]
+    assert "backend/verification" not in result[0]["covers_paths"]
 
 
-def test_model_supplied_paths_erased_when_nothing_derivable():
-    """派生不出范围时，模型自带的范围也被抹掉（不能靠模型给自己划范围）。"""
+def test_authored_paths_survive_when_nothing_derivable():
+    """没有任务映射时，声明的范围仍然保留（没有范围才是每轮重跑的那一侧）。"""
     plan = [
         {
             "id": "VP-001",
@@ -277,7 +288,56 @@ def test_model_supplied_paths_erased_when_nothing_derivable():
 
     result = _attach_covers_paths(plan, task_rows=None)
 
-    assert result[0]["covers_paths"] == []
+    assert result[0]["covers_paths"] == ["frontend/src"]
+
+
+def test_authored_paths_win_over_derived():
+    """同时有声明的 ``covers_paths`` 与 ``source_task_ids`` → 声明胜出。
+
+    派生结果不参与：声明的范围是作者（验证点）自己负责的那一片。
+    """
+    plan = [
+        {
+            "id": "VP-001",
+            "source_task_ids": ["3", "4"],
+            "covers_paths": ["backend/verification/"],
+        }
+    ]
+    tasks = [
+        {"id": "3", "files_to_modify": ["backend/verification/orchestrator.py"]},
+        {"id": "4", "files_to_modify": ["frontend/src/app.tsx"]},
+    ]
+
+    result = _attach_covers_paths(plan, tasks)
+
+    assert result[0]["covers_paths"] == ["backend/verification"]
+
+
+def test_authored_paths_are_normalised_and_deduped():
+    """声明列表里的重复项 / 尾斜杠写法被归一化去重。"""
+    plan = [
+        {
+            "id": "VP-001",
+            "source_task_ids": ["3"],
+            "covers_paths": [
+                "backend/verification/",
+                "backend/verification",
+                "backend/verification//",
+                "  backend/tests/unit/  ",
+                "backend/tests/unit",
+            ],
+        }
+    ]
+    tasks = [
+        {"id": "3", "files_to_modify": ["backend/verification/orchestrator.py"]},
+    ]
+
+    result = _attach_covers_paths(plan, tasks)
+
+    assert result[0]["covers_paths"] == [
+        "backend/verification",
+        "backend/tests/unit",
+    ]
 
 
 def test_attach_covers_paths_keeps_other_vp_fields():
@@ -373,10 +433,9 @@ def _make_agent(tmp_path, tasks_payload):
                 "id": "VP-001",
                 "title": "验证点",
                 "related_prd_criteria": "验收标准",
-                # 模型声明它验的是任务 3，并自己编了一个范围 —— 范围必须
-                # 被派生结果覆盖。
+                # 模型声明它验的是任务 3，但**没有**声明范围 —— 范围由框架从
+                # 任务声明派生（作者声明的范围见下面那条用例）。
                 "source_task_ids": ["3"],
-                "covers_paths": ["frontend/src/"],
                 "verification_method": "code_review",
                 "verification_phase": 1,
                 "priority": "high",
@@ -391,7 +450,7 @@ def _make_agent(tmp_path, tasks_payload):
 
 
 def test_generate_verification_plan_derives_covers_paths(tmp_path):
-    """Phase-1 生成路径上，范围由任务声明派生（模型自带的被覆盖）。"""
+    """Phase-1 生成路径上，作者没声明范围 → 由任务声明派生。"""
     agent, _tool = _make_agent(
         tmp_path,
         {
@@ -415,7 +474,31 @@ def test_generate_verification_plan_derives_covers_paths(tmp_path):
         "backend/verification/",
         "backend/tests/unit/",
     ]
-    assert "frontend/src/" not in point["covers_paths"]
+
+
+def test_generate_verification_plan_keeps_authored_covers_paths(tmp_path):
+    """Phase-1 生成路径上，作者声明的范围被保留（不被任务派生覆盖）。"""
+    agent, tool = _make_agent(
+        tmp_path,
+        {
+            "tasks": [
+                {
+                    "id": "3",
+                    "title": "派生范围",
+                    "files_to_modify": ["backend/verification/orchestrator.py"],
+                }
+            ]
+        },
+    )
+    tool.query_json.return_value["verification_points"][0]["covers_paths"] = [
+        "frontend/src/",
+    ]
+
+    plan = agent.generate_verification_plan(retry_llm=1)
+
+    point = plan["verification_points"][0]
+    assert point["covers_paths"] == ["frontend/src"]
+    assert "backend/verification" not in point["covers_paths"]
 
 
 def test_generate_verification_plan_persists_covers_paths(tmp_path):
@@ -489,6 +572,23 @@ def test_planning_prompt_hides_file_sentinels(tmp_path):
     assert "（未声明）" in prompt
 
 
+def test_system_prompt_requires_authored_covers_paths():
+    """规划提示词要求每条验证点声明 ``covers_paths``（目录级，宁宽勿窄）。
+
+    提示词是这条链路的**生产入口**：范围的第一来源是验证点自己声明的
+    文件夹，提示词必须把它说清楚 —— 包括"不再是被覆盖的字段"。
+    """
+    from prompts import VERIFICATION_PLAN_SYSTEM_PROMPT
+
+    assert "必须声明 `covers_paths`" in VERIFICATION_PLAN_SYSTEM_PROMPT
+    assert "宁宽勿窄" in VERIFICATION_PLAN_SYSTEM_PROMPT
+    # 旧口径（"不是你写的字段 / 你写了也会被覆盖"）必须不在提示词里。
+    assert "`covers_paths` 不是你写的字段" not in VERIFICATION_PLAN_SYSTEM_PROMPT
+    assert "你写了也会" not in VERIFICATION_PLAN_SYSTEM_PROMPT
+    # 输出格式模板里也要有那个字段 —— 模型才知道要写它。
+    assert '"covers_paths"' in VERIFICATION_PLAN_SYSTEM_PROMPT
+
+
 # ---------------------------------------------------------------------------
 # 7. 复用路径（磁盘上已经躺着计划）
 # ---------------------------------------------------------------------------
@@ -533,8 +633,8 @@ def test_reuse_path_does_not_add_a_scope_field(tmp_path):
     assert "covers_paths" not in plan["verification_points"][0]
 
 
-def test_reuse_path_rederives_an_existing_scope(tmp_path):
-    """复用路径上，已经带着范围的验证点按任务声明重算（模型编的被纠正）。"""
+def test_reuse_path_keeps_an_authored_scope(tmp_path):
+    """复用路径上，验证点自己声明的范围被保留（只归一化），不被任务派生覆盖。"""
     agent = _make_reuse_agent(
         tmp_path,
         [
@@ -544,6 +644,33 @@ def test_reuse_path_rederives_an_existing_scope(tmp_path):
                 "verification_method": "code_review",
                 "source_task_ids": ["3"],
                 "covers_paths": ["frontend/src/"],
+            }
+        ],
+        tasks_payload={
+            "tasks": [
+                {
+                    "id": "3",
+                    "files_to_modify": ["backend/verification/orchestrator.py"],
+                }
+            ]
+        },
+    )
+
+    plan = agent.generate_verification_plan(retry_llm=1)
+
+    assert plan["verification_points"][0]["covers_paths"] == ["frontend/src"]
+
+
+def test_reuse_path_derives_a_scope_when_none_is_authored(tmp_path):
+    """复用路径上，没有声明范围的验证点按任务声明派生（兜底路径仍然有效）。"""
+    agent = _make_reuse_agent(
+        tmp_path,
+        [
+            {
+                "id": "VP-001",
+                "title": "验证点",
+                "verification_method": "code_review",
+                "source_task_ids": ["3"],
             }
         ],
         tasks_payload={

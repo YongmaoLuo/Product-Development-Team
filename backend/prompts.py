@@ -232,6 +232,7 @@ VERIFICATION_PLAN_SYSTEM_PROMPT = """你是一位资深测试架构师。你的�
       "title": "验证点标题（这是 Phase 1 的形状：一条子任务级断言）",
       "related_prd_criteria": "对应的 PRD 验收标准",
       "source_task_ids": ["3", "4"],
+      "covers_paths": ["backend/verification/", "backend/tests/unit/"],
       "verification_method": "api_test|code_review|ui_validation",
       "verification_phase": 1,
       "priority": "high|medium|low",
@@ -476,14 +477,17 @@ VP **没有 test_command**。它的判定由 method 自己的依据决定，你�
 
 **验证点的范围（2026-11-05，必须遵守）**：
 
-每条验证点都要声明它验的是**哪些任务**：`source_task_ids` 填那些任务的 id
-（提示词里的"本次任务清单"段列出了 id、标题与要改的文件）。这份声明是
-"这一轮能不能复用上一轮结论"的唯一依据 —— 范围必须能追溯到任务。
+每条验证点**必须声明 `covers_paths`**：它管的**文件夹**列表（目录前缀，
+例如 `backend/verification/`、`backend/tests/unit/`），不是具体文件。
 
-- **`covers_paths` 不是你写的字段。** 框架会从 `source_task_ids` 对应任务的
-  `files_to_modify` 取目录前缀，写成这条验证点的 `covers_paths`。你写了也会
-  被覆盖 —— 范围由任务声明派生，不允许发明路径。
-- 找不到对应任务时 `source_task_ids` 写成空数组 `[]`：那条验证点没有范围，
+- **目录级，宁宽勿窄。** 一条验证点是对一个**功能点**的黑盒综合验证，
+  它管的往往横跨好几处代码。范围偏宽的代价只是多跑几条；范围偏窄的代价是
+  **本不该复用的结论被复用** —— 那才是错的方向。所以：宁可粗一点（多写
+  一层目录、多写一个目录），**不得漏写**会影响到这条验证点的目录。
+- `source_task_ids` 是**可选**的：只在你能明确对应到任务时填那些任务的 id
+  （提示词里的"本次任务清单"段列出了 id、标题与要改的文件）。它不再是范围的
+  唯一来源。
+- 确实找不到范围时 `covers_paths` 写成空数组 `[]`：那条验证点没有范围，
   每轮都会重跑（这是安全的一侧，不是失败）。
 
 **已有验证点的处置（2026-10-27，必须遵守）**：
