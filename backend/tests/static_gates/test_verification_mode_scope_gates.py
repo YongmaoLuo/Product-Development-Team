@@ -787,8 +787,18 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的
     # 范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
     # 任何再编辑照样红。
+    # 2026-11-11：「构造 PlanState 不再写库」这一已批准改动修改了
+    # `verification_loop.py`——自动验证回路里「让行存在」的那一句从
+    # `PlanState(plan_dir)` 改成 `PlanState(plan_dir).ensure_row()`，
+    # 因为构造函数不再有建行这个副作用（它曾让每一次只读访问都变成写入）。
+    # 相对上一版冻结基线（58f8063f 的 dc4b2d88…）只有一个 hunk：那一行替换
+    # 加 5 行注释，没有夹带别的改动；按本 gate 的既定流程把冻结基线前移到
+    # 本分支的批准态哈希。
+    # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的
+    # 范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
+    # 任何再编辑照样红。
     "backend/verification_loop.py": (
-        "dc4b2d8816092d8880b8edeb9e445b855733cf79bffff185e4b8a8f642db5d2e"
+        "1c2af3f71f20841c8b898fbf4d86e0a85241b926be13f36da05b3dc3796c9b79"
     ),
 }
 

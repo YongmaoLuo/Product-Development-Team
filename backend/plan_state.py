@@ -458,40 +458,69 @@ class PlanState:
         #: row it loaded, so a metadata-only write must not re-state a
         #: phase the cache may be stale on.
         #:
-        #: MUST be initialised BEFORE ``_load_state()``: the legacy-file
-        #: migration branch at the bottom of that method calls
-        #: ``_save_state_to_sqlite``, and if the attribute does not exist
-        #: yet the AttributeError is swallowed by that branch's blanket
-        #: ``except Exception`` — the migration silently never happens and
-        #: the routing row is never created. ``None`` is also the correct
-        #: starting value for the legacy/default branches: nothing is on
-        #: disk yet, so the first save really does own the column.
+        #: MUST be initialised BEFORE ``_load_state()``.  The order is
+        #: kept deliberately: ``_load_state()`` used to run a one-shot
+        #: migration that called ``_save_state_to_sqlite``, and that
+        #: method reads ``_persisted_phase``.  The migration branch is
+        #: gone (see ``_load_state`` below), but the initialisation
+        #: still happens first so the attribute can never be read
+        #: before it exists — the failure mode there was an
+        #: AttributeError swallowed by a blanket ``except`` and a
+        #: silently missing routing row, which is exactly the kind of
+        #: silent write this class must not do any more.
+        #: ``None`` is also the correct starting value for the
+        #: legacy/default branches: nothing is on disk yet, so the
+        #: first save really does own the column.
         self._persisted_phase: Optional[str] = None
         self._state = self._load_state()
         # The SQLite branch has already put the on-disk value in
-        # ``_state``; the legacy/default branches just wrote it. Either
-        # way the cache and disk now agree.
+        # ``_state``; the legacy/default branches just read it.  In
+        # those two branches there is no row on disk yet, so the cache
+        # holds the phase the first real write will establish.
         self._persisted_phase = self._state.get("current_phase")
 
     def _load_state(self) -> dict:
         # task #3.7: read from ``plan_routing`` first; fall back to
-        # the legacy ``plan_state.json`` file (and migrate it) only
-        # when no SQLite row exists. SQLite wins thereafter.
+        # the legacy ``plan_state.json`` file only when no SQLite row
+        # exists. SQLite wins thereafter.
+        #
+        # 2026-11-11: this method is a PURE READ.  It used to end with
+        # a one-shot migration that INSERTed the legacy/default state
+        # into ``plan_routing``, so merely *constructing* a
+        # ``PlanState`` wrote a row.  That turned every read-only
+        # use (``get_current_phase()`` / ``get_state()``) into a
+        # write — e.g. ``VerificationOrchestrator.__init__`` builds a
+        # ``PlanState``, so every probe registered a plan.  The row is
+        # now created by the first real write (see
+        # ``_save_state_to_sqlite``); ``write_plan_state`` is an
+        # ``INSERT ... ON CONFLICT DO UPDATE``, so the row appears on
+        # that first write without any extra code here.
         sqlite_row = self._load_state_from_sqlite()
         if sqlite_row is not None:
             return sqlite_row
         legacy_row = self._load_state_from_legacy_file()
         if legacy_row is None:
             legacy_row = self._default_state()
-        # One-shot migration: persist the legacy row to SQLite so
-        # subsequent reads short-circuit at the SQLite branch.
-        try:
-            self._save_state_to_sqlite(legacy_row)
-        except Exception:  # noqa: BLE001
-            # Migration failures must not break state reads; the
-            # next ``_save_state`` will retry the migration.
-            pass
         return legacy_row
+
+    def ensure_row(self) -> None:
+        """Create the ``plan_routing`` row for this plan if it is missing.
+
+        Explicit on purpose.  Constructing a ``PlanState`` writes
+        nothing (2026-11-11), so a caller that needs the row to
+        **exist** — e.g. a routing CAS that would otherwise raise
+        ``PlanNotFoundError`` because there is no row to move — has to
+        ask for it here, by name.
+
+        The row is written from the state this instance holds, with the
+        phase that state says, which is exactly the row the constructor
+        used to create as a side effect.
+
+        Idempotent: when the row already exists this is a metadata
+        write that leaves the phase column alone (the guard in
+        :meth:`_save_state_to_sqlite`).
+        """
+        self._save_state()
 
     def reload(self) -> None:
         """Re-read the plan state from the authoritative SQLite store.
@@ -805,6 +834,17 @@ class PlanState:
         the two must not fight).  Only :meth:`reset_to` passes
         ``"replace"``: rewinding the plan is the one operation whose
         purpose is to *forget* the phases after the target.
+
+        **Who creates the row (2026-11-11).**  The constructor no
+        longer creates it — ``_load_state`` is a pure read, so merely
+        constructing a ``PlanState`` writes nothing.  The row appears
+        on the FIRST real write, through the repository's
+        ``INSERT ... ON CONFLICT DO UPDATE``.  Because that INSERT arm
+        is the one that CREATES the row, it has to carry the phase:
+        this method therefore passes the phase whenever the row does
+        not exist yet, and only falls back to the "did I move it?"
+        rule when the row is already there.  See the inline comment
+        below.
         """
         try:
             from state_machine.db.connection import open as _open_db
@@ -819,13 +859,41 @@ class PlanState:
         except Exception:  # noqa: BLE001
             return
         current_phase = state.get("current_phase", "interview")
-        # ``None`` tells the repository to leave the column untouched.
-        phase_arg = (
-            current_phase if current_phase != self._persisted_phase else None
-        )
         try:
             _migrate(conn)
-            RoutingRepository(conn).write_plan_state(
+            repo = RoutingRepository(conn)
+            # 2026-11-11: the routing row no longer exists by the time
+            # we get here — the constructor stopped creating it (see
+            # ``_load_state``).  Two cases, two different rules for
+            # the phase column:
+            #
+            # * the row IS there → today's rule: write the phase only
+            #   when this instance moved it, otherwise leave the column
+            #   alone (a cached phase must never drag the live value
+            #   back over a phase another writer CAS'd in).
+            # * the row is NOT there → this write CREATES it, so the
+            #   INSERT arm must carry the phase we hold.  Without it
+            #   the column would fall back to its schema DEFAULT
+            #   ('interview') and the fresh routing row would
+            #   contradict the state we just read — e.g. a legacy plan
+            #   whose ``plan_state.json`` says ``prd_review`` would
+            #   get a row saying ``interview``.
+            try:
+                row_exists = repo.current(self.plan_dir.name) is not None
+            except Exception:  # noqa: BLE001
+                # Unknown → keep the conservative rule and never
+                # restate a phase we did not move.
+                row_exists = True
+            if row_exists:
+                # ``None`` tells the repository to leave the column
+                # untouched.
+                phase_arg = (
+                    current_phase
+                    if current_phase != self._persisted_phase else None
+                )
+            else:
+                phase_arg = current_phase
+            repo.write_plan_state(
                 self.plan_dir.name,
                 phase=phase_arg,
                 completed_phases=state.get("completed_phases", []),

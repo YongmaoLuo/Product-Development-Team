@@ -8860,7 +8860,12 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
     # The history itself is NOT maintained here: the CAS below owns it
     # and writes ``completed_phases`` in the SAME statement that moves
     # the phase.  This call only makes the row exist.
-    _server.PlanState(plan_dir)
+    #
+    # 2026-11-11: constructing a ``PlanState`` no longer creates the
+    # row (that was an accidental write, and every read-only use of
+    # ``PlanState`` paid for it).  The need for the row is real and is
+    # stated here, so it is asked for explicitly.
+    _server.PlanState(plan_dir).ensure_row()
 
     # 2026-09-11 plan v9 (Bug 2 fix): CAS ``plan_routing.current_phase``
     # from ``executing`` (or ``queued`` for the partial-completion

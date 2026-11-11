@@ -28,6 +28,29 @@ def read_plan_routing_state(plan_id, db_path):
     return PlanState._sqlite_row_to_state(row)
 
 
+def count_routing_rows(plan_id, db_path):
+    """How many ``plan_routing`` rows exist for ``plan_id``.
+
+    The raw ``COUNT(*)`` — not the repository accessor — because the
+    question these tests ask is "does a row EXIST", not "what does the
+    row say".  A read that has to go through the repository would
+    already be the thing under test.
+    """
+    from state_machine.db.connection import open as _open_db
+    from state_machine.db.schema import migrate
+
+    conn = _open_db(str(db_path))
+    try:
+        migrate(conn)
+        cur = conn.execute(
+            "SELECT COUNT(*) FROM plan_routing WHERE plan_id = ?",
+            (plan_id,),
+        )
+        return cur.fetchone()[0]
+    finally:
+        conn.close()
+
+
 @pytest.fixture
 def state_db(tmp_path, monkeypatch):
     """Point plan-state persistence at a hermetic per-test SQLite file."""
@@ -212,6 +235,10 @@ class TestPhaseSurvivesMetadataWrites:
     ):
         plan_dir = sample_plan_factory(phase="verification_running")
         ps = PlanState(plan_dir)
+        # 2026-11-11: 构造不再建行，所以这里必须**显式**写一次状态
+        # 把 routing 行建出来（行由第一次真正的写创建）。用显式写而不是
+        # 构造副作用，是这个用例的新前提。
+        ps._save_state()
         # The verification layer parks the plan while an operator resets.
         self._cas_phase(
             plan_dir.name, state_db, "verification_running",
@@ -279,3 +306,211 @@ class TestResetToTrimsTheHistory:
             f"{after['completed_phases']!r}"
         )
         assert after["current_phase"] == "prd_generation"
+
+
+def _make_plan_dir(tmp_path, plan_id="some_plan", legacy_phase=None):
+    """Materialise a plan directory, optionally with a legacy file.
+
+    ``legacy_phase`` writes the pre-SQLite ``plan_state.json`` the
+    read fallback is there for.
+    """
+    plan_dir = tmp_path / "plans" / plan_id
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    if legacy_phase is not None:
+        (plan_dir / "plan_state.json").write_text(
+            json.dumps({
+                "plan_id": plan_id,
+                "current_phase": legacy_phase,
+                "completed_phases": [],
+                "review_rounds": {"prd": 0, "arch": 0, "test": 0},
+                "flags": {},
+            }),
+            encoding="utf-8",
+        )
+    return plan_dir
+
+
+class TestConstructorDoesNotWrite:
+    """构造 ``PlanState`` 不得写库。
+
+    2026-11-11：``PlanState.__init__`` 以前会做一次「一次性迁移」，
+    把 legacy/default 状态 INSERT 进 ``plan_routing``。于是**只读**
+    用法（``get_current_phase()`` / ``get_state()``）也会留下一个
+    计划行；``VerificationOrchestrator.__init__`` 构造一次
+    ``PlanState``，所以每跑一个 probe 就登记一个 plan。
+
+    现在：构造是纯读，行由**第一次真正的写状态**创建。
+    """
+
+    def _plan_dir(self, tmp_path, plan_id="some_plan", legacy_phase=None):
+        return _make_plan_dir(
+            tmp_path, plan_id=plan_id, legacy_phase=legacy_phase,
+        )
+
+    def test_constructing_plan_state_does_not_write_a_row(
+        self, tmp_path, state_db,
+    ):
+        plan_dir = self._plan_dir(tmp_path, "some_plan")
+
+        PlanState(plan_dir)
+
+        assert count_routing_rows("some_plan", state_db) == 0, (
+            "constructing a PlanState must not create a routing row"
+        )
+
+    def test_first_save_creates_the_row(self, tmp_path, state_db):
+        """第一次真正的写状态 → 行出现，且相位正确。"""
+        plan_dir = self._plan_dir(tmp_path, "some_plan")
+
+        ps = PlanState(plan_dir)
+        assert count_routing_rows("some_plan", state_db) == 0
+
+        ps.set_verification_max_rounds(4)
+
+        assert count_routing_rows("some_plan", state_db) == 1, (
+            "the first real write must create the routing row"
+        )
+        row = read_plan_routing_state("some_plan", state_db)
+        assert row["current_phase"] == "interview", (
+            "a fresh plan's row must carry the phase we hold; got "
+            f"{row['current_phase']!r}"
+        )
+        assert row["verification"]["max_rounds"] == 4
+
+    def test_first_save_carries_the_phase_read_from_the_legacy_file(
+        self, tmp_path, state_db,
+    ):
+        """行由第一次写创建时，相位必须是**读到**的那个相位。
+
+        没有 routing 行、只有 ``plan_state.json`` 的老计划：
+        构造函数读到 ``prd_review``；第一次写建行时，行必须也是
+        ``prd_review``，不能掉回列的 DEFAULT（``'interview'``）——
+        那会让 routing 行和状态自相矛盾。
+        """
+        plan_dir = self._plan_dir(
+            tmp_path, "legacy_plan", legacy_phase="prd_review",
+        )
+
+        ps = PlanState(plan_dir)
+        assert ps.get_current_phase() == "prd_review"
+
+        ps.set_verification_max_rounds(5)
+
+        row = read_plan_routing_state("legacy_plan", state_db)
+        assert row is not None
+        assert row["current_phase"] == "prd_review", (
+            "the row created by the first write must carry the phase "
+            f"read from the legacy file; got {row['current_phase']!r}"
+        )
+
+    def test_legacy_file_is_still_read_when_no_row_exists(
+        self, tmp_path, state_db,
+    ):
+        """读侧回退保留：只有旧文件、没有行时，相位来自文件，且不建行。"""
+        plan_dir = self._plan_dir(
+            tmp_path, "legacy_plan", legacy_phase="prd_review",
+        )
+
+        ps = PlanState(plan_dir)
+
+        assert ps.get_current_phase() == "prd_review"
+        assert count_routing_rows("legacy_plan", state_db) == 0, (
+            "reading the legacy file must not create a routing row"
+        )
+
+    def test_a_read_only_accessor_never_writes(self, tmp_path, state_db):
+        """``get_state()`` / ``get_current_phase()`` 各调一次 → 行数不变。"""
+        plan_dir = self._plan_dir(tmp_path, "some_plan")
+
+        ps = PlanState(plan_dir)
+        before = count_routing_rows("some_plan", state_db)
+
+        ps.get_state()
+        ps.get_current_phase()
+
+        assert count_routing_rows("some_plan", state_db) == before == 0
+
+    def test_a_read_only_accessor_does_not_touch_an_existing_row(
+        self, tmp_path, state_db,
+    ):
+        """行已经存在时，只读访问也不该动它（连写都不该发生）。"""
+        plan_dir = self._plan_dir(tmp_path, "some_plan")
+
+        ps = PlanState(plan_dir)
+        ps.set_verification_max_rounds(4)
+        before = count_routing_rows("some_plan", state_db)
+        assert before == 1
+
+        ps2 = PlanState(plan_dir)
+        ps2.get_state()
+        ps2.get_current_phase()
+
+        assert count_routing_rows("some_plan", state_db) == before == 1
+
+
+class TestEnsureRowIsExplicit:
+    """``ensure_row()`` 是**显式**的建行动作。
+
+    构造不再写库，所以「现在就要这一行存在」的地方必须自己说出来。
+    生产上真有两个这样的调用点（2026-11-11）：
+
+    * ``backend/verification_loop.py`` —— 自动验证循环在动 routing
+      相位之前，先让行存在（否则 CAS 撞上 ``PlanNotFoundError``，
+      相位历史就没人维护）；
+    * ``backend/routes/verification.py`` —— ``POST /start`` 的 CAS 同理。
+
+    这里钉住的是这个方法的**契约**：建行、带正确的相位、不动已存在
+    行的相位。
+    """
+
+    def test_ensure_row_creates_the_row_with_the_state_it_holds(
+        self, tmp_path, state_db,
+    ):
+        plan_dir = _make_plan_dir(
+            tmp_path, "some_plan", legacy_phase="prd_review",
+        )
+
+        ps = PlanState(plan_dir)
+        assert count_routing_rows("some_plan", state_db) == 0
+
+        ps.ensure_row()
+
+        assert count_routing_rows("some_plan", state_db) == 1
+        row = read_plan_routing_state("some_plan", state_db)
+        assert row["current_phase"] == "prd_review"
+
+    def test_ensure_row_does_not_move_an_existing_phase(
+        self, tmp_path, state_db,
+    ):
+        """行已在、相位已被别人 CAS 动过 → ``ensure_row()`` 不能把它拖回去。"""
+        plan_dir = _make_plan_dir(
+            tmp_path, "some_plan", legacy_phase="prd_review",
+        )
+
+        ps = PlanState(plan_dir)
+        ps.ensure_row()
+
+        # 另一个写者把相位推到了 verifying。
+        from state_machine.db.connection import open as _open_db
+        from state_machine.db.schema import migrate
+        from state_machine.repositories.routing_repository import (
+            RoutingRepository,
+        )
+
+        conn = _open_db(str(state_db))
+        try:
+            migrate(conn)
+            RoutingRepository(conn).try_mark_phase(
+                "some_plan", ("prd_review",), "verifying",
+            )
+        finally:
+            conn.close()
+
+        ps.ensure_row()
+
+        row = read_plan_routing_state("some_plan", state_db)
+        assert row["current_phase"] == "verifying", (
+            "ensure_row() must not restate a cached phase; got "
+            f"{row['current_phase']!r}"
+        )
+
