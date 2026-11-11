@@ -145,6 +145,9 @@ class _FakePlanState:
     def set_verification_max_rounds(self, max_rounds: int) -> None:
         pass
 
+    def ensure_row(self) -> None:
+        """The real one creates the routing row; this file seeds it itself."""
+
     def reload(self) -> None:
         pass
 
