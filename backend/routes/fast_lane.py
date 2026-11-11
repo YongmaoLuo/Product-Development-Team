@@ -252,7 +252,16 @@ def _mark_queued(plan_id: str, plan_dir: Path) -> None:
     """
     _server._seed_plan_routing_phase(plan_id, phase="queued")
     try:
-        _server.PlanState(plan_dir).transition_to("queued")
+        # 2026-11-11: constructing a ``PlanState`` writes nothing, so the
+        # "fall back to the on-disk inference" promised above needs to be
+        # stated.  A seed that failed (SQLite unavailable → warning, no
+        # row) leaves nothing for ``transition_to`` to move, and
+        # ``transition_to`` is a no-op when the inferred phase already
+        # equals the target — so without this call the plan would stay
+        # unregistered on disk while the caller was told it imported.
+        _ps = _server.PlanState(plan_dir)
+        _ps.ensure_row()
+        _ps.transition_to("queued")
     except ValueError as exc:  # noqa: BLE001 - surfaced, never swallowed
         raise HTTPException(
             500,
