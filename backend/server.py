@@ -1081,10 +1081,30 @@ class HeartbeatMonitor:
             and not sub_agent_registry._by_plan
         ):
             return
+        # 2026-11-10: per-plan isolation, applied to every pass of this
+        # sweep. A single plan whose lazy check raises must not abort the
+        # tick: the plans after it — and, for the execution pass, the
+        # *later passes* — would then go unchecked for that tick, and the
+        # failure was invisible, because ``_tick``'s
+        # ``except Exception: pass`` swallowed it. A stuck plan could
+        # therefore stay unchecked indefinitely while the watchdog
+        # reported a healthy sweep. Every exception is logged with its
+        # plan_id (and its traceback) so the gap is visible, and the
+        # sweep continues.
         for plan_id in list(_execution_state.keys()):
-            _lazy_check_execution(plan_id)
+            try:
+                _lazy_check_execution(plan_id)
+            except Exception:
+                logger.exception(
+                    "[heartbeat] execution check failed plan_id=%s", plan_id
+                )
         for plan_id in list(_verification_state.keys()):
-            _lazy_check_verification(plan_id)
+            try:
+                _lazy_check_verification(plan_id)
+            except Exception:
+                logger.exception(
+                    "[heartbeat] verification check failed plan_id=%s", plan_id
+                )
         # 2026-08-25: third pass — sub-agent watchdog. Inspects the
         # registry of live ``VerificationSubAgent``s and kills any
         # whose ``last_progress_ts`` is older than
@@ -1093,7 +1113,14 @@ class HeartbeatMonitor:
         # thread; a sync-blocked ``ClaudeCodingTool.query_json`` call
         # keeps the main thread alive forever, so without this pass
         # a hung LLM provider hangs the whole round.
-        _lazy_check_sub_agents()
+        #
+        # This pass has no per-plan granularity — it sweeps the whole
+        # registry at once — so its failure is logged without a plan_id
+        # and without aborting the tick.
+        try:
+            _lazy_check_sub_agents()
+        except Exception:
+            logger.exception("[heartbeat] sub-agent check failed")
 
 
 heartbeat_monitor = HeartbeatMonitor(interval=HEARTBEAT_INTERVAL)
