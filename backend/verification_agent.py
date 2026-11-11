@@ -156,6 +156,7 @@ from verification_round_scope import (  # noqa: E402
     covers_paths_for_files,
     current_head_sha,
     load_round_scope,
+    normalise_prefix,
     record_round_scope,
 )
 # 2026-10-25（验证分支输入路径）：分支判定只有一个判据 ——
@@ -1065,14 +1066,17 @@ def _render_change_surface(surface: Optional[ChangeSurface]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# VP 范围派生（``covers_paths``）
+# VP 范围（``covers_paths``）
 # ---------------------------------------------------------------------------
 #
 # 一条验证点能不能在下一轮复用上一轮的结论，取决于它声明的**范围**
-# （``covers_paths``）。范围如果由模型自由发明，"范围"就成了模型说了算的事，
-# 复用判据随之失效 —— 所以范围的内容**只能**来自任务声明：模型负责声明"我
-# 验的是哪几个任务"（``source_task_ids``），框架从那些任务的
-# ``files_to_modify`` 派生范围（文件所在的目录前缀）。
+# （``covers_paths``）。范围的口径是"宁宽勿窄"：偏宽只是多跑几条，偏窄会让
+# 本不该复用的结论被复用。
+#
+# 因此范围的第一来源是**验证点自己声明的文件夹列表**（作者声明，归一化后
+# 原样保留）；作者没声明时，才从它对应任务的 ``files_to_modify`` 派生
+# （文件所在的目录前缀）作为兜底 —— VP 管的是一个功能点，任务可以拆得很
+# 细，二者不是绑定关系。
 #
 # 派生口径在 :mod:`verification_round_scope`（``covers_paths_for_files``），
 # 与复用判据那一侧共用同一份实现：去重保序、不跨目录合并、哨兵不是路径。
@@ -1102,16 +1106,35 @@ def _load_task_rows(plan_dir: Any) -> List[Dict[str, Any]]:
         return []
 
 
+def _authored_covers_paths(value: Any) -> List[str]:
+    """验证点**自己声明**的范围 → 归一化且去重后的前缀列表。
+
+    声明的形状是目录前缀的列表（``list[str]``）；裸字符串也认（当成单个
+    前缀）。归一化的口径与读侧共用 :func:`normalise_prefix`（反斜杠转正
+    斜杠、去掉尾斜杠与 ``./`` 前缀）—— 同一片代码因此只有一种写法。
+
+    归一化后为空 → 这条验证点**没有声明**范围（调用方退回派生逻辑）。
+    """
+    if isinstance(value, str):
+        raw: List[str] = [value]
+    elif isinstance(value, (list, tuple)):
+        raw = [item for item in value if isinstance(item, str)]
+    else:
+        raw = []
+    normalised = normalise_prefix(raw)
+    return list(normalised) if isinstance(normalised, tuple) else [normalised]
+
+
 def _attach_covers_paths(
     plan: List[Dict[str, Any]],
     task_rows: Optional[List[Dict[str, Any]]],
     *,
     create_empty: bool = True,
 ) -> List[Dict[str, Any]]:
-    """给每条验证点派生 ``covers_paths``（就地写回，返回同一个列表）。
+    """给每条验证点确定 ``covers_paths``（就地写回，返回同一个列表）。
 
-    :param plan: 验证点列表。每条验证点用 ``source_task_ids`` 声明它对应
-        哪些任务（模型写的）。
+    :param plan: 验证点列表。每条验证点可以自己声明 ``covers_paths``
+        （它管的文件夹），也可以用 ``source_task_ids`` 声明它对应哪些任务。
     :param task_rows: 任务行列表（``id`` + ``files_to_modify``）。
     :param create_empty: 派生不出范围时，要不要**新建**一个空的
         ``covers_paths`` 键。
@@ -1125,17 +1148,25 @@ def _attach_covers_paths(
           派生不出范围时就不动那条验证点：读侧把"没有范围"当成"每轮重跑"
           （安全的一侧），不需要那个空键。
 
-    规则（四条，全部是"往安全的一侧偏"）：
+    优先级（三条，都往安全的一侧偏）：
 
-    * 范围 = 那些任务的 ``files_to_modify`` 所在目录，去重保序，**不跨目录
-      合并**（``backend/verification/`` 与 ``backend/tests/unit/`` 是两条，
-      不会合并成 ``backend/``）；
-    * 任务 id 不存在 / ``source_task_ids`` 缺失 → 范围为空（该验证点每轮
-      重跑）；
-    * ``files_to_modify`` 只含哨兵（"这个任务不改文件"）→ 范围为空；
-    * **模型自己写的 ``covers_paths`` 一律被覆盖** —— 模型能声明范围，
-      但范围的内容由框架从任务清单派生。派生不出内容时，模型写的那些也
-      一起抹掉：留着就等于让模型自己决定"这条验证点可以不重跑"。
+    1. **验证点自己声明了非空 ``covers_paths`` → 保留它**，只做归一化与去重
+       （:func:`_authored_covers_paths`），**不被**任务派生结果覆盖。
+    2. 没有声明 / 声明为空 → 退回派生：范围 = 那些任务的
+       ``files_to_modify`` 所在目录，去重保序，**不跨目录合并**
+       （``backend/verification/`` 与 ``backend/tests/unit/`` 是两条，不会
+       合并成 ``backend/``）。
+    3. 两者都得不到范围 → 空（该验证点每轮重跑，安全的一侧）。
+
+    为什么让作者自己声明范围
+    ------------------------
+    VP 是对一个**功能点**的黑盒综合验证，任务可以拆得很细 —— 一条 VP 常常
+    横跨好几条任务，一条任务也可能涉及好几条 VP。VP 与任务**不是**绑定
+    关系，范围因此不能只由任务派生。
+
+    范围偏宽的代价只是多跑几条；范围偏窄的代价是**本不该复用的结论被
+    复用** —— 那才是错的方向。所以口径是"宁宽勿窄"，作者声明的范围原样
+    保留（只归一化），派生结果只在作者没声明时兜底。
     """
     files_by_task: Dict[str, List[str]] = {}
     for row in task_rows or []:
@@ -1154,6 +1185,12 @@ def _attach_covers_paths(
     for vp in plan or []:
         if not isinstance(vp, dict):
             continue
+        # 1. 作者自己声明的范围优先：保留它，只归一化去重。
+        authored = _authored_covers_paths(vp.get("covers_paths"))
+        if authored:
+            vp["covers_paths"] = authored
+            continue
+        # 2. 没声明 → 从任务声明派生（兜底）。
         raw_ids = vp.get("source_task_ids")
         source_ids = (
             [str(item).strip() for item in raw_ids if isinstance(item, (str, int))]
@@ -1177,9 +1214,9 @@ def _render_task_catalog(task_rows: Optional[List[Dict[str, Any]]]) -> str:
     """把任务清单渲染成提示词里的 ``## 本次任务清单`` 段。
 
     这段是**纯输入注入**：它告诉生成器"这次要验的任务有哪些、id 是多少"，
-    生成器据此在每条验证点上填 ``source_task_ids``。范围的**内容**不在这段
-    里 —— 那由框架从任务清单派生（见 :func:`_attach_covers_paths`），模型
-    不参与。
+    生成器据此在每条验证点上填 ``source_task_ids``（可选）。范围的**内容**
+    由验证点自己声明 ``covers_paths``（见 :func:`_attach_covers_paths`），
+    这段只提供派生兜底时需要的任务信息。
 
     没有任务行 → 空字符串，调用方据此整段略去，于是老提示词逐字节不变。
     """
@@ -4964,13 +5001,12 @@ class Orchestrator:
 
         print("[Verification] Phase 1: Generating verification plan...")
 
-        # 2026-11-05（范围派生）：验证点的范围（``covers_paths``）由**任务
-        # 声明**派生 —— 模型只声明"我验的是哪几个任务"
-        # （``source_task_ids``），范围的内容由框架从那些任务的
-        # ``files_to_modify`` 算出来。
+        # 验证点的范围（``covers_paths``）由**验证点自己声明**（目录级），
+        # 派生只是兜底（作者没声明时，从 ``source_task_ids`` 对应任务的
+        # ``files_to_modify`` 算）。
         #
         # 任务行读自 plan 目录的 ``tasks.json``。读不到 / 解析失败 → **空表**，
-        # 不是错误：范围为空 → 那些验证点每轮重跑 —— 这是安全的一侧。
+        # 不是错误：派生不出范围 → 那些验证点每轮重跑 —— 这是安全的一侧。
         task_rows = _load_task_rows(self.plan_dir)
 
         # Reuse the on-disk plan when present and structurally valid so a
@@ -5004,12 +5040,11 @@ class Orchestrator:
                     # the deterministic regex is cheap (microseconds) and
                     # idempotent.
                     disk_plan = self._normalize_legacy_methods(disk_plan)
-                    # 2026-11-05（范围派生）：复用路径上按任务声明**重算**
-                    # 已经带着范围的那些验证点 —— 磁盘上那份计划可能是这次
-                    # 改动之前写的（没有范围），也可能带着模型自己编的范围。
-                    # 前者不动（复用路径不改写计划的结构，见
-                    # ``create_empty=False``），后者纠正（范围永远来自任务
-                    # 声明）。
+                    # 范围：复用路径上，已经带着范围的那些验证点**保留自己
+                    # 声明的范围**（只归一化）；没有声明的那些按任务声明
+                    # 重算 —— 磁盘上那份计划可能是这次改动之前写的（没有
+                    # 范围）。派生不出范围的验证点不动（复用路径不改写计划
+                    # 的结构，见 ``create_empty=False``）。
                     #
                     # 放在增量评估**之前**：增量会把计划写回磁盘，范围一并
                     # 落盘，下一轮读到的就是带范围的那份。
@@ -5428,9 +5463,8 @@ class Orchestrator:
                         + "\n".join(f"  - {m.evidence}" for m in _uncovered)
                     )
 
-                # 2026-11-05（范围派生）：范围由**任务声明**派生，模型写的
-                # ``covers_paths`` 一律被覆盖 —— 否则"范围"就成了模型说了算的
-                # 事，跨轮复用的判据随之失效。
+                # 范围：验证点自己声明的 ``covers_paths`` 保留（只归一化），
+                # 没声明的才从任务声明派生（兜底）。
                 #
                 # 放在重试回路之后、被裁掉的验证点之后：范围是最终那份计划上
                 # 每条验证点的属性，早一步算出来的范围会被后来的增删作废。
@@ -5826,7 +5860,8 @@ class Orchestrator:
                 空改动面（或 ``None``）时整段略去，老提示词逐字节不变。
             task_rows: 本次任务清单（``id`` + ``title`` + ``files_to_modify``）。
                 **可选** —— 空清单时整段略去，老提示词逐字节不变。生成器据此
-                在每条验证点上填 ``source_task_ids``（范围本身由框架派生）。
+                在每条验证点上填 ``source_task_ids``（可选；范围由验证点
+                自己声明 ``covers_paths``）。
         """
         parts = []
 
@@ -5845,9 +5880,9 @@ class Orchestrator:
         if surface_block:
             parts.append(surface_block)
 
-        # 2026-11-05（范围派生）：生成器要声明"我验的是哪几个任务"
-        # （``source_task_ids``），前提是它知道有哪些任务、id 是多少。
-        # 这段是纯输入注入；范围的**内容**仍由框架从任务清单派生。
+        # 生成器可以声明"我验的是哪几个任务"（``source_task_ids``），前提是
+        # 它知道有哪些任务、id 是多少。这段是纯输入注入；范围的第一来源是
+        # 验证点自己声明的 ``covers_paths``，任务清单只是派生兜底。
         task_block = _render_task_catalog(task_rows)
         if task_block:
             parts.append(task_block)
