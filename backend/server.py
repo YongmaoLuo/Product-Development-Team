@@ -1960,8 +1960,21 @@ def _run_boot_sweeps() -> None:
         )
     else:
         try:
+            # 2026-11-13: the root the sweep reads is the root the
+            # instance lock was taken on.  The lock is taken in the
+            # lifespan with ``resolve_plans_dir()`` — the root as it
+            # is *now* — and ``server.PLANS_DIR`` is the root as it was
+            # when this module was imported.  The two are the same
+            # directory while nothing redirects the root in between,
+            # and they are NOT the same directory when something does:
+            # a redirected ``PDT_PLANS_DIR`` would leave the boot sweep
+            # reading a tree the lock does not cover, and the sweep's
+            # own lock gate would then refuse the sweep this backend
+            # is supposed to run.  So the sweep asks for the same root
+            # the lock was taken on — the same one the shutdown sweep
+            # already asks for.
             _swept = _reap_all_plans(
-                PLANS_DIR, reason="startup_sweep",
+                resolve_plans_dir(), reason="startup_sweep",
                 # The scheduler adopts the runs that outlived the
                 # previous backend: a plan it holds is still working,
                 # and the sweep must not take it away.  The shutdown

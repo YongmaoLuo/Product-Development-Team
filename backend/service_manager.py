@@ -117,6 +117,11 @@ from process_identity import probe as probe_process_identity
 # where it lives: the identity check, the child-before-parent order and
 # the escalation are all there, and none of them are repeated here.
 from process_reaper import reap_plan
+# The data-root instance lock — the one authority on "is this process the
+# backend that owns this plans root?".  The sweep gate below asks it, so
+# that an importer of this module (a test run, a one-off script) cannot
+# signal a tree a live backend owns.
+from instance_lock import holds_plans_lock
 from scheduler_ownership import scheduler_holds
 from service_declaration import SERVICE_HOST, ServiceDeclaration
 from service_freshness import (
@@ -7791,6 +7796,12 @@ def reap_all_plans(
     A plan whose ledger is missing or empty is skipped silently — the
     common case is that no plan ever started a service.
 
+    **The sweep belongs to the backend that owns the plans root.**  A
+    process that does not hold that root's instance lock does not sweep
+    it: the sweep is refused, one warning line is logged, and no plan is
+    touched.  See the comment at the gate below for why that is the
+    orphan sweep's owner work and not a loss of it.
+
     ``release_own_owners=True`` is for the *shutdown* sweep: the
     process doing the sweeping is going away, so the rounds it
     registered are over and their entries must be reapable — otherwise
@@ -7833,6 +7844,38 @@ def reap_all_plans(
     """
     plans_dir = Path(plans_dir)
     reports: List[ReapReport] = []
+
+    # 2026-11-13: the sweep belongs to the backend that owns this plans
+    # root -- not to anybody who merely imports this module.
+    #
+    # A sweep is a signal sent into a tree of other people's processes,
+    # so the question that has to be settled first is "who is the
+    # sweeper?".  The instance lock answers it: the backend takes it at
+    # boot and drops it only after its own sweep has run, so "holds the
+    # lock" is exactly "is the backend of this root".  An importer that
+    # merely ran this function -- a test run in a worktree, a one-off
+    # script -- does not hold it, and its sweep would reach a tree a
+    # live backend owns.
+    #
+    # This costs the orphan sweep nothing.  Orphans are swept by the
+    # process that HOLDS the lock: when the backend dies, the kernel
+    # releases the lock with the file descriptor it died holding (that
+    # is what flock is for), and the next backend takes the lock first
+    # and runs its boot sweeps afterwards.  So the orphans are still
+    # collected -- by their owner, not by a passer-by.
+    #
+    # The judgement here is "who is the sweeper", not "is the target my
+    # descendant": the latter is the reaper's own identity check, and it
+    # still runs unchanged for every record this sweep does collect.
+    if not holds_plans_lock(plans_dir):
+        logger.warning(
+            "[service_manager] sweep refused for plans root %s: this "
+            "process does not hold that root's instance lock (caller=%s)",
+            plans_dir,
+            caller,
+        )
+        return []
+
     if not plans_dir.is_dir():
         return reports
     for plan_dir in _plan_dirs_to_sweep(plans_dir):

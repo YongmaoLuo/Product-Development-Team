@@ -99,6 +99,7 @@ __all__ = [
     "InstanceLockHeld",
     "InstanceLocks",
     "acquire_instance_locks",
+    "holds_plans_lock",
     "instance_lock_paths",
 ]
 
@@ -146,6 +147,11 @@ class InstanceLockHeld(RuntimeError):
     """
 
 
+def _plans_lock_path(plans_dir: Path) -> Path:
+    """Where the plans tree's lock file lives."""
+    return Path(plans_dir).expanduser() / PLANS_LOCK_FILENAME
+
+
 def instance_lock_paths(
     plans_dir: Path, state_db_path: Path
 ) -> Tuple[Path, Path]:
@@ -161,10 +167,45 @@ def instance_lock_paths(
     of one root also name one file on disk, so the kernel's ``flock``
     arbitrates them the same way it arbitrates two processes.
     """
-    plans_path = Path(plans_dir).expanduser() / PLANS_LOCK_FILENAME
+    plans_path = _plans_lock_path(plans_dir)
     state_path = Path(state_db_path).expanduser()
     state_path = state_path.with_name(state_path.name + STATE_LOCK_SUFFIX)
     return plans_path, state_path
+
+
+def holds_plans_lock(plans_dir: Path) -> bool:
+    """Whether **this** process holds the instance lock on ``plans_dir``.
+
+    This is the question "is the caller the backend that owns this data
+    root?", asked of the only authority that can answer it: the
+    in-process registry :data:`_HELD`.
+
+    **Why not "take the lock and give it back".**  The obvious
+    alternative — open the lock file, try ``LOCK_EX | LOCK_NB``, and
+    release it again — cannot work, and the reason is the one this
+    module already documents for the registry: ``flock`` conflicts
+    between two *open file descriptions*, and a second ``open()`` in the
+    same process is a second description.  On the BSD flavours a process
+    is blocked by its **own** lock, so the probe would come back "not
+    held" for a lock this very process holds — the answer would be
+    backwards for exactly the process the question is about.  The
+    registry exists precisely because the kernel's answer cannot be
+    trusted for the in-process case, so the in-process case is answered
+    from the registry too.
+
+    The registry key is the *resolved* lock path, so two spellings of
+    one root (``/tmp/x`` and ``/private/tmp/x``) are one lock here as
+    they are on disk.
+
+    Args:
+        plans_dir: The plans root to ask about.
+
+    Returns:
+        ``True`` when this process holds the lock on that root.
+    """
+    key = _registry_key(_plans_lock_path(plans_dir))
+    with _REGISTRY_LOCK:
+        return key in _HELD
 
 
 def acquire_instance_locks(

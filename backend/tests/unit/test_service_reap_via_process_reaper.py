@@ -370,7 +370,7 @@ def test_reap_on_exit_false_entry_survives(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_reap_all_plans_continues_after_one_plan_fails(tmp_path, monkeypatch,
-                                                        caplog):
+                                                        caplog, plans_root_lock):
     """One broken plan must not cost the other plans their sweep.
 
     The tolerance lives here and only here: a plan that raises is
@@ -393,6 +393,8 @@ def test_reap_all_plans_continues_after_one_plan_fails(tmp_path, monkeypatch,
 
     monkeypatch.setattr(sm, "reap_services", _fake_reap_services)
 
+    plans_root_lock(plans_dir)
+
     reports = sm.reap_all_plans(plans_dir, reason="server_shutdown")
 
     assert calls == ["p1", "p2"], "the second plan was never reached"
@@ -402,7 +404,9 @@ def test_reap_all_plans_continues_after_one_plan_fails(tmp_path, monkeypatch,
     ), [record.getMessage() for record in caplog.records]
 
 
-def test_reap_all_plans_with_roles_none_covers_the_whole_tree(tmp_path):
+def test_reap_all_plans_with_roles_none_covers_the_whole_tree(
+    tmp_path, plans_root_lock,
+):
     """``roles=None`` means every role — the tree, not just the services.
 
     The backend's shutdown sweep has to take the executor and the
@@ -429,6 +433,8 @@ def test_reap_all_plans_with_roles_none_covers_the_whole_tree(tmp_path):
             owner_pid=os.getpid(),
             owner_role="backend",
         ))
+
+        plans_root_lock(plans_dir)
 
         reports = sm.reap_all_plans(
             plans_dir, reason="server_shutdown", grace_seconds=2.0,

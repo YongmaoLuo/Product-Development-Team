@@ -36,12 +36,9 @@ from contextlib import contextmanager
 
 from utils.process import kill_process_group
 from utils.secret_files import private_dir, redact_all, write_private_json
-# The one resolver for the plans root (stdlib only, no backend imports),
-# so this module and the backend agree on which tree "the plans root"
-# means even when the environment names it relatively.
-from config_paths import resolve_plans_dir
-# The two truths of the plan context (stdlib only, no backend imports),
-# so the plan's directory is derived from them and never copied.
+# The plan context (stdlib only, no backend imports): the plan's id, and
+# nothing else.  See ``_plan_context_env`` for why the plans root is not
+# among them.
 from plan_env import PLAN_ID_ENV, plan_env
 # Sub-agent sandbox wrapping (2026-10-06). Dependency-free (stdlib only)
 # and it imports nothing from this module, so a top-level import is safe.
@@ -1311,17 +1308,33 @@ _REPO_ROOT = _THIS_DIR.parent
 _FORMAL_REPO_PATH = Path(os.environ.get(
     "PDT_FORMAL_REPO_PATH", str(_REPO_ROOT)
 )).resolve()
-# The plans root, resolved the one way every process agrees on.
-#
-# It used to be read straight from the environment and resolved against
-# *this* process's working directory — which is ``backend/`` for the
-# executor and the plan's own checkout for a sub-agent. A relative
-# ``PDT_PLANS_DIR`` therefore named one directory for the backend and
-# another for everything the backend started, and the sub-agent was
-# handed the wrong one. ``resolve_plans_dir`` anchors a relative value
-# on the repository root instead, so the root means the same tree to
-# every process that reads it.
-_PLANS_DIR = resolve_plans_dir()
+
+
+def _plan_context_env() -> dict:
+    """The plan context the coding agent's settings payload carries.
+
+    **One fact: the plan's id.**  The plans root is deliberately not
+    among them.
+
+    The executor already put the whole plan context into the
+    environment — ``cli.py`` does ``os.environ.update(plan_env(plan_id,
+    plan_dir.parent))`` with an absolute root, before it starts
+    anything — so every process below the executor inherits it, and the
+    sub-agent gets it for free.  Writing the root into the settings
+    payload as well bought nothing and cost something: the payload's
+    ``env`` is applied to the child environment, so it *overrides* what
+    the child inherited.  It therefore stamped the **backend's** view of
+    the root — the one this module resolved at import time — onto any
+    process that ran this code, including a test run in a worktree that
+    had no business writing into the production tree at all.
+
+    The plan's id is kept because it is a fact about *which* plan this
+    is, and a child that does not know it cannot derive the plan's
+    directory.  The root is not a fact about the plan; it is a fact
+    about where the plans live, and every process that needs it already
+    has it in the environment it was started with.
+    """
+    return plan_env(os.environ.get(PLAN_ID_ENV), None)
 
 # PreToolUse hook that enforces "edit inside your own project_dir only",
 # and then asks the file-lock broker for the file before allowing it.
@@ -4677,15 +4690,18 @@ class ClaudeCodingTool(CodingTool):
                     # executor releases with.
                     settings_data["env"]["PDT_LOCK_TASK_ID"] = str(lock_task_id)
             settings_data["env"]["PDT_FORMAL_REPO_PATH"] = str(_FORMAL_REPO_PATH)
-            # The plan's context, as the two facts it is: the plan's id
-            # and the absolute root its directory hangs under. The
-            # sub-agent's children derive the plan's directory from
-            # those two, so they cannot name a different tree than the
-            # backend reads — which is what two ledgers for one plan
-            # looked like.
-            settings_data["env"].update(
-                plan_env(os.environ.get(PLAN_ID_ENV), _PLANS_DIR)
-            )
+            # The plan's context — and only the plan's id.
+            #
+            # The executor already set the whole group into
+            # ``os.environ`` (``cli.py``: ``os.environ.update(plan_env(
+            # plan_id, plan_dir.parent))``, with an absolute root), so
+            # the sub-agent's children inherit the plans root anyway.
+            # Writing it here again meant writing the **backend's**
+            # view of the root into a process that might be running
+            # tests — the payload's ``env`` overrides what the child
+            # inherited, so a process in a worktree was handed the
+            # production root.  See ``_plan_context_env``.
+            settings_data["env"].update(_plan_context_env())
             settings_data.setdefault("hooks", {})
             settings_data["hooks"].setdefault("PreToolUse", [])
             guard_hook = _build_guard_hook()
