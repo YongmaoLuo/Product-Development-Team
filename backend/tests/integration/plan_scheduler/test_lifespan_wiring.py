@@ -25,6 +25,7 @@ constructed can be recorded.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sqlite3
 import sys
 import threading
@@ -199,6 +200,29 @@ def _drive(server_module: Any, app: Any, inside: Callable[[], None]) -> None:
     asyncio.run(_main())
 
 
+@contextlib.contextmanager
+def _own_data_root(server_module: Any, root: Path):
+    """Point the lifespan at a data root of its own, for its duration.
+
+    The instance lock (``backend/instance_lock.py``) refuses a second
+    server on one root, so a case that needs two lifespans at once has
+    to give them two roots.  The patches are restored on the way out,
+    so the rest of the case still sees the roots the suite installed.
+    """
+    plans_dir = root / "plans"
+    plans_dir.mkdir(parents=True, exist_ok=True)
+    state_db = root / "state.db"
+    original_plans_dir = server_module.resolve_plans_dir
+    original_state_db = server_module._state_db_path
+    server_module.resolve_plans_dir = lambda: plans_dir
+    server_module._state_db_path = lambda: state_db
+    try:
+        yield
+    finally:
+        server_module.resolve_plans_dir = original_plans_dir
+        server_module._state_db_path = original_state_db
+
+
 # ---------------------------------------------------------------------------
 # The cases
 # ---------------------------------------------------------------------------
@@ -350,7 +374,7 @@ def test_shutdown_joins_thread(
 
 
 def test_double_start_single_thread(
-    server_module, startup, settings, recording_engine
+    server_module, startup, settings, recording_engine, tmp_path
 ) -> None:
     """A second start does not produce a second worker.
 
@@ -359,6 +383,14 @@ def test_double_start_single_thread(
     lifespan that finds a worker already running leaves it alone: it
     does not start a second one, and it does not stop the one it did
     not start either.
+
+    The inner lifespan gets a **data root of its own**
+    (``_own_data_root``): since 2026-11-12 the instance lock refuses a
+    second server on one root — that is the whole point of it — so two
+    lifespans on one root would now be refused before the scheduler is
+    ever asked.  What this case is about is the scheduler's
+    double-start rule, and that rule needs two *lifespans*, not two
+    servers on one root.
     """
     settings(
         enabled=True,
@@ -374,8 +406,9 @@ def test_double_start_single_thread(
 
     async def _main() -> None:
         async with server_module._lifespan(app):
-            async with server_module._lifespan(app):
-                seen["inside"] = _engine_threads()
+            with _own_data_root(server_module, tmp_path / "inner-root"):
+                async with server_module._lifespan(app):
+                    seen["inside"] = _engine_threads()
             seen["after_inner"] = _engine_threads()
         seen["after_outer"] = _engine_threads()
 
