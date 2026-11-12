@@ -412,6 +412,16 @@ def _apply_owner_guard(
     The set only ever shrinks, and a record's verdict can only go from
     "collectable" to "protected" (a protected record's owner can never
     come back into the collectable set), so the iteration terminates.
+
+    The set is asked about **other** records only.  A record is not its
+    own justification: the cascade rule ("an owner this sweep is going
+    to kill cannot protect its children") is about a parent that goes
+    down and takes its children with it, and asked with the record's
+    own pid it answers "yes, the owner is going to be killed" — the
+    owner *is* the record — so the record collects itself, and a
+    record whose ``owner_pid`` names a living process is signalled
+    even though somebody is serving it.  The record's own pid is
+    therefore not part of the set of owners the judgement may consult.
     """
     collectable: Set[int] = set(records)
     protected: Dict[int, str] = {}
@@ -421,7 +431,8 @@ def _apply_owner_guard(
         for pid, record in list(records.items()):
             if pid in protected:
                 continue
-            reason = _protection_reason(record, collectable, own)
+            others = collectable - {pid}
+            reason = _protection_reason(record, others, own)
             if reason is None:
                 continue
             protected[pid] = reason
