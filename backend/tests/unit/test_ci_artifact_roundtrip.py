@@ -107,17 +107,36 @@ def _artifact_dir(plan: Path) -> Path:
     return plan / "vp_artifacts"
 
 
-def _write_junit_report(plan: Path, vp_id: str, node_class: str,
-                         node_name: str) -> None:
-    """Lay down the junit report the gate's pytest would have written.
+#: A fake CI entry.  It publishes the prepared report into the
+#: directory the runner named through ``PDT_GATE_JUNIT_DIR`` — the very
+#: variable the real gate script reads — so the test exercises the
+#: wiring the production path uses rather than reaching into the
+#: reader directly.
+#:
+#: The exit code is the one the test asked for; when the environment
+#: variable is missing the entry exits 99 instead, so a test can tell
+#: "the gate ran and failed" from "the gate never learned where to
+#: write".
+_FAKE_GATE_SOURCE = '''\
+import os
+import shutil
+import sys
+from pathlib import Path
 
-    The runner reads the gate's per-phase reports out of the evidence
-    directory and turns the failing cases in them into the artifact's
-    ``failed_cases``.  This is that report — the producer's input, not
-    the producer's output, so writing it here keeps the chain honest:
-    the artifact is still produced by the real runner.
-    """
-    report = (
+target = os.environ.get("PDT_GATE_JUNIT_DIR")
+if not target:
+    sys.exit(99)
+destination = Path(target)
+destination.mkdir(parents=True, exist_ok=True)
+for report in sorted((Path(__file__).parent / "reports").glob("*.xml")):
+    shutil.copyfile(report, destination / report.name)
+sys.exit(int(sys.argv[1]))
+'''
+
+
+def _junit_report(node_class: str, node_name: str) -> str:
+    """The phase report the gate's pytest would have written."""
+    return (
         '<?xml version="1.0" encoding="utf-8"?>'
         '<testsuites>'
         '<testsuite name="unit" tests="1" failures="1" errors="0" skipped="0">'
@@ -127,24 +146,56 @@ def _write_junit_report(plan: Path, vp_id: str, node_class: str,
         '</testsuite>'
         '</testsuites>'
     )
-    directory = _artifact_dir(plan) / vp_id
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / "phase-1.xml").write_text(report, encoding="utf-8")
+
+
+def _gate_entry(tmp_path: Path, node_class: str, node_name: str) -> str:
+    """The ``ci_entry`` of a gate that leaves one phase report behind.
+
+    The report is published **while the runner runs**, into the
+    directory the runner named through ``PDT_GATE_JUNIT_DIR``: the
+    evidence directory of a VP is reused across rounds, so the runner
+    takes the reports of an earlier round out of the way before the
+    gate starts.  A report laid down before the run is one of those —
+    it is deleted as stale, and the round is left with no evidence of
+    its own.
+
+    The source report therefore lives **outside** the evidence
+    directory; the gate copies it in while the runner is running.  The
+    report is still the producer's input, not the producer's output:
+    the artifact is produced by the real runner either way.
+    """
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    (reports_dir / "phase-1.xml").write_text(
+        _junit_report(node_class, node_name), encoding="utf-8",
+    )
+    gate = tmp_path / "fake_gate.py"
+    gate.write_text(_FAKE_GATE_SOURCE, encoding="utf-8")
+    return f'"{sys.executable}" "{gate}" 1'
 
 
 def _run_producer(plan: Path, vp_id: str, *, round_no: int = 1) -> Any:
     """Run the **real** CI runner and let it write the evidence.
 
-    The VP carries a real entry, so the runner takes the normal path:
+    The VP carries a real entry — the fake gate that publishes a phase
+    report while the runner runs — so the runner takes the normal path:
     it runs the entry, reads the gate's junit report and writes the
     artifact from the evidence it built.
+
+    Every producer in this file runs the same gate.  A report laid down
+    before the run is one of the reports the runner takes out of the
+    way as stale, so the entry that produces the evidence has to be the
+    one that writes the report.
     """
+    entry = _gate_entry(
+        plan.parent, "backend.tests.unit.test_alpha", "test_one",
+    )
     return ci_runner.run_ci_verification(
         {
             "id": vp_id,
             "verification_method": "full_ci",
             "verification_phase": 2,
-            "ci_entry": "true",
+            "ci_entry": entry,
         },
         project_dir=plan.parent,
         artifact_dir=_artifact_dir(plan),
@@ -310,9 +361,6 @@ def test_consumer_prefers_structured_failed_cases(tmp_path):
     so the machine's own answer wins.
     """
     plan = _plan_dir(tmp_path)
-    _write_junit_report(
-        plan, CONSUMED_VP, "backend.tests.unit.test_alpha", "test_one",
-    )
     _run_producer(plan, CONSUMED_VP, round_no=1)
 
     # The producer wrote the machine's answer down — this is the file the
@@ -344,9 +392,6 @@ def test_consumer_falls_back_after_artifact_removed(tmp_path):
     and when that file is gone the answer comes from the text.
     """
     plan = _plan_dir(tmp_path)
-    _write_junit_report(
-        plan, CONSUMED_VP, "backend.tests.unit.test_alpha", "test_one",
-    )
     _run_producer(plan, CONSUMED_VP, round_no=1)
 
     artifact = _artifact_path(plan, CONSUMED_VP)
@@ -379,9 +424,6 @@ def test_consumer_answers_from_artifact_when_text_names_nothing(tmp_path):
     either, and the round would simply lose its failing case ids.
     """
     plan = _plan_dir(tmp_path)
-    _write_junit_report(
-        plan, CONSUMED_VP, "backend.tests.unit.test_alpha", "test_one",
-    )
     _run_producer(plan, CONSUMED_VP, round_no=1)
 
     payload = _read(_artifact_path(plan, CONSUMED_VP))

@@ -22,6 +22,16 @@ the normal path.  Nothing is added and nothing is guessed: a field the
 runner does not write is not in the contract, and a field the runner
 writes under another name is not in it either.
 
+The keys are spelled out **literally** on both sides — here and in the
+runner's evidence dictionaries — because the field set is not copied
+between them but **derived**: the pinning test reads the allowed keys
+out of the runner's own source.  A key assembled from a constant
+(``evidence[JUNIT_AVAILABLE_KEY] = ...``) is invisible to that
+derivation, so it can never enter the contract — and a contract that
+does not allow a key the producer writes makes the runner reject its
+own artifact as carrying unexpected keys.  Spelled out, the two sets
+stay equal in both directions.
+
 Two names, one slot
 -------------------
 
@@ -93,6 +103,12 @@ CI_ARTIFACT_FIELDS: FrozenSet[str] = frozenset({
     "gate_budget_seconds",
     "gate_summary",
     "spawned_processes_reaped",
+    # 2026-11-10: the proof that this run left nothing behind — the
+    # entries still registered are the processes this run could not give
+    # back.  Both names are spelled out literally (see the module
+    # docstring above).
+    "spawned_processes_outstanding",
+    "spawned_processes_all_given_back",
     "budget_exhausted_in",
     "gate_elapsed_seconds",
     "verifier_source",
@@ -103,6 +119,12 @@ CI_ARTIFACT_FIELDS: FrozenSet[str] = frozenset({
     "junit_failures",
     "junit_error",
     "junit_failures_truncated",
+    # 2026-11-10: whether this run could produce a junit report at all,
+    # why it could not, and which reports of an earlier round were
+    # removed to start from a clean directory.
+    "junit_available",
+    "junit_unavailable_reason",
+    "junit_stale_reports_removed",
     "failed_cases",
     "schema_issues",
 })

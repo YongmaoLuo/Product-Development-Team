@@ -12,8 +12,10 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
+import time
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1637,4 +1639,212 @@ def test_query_internal_m1_api_error_falls_back_instead_of_name_error(monkeypatc
     )
     assert "Vendor A API" in attempts[1], (
         f"the failed provider must be excluded on the retry; got {attempts[1]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The prompt must reach the child BEFORE anything that can block (2026-11-09)
+# ---------------------------------------------------------------------------
+#
+# 2026-11-09: a VP-010 code review came back FAILED with no review in it at
+# all.  The coding-tool child had been spawned and its dispatch registered,
+# but the prompt was written to the child's stdin only AFTER the
+# registration — and the registration blocks (a process identity probe plus
+# a write to the plan's process ledger).  When that took longer than the
+# CLI's grace period for the first byte of stdin, the CLI gave up:
+#
+#   Warning: no stdin data received in 3s, proceeding without it
+#   Error: Input must be provided either through stdin or as a prompt
+#   argument when using --print
+#
+# The parent then wrote into a pipe whose reader was gone (BrokenPipeError,
+# swallowed) and read nothing back: no review, empty details, exit code 1.
+#
+# Fifteen code-review dispatches were spawned inside a single second in that
+# round, so the ledger writes they queued behind were exactly the kind of
+# contention that pushes a registration past the CLI's grace period.
+
+#: A stand-in for the Claude Code CLI.  The real CLI waits a short grace
+#: period for the FIRST BYTE on stdin and gives up when it does not arrive;
+#: this double reproduces that, with the grace period shortened so the test
+#: stays fast.
+_FAKE_CLAUDE_TEMPLATE = r'''#!@@PYTHON@@
+"""Stand-in for the Claude Code CLI's piped-stdin behaviour."""
+import json
+import os
+import select
+import sys
+
+GRACE = float(os.environ.get("FAKE_CLAUDE_GRACE", "1.0"))
+ready, _, _ = select.select([sys.stdin], [], [], GRACE)
+if not ready:
+    sys.stderr.write(
+        "Warning: no stdin data received in "
+        + str(GRACE)
+        + "s, proceeding without it\n"
+    )
+    sys.stderr.write(
+        "Error: Input must be provided either through stdin or as a "
+        "prompt argument when using --print\n"
+    )
+    sys.exit(1)
+sys.stdin.read()
+sys.stdout.write(
+    json.dumps({
+        "type": "system",
+        "subtype": "init",
+        "session_id": "11111111-2222-3333-4444-555555555555",
+    }) + "\n"
+)
+sys.stdout.write(
+    json.dumps({"type": "result", "result": "ok", "is_error": False}) + "\n"
+)
+sys.stdout.flush()
+'''
+
+
+def _install_fake_claude(tmp_path, monkeypatch, script: str) -> None:
+    """Put an executable ``claude`` first on ``PATH``."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    fake = bindir / "claude"
+    fake.write_text(script, encoding="utf-8")
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv(
+        "PATH", str(bindir) + os.pathsep + os.environ.get("PATH", "")
+    )
+
+
+def _plan_dir_for(tmp_path, monkeypatch, plan_id: str) -> Path:
+    """Point the plan machinery at a throwaway plans root.
+
+    The dispatch writes its process ledger under ``<plans>/<plan_id>/``,
+    so the directory has to exist — a plan that has no directory on disk
+    has no ledger to write to.
+    """
+    plans_dir = tmp_path / "plans"
+    plan_dir = plans_dir / plan_id
+    plan_dir.mkdir(parents=True)
+    monkeypatch.setenv("PDT_PLANS_DIR", str(plans_dir))
+    monkeypatch.setenv("PDT_PLAN_ID", plan_id)
+    return plan_dir
+
+
+def test_a_blocking_registration_must_not_starve_the_child_of_its_prompt(
+    tmp_path, monkeypatch,
+):
+    """The child must get its prompt even when the registration blocks.
+
+    The registration is the part of the dispatch that can block (process
+    identity probe + plan process ledger write).  The child is the part
+    that can give up: the CLI waits a short grace period for the first
+    byte of stdin and exits 1 when it does not arrive.  When the two
+    overlap, the review comes back with no content at all — which is
+    exactly what the failed VP-010 round looked like.
+    """
+    plan_id = "20260101-stdinorder"
+    plan_dir = _plan_dir_for(tmp_path, monkeypatch, plan_id)
+    monkeypatch.setenv("FAKE_CLAUDE_GRACE", "1.0")
+    _install_fake_claude(
+        tmp_path, monkeypatch,
+        _FAKE_CLAUDE_TEMPLATE.replace("@@PYTHON@@", sys.executable),
+    )
+    monkeypatch.setattr(
+        ClaudeCodingTool, "_load_provider_from_db",
+        staticmethod(lambda provider_name: {}),
+    )
+
+    # Slow the blocking half of the registration down past the CLI's
+    # grace period.  Everything else about the registration still runs.
+    real_record = ct._record_dispatch_process
+
+    def _slow_record(plan, handle, scoped_tool):
+        time.sleep(2.0)
+        return real_record(plan, handle, scoped_tool)
+
+    monkeypatch.setattr(ct, "_record_dispatch_process", _slow_record)
+
+    tool = ClaudeCodingTool()
+    result, _session_id, _meta = tool._run_claude_interactive(
+        "please review this", idle_timeout=30, total_timeout=30,
+    )
+
+    assert result == "ok", (
+        "the prompt must be fed before the registration can block: a child "
+        "that gave up waiting for stdin produces no output at all"
+    )
+
+    # The registration must still happen — the fix moves it later, it
+    # does not skip it.
+    ledger = plan_dir / "process_ledger.jsonl"
+    assert ledger.exists(), "the dispatch must still write the plan ledger"
+    events = [
+        json.loads(line)
+        for line in ledger.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(e.get("event") == "spawn" for e in events), (
+        "the dispatch must still be registered on the plan's ledger; got "
+        f"{events!r}"
+    )
+
+
+def test_the_prompt_is_written_before_the_dispatch_registration(monkeypatch):
+    """The exact order, pinned: spawn → live register → feed → register.
+
+    ``register_live_dispatch`` stays ahead of the feed — it is a dict
+    write, no I/O — and the registration, the part that blocks, goes
+    after it.
+    """
+    order = []
+    written = []
+
+    mock_proc = MagicMock()
+    mock_proc.stdin.write.side_effect = lambda data: (
+        order.append("stdin_write"), written.append(data)
+    )
+    mock_proc.stdin.close.side_effect = lambda: order.append("stdin_close")
+    mock_proc.stdout = iter([
+        json.dumps({"type": "system", "subtype": "init", "session_id": "z"}),
+        json.dumps({"type": "result", "result": "ok", "is_error": False}),
+    ])
+    mock_proc.stderr.read.return_value = ""
+    mock_proc.wait.return_value = 0
+    mock_proc.poll.return_value = 0
+
+    def _fake_popen(*args, **kwargs):
+        order.append("spawn")
+        return mock_proc
+
+    def _fake_live_register(tool):
+        order.append("live_register")
+
+    def _fake_register(scoped_tool, plan_id):
+        order.append("dispatch_register")
+        return None, None
+
+    monkeypatch.setattr(ct.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(ct, "register_live_dispatch", _fake_live_register)
+    monkeypatch.setattr(ct, "_register_dispatch", _fake_register)
+    monkeypatch.setattr(
+        ClaudeCodingTool, "_load_provider_from_db",
+        staticmethod(lambda provider_name: {}),
+    )
+
+    tool = ClaudeCodingTool()
+    tool._run_claude_interactive("the prompt")
+
+    assert order[0] == "spawn"
+    assert any("the prompt" in chunk for chunk in written), (
+        f"the prompt must reach the child's stdin; wrote {written!r}"
+    )
+    assert order.index("live_register") < order.index("stdin_write"), (
+        "the child must be reachable for a cooperative stop before it is "
+        f"fed; order={order!r}"
+    )
+    assert order.index("stdin_write") < order.index("stdin_close")
+    assert order.index("stdin_close") < order.index("dispatch_register"), (
+        "the registration blocks (identity probe + ledger write); feeding "
+        "the prompt after it can starve the child of its prompt; "
+        f"order={order!r}"
     )
