@@ -2226,6 +2226,24 @@ async def _lifespan(app):
     On shutdown: stop the heartbeat monitor and kill any in-flight
     execution subprocesses.
     """
+    # 2026-11-12: the data-root instance lock — the FIRST thing the
+    # boot does, before anything that could touch the plans tree or
+    # the state database.
+    #
+    # One PDT server per data root: the plans tree and the state
+    # database are written by whoever holds them, and two servers on
+    # one root interleave their writes and reap each other's children.
+    # The lock is taken here (before the orphan reaper's marker, before
+    # the recovery sweeps, before the port is bound) so that a refused
+    # start never gets as far as touching the root it was refused for.
+    #
+    # The lock is released at the very END of the shutdown — after the
+    # execution sweep — so that a second instance cannot walk into this
+    # root while the first one is still tearing it down.
+    from instance_lock import acquire_instance_locks
+    _instance_locks = acquire_instance_locks(resolve_plans_dir(), _state_db_path())
+    app.state.instance_locks = _instance_locks
+
     # 2026-10-27 (T8): the orphan reaper's owner marker — first thing
     # the boot does, before anything that could spawn a child.
     #
@@ -2538,6 +2556,17 @@ async def _lifespan(app):
                     )
         except Exception:
             logger.exception("[startup_guard] shutdown backup failed")
+        # 2026-11-12: the data-root instance lock is dropped LAST — after
+        # the execution sweep and after the state.db backup.  Releasing
+        # it earlier would let a second instance start against a root the
+        # first one is still tearing down.
+        #
+        # Best effort: a failed release must not mask the shutdown
+        # outcome the caller is actually reporting.
+        try:
+            _instance_locks.release()
+        except Exception:
+            logger.exception("[instance_lock] release failed; shutdown continues")
         logger.warning(
             "[server_lifecycle] shutdown complete pid=%d", _os.getpid(),
         )
