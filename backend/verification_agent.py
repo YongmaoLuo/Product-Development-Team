@@ -408,6 +408,37 @@ def persist_conflict_repair_task(
 TERMINAL_TASK_STATUSES = frozenset({"completed", "skipped", "voided"})
 
 
+#: How many base-drift merge tasks one plan may get before the plan is
+#: allowed to give up on the conflict.
+#:
+#: The bound exists because both extremes are broken.  **Unbounded**
+#: re-dispatch is the loop this module's guard was built to stop: every
+#: round writes a *new* task id for the *same* conflict, so a conflict
+#: nobody can resolve produces a fresh task forever and the plan never
+#: converges — it just churns.  **No** re-dispatch at all is the other
+#: extreme and is just as broken: one SIGTERM (or one executor crash)
+#: between the merge's start and its end leaves a ``failed`` row behind,
+#: the guard reads that row as "a merge is already in flight", the round
+#: gets no task id, and the plan is dead in ``base_drift_conflicts``
+#: forever with a conflict nobody is even asked to resolve.  That is
+#: exactly what happened in the field on 2026-11-12.
+#:
+#: Three attempts is enough for the failures that are worth another try
+#: (a transient executor crash, a base that moved again mid-merge) and
+#: few enough that a genuinely unresolvable conflict stops burning
+#: rounds.
+MAX_BASE_DRIFT_MERGE_ATTEMPTS = 3
+
+
+#: The statuses an unfinished base-drift merge task can have, in the
+#: order they are looked at.  A task that is **running** outranks one
+#: that is merely queued: if both exist, the running one is the one the
+#: executor is working on, so that is the one to hand back.  A queued
+#: one outranks a failed one: it is still going to run.  A failed one is
+#: last — it is the only kind that does not get handed back.
+_BASE_DRIFT_OPEN_STATUS_ORDER = ("in_progress", "pending", "failed")
+
+
 
 
 def _read_plan_task_rows(
@@ -445,6 +476,129 @@ def _read_plan_task_rows(
     return dict(rows or {}), None
 
 
+def find_open_base_drift_merge_task(
+    plan_id: str,
+    *,
+    db_path: Optional[Path] = None,
+) -> Optional[Tuple[str, str]]:
+    """The plan's unfinished base-drift merge task — ``(task_id, status)``.
+
+    This is the guard's answer with the *detail* attached: which task
+    is open and what state it is in.  The guard
+    (:func:`has_open_base_drift_merge_task`) only needs to know whether
+    one exists; the writer
+    (:meth:`Orchestrator._persist_base_drift_repair_task`) needs to know
+    *which* one and *what state it is in*, because the two unfinished
+    states want opposite things:
+
+    * a task that is ``pending`` or ``in_progress`` is **alive** — it
+      is queued or running, it *will* be dispatched, and the conflict it
+      carries is being worked on.  Handing that task's id back to the
+      loop is what keeps the plan moving: the executor already has the
+      task, the loop just has to dispatch it again;
+    * a task that is ``failed`` is **dead** — the executor is done with
+      it and it will never run again, but the conflict it was written
+      for is still there.  That one wants a *new* task, under a new id,
+      with the number of attempts bounded.
+
+    A plan can carry both (a running merge and an earlier failure of
+    the same conflict).  The running one wins: it is the one the
+    executor is working on, and handing it back is the least
+    surprising thing to do.  So the pick is by status, not by row
+    order: ``in_progress`` first, then ``pending``, then ``failed``.
+
+    "Unfinished" means the same thing here as it means in the guard:
+    any status that is not terminal (see
+    :data:`TERMINAL_TASK_STATUSES`).  A row whose status was never
+    written is unfinished too — it has not finished.
+
+    The rows are read **per plan**: another plan's unfinished merge says
+    nothing about this one.
+
+    A query that fails is a warning, not a block: the answer is
+    ``None`` — "this plan has no open merge task" — and the round
+    continues as if there were no prior row.  Refusing to write a task
+    because a *read* failed would strand the conflict with nobody to
+    resolve it.
+
+    ``db_path`` defaults to :func:`config_paths.resolve_state_db_path`
+    — the one resolver the rest of the backend uses, so this read and
+    the write that follows it reach the same database.
+    """
+    plan = str(plan_id or "").strip()
+    if not plan:
+        return None
+    rows, error = _read_plan_task_rows(plan, db_path=db_path)
+    if error is not None:
+        logger.warning(
+            "[base_drift] could not read the tasks of plan %r: %s", plan, error,
+        )
+        return None
+
+    best: Optional[Tuple[str, str]] = None
+    best_rank = -1
+    for task_id, entry in rows.items():
+        if not isinstance(entry, Mapping):
+            continue
+        if str(entry.get("failed_vp_id") or "") != base_drift.BASE_DRIFT_VP_ID:
+            continue
+        status = str(entry.get("status") or "").strip().lower()
+        if status in TERMINAL_TASK_STATUSES:
+            continue
+        try:
+            rank = _BASE_DRIFT_OPEN_STATUS_ORDER.index(status)
+        except ValueError:
+            # An unfinished status this module does not know by name.
+            # It still counts as open (the guard has always said so),
+            # and it is looked at after the three it knows.
+            rank = len(_BASE_DRIFT_OPEN_STATUS_ORDER)
+        if best_rank < 0 or rank < best_rank:
+            best = (str(task_id), status)
+            best_rank = rank
+    return best
+
+
+def count_base_drift_merge_tasks(
+    plan_id: str,
+    *,
+    db_path: Optional[Path] = None,
+) -> int:
+    """How many base-drift merge tasks this plan has ever had.
+
+    Every base-drift merge task of the plan counts, whatever its
+    status: a completed one, a failed one, a running one.  The number
+    is what bounds the retries — see
+    :data:`MAX_BASE_DRIFT_MERGE_ATTEMPTS`.
+
+    The rows are told apart the same way the guard tells them apart:
+    by :attr:`base_drift.BASE_DRIFT_VP_ID`, the marker
+    :func:`base_drift.build_conflict_repair_task` stamps on the task
+    it builds.  That is a stable, structured marker — not a title
+    string, which can be reworded by anything that touches the row.
+
+    A read that fails is a warning, not a block: the answer is ``0``,
+    which lets the round write a task.  Losing the count must not cost
+    the plan its chance to resolve the conflict.
+    """
+    plan = str(plan_id or "").strip()
+    if not plan:
+        return 0
+    rows, error = _read_plan_task_rows(plan, db_path=db_path)
+    if error is not None:
+        logger.warning(
+            "[base_drift] could not count the base-drift tasks of plan %r: %s",
+            plan,
+            error,
+        )
+        return 0
+    return sum(
+        1
+        for entry in rows.values()
+        if isinstance(entry, Mapping)
+        and str(entry.get("failed_vp_id") or "") == base_drift.BASE_DRIFT_VP_ID
+    )
+
+
 def has_open_base_drift_merge_task(
     plan_id: str,
     *,
@@ -466,10 +620,20 @@ def has_open_base_drift_merge_task(
     *before* it writes: is there already a merge task for this plan that
     has not finished?
 
+    The guard only answers the question — it does not decide what the
+    writer does with the answer.  That decision lives in
+    :meth:`Orchestrator._persist_base_drift_repair_task`, and it is the
+    difference between "stop the plan" and "hand the work back to the
+    executor": a plan that owns a merge task it can still run must not
+    be stopped, because stopping it means the conflict is never
+    resolved.
+
     * ``pending`` / ``in_progress`` / ``failed`` — the merge is **not**
-      over.  A failed merge in particular *is* the loop: the conflict is
-      still there, and re-dispatching it every round under a new id is
-      exactly what this guard exists to stop.
+      over.  A failed merge in particular is not a finished merge: the
+      conflict is still there.  The guard reports it as open, and
+      :meth:`Orchestrator._persist_base_drift_repair_task` decides what
+      to do about it (hand an alive task back, or re-dispatch a dead one
+      under a bounded number of attempts).
     * ``completed`` / ``skipped`` — the merge is over.  If the base
       moves again afterwards that is a *new* conflict, and it deserves
       a task of its own.
@@ -488,8 +652,7 @@ def has_open_base_drift_merge_task(
       task, and calling it one would let a stuck merge be replaced by
       an endless series of new ones.  ``failed`` in particular stays
       unfinished: a failed merge is not a finished merge, the conflict
-      is still there, and re-dispatching it every round under a new id
-      is precisely the loop this guard exists to stop.
+      is still there.
 
     The rows are read **per plan**: another plan's unfinished merge says
     nothing about this one.
@@ -502,27 +665,11 @@ def has_open_base_drift_merge_task(
     ``db_path`` defaults to :func:`config_paths.resolve_state_db_path`
     — the one resolver the rest of the backend uses, so this read and
     the write that follows it reach the same database.
-    """
-    plan = str(plan_id or "").strip()
-    if not plan:
-        return False
-    rows, error = _read_plan_task_rows(plan, db_path=db_path)
-    if error is not None:
-        logger.warning(
-            "[base_drift] could not read the tasks of plan %r: %s", plan, error,
-        )
-        return False
 
-    for entry in rows.values():
-        if not isinstance(entry, Mapping):
-            continue
-        if str(entry.get("failed_vp_id") or "") != base_drift.BASE_DRIFT_VP_ID:
-            continue
-        status = str(entry.get("status") or "").strip().lower()
-        if status in TERMINAL_TASK_STATUSES:
-            continue
-        return True
-    return False
+    The answer is :func:`find_open_base_drift_merge_task`'s — this
+    function is the yes/no view of it, and the two can never disagree.
+    """
+    return find_open_base_drift_merge_task(plan_id, db_path=db_path) is not None
 
 
 def load_plan_task_ids(
@@ -14733,13 +14880,26 @@ class Orchestrator:
         the database itself: one writer per row, and the writer that
         already exists is the one that enforces the field allow-list.
 
-        Before anything is written, :func:`has_open_base_drift_merge_task`
+        Before anything is written, :func:`find_open_base_drift_merge_task`
         asks whether this plan already carries an **unfinished**
-        base-drift merge task.  If it does, this method returns ``None``
-        without writing a row: the task id carries the round number, so
-        a second task would be a *new* id for the *same* conflict, and a
-        merge that keeps failing would then be re-dispatched every round
-        forever.  Handing the loop no task id is what makes it stop.
+        base-drift merge task — and what state that task is in.  The
+        answer decides what happens next, and the three states want
+        three different things:
+
+        * the open task is ``pending`` or ``in_progress``: it is **alive**
+          — queued or running, and it *will* be dispatched.  Its id is
+          handed back, no row is written, and the loop dispatches the
+          task that already exists.  Stopping the plan here would be
+          the worst of both worlds: the plan sits in
+          ``base_drift_conflicts`` forever while the conflict it is
+          already working on is never allowed to finish;
+        * the open task is ``failed``: it is **dead** — the executor is
+          done with it — but the conflict is still there.  A new task is
+          written for it, under a new id, unless the plan has already
+          had :data:`MAX_BASE_DRIFT_MERGE_ATTEMPTS` merge tasks.  That
+          bound is what keeps a conflict nobody can resolve from
+          producing a new task every round forever;
+        * the plan has no open task: a new task is written, as before.
 
         The task's **id** is allocated, not written out: the plan's own
         task ids are read first and handed to
@@ -14753,27 +14913,60 @@ class Orchestrator:
         counter resets every cycle burned four rounds doing nothing at
         all.
 
-        Returns the task id, or ``None`` when there was nothing to
-        repair (the report names no conflicting file), the task could
-        not be built, or the plan already has an unfinished merge task.
-        A task that cannot be **stored** is reported and
+        Returns the task id — the existing one when the plan already has
+        a merge task that can still run — or ``None`` when there was
+        nothing to repair (the report names no conflicting file), the
+        task could not be built, or the plan exhausted its merge
+        attempts.  A task that cannot be **stored** is reported and
         the round goes on: a lost row must not take the round down.
         """
         plan_id = str(
             getattr(getattr(self, "plan_dir", None), "name", "") or ""
         )
-        # The convergence guard.  A plan that already carries an
-        # unfinished base-drift merge task does not get a second one:
-        # the round then hands the loop **no** task id, and the loop
-        # stops instead of dispatching the same conflict under a new id
-        # every round.
-        if has_open_base_drift_merge_task(plan_id):
+        # The convergence guard.  What it finds decides what this round
+        # does with the conflict — it is not a yes/no that stops the
+        # plan.
+        existing = find_open_base_drift_merge_task(plan_id)
+        if existing is not None:
+            existing_task_id, existing_status = existing
+            if existing_status in ("pending", "in_progress"):
+                # The task can still run: hand it back to the executor
+                # instead of stopping the plan.  Writing a second task
+                # would put two merges on one conflict, and stopping the
+                # plan would freeze a conflict that somebody is already
+                # working on.
+                logger.info(
+                    "[base_drift] the plan %r already has an unfinished "
+                    "base-drift merge task %s (%s); handing it back to "
+                    "the executor",
+                    plan_id,
+                    existing_task_id,
+                    existing_status,
+                )
+                return existing_task_id
+            # The task is dead (``failed``) but the conflict is not.
+            # Give it another chance, a bounded number of times: an
+            # unbounded retry is the loop this guard exists to stop, and
+            # no retry at all lets one crashed merge wedge the plan for
+            # good.
+            attempts = count_base_drift_merge_tasks(plan_id)
+            if attempts >= MAX_BASE_DRIFT_MERGE_ATTEMPTS:
+                logger.warning(
+                    "[base_drift] the plan %r has had %d base-drift merge "
+                    "attempts without resolving the conflict; stopping",
+                    plan_id,
+                    attempts,
+                )
+                return None
             logger.info(
-                "[base_drift] the plan %r already has an unfinished "
-                "base-drift merge task; no new task is written",
+                "[base_drift] the plan %r's last merge task %s failed; "
+                "writing attempt %d of at most %d",
                 plan_id,
+                existing_task_id,
+                attempts + 1,
+                MAX_BASE_DRIFT_MERGE_ATTEMPTS,
             )
-            return None
+            # Fall through to the ordinary "write a new task" path.
         try:
             round_number = int(getattr(self, "_current_round", 0) or 0)
         except (TypeError, ValueError):

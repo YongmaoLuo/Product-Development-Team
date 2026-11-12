@@ -25,19 +25,36 @@ The guard is a read of ``plan_tasks`` **before** the row is written:
   over; a later drift is a *new* conflict and gets its own task;
 * another plan's rows say nothing about this plan.
 
-When the guard fires, the preflight writes no task, so the blocked report
-carries **no** task id — and the verification loop, which dispatches a
-repair only when it is handed a task id, stops instead of looping.
+2026-11-12: the guard stopped being a yes/no.  It used to answer "does
+this plan own an unfinished merge task?" and the writer turned every
+"yes" into **stop the plan**: the round got no task id, the verification
+loop stopped, and the plan sat in ``base_drift_conflicts`` forever —
+*including* when the task it already owned was queued or running.  Seven
+plans did exactly that in the field.
+
+The guard now answers "**which** task, and in what state", and the
+writer acts on the state:
+
+* a task that is ``pending`` or ``in_progress`` is **alive** — it is
+  queued or running, it *will* be dispatched.  Its id is handed back to
+  the loop and no second row is written;
+* a task that is ``failed`` is **dead** but the conflict is not: a new
+  task is written for it, unless the plan has already had
+  :data:`MAX_BASE_DRIFT_MERGE_ATTEMPTS` merge tasks.  That bound is
+  what keeps a conflict nobody can resolve from producing a new task
+  every round forever;
+* no open task at all — a new task is written, as before.
 
 The properties pinned here:
 
-* a pending row blocks a second task;
-* a failed row blocks a second task (a merge that failed is not a merge
-  that is over — re-dispatching it every round is the loop);
+* a pending row is **handed back** — the same id, no second row;
+* a running row is **handed back** — the same id, no second row;
+* a failed row gets a **bounded** retry — a new row, and a new row only
+  while the attempt budget lasts;
 * a completed row allows a new task;
 * another plan's row does not block this plan (negative control);
-* with no prior row the task *is* created (positive control — the four
-  cases above must not pass because the guard blocks everything).
+* with no prior row the task *is* created (positive control — the cases
+  above must not pass because the guard blocks everything).
 """
 
 from __future__ import annotations
@@ -51,6 +68,10 @@ if str(_BACKEND_DIR) not in sys.path:
 
 import base_drift  # noqa: E402
 import verification_agent  # noqa: E402
+# ``server`` before ``verification_loop``: the server imports the loop at
+# the end of its own body, so the loop has to be loaded through it.
+import server  # noqa: E402,F401
+import verification_loop  # noqa: E402
 from base_drift import (  # noqa: E402
     BASE_DRIFT_VP_ID,
     STATUS_CONFLICTS,
@@ -193,13 +214,16 @@ def _base_drift_rows(db_path: Path, plan_id: str):
 # ---------------------------------------------------------------------------
 
 
-def test_pending_row_blocks_a_second_task(monkeypatch, tmp_path):
-    """A pending merge row means the plan already has a merge in flight.
+def test_pending_row_is_handed_back(monkeypatch, tmp_path):
+    """A pending merge row is a merge that **can still run** — hand it back.
 
-    The row is ``pending`` — the merge has been queued and nobody has
+    The row is ``pending``: the merge has been queued and nobody has
     finished it.  Writing a second task would give the executor two
-    merges for one conflict, and the second one would carry a fresh id,
-    so the round would keep finding "work to do" and never converge.
+    merges for one conflict.  Stopping the plan would be worse: the
+    conflict would never be resolved at all, and the plan would sit in
+    ``base_drift_conflicts`` forever (that is what seven plans did on
+    2026-11-12).  So the *same* id goes back to the loop, and no second
+    row is written.
     """
     db_path = _use_db(tmp_path, monkeypatch)
     _seed_base_drift_row(db_path, PLAN_ID, PRIOR_TASK_ID, "pending")
@@ -210,18 +234,19 @@ def test_pending_row_blocks_a_second_task(monkeypatch, tmp_path):
     blocked = orch._run_base_drift_preflight()
 
     assert verification_agent.has_open_base_drift_merge_task(PLAN_ID) is True
-    assert "base_drift_repair_task_id" not in blocked
+    assert blocked["base_drift_repair_task_id"] == PRIOR_TASK_ID
     assert len(_base_drift_rows(db_path, PLAN_ID)) == 1
 
 
-def test_failed_row_blocks_a_second_task(monkeypatch, tmp_path):
-    """A failed merge row also blocks — that is the loop this guards.
+def test_failed_row_gets_a_bounded_retry(monkeypatch, tmp_path):
+    """A failed merge row is dead — the conflict still needs a task.
 
     A failed merge is not a finished merge: the conflict is still there
-    and still needs resolving.  But re-dispatching it *every* round with
-    a new id is exactly what turned one stuck conflict into an endless
-    stream of them.  The row stays open, so the round stops and reports
-    instead of piling up tasks.
+    and still needs resolving.  Re-dispatching it *every* round with a
+    new id is what turned one stuck conflict into an endless stream of
+    them, so the retry is **bounded**
+    (:data:`MAX_BASE_DRIFT_MERGE_ATTEMPTS`).  This plan has had one
+    merge task, so it gets another one — and only one.
     """
     db_path = _use_db(tmp_path, monkeypatch)
     _seed_base_drift_row(db_path, PLAN_ID, PRIOR_TASK_ID, "failed")
@@ -232,18 +257,18 @@ def test_failed_row_blocks_a_second_task(monkeypatch, tmp_path):
     blocked = orch._run_base_drift_preflight()
 
     assert verification_agent.has_open_base_drift_merge_task(PLAN_ID) is True
-    assert "base_drift_repair_task_id" not in blocked
-    assert len(_base_drift_rows(db_path, PLAN_ID)) == 1
+    assert blocked["base_drift_repair_task_id"] == TASK_ID_AFTER_PRIOR
+    assert len(_base_drift_rows(db_path, PLAN_ID)) == 2
 
 
-def test_running_row_blocks_a_second_task(monkeypatch, tmp_path):
-    """A merge that is *running* is not a finished merge either.
+def test_running_row_is_handed_back(monkeypatch, tmp_path):
+    """A merge that is *running* is the one that must not be duplicated.
 
     ``in_progress`` is the status the executor writes while the merge
     agent works.  It is the state the plan is in for the whole time the
     merge runs — the longest window in which a second task could be
     written, and the one where writing it would put two merges on the
-    same conflict.
+    same conflict.  The running task's id goes back to the loop.
     """
     db_path = _use_db(tmp_path, monkeypatch)
     _seed_base_drift_row(db_path, PLAN_ID, PRIOR_TASK_ID, "in_progress")
@@ -254,7 +279,7 @@ def test_running_row_blocks_a_second_task(monkeypatch, tmp_path):
     blocked = orch._run_base_drift_preflight()
 
     assert verification_agent.has_open_base_drift_merge_task(PLAN_ID) is True
-    assert "base_drift_repair_task_id" not in blocked
+    assert blocked["base_drift_repair_task_id"] == PRIOR_TASK_ID
     assert len(_base_drift_rows(db_path, PLAN_ID)) == 1
 
 
@@ -388,3 +413,213 @@ def test_query_failure_only_warns(monkeypatch, tmp_path, caplog):
     blocked = orch._run_base_drift_preflight()
 
     assert blocked["base_drift_repair_task_id"] == TASK_ID
+
+
+# ---------------------------------------------------------------------------
+# The guard's answer decides what the round does — not just "stop"
+# ---------------------------------------------------------------------------
+#
+# The guard used to be a yes/no, and every "yes" turned into "stop the
+# plan": the round got no task id, the verification loop stopped, and the
+# plan sat in ``base_drift_conflicts`` forever — *including* when the task
+# it already owned was queued or running.  Seven plans did exactly that
+# on 2026-11-12.
+#
+# These cases drive the **production entry point**
+# (``Orchestrator._run_base_drift_preflight``) with the plan's rows and
+# the task write stubbed out: no database, no service, no executor.  The
+# assertion that matters is the one the verification loop reads —
+# ``base_drift_repair_task_id`` — because that is what turns "stop" into
+# "repair".
+
+
+def _base_drift_row(status: str):
+    """One base-drift merge row, in the shape the guard reads."""
+    return {"failed_vp_id": BASE_DRIFT_VP_ID, "status": status}
+
+
+def _stub_plan_rows(monkeypatch, rows):
+    """Answer the plan's task rows from a dict — no database involved."""
+    def fake_read(plan_id, *, db_path=None):
+        return dict(rows), None
+
+    monkeypatch.setattr(verification_agent, "_read_plan_task_rows", fake_read)
+    return fake_read
+
+
+def _stub_writes(monkeypatch):
+    """Record every task the round writes; write nothing."""
+    written = []
+
+    def fake_persist(plan_id, task):
+        written.append((plan_id, task))
+        return True
+
+    monkeypatch.setattr(
+        verification_agent, "persist_conflict_repair_task", fake_persist
+    )
+    return written
+
+
+def test_running_task_is_handed_back_and_no_second_row_is_written(
+    monkeypatch, tmp_path,
+):
+    """A merge that is *running* is handed back to the executor.
+
+    The round finds a merge task that is already in flight.  It must not
+    write a second one (two merges on one conflict), and it must not stop
+    the plan either — stopping it means the conflict is never resolved
+    and the plan is dead in ``base_drift_conflicts`` for good.  So the
+    **same** id goes back to the loop, which then dispatches the repair.
+    """
+    _stub_plan_rows(monkeypatch, {"repair-01": _base_drift_row("in_progress")})
+    written = _stub_writes(monkeypatch)
+
+    orch = _orchestrator(tmp_path)
+    _stub_conflict(monkeypatch)
+
+    blocked = orch._run_base_drift_preflight()
+
+    assert blocked["base_drift_repair_task_id"] == "repair-01"
+    assert written == []
+    assert verification_loop._base_drift_round_action(blocked) == "repair"
+
+
+def test_pending_task_is_handed_back_and_no_second_row_is_written(
+    monkeypatch, tmp_path,
+):
+    """A merge that is *queued* is handed back to the executor too.
+
+    ``pending`` is the same situation one step earlier: the task exists,
+    it has not run, and it *will* run.  Handing it back is what lets the
+    loop dispatch it; writing a second row would put two merges on one
+    conflict.
+    """
+    _stub_plan_rows(monkeypatch, {"repair-01": _base_drift_row("pending")})
+    written = _stub_writes(monkeypatch)
+
+    orch = _orchestrator(tmp_path)
+    _stub_conflict(monkeypatch)
+
+    blocked = orch._run_base_drift_preflight()
+
+    assert blocked["base_drift_repair_task_id"] == "repair-01"
+    assert written == []
+    assert verification_loop._base_drift_round_action(blocked) == "repair"
+
+
+def test_failed_task_is_retried_while_the_attempt_budget_lasts(
+    monkeypatch, tmp_path,
+):
+    """A merge that *failed* gets a new task — a bounded number of times.
+
+    The failed row is dead: the executor is done with it and it will
+    never run again.  The conflict it was written for is still there, so
+    the plan gets a **new** task under a new id.  The retry is bounded by
+    :data:`MAX_BASE_DRIFT_MERGE_ATTEMPTS`, so a conflict nobody can
+    resolve cannot produce a new task every round forever.
+    """
+    _stub_plan_rows(monkeypatch, {"repair-01": _base_drift_row("failed")})
+    written = _stub_writes(monkeypatch)
+
+    orch = _orchestrator(tmp_path)
+    _stub_conflict(monkeypatch)
+
+    blocked = orch._run_base_drift_preflight()
+
+    assert [task["id"] for _plan_id, task in written] == ["repair-02"]
+    assert blocked["base_drift_repair_task_id"] == "repair-02"
+    assert verification_loop._base_drift_round_action(blocked) == "repair"
+
+
+def test_failed_task_is_not_retried_past_the_attempt_budget(
+    monkeypatch, tmp_path,
+):
+    """Past the budget the plan stops — and that is the *only* way it stops.
+
+    Three merge tasks have failed for this plan.  A fourth would be the
+    endless stream the guard exists to stop, so the round writes nothing
+    and hands the loop no task id — and the loop stops the plan with
+    ``base_drift_conflicts``.  This is the deliberate, bounded end of the
+    road; every other state keeps the plan moving.
+    """
+    rows = {
+        "repair-01": _base_drift_row("failed"),
+        "repair-02": _base_drift_row("failed"),
+        "repair-03": _base_drift_row("failed"),
+    }
+    assert len(rows) == verification_agent.MAX_BASE_DRIFT_MERGE_ATTEMPTS
+    _stub_plan_rows(monkeypatch, rows)
+    written = _stub_writes(monkeypatch)
+
+    orch = _orchestrator(tmp_path)
+    _stub_conflict(monkeypatch)
+
+    blocked = orch._run_base_drift_preflight()
+
+    assert written == []
+    assert "base_drift_repair_task_id" not in blocked
+    assert verification_loop._base_drift_round_action(blocked) == "stop"
+
+
+def test_no_open_task_writes_a_new_task_as_before(monkeypatch, tmp_path):
+    """With no open task the round writes a task — the behaviour of today.
+
+    The positive control: the four cases above must not pass because the
+    guard blocks everything.  A plan that has never seen a conflict gets
+    its merge task, with the first number of the plan's repair sequence.
+    """
+    _stub_plan_rows(monkeypatch, {})
+    written = _stub_writes(monkeypatch)
+
+    orch = _orchestrator(tmp_path)
+    _stub_conflict(monkeypatch)
+
+    blocked = orch._run_base_drift_preflight()
+
+    assert [task["id"] for _plan_id, task in written] == ["repair-01"]
+    assert blocked["base_drift_repair_task_id"] == "repair-01"
+    assert verification_loop._base_drift_round_action(blocked) == "repair"
+
+
+def test_find_open_prefers_the_running_task(monkeypatch):
+    """A plan carrying several open merge tasks hands back the running one.
+
+    The same conflict can leave a plan with a failed row *and* a running
+    one.  The running task is the one the executor is working on, so it
+    is the one to hand back.
+    """
+    _stub_plan_rows(monkeypatch, {
+        "repair-01": _base_drift_row("failed"),
+        "repair-02": _base_drift_row("pending"),
+        "repair-03": _base_drift_row("in_progress"),
+    })
+
+    found = verification_agent.find_open_base_drift_merge_task(PLAN_ID)
+
+    assert found == ("repair-03", "in_progress")
+
+
+def test_find_open_ignores_finished_tasks(monkeypatch):
+    """A finished merge task is not open — the guard says so, as before."""
+    _stub_plan_rows(monkeypatch, {"repair-01": _base_drift_row("completed")})
+
+    assert verification_agent.find_open_base_drift_merge_task(PLAN_ID) is None
+    assert verification_agent.has_open_base_drift_merge_task(PLAN_ID) is False
+
+
+def test_count_counts_every_base_drift_task_of_the_plan(monkeypatch):
+    """The attempt counter counts the plan's base-drift tasks, whatever state.
+
+    A completed merge is still a merge this plan had, and it still
+    happened before the conflict that is being retried.  Rows that are
+    not base-drift merges (an ordinary verification task) are not
+    counted.
+    """
+    _stub_plan_rows(monkeypatch, {
+        "repair-01": _base_drift_row("completed"),
+        "repair-02": _base_drift_row("failed"),
+        "vp-01": {"failed_vp_id": "vp-01", "status": "pending"},
+    })
+
+    assert verification_agent.count_base_drift_merge_tasks(PLAN_ID) == 2
