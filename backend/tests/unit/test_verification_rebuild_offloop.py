@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import sys
 import threading
 import time
@@ -76,6 +77,38 @@ if str(_BACKEND_DIR) not in sys.path:
 #: sibling VP finishing inside the window is unambiguous evidence, short
 #: enough to keep the suite fast.
 REBUILD_SLEEP_SECONDS = 1.5
+
+
+def _write_checkpoints(plan_dir: Path, vp_id: str) -> None:
+    """The artifact an e2e leg writes before it reports PASSED.
+
+    2026-11-06（VP-015 根因 · 层五）：``e2e`` 现在真的走依据核对了 ——
+    ``_apply_evidence_check`` 的方法过滤器以
+    ``verification_evidence.EVIDENCE_REQUIRED_METHODS`` 为准，那份常量含
+    ``e2e``。于是一份**没有** ``checkpoints.json`` 的 e2e PASSED 会被改判
+    FAILED。这份夹具把验证腿整个 stub 掉了，所以 stub 必须替那条腿把产物
+    写出来 —— 真腿也是这么做的：先写 checkpoints.json，再报 PASSED。
+
+    少了这一步，这份夹具断言的就是**修复前的行为**（一份没有依据的 PASSED
+    照样通过），而它要测的东西（二进制重建期间另一个 VP 能不能推进）跟
+    依据核对毫无关系。
+    """
+    directory = Path(plan_dir) / "vp_artifacts" / str(vp_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "checkpoints.json").write_text(
+        json.dumps({"checkpoints": [
+            {"selector": "#status", "expected": "green",
+             "actual": "green", "passed": True},
+        ]}), encoding="utf-8",
+    )
+
+
+def _with_artifact(agent, inner):
+    """Wrap a stubbed leg so it writes the artifact it would have written."""
+    async def _wrapped(vp):
+        _write_checkpoints(agent.plan_dir, str(vp.get("id")))
+        return await inner(vp)
+    return _wrapped
 
 
 def _make_agent(tmp_path: Path):
@@ -238,7 +271,10 @@ def test_sibling_vp_keeps_progressing_while_a_rebuild_runs(
             "evidence": {},
         }
 
-    monkeypatch.setattr(agent, "_run_single_vp_async", fake_run_single_vp)
+    monkeypatch.setattr(
+        agent, "_run_single_vp_async",
+        _with_artifact(agent, fake_run_single_vp),
+    )
 
     executor = agent._build_verification_executor(_two_vp_plan())
 
@@ -341,7 +377,10 @@ def test_stale_vp_still_blocked_and_events_still_fired(
             "actual_result": "test: downstream stub", "evidence": {},
         }
 
-    monkeypatch.setattr(agent, "_run_single_vp_async", fake_run_single_vp)
+    monkeypatch.setattr(
+        agent, "_run_single_vp_async",
+        _with_artifact(agent, fake_run_single_vp),
+    )
 
     executor = agent._build_verification_executor(_two_vp_plan())
     asyncio.run(executor.run(max_parallel=0))
@@ -442,7 +481,10 @@ def test_successful_rebuild_rechecks_freshness_in_a_thread(
             "actual_result": "test: downstream stub", "evidence": {},
         }
 
-    monkeypatch.setattr(agent, "_run_single_vp_async", fake_run_single_vp)
+    monkeypatch.setattr(
+        agent, "_run_single_vp_async",
+        _with_artifact(agent, fake_run_single_vp),
+    )
 
     executor = agent._build_verification_executor(_two_vp_plan())
 

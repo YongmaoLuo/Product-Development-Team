@@ -80,6 +80,20 @@ from verification_subagent import (
     Verdict,
 )
 from verification_buckets import blocked_reason
+# 2026-11-09（VP-049）：判定用的两个模块（子 agent / 执行器）与方法表必须
+# 来自**同一轮**解析出来的那一份 —— 也就是**被测树**里的那份，而不是这个
+# 长驻进程自己 import 到的副本。解析规则见 ``verification_harness_loader``
+# 的模块文档；本模块只负责"接线"：每轮解析一次、构造点用解析出来的那份、
+# 出处落盘。
+from verification_harness_loader import (
+    RESOLUTION_PROJECT,
+    LoadedHarness,
+    harness_module_path,
+    load_harness_modules,
+)
+# 同一套"出处"读法（文件哈希 / 仓库 HEAD）—— 回落时也要能说清"用的是
+# harness 自己那份的哪个文件"。
+from verification_ci_runner_loader import file_sha256, git_head_at
 # 2026-11-05（改动面注入，缺陷 B 第 1 条后半）：生成器要判断"这次改动该生成
 # 哪类 E2E"，前提是它知道**这次改动碰了哪些文件**。这个事实只存在于 plan
 # 目录的 ``tasks.json``（``tasks[].files_to_modify``）里，由任务 8 的
@@ -2000,6 +2014,136 @@ def _mint_request_id(plan_id: str, round_number: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 把轮次告诉 runner（2026-11-09）
+# ---------------------------------------------------------------------------
+#
+# 一个 VP 的产物目录是**跨轮复用**的：后一轮把前一轮的 ``ci_output.json``
+# 覆盖掉，于是「这份取证属于哪一轮」就没有答案了（2026-11-08）。agent 知道
+# 自己正在跑第几轮，所以轮次由它交给 runner —— runner 据此按轮次另存一份
+# 副本，判定的语义一个字不改（``ci_output.json`` 仍然是 full_ci 的唯一判据）。
+#
+# 但项目可能自带一份 ``verification_ci_runner``（loader 优先用被测树里的那份），
+# 而那份可能还没有 ``round_no`` 这个参数。用错参数会把该项目的每个 full_ci
+# 都变成崩溃 —— 所以轮次只交给**接得住它**的 runner。
+
+
+# ---------------------------------------------------------------------------
+# Which copy judges this round (VP-049, 2026-11-09)
+# ---------------------------------------------------------------------------
+#
+# 判定用的两个模块（子 agent / 执行器）与方法表必须来自**同一轮**解析出来的
+# 那一份 —— 也就是**被测树**里的那份，而不是长驻进程自己 import 到的副本。
+# 解析规则（候选路径 / 框架检出判定 / 加载纪律 / 回落）在
+# :mod:`verification_harness_loader` 里；这里只有三个接线用的helper：回落时
+# 用哪一份模块、回落时类从哪来、回落时方法表从哪来。
+#
+# 三条回落规则都指向**harness 自己那一份**，而且是**晚绑定**的：harness 的
+# 副本是框架的**注入点**（框架的测试替换
+# ``verification_agent.VerificationSubAgent``），早绑定会把那次替换悄悄
+# 丢掉 —— 那是同一个坑的更安静的版本。
+
+
+def _harness_own_module(module_name: str) -> Any:
+    """The harness' own copy of ``module_name`` (``None`` when unusable)."""
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return module
+    try:
+        import importlib
+
+        return importlib.import_module(module_name)
+    except Exception:  # noqa: BLE001 - a fallback, never a failure
+        logger.warning(
+            "[harness_loader] the harness' own %s could not be imported",
+            module_name, exc_info=True,
+        )
+        return None
+
+
+def _late_bound(name: str) -> Any:
+    """The harness' own class, bound **now** rather than at import time.
+
+    Reading the module global at call time is what keeps the framework's
+    injection point working: ``monkeypatch.setattr(verification_agent,
+    "VerificationSubAgent", ...)`` swaps the name in this module's globals,
+    and a fallback that resolved the class at import time would run the
+    un-swapped one.
+    """
+    resolved = globals().get(name)
+    if resolved is not None:
+        return resolved
+    module_name = (
+        "verification_subagent"
+        if name == "VerificationSubAgent"
+        else "verification_executor"
+    )
+    module = _harness_own_module(module_name)
+    resolved = getattr(module, name, None)
+    if resolved is None:  # pragma: no cover - the module-level import binds it
+        raise RuntimeError(
+            f"the harness' own {name} is not available — the verification "
+            f"round cannot construct one",
+        )
+    return resolved
+
+
+def _harness_method_tables() -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """The harness' own method table — the fallback vocabulary.
+
+    A **empty** table would retire every verification point in the round
+    ("this method does not exist"), which is a far worse outcome than
+    falling back to the vocabulary the framework actually ships.
+    """
+    module = _harness_own_module("verification_subagent")
+    supported = tuple(getattr(module, "SUPPORTED_METHODS", ()) or ())
+    legacy = tuple(getattr(module, "LEGACY_METHODS", ()) or ())
+    return supported, legacy
+
+
+def _fallback_harness_modules(
+    exc: Optional[BaseException] = None,
+) -> LoadedHarness:
+    """The harness' own copies — with the reason the resolution failed.
+
+    Reached only when the loader itself raised (it never raises for a
+    missing or broken tree: it falls back on its own).  The provenance
+    says "harness" and carries the reason, so a reader can tell this
+    apart from the loader's own fallback.
+    """
+    reason = (
+        f"{type(exc).__name__}: {exc}" if exc is not None
+        else "resolution failed"
+    )
+    modules = {
+        "subagent": _harness_own_module("verification_subagent"),
+        "executor": _harness_own_module("verification_executor"),
+    }
+    provenance: Dict[str, Any] = {}
+    for key, module_name in (
+        ("subagent", "verification_subagent"),
+        ("executor", "verification_executor"),
+    ):
+        path = harness_module_path(module_name)
+        provenance[key] = {
+            "resolution": "harness",
+            "module_path": str(path),
+            "sha256": file_sha256(path),
+            "git_head": git_head_at(path),
+            "fallback_reason": reason,
+        }
+    return LoadedHarness(
+        subagent_module=modules["subagent"],
+        executor_module=modules["executor"],
+        provenance={
+            **provenance["subagent"],
+            "subagent": provenance["subagent"],
+            "executor": provenance["executor"],
+            "fallback_reason": reason,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # A runtime that names no address (2026-10-25, repair-r1-29)
 # ---------------------------------------------------------------------------
 #
@@ -3883,6 +4027,11 @@ class Orchestrator:
         # Current round number (will be set when running verification)
         self._current_round = 0
 
+        # 2026-11-09（VP-049）：本轮判定用的模块的解析缓存（按
+        # ``(project_dir, round)`` 记）。轮次开始时整个丢掉，每轮重新解析
+        # —— 长驻进程不能拿着一份陈旧的模块判定一整轮。
+        self._harness_modules_cache: Dict[Any, LoadedHarness] = {}
+
         # 2026-11-06（本轮起点）：本轮**开始**的时刻（ISO-8601 UTC）。
         #
         # 轮次可以退回（``reset_rounds`` 把轮次号拨回 1），而
@@ -4636,7 +4785,9 @@ class Orchestrator:
         # 跑它。`verification_subagent` 在同一条 import 路径上、执行期本来
         # 就必须可导入（下面第 3600 行附近就是无条件导入），所以兜底是死
         # 代码，直接去掉。
-        from verification_subagent import LEGACY_METHODS, SUPPORTED_METHODS
+        # 2026-11-09（VP-049）：方法表跟着**本轮判定用的那一份**走 ——
+        # 与子 agent、执行器同一份模块（见 :meth:`_method_tables`）。
+        supported_methods, legacy_methods = self._method_tables()
 
         vps = plan_data.get("verification_points")
         if not isinstance(vps, list):
@@ -4647,9 +4798,9 @@ class Orchestrator:
             if not isinstance(vp, dict):
                 continue
             method = str(vp.get("verification_method") or "").strip()
-            if method in SUPPORTED_METHODS:
+            if method in supported_methods:
                 continue
-            if method in LEGACY_METHODS:
+            if method in legacy_methods:
                 reason = (
                     f"verification_method {method!r} was retired on "
                     f"2026-09-18; this assertion is no longer verified — "
@@ -4664,7 +4815,7 @@ class Orchestrator:
             else:
                 reason = (
                     f"verification_method {method!r} is not one of "
-                    f"{list(SUPPORTED_METHODS)}; this VP cannot be executed"
+                    f"{list(supported_methods)}; this VP cannot be executed"
                 )
             vp["obsolete"] = True
             vp["obsolete_reason"] = reason
@@ -4911,9 +5062,10 @@ class Orchestrator:
             "verification_points": [by_id[i] for i in added_ids if i in by_id],
         }
         bad_ids = {f["id"] for f in self._api_schema_report(candidates)}
-        from verification_subagent import SUPPORTED_METHODS
+        # 2026-11-09（VP-049）：新增条目按**本轮判定用的那一份**方法表核。
+        supported_methods, _ = self._method_tables()
         for vp in candidates["verification_points"]:
-            if str(vp.get("verification_method") or "") not in SUPPORTED_METHODS:
+            if str(vp.get("verification_method") or "") not in supported_methods:
                 bad_ids.add(str(vp.get("id")))
         if bad_ids:
             candidate["verification_points"] = [
@@ -5940,6 +6092,175 @@ class Orchestrator:
         return self._enrich_vps_with_execution_metadata(plan)
 
     # -----------------------------------------------------------------------
+    # Which copy judges this round (VP-049, 2026-11-09)
+    # -----------------------------------------------------------------------
+
+    def _harness_modules(self) -> LoadedHarness:
+        """The modules that judge **this** round — and where they came from.
+
+        2026-11-09（VP-049）：验证轮由 harness 里的**长驻进程**执行
+        （AC server 常年不重启），它通过 ``sys.path`` 解析
+        ``verification_subagent`` / ``verification_executor``，拿到的是
+        **harness 自己那份**——不是被测树里修好的那份。于是"修复停在分支
+        上、判定跑的是旧代码"，而报告里看不出任何异样。
+
+        所以判定用的模块必须**按被测树解析**：候选路径、框架检出判定、加载
+        纪律与回落规则全在 :mod:`verification_harness_loader` 里（那里逐字
+        记录了同一失效类）。本方法只负责接线：
+
+        * **每轮重新解析** —— 缓存的键是 ``(project_dir, round)``，轮次开始
+          时整个丢弃；长驻进程不会拿着一份陈旧的模块判定一整轮；
+        * **解析不了不打断这一轮** —— 异常一律回落 harness 自己那一份，
+          并把原因写进出处（回落是事实，不是失败）。
+
+        Returns:
+            The resolved modules and their provenance.
+        """
+        key = (
+            str(getattr(self, "project_dir", "") or ""),
+            int(getattr(self, "_current_round", 0) or 0),
+        )
+        cache = getattr(self, "_harness_modules_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._harness_modules_cache = cache
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            loaded = load_harness_modules(getattr(self, "project_dir", None))
+        except Exception as exc:  # noqa: BLE001 - a fallback, never a failure
+            logger.warning(
+                "[harness_loader] could not resolve the modules for round %s; "
+                "falling back to the harness' own copies: %s",
+                key[1], exc,
+            )
+            loaded = _fallback_harness_modules(exc)
+        cache[key] = loaded
+        return loaded
+
+    def _verification_subagent_class(self) -> Any:
+        """The ``VerificationSubAgent`` class that judges this round.
+
+        解析到**被测树**那份时用它；回落时**晚绑定**到模块全局
+        （``globals()["VerificationSubAgent"]``）—— 晚绑定是必须的：
+        harness 自己那一份是框架的**注入点**（框架的测试替换
+        ``verification_agent.VerificationSubAgent``），早绑定会把那次替换
+        悄悄丢掉。
+        """
+        loaded = self._harness_modules()
+        provenance = dict(getattr(loaded, "provenance", {}) or {})
+        subagent = dict(provenance.get("subagent") or {})
+        if subagent.get("resolution") == RESOLUTION_PROJECT:
+            resolved = getattr(
+                getattr(loaded, "subagent_module", None),
+                "VerificationSubAgent",
+                None,
+            )
+            if resolved is not None:
+                return resolved
+        return _late_bound("VerificationSubAgent")
+
+    def _verification_executor_class(self) -> Any:
+        """The ``VerificationExecutor`` class that judges this round.
+
+        与 :meth:`_verification_subagent_class` 同一套规则：解析到被测树
+        那份时用它，回落时晚绑定到模块全局。
+        """
+        loaded = self._harness_modules()
+        provenance = dict(getattr(loaded, "provenance", {}) or {})
+        executor = dict(provenance.get("executor") or {})
+        if executor.get("resolution") == RESOLUTION_PROJECT:
+            resolved = getattr(
+                getattr(loaded, "executor_module", None),
+                "VerificationExecutor",
+                None,
+            )
+            if resolved is not None:
+                return resolved
+        return _late_bound("VerificationExecutor")
+
+    def _method_tables(self) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+        """The method table of the module that judges this round.
+
+        **同一份**：方法表与子 agent、执行器必须来自同一个模块 ——
+        一份词汇表配一个别的执行器，等于用两种语言判同一条 VP。方法表住在
+        ``verification_subagent`` 里（``SUPPORTED_METHODS`` /
+        ``LEGACY_METHODS``），所以它跟着子 agent 那一份走。
+
+        解析到的那份没有方法表时回落 harness 自己那份：一张**空表**会把
+        每一条 VP 都判成"方法不存在"，那是比回落更坏的结果。
+        """
+        loaded = self._harness_modules()
+        module = getattr(loaded, "subagent_module", None)
+        supported = tuple(getattr(module, "SUPPORTED_METHODS", ()) or ())
+        legacy = tuple(getattr(module, "LEGACY_METHODS", ()) or ())
+        if supported:
+            return supported, legacy
+        return _harness_method_tables()
+
+    def _supported_methods(self) -> Tuple[str, ...]:
+        """The methods this round's copy of the framework can execute."""
+        return self._method_tables()[0]
+
+    def _legacy_methods(self) -> Tuple[str, ...]:
+        """The methods this round's copy of the framework has retired."""
+        return self._method_tables()[1]
+
+    def _record_harness_provenance(self) -> None:
+        """Write "which copy judged this round" where it cannot be lost.
+
+        2026-11-09（VP-049）：出处不是可有可无的日志行 —— 上一轮失效的
+        根因正是"报告里看不出判定跑的是哪份代码"，于是修复停在分支上而
+        判定照旧跑旧代码。出处落两处：
+
+        * 轮日志（``logs/verification_<n>_<ts>.log``）—— 读这一轮的人看得到；
+        * 持久化审计事件（``logs/audit_events.jsonl``）—— 不依赖轮日志是否
+          打开，事件不会因为"当时没有日志文件"而丢。
+
+        写失败被吞掉（与 :meth:`_record_verifier_provenance` 同一处置）：
+        出处写不进去是**这一轮的事实**，不是这一轮的失败。
+        """
+        try:
+            loaded = self._harness_modules()
+        except Exception:  # noqa: BLE001 - provenance never fails a round
+            logger.debug(
+                "[harness_loader] could not resolve the modules to record",
+                exc_info=True,
+            )
+            return
+        provenance = dict(getattr(loaded, "provenance", {}) or {})
+        for key in ("subagent", "executor"):
+            data = dict(provenance.get(key) or {})
+            if not data:
+                continue
+            try:
+                from verification_persistence import write_audit_event
+
+                write_audit_event(
+                    self.plan_dir,
+                    f"harness_{key}",
+                    "harness_provenance_recorded",
+                    data,
+                )
+            except Exception:  # noqa: BLE001 - provenance never fails a round
+                logger.debug(
+                    "[harness_loader] could not record the %s provenance in "
+                    "the audit trail", key, exc_info=True,
+                )
+            try:
+                self.persistence.write_verification_point_log(
+                    f"harness_{key}",
+                    "harness_provenance_recorded",
+                    data,
+                )
+            except Exception:  # noqa: BLE001 - provenance never fails a round
+                logger.debug(
+                    "[harness_loader] could not record the %s provenance in "
+                    "the round log", key, exc_info=True,
+                )
+
+    # -----------------------------------------------------------------------
     # Phase 2: Execution
     # -----------------------------------------------------------------------
 
@@ -5954,6 +6275,10 @@ class Orchestrator:
             Path to the new log file
         """
         self._current_round = round_number
+        # 2026-11-09（VP-049）：**每轮重新解析**判定用的模块。缓存整个
+        # 丢掉 —— 树在两轮之间改了，这一轮判的就必须是改过的那一份；留着
+        # 上一轮解析出来的模块，等于让长驻进程拿着旧代码判新一轮。
+        self._harness_modules_cache = {}
         # 2026-11-06（本轮起点）：本轮开工的时刻 —— 读拒绝账本时用它把
         # "本轮之前写的记录"（轮次退回后残留的旧证据）剔掉。记在这里，
         # 因为这里是 ``_current_round`` 被定下来的那一步，也就是"本轮开始"
@@ -5986,6 +6311,10 @@ class Orchestrator:
             self.plan_dir.name, round_number,
         )
         log_path = self.persistence.start_round(round_number)
+        # 2026-11-09（VP-049）：本轮判定用的模块出处必须**落盘** —— 轮
+        # 日志与持久化审计事件各一份。放在 ``start_round`` 之后，因为轮
+        # 日志那时才打开（写不进去也不影响这一轮：出处写失败被吞掉）。
+        self._record_harness_provenance()
         # 2026-11-05（轮次作用域）：这一轮的 HEAD、上一轮的 HEAD、以及
         # "这一轮相对上一轮改了什么"必须**在轮次开始时**记下来 ——
         # 复用判定要拿它跟上一轮的 verdict 对照，而上一轮那些改动正是本轮
@@ -7641,7 +7970,18 @@ class Orchestrator:
         method = str(
             vp.get("verification_method") or vp.get("method") or ""
         ).strip()
-        if method not in ("code_review", "ui_validation"):
+        # 2026-11-06（VP-015 根因 · 层五）：方法过滤器以
+        # ``verification_evidence.EVIDENCE_REQUIRED_METHODS`` 为准 ——
+        # 那份常量已经含 ``e2e``，``verify_evidence`` 也已经有 ``e2e``
+        # 分支，但调用方写死的是 ``("code_review", "ui_validation")``，
+        # 于是浏览器腿的证据契约**从来没有被执行过**：一份没有
+        # ``checkpoints.json`` 的 e2e PASSED 照样通过。
+        # 这里不再手写第三份列表。
+        try:
+            from verification_evidence import EVIDENCE_REQUIRED_METHODS
+        except Exception:  # pragma: no cover - defensive
+            EVIDENCE_REQUIRED_METHODS = ("code_review", "ui_validation")
+        if method not in tuple(EVIDENCE_REQUIRED_METHODS):
             return verdict
 
         vp_id = str(vp.get("id", "unknown"))
@@ -7666,6 +8006,7 @@ class Orchestrator:
         try:
             checked = apply_to_verdict(
                 verdict, method, self.plan_dir, self.project_dir, vp_id,
+                vp=vp,
             )
         except Exception:  # pragma: no cover - apply never raises
             logger.exception(
@@ -7684,6 +8025,79 @@ class Orchestrator:
                     "to": checked.get("status"),
                     "issues": (checked.get("evidence") or {}).get(
                         "evidence_check", {}
+                    ),
+                },
+            )
+        # 2026-11-07（第 4 轮 · VP-028）：依据站得住 ≠ 答的是这道题。
+        # 那一轮里子 agent 交回一份 PASSED，11 条理由讲的全是另一个验证点
+        # 的文件 —— 依据解得开、产物在、状态是 PASSED，而**没有一道闸问过
+        # 「这条裁决答的是不是这道题」**。这里补上那一闸：答错了题的通过
+        # 只能改判，不能带着 PASSED 进最终报告。
+        return self._apply_subject_check(
+            vp, checked if checked is not None else verdict,
+        )
+
+    def _apply_subject_check(self, vp: dict, verdict: dict) -> dict:
+        """Downgrade a verdict that answered a different question.
+
+        2026-11-07（第 4 轮 · VP-028）：那一条 PASSED 的 11 条理由讲的
+        全是 ``backend/routes/verification.py`` —— 另一个验证点（VP-038）
+        的题目，而问题问的是 ``backend/verification_executor.py``。别的
+        闸门都满意了：引用解得开、产物在、状态是 PASSED。于是它以「已验证
+        的通过」进了最终报告。
+
+        这一闸只做 **downgrade**：PASSED → FAILED，并追加一条点明双方
+        路径的理由。FAILED / SKIPPED 一律不动，绝不把失败升成通过，也不
+        新增任何修复语义 —— 判错了的验证点下一轮可以重新审查。
+
+        Never raises: a subject-check failure leaves the verdict alone and
+        records why; it never aborts the VP.
+        """
+        if not isinstance(verdict, dict) or not isinstance(vp, dict):
+            return verdict
+        vp_id = str(vp.get("id", "unknown"))
+        try:
+            from verification_evidence import (
+                apply_subject_check_to_verdict,
+                read_citation_files,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "[verification_subject] unavailable (%s); skipping the "
+                "subject check for %s", exc, vp_id,
+            )
+            return verdict
+
+        try:
+            cited = read_citation_files(self.plan_dir, vp_id)
+        except Exception:  # pragma: no cover - defensive
+            cited = []
+
+        try:
+            checked = apply_subject_check_to_verdict(
+                verdict, vp, self.project_dir, cited,
+            )
+        except Exception:  # pragma: no cover - the check never raises
+            logger.exception(
+                "[verification_subject] subject check crashed for %s", vp_id,
+            )
+            return verdict
+
+        if checked is not None and checked is not verdict and (
+            str(checked.get("status")) != str((verdict or {}).get("status"))
+        ):
+            self._safe_log_freshness_event(
+                vp_id, "subject_check_downgraded",
+                {
+                    "method": str(
+                        vp.get("verification_method")
+                        or vp.get("method")
+                        or ""
+                    ),
+                    "from": (verdict or {}).get("status"),
+                    "to": checked.get("status"),
+                    "subject_check": (checked.get("evidence") or {}).get(
+                        "subject_check", {},
                     ),
                 },
             )
@@ -7955,7 +8369,7 @@ class Orchestrator:
                     continue
 
                 checked = self._recheck_deferred_evidence(
-                    vp_id, method, verdict,
+                    vp_id, method, verdict, vp,
                 )
                 if checked is None:
                     continue
@@ -7965,18 +8379,22 @@ class Orchestrator:
                     # The check ran and the basis holds: nothing changes,
                     # so nothing is written and nothing is logged.
                     continue
-                self._safe_log_freshness_event(
-                    vp_id, "evidence_check_downgraded",
-                    {
-                        "method": method,
-                        "from": (verdict or {}).get("status"),
-                        "to": checked.get("status"),
-                        "issues": (checked.get("evidence") or {}).get(
-                            "evidence_check", {},
-                        ),
-                        "phase": "round_end_flush",
-                    },
-                )
+                if not (checked.get("evidence") or {}).get("subject_check"):
+                    # The evidence check did it.  (When the *subject*
+                    # check did it, it logged its own event — one
+                    # downgrade, one event.)
+                    self._safe_log_freshness_event(
+                        vp_id, "evidence_check_downgraded",
+                        {
+                            "method": method,
+                            "from": (verdict or {}).get("status"),
+                            "to": checked.get("status"),
+                            "issues": (checked.get("evidence") or {}).get(
+                                "evidence_check", {},
+                            ),
+                            "phase": "round_end_flush",
+                        },
+                    )
                 updates[vp_id] = checked
             except Exception:  # pragma: no cover - defensive
                 logger.exception(
@@ -8005,12 +8423,25 @@ class Orchestrator:
 
     def _recheck_deferred_evidence(
         self, vp_id: str, method: str, verdict: dict,
+        vp: Optional[dict] = None,
     ) -> Optional[dict]:
         """Re-run one deferred evidence check; ``None`` when it cannot run.
 
         A check that crashes is not a downgrade — it is a check that did
         not happen.  The original conclusion stands and the crash is
         logged; the round must not die over it.
+
+        The deferred check carries the whole gate, not just half of it:
+        the subject check (2026-11-07, VP-028) is part of it, so a
+        deferred verdict that answered another question is downgraded
+        here too — the round owes the operator an answer either way.
+
+        ``vp`` travels with the deferred entry for the same reason: it is
+        what tells an ``e2e`` ``command`` point apart from an ``e2e``
+        ``browser`` one, and the two owe different artifacts.  A deferred
+        check that lost the point would fall back to the browser
+        contract and judge a deterministic PASSED FAILED for a file it
+        was never going to write.
         """
         apply_fn = _resolve_apply_to_verdict()
         if apply_fn is None:  # pragma: no cover - defensive
@@ -8018,6 +8449,7 @@ class Orchestrator:
         try:
             checked = apply_fn(
                 verdict, method, self.plan_dir, self.project_dir, vp_id,
+                vp=vp,
             )
         except Exception:
             logger.exception(
@@ -8027,7 +8459,9 @@ class Orchestrator:
             return None
         if checked is None:
             return None
-        return checked
+        if vp is None:
+            return checked
+        return self._apply_subject_check(vp, checked)
 
     def _log_inconclusive_evidence_check(
         self, vp_id: str, method: str, verdict: dict,
@@ -9946,6 +10380,49 @@ class Orchestrator:
             ]
         return entry
 
+    def _attach_machine_written_failed_cases(
+        self, vp_id: str, result: Dict[str, Any],
+    ) -> None:
+        """Attach the machine-written failing set to a result dict.
+
+        2026-11-06（VP-015 根因 · 层五配套）：框架在重建一个卡死判决时，
+        把失败的 checkpoint id 写进了 ``vp_artifacts/<vp>/failure.json``
+        —— 那是**机器写出的**集合，不是任何人转述的散文。这条路把它带回
+        结果字典，于是它能一路走到报告条目，成为失败指纹的输入。
+
+        只在没有别的来源时补：条目自己带的 ``failed_assertions`` 优先。
+        """
+        existing = result.get("failed_assertions")
+        if isinstance(existing, (list, tuple)) and existing:
+            return
+        ids = self._machine_written_failed_cases(vp_id)
+        if ids:
+            result["failed_assertions"] = ids
+
+    def _machine_written_failed_cases(self, vp_id: str) -> List[str]:
+        """The failing set the framework wrote down for this VP.
+
+        Read from ``vp_artifacts/<vp>/failure.json``.  A missing or
+        unreadable file yields no ids — the caller then falls back to the
+        legacy fingerprint, which is worse but never wrong.
+        """
+        plan_dir = getattr(self, "plan_dir", None)
+        if plan_dir is None or not vp_id:
+            return []
+        path = Path(plan_dir) / "vp_artifacts" / str(vp_id) / "failure.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        if not isinstance(payload, dict):
+            return []
+        failed = payload.get("failed_cases")
+        if not isinstance(failed, (list, tuple)):
+            return []
+        return sorted({
+            str(item).strip() for item in failed if str(item).strip()
+        })
+
     def _save_execution_results(self, execution_results: dict) -> None:
         """Write the round's results back to SQLite — best effort.
 
@@ -10548,6 +11025,11 @@ class Orchestrator:
                 "fallback_reason": f"{type(exc).__name__}: {exc}",
             }
 
+        # 2026-11-09: 这一轮跑出来的取证必须能说清自己属于哪一轮 ——
+        # 产物目录是跨轮复用的，后一轮会把前一轮的 ``ci_output.json`` 覆盖掉，
+        # 于是同一束证据自相矛盾（2026-11-08）。轮次由**这一轮**说出来（agent
+        # 知道自己是第几轮），runner 据此按轮次另存一份副本；判定的语义一个字
+        # 不改（``ci_output.json`` 仍然是 full_ci 的唯一判据）。
         try:
             result = run_ci_verification(
                 vp,
@@ -10752,6 +11234,14 @@ class Orchestrator:
                     # subprocesses via ``HardTimeoutError``.
                     verdict = await self._delegate_to_sub_agent(vp, method, vp_id)
                     result = self._verdict_to_result(vp_id, verdict)
+                    # 2026-11-06（VP-015 根因 · 层五配套）：机器写出的失败
+                    # 集合有**自己的一条路**。以前只有 ``_failed_case_ids_from_
+                    # evidence`` —— 那条路读的是**给 LLM 看的证据文本**里的
+                    # id，不是机器写出的集合。框架重建判决时把失败集合写进
+                    # 了 ``vp_artifacts/<vp>/failure.json``，这里把它读回来
+                    # 挂到结果上，于是报告条目、事件日志、产物与失败指纹
+                    # 说的是**同一组**失败。
+                    self._attach_machine_written_failed_cases(vp_id, result)
             except HardTimeoutError as hte:
                 # 2026-09-08: inner coding_tool SIGKILL fired
                 # (subprocess silent for ``total_sec``) OR the outer
@@ -10941,7 +11431,11 @@ class Orchestrator:
         # the importer is unavailable the legacy behaviour is preserved.
         from sub_agent_registry import sub_agent_registry
 
-        sub_agent = VerificationSubAgent(
+        # 2026-11-09（VP-049）：构造点用的是**本轮解析出来的那份** ——
+        # 被测树里的子 agent，而不是这个长驻进程 import 到的副本。回落时
+        # 晚绑定到模块全局，既有 ``monkeypatch.setattr`` 写法仍然有效。
+        sub_agent_class = self._verification_subagent_class()
+        sub_agent = sub_agent_class(
             method=method,
             # 2026-09-14: 2 retries + initial try = 3
             # total attempts, hard cap. Beyond that the VP goes to
@@ -13117,8 +13611,10 @@ class Orchestrator:
             # 归一化时就被标 obsolete，这里再兜一层 —— `MethodTemplateRegistry`
             # 找不到模板会抛 ValueError，那会让一条本该"干净地不跑"的 VP
             # 变成一条带 traceback 的崩溃。
-            from verification_subagent import SUPPORTED_METHODS
-            if str(vp.get("verification_method") or "") not in SUPPORTED_METHODS:
+            # 2026-11-09（VP-049）：按**本轮判定用的那一份**方法表核 ——
+            # 与子 agent、执行器同一份模块。
+            supported_methods, _ = self._method_tables()
+            if str(vp.get("verification_method") or "") not in supported_methods:
                 retired_method = str(vp.get("verification_method") or "(missing)")
                 self._safe_log_freshness_event(
                     vp_id, "unsupported_method_blocked",
@@ -13203,7 +13699,10 @@ class Orchestrator:
             after = self._capture_serving_snapshot(vp_node, vp_id)
             return self._apply_serving_handover(vp_id, before, after, verdict)
 
-        return VerificationExecutor(
+        # 2026-11-09（VP-049）：执行器与子 agent、方法表必须来自**同一份**
+        # 解析结果 —— 三者不是三份副本，是这一轮判定用的那一份。
+        executor_class = self._verification_executor_class()
+        return executor_class(
             verification_plan=executor_plan,
             plan_id=self.plan_dir.name,
             plan_dir=self.plan_dir,
@@ -13230,13 +13729,15 @@ class Orchestrator:
         :meth:`_build_service_freshness_blocked_verdict` 同形：``status`` /
         ``reasons`` / ``actual_result`` / ``evidence`` / ``framework_checks``。
         """
-        from verification_subagent import SUPPORTED_METHODS
+        # 2026-11-09（VP-049）：被退役的方法名按**本轮判定用的那一份**
+        # 方法表列出。
+        supported_methods, _ = self._method_tables()
         return {
             "status": "BLOCKED",
             "reasons": [
                 blocked_reason(
                     f"verification_method {retired_method!r} is not one "
-                    f"of {list(SUPPORTED_METHODS)}"
+                    f"of {list(supported_methods)}"
                 )
             ],
             "actual_result": (

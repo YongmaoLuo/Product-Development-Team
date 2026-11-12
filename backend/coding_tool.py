@@ -673,22 +673,44 @@ class JsonSession:
     * ``None`` — no id was bound, so there is nothing to label. This is
       also what every existing caller gets, since ``stage`` defaults to
       ``None`` and construction without it is unchanged.
+
+    ``resume_anchor`` (2026-11-08) is the one line that says what the
+    session is FOR, and it travels with the session rather than with
+    the prompt because the prompt is not always sent. A dispatch that
+    continues a session — the provider switched, the rate limit was
+    waited out — re-opens the transcript and sends
+    :data:`RESUME_CONTINUATION_PROMPT` INSTEAD of the question, because
+    the question is already in the transcript. That cue names no task:
+    it says "carry on", and the model has to work out what it is
+    carrying on from whatever the transcript holds. When the transcript
+    belongs to a different job, the model carries on with the wrong one
+    and answers about the wrong subject — which is what the round-24
+    verification attempt did (VP-028's attempt came back with a verdict
+    about VP-038).
+
+    The anchor is the identity the transcript cannot supply. It is
+    optional and defaults to ``None``, and a dispatch with no anchor
+    sends exactly what it sent before the field existed — the field is
+    inert until somebody fills it in.
     """
 
-    __slots__ = ("session_id", "pinned_session_id", "stage")
+    __slots__ = ("session_id", "pinned_session_id", "stage", "resume_anchor")
 
     def __init__(self, session_id: Optional[str] = None,
                  pinned_session_id: Optional[str] = None,
-                 stage: Optional[str] = None):
+                 stage: Optional[str] = None,
+                 resume_anchor: Optional[str] = None):
         self.session_id = session_id
         self.pinned_session_id = pinned_session_id
         self.stage = stage
+        self.resume_anchor = resume_anchor
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (
             f"JsonSession(session_id={self.session_id!r}, "
             f"pinned_session_id={self.pinned_session_id!r}, "
-            f"stage={self.stage!r})"
+            f"stage={self.stage!r}, "
+            f"resume_anchor={self.resume_anchor!r})"
         )
 
 
@@ -856,6 +878,7 @@ RESUME_CONTINUATION_PROMPT = (
     "report the outcome."
 )
 
+
 #: Prepended to a re-ask that runs in the session the same caller just
 #: used. It is deliberately not the cue above: that one describes a turn
 #: cut off mid-task and asks the model to pick the task back up, which is
@@ -881,6 +904,29 @@ RESUME_REASK_PROMPT = (
 JSON_ONLY_SUFFIX = (
     "\n\nIMPORTANT: Return ONLY the JSON object requested, no markdown fencing."
 )
+
+
+def _resume_anchor_suffix(session_handle: Any) -> str:
+    """The identity anchor a CONTINUATION turn carries, or ``""``.
+
+    2026-11-08 (VP-028). The continuation cue above names no task — it
+    says "carry on" and leaves the model to work out what it is carrying
+    on from the restored transcript. When the transcript belongs to a
+    different job, that guess is wrong and the answer comes back about
+    the wrong subject. The anchor is the identity the transcript cannot
+    supply: one line naming what this session is deciding.
+
+    It is appended only to a CONTINUATION, never to a re-ask: a re-ask
+    sends the new question itself, and the question is the task book.
+
+    A handle with no anchor contributes nothing at all — not even a
+    separator — so a dispatch that does not use the field sends exactly
+    what it sent before the field existed.
+    """
+    anchor = getattr(session_handle, "resume_anchor", None) or ""
+    if not anchor:
+        return ""
+    return "\n\n" + anchor
 
 
 class SceneProviderUnavailable(RuntimeError):
@@ -6146,6 +6192,54 @@ class ClaudeCodingTool(CodingTool):
             # own SIGTERM never reaches it).
             register_live_dispatch(self)
 
+            # 2026-11-09 — feed the user prompt via stdin, then close.
+            #
+            # This used to sit AFTER the dispatch registration below, and
+            # that ordering is what silently ate a whole verification
+            # round.  The registration is the part of a dispatch that can
+            # BLOCK: it probes the child's identity in the kernel and
+            # writes the plan's process ledger, and both of those go
+            # through a global lock and the filesystem.  The child, on the
+            # other hand, is the part that can GIVE UP: the CLI waits a
+            # short grace period (3 s) for the first byte on stdin and
+            # exits 1 when it does not arrive —
+            #
+            #   Warning: no stdin data received in 3s, proceeding without it
+            #   Error: Input must be provided either through stdin or as a
+            #   prompt argument when using --print
+            #
+            # So a registration that blocked past that grace period left
+            # the child already dead: the parent's write hit a closed
+            # pipe (BrokenPipeError, swallowed below) and the read loop
+            # got nothing back.  The dispatch was reported as a failure
+            # with no output and no review in it — a code review that
+            # never happened, indistinguishable from a review that found
+            # nothing.
+            #
+            # The fix is the ORDER, not a timeout: feed the child first,
+            # then register.  ``register_live_dispatch`` stays ahead of
+            # the feed — it is one dict write under a lock, no I/O — so
+            # the child is reachable for a cooperative stop from the
+            # moment it exists, exactly as before.
+            #
+            # The feed stays synchronous (no thread): the write is a few
+            # kilobytes into a pipe, and a thread here would change the
+            # call ordering the watchdog and the ledger both assume.
+            # A failed feed is still swallowed exactly as before — it
+            # must not become a new exception path out of the dispatch.
+            try:
+                process.stdin.write(prompt)
+                if not prompt.endswith("\n"):
+                    process.stdin.write("\n")
+                process.stdin.flush()
+            except BrokenPipeError:
+                pass
+            finally:
+                try:
+                    process.stdin.close()
+                except Exception:
+                    pass
+
             # 2026-10-22 — register the dispatch so ``/stop`` can find
             # and kill it. The handle is registered AFTER the spawn
             # succeeded (there is nothing to kill before that) and
@@ -6161,23 +6255,13 @@ class ClaudeCodingTool(CodingTool):
             # Every failure here is swallowed: the registry is a
             # watchdog aid, and a dispatch that cannot be watched must
             # still run. The same is true of the unregister below.
+            #
+            # 2026-11-09 — this registration now runs AFTER the prompt
+            # has been fed (see above): it is the step that can block,
+            # and the child must not be waiting on us when it does.
             _dispatch_registry, _dispatch_handle = _register_dispatch(
                 self, dispatch_plan_id,
             )
-
-            # Feed the user prompt via stdin, then close.
-            try:
-                process.stdin.write(prompt)
-                if not prompt.endswith("\n"):
-                    process.stdin.write("\n")
-                process.stdin.flush()
-            except BrokenPipeError:
-                pass
-            finally:
-                try:
-                    process.stdin.close()
-                except Exception:
-                    pass
 
             # Idle timer — Layer-1 protection (close stdout pipe on inactivity).
             idle_sec = idle_timeout if idle_timeout is not None else self.DEFAULT_IDLE_TIMEOUT
@@ -7671,7 +7755,14 @@ class ClaudeCodingTool(CodingTool):
                     # partway through this same ask, so resume its
                     # session rather than paying for the whole prompt
                     # again.
-                    resume_prompt = RESUME_CONTINUATION_PROMPT
+                    #
+                    # 2026-11-08 (VP-028): the cue names no task, so the
+                    # anchor — what this session is deciding — rides
+                    # along with it. See ``_resume_anchor_suffix``.
+                    resume_prompt = (
+                        RESUME_CONTINUATION_PROMPT
+                        + _resume_anchor_suffix(session_handle)
+                    )
                 text, used_sid = self._resume_or_fresh_session(
                     prev_session_id=pinned_session_id,
                     resume_prompt=resume_prompt,
@@ -8503,7 +8594,18 @@ class ClaudeCodingTool(CodingTool):
                     # continuation cue carries the JSON-only instruction
                     # with it because the restored context ends on the
                     # previous attempt's own turn, not on the original ask.
-                    resume_prompt = RESUME_CONTINUATION_PROMPT + JSON_ONLY_SUFFIX
+                    #
+                    # 2026-11-08 (VP-028): the cue names no task, so the
+                    # anchor — what this session is deciding — rides
+                    # along with it, between the cue and the format
+                    # instruction. The format instruction stays last:
+                    # it is the contract, and a contract the model stops
+                    # reading is not a contract.
+                    resume_prompt = (
+                        RESUME_CONTINUATION_PROMPT
+                        + _resume_anchor_suffix(session_handle)
+                        + JSON_ONLY_SUFFIX
+                    )
                 response_text, used_sid = self._resume_or_fresh_session(
                     prev_session_id=session_id,
                     resume_prompt=resume_prompt,

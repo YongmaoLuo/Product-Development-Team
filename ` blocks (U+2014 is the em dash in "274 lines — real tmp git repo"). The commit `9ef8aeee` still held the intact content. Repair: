@@ -1,4 +1,0 @@
-$ git checkout HEAD -- backend/agent.py backend/tests/unit/test_undeclared_write_gate_enforced.py
---- (empty = restored) ---
-backend/agent.py AST OK, lines: 11693
-backend/tests/unit/test_undeclared_write_gate_enforced.py AST OK, lines: 274

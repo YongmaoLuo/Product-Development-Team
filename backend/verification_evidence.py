@@ -1,4 +1,9 @@
-"""Evidence contract for the LLM-judged verification methods (2026-09-18).
+"""Evidence contract for the verification methods that owe an artifact (2026-09-18).
+
+The heading used to read "the LLM-judged verification methods".  That stopped
+being true when ``e2e`` grew a ``command`` face (2026-11-04): the
+deterministic runner judges that face on the exit code of its entry command,
+and no LLM ever speaks about it.
 
 Why this module exists
 -----------------------
@@ -10,11 +15,22 @@ still need an LLM to reach a conclusion:
   * ``full_ci``        — framework-executed, no LLM (see
                          :mod:`verification_ci_runner`).
   * ``ui_validation``  — a puppeteer-driving sub-agent.
-  * ``e2e``            — the same sub-agent, driving the whole flow.
+  * ``e2e``            — the same sub-agent, driving the whole flow —
+                         or, for its ``command`` face, the framework
+                         itself (see :mod:`verification_ci_runner`).
   * ``code_review``    — a reading sub-agent.
 
-The three LLM-judged methods (:attr:`EVIDENCE_REQUIRED_METHODS`) rest on
-a sub-agent's word, which is why they owe an artifact.
+The methods on :attr:`EVIDENCE_REQUIRED_METHODS` owe an artifact: their
+verdict has to be checkable, and for the LLM-judged ones that means
+resting on a sub-agent's word.
+
+``e2e`` is the one method on that list with two faces (2026-11-04, arch
+决策点 7): its ``browser`` sub-class is judged by that sub-agent and
+owes ``checkpoints.json``, while its ``command`` sub-class is run by the
+deterministic runner — the exit code of its entry command *is* the
+verdict, and no LLM ever speaks about it — so it owes ``ci_output.json``
+instead.  Which contract applies is decided by the **declared**
+sub-class, not by the method name (see :func:`_uses_ci_output_contract`).
 
 The remaining risk is the one the 2026-09-18 post-mortem kept hitting:
 an LLM claiming PASSED without having done anything checkable. The old
@@ -29,6 +45,8 @@ the verification was supposed to produce:
     file/line/snippet each conclusion rests on.
   * ``ui_validation`` must write ``checkpoints.json`` — the selector,
     the expected label and what was actually observed.
+  * ``e2e`` must write ``checkpoints.json`` for its ``browser``
+    sub-class, and ``ci_output.json`` for its ``command`` sub-class.
 
 The framework then checks those claims against reality: does the cited
 file exist, does it have that line, does the quoted snippet actually
@@ -70,15 +88,26 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from bounded_subprocess import run_bounded
+
+# e2e 的两个子类与「这条验证点是哪一类」的读法，从执行侧借
+# （``verification_ci_runner`` 是判定 e2e 能不能跑的那一层）。
+# **同一份判定、不写第二遍**：子类判定的口径住在 runner 里，抄一份进本
+# 模块，迟早会漂 —— 而漂的方向一定是「看起来能过」。
+from verification_ci_runner import E2E_KIND_COMMAND, E2E_METHOD, e2e_kind
 
 logger = logging.getLogger(__name__)
 
 #: Artifact filenames, relative to ``plans/<id>/vp_artifacts/<vp_id>/``.
 CITATIONS_FILENAME = "citations.json"
 CHECKPOINTS_FILENAME = "checkpoints.json"
+
+#: The deterministic runner's audit copy (``verification_ci_runner``).  It
+#: is what an ``e2e`` **command** point owes: that point is judged by the
+#: runner's exit code, not by an LLM, so it never writes a checkpoint.
+CI_OUTPUT_FILENAME = "ci_output.json"
 
 #: How many lines either side of the cited line a snippet may be found
 #: on. LLM citations are usually exact but occasionally off by one when
@@ -94,6 +123,13 @@ _LINE_TOLERANCE = 2
 #: whole-flow scope instead of one component), so it rests on exactly the
 #: same kind of unverifiable claim and needs exactly the same checkpoints
 #: artifact.
+#:
+#: 2026-11-09: the ``command`` face of ``e2e`` is **not** LLM-judged — the
+#: deterministic runner grades it on the exit code of its entry command —
+#: so it owes that runner's own artifact (``ci_output.json``) instead of a
+#: checkpoint.  The method stays on this list either way: it owes an
+#: artifact, and *which* one is decided by the declared sub-class (see
+#: :func:`_uses_ci_output_contract`).
 EVIDENCE_REQUIRED_METHODS = ("code_review", "ui_validation", "e2e")
 
 
@@ -400,10 +436,74 @@ def _stage_one(source: Path, target: Path) -> None:
         )
 
 
+def _uses_ci_output_contract(
+    method: str, vp: Optional[Dict[str, Any]],
+) -> bool:
+    """Is this an ``e2e`` point the framework judges itself?
+
+    ``e2e`` has two faces (2026-11-04, arch 决策点 7).  The ``browser``
+    face is a sub-agent's job and owes ``checkpoints.json``; the
+    ``command`` face is run by the deterministic runner, which leaves
+    ``ci_output.json`` behind and never writes a checkpoint.
+
+    So the contract is picked by the **declared** sub-class and not by
+    the method name: holding a command point to the browser contract
+    judged a deterministic PASSED FAILED for a file it was never going
+    to write — and the whole job of this module is to refuse
+    *unsupported* passes, not to invent one.  A point that declares no
+    sub-class is a browser point (that is the runner's own reading), and
+    a bare call — one that knows no VP at all — is held to the browser
+    contract too.
+    """
+    if method != E2E_METHOD:
+        return False
+    if not isinstance(vp, dict):
+        return False
+    return e2e_kind(vp) == E2E_KIND_COMMAND
+
+
+def _verify_ci_output(directory: Path, vp_id: str) -> List[EvidenceIssue]:
+    """Check the deterministic runner's audit copy of an ``e2e`` command point.
+
+    The runner wrote it; nobody else does.  Three things are asked of it:
+    it is there, it is a JSON object, and — when it names a VP at all —
+    it names **this** one.  A VP's artifact directory is reused across
+    rounds, so an artifact that quotes another VP is not this VP's basis.
+    """
+    path = Path(directory) / CI_OUTPUT_FILENAME
+    if not path.is_file():
+        return [EvidenceIssue(
+            "missing_artifact",
+            f"缺少 {CI_OUTPUT_FILENAME} —— e2e(command) 由框架直接执行，"
+            f"判定依据就是这条入口命令的退出码",
+        )]
+    payload = _read_json(path)
+    if not isinstance(payload, dict):
+        return [EvidenceIssue(
+            "malformed",
+            f"{CI_OUTPUT_FILENAME} 不是可解析的 JSON 对象 —— 它记的是"
+            f"这条入口命令的退出码与产物",
+        )]
+    named = str(payload.get("vp_id") or "").strip()
+    if named and named != vp_id:
+        return [EvidenceIssue(
+            "vp_id_mismatch",
+            f"{CI_OUTPUT_FILENAME} 记的是 {named} 的裁决，不是 {vp_id} 的 —— "
+            f"产物目录串了",
+        )]
+    return []
+
+
 def verify_evidence(
     method: str, plan_dir: Path, project_dir: Path, vp_id: str,
+    vp: Optional[Dict[str, Any]] = None,
 ) -> List[EvidenceIssue]:
     """Verify the artifact ``method`` is required to produce.
+
+    ``vp`` is the verification point itself — the only thing that knows
+    **which** ``e2e`` sub-class this is.  It is optional: a bare call
+    knows nothing about the sub-class and applies the browser contract,
+    which is the one that holds by default.
 
     Returns ``[]`` for methods with no evidence contract (``api_test``
     carries its own, inline, in :mod:`verification_api_runner`).
@@ -427,6 +527,9 @@ def verify_evidence(
                 )]
             citations = payload.get("citations") if isinstance(payload, dict) else None
             return verify_citations(citations, project_dir)
+
+        if method == E2E_METHOD and _uses_ci_output_contract(method, vp):
+            return _verify_ci_output(directory, vp_id)
 
         if method in ("ui_validation", "e2e"):
             payload = _read_json(directory / CHECKPOINTS_FILENAME)
@@ -458,6 +561,7 @@ def apply_to_verdict(
     plan_dir: Path,
     project_dir: Path,
     vp_id: str,
+    vp: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Downgrade a PASSED whose stated basis cannot be verified.
 
@@ -468,6 +572,11 @@ def apply_to_verdict(
     path (including the exception paths that never had a chance to write
     an artifact).
 
+    ``vp`` is the verification point: it is what tells an ``e2e``
+    ``command`` point apart from an ``e2e`` ``browser`` one, and the two
+    owe different artifacts.  A bare call knows no VP and applies the
+    browser contract.
+
     Returns ``verdict`` unchanged when the status is not PASSED or the
     evidence holds up.
     """
@@ -476,7 +585,7 @@ def apply_to_verdict(
     if str(verdict.get("status")) != "PASSED":
         return verdict
 
-    issues = verify_evidence(method, plan_dir, project_dir, vp_id)
+    issues = verify_evidence(method, plan_dir, project_dir, vp_id, vp=vp)
     if not issues:
         return verdict
 
@@ -498,6 +607,368 @@ def apply_to_verdict(
     }
     verdict["evidence"] = evidence
     return verdict
+
+
+# ---------------------------------------------------------------------------
+# Subject check — is this verdict about *this* verification point?
+# ---------------------------------------------------------------------------
+#
+# 2026-11-07（第 4 轮 · VP-028）：验证点问的是
+# ``backend/verification_executor.py`` 的门禁重算，子 agent 交回来的却是
+# 一份 PASSED，11 条理由讲的全是 ``backend/routes/verification.py``
+# —— 另一个验证点（VP-038）的题目。别的闸门都满意了：引用解得开、
+# 产物在、状态是 PASSED。**没有任何一道闸问过「这条裁决答的是不是这道
+# 题」**，于是一份答错题的裁决以「已验证的通过」的身份进了最终报告。
+#
+# 下面的规则刻意很窄 —— 只在能*证明*答的是别的东西时才判：
+#
+#   * 只对 LLM 判定的方法（``EVIDENCE_REQUIRED_METHODS``）；
+#   * 只在验证点的 ``expected_result`` 点名了一个 ``project_dir`` 下
+#     **真实存在**的仓库路径时（点不出路径就不判）；
+#   * 只在裁决本身也提到了路径时（纯文字的审查不该被罚）；
+#   * 裁决用**裸文件名**指代验证点点名的那个文件时，视为同一路径
+#     （判据 (5)）—— 裁决顺带提到的产物名（``checkpoints.json`` 等）
+#     不算路径，不会凭空造出 mismatch；
+#   * 裁决的路径与验证点的路径**一个都不相交** → 答的不是这道题。
+#
+# 它只做 downgrade：PASSED → FAILED。FAILED 仍是 FAILED，SKIPPED 仍是
+# SKIPPED，绝不把失败升成通过，也不新增任何修复语义。
+
+#: A path word: a slash-separated chain that ends in a file name with an
+#: extension — ``backend/verification_executor.py``,
+#: ``backend/routes/verification.py``.  The ``:1700-1701`` that follows a
+#: citation is **not** part of the word (the character class stops at the
+#: colon), and the lookbehind keeps a word from starting in the middle of
+#: a longer path.
+_PATH_WORD_RE = re.compile(
+    r"(?<![\w/.\-])/?(?:[A-Za-z0-9_.\-]+/)*[A-Za-z0-9_\-]+\.[A-Za-z][A-Za-z0-9]*"
+)
+
+#: How many paths a reason names before it says "等".
+_PATH_LIST_LIMIT = 3
+
+
+def _path_words(text: str) -> List[str]:
+    """Every path-shaped word in ``text``, in order, without duplicates."""
+    words: List[str] = []
+    for match in _PATH_WORD_RE.finditer(text or ""):
+        token = match.group(0)
+        if "/" not in token:
+            continue
+        if token not in words:
+            words.append(token)
+    return words
+
+
+def _bare_file_names(text: str) -> Set[str]:
+    """The file names ``text`` mentions *without* a path in front of them.
+
+    A bare name is not a path of this repository on its own — that is
+    exactly why :func:`_path_words` drops it, and why it must not become
+    a path source of its own.  But for the file a verification point
+    named, the bare name *is* that file: a verdict that calls the
+    checked file ``verification_executor.py`` has answered the question
+    about ``backend/verification_executor.py`` (judging (5)).
+
+    Only the tokens that stand alone are collected — a name that is the
+    last segment of a longer path (``backend/routes/verification.py``)
+    is not a bare mention of ``verification.py``.
+    """
+    names: Set[str] = set()
+    for match in _PATH_WORD_RE.finditer(text or ""):
+        token = match.group(0)
+        if "/" in token:
+            continue
+        names.add(token.lower())
+    return names
+
+
+def _repo_relative(token: str, root: Path) -> Optional[str]:
+    """Map a path word onto a repo-relative path, or ``None``.
+
+    An absolute path only counts when it points inside the project; a
+    path outside the tree (``/usr/lib/…``, ``../elsewhere``) is not a
+    path of this repository and is dropped.
+    """
+    token = str(token or "").strip()
+    if not token:
+        return None
+    if token.startswith("/"):
+        try:
+            return Path(token).resolve().relative_to(
+                Path(root).resolve(),
+            ).as_posix()
+        except (ValueError, OSError, RuntimeError):
+            return None
+    parts = [part for part in token.split("/") if part]
+    if not parts or any(part == ".." for part in parts):
+        return None
+    return "/".join(parts)
+
+
+def _exists_under(root: Path, rel: str) -> bool:
+    """Does ``rel`` name a file that really exists inside ``root``?"""
+    try:
+        target = (Path(root) / rel).resolve()
+        target.relative_to(root.resolve())
+    except (ValueError, OSError, RuntimeError):
+        return False
+    return target.exists()
+
+
+def _same_path(left: str, right: str) -> bool:
+    """Do two repo paths name the same file?
+
+    Equal — or one is the other's path-segment suffix
+    (``backend/verification_executor.py`` vs ``verification_executor.py``).
+    The suffix rule is deliberately lenient: a verdict that names the
+    right file by its bare name must not be punished.
+    """
+    first, second = left.lower(), right.lower()
+    if first == second:
+        return True
+    return first.endswith("/" + second) or second.endswith("/" + first)
+
+
+def _flatten_into(value: Any, out: List[str]) -> None:
+    """Collect every string under ``value`` into ``out``."""
+    if value is None:
+        return
+    if isinstance(value, str):
+        out.append(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _flatten_into(item, out)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _flatten_into(item, out)
+    else:
+        out.append(str(value))
+
+
+def _flatten_text(value: Any) -> str:
+    """Flatten a plan field (string / list / dict) into plain text."""
+    parts: List[str] = []
+    _flatten_into(value, parts)
+    return "\n".join(parts)
+
+
+def _verdict_text(verdict: Dict[str, Any]) -> str:
+    """The verdict's answer: its reasons, its evidence and its citations.
+
+    The framework's own attachments are **not** part of the answer: the
+    ``evidence_command`` output is supporting material produced by the
+    framework, and ``evidence_check`` is this module's own bookkeeping.
+    Only what the sub-agent said counts.
+    """
+    parts: List[str] = []
+    _flatten_into(verdict.get("reasons"), parts)
+    evidence = verdict.get("evidence")
+    if isinstance(evidence, dict):
+        for key, value in evidence.items():
+            if key in ("evidence_command", "evidence_check"):
+                continue
+            _flatten_into(value, parts)
+    else:
+        _flatten_into(evidence, parts)
+    _flatten_into(verdict.get("citations"), parts)
+    return "\n".join(parts)
+
+
+def _project_root(
+    project_dir: Optional[Path], vp: Dict[str, Any],
+) -> Optional[Path]:
+    """The tree the paths are resolved against — ``None`` when unknown."""
+    raw = project_dir or (vp or {}).get("project_root")
+    if not raw:
+        return None
+    try:
+        root = Path(str(raw)).expanduser()
+    except (TypeError, ValueError):
+        return None
+    if not root.is_dir():
+        return None
+    return root
+
+
+def _expected_paths(vp: Dict[str, Any], root: Path) -> List[str]:
+    """The repo paths the verification point names, and that really exist."""
+    paths: List[str] = []
+    for token in _path_words(_flatten_text(vp.get("expected_result"))):
+        rel = _repo_relative(token, root)
+        if rel is None or rel in paths:
+            continue
+        if not _exists_under(root, rel):
+            continue
+        paths.append(rel)
+    return paths
+
+
+def _paths_in_text(text: str, root: Path) -> List[str]:
+    """The repo paths a piece of text names."""
+    paths: List[str] = []
+    for token in _path_words(text):
+        rel = _repo_relative(token, root)
+        if rel is None or rel in paths:
+            continue
+        paths.append(rel)
+    return paths
+
+
+def _verdict_paths(verdict: Dict[str, Any], root: Path) -> List[str]:
+    """The repo paths the answer talks about."""
+    return _paths_in_text(_verdict_text(verdict), root)
+
+
+def _join_paths(paths: List[str]) -> str:
+    """Name the paths in a reason — the first few, then "等"."""
+    shown = paths[:_PATH_LIST_LIMIT]
+    text = "、".join(shown)
+    if len(paths) > len(shown):
+        text += " 等"
+    return text
+
+
+def read_citation_files(plan_dir: Path, vp_id: str) -> List[str]:
+    """The repo paths the verdict's own citations name.
+
+    A verdict's prose is not the only place a review shows *what it
+    read*: ``citations.json`` is the review's file list.  Both count as
+    the answer — a review that cited the file the verification point is
+    about is on subject, even when its prose never repeats the path.
+    """
+    artifact = artifact_dir_for(plan_dir, vp_id) / CITATIONS_FILENAME
+    payload = _read_json(artifact)
+    if not isinstance(payload, dict):
+        return []
+    citations = payload.get("citations")
+    if not isinstance(citations, list):
+        return []
+    files: List[str] = []
+    for citation in citations:
+        if not isinstance(citation, dict):
+            continue
+        rel = str(citation.get("file") or "").strip()
+        if rel and rel not in files:
+            files.append(rel)
+    return files
+
+
+def verdict_subject_mismatch(
+    vp: Dict[str, Any],
+    verdict: Dict[str, Any],
+    project_dir: Optional[Path] = None,
+    citation_files: Optional[List[str]] = None,
+) -> Optional[str]:
+    """Is this verdict about a different question than the one asked?
+
+    Returns the reason when the verdict demonstrably answers another
+    question, and ``None`` when that cannot be told — which is the
+    common case, because the rule is deliberately narrow.
+    """
+    if not isinstance(vp, dict) or not isinstance(verdict, dict):
+        return None
+    method = str(
+        vp.get("verification_method") or vp.get("method") or ""
+    ).strip()
+    if method not in EVIDENCE_REQUIRED_METHODS:
+        return None
+    root = _project_root(project_dir, vp)
+    if root is None:
+        return None
+
+    expected = _expected_paths(vp, root)
+    if not expected:
+        # The point names no file of this tree — there is no subject to
+        # compare the answer against.
+        return None
+
+    # One text, two readings: the paths the answer names and the bare
+    # file names it mentions must come from the *same* answer, or the
+    # two rules could disagree about what the verdict said.
+    text = _verdict_text(verdict)
+
+    answered = _paths_in_text(text, root)
+    for cited in citation_files or []:
+        rel = _repo_relative(str(cited), root)
+        if rel and rel not in answered:
+            answered.append(rel)
+    if not answered:
+        # The answer names no file either — a pure-text review is not
+        # evidence of answering the wrong question.
+        return None
+
+    # Judging (5): the answer may call the point's own file by its bare
+    # name (``verification_executor.py:3732``) — that is the same path.
+    # Only the point's own file is answered this way: a bare name the
+    # verdict mentions in passing (``checkpoints.json`` and friends)
+    # never becomes a path of its own, so it can neither rescue a
+    # verdict about another question nor manufacture a mismatch.
+    bare = _bare_file_names(text)
+
+    for one in expected:
+        if Path(one).name.lower() in bare:
+            return None
+        for other in answered:
+            if _same_path(one, other):
+                return None
+
+    return (
+        f"本验证点点名 {_join_paths(expected)}，"
+        f"而结论只涉及 {_join_paths(answered)}"
+        " —— 裁决回答的不是这道验证点"
+    )
+
+
+def apply_subject_check_to_verdict(
+    verdict: Dict[str, Any],
+    vp: Dict[str, Any],
+    project_dir: Optional[Path] = None,
+    citation_files: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Downgrade a PASSED that answered a different question.
+
+    **Only PASSED is inspected** — the same discipline as
+    :func:`apply_to_verdict`: this check refuses to let a wrong pass
+    through, and it never touches a failure (a FAILED stays FAILED, a
+    SKIPPED stays SKIPPED).  Nothing here turns a failure into a pass,
+    and nothing here adds a repair semantic: the only thing it does is
+    say that this verdict did not answer this question — the point can
+    be looked at again in the next round.
+
+    Returns ``verdict`` unchanged when the verdict is not PASSED or when
+    the subject cannot be told.
+    """
+    if not isinstance(verdict, dict):
+        return verdict
+    if str(verdict.get("status")) != "PASSED":
+        return verdict
+
+    reason = verdict_subject_mismatch(
+        vp, verdict, project_dir, citation_files,
+    )
+    if not reason:
+        return verdict
+
+    method = str(
+        (vp or {}).get("verification_method")
+        or (vp or {}).get("method")
+        or "code_review"
+    ).strip()
+    checked = dict(verdict)
+    checked["reasons"] = list(verdict.get("reasons") or []) + [reason]
+    checked["status"] = "FAILED"
+    checked["actual_result"] = (
+        f"{method} 判定为 PASSED，但结论回答的不是这道验证点，改判 FAILED："
+        + reason
+    )
+    evidence = verdict.get("evidence")
+    evidence = dict(evidence) if isinstance(evidence, dict) else (
+        {"original_evidence": evidence}
+    )
+    evidence["subject_check"] = {"reason": reason}
+    checked["evidence"] = evidence
+    return checked
 
 
 # ---------------------------------------------------------------------------

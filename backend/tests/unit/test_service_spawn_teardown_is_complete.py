@@ -47,7 +47,10 @@ if str(BACKEND_DIR) not in sys.path:
 import orphan_reaper as reaper  # noqa: E402
 import service_manager as sm  # noqa: E402
 from service_declaration import ServiceDeclaration  # noqa: E402
-from verification_ci_runner import run_ci_verification  # noqa: E402
+from verification_ci_runner import (  # noqa: E402
+    _reap_spawned,
+    run_ci_verification,
+)
 
 #: The python the gate and the runner use.
 VENV_PYTHON = BACKEND_DIR / ".venv" / "bin" / "python"
@@ -844,3 +847,165 @@ def test_the_gate_gives_back_its_own_service_and_nobody_elses(
         monkeypatch.undo()
         _kill(foreign_service)
         _kill(foreign_owner)
+
+
+# --------------------------------------------------------------------------
+# The runner waits for the owner to be gone
+# --------------------------------------------------------------------------
+#
+# The gate is killed from the outside, and the processes it started are
+# written down against *it* as their owner.  For a moment after the
+# kill that owner is still there -- and a sweep that runs in that
+# window leaves the processes alone, which is right while the owner is
+# there.  Nobody else is coming to give them back: the runner is the
+# process that outlives the gate, so the runner is the process that
+# waits for that window to close and sweeps again.
+
+
+def _registry_entry(pid: int, owner_pid: int, *, pgid: int | None = None) -> dict:
+    """One registry entry, written by hand.
+
+    The owner is not this process: these cases are about an entry whose
+    owner is *somebody else*, so the runner has to judge whether that
+    owner is still there.
+    """
+    return {
+        "pid": pid,
+        "pgid": pgid if pgid is not None else pid,
+        "kind": reaper.KIND_SERVICE,
+        "name": "backend.server",
+        "owner_pid": owner_pid,
+        "start_epoch": reaper.process_start_epoch(pid),
+        "registered_at": time.time(),
+    }
+
+
+def test_a_process_whose_owner_dies_mid_sweep_is_given_back(tmp_path, monkeypatch):
+    """The owner is gone a moment later -- and the process goes with it.
+
+    This is the race the CI of 2026-11-08 lost: the gate was killed,
+    the owner was still there when the sweep ran, and the process the
+    gate had started outlived the run that started it.
+
+    The runner therefore waits, bounded, for the owner to be gone, and
+    sweeps again.  The guardrail is untouched: a process whose owner is
+    still there is still not signalled.
+    """
+    registry = tmp_path / "spawn_registry.jsonl"
+    target = _spawn_detached()
+    owner = _spawn_detached()
+    registry.write_text(
+        json.dumps(_registry_entry(target.pid, owner.pid)) + "\n",
+        encoding="utf-8",
+    )
+
+    sweeps = []
+    real_sweep = reaper.reap_spawned_processes
+
+    def _counting_sweep(path, **kwargs):
+        result = real_sweep(path, **kwargs)
+        sweeps.append(list(result))
+        if len(sweeps) == 1:
+            # The owner is still there for the first sweep and dies
+            # right after it -- which is the race this case is about.
+            _kill(owner)
+        return result
+
+    monkeypatch.setattr(reaper, "reap_spawned_processes", _counting_sweep)
+
+    try:
+        given_back, outstanding = _reap_spawned(
+            registry, reason="the gate was killed",
+        )
+        still_alive = _alive(target.pid)
+    finally:
+        _kill(target)
+        _kill(owner)
+
+    assert len(sweeps) >= 2, (
+        "the runner swept once and gave up; the owner was gone a moment "
+        f"after the first sweep: {sweeps!r}"
+    )
+    assert sweeps[0] == [], (
+        "the first sweep gave something back although the owner was "
+        f"still there: {sweeps[0]!r}"
+    )
+    assert target.pid in [int(entry["pid"]) for entry in given_back], (
+        f"the process was not given back: {given_back!r}"
+    )
+    assert outstanding == [], (
+        f"the registry still holds entries: {outstanding!r}"
+    )
+    assert still_alive is False, (
+        "the process is still running after the run gave it back"
+    )
+
+
+def test_a_process_whose_owner_is_still_there_is_not_given_back(tmp_path):
+    """The guardrail is untouched: an owner that is there keeps its process.
+
+    The wait the runner does is a wait, not a licence: while the owner
+    is still there the process is not signalled, and the registry keeps
+    the entry -- because the run has not established that the process
+    is gone.
+    """
+    registry = tmp_path / "spawn_registry.jsonl"
+    target = _spawn_detached()
+    owner = _spawn_detached()
+    registry.write_text(
+        json.dumps(_registry_entry(target.pid, owner.pid)) + "\n",
+        encoding="utf-8",
+    )
+
+    try:
+        given_back, outstanding = _reap_spawned(
+            registry, reason="the gate is over",
+        )
+        still_alive = _alive(target.pid)
+    finally:
+        _kill(target)
+        _kill(owner)
+
+    assert given_back == [], (
+        f"a process whose owner was still there was given back: {given_back!r}"
+    )
+    assert still_alive is True, (
+        "a process whose owner was still there was killed"
+    )
+    assert [int(entry["pid"]) for entry in outstanding] == [target.pid], (
+        f"the registry does not say what is still there: {outstanding!r}"
+    )
+
+
+def test_the_verdict_says_that_every_registered_process_is_gone(tmp_path):
+    """The verdict carries the proof that nothing was left behind.
+
+    A run that leaves a service behind does not know it: the registry
+    is the only record of what the run started.  So the verdict says
+    which processes are still registered -- and an empty list is the
+    proof that every one of them is gone.
+    """
+    gate = tmp_path / "hanging_gate.py"
+    gate.write_text(
+        _HANGING_GATE_SOURCE.format(backend_dir=str(BACKEND_DIR)),
+        encoding="utf-8",
+    )
+
+    result = run_ci_verification(
+        {
+            "id": "VP-016",
+            "verification_method": "full_ci",
+            "verification_phase": 2,
+            "ci_entry": f"{VENV_PYTHON} {gate}",
+            "ci_timeout_seconds": 5,
+        },
+        project_dir=tmp_path,
+    )
+
+    assert result.evidence["spawned_processes_outstanding"] == [], (
+        "the run left a process behind: "
+        f"{result.evidence.get('spawned_processes_outstanding')!r}"
+    )
+    assert result.evidence["spawned_processes_all_given_back"] is True, (
+        "the verdict does not say that everything was given back"
+    )

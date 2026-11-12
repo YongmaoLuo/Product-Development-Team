@@ -1917,7 +1917,19 @@ class VerificationOrchestrator:
            event log and the artifact all say the same thing;
         2. **this round's CI artifact** —
            ``vp_artifacts/<vp>/ci_output.json``'s ``junit_failures``,
-           which the gate itself wrote.
+           which the gate itself wrote;
+        3. **the machine-written failure record** —
+           ``vp_artifacts/<vp>/failure.json``'s ``failed_cases``, or the
+           ids of the ``checkpoints.json`` entries whose ``passed`` is
+           ``false`` (2026-11-06, VP-015 根因 · 层六).
+
+        The third source is what a **browser leg** has and the first two
+        do not: it writes no CI artifact, and before this layer its
+        report entry carried no failing set either.  Without it the
+        fingerprint had nothing but the run's prose to hash, and the same
+        defect reworded itself into a new fingerprint — which is how one
+        defect was reported as two root causes
+        (``e38fbf818e94c8ed`` → ``0c75226e955636eb``).
 
         The prose in the report (``evidence`` / ``actual_result``) is NOT
         a source: that is the run's summary, and the fingerprint has to
@@ -1936,10 +1948,79 @@ class VerificationOrchestrator:
             if ids:
                 return sorted({_canonical_case_id(item) for item in ids})
 
+        artifact_ids = self._artifact_failed_case_ids(vp_id)
+        if not artifact_ids:
+            artifact_ids = self._machine_written_failed_case_ids(vp_id)
         return sorted({
             _canonical_case_id(item)
-            for item in self._artifact_failed_case_ids(vp_id)
+            for item in artifact_ids
         })
+
+    def _machine_written_failed_case_ids(self, vp_id: str) -> List[str]:
+        """The failing set the framework itself wrote down.
+
+        Two files carry it, and both are machine-written:
+
+        * ``vp_artifacts/<vp>/failure.json`` — the failure record the
+          framework writes when it decides a verification point failed
+          (``failed_cases``);
+        * ``vp_artifacts/<vp>/checkpoints.json`` — the checkpoints a
+          browser leg wrote; the ones whose ``passed`` is not ``true``
+          are the failing set.
+
+        A missing or unreadable file yields no ids — the caller then
+        falls back to the legacy fingerprint, which is worse but never
+        wrong.
+        """
+        if not vp_id:
+            return []
+        directory = Path(self.plan_dir) / "vp_artifacts" / str(vp_id)
+
+        record = self._read_json_payload(
+            directory / "failure.json"
+        )
+        if isinstance(record, dict):
+            failed = record.get("failed_cases")
+            if isinstance(failed, (list, tuple)):
+                ids = {
+                    str(item).strip() for item in failed
+                    if str(item).strip()
+                }
+                if ids:
+                    return sorted(ids)
+
+        checkpoints = self._read_json_payload(
+            directory / "checkpoints.json"
+        )
+        if isinstance(checkpoints, dict):
+            entries = checkpoints.get("checkpoints")
+        else:
+            entries = checkpoints
+        if not isinstance(entries, list):
+            return []
+        ids = []
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("passed") is True:
+                continue
+            identity = ""
+            for key in ("id", "name", "label"):
+                identity = str(entry.get(key) or "").strip()
+                if identity:
+                    break
+            if not identity:
+                identity = "checkpoint[{0}]".format(index)
+            ids.append(identity)
+        return sorted(set(ids))
+
+    @staticmethod
+    def _read_json_payload(path: Path) -> Any:
+        """Read a JSON file, or ``None`` when it is missing or unreadable."""
+        try:
+            return json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
 
     def _artifact_failed_case_ids(self, vp_id: str) -> List[str]:
         """The failing node ids the gate recorded in this round's artifact.
