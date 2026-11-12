@@ -24,8 +24,9 @@
 护栏脚本自己定的三个变量（见 ``backend/verification_write_guard.py`` 的模块
 docstring）：``PDT_VP_WRITE_SCOPE``（**值就是 plan 目录** —— 护栏把它的值
 当成唯一可写根）、``PDT_VP_ID``、``PDT_VP_ROUND``。这里照抄那三个名字，另加
-两个纯说明性的：``PDT_VP_PLAN_DIR`` 与 ``PDT_VP_REFUSAL_DIR`` —— 后者把拒绝
-证据的落点直接写出来，省得读的人自己拼一遍路径。
+一个纯说明性的：``PDT_VP_REFUSAL_DIR`` —— 把拒绝证据的落点直接写出来，省得
+读的人自己拼一遍路径。plan 目录本身只写一份（``PDT_VP_WRITE_SCOPE``）：同一
+件事写两个名字，就是两份会漂的副本。
 
 断言走的是**生产入口**：``SettingsJsonBuilder.build()`` 写出来的文件，而不是
 直接摸 ``_HOOK_RULES`` 里的常量 —— 钩子只有在真的被写进 settings.json 时，
@@ -65,11 +66,10 @@ EDIT_GUARD_NAME = "verifier_write_scope_block"
 #: Bash 分支恒放行（判定改成事后测量），留着只会白起一个 Python 进程。
 BASH_GUARD_NAME = "verifier_bash_write_block"
 
-#: scope env 的四个键。前两个由护栏脚本消费，后两个是给人看的落点说明。
+#: scope env 的三个键。前两个由护栏脚本消费，最后一个是给人看的落点说明。
 SCOPE_ENV_KEYS = (
     "PDT_VP_WRITE_SCOPE",
     "PDT_VP_ID",
-    "PDT_VP_PLAN_DIR",
     "PDT_VP_REFUSAL_DIR",
 )
 
@@ -142,7 +142,7 @@ def _run_hook(command: str, payload: Dict, env: Dict[str, str]) -> int:
 
 
 def test_build_writes_scope_env(tmp_path):
-    """带 plan_dir → settings.json 的 env 里四个 scope 键齐全。"""
+    """带 plan_dir → settings.json 的 env 里三个 scope 键齐全。"""
     plan_dir = tmp_path / "plan"
     plan_dir.mkdir()
 
@@ -153,9 +153,14 @@ def test_build_writes_scope_env(tmp_path):
         assert key in env, f"env 少了 {key}：{sorted(env)}"
 
     assert env["PDT_VP_ID"] == "VP-055"
-    assert env["PDT_VP_PLAN_DIR"] == str(plan_dir)
     assert env["PDT_VP_REFUSAL_DIR"] == str(
         plan_dir / "vp_write_scope" / "refusals" / "round-3"
+    )
+    # plan 目录只写一份：``PDT_VP_WRITE_SCOPE`` 就是它。同一件事再写一个
+    # 名字（``PDT_VP_PLAN_DIR``）就是一份会漂的副本 —— 护栏读的那份和
+    # 人读的那份可以指向不同的目录。
+    assert "PDT_VP_PLAN_DIR" not in env, (
+        f"plan 目录被写了两份：{sorted(env)}"
     )
     # 护栏脚本把 PDT_VP_WRITE_SCOPE 的**值**当成唯一可写根，所以这里必须是
     # plan 目录本身（一个 flag 式的 "1" 会让护栏拿 cwd/1 当可写根）。

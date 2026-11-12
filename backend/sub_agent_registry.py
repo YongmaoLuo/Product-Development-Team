@@ -90,6 +90,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import process_ledger
 from config_paths import resolve_plans_dir
 from framework.ids import validate_plan_id
+# The two truths of the plan context (stdlib only, no backend imports):
+# the plan's directory is derived from them, never copied.
+import plan_env
 
 logger = logging.getLogger(__name__)
 
@@ -429,26 +432,31 @@ def _apply_process_facts(
 def _plan_dir_from_env(plan_id: str) -> Optional[Path]:
     """The plan directory the environment names, when it names this plan.
 
-    ``PDT_PLAN_DIR`` is the absolute directory of the plan an executor
-    run belongs to. The executor is the only process in the tree that
-    knows it for certain — it was handed the plan's ``tasks.json`` — so
-    it says so in the environment, and every process below it writes
-    its ledger records into the one directory the backend sweeps.
+    The environment carries two facts about the plan: its id
+    (``PDT_PLAN_ID``) and the absolute root its directory hangs under
+    (``PDT_PLANS_DIR``).  The plan's own directory is *not* carried —
+    it is derived from those two by :mod:`plan_env`, so it cannot drift
+    away from them.
+
+    The executor is the only process in the tree that knows the plan
+    for certain — it was handed the plan's ``tasks.json`` — so it pins
+    the two facts into the environment, and every process below it
+    derives the one directory the backend sweeps.
 
     The value is only trusted for the plan it is named after: the
     environment is inherited by everything the executor starts, and a
     directory named after a *different* plan says nothing about this
-    one. A relative value is refused for the same reason the plans
+    one.  A relative plans root is refused for the same reason the
     root is anchored rather than taken literally: the executor's
     working directory is ``backend/``, so a relative path there names
     a different tree than the one the backend reads.
     """
-    raw = os.environ.get("PDT_PLAN_DIR")
-    if not raw:
-        return None
-    try:
-        candidate = Path(raw).expanduser()
-    except (TypeError, ValueError, OSError):
+    # The environment's own two truths.  The plan id that names the
+    # directory is the one the environment carries, so the check below
+    # ("is this directory named after *this* plan?") still has teeth:
+    # a directory derived for another plan is refused, not adopted.
+    candidate = plan_env.plan_dir_for()
+    if candidate is None:
         return None
     if not candidate.is_absolute():
         return None

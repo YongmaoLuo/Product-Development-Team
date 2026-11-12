@@ -550,30 +550,30 @@ def test_repeated_registration_writes_one_spawn(tmp_path, monkeypatch):
 # and the order the tree was collected in cannot be read off the ledger
 # at all.
 #
-# So the executor hands its descendants the *absolute* path of the plan
-# it belongs to, and the registry prefers it over the plans root.
+# So the executor hands its descendants two facts — the plan's id and
+# the *absolute* root its directory hangs under — and the registry
+# derives the plan's own directory from them.  No directory string is
+# handed around any more, so there is no second copy of it to drift.
 
 
-def test_the_ledger_follows_the_plan_directory_the_executor_named(
+def test_the_ledger_follows_the_plan_directory_the_environment_names(
     tmp_path, monkeypatch
 ):
-    """``PDT_PLAN_DIR`` wins over the plans root.
+    """``PDT_PLANS_DIR`` + ``PDT_PLAN_ID`` name the plan's own directory.
 
-    The directory the executor names is the plan's own directory — the
-    one the backend sweeps.  When it is there, it is the ledger's home;
-    the plans root is only the fallback for a process that was not told
-    where the plan lives.
+    The two facts the executor pins are enough: the plan's directory is
+    ``<plans root>/<plan id>``, and that is the directory the backend
+    sweeps.  When they are there, it is the ledger's home.
     """
     plan_id = "20261031-plan-dir-handoff"
     plans_root = tmp_path / "plans"
-    plans_root.mkdir()
-    backend_plan_dir = plans_root / plan_id
-    backend_plan_dir.mkdir()
-    executor_plan_dir = tmp_path / "executor-plans" / plan_id
-    executor_plan_dir.mkdir(parents=True)
+    plan_dir = plans_root / plan_id
+    plan_dir.mkdir(parents=True)
+    other_root = tmp_path / "somebody-elses-plans"
+    other_root.mkdir()
 
     monkeypatch.setenv("PDT_PLANS_DIR", str(plans_root))
-    monkeypatch.setenv("PDT_PLAN_DIR", str(executor_plan_dir))
+    monkeypatch.setenv("PDT_PLAN_ID", plan_id)
 
     process = _spawn_holder()
     tool = _StandInTool(process, str(tmp_path))
@@ -582,38 +582,41 @@ def test_the_ledger_follows_the_plan_directory_the_executor_named(
     finally:
         _reap(process)
 
-    assert ledger.live_records(executor_plan_dir), (
-        "the spawn was not written into the plan directory the executor "
-        "named — the backend's sweep will not see this sub-agent"
+    assert ledger.live_records(plan_dir), (
+        "the spawn was not written into the plan directory the environment "
+        "names — the backend's sweep will not see this sub-agent"
     )
-    assert not ledger.read_events(backend_plan_dir), (
-        "the spawn was written into the plans root as well — one plan, "
-        "two ledgers"
+    written = sorted(
+        str(path.parent)
+        for path in tmp_path.rglob(ledger.LEDGER_FILENAME)
+    )
+    assert written == [str(plan_dir)], (
+        f"the spawn was written somewhere else as well — one plan, two "
+        f"ledgers: {written!r}"
     )
 
 
-def test_a_plan_directory_that_names_another_plan_is_ignored(
+def test_a_plan_context_that_names_another_plan_is_ignored(
     tmp_path, monkeypatch
 ):
-    """``PDT_PLAN_DIR`` only speaks for the plan it is named after.
+    """The environment's plan id only speaks for the plan it names.
 
     The environment is inherited by everything the executor starts, so
-    the value is only trustworthy for the plan the executor belongs to.
-    A directory that is named after a *different* plan says nothing about
-    this one, and following it would put this plan's records in another
-    plan's directory.
+    the plan id it carries is only trustworthy for the plan the
+    executor belongs to.  A context that names a *different* plan says
+    nothing about this one, and following it would put this plan's
+    records in another plan's directory.
     """
     plan_id = "20261031-plan-dir-handoff"
     other_plan_id = "20261031-somebody-else"
     plans_root = tmp_path / "plans"
-    plans_root.mkdir()
     plan_dir = plans_root / plan_id
-    plan_dir.mkdir()
+    plan_dir.mkdir(parents=True)
     other_plan_dir = plans_root / other_plan_id
-    other_plan_dir.mkdir()
+    other_plan_dir.mkdir(parents=True)
 
     monkeypatch.setenv("PDT_PLANS_DIR", str(plans_root))
-    monkeypatch.setenv("PDT_PLAN_DIR", str(other_plan_dir))
+    monkeypatch.setenv("PDT_PLAN_ID", other_plan_id)
 
     process = _spawn_holder()
     tool = _StandInTool(process, str(tmp_path))
@@ -630,19 +633,20 @@ def test_a_plan_directory_that_names_another_plan_is_ignored(
     )
 
 
-def test_the_executor_hands_its_plan_directory_to_its_descendants(
+def test_the_executor_hands_its_plan_context_to_its_descendants(
     tmp_path, monkeypatch
 ):
-    """``cli.py`` exports the plan's absolute directory.
+    """``cli.py`` exports the plan's id and the absolute root it hangs under.
 
     The executor knows which plan it is running — the plan whose
     ``tasks.json`` it was handed — and it is the only process in the
-    tree that knows it for certain.  It says so in the environment, so
-    that everything it starts writes its ledger records into the same
-    directory the backend reads, and the plan has one ledger rather
-    than one per working directory.
+    tree that knows it for certain.  It says so in the environment as
+    two facts, so that everything it starts derives the same directory
+    the backend reads, and the plan has one ledger rather than one per
+    working directory.
     """
     import cli as cli_module
+    import plan_env
 
     plan_dir = tmp_path / "plans" / "20261031-plan-dir-handoff"
     plan_dir.mkdir(parents=True)
@@ -654,7 +658,11 @@ def test_the_executor_hands_its_plan_directory_to_its_descendants(
     project_dir = tmp_path / "project"
     project_dir.mkdir()
 
-    monkeypatch.delenv("PDT_PLAN_DIR", raising=False)
+    # A root that is not this plan's: the executor must replace it with
+    # the one it knows, and the plan's directory must follow from the
+    # two facts alone.
+    monkeypatch.delenv("PDT_PLAN_ID", raising=False)
+    monkeypatch.setenv("PDT_PLANS_DIR", str(tmp_path / "some-other-root"))
     monkeypatch.setattr(cli_module, "autonomous_coding", lambda *a, **k: 0)
     monkeypatch.setattr(
         "sys.argv",
@@ -668,10 +676,21 @@ def test_the_executor_hands_its_plan_directory_to_its_descendants(
 
     cli_module.main()
 
-    assert os.environ.get("PDT_PLAN_DIR") == str(plan_dir), (
-        "the executor did not hand its plan directory to the processes it "
-        "starts — a descendant rebuilds it from the environment and lands "
-        "in a different tree"
+    assert os.environ.get("PDT_PLAN_ID") == plan_dir.name, (
+        "the executor did not hand its plan id to the processes it starts"
+    )
+    plans_root = Path(os.environ.get("PDT_PLANS_DIR", ""))
+    assert plans_root.is_absolute(), (
+        f"the plans root the executor handed down is not absolute: {plans_root!s}"
+    )
+    assert plans_root == plan_dir.parent.resolve(), (
+        "the executor did not hand down the root its plan lives under — a "
+        "descendant derives the plan's directory from it and lands in a "
+        "different tree"
+    )
+    assert plan_env.plan_dir_for() == plan_dir.resolve(), (
+        "the plan's directory is not derivable from the two facts the "
+        "executor handed down"
     )
 
 

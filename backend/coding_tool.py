@@ -40,6 +40,9 @@ from utils.secret_files import private_dir, redact_all, write_private_json
 # so this module and the backend agree on which tree "the plans root"
 # means even when the environment names it relatively.
 from config_paths import resolve_plans_dir
+# The two truths of the plan context (stdlib only, no backend imports),
+# so the plan's directory is derived from them and never copied.
+from plan_env import PLAN_ID_ENV, plan_env
 # Sub-agent sandbox wrapping (2026-10-06). Dependency-free (stdlib only)
 # and it imports nothing from this module, so a top-level import is safe.
 import claude_sandbox
@@ -4628,16 +4631,15 @@ class ClaudeCodingTool(CodingTool):
                     # executor releases with.
                     settings_data["env"]["PDT_LOCK_TASK_ID"] = str(lock_task_id)
             settings_data["env"]["PDT_FORMAL_REPO_PATH"] = str(_FORMAL_REPO_PATH)
-            settings_data["env"]["PDT_PLANS_DIR"] = str(_PLANS_DIR)
-            # The plan's own directory, when this run was told where the
-            # plan lives. The sub-agent's children write their ledger
-            # records into the plan's directory, and the plans root
-            # alone is not enough to name it: the root can be relative,
-            # and the sub-agent's working directory is not the
-            # backend's.
-            plan_dir_env = os.environ.get("PDT_PLAN_DIR")
-            if plan_dir_env:
-                settings_data["env"]["PDT_PLAN_DIR"] = plan_dir_env
+            # The plan's context, as the two facts it is: the plan's id
+            # and the absolute root its directory hangs under. The
+            # sub-agent's children derive the plan's directory from
+            # those two, so they cannot name a different tree than the
+            # backend reads — which is what two ledgers for one plan
+            # looked like.
+            settings_data["env"].update(
+                plan_env(os.environ.get(PLAN_ID_ENV), _PLANS_DIR)
+            )
             settings_data.setdefault("hooks", {})
             settings_data["hooks"].setdefault("PreToolUse", [])
             guard_hook = _build_guard_hook()

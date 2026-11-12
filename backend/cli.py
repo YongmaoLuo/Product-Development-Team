@@ -28,6 +28,7 @@ from coding_tool import stop_all_live_dispatches
 from crash_forensics import CrashGuard
 from execution_logger import get_logger
 from executor_lock import LOCK_FILENAME, ExecutorLock, acquire
+from plan_env import plan_env
 from process_reaper import EXECUTOR_SIGNALS, reap_plan
 
 # The plan's ledger vocabulary.  The executor sweeps the plan's tree
@@ -873,22 +874,37 @@ def main():
         tasks_file if tasks_file is not None else Path(workspace_dir) / "tasks.json"
     )
 
-    # The plan's own directory, handed to everything this run starts.
+    # The plan's context, handed to everything this run starts.
     #
     # The executor is the only process in the tree that knows which plan
     # it is running: it was handed the plan's ``tasks.json``, and the
-    # directory that file lives in *is* the plan's directory. Its
-    # working directory is ``backend/`` and the plans root it resolves
-    # can be relative, so a process below the executor that rebuilds
-    # the plan's directory from the environment can name a different
-    # directory than the one the backend reads — and two ledgers for one
+    # directory that file lives in *is* the plan's directory. So it is
+    # the one process that can say, without guessing, where the plan
+    # lives — and it says it as two facts: the plan's id, and the
+    # *absolute* root its directory hangs under.
+    #
+    # Two facts, because the plan's own directory is not a fact: it is
+    # ``<plans root>/<plan id>``, and everyone below the executor
+    # derives it from those two. A process that rebuilds the directory
+    # from a relative root would name a different tree than the one
+    # the backend reads — the executor's working directory is
+    # ``backend/``, not the repository root — and two ledgers for one
     # plan is not a cosmetic problem. The backend's sweep cannot see
     # the sub-agents, so the plan's live set never reaches zero and the
     # order the tree was collected in cannot be read off the ledger.
     #
-    # The absolute path removes the guesswork: every descendant writes
-    # its records into the one directory the backend sweeps.
-    os.environ["PDT_PLAN_DIR"] = str(plan_dir)
+    # So the root is absolute, and the plan's directory is derived
+    # rather than copied: there is no second copy of it to drift.
+    #
+    # Only when the executor was handed a tasks file.  Then the plan's
+    # directory is the directory that file lives in, and the plans root
+    # is the one above it.  An executor started without a tasks file --
+    # an operator running one by hand against a workspace -- knows no
+    # plan, and the directory above a workspace is not a plans root:
+    # pinning it would send every plan lookup in that process to a
+    # tree that has nothing to do with plans.
+    if tasks_file is not None:
+        os.environ.update(plan_env(plan_id, plan_dir.parent))
 
     lock: Optional[ExecutorLock] = acquire(plan_dir)
     if lock is None:

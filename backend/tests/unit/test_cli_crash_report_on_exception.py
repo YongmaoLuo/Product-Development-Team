@@ -35,6 +35,7 @@ happened, never to say something *instead* of what happened.
 from __future__ import annotations
 
 import json
+import os
 import signal
 import sys
 from pathlib import Path
@@ -95,17 +96,26 @@ def _isolated_module_state(monkeypatch):
     """Give the module globals and the environment back the way they were.
 
     ``main()`` leaves three things behind: the flag that says the stop
-    handler is installed, the module's own guard slot, and
-    ``PDT_PLAN_DIR`` in the environment.  None of them belongs to a test
-    that has finished, and a test that leaves the stop handler claimed
-    would silently disarm the next test that runs ``main()``.
+    handler is installed, the module's own guard slot, and the plan
+    context in the environment (``PDT_PLAN_ID`` and ``PDT_PLANS_DIR``).
+    None of them belongs to a test that has finished, and a test that
+    leaves the stop handler claimed would silently disarm the next test
+    that runs ``main()``.
     """
     monkeypatch.setattr(cli, "_stop_handler_installed", False)
     # ``raising=False``: the slot is part of the contract, but a test
     # that fails because the slot is missing says less than a test that
     # fails because the scene was not written.
     monkeypatch.setattr(cli, "_crash_guard", None, raising=False)
-    monkeypatch.delenv("PDT_PLAN_DIR", raising=False)
+    # The plan context is restored, not merely removed: ``main()`` pins
+    # both halves of it, and a test that removed ``PDT_PLANS_DIR`` for
+    # its whole duration would send every resolver that reads it back
+    # to the repository's live tree.
+    for name in ("PDT_PLAN_ID", "PDT_PLANS_DIR"):
+        if name in os.environ:
+            monkeypatch.setenv(name, os.environ[name])
+        else:
+            monkeypatch.delenv(name, raising=False)
     monkeypatch.delenv("PDT_CRASH_FORENSICS", raising=False)
 
 
