@@ -30,15 +30,23 @@ the regression alarms for the runtime:
 
 3. ``test_perf_no_memory_leak_3_rounds`` — running one
    warmup round and then 3 measured sequential rounds with 9
-   VPs each, with ``tracemalloc`` snapshotting peak memory at
-   the end of each measured round, must not see a
-   monotonically increasing peak. The check allows a one-time
-   bump from the first measured round to the second (the
-   persistence layer's first round opens a new log file,
-   registers a logger, etc.) of up to 2× the first measured
-   peak, and then requires the third measured round to be
-   within 10% of the second (stability). Real leaks (which
-   grow unboundedly) would blow past the 2× warmup bound.
+   VPs each, with ``tracemalloc`` snapshotting memory at
+   the end of each measured round, must not see the
+   *retained* memory (what is still alive after
+   ``gc.collect()``) grow from round to round. The check
+   allows a one-time bump from the first measured round to
+   the second (the persistence layer's first round opens a
+   new log file, registers a logger, etc.) of up to 2× the
+   first measured peak, and then requires the growth of the
+   retained memory between any two adjacent measured rounds
+   to stay within 10% of the first measured peak. The peak
+   (the largest *transient* allocation a round made) is
+   measured too, but it is not what the leak criterion is
+   judged on: a transient allocation frees itself before the
+   next round's measurement, and the peak's absolute value
+   drifts between processes. Real leaks (which grow
+   unboundedly, round after round) would blow past both the
+   2× warmup bound and the per-round growth allowance.
    The warmup round exists so that the pipeline's lazy
    imports are paid before the measurement starts; without
    it the import cost lands on whichever round runs first
@@ -68,11 +76,16 @@ perf budget.
 Memory measurement
 ------------------
 We use :mod:`tracemalloc` rather than ``resource.getrusage``
-because the former gives Python-level peak allocations,
-which is what a slow leak in the verification pipeline
-would actually show (the orchestrator's data structures
-are all Python objects). ``getrusage`` would be skewed by
-libc / OS-level noise unrelated to the agent.
+because the former gives Python-level memory numbers --
+both the *retained* memory (``current``, i.e. what is still
+alive) and the *peak* (the largest transient allocation a
+round made) -- which is what a slow leak in the verification
+pipeline would actually show (the orchestrator's data
+structures are all Python objects). ``getrusage`` would be
+skewed by libc / OS-level noise unrelated to the agent.
+The leak criterion is judged on the retained memory: that is
+the quantity a leak grows, while the peak only records a
+transient allocation that frees itself again.
 """
 
 from __future__ import annotations
@@ -84,7 +97,7 @@ import sys
 import time
 import tracemalloc
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from unittest.mock import Mock
 
 import pytest
@@ -588,15 +601,72 @@ _WARMUP_ROUND = 1
 _MEASURED_ROUNDS = 3
 
 
+#: The allowance for per-round growth, as a fraction of the first
+#: measured round's peak.  This is the *same absolute amount* the
+#: peak-based criterion allowed (10% of a ~240 KB peak ≈ 24 KB) -- the
+#: change is which quantity it is measured against, not how much of
+#: it is tolerated.
+_RETAINED_GROWTH_ALLOWANCE = 0.10
+
+
+def _assert_no_retained_leak(
+    retained_mb: List[float],
+    peak_scale_mb: float,
+    peaks_mb: Optional[List[float]] = None,
+) -> None:
+    """Assert that retained memory does not grow from round to round.
+
+    "Per-round leak" means memory that is *still alive* after
+    ``gc.collect()`` keeps growing round over round.  The *peak* is the
+    largest transient allocation a round ever made -- a one-off
+    transient is not a leak, and the absolute value of a peak drifts
+    between processes (allocator state, import order), so a peak that
+    sits 20% above the previous round's peak says nothing about
+    accumulation.
+
+    The allowance is therefore applied to the *retained* series: the
+    growth between two adjacent measured rounds must stay within
+    ``_RETAINED_GROWTH_ALLOWANCE`` of ``peak_scale_mb`` (the first
+    measured round's peak -- the same absolute budget the peak-based
+    criterion gave).  A real leak grows by far more than that on every
+    round; a transient allocation frees itself before the next round's
+    measurement.
+
+    The failure message discloses the *whole* series (``peaks_mb`` and
+    ``retained_mb``), not two numbers: the next red has to be
+    diagnosable from the message alone.
+    """
+    allowance_mb = _RETAINED_GROWTH_ALLOWANCE * peak_scale_mb
+    for index in range(1, len(retained_mb)):
+        previous_mb = retained_mb[index - 1]
+        growth_mb = retained_mb[index] - previous_mb
+        if previous_mb > 0:
+            growth_pct = f"+{100 * growth_mb / previous_mb:.1f}%"
+        else:
+            growth_pct = f"+{growth_mb:.6f} MB"
+        assert growth_mb <= allowance_mb, (
+            f"retained memory grew from {previous_mb:.3f} MB "
+            f"(measured round {index}) to {retained_mb[index]:.3f} MB "
+            f"(measured round {index + 1}): {growth_pct}, "
+            f"expected ≤ +{allowance_mb * 1024:.1f} KB "
+            f"({_RETAINED_GROWTH_ALLOWANCE:.0%} of the first measured peak "
+            f"= {peak_scale_mb:.3f} MB) — per-round leak\n"
+            f"  peaks_mb={peaks_mb!r}\n"
+            f"  retained_mb={retained_mb!r}"
+        )
+
+
 def test_perf_no_memory_leak_3_rounds(
     dry_run_env, temp_plan_dir, temp_project_dir, mock_coding_tool
 ):
     """3 sequential verification rounds (9 VPs each) must
-    not exhibit monotonically increasing peak memory.
+    not exhibit monotonically increasing retained memory.
 
     The test runs one **warmup** round and then 3 measured rounds,
-    snapshotting the peak Python heap at the end of each *measured*
-    round via :mod:`tracemalloc`.
+    snapshotting the Python heap at the end of each *measured*
+    round via :mod:`tracemalloc` -- both the peak (the largest
+    transient allocation of the round) and the retained memory (what
+    is still alive after the collection).
 
     Why the warmup round exists: the pipeline's lazy imports (sqlite3
     via ``_load_provider_info``'s CC Switch DB fallback, the
@@ -623,11 +693,18 @@ def test_perf_no_memory_leak_3_rounds(
       state — these get reused (not re-allocated) on
       the later rounds, so a real leak would still grow past
       the warmup floor.
-    * ``peak[measured_3]`` ≤ ``peak[measured_2]`` × 1.10 — the third
-      measured round must be stable relative to the second. Anything
-      larger is a per-round leak (e.g. a growing list of completed
-      VPs not freed between rounds, or a logger holding a
-      reference to old round contexts).
+    * ``retained[measured_n+1]`` − ``retained[measured_n]`` ≤
+      10% of ``peak[measured_1]`` for every adjacent pair of
+      measured rounds — the per-round leak criterion. *Retained* is
+      what is still alive after ``gc.collect()``; that is what a leak
+      grows. The peak is only the largest transient allocation a
+      round made, and its absolute value drifts between processes
+      (allocator state, import order) — a round whose peak happens to
+      sit 20% above the previous round's peak says nothing about
+      accumulation, and judging it as a leak is what made this case
+      fail on a shared CI runner. The allowance is the *same absolute
+      amount* the peak-based criterion gave (10% of a ~240 KB peak
+      ≈ 24 KB), so a leak that really accumulates still trips it.
 
     A regression that *under*-uses memory (e.g. a leak
     detection that's fooled by aggressive GC) would
@@ -719,6 +796,7 @@ def test_perf_no_memory_leak_3_rounds(
 
         # ---- measured rounds ------------------------------------
         peaks_mb: List[float] = []
+        retained_mb: List[float] = []
         first_measured = _WARMUP_ROUND + 1
         for round_number in range(first_measured, first_measured + _MEASURED_ROUNDS):
             agent.start_verification_round(round_number)
@@ -733,6 +811,12 @@ def test_perf_no_memory_leak_3_rounds(
             gc.collect()
             current, peak = tracemalloc.get_traced_memory()
             peaks_mb.append(peak / (1024 * 1024))
+            # ``current`` is what is still *alive* after the collection
+            # -- the quantity a per-round leak actually grows.  The
+            # peak above is only the largest transient allocation the
+            # round made, and it drifts between processes (allocator
+            # state, import order) without anything accumulating.
+            retained_mb.append(current / (1024 * 1024))
             # Reset the peak counter for the next round.
             tracemalloc.reset_peak()
     finally:
@@ -761,17 +845,83 @@ def test_perf_no_memory_leak_3_rounds(
     # round already paid the lazy imports); the second
     # measured round is allowed to bump up to 2× the
     # first (persistence layer opens a new log file, primes
-    # asyncio state, etc.). The third measured round must
-    # then be stable (within 10% of the second) — anything
-    # larger is a per-round leak that accumulates over time.
-    p1, p2, p3 = peaks_mb
+    # asyncio state, etc.).
+    p1, p2 = peaks_mb[0], peaks_mb[1]
     assert p2 <= p1 * 2.0, (
         f"peak memory grew from {p1:.3f} MB (measured round 1) "
         f"to {p2:.3f} MB (measured round 2): +{100 * (p2 - p1) / p1:.1f}%, "
-        f"expected ≤ 2× warmup tolerance (possible leak)"
+        f"expected ≤ 2× warmup tolerance (possible leak)\n"
+        f"  peaks_mb={peaks_mb!r}\n"
+        f"  retained_mb={retained_mb!r}"
     )
-    assert p3 <= p2 * 1.10, (
-        f"peak memory grew from {p2:.3f} MB (measured round 2) "
-        f"to {p3:.3f} MB (measured round 3): +{100 * (p3 - p2) / p2:.1f}%, "
-        f"expected ≤ +10% (per-round leak)"
+
+    # 3. The *retained* memory must not grow from round to round.
+    # This is the per-round leak criterion: memory that is still
+    # alive after ``gc.collect()`` and keeps growing is a leak; a
+    # one-off transient allocation is not. The allowance is the same
+    # absolute amount the peak-based criterion allowed (10% of the
+    # first measured peak), so a leak that really accumulates still
+    # trips it -- what changed is that the noise a shared runner
+    # produces (a transient allocation in one round) no longer does.
+    _assert_no_retained_leak(retained_mb, peaks_mb[0], peaks_mb=peaks_mb)
+
+
+# =============================================================================
+# 4. The leak criterion judges retained memory, not the peak
+# =============================================================================
+
+
+def test_perf_leak_criterion_separates_retained_growth_from_peak_noise():
+    """Negative control for the per-round leak criterion.
+
+    "Per-round leak" means *retained* memory grows round over round --
+    memory that is still alive after ``gc.collect()``.  The *peak* is
+    the largest transient allocation a round ever made; a one-off
+    transient allocation is not a leak, and judging it as one is what
+    made the round-3 peak comparison flaky on a shared runner.
+
+    Two sequences pin the difference:
+
+    * Retained memory grows 64 KB every round and the peaks stay
+      flat -- a real leak.  The criterion must reject it, even though
+      the old peak-based criterion (``p3 <= p2 * 1.10``) would have
+      accepted it.
+    * Retained memory is flat and one round's peak is 20% above the
+      previous round -- transient noise, the shape the CI runner
+      produced.  The criterion must accept it, even though the old
+      peak-based criterion would have rejected it.
+
+    The allowance is the *same absolute amount* as before (10% of the
+    first measured peak); only the quantity it is measured against
+    changed.  The first sequence proves the criterion still catches a
+    leak that actually accumulates.
+    """
+    # (a) A real leak: retained grows 64 KB (0.0625 MB) per round,
+    #     while the peaks stay flat.
+    flat_peaks_mb = [0.25, 0.25, 0.25]
+    leaking_retained_mb = [0.05, 0.05 + 0.0625, 0.05 + 2 * 0.0625]
+    # The old peak-based criterion accepted this sequence:
+    assert flat_peaks_mb[2] <= flat_peaks_mb[1] * 1.10
+    with pytest.raises(AssertionError) as excinfo:
+        _assert_no_retained_leak(
+            leaking_retained_mb,
+            flat_peaks_mb[0],
+            peaks_mb=flat_peaks_mb,
+        )
+    # The failure must disclose the whole series, not two numbers --
+    # the next red has to be diagnosable from the message alone.
+    assert "peaks_mb=" in str(excinfo.value)
+    assert "retained_mb=" in str(excinfo.value)
+
+    # (b) Transient noise: retained is flat, one round's peak is +20%
+    #     over the previous round (the shape CI reported).
+    noisy_peaks_mb = [0.24, 0.20, 0.24]
+    flat_retained_mb = [0.100, 0.1022, 0.1044]
+    # The old peak-based criterion rejected this sequence:
+    assert not (noisy_peaks_mb[2] <= noisy_peaks_mb[1] * 1.10)
+    # The retained-based criterion accepts it: nothing accumulates.
+    _assert_no_retained_leak(
+        flat_retained_mb,
+        noisy_peaks_mb[0],
+        peaks_mb=noisy_peaks_mb,
     )

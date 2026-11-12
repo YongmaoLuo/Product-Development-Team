@@ -38,11 +38,12 @@ import shlex
 import sys
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 # 2026-09-08: HardTimeoutError is raised by coding_tool when
 # the inner adaptive timer SIGKILLs a silent subprocess. The
@@ -57,8 +58,10 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 # verification layer above turns it into a re-queue instead.
 from coding_tool import (
     HardTimeoutError,
+    JsonSession,
     ProviderSlotWaitExpired,
     WorkClock,
+    query_json_in_session,
 )
 from utils.secret_files import private_dir, write_private_json
 # 2026-11-09（VP-023）：浏览器方法的证据产物文件名与
@@ -246,6 +249,54 @@ def _marshal_safe_on_worker_thread(func: Any) -> Any:
     return _wrapper
 
 
+def _verification_point_anchor(vp_node: Dict[str, Any]) -> str:
+    """The one line that says which verification point a session is judging.
+
+    2026-11-08（VP-028 归因 · 层二）。续跑的那一轮拿到的不是任务书，
+    只有 :data:`coding_tool.RESUME_CONTINUATION_PROMPT`（"上一轮被中断，
+    继续"）—— 它不点名任何验证点，而记录本身也点不了名：被续跑的会话
+    可能根本不是这个验证点的会话。所以身份只能由派发方写进去。
+
+    每次 attempt 同一形状：它是给模型看的锚，不是给人看的日志。
+    """
+    vp_id = str(vp_node.get("id", "unknown") or "unknown")
+    title = str(vp_node.get("title", "") or "")
+    return (
+        f"本会话正在判定验证点 {vp_id}：{title}，"
+        "最终回复必须是该验证点的裁决 JSON 并引用它点名的源码。"
+    )
+
+
+def _new_attempt_session(vp_node: Dict[str, Any]) -> JsonSession:
+    """The session handle ONE attempt owns.
+
+    2026-11-08（VP-028 归因 · 层一）。一个 attempt 一个句柄：id 由本次
+    attempt 现生成（所以别的 attempt、别的验证点都不可能撞上它），
+    ``stage`` 说明这个 id 是"要被创建"而不是"要被重开"，锚说明这个会话
+    在判什么。
+
+    不复用、不共享：同一验证点的第 2 次 attempt 也不复用第 1 次的会话
+    —— 重试存在的理由就是上一份答案不能用，让它接着上一份不能用的话
+    继续，等于把不能用的话又读了一遍。
+    """
+    return JsonSession(
+        pinned_session_id=str(uuid.uuid4()),
+        stage="pinned",
+        resume_anchor=_verification_point_anchor(vp_node),
+    )
+
+
+def _session_capable(tool: Any) -> bool:
+    """Whether ``tool`` owns the session machinery at all.
+
+    归因规则针对的是**应该有却没有**的会话。一个根本没有会话机制的工具
+    （测试替身、脚本化夹具）从来就没有会话可建，"没有会话产出回复"对它
+    不是缺陷而是前提 —— 所以规则只适用于真正拥有这套机制的工具。
+    """
+    from coding_tool import ClaudeCodingTool
+    return isinstance(tool, ClaudeCodingTool)
+
+
 async def _await_under_work_clock(awaitable: Any, clock: WorkClock) -> Any:
     """Await ``awaitable``, bounded by the clock's *work* time only.
 
@@ -397,6 +448,173 @@ METHOD_WALL_CLOCK_CAPS: Dict[str, int] = {
 #: 无进展心跳（秒）：多少秒没有新的工具调用 / 产出就算卡死。
 #: 必须**严格小于**对应方法的墙钟上限，否则心跳永远触发不了。
 NO_PROGRESS_HEARTBEAT_SECONDS: int = 300
+
+# 2026-11-06（VP-015 根因 · 层四「生命周期」）：子 agent 的工作预算用完
+# 之后，它**可能还在跑**—— ``_await_under_work_clock`` 放弃的是 worker
+# 线程，不是那个线程里跑着的浏览器腿。于是 2026-11-06 那一轮出现了最刺眼
+# 的一幕：22:30:28 判决落定「未产出任何结果」，而 22:31:27–22:32:08 证据
+# 与 ``checkpoints.json`` 全部落盘，然后没有人读过。
+#
+# 宽限期就是给这种"判决比产物早到"的情况留的一道门：预算用完之后不立刻判
+# 死，先在这段时间里轮询产物是否落盘。落盘了就按产物重建判决（层二），
+# 没落盘才终止进程组（层二之外的那一半），并且**必须**把"终止了"写进
+# reasons —— 不能把"框架没读"写成"场景没产出"。
+#:
+#: 宽限期（秒）：预算用完之后等待迟到产物落盘的时间。
+#: 120 这个数是按 2026-11-06 那轮实测的 99.8 秒落盘延迟留的余量 ——
+#: 它是量出来的，不是推导出来的。
+STUCK_GRACE_SECONDS: int = 120
+
+#: 宽限期内轮询产物的间隔（秒）。
+STUCK_GRACE_POLL_SECONDS: float = 2.0
+
+#: 浏览器腿真正的产物文件名（``<plan_dir>/vp_artifacts/<vp_id>/`` 下）。
+CHECKPOINTS_ARTIFACT_FILENAME = "checkpoints.json"
+
+#: 框架自己写的失败记录（机器写出的失败集合 + 分类 + 原因码）。
+FAILURE_RECORD_FILENAME = "failure.json"
+
+
+# ---------------------------------------------------------------------------
+# The artifacts a verification attempt leaves behind
+# ---------------------------------------------------------------------------
+#
+# 2026-11-06（VP-015 根因 · 层二「卡死恢复」）。恢复路径以前只认
+# ``/tmp/vp_<id>_progress.log`` —— 那条路径的设计前提是"卡死的 attempt
+# 是一个跑 pytest 的进程"。浏览器腿（``e2e`` / ``ui_validation``）永远
+# 不写那个文件：它的产出是 ``vp_artifacts/<vp_id>/checkpoints.json`` 加
+# 一个 ``evidence/`` 目录。于是框架去一个浏览器腿永远不会写的地方要
+# pytest 日志，然后把自己没找到东西写成了"场景没跑"。
+#
+# 下面这两个读法**永不抛异常**：产物损坏就是"没有产物"，不能让一轮验证
+# 因为一个半截 JSON 崩掉。
+
+
+def _read_json_payload(path: Path) -> Optional[Any]:
+    """Read a JSON file, or ``None`` when it is missing or unreadable."""
+    try:
+        with Path(path).open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def read_checkpoints_artifact(
+    artifact_dir: Optional[Path],
+) -> Optional[List[Dict[str, Any]]]:
+    """The checkpoints a browser leg wrote, or ``None``.
+
+    ``None`` means "there is no usable artifact": the directory is
+    unknown, the file is missing, it is not JSON, its ``checkpoints`` is
+    not a list, or the list is empty.  An empty list is no artifact
+    either — there is nothing in it to decide anything with.
+    """
+    if artifact_dir is None:
+        return None
+    payload = _read_json_payload(
+        Path(artifact_dir) / CHECKPOINTS_ARTIFACT_FILENAME
+    )
+    if not isinstance(payload, dict):
+        return None
+    checkpoints = payload.get("checkpoints")
+    if not isinstance(checkpoints, list) or not checkpoints:
+        return None
+    return [item for item in checkpoints if isinstance(item, dict)]
+
+
+def _checkpoint_identity(checkpoint: Dict[str, Any], index: int) -> str:
+    """One checkpoint's machine-written id.
+
+    The browser leg's checkpoint shape is
+    ``{selector, expected, actual, passed}`` — no id of its own.  An id
+    the producer wrote down wins; otherwise the checkpoint's position
+    in the list is the id.  A position is stable (the list is written by
+    a fixed script) and, unlike the ``selector``, it is not prose: the
+    failing set has to be an identity, and prose is what made the
+    fingerprint change every round.
+    """
+    for key in ("id", "name", "label"):
+        value = str(checkpoint.get(key) or "").strip()
+        if value:
+            return value
+    return f"checkpoint[{index}]"
+
+
+def failed_checkpoint_ids(
+    checkpoints: Optional[List[Dict[str, Any]]],
+) -> List[str]:
+    """The ids of the checkpoints that did not pass.
+
+    The machine-written failing set.  A checkpoint whose ``passed`` is
+    not ``True`` did not pass — the shape check lives in
+    :mod:`verification_evidence`, and a checkpoint that does not even
+    carry a boolean ``passed`` has certainly not passed.
+    """
+    ids: List[str] = []
+    for index, checkpoint in enumerate(checkpoints or []):
+        if not isinstance(checkpoint, dict):
+            continue
+        if checkpoint.get("passed") is True:
+            continue
+        ids.append(_checkpoint_identity(checkpoint, index))
+    return ids
+
+
+# ---------------------------------------------------------------------------
+# The budget an attempt spends, and the part of it reserved for recovery
+# ---------------------------------------------------------------------------
+#
+# 2026-11-06（VP-015 根因 · 层四边界）：宽限期必须**从预算里扣**，不能
+# 变成 ``cap + 120`` 的额外占用 —— 一个 attempt 的实际占用仍然只能是
+# 它自己的预算。所以工作阶段提前一截收工，那一截留给宽限期。
+#
+# 扣多少：``STUCK_GRACE_SECONDS`` 是上限，但也只能是预算的一部分 ——
+# 一个 0.1 秒的预算不能把 0.1 秒全扣掉，那样 attempt 连工作都没做就
+# 直接进宽限期了。所以宽限期最多拿走预算的一半。
+
+
+def _grace_reserve_seconds(cap: float) -> float:
+    """How much of an attempt's budget the stuck-grace window may spend.
+
+    ``min(STUCK_GRACE_SECONDS, cap / 2)``: the recovery window is capped
+    by the constant, and it can never take more than half of the
+    attempt's own budget — so the work phase always gets the other half
+    to work with.
+    """
+    try:
+        budget = max(0.0, float(cap))
+    except (TypeError, ValueError):
+        return 0.0
+    return min(float(STUCK_GRACE_SECONDS), budget / 2.0)
+
+
+class _GraceReservedClock:
+    """A work clock with the stuck-grace window reserved out of it.
+
+    The clock itself is untouched — the dispatch still parks and resumes
+    *it*, and the dispatch's own view of the budget is unchanged.  This
+    is the **waiting** side's view: it stops asking the clock to wait
+    once only the reserved remainder is left, so the grace window has
+    exactly that much budget to spend on a late artifact.
+
+    ``_await_under_work_clock`` only ever asks three things of a clock
+    (:meth:`remaining`, :meth:`bind_resume` and ``is_parked``), so this
+    is the whole of the surface that has to be forwarded.
+    """
+
+    def __init__(self, inner: WorkClock, reserved: float) -> None:
+        self._inner = inner
+        self._reserved = max(0.0, float(reserved))
+
+    def remaining(self) -> float:
+        return max(0.0, self._inner.remaining() - self._reserved)
+
+    def bind_resume(self, callback: Optional[Callable[[], None]]) -> None:
+        self._inner.bind_resume(callback)
+
+    @property
+    def is_parked(self) -> bool:
+        return self._inner.is_parked
 
 
 # Shared rule applied to every verification sub-agent (added 2026-09-07
@@ -788,12 +1006,18 @@ class VerificationSubAgent:
         self.logger = logging.getLogger(
             f"verification.subagent.{self.method}"
         )
+        # 2026-11-06（VP-015 根因 · 层一）：本次 attempt 的 VP 节点。
+        # ``wall_clock_cap()`` 读得到它自己声明的 ``timeout_seconds`` ——
+        # 调用点不必把节点一路传下去。
+        self._active_vp_node: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------
     # wall_clock_cap() — the budget THIS attempt may spend
     # ------------------------------------------------------------------
 
-    def wall_clock_cap(self) -> float:
+    def wall_clock_cap(
+        self, vp_node: Optional[Dict[str, Any]] = None,
+    ) -> float:
         """The wall-clock budget (seconds) one attempt of this method may spend.
 
         2026-11-05（arch 决策点 9 / 缺陷 B 第 5 条）：预算按方法给。
@@ -801,13 +1025,28 @@ class VerificationSubAgent:
         900；其余方法用扁平的一小时
         (:attr:`HARD_WALL_CLOCK_CAP_SECONDS`)。
 
-        取的是**两者中更小的那个**：按方法的收窄只能把预算变紧，不能把
-        一个已经被显式调小的实例预算（测试里把上限压到秒级的那些）重新
-        放大回 900。
+        取的是**方法下限与扁平上限中更小的那个**：按方法的收窄只能把预算
+        变紧，不能把一个已经被显式调小的实例预算（测试里把上限压到秒级的
+        那些）重新放大回 900。VP 自己声明的 ``timeout_seconds`` 只能把
+        预算**往上抬**（见下面 2026-11-06 那段）。
 
         方法名在比对前会去掉首尾空白并折叠大小写 —— 计划里的
         ``verification_method`` 未必是干净的 ``"e2e"``，而一个带空格或
         大小写不同的名字仍然是同一个方法，不该因此拿到另一份预算。
+
+        2026-11-06（VP-015 根因 · 层一「预算层」）：方法下限是**下限**，
+        不是判决。VP-015 自己声明了 ``timeout_seconds: 3600``，而它拿到
+        的是 900 —— 于是它在 900.042 秒处被掐断，比自己的产物落盘早了
+        整整一百秒。声明必须算数，但只允许**往上抬**：
+
+            cap = min(扁平天花板, max(方法下限, VP 声明的预算))
+
+        * 声明值比方法下限大 → 抬到声明值（VP-015：900 → 3600）；
+        * 声明值比方法下限小 → 仍然按方法下限（一份 ``timeout_seconds:
+          120`` 的老计划不能把浏览器腿的预算压到 120 秒）；
+        * 没有声明 → 行为完全不变；
+        * 方法没有下限（``code_review`` 等）→ 扁平天花板就是全部预算，
+          声明值不能把它缩小。
 
         Returns:
             A positive number of seconds.
@@ -817,9 +1056,39 @@ class VerificationSubAgent:
         # 截断会把它变成 0，于是每一次尝试都立刻被判成卡死。
         cap = self.HARD_WALL_CLOCK_CAP_SECONDS
         per_method = METHOD_WALL_CLOCK_CAPS.get(self._method_key())
-        if per_method is not None:
-            cap = min(cap, per_method)
-        return cap
+        if per_method is None:
+            # 没有方法下限：扁平天花板就是全部预算，声明值不得缩小它。
+            return cap
+        declared = self._declared_timeout_seconds(vp_node)
+        budget = per_method if declared is None else max(per_method, declared)
+        return min(cap, budget)
+
+    def _declared_timeout_seconds(
+        self, vp_node: Optional[Dict[str, Any]] = None,
+    ) -> Optional[float]:
+        """The budget this VP declared, or ``None`` when it declared none.
+
+        The node is the one the attempt is running; when no node is
+        passed the attempt's own node is read (set by
+        :meth:`_execute_attempt`), so every call site sees the same
+        declared budget without having to thread it through.
+
+        A value that is not a positive number is not a declaration: a
+        plan with ``timeout_seconds: 0`` or ``"soon"`` declares nothing,
+        and must not be read as "no budget at all".
+        """
+        node = vp_node
+        if node is None:
+            node = getattr(self, "_active_vp_node", None)
+        if not isinstance(node, dict):
+            return None
+        try:
+            declared = float(node.get("timeout_seconds"))
+        except (TypeError, ValueError):
+            return None
+        if declared <= 0:
+            return None
+        return declared
 
     def _method_key(self) -> str:
         """The method name, normalised for lookup.
@@ -1246,6 +1515,7 @@ class VerificationSubAgent:
                     log_path=log_path,
                     project_dir=project_dir,
                     excluded_providers=excluded_providers,
+                    artifact_dir=self._artifact_dir(plan_dir, vp_id),
                 )
         except BlockedPathError as e:
             # Security net intercepted an action; surface as a BLOCKED
@@ -1352,6 +1622,25 @@ class VerificationSubAgent:
             model_complexity=self.model_complexity,
         )
 
+    def _artifact_dir(
+        self, plan_dir: Optional[Path], vp_id: str,
+    ) -> Optional[Path]:
+        """Where this VP's artifacts live.
+
+        ``<plan_dir>/vp_artifacts/<vp_id>/`` — the browser leg's
+        ``checkpoints.json`` and its ``evidence/`` directory live there,
+        and that is the only place the stuck path can read them from.
+        ``None`` when there is no plan directory: without one there is
+        no artifact location to read, and the framework falls back to
+        the legacy pytest tee log.
+        """
+        if plan_dir is None:
+            return None
+        try:
+            return Path(plan_dir) / "vp_artifacts" / str(vp_id)
+        except (TypeError, ValueError):
+            return None
+
     async def _self_heal_loop(
         self,
         vp_node: Dict[str, Any],
@@ -1360,6 +1649,7 @@ class VerificationSubAgent:
         log_path: Path,
         project_dir: Optional[Path] = None,
         excluded_providers: Optional[Iterable[str]] = None,
+        artifact_dir: Optional[Path] = None,
     ) -> "Verdict":
         """Run the self-heal retry loop, returning the final Verdict.
 
@@ -1392,10 +1682,19 @@ class VerificationSubAgent:
         total_attempts = self.max_retries + 1
 
         for attempt in range(total_attempts):
+            # 2026-11-08（VP-028 归因 · 层一）：本次 attempt 独占一个会话
+            # 句柄。没有它，派发层自己挑会话，续跑时子 agent 只能对着别人
+            # 的记录继续 —— round 24 就是这样：判 VP-028 的 attempt 答了
+            # VP-038，而那份答卷看起来像一份合法的裁决。
+            session = _new_attempt_session(vp_node)
             self._write_log(log_path, "attempt_started", {
                 "vp_id": vp_node.get("id", "unknown"),
                 "attempt": attempt,
                 "max_attempts": total_attempts,
+                # 这是**申请**的会话（本次 attempt 生成的固定 id）；
+                # ``attempt_completed`` 里记的是**作答**的会话 ——
+                # provider 切换可能换 id，记录要能回答"哪段对话答的"。
+                "session_id": session.pinned_session_id,
             })
 
             try:
@@ -1407,6 +1706,8 @@ class VerificationSubAgent:
                     attempt=attempt,
                     project_dir=project_dir,
                     excluded_providers=excluded_providers,
+                    artifact_dir=artifact_dir,
+                    session=session,
                 )
             except BlockedPathError:
                 # Propagate to the outer handler in run() so the
@@ -1508,6 +1809,8 @@ class VerificationSubAgent:
                     output_file=e.output_file,
                     coding_tool=coding_tool,
                     log_path=log_path,
+                    artifact_dir=e.artifact_dir or artifact_dir,
+                    terminated=e.terminated,
                 )
                 # Whatever the summarizer returns is treated as the
                 # final verdict — the stuck agent's retry would just
@@ -1538,6 +1841,9 @@ class VerificationSubAgent:
                 "attempt": attempt,
                 "verdict": verdict.verdict,
                 "reasons": verdict.reasons,
+                # 作答的会话（句柄最终记下的那个）。provider 切换可能
+                # 换 id，所以它未必等于 ``attempt_started`` 里申请的那个。
+                "session_id": session.session_id,
             })
 
             if verdict.verdict == "PASSED":
@@ -1610,6 +1916,8 @@ class VerificationSubAgent:
         attempt: int,
         project_dir: Optional[Path] = None,
         excluded_providers: Optional[Iterable[str]] = None,
+        artifact_dir: Optional[Path] = None,
+        session: Optional[JsonSession] = None,
     ) -> "Verdict":
         """Execute one verification attempt.
 
@@ -1627,7 +1935,28 @@ class VerificationSubAgent:
         signature would raise ``TypeError`` on a keyword it never
         learned about, and that error would be swallowed as a transport
         failure.
+
+        ``artifact_dir`` is where this attempt's artifacts live
+        (``<plan_dir>/vp_artifacts/<vp_id>/``). It is what the stuck
+        path reads when the attempt is cut off: a browser leg's verdict
+        is its ``checkpoints.json``, and without this the framework can
+        only go looking for a pytest tee log it will never find.
+
+        ``session`` (2026-11-08, VP-028) is the session handle this
+        attempt runs in. It is passed in rather than created here so
+        that the attempt log can name the session the attempt ASKED for
+        before the dispatch starts; a caller that does not supply one
+        gets a fresh handle of its own.
         """
+        # 2026-11-06（VP-015 根因 · 层一）：本次 attempt 的 VP 节点记在
+        # 实例上，``wall_clock_cap()`` 因此读得到它自己声明的
+        # ``timeout_seconds`` —— 调用点不必把节点一路传下去。
+        self._active_vp_node = vp_node
+        # 2026-11-08（VP-028 归因 · 层一）：本次 attempt 的会话句柄。
+        # 调用方（``_self_heal_loop``）传进来的是它已经记进 attempt 日志
+        # 的那一个；没传就现造一个 —— 两种情况下句柄都只属于本次 attempt。
+        if session is None:
+            session = _new_attempt_session(vp_node)
         if coding_tool is None:
             # Lazy import so the module remains importable in
             # environments where coding_tool is unavailable (e.g.,
@@ -1765,6 +2094,14 @@ class VerificationSubAgent:
                 # while it waits, and the budget below asks it how much
                 # work time is left rather than assuming wall time.
                 work_clock = WorkClock(self.wall_clock_cap())
+                # 2026-11-06（VP-015 根因 · 层四边界）：宽限期**从预算里
+                # 扣**，不是额外加 —— 否则一个 attempt 的实际占用会变成
+                # ``cap + 120``。所以等待侧看到的预算要先扣掉宽限期那一
+                # 截：工作阶段提前收工，宽限期正好有那一截可花。
+                # dispatch 拿到的仍然是原始的 clock（它要 park / resume
+                # 的就是那个），扣减只发生在等待侧。
+                grace_reserve = _grace_reserve_seconds(self.wall_clock_cap())
+                wait_clock = _GraceReservedClock(work_clock, grace_reserve)
                 try:
                     scoped_tool._work_clock = work_clock
                 except Exception:
@@ -1825,14 +2162,24 @@ class VerificationSubAgent:
                 if excluded:
                     query_kwargs["excluded_providers"] = excluded
                 try:
+                    # 2026-11-08（VP-028 归因 · 层一）：派发**带着本次
+                    # attempt 的会话句柄**。不带句柄时工具自选会话，续跑
+                    # 的那一轮就对着别人的记录继续 —— 这正是 round 24 的
+                    # 形状。``query_json_in_session`` 把句柄绑进这次调用
+                    # 的上下文，工具在 dispatch 里读得到它、并把真正作答
+                    # 的会话 id 写回句柄。
                     response_dict = await _await_under_work_clock(
                         asyncio.to_thread(
                             _marshal_safe_on_worker_thread(
-                                scoped_tool.query_json,
+                                functools.partial(
+                                    query_json_in_session,
+                                    scoped_tool,
+                                    session,
+                                ),
                             ),
                             **query_kwargs,
                         ),
-                        work_clock,
+                        wait_clock,
                     )
                 finally:
                     _pump_stop.set()
@@ -1917,11 +2264,88 @@ class VerificationSubAgent:
                     vp_id_log, outer_cap,
                     self.wall_clock_cap(), output_file,
                 )
+                # 2026-11-06（VP-015 根因 · 层四「生命周期」）：预算用完
+                # 不等于产物没写出来。``_await_under_work_clock`` 放弃的是
+                # worker 线程，线程里那条浏览器腿**还在跑** —— 2026-11-06
+                # 那一轮它的 checkpoints 在判决之后 99.8 秒才落盘，然后
+                # 没有人读过。所以先在宽限期内等它落盘。
+                #
+                # 宽限期能等多久，是这次 attempt 预算里**预留**出来的那
+                # 一截（层四边界：宽限期从预算里扣，不是额外加）。
+                grace_reserve = _grace_reserve_seconds(
+                    self.wall_clock_cap()
+                )
+                late_checkpoints = await self._await_stuck_artifact(
+                    artifact_dir, budget_seconds=grace_reserve,
+                )
+                if late_checkpoints:
+                    # 2026-11-11 (VP-061): 宽限期里等到的迟到产物，判决
+                    # 仍然必须披露终止事实 —— 框架在 :2247 已经用
+                    # ``kill_in_flight_dispatch`` 结束了在飞的 dispatch，
+                    # ``killed`` 就是那个已经算出的事实，复用它即可（不新增
+                    # 任何 kill 调用，也不把 ``_terminate_attempt_process``
+                    # 提前到宽限期之前：生命周期语义是「先等宽限期产物，
+                    # 再收掉还在跑的 attempt」）。``killed`` 为假时框架并
+                    # 没有结束这次尝试 —— 不得声称终止。
+                    verdict = self._verdict_from_checkpoints(
+                        late_checkpoints, vp_node, artifact_dir,
+                        terminated=bool(killed),
+                    )
+                    self._write_log(log_path, "stuck_artifact_recovered", {
+                        "vp_id": vp_id_log,
+                        "artifact_dir": str(artifact_dir),
+                        "checkpoints": len(late_checkpoints),
+                        "verdict": verdict.verdict,
+                        # 日志与判决必须讲同一件事：这条判决披露了终止
+                        # 事实，日志也得记下框架是不是真的结束了这次尝试。
+                        "terminated": bool(killed),
+                        "killed": bool(killed),
+                    })
+                    return verdict
+                # 宽限期用完还没有产物：这次 attempt 真的白跑了 —— 把它
+                # 收掉，别让它继续往一个没人读的目录里写东西。
+                #
+                # 2026-11-10 (VP-032): the attempt's process group was
+                # **already ended** above, by ``kill_in_flight_dispatch`` —
+                # and ending it drops the tool's process handle.  So the
+                # termination below found nothing left to kill and
+                # reported "not terminated", while the attempt was in
+                # fact terminated — by the framework.  The fact was
+                # already computed: ``killed`` says whether a process
+                # group was really killed.  The verdict of the
+                # termination is that fact, not a second observation of
+                # it.
+                #
+                # ``or`` short-circuits on purpose: once the dispatch has
+                # been ended there is nothing left to terminate, and
+                # asking again could reach a *different* dispatch that
+                # has since started — a process this branch does not
+                # own.  No new kill path is added, and no signal is sent
+                # to a process the framework did not start.
+                terminated = bool(
+                    killed or self._terminate_attempt_process(scoped_tool)
+                )
+                self._write_log(log_path, "stuck_attempt_terminated", {
+                    "vp_id": vp_id_log,
+                    "artifact_dir": str(artifact_dir),
+                    "terminated": terminated,
+                    # The two facts are not the same, and an operator
+                    # needs both: ``terminated`` says the attempt's
+                    # process group is gone (the reason the verdict
+                    # names the termination), ``killed`` says the
+                    # in-flight dispatch itself was ended.  The
+                    # dispatch kill is what usually ends the attempt,
+                    # so a log that carries only ``terminated`` cannot
+                    # say which of the two happened.
+                    "killed": killed,
+                })
                 stuck_error = StuckAgentError(
                     elapsed=outer_cap,
                     threshold=outer_cap,
                     vp_id=vp_id_log,
                     output_file=output_file,
+                    artifact_dir=artifact_dir,
+                    terminated=terminated,
                 )
                 # Whether the in-flight dispatch was actually ended —
                 # the log below says so, so an operator can tell "the
@@ -2028,6 +2452,31 @@ class VerificationSubAgent:
                     verdict.provider = getattr(
                         scoped_tool, "current_call_provider", "",
                     ) or ""
+                # 2026-11-08（VP-028 归因 · 层三）：裁决要能归因才算数。
+                # 一个会话都没产出过回复的答案，无法证明它出自本次
+                # attempt、这个验证点 —— 它只是一段来路不明的文字。
+                # 所以它不能记成 PASSED：这类失败属于 attempt，不属于
+                # 被验的交付物（failure_class=infra）。
+                if not session.session_id and _session_capable(scoped_tool):
+                    self._write_log(log_path, "attempt_unattributed", {
+                        "vp_id": vp_node.get("id", "unknown"),
+                        "attempt": attempt,
+                        "pinned_session_id": session.pinned_session_id,
+                        "verdict": verdict.verdict,
+                    })
+                    return Verdict(
+                        verdict="FAILED",
+                        reasons=[
+                            "no session produced a reply for this attempt; "
+                            "the verdict cannot be attributed to this "
+                            "verification point",
+                        ],
+                        evidence=[],
+                        provider=verdict.provider,
+                        model_complexity=self.model_complexity,
+                        failure_class=INFRA_FAILURE_CLASS,
+                        failure_class_source=DETERMINISTIC_FAILURE_CLASS_SOURCE,
+                    )
                 return verdict
             # NEGCTL-P0-1-BEGIN
             except VerdictParseError as e:
@@ -2077,15 +2526,308 @@ class VerificationSubAgent:
                     # Unregister failure must never bleed out of VP code.
                     pass
 
+    # ------------------------------------------------------------------
+    # The artifacts a cut-off attempt leaves behind
+    # ------------------------------------------------------------------
+
+    async def _await_stuck_artifact(
+        self,
+        artifact_dir: Optional[Path],
+        budget_seconds: Optional[float] = None,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Wait out the grace window for a late artifact to land.
+
+        The attempt's budget ran out; the work it was doing did not
+        stop.  This waits for the artifact that attempt is still
+        writing, and returns it if it lands.
+
+        ``budget_seconds`` is how long the grace window may wait — the
+        share of the attempt's own budget that was reserved for it
+        (层四边界：宽限期从预算里扣，不是额外加).  It defaults to
+        :data:`STUCK_GRACE_SECONDS`.
+
+        ``None`` means "no artifact landed" — the caller then has to
+        terminate the attempt and say so.  It never raises: a corrupt
+        artifact is "no artifact", not a reason to abort the round.
+        """
+        if artifact_dir is None:
+            return None
+        if budget_seconds is None:
+            budget_seconds = float(STUCK_GRACE_SECONDS)
+        deadline = time.monotonic() + max(0.0, float(budget_seconds))
+        while True:
+            checkpoints = read_checkpoints_artifact(artifact_dir)
+            if checkpoints:
+                return checkpoints
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            await asyncio.sleep(min(STUCK_GRACE_POLL_SECONDS, remaining))
+
+    def _list_evidence_dir(
+        self, artifact_dir: Optional[Path],
+    ) -> List[str]:
+        """The attempt's evidence files — the second recovery input.
+
+        A browser leg writes its evidence into
+        ``<plan_dir>/vp_artifacts/<vp_id>/evidence/``.  The listing
+        itself is not a verdict (only ``checkpoints.json`` is), but it
+        is the record of what the attempt *did* produce, and it is
+        attached to whatever verdict is produced.
+
+        Never raises: a missing directory is an empty listing.
+        """
+        if artifact_dir is None:
+            return []
+        try:
+            directory = Path(artifact_dir) / "evidence"
+            if not directory.is_dir():
+                return []
+            names = sorted(
+                entry.name for entry in directory.iterdir() if entry.is_file()
+            )
+        except OSError:
+            return []
+        return [f"evidence/{name}" for name in names]
+
+    def _verdict_from_checkpoints(
+        self,
+        checkpoints: List[Dict[str, Any]],
+        vp_node: Dict[str, Any],
+        artifact_dir: Optional[Path],
+        terminated: bool = False,
+    ) -> "Verdict":
+        """Rebuild a verdict from the checkpoints the attempt wrote.
+
+        The checkpoints are the attempt's own machine-written record of
+        what it observed, so they answer the question the framework was
+        about to ask a model to guess at.
+
+        * every checkpoint passed → **PASSED**, naming the artifact;
+        * some checkpoint did not pass → **FAILED**, naming the failing
+          checkpoints, and the machine-written failing set is written to
+          ``failure.json`` so the report, the artifact and the failure
+          fingerprint all name the same set.
+
+        ``terminated`` says the framework itself ended this attempt
+        (2026-11-11, VP-061).  When it is true the verdict **discloses**
+        that fact, the way every other branch that returns a verdict
+        does: the dispatcher hands every VP it runs an
+        ``evidence_artifact_dir``, so for a browser leg this branch — not
+        the one that discloses — is the branch production takes, and a
+        verdict returned from here without the disclosure hid the
+        framework's own decision behind a statement about the
+        deliverable.  The disclosure is **added** to the verdict: the
+        reasons above, the failing set and the classification are
+        unchanged.
+        """
+        vp_id = str(vp_node.get("id", "unknown"))
+        failed = failed_checkpoint_ids(checkpoints)
+        artifact = (
+            str(Path(artifact_dir) / CHECKPOINTS_ARTIFACT_FILENAME)
+            if artifact_dir is not None else CHECKPOINTS_ARTIFACT_FILENAME
+        )
+        evidence = [
+            f"{CHECKPOINTS_ARTIFACT_FILENAME}: {len(checkpoints)} "
+            f"checkpoint(s) at {artifact}",
+        ]
+        if not failed:
+            reasons = [
+                f"the attempt wrote {len(checkpoints)} checkpoint(s) and "
+                f"all of them passed ({artifact})",
+            ]
+            if terminated:
+                reasons.append(self._termination_disclosure(
+                    "the checkpoints it did write are the whole of the "
+                    "walk's evidence"
+                ))
+            return Verdict(
+                verdict="PASSED",
+                reasons=reasons,
+                evidence=evidence,
+                model_complexity=self.model_complexity,
+            )
+
+        evidence.append("failed checkpoints: " + ", ".join(failed))
+        self._write_failure_record(
+            artifact_dir,
+            vp_id=vp_id,
+            reason_code="checkpoints_failed",
+            failure_class=DEFAULT_FAILURE_CLASS,
+            failure_class_source=DETERMINISTIC_FAILURE_CLASS_SOURCE,
+            failed_cases=failed,
+            verdict="FAILED",
+        )
+        reasons = [
+            f"the attempt wrote {len(checkpoints)} checkpoint(s) and "
+            f"{len(failed)} of them did not pass ({artifact}): "
+            + ", ".join(failed),
+        ]
+        # 2026-11-09（合并 VP-023）：机器写的失败集合是**位置 id**（稳定，
+        # 指纹靠它），但只给 id 的理由读不出"哪一条没对上" —— 浏览器腿的
+        # 失败还要点名选择器、期望与实际。
+        reasons.extend(self._failed_checkpoint_details(checkpoints))
+        if terminated:
+            # 2026-11-11 (VP-061): 终止事实必须在**每一条**会返回判决的
+            # 分支上被披露 —— 这一条是产物优先的那条，浏览器腿在生产上
+            # 走的正是它（派发层给每个 VP 都发了 ``evidence_artifact_dir``）。
+            reasons.append(self._termination_disclosure(
+                "the checkpoints it did write are the only ones this "
+                "verdict can speak for"
+            ))
+        return Verdict(
+            verdict="FAILED",
+            reasons=reasons,
+            evidence=evidence,
+            model_complexity=self.model_complexity,
+            failure_class=DEFAULT_FAILURE_CLASS,
+            failure_class_source=DETERMINISTIC_FAILURE_CLASS_SOURCE,
+        )
+
+    @staticmethod
+    def _failed_checkpoint_details(
+        checkpoints: List[Dict[str, Any]],
+    ) -> List[str]:
+        """One line per failed checkpoint, naming what was not met.
+
+        The failing **set** is carried by ids — a position in the
+        checkpoint list, so the fingerprint does not move from round to
+        round.  The prose a reader needs is the other half: which
+        selector was checked, what was expected there and what was
+        actually there.  Only the checkpoint itself holds that.
+        """
+        lines: List[str] = []
+        for checkpoint in checkpoints or []:
+            if not isinstance(checkpoint, dict):
+                continue
+            if checkpoint.get("passed") is True:
+                continue
+            selector = str(checkpoint.get("selector") or "")
+            expected = str(checkpoint.get("expected") or "")
+            actual = str(checkpoint.get("actual") or "")
+            lines.append(
+                f"checkpoint failed: selector={selector!r} "
+                f"expected={expected!r} actual={actual!r}"
+            )
+        return lines
+
+    def _write_failure_record(
+        self,
+        artifact_dir: Optional[Path],
+        *,
+        vp_id: str,
+        reason_code: str,
+        failure_class: str,
+        failure_class_source: str,
+        failed_cases: Optional[List[str]] = None,
+        verdict: str = "FAILED",
+    ) -> None:
+        """Write the machine-written record of a failure next to the artifact.
+
+        ``failure.json`` is what the fingerprint layer reads when the
+        report entry carries no failing set of its own: it is the
+        machine-written identity of the failing set, so the same defect
+        fingerprints the same however the run was worded.
+        """
+        if artifact_dir is None:
+            return
+        payload = {
+            "vp_id": vp_id,
+            "verdict": verdict,
+            "reason_code": reason_code,
+            "failure_class": failure_class,
+            "failure_class_source": failure_class_source,
+            "failed_cases": list(failed_cases or []),
+            "written_at": datetime.now().isoformat(),
+        }
+        try:
+            directory = Path(artifact_dir)
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / FAILURE_RECORD_FILENAME).write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            # The record is evidence, not a gate: a plan directory that
+            # cannot be written must not fail the round.
+            pass
+
+    def _terminate_attempt_process(self, scoped_tool: Any) -> bool:
+        """Kill the attempt that was cut off. True when it was killed.
+
+        The attempt's worker thread was **abandoned**, not cancelled, so
+        the subprocess it drove is still running.  Left alone it keeps
+        writing into an artifact directory nobody will read — and on the
+        next round it is still there.
+
+        The repo's existing termination path is reused: the tool's own
+        ``Popen``, killed through :func:`utils.process.kill_process_group`
+        (the same helper the watchdog uses), so the whole process group
+        goes and not just the wrapper.
+        """
+        proc = None
+        try:
+            lock = getattr(scoped_tool, "_process_lock", None)
+            if lock is not None:
+                with lock:
+                    proc = getattr(scoped_tool, "_current_process", None)
+            else:
+                proc = getattr(scoped_tool, "_current_process", None)
+        except Exception:
+            proc = None
+        if proc is None:
+            return False
+        try:
+            import signal
+
+            from utils.process import kill_process_group
+
+            kill_process_group(
+                proc, sig=signal.SIGTERM, wait_timeout=1.0,
+            )
+            kill_process_group(
+                proc, sig=signal.SIGKILL, wait_timeout=1.0,
+            )
+        except Exception:
+            # A kill that cannot be delivered is not a reason to abort:
+            # the attempt is abandoned either way, and the reason says
+            # so.
+            return False
+        return True
+
     #: The methods whose evidence is a browser walk.  Their evidence
     #: artifact is ``checkpoints.json`` — there is no pytest log behind
     #: them, which is exactly why the stuck fallback used to throw
     #: their observations away (2026-11-09, VP-023).
     _BROWSER_EVIDENCE_METHODS = ("ui_validation", "e2e")
 
+    def _termination_disclosure(self, consequence: str) -> str:
+        """The sentence that discloses that the FRAMEWORK ended the attempt.
+
+        2026-11-10 (VP-032): when the outer cap fires and the grace
+        window expires without an artifact, the framework terminates the
+        attempt's process group **itself**.  Every verdict built in that
+        state has to say so: "the walk cannot be graded" reads like a
+        statement about the deliverable, and it is false — the framework
+        is the one that stopped the walk.  A verdict that omits the
+        disclosure blames the deliverable for a decision the framework
+        made.
+
+        The disclosure goes **last** among the reasons: this codebase's
+        convention is "satisfied criteria first, the failing one last"
+        (see :meth:`VerificationAgent._verdict_to_result`), and the
+        consumers that read the tail of the reason text must read the
+        cause, not the symptom.
+        """
+        return (
+            "stuck sub-agent: the attempt was terminated after its budget "
+            f"ran out; the framework ended it, so {consequence}"
+        )
+
     def _verdict_from_checkpoint_artifact(
         self,
         vp_node: Dict[str, Any],
+        terminated: bool = False,
     ) -> Optional["Verdict"]:
         """Grade a browser verification point from the artifact it left.
 
@@ -2101,6 +2843,14 @@ class VerificationSubAgent:
         be ``passed=true``.  A missing or malformed artifact is a FAILED
         that **names the artifact** — it must never claim that a test log
         was read, because a browser walk does not produce one.
+
+        ``terminated`` says the framework itself ended this attempt.
+        When it is true, the verdict **discloses** that fact (2026-11-10,
+        VP-032): the dispatching agent gives every VP an
+        ``evidence_artifact_dir``, so this branch is the one every
+        browser verification point takes, and a verdict that returned
+        here without the disclosure hid the framework's own decision
+        behind a statement about the deliverable.
 
         Returns ``None`` for a method that does not keep its evidence in
         a checkpoint artifact (the caller then falls back to the log).
@@ -2123,17 +2873,20 @@ class VerificationSubAgent:
             raw = path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return self._checkpoint_artifact_failure(
-                path, "the evidence artifact is missing"
+                path, "the evidence artifact is missing",
+                terminated=terminated,
             )
         except OSError as e:
             return self._checkpoint_artifact_failure(
-                path, f"the evidence artifact could not be read: {e}"
+                path, f"the evidence artifact could not be read: {e}",
+                terminated=terminated,
             )
         try:
             payload = json.loads(raw)
         except ValueError as e:
             return self._checkpoint_artifact_failure(
-                path, f"the evidence artifact is not valid JSON: {e}"
+                path, f"the evidence artifact is not valid JSON: {e}",
+                terminated=terminated,
             )
 
         checkpoints = (
@@ -2141,11 +2894,13 @@ class VerificationSubAgent:
         )
         if not isinstance(checkpoints, list):
             return self._checkpoint_artifact_failure(
-                path, "the evidence artifact carries no 'checkpoints' list"
+                path, "the evidence artifact carries no 'checkpoints' list",
+                terminated=terminated,
             )
         if not checkpoints:
             return self._checkpoint_artifact_failure(
-                path, "the evidence artifact carries an empty checkpoint list"
+                path, "the evidence artifact carries an empty checkpoint list",
+                terminated=terminated,
             )
 
         failed = [
@@ -2155,13 +2910,19 @@ class VerificationSubAgent:
         passed_count = len(checkpoints) - len(failed)
         summary = f"{passed_count}/{len(checkpoints)} checkpoints passed"
         if not failed:
+            reasons = [
+                f"stuck sub-agent: every checkpoint in {path} passed "
+                f"({summary}) — graded from the evidence artifact, "
+                f"not from a test log"
+            ]
+            if terminated:
+                reasons.append(self._termination_disclosure(
+                    "the artifact it left behind is the whole of the "
+                    "walk's evidence"
+                ))
             return Verdict(
                 verdict="PASSED",
-                reasons=[
-                    f"stuck sub-agent: every checkpoint in {path} passed "
-                    f"({summary}) — graded from the evidence artifact, "
-                    f"not from a test log"
-                ],
+                reasons=reasons,
                 evidence=[f"{path}: {summary}"],
                 model_complexity=self.model_complexity,
             )
@@ -2187,6 +2948,11 @@ class VerificationSubAgent:
                 f"checkpoint failed: selector={selector!r} "
                 f"expected={expected!r} actual={actual!r}"
             )
+        if terminated:
+            reasons.append(self._termination_disclosure(
+                "the checkpoints it did write are the only ones this "
+                "verdict can speak for"
+            ))
         return Verdict(
             verdict="FAILED",
             reasons=reasons,
@@ -2198,16 +2964,37 @@ class VerificationSubAgent:
         self,
         path: Path,
         detail: str,
+        terminated: bool = False,
     ) -> "Verdict":
-        """A FAILED that names the evidence artifact it could not use."""
+        """A FAILED that names the evidence artifact it could not use.
+
+        ``terminated`` says the framework ended the attempt itself.  The
+        artifact statement stays — it is a fact about the walk — but the
+        termination is disclosed as well, because without it the verdict
+        says nothing about the framework's own decision and reads like a
+        verdict on the deliverable (2026-11-10, VP-032).
+        """
+        reasons = [
+            f"stuck sub-agent: {detail} — {path} carries no usable "
+            f"checkpoint evidence, so the walk cannot be graded"
+        ]
+        if terminated:
+            reasons.append(self._termination_disclosure(
+                "the missing evidence artifact is not a claim that the "
+                "deliverable produced no result"
+            ))
         return Verdict(
             verdict="FAILED",
-            reasons=[
-                f"stuck sub-agent: {detail} — {path} carries no usable "
-                f"checkpoint evidence, so the walk cannot be graded"
-            ],
+            reasons=reasons,
             evidence=[str(path)],
             model_complexity=self.model_complexity,
+            # 2026-11-06（层三，合并保留）：这是**框架自己**造的判决 ——
+            # 证据产物读不到，框架手里没有可以判决的东西。分类必须是
+            # infra（且必须是 deterministic：分类层会按 source 降级一个
+            # "defaulted" 的声明），少了它，"框架超时"会被归档成产品缺陷，
+            # 开成产品修复任务。
+            failure_class=INFRA_FAILURE_CLASS,
+            failure_class_source=DETERMINISTIC_FAILURE_CLASS_SOURCE,
         )
 
     async def _summarize_vp_result(
@@ -2216,24 +3003,33 @@ class VerificationSubAgent:
         output_file: Optional[str],
         coding_tool: Optional[Any],
         log_path: Path,
+        artifact_dir: Optional[Path] = None,
+        terminated: bool = False,
     ) -> "Verdict":
-        """Fresh-LLM-call summarizer for a stuck sub-agent (2026-09-08 plan).
+        """Decide a stuck attempt's verdict — from its artifact first.
 
-        Contract:
-          * Builds a fresh coding-tool call with **NO tools allowed**
-            (``allowed_tools=[]``). The summarizer can ONLY return
-            JSON; it cannot run Bash, Read, Grep, or any tool.
-          * The prompt contains: VP id, title, ``expected_result``,
-            ``test_command``, and the **tail** of the tee'd log
-            (``output_file``) so the LLM can read the actual pytest
-            summary line + last failing test names. The summarizer is
-            NOT given the full conversation history of the stuck
-            agent — that would re-introduce the loop. Instead it's
-            given the relevant fact: "pytest exited with what?
-            Did it satisfy expected_result?".
-          * Returns a parsed :class:`Verdict`. On parse failure
-            falls back to ``FAILED`` with a clear reason so the
-            downstream split path can take over.
+        Contract (2026-11-06, VP-015 根因 · 层二/层三/层四):
+          * **The artifact comes first.**  A browser leg's verdict is its
+            ``checkpoints.json``: the checkpoints the attempt wrote are
+            its own machine-written record of what it saw, and they
+            answer the question without asking a model to guess.  So
+            when they are there, they decide — and no summarizer call is
+            made at all.
+          * The **evidence directory listing** comes next, and is
+            attached to whatever verdict is produced.
+          * Only when there is no artifact at all does the old
+            fresh-LLM-call summarizer run (2026-09-08 plan): a coding
+            tool call with **NO tools allowed** (``allowed_tools=[]``),
+            given the **tail** of the tee'd pytest log.  That path is
+            kept exactly as it was — a browser leg has no tee log, but a
+            pytest leg still does.
+          * Every verdict **the framework makes up** — no artifact and
+            no log, a summarizer that could not be reached, a summarizer
+            that answered something unparseable — carries
+            ``failure_class=infra`` and
+            ``failure_class_source=deterministic``.  A framework
+            timeout is not a broken deliverable, and an unclassified
+            one used to be filed as one.
 
         Why a fresh agent instead of re-running the original:
         ``_self_heal_loop`` could in principle retry the original
@@ -2250,6 +3046,30 @@ class VerificationSubAgent:
         """
         vp_id = str(vp_node.get("id", "unknown"))
 
+        # 2026-11-06（层二）：恢复输入按顺序取，先到先得 ——
+        # (a) checkpoints.json，(b) evidence/ 目录清单，(c) 旧的 pytest tee
+        # 日志。浏览器腿没有 (c)，所以 (a) 必须真的被读。
+        checkpoints = read_checkpoints_artifact(artifact_dir)
+        if checkpoints:
+            # 2026-11-11 (VP-061): 产物优先的分支顺序不动，但它必须**携带**
+            # 终止事实 —— 派发层给每个派发的 VP 都发了
+            # ``evidence_artifact_dir``，所以浏览器腿在生产上走的正是这条
+            # 腿，它返回的判决必须披露框架自己收掉了这次尝试。
+            verdict = self._verdict_from_checkpoints(
+                checkpoints, vp_node, artifact_dir, terminated=terminated,
+            )
+            self._write_log(log_path, "summarizer_artifact_verdict", {
+                "vp_id": vp_id,
+                "artifact_dir": str(artifact_dir),
+                "checkpoints": len(checkpoints),
+                "verdict": verdict.verdict,
+                # 2026-11-11 (VP-061): 日志与判决必须讲同一件事 —— 这条
+                # 判决披露了终止事实，日志也得记下框架是不是真的结束了这次
+                # 尝试（``summarizer_no_output`` 那条事件早就记了）。
+                "terminated": terminated,
+            })
+            return verdict
+
         # 2026-11-09 (VP-023): a browser walk leaves its evidence in
         # checkpoints.json, NOT in a pytest log. Decide from the
         # artifact BEFORE reading a log: the no-log branch below used
@@ -2257,7 +3077,15 @@ class VerificationSubAgent:
         # "no test output captured", and an LLM asked to summarize a
         # log that a browser walk never produces can only disagree
         # with the artifact that actually holds the observations.
-        artifact_verdict = self._verdict_from_checkpoint_artifact(vp_node)
+        #
+        # 2026-11-09（合并）：上面的 ``_verdict_from_checkpoints`` 先读同一
+        # 份产物，读到**能读**的产物就用它判决（它还写 failure.json，给
+        # 指纹层同一份机器写的失败集合）。它读不到时（缺失／损坏／为空）
+        # 才轮到这条腿的严格读法接手 —— 那种情况下判决必须**点名产物**，
+        # 不能退回去说 "no test output captured"（浏览器腿没有 pytest 日志）。
+        artifact_verdict = self._verdict_from_checkpoint_artifact(
+            vp_node, terminated=terminated,
+        )
         if artifact_verdict is not None:
             self._write_log(log_path, "summarizer_verdict_from_artifact", {
                 "vp_id": vp_id,
@@ -2265,6 +3093,14 @@ class VerificationSubAgent:
                 "reasons": artifact_verdict.reasons,
             })
             return artifact_verdict
+
+        evidence_files = self._list_evidence_dir(artifact_dir)
+        if evidence_files:
+            self._write_log(log_path, "summarizer_evidence_dir", {
+                "vp_id": vp_id,
+                "artifact_dir": str(artifact_dir),
+                "files": len(evidence_files),
+            })
 
         if coding_tool is None:
             from coding_tool import ClaudeCodingTool
@@ -2295,19 +3131,45 @@ class VerificationSubAgent:
                 })
 
         if not log_tail:
-            # No log → can't summarize → return a clear FAILED so
-            # the parent split path can take over instead.
+            # No artifact and no log → can't summarize → return a clear
+            # FAILED so the parent split path can take over instead.
+            #
+            # 2026-11-06（层三）：这是**框架自己**造的判决，分类必须是
+            # infra —— 框架的卡死不是交付物坏了。少了这个分类，它会落到
+            # ``deliverable_defect`` / ``defaulted`` 上，于是"框架超时"
+            # 被归档成产品缺陷，开成产品修复任务。
             self._write_log(log_path, "summarizer_no_output", {
                 "vp_id": vp_id, "output_file": output_file,
+                "artifact_dir": str(artifact_dir),
+                "terminated": terminated,
             })
+            if terminated:
+                # 层四：attempt 的进程组是被框架**收掉**的，reasons 说的
+                # 必须是这件事 —— 不能说成"场景没产出任何结果"，那是对
+                # 交付物的判决，而框架只是没等到它。
+                return Verdict(
+                    verdict="FAILED",
+                    reasons=[
+                        "stuck sub-agent: the attempt was terminated after "
+                        "its budget ran out; it left no artifact behind in "
+                        f"{str(artifact_dir)!r} and no test log at "
+                        f"{output_file!r}"
+                    ],
+                    evidence=list(evidence_files),
+                    model_complexity=self.model_complexity,
+                    failure_class=INFRA_FAILURE_CLASS,
+                    failure_class_source=DETERMINISTIC_FAILURE_CLASS_SOURCE,
+                )
             return Verdict(
                 verdict="FAILED",
                 reasons=[
                     "stuck sub-agent: no test output captured at "
                     f"{output_file!r}; cannot summarize"
                 ],
-                evidence=[],
+                evidence=list(evidence_files),
                 model_complexity=self.model_complexity,
+                failure_class=INFRA_FAILURE_CLASS,
+                failure_class_source=DETERMINISTIC_FAILURE_CLASS_SOURCE,
             )
 
         self._write_log(log_path, "summarizer_started", {
@@ -2359,14 +3221,25 @@ class VerificationSubAgent:
             self._write_log(log_path, "summarizer_query_failed", {
                 "vp_id": vp_id, "error": str(e)[:300],
             })
+            # 2026-11-06（层三）：框架自己造的判决 —— 分类必须是 infra。
+            reasons = [
+                f"stuck sub-agent: summarizer query failed: "
+                f"{type(e).__name__}: {str(e)[:200]}"
+            ]
+            if terminated:
+                # 2026-11-10（VP-032）：终止事实必须在**每一条**会返回
+                # 判决的分支上被披露。
+                reasons.append(self._termination_disclosure(
+                    "the failure above is the framework's own summarizer "
+                    "failure, not the deliverable's behaviour"
+                ))
             return Verdict(
                 verdict="FAILED",
-                reasons=[
-                    f"stuck sub-agent: summarizer query failed: "
-                    f"{type(e).__name__}: {str(e)[:200]}"
-                ],
-                evidence=[],
+                reasons=reasons,
+                evidence=list(evidence_files),
                 model_complexity=self.model_complexity,
+                failure_class=INFRA_FAILURE_CLASS,
+                failure_class_source=DETERMINISTIC_FAILURE_CLASS_SOURCE,
             )
 
         raw = json.dumps(response_dict) if not isinstance(
@@ -2380,14 +3253,24 @@ class VerificationSubAgent:
                 "error": str(e)[:300],
                 "raw_head": raw[:400],
             })
+            # 2026-11-06（层三）：同上 —— 框架自己造的判决。
+            reasons = [
+                f"stuck sub-agent: summarizer returned unparseable "
+                f"verdict ({type(e).__name__}: {str(e)[:200]})"
+            ]
+            if terminated:
+                # 2026-11-10（VP-032）：同上 —— 终止事实必须被披露。
+                reasons.append(self._termination_disclosure(
+                    "the failure above is the framework's own parse "
+                    "failure, not the deliverable's behaviour"
+                ))
             return Verdict(
                 verdict="FAILED",
-                reasons=[
-                    f"stuck sub-agent: summarizer returned unparseable "
-                    f"verdict ({type(e).__name__}: {str(e)[:200]})"
-                ],
-                evidence=[raw[:500]],
+                reasons=reasons,
+                evidence=[raw[:500], *evidence_files],
                 model_complexity=self.model_complexity,
+                failure_class=INFRA_FAILURE_CLASS,
+                failure_class_source=DETERMINISTIC_FAILURE_CLASS_SOURCE,
             )
 
         self._write_log(log_path, "summarizer_returned_verdict", {
@@ -2396,6 +3279,23 @@ class VerificationSubAgent:
             "reasons_count": len(verdict.reasons or []),
             "evidence_count": len(verdict.evidence or []),
         })
+        if evidence_files:
+            # The attempt's own evidence listing rides along with the
+            # verdict — it is the record of what the attempt produced,
+            # and the verdict is the framework's reading of it.
+            verdict.evidence = list(verdict.evidence or []) + list(
+                evidence_files
+            )
+        if terminated:
+            # 2026-11-10（VP-032）：终止事实必须在**每一条**会返回判决的
+            # 分支上被披露 —— 这一条是模型读的日志尾，框架仍然得说清楚
+            # 是**它**收掉了这次尝试。
+            verdict.reasons = list(verdict.reasons or []) + [
+                self._termination_disclosure(
+                    "this verdict is the framework's reading of the log "
+                    "tail, not of a walk that ran to completion"
+                )
+            ]
         return verdict
 
     def _context_pack_reference_line(self) -> str:
@@ -2927,6 +3827,15 @@ class StuckAgentError(Exception):
             ``None`` if pytest never produced one (in which case the
             summarizer degrades to ``FAILED, reasons=["no test
             output captured"]``).
+        artifact_dir: The artifact directory the attempt was writing
+            into (``<plan_dir>/vp_artifacts/<vp_id>/``).  The recovery
+            path reads the attempt's own machine-written record from
+            here — a browser leg writes no pytest tee log, so this is
+            the only place its result can be.
+        terminated: Whether the abandoned attempt's process group was
+            actually killed — by the in-flight dispatch kill, or by the
+            termination that follows it.  The reason the verdict carries
+            says "terminated" only when this is true.
         killed: Whether the in-flight dispatch was actually ended when
             the outer cap fired (2026-11-10).  ``False`` means there
             was nothing to kill, or the kill could not be attempted.
@@ -2938,11 +3847,15 @@ class StuckAgentError(Exception):
         threshold: float,
         vp_id: str,
         output_file: Optional[str] = None,
+        artifact_dir: Optional[Path] = None,
+        terminated: bool = False,
     ):
         self.elapsed = elapsed
         self.threshold = threshold
         self.vp_id = vp_id
         self.output_file = output_file
+        self.artifact_dir = artifact_dir
+        self.terminated = terminated
         # 2026-11-10 — the outer cap ends the in-flight dispatch
         # before it raises; this carries the answer ("was there
         # something to kill?") to the log that reports the routing.

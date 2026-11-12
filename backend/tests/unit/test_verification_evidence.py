@@ -27,6 +27,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 from verification_evidence import (  # noqa: E402
+    CI_OUTPUT_FILENAME,
     CITATIONS_FILENAME,
     CHECKPOINTS_FILENAME,
     MAX_EVIDENCE_OUTPUT_CHARS,
@@ -302,6 +303,149 @@ def test_checkpoints_artifact_end_to_end(tmp_path: Path, project: Path):
 
 
 # ---------------------------------------------------------------------------
+# e2e — two sub-classes, two artifacts (2026-11-09)
+# ---------------------------------------------------------------------------
+#
+# ``e2e`` has two faces (2026-11-04, arch 决策点 7).  The ``browser`` face
+# is a sub-agent's job and owes ``checkpoints.json``; the ``command`` face
+# is run by the deterministic runner, which leaves ``ci_output.json``
+# behind and never writes a checkpoint.  Holding the command face to the
+# browser contract judged a deterministic PASSED FAILED for a file it was
+# never going to write.
+
+
+def _command_vp(**over) -> dict:
+    vp = {
+        "id": "VP-CMD",
+        "verification_method": "e2e",
+        "e2e_kind": "command",
+        "entry_command": "python3 -c \"print('ok')\"",
+    }
+    vp.update(over)
+    return vp
+
+
+def test_a_command_kind_e2e_is_held_to_the_ci_output_contract(
+    tmp_path: Path, project: Path,
+):
+    issues = verify_evidence(
+        "e2e", tmp_path, project, "VP-CMD", vp=_command_vp(),
+    )
+
+    assert [i.kind for i in issues] == ["missing_artifact"]
+    assert CI_OUTPUT_FILENAME in issues[0].detail
+    assert CHECKPOINTS_FILENAME not in issues[0].detail
+
+
+def test_a_command_kind_e2e_with_a_ci_output_artifact_passes(
+    tmp_path: Path, project: Path,
+):
+    _write(tmp_path, "VP-CMD", CI_OUTPUT_FILENAME, {
+        "vp_id": "VP-CMD", "exit_code": 0,
+    })
+
+    assert verify_evidence(
+        "e2e", tmp_path, project, "VP-CMD", vp=_command_vp(),
+    ) == []
+
+
+def test_a_ci_output_artifact_that_names_no_vp_passes(
+    tmp_path: Path, project: Path,
+):
+    """``vp_id`` is optional: an artifact that names no VP cannot be
+    about another one."""
+    _write(tmp_path, "VP-CMD", CI_OUTPUT_FILENAME, {"exit_code": 0})
+
+    assert verify_evidence(
+        "e2e", tmp_path, project, "VP-CMD", vp=_command_vp(),
+    ) == []
+
+
+def test_a_ci_output_artifact_naming_another_vp_is_reported(
+    tmp_path: Path, project: Path,
+):
+    _write(tmp_path, "VP-CMD", CI_OUTPUT_FILENAME, {"vp_id": "VP-OTHER"})
+
+    issues = verify_evidence(
+        "e2e", tmp_path, project, "VP-CMD", vp=_command_vp(),
+    )
+
+    assert [i.kind for i in issues] == ["vp_id_mismatch"]
+
+
+def test_an_unparseable_ci_output_artifact_is_reported(
+    tmp_path: Path, project: Path,
+):
+    directory = artifact_dir_for(tmp_path, "VP-CMD")
+    directory.mkdir(parents=True)
+    (directory / CI_OUTPUT_FILENAME).write_text("{not json")
+
+    issues = verify_evidence(
+        "e2e", tmp_path, project, "VP-CMD", vp=_command_vp(),
+    )
+
+    assert [i.kind for i in issues] == ["malformed"]
+
+
+def test_a_browser_kind_e2e_still_demands_checkpoints(
+    tmp_path: Path, project: Path,
+):
+    vp = {"id": "VP-B", "verification_method": "e2e", "e2e_kind": "browser"}
+
+    issues = verify_evidence("e2e", tmp_path, project, "VP-B", vp=vp)
+
+    assert [i.kind for i in issues] == ["missing_artifact"]
+    assert CHECKPOINTS_FILENAME in issues[0].detail
+
+
+def test_an_undeclared_e2e_sub_class_still_demands_checkpoints(
+    tmp_path: Path, project: Path,
+):
+    """A point that declares no sub-class is a browser point."""
+    vp = {"id": "VP-U", "verification_method": "e2e"}
+
+    issues = verify_evidence("e2e", tmp_path, project, "VP-U", vp=vp)
+
+    assert [i.kind for i in issues] == ["missing_artifact"]
+    assert CHECKPOINTS_FILENAME in issues[0].detail
+
+
+def test_a_bare_e2e_call_still_demands_checkpoints(tmp_path: Path, project: Path):
+    """The bare call knows nothing about the sub-class — the browser
+    contract is the one that holds by default."""
+    issues = verify_evidence("e2e", tmp_path, project, "VP-017")
+
+    assert [i.kind for i in issues] == ["missing_artifact"]
+    assert CHECKPOINTS_FILENAME in issues[0].detail
+
+
+def test_a_command_kind_e2e_pass_survives_apply_to_verdict(
+    tmp_path: Path, project: Path,
+):
+    _write(tmp_path, "VP-CMD", CI_OUTPUT_FILENAME, {"vp_id": "VP-CMD"})
+
+    checked = apply_to_verdict(
+        {"status": "PASSED", "reasons": [], "evidence": {}},
+        "e2e", tmp_path, project, "VP-CMD", vp=_command_vp(),
+    )
+
+    assert checked["status"] == "PASSED"
+
+
+def test_a_command_kind_e2e_without_the_artifact_is_downgraded(
+    tmp_path: Path, project: Path,
+):
+    checked = apply_to_verdict(
+        {"status": "PASSED", "reasons": [], "evidence": {}},
+        "e2e", tmp_path, project, "VP-CMD", vp=_command_vp(),
+    )
+
+    assert checked["status"] == "FAILED"
+    assert any(CI_OUTPUT_FILENAME in r for r in checked["reasons"])
+    assert not any(CHECKPOINTS_FILENAME in r for r in checked["reasons"])
+
+
+# ---------------------------------------------------------------------------
 # Agent wiring
 # ---------------------------------------------------------------------------
 
@@ -351,6 +495,116 @@ def test_apply_evidence_check_accepts_resolvable_evidence(tmp_path: Path):
     )
 
     assert checked["status"] == "PASSED"
+
+
+class _Executor:
+    """The executor's verdict table, reduced to what the flush writes."""
+
+    def __init__(self):
+        self.updates: dict = {}
+
+    def apply_verdict_updates(self, updates):
+        self.updates = dict(updates)
+        return list(updates)
+
+
+def test_the_agent_keeps_a_command_kind_e2e_pass(tmp_path: Path):
+    agent = _make_agent(tmp_path)
+    _write(agent.plan_dir, "VP-CMD", CI_OUTPUT_FILENAME, {"vp_id": "VP-CMD"})
+
+    checked = agent._apply_evidence_check(
+        _command_vp(), {"status": "PASSED", "reasons": [], "evidence": {}},
+    )
+
+    assert checked["status"] == "PASSED"
+
+
+def test_the_agent_still_holds_a_browser_kind_e2e_to_checkpoints(tmp_path: Path):
+    agent = _make_agent(tmp_path)
+
+    checked = agent._apply_evidence_check(
+        {"id": "VP-B", "verification_method": "e2e", "e2e_kind": "browser"},
+        {"status": "PASSED", "reasons": [], "evidence": {}},
+    )
+
+    assert checked["status"] == "FAILED"
+
+
+def test_a_deterministic_command_e2e_pass_survives_the_evidence_check(
+    tmp_path: Path,
+):
+    """The whole chain: the runner judges the point, leaves
+    ``ci_output.json`` behind, and the evidence check lets that PASSED
+    stand."""
+    from verification_subagent import (
+        DETERMINISTIC_MODE,
+        resolve,
+        run_deterministic,
+    )
+
+    agent = _make_agent(tmp_path)
+    vp = _command_vp()
+
+    route, mode = resolve(vp)
+    assert mode == DETERMINISTIC_MODE, f"{route}/{mode}"
+
+    outcome = run_deterministic(
+        vp,
+        project_dir=agent.project_dir,
+        artifact_dir=agent.plan_dir / "vp_artifacts",
+    )
+    verdict = outcome.verdict or {}
+    assert verdict.get("status") == "PASSED", verdict
+
+    checked = agent._apply_evidence_check(vp, {
+        "id": vp["id"],
+        "status": verdict.get("status"),
+        "reasons": list(verdict.get("reasons") or []),
+        "evidence": verdict.get("evidence") or {},
+    })
+
+    assert checked.get("status") == "PASSED", checked.get("actual_result")
+
+
+def test_the_deferred_recheck_keeps_a_command_kind_e2e_pass(tmp_path: Path):
+    """A deferred check carries the whole gate — and the sub-class with
+    it, so the round-end re-check applies the same contract."""
+    agent = _make_agent(tmp_path)
+    _write(agent.plan_dir, "VP-CMD", CI_OUTPUT_FILENAME, {"vp_id": "VP-CMD"})
+
+    checked = agent._recheck_deferred_evidence(
+        "VP-CMD", "e2e",
+        {"status": "PASSED", "reasons": [], "evidence": {}},
+        _command_vp(),
+    )
+
+    assert checked is not None
+    assert checked["status"] == "PASSED"
+
+
+def test_a_deferred_command_kind_e2e_stays_passed_at_flush(tmp_path: Path):
+    agent = _make_agent(tmp_path)
+    _write(agent.plan_dir, "VP-CMD", CI_OUTPUT_FILENAME, {"vp_id": "VP-CMD"})
+    agent._defer_evidence_check(
+        "VP-CMD", _command_vp(),
+        {"status": "PASSED", "reasons": [], "evidence": {}}, "e2e",
+    )
+
+    applied = agent._flush_deferred_evidence_checks(_Executor())
+
+    assert applied == []
+
+
+def test_a_deferred_browser_kind_e2e_is_downgraded_at_flush(tmp_path: Path):
+    agent = _make_agent(tmp_path)
+    agent._defer_evidence_check(
+        "VP-B", {"id": "VP-B", "verification_method": "e2e"},
+        {"status": "PASSED", "reasons": [], "evidence": {}}, "e2e",
+    )
+
+    applied = agent._flush_deferred_evidence_checks(_Executor())
+
+    assert applied == ["VP-B"]
 
 
 def test_apply_evidence_check_never_raises(tmp_path: Path, monkeypatch):

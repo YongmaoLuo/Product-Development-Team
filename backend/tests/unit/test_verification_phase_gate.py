@@ -54,13 +54,13 @@ def _make_executor(
 ):
     """Executor whose runner returns ``verdicts[vp_id]`` as the status.
 
-    ``round_no`` pins the round the executor believes it is in — the
-    round every verdict it writes gets stamped with.  Omitted → the
-    executor asks the state store, which knows nothing here → round 0
-    ("unknown").  Two executors built from the same ``tmp_path`` share
-    one ``plan_dir``, so the second one hydrates the first one's
-    verdicts back from the state file — that is how a second round
-    sees what the first round concluded.
+    ``round_no`` 给的是**这一轮**的轮次号：轮次已知时，裁决才分得清
+    「本轮的」与「上一轮的」（``VERDICT_ROUND_FIELD``）。省略时执行器去问
+    状态库 —— 这里它什么也不知道 —— 于是轮次是 0（"未知"）。
+
+    两个用同一个 ``tmp_path`` 建出来的执行器共用一个 ``plan_dir``，所以
+    第二个会把第一个的裁决从状态文件里读回来 —— 下一轮就是这样看见上一轮
+    的结论的。
     """
     from verification_executor import VerificationExecutor
 
@@ -86,6 +86,46 @@ def _make_executor(
         round_no=round_no,
     )
     return executor, calls
+
+
+def _state_file(tmp_path: Path) -> Path:
+    return tmp_path / "plan" / "verification_executor_state.json"
+
+
+def _carry_round_verdicts(executor, tmp_path: Path) -> None:
+    """让下一轮的执行器能继承这一轮的结论（补上命令指纹）。
+
+    跨轮继承在生产路径上靠的是盘上那份 state 文件。这里补上**命令指纹**
+    —— 生产路径（``_record_result``）写出来的结论不带它，而分桶侧的判据
+    是「没有指纹 = 失效」：下一轮装载时这些结论会被当成「出处过期」摘掉，
+    继承就等于没继承。
+    """
+    import json
+
+    from verification_verdict_provenance import stamp as stamp_command
+
+    state_file = _state_file(tmp_path)
+    data = json.loads(state_file.read_text(encoding="utf-8"))
+
+    def _stamp(verdict: Dict[str, Any], vp_id: str) -> Dict[str, Any]:
+        return stamp_command(
+            dict(verdict), executor._current_command_for(vp_id),
+        )
+
+    data["verdicts"] = {
+        vp_id: _stamp(verdict, vp_id)
+        for vp_id, verdict in (data.get("verdicts") or {}).items()
+    }
+    data["verdict_rounds"] = {
+        str(round_no): {
+            vp_id: _stamp(verdict, vp_id)
+            for vp_id, verdict in (verdicts or {}).items()
+        }
+        for round_no, verdicts in (data.get("verdict_rounds") or {}).items()
+    }
+    state_file.write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +281,159 @@ def test_schema_accepts_deferred(tmp_path: Path) -> None:
         "status": "DEFERRED", "reasons": ["延后"], "evidence": {},
     })
     assert "VP-010" in executor._deferred_vps
+
+
+# ---------------------------------------------------------------------------
+# 门禁重算（2026-11-06）：延后不是终态，理由必须点名当前的阻塞者
+# ---------------------------------------------------------------------------
+#
+# 门禁原来只在层被短路的那一刻读一次结论，之后不再重算。于是：
+#
+#   * 阻塞前提在本轮后续（同一轮的重试 / 第二遍 pass）翻成终态成功之后，
+#     那一层再也没被派发过 —— DEFERRED 被留成了终态；
+#   * 上一轮留下的延后理由一直留在账本里，点名一个**已经翻绿**的结论
+#     （「Phase 1 的 VP-016 结论为 FAILED」，而 VP-016 早已 PASSED），
+#     而本轮的账本里又没有这个关卡的任何条目。
+
+
+def test_deferred_gate_is_recomputed_and_rerun_when_blocker_flips(
+    tmp_path: Path,
+) -> None:
+    """前提在本轮后续翻成终态成功 → 门禁重算 → 那一层必须在本轮真正派发。"""
+    plan = _plan(
+        _vp("VP-001"),
+        _vp("VP-010", verification_phase=2, phase_order=1, title="全量 Nightly CI"),
+    )
+    executor, calls = _make_executor(
+        plan, tmp_path, {"VP-001": "FAILED"}, round_no=1,
+    )
+    asyncio.run(executor.run(max_parallel=1))
+    assert "VP-010" not in calls, "Phase 1 有失败时全量关卡不得执行"
+    assert executor._verdicts["VP-010"]["status"] == "DEFERRED"
+
+    # 本轮后续（同一轮的重试 / 第二遍 pass）：阻塞前提翻成终态成功
+    executor.record_verdict(
+        "VP-001",
+        {"status": "PASSED", "reasons": ["重试通过"], "evidence": {}},
+    )
+    # 门禁重算：无阻塞就在本轮把那一层真正派发执行
+    asyncio.run(executor.rerun_deferred_gate_layers())
+
+    assert "VP-010" in calls, "前提消失后被延后的关卡必须在本轮补跑"
+    assert executor._verdicts["VP-010"]["status"] == "PASSED"
+
+
+def test_deferral_reason_follows_the_blocker_within_the_round(
+    tmp_path: Path,
+) -> None:
+    """本轮内阻塞者换了人 → 延后理由必须跟着换。
+
+    理由落在报告与状态里：点名一个**当前已经不成立**的结论状态（阻塞者早已
+    PASSED，理由还写着「结论为 FAILED」）就是撒谎。
+    """
+    plan = _plan(
+        _vp("VP-001"),
+        _vp("VP-002"),
+        _vp("VP-010", verification_phase=2, phase_order=1, title="全量 Nightly CI"),
+    )
+    executor, calls = _make_executor(
+        plan, tmp_path, {"VP-001": "FAILED", "VP-002": "FAILED"}, round_no=1,
+    )
+    asyncio.run(executor.run(max_parallel=1))
+    assert "VP-010" not in calls
+    reason = executor._verdicts["VP-010"]["reasons"][0]
+    assert "VP-001" in reason, "延后理由必须点名当前的阻塞者"
+
+    # 本轮内：VP-001 翻绿 —— 理由必须改口成还挡着的那一个
+    executor.record_verdict(
+        "VP-001",
+        {"status": "PASSED", "reasons": ["重试通过"], "evidence": {}},
+    )
+    reason = executor._verdicts["VP-010"]["reasons"][0]
+    assert "VP-002" in reason, "延后理由必须改口成当前的阻塞者"
+    assert "VP-001" not in reason, "延后理由不得点名一个已经翻绿的结论"
+
+
+def test_deferral_reason_names_the_current_blocker(tmp_path: Path) -> None:
+    """延后理由必须点名**本轮**的阻塞者，不能留着上一轮那个已经翻绿的结论。"""
+    plan = _plan(
+        _vp("VP-001"),
+        _vp("VP-002"),
+        _vp("VP-010", verification_phase=2, phase_order=1, title="全量 Nightly CI"),
+    )
+    executor, _ = _make_executor(
+        plan, tmp_path, {"VP-001": "FAILED", "VP-002": "PASSED"}, round_no=1,
+    )
+    asyncio.run(executor.run(max_parallel=1))
+    first = executor._verdicts["VP-010"]["reasons"][0]
+    assert "VP-001" in first, "延后理由必须点名阻塞者"
+
+    # 下一轮：VP-001 翻绿、VP-002 失败 → 理由必须改口成当前的阻塞者
+    _carry_round_verdicts(executor, tmp_path)
+    executor2, _ = _make_executor(
+        plan, tmp_path, {"VP-001": "PASSED", "VP-002": "FAILED"}, round_no=2,
+    )
+    asyncio.run(executor2.run(max_parallel=1))
+
+    second = executor2._verdicts["VP-010"]["reasons"][0]
+    assert "VP-002" in second, "延后理由必须改口成当前的阻塞者"
+    assert "VP-001" not in second, "延后理由不得点名一个已经翻绿的结论"
+
+
+def test_deferral_is_recorded_in_the_round_that_deferred_it(
+    tmp_path: Path,
+) -> None:
+    """本轮再次延后时，本轮账本里必须有一条**自己的**条目。"""
+    from verification_executor import VERDICT_ROUND_FIELD
+
+    plan = _plan(
+        _vp("VP-001"),
+        _vp("VP-010", verification_phase=2, phase_order=1, title="全量 Nightly CI"),
+    )
+    executor, _ = _make_executor(
+        plan, tmp_path, {"VP-001": "FAILED"}, round_no=1,
+    )
+    asyncio.run(executor.run(max_parallel=1))
+    assert executor._verdicts["VP-010"][VERDICT_ROUND_FIELD] == 1
+
+    _carry_round_verdicts(executor, tmp_path)
+    executor2, _ = _make_executor(
+        plan, tmp_path, {"VP-001": "FAILED"}, round_no=2,
+    )
+    asyncio.run(executor2.run(max_parallel=1))
+
+    assert "VP-010" in executor2._current_round_verdicts(), (
+        "本轮延后过的关卡必须在本轮账本里有一条自己的条目"
+    )
+    assert executor2._verdicts["VP-010"][VERDICT_ROUND_FIELD] == 2
+
+
+def test_a_real_conclusion_is_not_overwritten_by_a_deferral(
+    tmp_path: Path,
+) -> None:
+    """「已有结论就不覆盖」的跨轮规则：真跑出来的结论不得被延后记录顶掉。"""
+    plan = _plan(
+        _vp("VP-001"),
+        _vp("VP-010", verification_phase=2, phase_order=1, title="全量 Nightly CI"),
+    )
+    executor, calls = _make_executor(
+        plan, tmp_path, {"VP-001": "PASSED"}, round_no=1,
+    )
+    asyncio.run(executor.run(max_parallel=1))
+    assert "VP-010" in calls
+    assert executor._verdicts["VP-010"]["status"] == "PASSED"
+
+    # 下一轮：Phase 1 失败 → 关卡这一轮被延后 —— 上一轮的结论不许被顶掉
+    _carry_round_verdicts(executor, tmp_path)
+    executor2, calls2 = _make_executor(
+        plan, tmp_path, {"VP-001": "FAILED"}, round_no=2,
+    )
+    asyncio.run(executor2.run(max_parallel=1))
+
+    assert "VP-010" not in calls2, "本轮 Phase 1 失败时关卡不得执行"
+    assert executor2._verdicts["VP-010"]["status"] == "PASSED", (
+        "已有结论不得被一条延后记录覆盖"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -69,12 +69,16 @@ LANE_TIMEOUT="${PDT_CI_LANE_TIMEOUT:-3600}"
 # machine, not on the run, so two drivers that disagreed about where
 # it lives would happily run the gate at the same time.
 #
-# ``PDT_CI_DRIVER_LOCK_DIR`` moves it, and only the tests move it.
-# The gate runs the test file with ``-n 8``, so several workers run
-# those tests side by side on one machine, and workers that share the
-# machine-wide lock take each other's lock and refuse to start.  Every
-# other caller -- the gate itself, a person at a terminal -- keeps the
-# default, so the lock still means what it means.
+# ``PDT_CI_DRIVER_LOCK_DIR`` overrides the path, and only the tests
+# move it.  The gate runs the test file with ``-n 8``, so several
+# workers run those tests side by side on one machine, and workers
+# that share the machine-wide lock take each other's lock and refuse
+# to start.  Every other caller -- the gate itself, a person at a
+# terminal -- keeps the default, so the lock still means what it
+# means: the default stays the machine-wide path, so every real run
+# still claims the same lock, two real drivers still refuse to run at
+# the same time, and the tests cannot collide with a real gate run on
+# the same machine.
 LOCK_DIR="${PDT_CI_DRIVER_LOCK_DIR:-/tmp/pdt-ci-driver.lock}"
 
 case "$LANE_TIMEOUT" in

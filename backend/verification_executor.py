@@ -74,7 +74,7 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 from base_executor import BaseExecutor, _build_layers, _now_iso, stable_fingerprint
 from utils.atomic_io import atomic_write_json
@@ -157,6 +157,16 @@ ALLOWED_STATUSES = ("PASSED", "FAILED", "SKIPPED", "BLOCKED", "DEFERRED")
 #: Required keys for a valid verdict payload. The contract is
 #: position-free: any extra keys are ignored.
 REQUIRED_VERDICT_KEYS = ("status", "reasons", "evidence")
+
+#: 这一轮「**已经有结论**」的状态 —— :data:`ALLOWED_STATUSES` 去掉 DEFERRED。
+#:
+#: DEFERRED 不是结论，它是「这一轮还没跑」的记号（见
+#: :meth:`VerificationExecutor._mark_layer_deferred`）。派发侧（谁该被叫起来
+#: 跑）与读侧（报告里有没有这一条）必须对「有没有结论」用**同一份**口径 ——
+#: 两处各写一份，迟早漂移成「派发认为该跑、报告认为没跑过」。
+CONCLUSIVE_VERDICT_STATUSES = frozenset(
+    status for status in ALLOWED_STATUSES if status != "DEFERRED"
+)
 
 
 # Cost gate (2026-11-04, defect B item 4) ---------------------------------
@@ -403,6 +413,109 @@ def definition_fingerprint_for_vp(vp: Any) -> str:
         if field in vp:
             payload[field] = vp[field]
     return stable_fingerprint(payload)
+
+
+# Dispatch set ----------------------------------------------------------------
+#
+# 2026-11-08：这一轮「谁该被派发」必须是一份**纯函数**判据，派发侧与读侧
+# 共用同一份口径。
+#
+# 起因（VP-015）：一个验证点可以**两头不落** —— 不在复用里（复用判据不成立：
+# 它没有 ``covers_paths``），也没有本轮结论，于是没有任何人叫它跑。报告只列
+# 有本轮结论的验证点，它没有条目，判定环节于是自己补一条 FAILED —— 报告在
+# 说一件从没发生过的事。
+#
+# 判据只有一条：**本轮有没有结论**。DEFERRED 不算结论（它是「这一轮还没跑」
+# 的记号）；复用的结论算（它以本轮的轮次号重新写入，答案是本轮的）。
+
+
+def is_round_conclusion(verdict: Any) -> bool:
+    """这条裁决算不算「这一轮已经有结论了」。
+
+    ``DEFERRED`` 不算 —— 它只说明「这一轮还没跑」。坏数据（不是 dict、没有
+    status、status 不认识）一律不算：宁可多派发一次，不许把一条坏结论当成
+    「已经答过」。
+    """
+    if not isinstance(verdict, dict):
+        return False
+    status = str(verdict.get("status") or "").strip().upper()
+    return status in CONCLUSIVE_VERDICT_STATUSES
+
+
+def vps_requiring_dispatch(
+    plan_vp_ids: Iterable[str],
+    current_round_verdicts: Mapping[str, Any],
+    reused_vp_ids: Iterable[str] = (),
+) -> Set[str]:
+    """这一轮**还没有结论**的验证点 —— 它们必须被派发。
+
+    纯函数：同样的输入永远给出同样的答案，不碰磁盘、不碰状态库。
+
+    Args:
+        plan_vp_ids: 计划里的验证点 id（工作集 —— 已作废 / 已移除的不在其中）。
+        current_round_verdicts: **本轮**的裁决（``{vp_id: 裁决}``），见
+            :meth:`VerificationExecutor._current_round_verdicts`。
+        reused_vp_ids: 本轮从上一轮**复用**搬过来的验证点 id。
+
+    Returns:
+        必须被派发的验证点 id 集合。
+
+    为什么复用项不在里面：复用搬过来的结论以**本轮**的轮次号重新写入
+    （:meth:`VerificationExecutor._seed_reused_verdicts`），它已经是本轮的
+    答案 —— 再叫它跑一遍就是把「已经答过」当成「还没答」。所以复用项在
+    派发集之外，但**仍然有本轮条目**（报告里看得见它标着复用来源）。
+    """
+    reused = {str(vp_id) for vp_id in (reused_vp_ids or ())}
+    required: Set[str] = set()
+    for raw_id in plan_vp_ids or ():
+        vp_id = str(raw_id)
+        if vp_id in reused:
+            continue
+        if is_round_conclusion((current_round_verdicts or {}).get(vp_id)):
+            continue
+        required.add(vp_id)
+    return required
+
+
+def verdict_round_no(verdict: Any) -> int:
+    """一条裁决身上的轮次号（``round`` 字段）—— 规范化成 ``int``。
+
+    没有这个字段（或不是数字）→ 0（「轮次未知」）。**绝不**因为字段缺失就
+    丢掉那条裁决：丢一份结论比标错一个轮次贵得多。
+    """
+    if not isinstance(verdict, dict):
+        return 0
+    raw = verdict.get(VERDICT_ROUND_FIELD)
+    try:
+        round_no = int(raw)
+    except (TypeError, ValueError):
+        return 0
+    return round_no if round_no > 0 else 0
+
+
+def keeps_previous_conclusion(previous: Any, incoming: Any) -> bool:
+    """新来的一条裁决**不**顶掉前一条吗？—— 唯一的例外是「跨轮的延后记号」。
+
+    纯函数：同样的两条裁决永远给出同样的答案。
+
+    为什么有这条例外：``DEFERRED`` 是「这一轮还没跑」的记号，**不是结论**。
+    拿它顶掉**别的轮次**真跑出来的结论，等于把「没跑」说成「跑过、而且结论
+    相反」（2026-11-08 的 VP-015：第 4 轮 PASSED，第 5 轮被更早的关卡拦下）。
+
+    但它**也不能什么都不写** —— 报告只列有本轮条目的验证点，没有条目的那一
+    条会被判定环节自己补成 FAILED（同样是在说一件从没发生过的事）。所以两
+    条必须同时成立：结论留在裁决表里，延后记号进**本轮账本**（读侧按轮次
+    取值，见 :meth:`VerificationExecutor.collect_verdicts`）。
+
+    同一轮里后来的结论照旧顶掉前面的（先失败后延后仍然是「延后」）。
+    """
+    if not isinstance(incoming, dict):
+        return False
+    if str(incoming.get("status") or "").strip().upper() != "DEFERRED":
+        return False
+    if not is_round_conclusion(previous):
+        return False
+    return verdict_round_no(previous) != verdict_round_no(incoming)
 
 
 # Index-bucket plumbing -------------------------------------------------------
@@ -727,12 +840,28 @@ class VerificationExecutor(BaseExecutor):
         # 必须真正跑起来），所以单列一桶、不进 BaseExecutor 的
         # ``completed_set``。
         self._deferred_vps: List[str] = []
+        #: 2026-11-08：这一轮**必须**被派发的验证点 id（见
+        #: :func:`vps_requiring_dispatch`）。派发侧据此不跳过它们 ——
+        #: 「本轮没有结论」就等于「本轮还没跑」，它必须被叫起来跑。
+        self._dispatch_required_ids: Set[str] = set()
         #: ``_build_execution_layers`` 产出的层 → 阶段映射，供门禁判定。
         self._phase_of_layer: List[int] = []
         #: 层 → 该层的 Phase 2 关卡 VP（Phase 1 层为 None）。
         self._gate_of_layer: List[Optional[Dict[str, Any]]] = []
         #: 最近一次门禁拦截的理由，写进 DEFERRED 的 reasons 便于操作者定位。
         self._gate_block_reason: str = ""
+
+        # 2026-11-06（门禁重算）：本轮被延后的 Phase 2 关卡**层**。
+        #
+        # 门禁原来只在层被短路的那一刻读一次结论，之后不再重算：阻塞前提
+        # 在本轮后续翻成终态成功之后，那一层再也没被派发过 —— DEFERRED 被
+        # 留成了终态（它不是终态：它只意味着「这一轮还没跑」）。这张表记着
+        # 「本轮延后过哪些层」，好让 :meth:`rerun_deferred_gate_layers` 在
+        # 前提消失后把它们真正派发出去。
+        self._deferred_gate_layers: List[List[Dict[str, Any]]] = []
+        # 刷新延后理由会再次写裁决，而写裁决又会触发重算 —— 这道护栏挡住
+        # 那条环。
+        self._in_deferred_recheck: bool = False
 
         # Progress state mirrors. ``_current_vp`` shadows
         # :attr:`BaseExecutor._current_item` so the on-disk schema
@@ -823,6 +952,13 @@ class VerificationExecutor(BaseExecutor):
         每轮原样流进报告，再被修复生成器读成"本轮失败"，修复环因此
         永远收敛不了。判据与分桶侧共用 :meth:`_orphaned_vp_ids`。
 
+        2026-11-08（VP-015）：**本轮有条目就用本轮的**。裁决表里留的是
+        「这个验证点最新的一条**结论**」—— 一条跨轮的延后记号（``DEFERRED``）
+        顶不掉别的轮次真跑出来的结论（见 :func:`keeps_previous_conclusion`），
+        于是表里可能还留着上一轮的 PASSED。报告只认本轮的条目：那条本轮的
+        延后记号在**本轮账本**里，报告看到的是「这一轮还没跑」，而不是上
+        一轮的 PASSED。
+
         Returns:
             A list of ``{"vp_id": str, "status": str, "reasons": list,
             "evidence": dict, ...}`` dicts. The ``vp_id`` key is
@@ -832,8 +968,16 @@ class VerificationExecutor(BaseExecutor):
         """
         retired = self._plan_retired_vps()
         orphaned = self._orphaned_vp_ids()
+        current_bucket = self._current_round_bucket()
+        # 顺序：裁决表的插入顺序优先（报告按这个顺序渲染）；本轮账本里**多
+        # 出来**的接在后面 —— 那种情况是裁决表里那份被摘掉了（上一轮的结论
+        # 出处过期），而本轮的条目还在。
+        vp_ids = list(self._verdicts)
+        vp_ids.extend(
+            vp_id for vp_id in current_bucket if vp_id not in self._verdicts
+        )
         out: List[Dict[str, Any]] = []
-        for vp_id, verdict in self._verdicts.items():
+        for vp_id in vp_ids:
             # ``str()``: ``_plan_retired_vps`` keys on ``str(vp["id"])`` and
             # the executor derives ids the same way, but a verdict key that
             # arrived as a non-str from a persisted store must not silently
@@ -850,6 +994,10 @@ class VerificationExecutor(BaseExecutor):
             # :meth:`_removed_vp_ids`。
             if str(vp_id).strip() in self._removed_vp_ids:
                 continue
+            # 2026-11-08（VP-015）：本轮账本里有条目就用**本轮**那一条 ——
+            # 报告只认本轮的结论。裁决表里留着的可能是上一轮的结论（跨轮的
+            # 延后记号顶不掉它，见 :func:`keeps_previous_conclusion`）。
+            verdict = current_bucket.get(vp_id) or self._verdicts.get(vp_id) or {}
             entry = dict(verdict)  # defensive copy
             entry["vp_id"] = vp_id
             out.append(entry)
@@ -1055,6 +1203,9 @@ class VerificationExecutor(BaseExecutor):
         单独一个方法只为让 :meth:`run` 的归因绑定包住整轮：轮次号是**这一
         轮**的属性，不是某一次分派的属性。
         """
+        # 0. 本轮的延后层表从空开始 —— 上一轮延后过的层归上一轮管（它那条
+        #    结论在账本里，带着它自己的轮次号）。
+        self._deferred_gate_layers = []
         # 1. 装载裁决 —— 这一轮看到的是「构造之后才落库」的结论。
         self._hydrate_verdicts()
         # 2. 隔离孤儿 —— 行为不变：计划没有定义的裁决不进报告投影。
@@ -1067,7 +1218,18 @@ class VerificationExecutor(BaseExecutor):
         #
         #    默认一条都不复用：没有本轮的轮次作用域记录 = 不知道这一轮相对
         #    上一轮改了什么 = 全量重跑（安全的一侧）。
-        self._seed_reused_verdicts_for_current_round()
+        reused = self._seed_reused_verdicts_for_current_round()
+        # 4b. 重建派发集（2026-11-08）—— 计划里每个**还没有本轮结论**的
+        #     验证点都必须被派发。
+        #
+        #     放在复用之后：复用的判据要么成立（那条结论已经是本轮的），要么
+        #     不成立（那条验证点必须重跑）。两种情况在这里都能落成一句话 ——
+        #     「本轮有没有结论」。
+        #
+        #     不重建的后果（VP-015）：它既没被复用、也没有本轮结论，于是
+        #     **两头不落** —— 没人叫它跑，报告里也没有它的条目，判定环节只
+        #     能自己编一条 FAILED。
+        self._rebuild_dispatch_set(reused)
         # 5. 派生索引 —— 在移除**之后**派生，所以被移除的验证点不进任何桶。
         #
         #    派生放在执行**之前**是有原因的：``_backfill_index_lists_from_verdicts``
@@ -1081,6 +1243,18 @@ class VerificationExecutor(BaseExecutor):
         self._skipped_items = list(self._skipped_vps)
 
         await super().run(max_parallel=max_parallel, gate=gate)
+        # 2026-11-06（门禁重算）：本轮跑完之后重算一遍被延后的门禁层 ——
+        # 阻塞前提若在本轮翻绿了（同一轮的重试，或者第二遍 pass 把结论写回
+        # 来了），那一层必须**在本轮**真正跑起来。DEFERRED 不是终态，它只
+        # 意味着「这一轮还没跑」。
+        await self.rerun_deferred_gate_layers(gate=gate)
+        # 7. 收尾闸（2026-11-08）—— 计划里每个验证点都必须有**本轮**的条目。
+        #
+        #    报告只列有本轮结论的验证点；没有条目的那一条，判定环节会自己
+        #    补成 FAILED —— 那是**编造**：这一轮它根本没跑（VP-015，2026-11-08）。
+        #    这里给它记一条 DEFERRED（「这一轮还没跑」），不是给它编一条结论，
+        #    而是说清楚「没有」。
+        self._ensure_current_round_entries()
         # After super().run() returns, BaseExecutor has set
         # ``_current_item = None`` and saved the final progress
         # snapshot.  Mirror the historical field so the public
@@ -1291,8 +1465,11 @@ class VerificationExecutor(BaseExecutor):
                     ),
                 },
             )
-            return
-        self._save_state()
+        else:
+            self._save_state()
+        # 2026-11-06（门禁重算）：结论变了就重算一遍被延后的门禁层 ——
+        # 延后理由必须点名**当前**的阻塞者。
+        self._recheck_deferred_gate_reasons()
 
     def apply_verdict_updates(
         self, updates: Dict[str, Dict[str, Any]],
@@ -1738,10 +1915,22 @@ class VerificationExecutor(BaseExecutor):
             )
         ]
         for vp_id in stale_ids:
+            stale_round = self._verdict_round_of(self._verdicts.get(vp_id))
             self._verdicts.pop(vp_id, None)
             # 2026-11-05（轮次作用域）：轮次表里那一份也要摘 —— 桶只喂本轮
             # 的结论，留在轮次表里的话本轮视图会读到一条出处过期的结论。
-            for round_verdicts in self._verdicts_by_round.values():
+            #
+            # 2026-11-08（VP-015）：只摘**那一条**（它属于哪一轮就摘哪一轮）。
+            # 以前这里把整张轮次表里这个 VP 的条目全摘掉 —— 跨轮的延后记号
+            # （DEFERRED）会跟着一起消失：上一轮的结论出处过期，不该让**本轮**
+            # 的记号也没了。报告只列有本轮条目的验证点，条目没了它就会自己
+            # 编一条 FAILED（那正是这一层要治的病）。
+            for round_no, round_verdicts in self._verdicts_by_round.items():
+                entry = round_verdicts.get(vp_id)
+                if entry is None:
+                    continue
+                if self._verdict_round_of(entry) != stale_round:
+                    continue
                 round_verdicts.pop(vp_id, None)
 
         # 2026-10-14：计划自己已经作废的 VP，它的裁决同样不进失败桶。判据是
@@ -2346,8 +2535,11 @@ class VerificationExecutor(BaseExecutor):
                     ),
                 },
             )
-            return
-        self._save_state()
+        else:
+            self._save_state()
+        # 2026-11-06（门禁重算）：结论变了就重算一遍被延后的门禁层 ——
+        # 延后理由必须点名**当前**的阻塞者。
+        self._recheck_deferred_gate_reasons()
 
     def _recover_inflight(self) -> None:
         """Crash-recovery pass for any in-flight VP.
@@ -3057,15 +3249,11 @@ class VerificationExecutor(BaseExecutor):
 
         旧数据没有这个字段 → 0（「轮次未知」）。**绝不**因为字段缺失就
         丢掉那条裁决：丢一份结论比标错一个轮次贵得多。
+
+        判据本体在模块级的 :func:`verdict_round_no`（纯函数，写侧与读侧
+        共用同一份口径）。
         """
-        if not isinstance(verdict, dict):
-            return 0
-        raw = verdict.get(VERDICT_ROUND_FIELD)
-        try:
-            round_no = int(raw)
-        except (TypeError, ValueError):
-            return 0
-        return round_no if round_no > 0 else 0
+        return verdict_round_no(verdict)
 
     def _stamp_round(self, verdict: Dict[str, Any]) -> Dict[str, Any]:
         """给一条裁决盖上「它属于哪一轮」（返回副本，不改原对象）。
@@ -3087,12 +3275,34 @@ class VerificationExecutor(BaseExecutor):
 
         轮次从裁决自己身上的 ``round`` 字段读（没有就当 0）：装载历史
         数据时必须保住它原来的轮次，不能盖成"当前轮"。
+
+        2026-11-08（VP-015）：**跨轮**的延后记号（``DEFERRED``）顶不掉
+        别的轮次真跑出来的结论 —— 那份结论留在裁决表里，延后记号进**本轮
+        账本**。读侧按轮次取值（:meth:`collect_verdicts`），所以报告看到的
+        仍然是「这一轮还没跑」，而不是上一轮的 PASSED。
         """
         entry = dict(verdict)
         round_no = self._verdict_round_of(entry)
         entry[VERDICT_ROUND_FIELD] = round_no
-        self._verdicts[vp_id] = entry
+        if not keeps_previous_conclusion(self._verdicts.get(vp_id), entry):
+            self._verdicts[vp_id] = entry
         self._verdicts_by_round.setdefault(round_no, {})[vp_id] = entry
+
+    def _current_round_bucket(self) -> Dict[str, Dict[str, Any]]:
+        """本轮账本里**确确实实**属于本轮的那一份（不做旧数据兜底）。
+
+        与 :meth:`_current_round_verdicts` 的区别：那一处在本轮一条都没有
+        时会回落到「没有轮次字段的旧结论」（兼容升级前写下的裁决）；这里
+        不回落 —— 「本轮有没有这条」必须答得毫不含糊。
+
+        轮次**未知**时（0）：本轮写下的结论都落在「没有轮次字段」的那一份
+        里（``_stamp_round`` 盖的就是 0），所以本轮的那一份就是它 —— 这时
+        回落不是兜底，是唯一说得通的答案。
+        """
+        current = self._verdict_round_no()
+        if current <= 0:
+            return self._verdicts_by_round.get(0) or {}
+        return self._verdicts_by_round.get(current) or {}
 
     def _current_round_verdicts(self) -> Dict[str, Dict[str, Any]]:
         """**本轮**的裁决 —— ``{vp_id: 裁决}``。
@@ -3160,12 +3370,118 @@ class VerificationExecutor(BaseExecutor):
 
         定义指纹那道校验**原样保留**（走基类）：一条结论只对它产生它的那份
         定义有效，轮次作用域是**加**了一道判据，不是把既有那道换掉。
+
+        2026-11-08：再加一道 —— **派发集**（:func:`vps_requiring_dispatch`）
+        说「必须跑」的验证点不许出现在「可以跳过」里。判据不同、方向相反：
+        上一条问「这条结论能不能算数」，这一条问「这一轮到底跑没跑过」。
         """
         resumable = super()._resumable_completed_ids(items)
-        return {
+        resumable = {
             item_id for item_id in resumable
             if self._is_current_round_verdict(item_id)
         }
+        required = self._dispatch_required_ids
+        if not required:
+            return resumable
+        return {
+            item_id for item_id in resumable
+            if item_id not in required
+        }
+
+    def _rebuild_dispatch_set(
+        self,
+        reused_vp_ids: Optional[Iterable[str]] = None,
+    ) -> Set[str]:
+        """重建这一轮的**派发集** —— 返回必须被派发的验证点 id。
+
+        判据是 :func:`vps_requiring_dispatch`（纯函数）：计划里每个**还没有
+        本轮结论**的验证点都必须被派发。复用搬过来的结论已经是本轮的答案，
+        不在派发集里（见那个函数的 docstring）。
+
+        副作用两处：
+
+        * ``self._pending_vps`` —— 与既有队列取**并集**（不覆盖别人的条目：
+          队列里已有的、还没跑完的必须原样留下）；
+        * ``self._dispatch_required_ids`` —— 派发侧据此不跳过它们。
+
+        2026-11-08（VP-015）：不重建的后果是那个验证点**两头不落** ——
+        既没被复用（复用判据不成立），也没有本轮结论，于是没有任何人叫它
+        跑；报告只列有本轮结论的验证点，它没有条目，判定环节于是自己编一条
+        FAILED —— 报告在说一件从没发生过的事。
+        """
+        plan_ids: List[str] = []
+        for item in self._build_items_from_plan():
+            item_id = self._derive_item_id(item)
+            if item_id and item_id not in plan_ids:
+                plan_ids.append(item_id)
+        required = vps_requiring_dispatch(
+            plan_ids,
+            self._current_round_bucket(),
+            reused_vp_ids=reused_vp_ids or (),
+        )
+        queued = list(self._pending_vps)
+        for vp_id in plan_ids:
+            if vp_id in required and vp_id not in queued:
+                queued.append(vp_id)
+        self._pending_vps = queued
+        self._dispatch_required_ids = set(required)
+        return set(required)
+
+    def _ensure_current_round_entries(self) -> List[str]:
+        """收尾闸：计划里每个验证点都必须有**本轮**的条目。
+
+        报告只列有本轮结论的验证点；没有条目的那一条，判定环节会自己补成
+        FAILED —— 那是**编造**（2026-11-08 的 VP-015：这一轮它根本没跑）。
+
+        这里给它记一条 DEFERRED —— 不是给它编一条结论，而是**说清楚「没有」**：
+        DEFERRED 的语义就是「这一轮还没跑」，它不是失败，也不是终态成功，
+        下一轮还会被叫起来跑（见 :meth:`_rebuild_dispatch_set`）。
+
+        返回：这次被补上条目的验证点 id（审计用）。
+        """
+        current = self._current_round_bucket()
+        missing: List[str] = []
+        for item in self._build_items_from_plan():
+            item_id = self._derive_item_id(item)
+            if not item_id:
+                continue
+            # 判据是「本轮**有没有条目**」，不是「本轮有没有**结论**」——
+            # 关卡拦下时已经写过一条 DEFERRED，理由写清了「被谁拦下」，
+            # 那条比这里的笼统理由有用得多，不许被它顶掉。
+            if item_id in current:
+                continue
+            missing.append(item_id)
+        if not missing:
+            return []
+        reason = "本轮未产生结论（未被派发）"
+        for item_id in missing:
+            try:
+                self.record_verdict(
+                    item_id,
+                    {
+                        "status": "DEFERRED",
+                        "reasons": [reason],
+                        "evidence": {"round": self._verdict_round_no()},
+                        "actual_result": reason,
+                    },
+                )
+            except Exception:  # noqa: BLE001 — 补条目失败也不能让整轮崩掉
+                self._store_verdict(
+                    item_id,
+                    self._stamp_round(
+                        {
+                            "status": "DEFERRED",
+                            "reasons": [reason],
+                            "evidence": {},
+                            "actual_result": reason,
+                        }
+                    ),
+                )
+        try:
+            self._save_state()
+        except Exception:  # noqa: BLE001 — 落库失败也不许让整轮崩掉
+            pass
+        return missing
 
     def _is_current_round_verdict(self, item_id: str) -> bool:
         """这条结论是不是**本轮**的。
@@ -3664,11 +3980,7 @@ class VerificationExecutor(BaseExecutor):
             return False
 
         gate = self._gate_of_layer[next_idx] if self._gate_of_layer else None
-        gate_order = infer_phase_order(gate) if isinstance(gate, dict) else None
-        reason = (
-            self._blocking_gate_reason()
-            or self._gate_predecessor_reason(gate_order)
-        )
+        reason = self._gate_block_reason_for(gate)
         if reason:
             self._gate_block_reason = reason
             return True
@@ -3685,12 +3997,17 @@ class VerificationExecutor(BaseExecutor):
         是"终态成功"，会进 ``completed_set`` 而在后续轮次被跳过；被延后的
         全量关卡必须在下一次（Phase 1 修好之后的）轮次真正跑起来，所以它
         既不是失败、也不是跳过。
+
+        2026-11-06（门禁重算）：被延后的**层**要记下来 —— 门禁的结论以后
+        可能翻绿，那时这一层必须能补跑（见 :meth:`rerun_deferred_gate_
+        layers`）。
         """
         if layer and all(is_final_gate(item) for item in layer):
             detail = self._gate_block_reason or reason
             self._mark_layer_deferred(
                 layer, f"Phase 2 关卡延后：{detail}",
             )
+            self._register_deferred_gate_layer(layer)
             return
         self._mark_layer_skipped(layer, reason)
 
@@ -3698,6 +4015,8 @@ class VerificationExecutor(BaseExecutor):
         self,
         layer: List[Dict[str, Any]],
         reason: str,
+        *,
+        refresh: bool = False,
     ) -> None:
         """把整层 Phase 2 VP 标为 ``DEFERRED``（本轮延后，下轮重跑）。
 
@@ -3713,14 +4032,47 @@ class VerificationExecutor(BaseExecutor):
         关卡就从账本里消失，Phase 3 只能对「没有记录」猜一个 FAILED，报告
         于是把它写成「未获得执行结果」，修复环去修一条从没跑过的关卡。
 
-        同一轮内不覆盖既有结论；跨轮必须重新落一条带本轮轮次戳的
-        DEFERRED —— 与 :meth:`_mark_layer_skipped` 的轮次语义一致（整层
-        跳过每一轮都走 ``_stamp_round`` 落一条本轮结论）。
+        2026-11-06（门禁重算）：**已经有延后记录**的层要能**刷新**那条记录
+        —— 理由必须点名**当前**的阻塞者，轮次戳必须落在**本轮**。以前这里
+        一律 ``continue``（"已有结论就不覆盖"），于是本轮再次延后时本轮账本
+        里一条条目都没有，而上一轮那条理由还留着 —— 它点名的结论可能早已翻绿
+        （「Phase 1 的 VP-016 结论为 FAILED」，而 VP-016 早已 PASSED）。
+
+        两条判据各有各的用武之地，合起来是一条：
+
+        1. **本轮真跑出来的结论**（PASSED / FAILED / SKIPPED / BLOCKED）——
+           任何路径都不许被一条延后记录顶掉。DEFERRED 不是结论，它是
+           「这一轮还没跑」的记号。
+        2. **本轮已经落过账**（含本轮那条 DEFERRED）—— **首次**落账时不许
+           覆盖：一轮里反复落账只会把「本轮为什么延后」改写成最后一次的理由。
+
+        而**重算**路径（:meth:`_recheck_deferred_gate_reasons` /
+        :meth:`rerun_deferred_gate_layers`）要把理由改口成当前的阻塞者，
+        所以它带着 ``refresh=True`` 调用本方法：那条本轮 DEFERRED 是本方法
+        自己写的，重算它正是本方法存在的意义。
+
+        2026-11-08：判据 1 以前读的是 ``self._verdicts``（每个 VP 的**最新**
+        一条，不分轮次），于是**上一轮**的结论也顶住了本轮的延后记号：
+        VP-015 第 4 轮 PASSED，第 5 轮被更早的关卡拦下（DEFERRED）——
+        延后记号被第 4 轮那条顶掉，本轮账本里一条都没有，报告里也没有它的
+        条目，判定环节只能自己编一条 FAILED。
+
+        所以判据 1 只看**本轮**那一份（``_current_round_bucket``）。
         """
         current_round = self._verdict_round_no()
         for item in layer:
             item_id = self._derive_item_id(item)
-            if self._verdict_exists_in_round(item_id, current_round):
+            existing = self._current_round_bucket().get(item_id)
+            if (
+                isinstance(existing, dict)
+                and str(existing.get("status") or "") != "DEFERRED"
+            ):
+                # 本轮真跑出来的结论：不许被一条延后记录顶掉。
+                continue
+            if not refresh and self._verdict_exists_in_round(
+                item_id, current_round
+            ):
+                # 本轮已经落过账 —— 同一轮内不覆盖既有结论。
                 continue
             verdict = {
                 "status": "DEFERRED",
@@ -3739,4 +4091,113 @@ class VerificationExecutor(BaseExecutor):
             if item_id not in self._deferred_vps:
                 self._deferred_vps.append(item_id)
         self._gate_block_reason = ""
+
+    # ------------------------------------------------------------------
+    # Gate recheck (2026-11-06)
+    # ------------------------------------------------------------------
+    #
+    # 门禁原来只在层被短路的那一刻读一次结论，之后不再重算。于是：
+    #
+    #   * 阻塞前提在本轮后续翻成终态成功之后，那一层再也没被派发过 ——
+    #     DEFERRED 被留成了终态（它不是终态：它只意味着「这一轮还没跑」）；
+    #   * 上一轮留下的延后理由一直躺在账本里，点名一个**已经翻绿**的结论
+    #     （「Phase 1 的 VP-016 结论为 FAILED」，而 VP-016 早已 PASSED）。
+    #
+    # 这一节把「读一次」改成「读了就记着，之后随时能重算」：被延后的层记在
+    # ``_deferred_gate_layers`` 里，前提一变就重算 —— 还在就刷新理由，
+    # 没了就把那一层真正派发出去。
+
+    def _gate_block_reason_for(self, gate: Any) -> str:
+        """这个关卡层当前的阻塞理由（空串 = 无阻塞，可以放行）。
+
+        与 :meth:`_should_short_circuit_layer` 用的是**同一份**判据 ——
+        两处各写一份，迟早漂移成「短路时拦的是 A，重算时算的是 B」。
+        """
+        gate_order = infer_phase_order(gate) if isinstance(gate, dict) else None
+        return (
+            self._blocking_gate_reason()
+            or self._gate_predecessor_reason(gate_order)
+        )
+
+    def _register_deferred_gate_layer(
+        self,
+        layer: List[Dict[str, Any]],
+    ) -> None:
+        """记下本轮被延后的关卡层（好让它能被重算）。"""
+        ids = [self._derive_item_id(item) for item in layer]
+        for known in self._deferred_gate_layers:
+            if [self._derive_item_id(i) for i in known] == ids:
+                return
+        self._deferred_gate_layers.append(list(layer))
+
+    def _recheck_deferred_gate_reasons(self) -> None:
+        """前提变了就刷新延后理由。
+
+        只刷新**还在被挡着**的层：前提消失的那些层由
+        :meth:`rerun_deferred_gate_layers` 真正派发出去（派发成功后那条
+        DEFERRED 记录自然被真结论顶掉）。
+
+        刷新是必要的：延后理由落在报告与状态里，点名一个当前已经不成立的
+        结论状态（阻塞者早已 PASSED，理由还写着「结论为 FAILED」）就是撒谎。
+        理由要么是**本轮最终的**阻塞者状态，要么在前提消失后不再存在。
+        """
+        if self._in_deferred_recheck or not self._deferred_gate_layers:
+            return
+        self._in_deferred_recheck = True
+        try:
+            for layer in list(self._deferred_gate_layers):
+                reason = self._gate_block_reason_for(layer[0])
+                if not reason:
+                    # 前提没了 —— 派发由 :meth:`rerun_deferred_gate_layers`
+                    # 负责（它要 await，不能在同步路径上做）。
+                    continue
+                # refresh=True —— 这条本轮 DEFERRED 是本方法自己写的，
+                # 重算它正是目的：理由必须改口成**当前**的阻塞者。
+                self._mark_layer_deferred(
+                    layer, f"Phase 2 关卡延后：{reason}", refresh=True,
+                )
+        finally:
+            self._in_deferred_recheck = False
+
+    async def rerun_deferred_gate_layers(self, gate: Any = None) -> List[str]:
+        """重算被延后的门禁层 —— 前提没了就**在本轮真正跑起来**。
+
+        DEFERRED 不是终态：它只意味着「这一轮还没跑」。前提一旦消失
+        （阻塞者翻绿、或者更早的关卡过了），那一层就必须补跑 —— 否则
+        「整仓门禁真的跑过并且是绿的」这条判据永远兑现不了。
+
+        Args:
+            gate: 并发闸（``acquire()`` / ``release()``），与
+                :meth:`run` 收的是同一个。
+
+        Returns:
+            真正派发出去了的关卡 id（空列表 = 全都还在等前提）。
+        """
+        dispatched: List[str] = []
+        for layer in list(self._deferred_gate_layers):
+            if not layer:
+                continue
+            reason = self._gate_block_reason_for(layer[0])
+            if reason:
+                # 还在被挡着：理由刷新（点名当前的阻塞者）。
+                # refresh=True —— 这条本轮 DEFERRED 是本方法自己写的，
+                # 重算它正是目的：理由必须改口成**当前**的阻塞者。
+                self._mark_layer_deferred(
+                    layer, f"Phase 2 关卡延后：{reason}", refresh=True,
+                )
+                continue
+            self._deferred_gate_layers.remove(layer)
+            try:
+                await asyncio.gather(
+                    *[self._execute_one_item(item, gate) for item in layer],
+                    return_exceptions=True,
+                )
+            except Exception:  # noqa: BLE001 — 派发失败也不能让整轮崩掉
+                logger.exception(
+                    "[verification_executor] re-running the deferred gate "
+                    "layer %s failed",
+                    [self._derive_item_id(i) for i in layer],
+                )
+            dispatched.append(self._derive_item_id(layer[0]))
+        return dispatched
 
