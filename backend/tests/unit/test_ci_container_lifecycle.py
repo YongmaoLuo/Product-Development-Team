@@ -41,14 +41,19 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 #: The driver under test.
 DRIVER = PROJECT_ROOT / "scripts" / "run_ci_lanes_in_container.sh"
 
-#: The name of the variable that tells the driver where its lock
-#: lives.  The driver takes a machine-wide lock by default -- two
-#: drivers on one machine would run the gate at the same time and each
-#: would report the other's failures as its own -- but the tests here
-#: point it somewhere else, because pytest-xdist spreads this file
-#: across several workers of one job and those workers must not take
-#: each other's lock.
-LOCK_DIR_VARIABLE = "PDT_CI_DRIVER_LOCK_DIR"
+#: The lock the driver takes, so a second driver refuses to start.
+#: It is a fixed path on purpose -- the lock is a machine-wide claim,
+#: not a per-run one, so two drivers that disagree about where the
+#: lock lives would happily run the gate at the same time.
+DEFAULT_LOCK_DIR = Path("/tmp/pdt-ci-driver.lock")
+
+#: The environment variable that moves the lock somewhere else.  It
+#: exists so the cases in this file can run at the same time -- the
+#: unit lane runs the suite with ``-n 8``, so several cases of this
+#: file are alive at once, and a machine-wide lock would make them
+#: collide with each other (and with a real gate run on the same
+#: machine).  Every real driver still takes the machine-wide lock.
+LOCK_DIR_ENV = "PDT_CI_DRIVER_LOCK_DIR"
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +115,39 @@ exit "$status"
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _no_lock_left_behind(tmp_path: Path):
+    """The lock is state; no test may leave one behind.
+
+    The driver removes the lock when it exits, so this only matters
+    when a driver was killed mid-run -- but that is exactly the case
+    the lock has to survive, and a leftover lock would make every
+    later test in this file fail with "another gate run is in
+    progress".
+
+    The lock this file cleans up is the *per-test* one (see
+    :func:`_lock_dir`): the machine-wide lock belongs to the real
+    gate runs, and a test that removed it would take away the claim a
+    real driver is holding.
+    """
+    lock_dir = _lock_dir(tmp_path)
+    shutil.rmtree(lock_dir, ignore_errors=True)
+    yield
+    shutil.rmtree(lock_dir, ignore_errors=True)
+
+
+def _lock_dir(tmp_path: Path) -> Path:
+    """Where the lock of the driver run by *tmp_path* lives."""
+    return tmp_path / "driver.lock"
+
+
+def _workspace(root: Path, name: str) -> Path:
+    """A directory of its own, for one environment."""
+    path = root / name
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _environment(tmp_path: Path, **overrides: str) -> dict[str, str]:
     """The environment the driver runs with: a stand-in docker on PATH."""
     bin_dir = tmp_path / "bin"
@@ -127,50 +165,15 @@ def _environment(tmp_path: Path, **overrides: str) -> dict[str, str]:
     env["PDT_CI_TEST_EVENTS"] = str(tmp_path / "events.log")
     env["PDT_CI_TEST_EXIT_MAP"] = str(exit_map)
     # The driver locks the machine by default, which is right in
-    # production and wrong here: the gate runs this file with
-    # ``-n 8``, so several workers run these tests side by side, and
-    # workers that share one machine-wide lock take each other's lock
-    # and refuse to start.  Each test therefore gets a lock of its
-    # own, under its own ``tmp_path``.
-    env[LOCK_DIR_VARIABLE] = str(tmp_path / "driver.lock")
+    # production and wrong here: the cases of this file run at the
+    # same time (the unit lane runs the suite with ``-n 8``), so
+    # several workers run these tests side by side -- workers that
+    # share one machine-wide lock take each other's lock and refuse
+    # to start.  Each test therefore gets a lock of its own, under
+    # its own ``tmp_path``.
+    env[LOCK_DIR_ENV] = str(_lock_dir(tmp_path))
     env.update(overrides)
     return env
-
-
-def _lock_dir(env: dict[str, str]) -> Path:
-    """The lock the driver was told to take."""
-    return Path(env[LOCK_DIR_VARIABLE])
-
-
-def _workspace(root: Path, name: str) -> Path:
-    """A directory of its own, for one environment."""
-    path = root / name
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _stop_driver(process: subprocess.Popen[str]) -> None:
-    """Stop a driver, and the stand-in docker it left behind.
-
-    The signal goes to the driver first, so its own trap takes the
-    container -- and the lock -- with it.  The process group goes
-    afterwards, because the stand-in is still sleeping inside the
-    container it pretended to start.
-    """
-    try:
-        process.send_signal(signal.SIGTERM)
-        process.wait(timeout=60)
-    except (ProcessLookupError, subprocess.TimeoutExpired):
-        pass
-    finally:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-        try:
-            process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            pass
 
 
 def _read_log(path: str) -> str:
@@ -438,8 +441,12 @@ def test_a_second_driver_is_refused(tmp_path: Path) -> None:
     exists to catch.
     """
     env = _environment(tmp_path)
-    _lock_dir(env).mkdir(parents=True, exist_ok=True)
-    result = _run_driver(env, "unit")
+    lock_dir = _lock_dir(tmp_path)
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        result = _run_driver(env, "unit")
+    finally:
+        shutil.rmtree(lock_dir, ignore_errors=True)
 
     assert result.returncode == 75, (
         "the second driver was not refused: "
@@ -453,6 +460,61 @@ def test_a_second_driver_is_refused(tmp_path: Path) -> None:
         "the refused driver started a container anyway: "
         f"{_read_log(env['PDT_CI_TEST_DOCKER_LOG'])!r}"
     )
+
+
+def test_a_driver_takes_the_lock_it_was_pointed_at(tmp_path: Path) -> None:
+    """The override moves the lock, and the driver takes the one it is given.
+
+    The override exists so the cases of this file can run at the same
+    time.  It has to be a real override: a driver that was pointed
+    somewhere else and still took the machine-wide lock would keep the
+    cases of this file colliding with each other -- and with a real
+    gate run.
+    """
+    source = DRIVER.read_text(encoding="utf-8")
+
+    assert f'{LOCK_DIR_ENV}:-' in source, (
+        "the driver does not read the lock location from the environment"
+    )
+
+    env = _environment(tmp_path)
+    assert env[LOCK_DIR_ENV] == str(_lock_dir(tmp_path))
+
+    lock_dir = _lock_dir(tmp_path)
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        result = _run_driver(env, "unit")
+    finally:
+        shutil.rmtree(lock_dir, ignore_errors=True)
+
+    assert result.returncode == 75, (
+        "the driver did not take the lock it was pointed at: "
+        f"{result.stdout!r} / {result.stderr!r}"
+    )
+
+
+def _stop_driver(process: subprocess.Popen[str]) -> None:
+    """Stop a driver, and the stand-in docker it left behind.
+
+    The signal goes to the driver first, so its own trap takes the
+    container -- and the lock -- with it.  The process group goes
+    afterwards, because the stand-in is still sleeping inside the
+    container it pretended to start.
+    """
+    try:
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=60)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        pass
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -475,8 +537,10 @@ def test_two_environments_do_not_share_the_gate_lock(tmp_path: Path) -> None:
     somewhere else.  Before the lock path could be configured, the
     second driver found the first driver's lock and refused to start.
     """
-    env_a = _environment(_workspace(tmp_path, "a"), PDT_CI_TEST_HANG="1")
-    env_b = _environment(_workspace(tmp_path, "b"))
+    root_a = _workspace(tmp_path, "a")
+    root_b = _workspace(tmp_path, "b")
+    env_a = _environment(root_a, PDT_CI_TEST_HANG="1")
+    env_b = _environment(root_b)
 
     driver_a = subprocess.Popen(
         ["bash", str(DRIVER), "unit"],
@@ -501,8 +565,8 @@ def test_two_environments_do_not_share_the_gate_lock(tmp_path: Path) -> None:
         assert events == ["start unit", "end unit", "start e2e", "end e2e"], (
             f"the second driver did not run its lanes: {events!r}"
         )
-        assert _lock_dir(env_a).is_dir(), (
-            f"the first driver did not take its lock: {_lock_dir(env_a)!r}"
+        assert _lock_dir(root_a).is_dir(), (
+            f"the first driver did not take its lock: {_lock_dir(root_a)!r}"
         )
     finally:
         _stop_driver(driver_a)
@@ -513,34 +577,63 @@ def test_two_environments_do_not_share_the_gate_lock(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_the_default_lock_is_the_machine_wide_path(tmp_path: Path) -> None:
-    """Without the override the driver still locks the machine.
+def test_the_default_lock_path_is_still_machine_wide(tmp_path: Path) -> None:
+    """Without the override, two drivers still refuse each other.
 
-    The override is a test seam; the default is the machine-wide lock
-    that keeps two gate runs off one machine.  A driver that was not
-    told otherwise has to find that lock and refuse to start.
+    The override exists so the cases of this file can run at the same
+    time.  It must not become a way for two *real* drivers to run the
+    gate on one machine: the default therefore stays the fixed
+    machine-wide path, and two drivers that both take the default are
+    still mutually exclusive -- the second one says so and starts
+    nothing at all.
     """
-    default_lock = Path("/tmp/pdt-ci-driver.lock")
     env = _environment(tmp_path)
-    env.pop(LOCK_DIR_VARIABLE, None)
+    # The default path, not the one of this test: this case is about
+    # what a driver does when it is *not* told where the lock is.
+    env.pop(LOCK_DIR_ENV, None)
 
-    # The lock is only taken here if it was free.  A lock that somebody
-    # else holds is left alone -- it is not this test's to remove --
-    # and the driver has to refuse either way.
-    taken_here = not default_lock.exists()
-    if taken_here:
-        default_lock.mkdir(parents=True, exist_ok=True)
+    holder = None
+    if not DEFAULT_LOCK_DIR.exists():
+        # The lock is free, so the first driver takes it -- and keeps
+        # it for as long as it runs.
+        holder = subprocess.Popen(
+            ["bash", str(DRIVER), "unit"],
+            cwd=str(PROJECT_ROOT),
+            env={**env, "PDT_CI_TEST_HANG": "1"},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline and not DEFAULT_LOCK_DIR.exists():
+            if holder.poll() is not None:
+                # Somebody else took the lock first.  That is the same
+                # situation with somebody else's holder, and the
+                # driver that follows must be refused either way.
+                break
+            time.sleep(0.05)
+
     try:
-        result = _run_driver(env, "unit")
+        second = _run_driver(env, "unit")
     finally:
-        if taken_here:
-            shutil.rmtree(default_lock, ignore_errors=True)
+        if holder is not None:
+            _stop_driver(holder)
+            if (
+                holder.returncode is None or holder.returncode < 0
+            ) and DEFAULT_LOCK_DIR.exists():
+                # The holder was killed before its trap could run, so
+                # the lock it took is still there.  A holder that exited
+                # on its own (0), that never got the lock (75) or that
+                # went through its trap (143) has already taken the lock
+                # away again -- and the lock of somebody else is not
+                # ours to remove.
+                shutil.rmtree(DEFAULT_LOCK_DIR, ignore_errors=True)
 
-    assert result.returncode == 75, (
-        "the driver did not find the machine-wide lock: "
-        f"{result.stdout!r} / {result.stderr!r}"
+    assert second.returncode == 75, (
+        "a second driver was not refused on the machine-wide lock: "
+        f"{second.stdout!r} / {second.stderr!r}"
     )
-    assert "another gate run is in progress" in result.stdout + result.stderr, (
-        "the driver did not say why it refused: "
-        f"{result.stdout!r} / {result.stderr!r}"
+    assert "another gate run is in progress" in second.stdout + second.stderr, (
+        "the second driver did not say why it refused: "
+        f"{second.stdout!r} / {second.stderr!r}"
     )

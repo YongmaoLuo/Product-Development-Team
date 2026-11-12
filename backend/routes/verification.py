@@ -13,7 +13,7 @@ from fastapi import APIRouter
 from typing import Dict, List, Optional, Tuple, Any
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from datetime import datetime
 import json
 import os
@@ -1720,7 +1720,7 @@ def _plan_relative_report_path(
     :func:`root_cause_task.root_cause_report_path` returns, i.e.
     ``plans/<plan_id>/reports/root-cause-<vp>.md``.
 
-    Three shapes are refused, and the reason is the same for all of them:
+    Four shapes are refused, and the reason is the same for all of them:
     **the chain is data, and data does not get to name a file anywhere on
     the disk.**
 
@@ -1728,7 +1728,16 @@ def _plan_relative_report_path(
       outside the plan tree entirely;
     * a path with a ``..`` component — the same thing, one level up;
     * a path that is not under ``plans/<plan_id>/`` — it names some other
-      plan's file, or a file outside the plans tree.
+      plan's file, or a file outside the plans tree;
+    * a path whose **tail** escapes the plan tree even though its head
+      looks right (``plans/<plan_id>//etc/passwd``) — the prefix is only
+      half of an address, and the other half is checked too.
+
+    The prefix is judged on the **normalized** parts, and the tail is
+    taken from that same normalized path — so an address that only looks
+    in-tree after ``Path`` rewrote it (``//`` collapsed, ``.`` dropped)
+    is refused rather than quietly reinterpreted: the ledger named one
+    address, and the reset acts on that address or on none.
 
     A refused path is skipped, not an error: one bad entry in the ledger
     must not stop the reset from clearing the rest of it.
@@ -1741,13 +1750,33 @@ def _plan_relative_report_path(
     # ``Path.is_absolute`` does not on a POSIX host.
     if candidate.is_absolute() or PureWindowsPath(raw).is_absolute():
         return None
-    if ".." in candidate.parts:
+    # The ledger's addresses are repo-relative POSIX paths, so the
+    # normalization is done with ``PurePosixPath`` — the result is the
+    # same on every host, which is what the comparison below needs.
+    posix = PurePosixPath(raw)
+    if ".." in posix.parts or ".." in PureWindowsPath(raw).parts:
         return None
-    prefix = f"plans/{plan_id}/"
-    if not raw.startswith(prefix):
+    # The prefix is judged on the normalized parts, not on a string
+    # slice: ``plans/<plan_id>//etc/passwd`` *starts with* the prefix,
+    # but its tail is an absolute path.
+    if posix.parts[:2] != ("plans", str(plan_id)):
         return None
-    relative = raw[len(prefix):]
-    if not relative:
+    # Normalization must not change the address. A path that only looks
+    # in-tree after ``Path`` rewrote it (``//`` collapsed, ``.`` dropped)
+    # is refused: silently rewriting the ledger's address would let a
+    # tampered entry name a different file than the one it wrote down.
+    if posix.as_posix() != raw:
+        return None
+    tail = posix.parts[2:]
+    if not tail:
+        return None
+    relative = "/".join(tail)
+    # The tail gets the same treatment as a whole address: an absolute
+    # tail (``C:\\...`` on a Windows host) escapes the plan tree just as
+    # surely as an absolute head does.
+    if PurePosixPath(relative).is_absolute() or PureWindowsPath(relative).is_absolute():
+        return None
+    if ".." in PurePosixPath(relative).parts or ".." in PureWindowsPath(relative).parts:
         return None
     return relative
 
@@ -1777,6 +1806,27 @@ def _load_root_cause_chain(chain_path: Path) -> Dict[str, Any]:
     return payload
 
 
+def _is_inside_plan_dir(plan_root: Path, target: Path) -> bool:
+    """Is ``target`` still inside ``plan_root`` after resolution?
+
+    The containment check the delete itself makes, so that removing a
+    file never rests on a single string-prefix check having been right.
+    Symlinks are resolved on both sides: a path that only *looks* like
+    it is under the plan directory but leaves it through a link is out
+    of the plan tree too.
+    """
+    try:
+        resolved = target.resolve()
+    except (OSError, RuntimeError):
+        # ``RuntimeError`` is what ``resolve()`` raises on a symlink loop
+        # before Python 3.13 — an unreadable target is out of the plan
+        # tree as far as the delete is concerned.
+        return False
+    if resolved == plan_root:
+        return False
+    return plan_root in resolved.parents
+
+
 def _clear_root_cause_chain(plan_id: str, plan_dir: Path) -> List[str]:
     """Delete the chain's ledger and the reports it names.
 
@@ -1792,6 +1842,10 @@ def _clear_root_cause_chain(plan_id: str, plan_dir: Path) -> List[str]:
     reports directory: that directory also holds the reports of points
     that are no longer on the chain, and a reset has no business taking
     those with it.
+
+    And only the files that are still **inside the plan directory**:
+    the delete re-checks that for itself, so a target that somehow
+    escapes the tree is skipped and logged rather than removed.
 
     A file that cannot be deleted is logged and skipped: one unwritable
     file must not turn the whole reset into a 500.
@@ -1827,8 +1881,22 @@ def _clear_root_cause_chain(plan_id: str, plan_dir: Path) -> List[str]:
         except OSError:
             _server.logger.exception("[reset] unlink failed %s", chain_path)
 
+    try:
+        plan_root = plan_dir.resolve()
+    except (OSError, RuntimeError):
+        plan_root = Path(os.path.abspath(plan_dir))
+
     for relative in targets:
         target = plan_dir / relative
+        # The delete re-checks containment itself: one string-prefix
+        # check is not enough to keep a removal inside the plan tree.
+        if not _is_inside_plan_dir(plan_root, target):
+            _server.logger.warning(
+                "[reset] skipping root-cause report outside the plan tree "
+                "plan=%s path=%s target=%s",
+                plan_id, relative, target,
+            )
+            continue
         # Only *files* are deleted. A ``report_path`` that names a
         # directory is not a report — and the contract says "delete the
         # files the ledger names", not "delete what the ledger points at".

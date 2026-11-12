@@ -155,6 +155,48 @@ per-phase junit（2026-10-31）
 这两条字段**只是证据**：判定仍然只看退出码。XML 缺失 → 两个字段为空；
 XML 解析不了 → 记 ``junit_error`` 并继续，绝不抛异常、绝不影响判定。
 
+证据必须是**本轮写的**（2026-11-08）
+------------------------------------
+一个 VP 的产物目录是**跨轮复用**的（审计副本 ``ci_output.json`` 也住在里面），
+所以上一轮写的 ``phase-<n>.xml`` 在下一轮开始时还在那儿。它不是本轮的证据 ——
+当成是，就会把「本轮根本没跑过的用例」算成失败，修复轮于是去修一个不存在的
+缺陷（2026-11-08 那一轮就是这么修的：修完照样红，因为那些用例一次都没跑过）。
+
+所以门禁启动**之前**先把目录里旧的 ``phase-<n>.xml`` 清掉；门禁跑完之后目录里
+剩下的，就是本轮写的。
+
+另一条路：本轮**一张都没有**。门禁把整仓的跑派到了别处（例如派给一个 CI
+runner）时，报告留在那边，本机自然没有。这种情况下 evidence 记
+``junit_available: False`` 并说明原因，**不去读**本机上的残留 ——
+「本轮拿不到」和「本轮没有失败」是两件事。
+
+这个判据是**观测**，不是猜的：框架不认识项目自己的门禁脚本叫什么，也不该
+认识（入口由项目决定，框架不得硬编码项目脚本名）。「这次有没有产出报告」是
+门禁跑完看一眼目录就知道的事实 —— 目录在跑之前已经清空过，所以里面剩下的
+就是本轮写的。
+
+取证副本按轮次另存（2026-11-09）
+--------------------------------
+一个 VP 的产物目录是**跨轮复用**的，所以 ``ci_output.json`` 里留下的永远
+是**最后一轮**的结论 —— 后一轮把它覆盖掉，前一轮的取证就没了。于是同一束
+证据自相矛盾：产物文件里记的是后一轮的退出码，同目录的 gate 日志里记的
+是前一轮的结论，谁也说不清自己引用的是哪一轮。
+
+所以每一次运行除了 ``ci_output.json``（路径与语义一个字不改，**仍然是
+full_ci 的唯一判据**）还另存一份 ``ci_output.round-<n>.json``：
+
+* 副本用**独占创建**落地（``os.link``），后一轮因此**不可能**覆盖前一轮
+  已经留下的副本；
+* 轮次号写进**副本的**载荷（``round`` / ``round_source``），所以「这份产物属于哪
+  一轮」是可以核对的，而不是从文件名猜；``ci_output.json`` 本身**只带契约
+  字段** —— 写入器不替调用方加键；
+* 轮次由**调用方**给出（``run_ci_verification(..., round_no=…)`` —— agent
+  知道自己是第几轮），取不到时退回计划的 context pack，再取不到就**不写
+  副本** —— 不猜。
+
+副本写不出来**不改变判决**：判决在写副本之前就定了，取证是事后追认的
+东西，不是判定的输入。
+
 两套证据互不越界
 ----------------
 ``stdout_head`` / ``stderr_head`` 与 ``stdout_tail`` / ``stderr_tail`` 是
@@ -355,6 +397,10 @@ ROUND_SOURCE_PARAMETER = "parameter"
 #: The round number came from the plan's context pack.
 ROUND_SOURCE_CONTEXT_PACK = "context_pack"
 
+#: The round number came from the payload's own ``round`` key — what a
+#: caller that already knew the round wrote into the evidence.
+ROUND_SOURCE_PAYLOAD = "payload"
+
 #: Ceiling for a full CI gate. A whole-repo nightly run is measured in
 #: tens of minutes (a whole workspace build plus the full test suite), so
 #: the default is deliberately far
@@ -491,6 +537,38 @@ MAX_JUNIT_FAILURES = 50
 #: pointer ("assert 41 == 42"), not the traceback: the whole traceback
 #: is in the junit file the evidence names.
 MAX_JUNIT_MESSAGE_CHARS = 300
+
+#: The name of the per-round copy of the audit artifact.
+#:
+#: The artifact directory of a VP is reused across rounds, so the live
+#: audit copy (``ci_output.json``) holds the verdict of the **newest**
+#: round, and the forensics of an earlier round are gone the moment the
+#: next round writes.  A conclusion that quotes the file therefore
+#: quotes whichever round wrote it last -- which is how a report ended
+#: up claiming one exit code while the artifact next to it held
+#: another.  The copy is named after the round, so the round a claim
+#: belongs to is in the file name.
+ROUND_ARTIFACT_TEMPLATE = "ci_output.round-{round_no}.json"
+
+#: The directory of a plan's context packs, relative to the plan
+#: directory.  One pack per round; the newest one names the round a
+#: run belongs to.
+CONTEXT_PACK_DIRNAME = "context"
+
+#: How long the runner waits for a killed gate's owner to be *observed*
+#: gone before it judges who may give a registered process back.
+#:
+#: The gate is killed from the outside, and the processes it started are
+#: written down against *it* as their owner.  While that owner is still
+#: there the reaper leaves them alone -- correctly: an owner that is
+#: still there may want the process.  The runner is the process that
+#: outlives the gate, so the runner is the process that waits for that
+#: window to close.  The wait is bounded, because an owner that is
+#: still there after it is somebody who is *not* going away.
+REAP_OWNER_TIMEOUT_SECONDS = 5.0
+
+#: How long one wait between two sweeps sleeps.
+REAP_POLL_SECONDS = 0.25
 
 #: 结构性收窄标记 —— 一条 ``ci_entry`` 命中任何一个，说明它指的不是"整仓"，
 #: 而是"某个测试子集"。``full_ci`` 的职责是整仓门禁，收窄过的入口属于
@@ -1589,8 +1667,15 @@ def _spawn_registry() -> Tuple[Path, Path]:
     return directory, directory / "spawn_registry.jsonl"
 
 
-def _reap_spawned(registry: Path, *, reason: str) -> List[Dict[str, Any]]:
+def _reap_spawned(
+    registry: Path, *, reason: str,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Give back the processes the registry names.  Never raises.
+
+    Returns the entries that were given back and the entries that are
+    still registered.  The second list is the proof that the run did
+    not leave a service behind: an empty one means every process this
+    run started is gone.
 
     A cleanup path that raises would take the verdict down with it, and
     the verdict is the thing this module exists to produce.
@@ -1598,15 +1683,58 @@ def _reap_spawned(registry: Path, *, reason: str) -> List[Dict[str, Any]]:
     try:
         import orphan_reaper
     except Exception:  # pragma: no cover - the module is stdlib-only
+        return [], []
+    given_back: List[Dict[str, Any]] = []
+    deadline = time.monotonic() + REAP_OWNER_TIMEOUT_SECONDS
+    while True:
+        try:
+            given_back.extend(
+                orphan_reaper.reap_spawned_processes(registry, reason=reason)
+            )
+        except Exception as exc:  # noqa: BLE001 - a cleanup never fails a verdict
+            logger.warning(
+                "[verification_ci_runner] could not give the spawned "
+                "processes back: %s", exc,
+            )
+            break
+        outstanding = _registered_processes(registry)
+        if not outstanding:
+            break
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "[verification_ci_runner] %d registered process(es) are "
+                "still there after %.1fs; their owner(s) are still alive",
+                len(outstanding), REAP_OWNER_TIMEOUT_SECONDS,
+            )
+            break
+        # The gate is killed from the outside, and for a moment after
+        # the kill the processes it started are still attributed to a
+        # process that is on its way out.  A sweep that runs in that
+        # window leaves them alone -- correctly, while that owner is
+        # still there -- and nobody else is coming to give them back.
+        # The runner is the process that outlives the gate, so the
+        # runner is the process that waits for that window to close and
+        # sweeps again.
+        time.sleep(REAP_POLL_SECONDS)
+    return given_back, _registered_processes(registry)
+
+
+def _registered_processes(registry: Path) -> List[Dict[str, Any]]:
+    """The processes the registry still names.  Never raises.
+
+    An empty list is the answer the verdict needs: everything this run
+    started has been given back.
+    """
+    try:
+        import orphan_reaper
+    except Exception:  # pragma: no cover - the module is stdlib-only
         return []
     try:
-        return list(
-            orphan_reaper.reap_spawned_processes(registry, reason=reason)
-        )
+        return list(orphan_reaper.read_spawn_registry(registry))
     except Exception as exc:  # noqa: BLE001 - a cleanup never fails a verdict
         logger.warning(
-            "[verification_ci_runner] could not give the spawned "
-            "processes back: %s", exc,
+            "[verification_ci_runner] could not read the spawn registry "
+            "%s: %s", registry, exc,
         )
         return []
 
@@ -1727,7 +1855,52 @@ def _junit_count(suite: ET.Element, attribute: str, fallback: int) -> int:
         return fallback
 
 
-def _read_junit_evidence(junit_dir: Optional[Path]) -> Dict[str, Any]:
+def _clear_stale_junit_reports(junit_dir: Optional[Path]) -> List[str]:
+    """Take the reports of an earlier round out of the junit directory.
+
+    The directory of a VP is reused across rounds -- it holds this VP's
+    audit copy as well -- so the reports the last round wrote are still
+    there when the next round starts.  A report that belongs to an
+    earlier round is not evidence about this one: read as if it were,
+    it names cases this round never ran, and the repair loop then goes
+    and fixes a failure that is not there (2026-11-08: a whole repair
+    round was built out of reports six days old, and the gate it was
+    meant to fix was green).
+
+    So the reports go before the gate runs.  What is in the directory
+    afterwards was written by this run.
+    """
+    removed: List[str] = []
+    if junit_dir is None:
+        return removed
+    try:
+        reports = list(junit_dir.glob("phase-*.xml"))
+    except OSError as exc:  # noqa: BLE001 - evidence must not break a verdict
+        logger.warning(
+            "[ci_runner] could not list the stale junit reports in %s: %s",
+            junit_dir, exc,
+        )
+        return removed
+    for path in reports:
+        if _junit_phase_number(path) is None:
+            # Not one of ours by name: it is not read either, and it is
+            # not ours to delete.
+            continue
+        try:
+            path.unlink()
+        except OSError as exc:  # noqa: BLE001 - a stale report is not fatal
+            logger.warning(
+                "[ci_runner] could not remove the stale junit report %s: %s",
+                path, exc,
+            )
+            continue
+        removed.append(path.name)
+    return removed
+
+
+def _read_junit_evidence(
+    junit_dir: Optional[Path],
+) -> Dict[str, Any]:
     """The per-phase junit evidence a gate run left behind.
 
     Best-effort by construction: this function never raises.  A missing
@@ -1735,6 +1908,21 @@ def _read_junit_evidence(junit_dir: Optional[Path]) -> Dict[str, Any]:
     evidence comes back empty — the verdict has already been decided by
     the exit code, and a report that cannot be parsed must not be able
     to disturb it.
+
+    Whether the reports are **available** is an observed fact, not a
+    guess about the entry: the directory was emptied before the gate
+    started (:func:`_clear_stale_junit_reports`), so what is in it
+    afterwards is what this run wrote.  Reports in it → available; no
+    reports in it → not available, with a reason.  A gate that ran the
+    whole-repo gate somewhere else leaves its reports there, and this
+    machine has none — reading whatever it happens to be carrying would
+    attribute another round's failures to this one, so the evidence says
+    "not available this run" instead.
+
+    The framework does not know what the project's gate scripts are
+    called: the entry is the project's to choose, and a name the
+    framework recognises would be a name it would also mis-recognise
+    somewhere else.
     """
     evidence: Dict[str, Any] = {
         "junit_phases": [],
@@ -1744,8 +1932,25 @@ def _read_junit_evidence(junit_dir: Optional[Path]) -> Dict[str, Any]:
         # the same thing on every path, or its absence reads as "the
         # machine did not say".
         "failed_cases": [],
+        # Whether this run produced a junit report at all.
+        # "the reports are not there" and "the reports were never going
+        # to be here" are different facts, and a reader has to be able
+        # to tell them apart: the first is a gap in the run, the second
+        # is a property of the gate that was run.
+        #
+        # Spelled out rather than named by a constant (2026-11-10): the
+        # contract's field set is **derived from this source** — the
+        # allowed keys are read out of these evidence dictionaries — so
+        # a key the derivation cannot see is a key the contract can
+        # never allow.
+        "junit_available": True,
     }
     if junit_dir is None:
+        evidence["junit_available"] = False
+        evidence["junit_unavailable_reason"] = (
+            "the junit directory could not be created, so this run had "
+            "nowhere to write a junit report"
+        )
         return evidence
 
     try:
@@ -1755,6 +1960,18 @@ def _read_junit_evidence(junit_dir: Optional[Path]) -> Dict[str, Any]:
         )
     except OSError as exc:  # noqa: BLE001 - evidence must not break a verdict
         evidence["junit_error"] = f"{type(exc).__name__}: {exc}"
+        return evidence
+
+    if not reports:
+        # Nothing in the directory the run started from an empty one:
+        # this run wrote no report.  A gate that ran the whole-repo
+        # gate elsewhere leaves its reports there, and this machine has
+        # none.
+        evidence["junit_available"] = False
+        evidence["junit_unavailable_reason"] = (
+            "this run produced no junit report on this machine; a gate "
+            "that runs elsewhere leaves its reports there"
+        )
         return evidence
 
     phases: List[Dict[str, Any]] = []
@@ -1973,13 +2190,19 @@ def run_ci_verification(
     runs its ``ci_entry``; an ``e2e`` command point runs its
     ``entry_command`` — and neither of them opens an LLM session.
 
-    ``round_no`` names the round this run belongs to.  It is **not** part
-    of the artifact the runner writes — the artifact stays exactly what
-    the contract describes — but it names the **copy** the runner writes
-    beside it (``ci_output.round-<n>.json``), because the evidence
-    directory is reused across rounds and the next round would otherwise
-    overwrite this round's evidence.  A caller that does not know its
-    round gets it from the plan's context pack; see :func:`_resolve_round`.
+    ``round_no`` names the round this run belongs to.  It is **evidence**,
+    not a knob: the artifact directory of a VP is reused across rounds,
+    so without it a later round silently replaces the forensic copy of an
+    earlier one and nobody can say which round a conclusion is quoting
+    (2026-11-08).  It is **not** part of the artifact the runner writes —
+    the artifact stays exactly what the contract describes — but it names
+    the **copy** the runner writes beside it
+    (``ci_output.round-<n>.json``), because the evidence directory is
+    reused across rounds and the next round would otherwise overwrite
+    this round's evidence.  A caller that does not know its round gets it
+    from the plan's context pack; see :func:`_resolve_round`.  ``None``
+    means "the round is not known here" — the artifact then says so
+    instead of inventing a number.
     """
     vp_id = str(vp.get("id", "unknown"))
     result = CiRunResult()
@@ -2004,6 +2227,11 @@ def run_ci_verification(
             # case left **nothing** on disk, and the next round could
             # not tell "which file judged me" from "what did it say".
             "verifier_source": verifier_source(project_dir),
+            # 2026-11-09: the round is **not** part of this evidence:
+            # ``ci_output.json`` carries the contract fields only, and
+            # the round this artifact belongs to is named by the
+            # per-round copy (``ci_output.round-<n>.json``) that
+            # :func:`_write_artifact` writes next to it.
         }
         _write_ci_artifacts(
             artifact_dir, vp_id, result.evidence, round_no=round_no,
@@ -2027,6 +2255,7 @@ def run_ci_verification(
     error = ""
     gate_summary: Dict[str, Any] = {}
     reaped: List[Dict[str, Any]] = []
+    outstanding: List[Dict[str, Any]] = []
 
     # The registry of the processes this run starts.  It is named in the
     # gate's environment, so the service, the reaper daemon the service
@@ -2070,6 +2299,12 @@ def run_ci_verification(
             junit_dir = candidate
             gate_env[GATE_JUNIT_DIR_ENV] = str(candidate)
 
+    # The reports of an earlier round are still in that directory -- it
+    # is reused across rounds -- and they are not evidence about this
+    # run.  They go before the gate starts, so that whatever is in the
+    # directory afterwards was written by this run.
+    stale_reports = _clear_stale_junit_reports(junit_dir)
+
     try:
         try:
             completed = run_bounded(
@@ -2100,7 +2335,9 @@ def run_ci_verification(
         # run — and a service is detached, so it outlives the gate that
         # started it.  The runner is the process that outlives the
         # gate, so the runner is the process that gives it back.
-        reaped = _reap_spawned(registry, reason="the CI gate ended")
+        reaped, outstanding = _reap_spawned(
+            registry, reason="the CI gate ended",
+        )
         shutil.rmtree(registry_dir, ignore_errors=True)
 
     duration = time.monotonic() - started
@@ -2139,12 +2376,23 @@ def run_ci_verification(
         "gate_budget_seconds": declared_budget,
         "gate_summary": gate_summary,
         "spawned_processes_reaped": reaped,
+        # 2026-11-08: the proof that this run left nothing behind.  The
+        # entries that are still registered are the processes this run
+        # started and could not give back -- an empty list says every
+        # one of them is gone.
+        "spawned_processes_outstanding": outstanding,
+        "spawned_processes_all_given_back": not outstanding,
         "budget_exhausted_in": exhausted_in,
         "gate_elapsed_seconds": gate_elapsed,
         # 2026-11-05: the verdict says which file judged it — the same
         # question the schema-failure path answers, asked of the normal
         # path too.
         "verifier_source": verifier_source(project_dir),
+        # 2026-11-10: which round this run belongs to is **not** a field
+        # of this evidence.  The artifact carries the contract fields
+        # only — a round label in here would make the artifact a copy of
+        # itself — and the round is named by the per-round copy
+        # (``ci_output.round-<n>.json``) that sits next to it.
     }
     if error:
         evidence["error"] = error
@@ -2164,6 +2412,11 @@ def run_ci_verification(
     # is not allowed to be the only witness.
     junit_evidence = _read_junit_evidence(junit_dir)
     evidence.update(junit_evidence)
+    if stale_reports:
+        # The reports of an earlier round that were in the way.  They
+        # are named so a reader can see that this run started from a
+        # clean directory rather than from somebody else's evidence.
+        evidence["junit_stale_reports_removed"] = sorted(stale_reports)
     # The host's own account of itself, lifted to the top level of the
     # evidence: an operator reading the artifact has to be able to see
     # *why* this machine's verdict is worth less than a quiet one's.
@@ -2398,6 +2651,7 @@ def _timeout_reason(
 
 def _write_artifact(
     artifact_dir: Optional[Path], vp_id: str, payload: Dict[str, Any],
+    round_no: Optional[int] = None,
 ) -> None:
     """Persist the raw basis of this verdict for post-hoc investigation.
 
@@ -2412,6 +2666,29 @@ def _write_artifact(
     invisible to ``find_orphans`` (which only knows about non-``tmp``
     files), so the residue silently grows until the next operator
     sweep.
+
+    Two files are written, and they have different jobs:
+
+    * ``ci_output.json`` — the **live** verdict.  Its path and its
+      meaning do not change: it is the verdict of the run that just
+      happened, and the next round replaces it.  It is the payload
+      the caller gave, byte for byte: this writer adds no key of its
+      own, so the contract fields it carries are the caller's and
+      only the caller's.
+    * ``ci_output.round-<n>.json`` — this round's own copy of the
+      same verdict.  The artifact directory of a VP is **reused**
+      across rounds, so the live verdict of one round is the only
+      thing that survives it; the copy is what a later round cannot
+      take away.  No copy is ever overwritten (see
+      :func:`_write_round_copy`).  **This** is the file that says
+      which round it belongs to (``round`` / ``round_source``): the
+      round label the writer resolves lives in the copy, never in the
+      live verdict.
+
+    ``round_no`` is the round this run belongs to, told by the caller
+    (the agent knows which round it is in).  Without it the round is
+    read off the plan's context packs — and when neither knows, **no
+    round copy is written**: the writer does not guess a number.
     """
     if artifact_dir is None:
         return
@@ -2419,12 +2696,37 @@ def _write_artifact(
     try:
         target_dir = Path(artifact_dir) / vp_id
         target_dir.mkdir(parents=True, exist_ok=True)
+        resolved_round, round_source = _resolve_round(
+            round_no, artifact_dir, payload,
+        )
         target = target_dir / "ci_output.json"
         fd, tmp_name = tempfile.mkstemp(dir=str(target_dir), suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, ensure_ascii=False)
         os.replace(tmp_name, target)
         tmp_name = None  # ownership transferred; do not unlink on success
+        if resolved_round is not None and round_source is not None:
+            # The round label lives in the **copy**, not in the live
+            # verdict: the live verdict is the payload the caller gave
+            # (contract fields only), and the copy is the file that
+            # names the round.
+            #
+            # The round copy is **evidence of a round that already
+            # happened**: losing it must not change the verdict, so it
+            # is written on its own terms and its failure is logged.
+            try:
+                _write_round_copy(
+                    artifact_dir,
+                    vp_id,
+                    payload,
+                    round_no=resolved_round,
+                    round_source=round_source,
+                )
+            except Exception as exc:  # noqa: BLE001 - the copy is best-effort
+                logger.warning(
+                    "[ci_runner] could not write the round copy for %s: %s",
+                    vp_id, exc,
+                )
     except Exception as exc:  # noqa: BLE001 - audit copy is best-effort
         if tmp_name is not None:
             try:
@@ -2437,11 +2739,13 @@ def _write_artifact(
 
 
 def _resolve_round(
-    round_no: Optional[int], artifact_dir: Optional[Path],
+    round_no: Optional[int],
+    artifact_dir: Optional[Path],
+    payload: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[int], Optional[str]]:
     """Which round is this run, and where does the number come from?
 
-    Two sources, in this order:
+    Three sources, in this order:
 
     * the **caller** knows the round — it is the orchestrator, and it
       counts the rounds.  A positive integer is taken as it is, and the
@@ -2449,11 +2753,14 @@ def _resolve_round(
     * the **context pack** knows the round too: the plan writes one
       pack per round (``<plan>/context/round-<n>.json``) and the
       **largest** ``n`` is the round that is running now.
+    * the **payload** says which round it is — what a caller that
+      already knew the round wrote into the evidence.
 
-    ``0``, a negative number and ``None`` all mean "not given" — round 0
-    is not a round, and a copy named after it would be a lie.  When
-    neither source knows, the answer is ``(None, None)`` and no copy is
-    written at all.
+    ``0``, a negative number, a ``bool`` and ``None`` all mean "not
+    given" — round 0 is not a round, and ``bool`` is a subclass of
+    ``int``, so ``True`` would otherwise be resolved as round 1 and
+    would name a file no contract describes.  When none of the three
+    knows, the answer is ``(None, None)`` and no copy is written at all.
 
     The plan directory is derived from the artifact directory's parent
     (``<plan>/vp_artifacts`` → ``<plan>``), because that is where the
@@ -2469,7 +2776,33 @@ def _resolve_round(
     from_pack = _round_from_context_pack(artifact_dir)
     if from_pack is not None:
         return from_pack, ROUND_SOURCE_CONTEXT_PACK
+
+    if payload is not None:
+        claimed = payload.get("round")
+        if (
+            isinstance(claimed, int)
+            and not isinstance(claimed, bool)
+            and claimed > 0
+        ):
+            return claimed, ROUND_SOURCE_PAYLOAD
     return None, None
+
+
+def _round_copy_name(round_no: int, target_dir: Path) -> str:
+    """The name of this round's copy — a name that is free.
+
+    The first copy of a round takes the round's own name; a further run
+    in the same round takes the next free number after it.
+    """
+    first = ROUND_ARTIFACT_TEMPLATE.format(round_no=round_no)
+    if not (target_dir / first).exists():
+        return first
+    sequence = 1
+    while True:
+        name = f"ci_output.round-{round_no}.{sequence}.json"
+        if not (target_dir / name).exists():
+            return name
+        sequence += 1
 
 
 def _round_from_context_pack(artifact_dir: Optional[Path]) -> Optional[int]:
@@ -2541,17 +2874,29 @@ def _write_ci_artifacts(
     """
     for issue in validate_ci_artifact(payload):
         logger.error("[ci_artifact] %s", issue)
-    _write_artifact(artifact_dir, vp_id, payload)
+    _write_artifact(artifact_dir, vp_id, payload, round_no=round_no)
 
-    resolved_round, round_source = _resolve_round(round_no, artifact_dir)
-    if resolved_round is not None and round_source is not None:
-        _write_round_copy(
-            artifact_dir,
-            vp_id,
-            payload,
-            round_no=resolved_round,
-            round_source=round_source,
-        )
+
+def _round_copy_says_the_same(
+    target: Path, copy_payload: Dict[str, Any],
+) -> bool:
+    """Whether the copy that is already there says what this run says.
+
+    Two runs in one round are two runs — but they are not two **facts**.
+    When the second run's evidence is the same as the copy that is
+    already on disk, that copy already says it: writing a second file
+    would say the same thing twice, and a reader looking for "the copy
+    of round 2" would have to guess which of the two is the one.
+
+    A copy that cannot be read is **not** "the same": the safe reading
+    of a file nobody can parse is that it says something we cannot see,
+    so the new evidence gets a file of its own.
+    """
+    try:
+        existing = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return existing == copy_payload
 
 
 def _write_round_copy(
@@ -2575,12 +2920,22 @@ def _write_round_copy(
     came from).  They are **not** part of the artifact the runner
     writes, so the copy is checked with ``allow_round_fields=True``.
 
+    **No copy is ever overwritten.**  A copy that is already there is
+    evidence of an earlier run, so it is kept exactly as it is.  What
+    this run writes beside it depends on what it has to say: a run
+    whose evidence is **the same** as the copy that is there has
+    nothing new to say, so it writes no second file at all — two files
+    saying the same thing is one file too many.  A run whose evidence
+    **differs** writes its own copy under the next free name
+    (``ci_output.round-<n>.1.json``), so both runs stay on disk.  The
+    runner says at WARNING level that the earlier copy was kept,
+    because a reader who wonders why the file did not change has to be
+    able to find the answer.
+
     The copy is written with a **hard link**, not a replace: a link
     refuses to land on a name that is already taken, so a copy from an
-    earlier round is kept exactly as it is.  Overwriting it would undo
-    the only thing the copy is for.  The runner says so at WARNING
-    level, because a reader who wonders why the file did not change has
-    to be able to find the answer.
+    earlier round cannot be clobbered even if another process claims
+    the name in between.
 
     A copy that cannot be written changes **nothing** about the verdict:
     the verdict was decided before this ran, and it is not about the
@@ -2598,7 +2953,25 @@ def _write_round_copy(
     try:
         target_dir = Path(artifact_dir) / vp_id
         target_dir.mkdir(parents=True, exist_ok=True)
-        target = target_dir / f"ci_output.round-{round_no}.json"
+        first = ROUND_ARTIFACT_TEMPLATE.format(round_no=round_no)
+        target = target_dir / first
+        if target.exists():
+            # The copy of this round is already there.  It is evidence of
+            # an earlier run of this round, so it is kept exactly as it
+            # is — and the runner says so, because a reader who wonders
+            # why the file did not change has to be able to find the
+            # answer.
+            logger.warning(
+                "[ci_runner] round copy %s already exists; keeping it", target,
+            )
+            if _round_copy_says_the_same(target, copy_payload):
+                # This run says what the copy that is there already
+                # says: a second file would only say it twice.
+                return
+            # This run says something the copy that is there does not.
+            # The earlier copy is evidence and is never touched; this
+            # one is written beside it.
+            target = target_dir / _round_copy_name(round_no, target_dir)
         fd, tmp_name = tempfile.mkstemp(dir=str(target_dir), suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(copy_payload, handle, indent=2, ensure_ascii=False)

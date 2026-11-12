@@ -1807,3 +1807,224 @@ class TestPlanToExecutorSchemaKeepsE2eFields:
         converted["verification_method"] = converted["method"]
         assert ci_runner.e2e_kind(converted) == ci_runner.E2E_KIND_COMMAND
         assert validate_vp(converted) == []
+
+
+# ---------------------------------------------------------------------------
+# 轮次归属 — 取证副本按轮次另存，轮次写进载荷
+# ---------------------------------------------------------------------------
+#
+# 一个 VP 的产物目录是**跨轮复用**的（2026-11-08）：后一轮的
+# ``ci_output.json`` 覆盖了前一轮的，于是同一束证据自相矛盾 —— 产物文件里
+# 记的是后一轮的退出码，同目录的 gate 日志里记的是前一轮的结论。没有轮次
+# 归属的取证，谁也说不清自己引用的是哪一轮。
+#
+# 所以：``ci_output.json`` 的路径与语义一个字不改（它仍然是 full_ci 的
+# 唯一判据），但同一次运行**另存**一份 ``ci_output.round-<n>.json``，
+# 轮次号写进载荷，后一轮不覆盖前一轮的副本。
+
+
+class TestRoundScopedArtifact:
+    def test_the_round_copy_is_written_next_to_the_live_verdict(self, tmp_path):
+        artifact = tmp_path / "vp_artifacts"
+
+        result = run_ci_verification(
+            _vp("exit 0"), project_dir=tmp_path, artifact_dir=artifact,
+            round_no=7,
+        )
+
+        assert result.status == STATUS_PASSED
+        copy = artifact / "VP-901" / "ci_output.round-7.json"
+        assert copy.is_file()
+        record = json.loads(copy.read_text(encoding="utf-8"))
+        assert record["exit_code"] == 0
+        assert record["round"] == 7
+
+    def test_the_live_verdict_says_which_round_it_belongs_to(self, tmp_path):
+        """The live verdict names no round; the copy beside it does.
+
+        The merged contract (2026-11-09): the runner writes the payload
+        it was given, byte for byte, so ``ci_output.json`` carries the
+        contract fields and **no key of its own** — a round label in
+        there would make the artifact a copy of itself.  The round
+        bookkeeping lives in the per-round copy, and that is the file
+        that says which round the evidence belongs to.
+        """
+        artifact = tmp_path / "vp_artifacts"
+
+        result = run_ci_verification(
+            _vp("exit 0"), project_dir=tmp_path, artifact_dir=artifact,
+            round_no=7,
+        )
+
+        assert "round" not in result.evidence
+        assert "round_source" not in result.evidence
+        payload = json.loads(
+            (artifact / "VP-901" / "ci_output.json").read_text(encoding="utf-8")
+        )
+        assert "round" not in payload
+        assert "round_source" not in payload
+
+        # The copy beside it is the file that names the round ...
+        copy = json.loads(
+            (artifact / "VP-901" / "ci_output.round-7.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert copy["round"] == 7
+        assert copy["round_source"] == "parameter"
+        # ... and it differs from the live verdict by that bookkeeping
+        # and by nothing else: a reader of the copy is reading the same
+        # run the artifact describes.
+        stripped = {
+            key: value for key, value in copy.items()
+            if key not in ("round", "round_source")
+        }
+        assert stripped == payload
+
+    def test_a_later_round_does_not_overwrite_an_earlier_copy(self, tmp_path):
+        """The earlier round's copy survives — and the round is named by
+        the copies, not by the live verdict.
+
+        The live verdict is the newest round's — that is what it is for
+        — and under the merged contract it names no round at all: the
+        round each piece of evidence belongs to is written on the copy
+        beside it.
+        """
+        artifact = tmp_path / "vp_artifacts"
+
+        run_ci_verification(
+            _vp("exit 0"), project_dir=tmp_path, artifact_dir=artifact,
+            round_no=1,
+        )
+        run_ci_verification(
+            _vp("exit 1"), project_dir=tmp_path, artifact_dir=artifact,
+            round_no=2,
+        )
+
+        earlier = json.loads(
+            (artifact / "VP-901" / "ci_output.round-1.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert earlier["exit_code"] == 0
+        assert earlier["round"] == 1
+        later = json.loads(
+            (artifact / "VP-901" / "ci_output.round-2.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert later["exit_code"] == 1
+        assert later["round"] == 2
+        # the live verdict is the newest round's — that is what it is for
+        live = json.loads(
+            (artifact / "VP-901" / "ci_output.json").read_text(encoding="utf-8")
+        )
+        assert live["exit_code"] == 1
+        assert "round" not in live
+        assert "round_source" not in live
+
+    def test_the_schema_failure_path_says_the_round_too(self, tmp_path):
+        """A round that never ran a case left an artifact too — and that
+        artifact belongs to a round as well.
+
+        The round is named by the per-round copy: ``ci_output.json``
+        carries the contract fields only — the writer adds no key of
+        its own (2026-11-09).
+        """
+        artifact = tmp_path / "vp_artifacts"
+        vp = {"id": "VP-901", "verification_method": "full_ci",
+              "verification_phase": 2}
+
+        result = run_ci_verification(
+            vp, project_dir=tmp_path, artifact_dir=artifact, round_no=4,
+        )
+
+        assert "round" not in result.evidence
+        payload = json.loads(
+            (artifact / "VP-901" / "ci_output.json").read_text(encoding="utf-8")
+        )
+        assert "round" not in payload
+        copy = json.loads(
+            (artifact / "VP-901" / "ci_output.round-4.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert copy["round"] == 4
+        assert copy["round_source"] == "parameter"
+
+    def test_a_copy_that_cannot_be_written_does_not_change_the_verdict(
+        self, tmp_path, monkeypatch,
+    ):
+        """取证副本写不出来不得改变判决 —— 判决在写副本之前就定了。"""
+        artifact = tmp_path / "vp_artifacts"
+
+        def _boom(*args, **kwargs):
+            raise OSError("no space left on device")
+
+        monkeypatch.setattr(ci_runner, "_write_round_copy", _boom)
+
+        result = run_ci_verification(
+            _vp("exit 0"), project_dir=tmp_path, artifact_dir=artifact,
+            round_no=7,
+        )
+
+        assert result.status == STATUS_PASSED
+        assert (artifact / "VP-901" / "ci_output.json").is_file()
+
+    def test_no_temporary_file_is_left_behind(self, tmp_path):
+        artifact = tmp_path / "vp_artifacts"
+
+        run_ci_verification(
+            _vp("exit 0"), project_dir=tmp_path, artifact_dir=artifact,
+            round_no=7,
+        )
+
+        assert not list((artifact / "VP-901").glob("*.tmp"))
+
+
+# ---------------------------------------------------------------------------
+# 轮次从哪来 —— agent 知道自己正在跑第几轮
+# ---------------------------------------------------------------------------
+
+
+def test_the_agent_tells_the_runner_which_round_it_is(tmp_path, monkeypatch):
+    """产物属于哪一轮，得由跑它的那一轮说出来 —— agent 知道自己是第几轮。"""
+    captured = {}
+
+    def _fake_run(vp, *, project_dir, artifact_dir=None, round_no=None):
+        captured["round_no"] = round_no
+        return ci_runner.CiRunResult(
+            status=STATUS_PASSED,
+            reasons=["[full_ci] `exit 0` 退出码 0（用时 0s）"],
+            evidence={"vp_id": "VP-901", "exit_code": 0},
+        )
+
+    monkeypatch.setattr(ci_runner, "run_ci_verification", _fake_run)
+    monkeypatch.setenv("PDT_STATE_DB_PATH", str(tmp_path / "state.db"))
+
+    agent = _full_ci_agent(tmp_path)
+    agent._current_round = 5
+
+    agent._run_full_ci_vp(_full_ci_vp())
+
+    assert captured["round_no"] == 5
+
+
+def test_a_runner_that_cannot_be_told_the_round_still_works(tmp_path, monkeypatch):
+    """项目自带的 runner 副本可能还没有这个参数 —— 不能因此崩掉一轮。"""
+    def _fake_run(vp, *, project_dir, artifact_dir=None):
+        return ci_runner.CiRunResult(
+            status=STATUS_PASSED,
+            reasons=["[full_ci] `exit 0` 退出码 0（用时 0s）"],
+            evidence={"vp_id": "VP-901", "exit_code": 0},
+        )
+
+    monkeypatch.setattr(ci_runner, "run_ci_verification", _fake_run)
+    monkeypatch.setenv("PDT_STATE_DB_PATH", str(tmp_path / "state.db"))
+
+    agent = _full_ci_agent(tmp_path)
+    agent._current_round = 5
+
+    verdict = agent._run_full_ci_vp(_full_ci_vp())
+
+    assert verdict["status"] == STATUS_PASSED, verdict
