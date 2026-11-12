@@ -1846,6 +1846,15 @@ class PlanSchedulerEngine:
         victims = converge(state, capacity)
         for victim in victims:
             self._decide("stop", victim, "over_capacity")
+        if victims:
+            log.warning(
+                "the scheduler is over its capacity (used %s, capacity %s) "
+                "and interrupted %s plan(s): %s",
+                state.get("used"),
+                capacity,
+                len(victims),
+                ", ".join(victims),
+            )
         return victims
 
     def _workspace_is_busy(self, key: Any, held: Any) -> bool:
@@ -2364,6 +2373,12 @@ class PlanSchedulerEngine:
                 "plan_id": plan_id,
                 "reason": reason,
             }
+        )
+        log.info(
+            "scheduler decision: action=%s plan_id=%s reason=%s",
+            action,
+            plan_id,
+            reason,
         )
 
     def _record_error(self, phase: str, exc: BaseException) -> None:
