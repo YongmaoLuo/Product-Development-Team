@@ -37,6 +37,7 @@ import pytest
 from instance_lock import (
     InstanceLockHeld,
     acquire_instance_locks,
+    holds_plans_lock,
     instance_lock_paths,
 )
 
@@ -327,3 +328,66 @@ def test_the_holder_file_carries_the_full_diagnostics(tmp_path):
     from datetime import datetime
     datetime.fromisoformat(holder["started_at"])
     assert state_lock.exists()
+
+
+# ---------------------------------------------------------------------------
+# 5. Who holds the lock
+# ---------------------------------------------------------------------------
+
+
+def test_holds_plans_lock_answers_for_this_process_only(tmp_path):
+    """The helper answers "is *this* process the holder?", not "is the
+    root locked?".
+
+    A root nobody has taken is not held; a root this process has taken
+    is; and after the release it is not again.  The state database's
+    lock is a different file and a different question — holding the
+    plans root is what the sweep asks about.
+    """
+    plans_dir, state_db = _root(tmp_path)
+
+    assert holds_plans_lock(plans_dir) is False, (
+        "a root nobody has taken must not be reported as held"
+    )
+
+    locks = acquire_instance_locks(plans_dir, state_db)
+    try:
+        assert holds_plans_lock(plans_dir) is True, (
+            "the process that took the lock must be told that it holds it"
+        )
+    finally:
+        locks.release()
+
+    assert holds_plans_lock(plans_dir) is False, (
+        "after the release the root is not held any more"
+    )
+
+
+def test_holds_plans_lock_is_false_while_another_process_holds_the_root(
+    tmp_path,
+):
+    """Another process holding the root does not make *this* one the holder.
+
+    The helper is the answer to "is the caller the backend of this
+    root?", and a root another process owns is not this process's root.
+    The holder is a real child process, so the case is about the kernel
+    and not about a written file.
+    """
+    plans_dir, state_db = _root(tmp_path)
+
+    holder = _start_holder(plans_dir, state_db)
+    try:
+        assert holds_plans_lock(plans_dir) is False, (
+            "the root is held by another process; this process is not its "
+            "backend"
+        )
+    finally:
+        _stop(holder)
+
+    # And once the holder is gone, this process may take it — the
+    # answer follows the lock, not the file.
+    locks = acquire_instance_locks(plans_dir, state_db)
+    try:
+        assert holds_plans_lock(plans_dir) is True
+    finally:
+        locks.release()

@@ -333,6 +333,7 @@ def main():
     sys.path.insert(0, backend_dir)
     sys.path.insert(0, str(Path(backend_dir).parent))
 
+    import instance_lock
     import process_identity
     import process_ledger as ledger
     import service_manager
@@ -349,6 +350,16 @@ def main():
     stderr_path = config.get("stderr")
     if stderr_path:
         sys.stderr = open(stderr_path, "a", buffering=1, encoding="utf-8")
+
+    # --- the data root's instance lock --------------------------------
+    # A real backend takes this lock at boot, before anything that could
+    # touch the plans tree, and drops it only after its own sweep.  The
+    # sweep below is the backend's own, so the lock has to be held while
+    # it runs: a sweep belongs to the backend that owns the root, and
+    # the backend is exactly the process that holds the lock.
+    _locks = instance_lock.acquire_instance_locks(
+        plans_dir, plans_dir.parent / "instance-lock-state.db"
+    )
 
     # --- what a backend does when it boots ----------------------------
     # A backend that was killed leaves its tree behind.  The next boot

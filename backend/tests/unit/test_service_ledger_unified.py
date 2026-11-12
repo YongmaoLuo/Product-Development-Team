@@ -193,7 +193,9 @@ def test_read_ledger_of_a_damaged_file_is_empty(tmp_path: Path):
 # ---------------------------------------------------------------------------
 # The sweep: a plan is found by the ledger it has.
 # ---------------------------------------------------------------------------
-def test_reap_all_plans_sweeps_a_pre_migration_plan(tmp_path: Path):
+def test_reap_all_plans_sweeps_a_pre_migration_plan(
+    tmp_path: Path, plans_root_lock,
+):
     """The sweep looks for the retired file name too.
 
     The file the service ledger used to live in is still the only
@@ -220,6 +222,10 @@ def test_reap_all_plans_sweeps_a_pre_migration_plan(tmp_path: Path):
         }),
         encoding="utf-8",
     )
+
+    # A sweep belongs to the backend that owns the plans root: the
+    # test holds the lock the way the backend does.
+    plans_root_lock(plans_dir)
 
     reports = sm.reap_all_plans(plans_dir, reason="startup_sweep")
 

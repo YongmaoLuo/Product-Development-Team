@@ -2310,7 +2310,7 @@ def test_reap_kills_entries_whose_owner_is_gone(tmp_path: Path, monkeypatch):
 
 
 def test_the_shutdown_sweep_reaps_what_the_leaving_process_started(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path, monkeypatch, plans_root_lock,
 ):
     """The backend's own rounds are over when the backend exits.
 
@@ -2338,6 +2338,11 @@ def test_the_shutdown_sweep_reaps_what_the_leaving_process_started(
         lambda *a, **k: stopped.append(1) or {"port_free": True, "detail": ""},
     )
 
+    # A sweep belongs to the backend that owns the plans root, so the
+    # test has to hold that root's instance lock first — the same
+    # precondition the real backend satisfies at boot.
+    plans_root_lock(tmp_path)
+
     reports = sm.reap_all_plans(
         tmp_path, reason="server_shutdown", release_own_owners=True,
     )
@@ -2349,7 +2354,7 @@ def test_the_shutdown_sweep_reaps_what_the_leaving_process_started(
 
 
 def test_the_startup_sweep_leaves_another_processs_round_alone(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path, monkeypatch, plans_root_lock,
 ):
     """A second backend may be running rounds against the same tree."""
     plan_dir = tmp_path / "plan-x"
@@ -2372,6 +2377,11 @@ def test_the_startup_sweep_leaves_another_processs_round_alone(
         lambda *a, **k: stopped.append(1) or {"port_free": True, "detail": ""},
     )
 
+    # The sweep has to reach the tree for this case to say anything at
+    # all: without the lock the sweep is refused, and "nothing was
+    # stopped" would be true for the wrong reason.
+    plans_root_lock(tmp_path)
+
     sm.reap_all_plans(tmp_path, reason="startup_sweep")
 
     assert stopped == [], (
@@ -2380,7 +2390,10 @@ def test_the_startup_sweep_leaves_another_processs_round_alone(
     )
 
 
-def test_reap_all_plans_only_visits_plans_with_a_ledger(tmp_path: Path):
+def test_reap_all_plans_only_visits_plans_with_a_ledger(
+    tmp_path: Path, plans_root_lock,
+):
+    plans_root_lock(tmp_path)
     _write_ledger(tmp_path / "a", [_entry()])
     _write_ledger(tmp_path / "b", [_entry(name="api", port=8080)])
     (tmp_path / "c").mkdir()
@@ -3266,7 +3279,7 @@ def test_reap_skips_pinned_pid(tmp_path, monkeypatch):
     assert sm.read_ledger(plan_dir)["services"]
 
 
-def test_startup_sweep_respects_live_pin(tmp_path, monkeypatch):
+def test_startup_sweep_respects_live_pin(tmp_path, monkeypatch, plans_root_lock):
     """The tree-wide sweep reads the pins before it kills anything."""
     plans_dir = tmp_path / "plans"
     plan_dir = plans_dir / "plan-x"
@@ -3287,6 +3300,8 @@ def test_startup_sweep_respects_live_pin(tmp_path, monkeypatch):
         sm, "stop_service",
         lambda *a, **k: stopped.append(1) or {"port_free": True, "detail": ""},
     )
+
+    plans_root_lock(plans_dir)
 
     reports = sm.reap_all_plans(plans_dir, reason="startup_sweep")
 

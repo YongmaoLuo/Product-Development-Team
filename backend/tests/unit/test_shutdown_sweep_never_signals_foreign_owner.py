@@ -157,8 +157,14 @@ def _alive(pid):
     return True
 
 
-def _sweep(plans_dir):
-    """Run the production shutdown sweep over ``plans_dir``."""
+def _sweep(plans_dir, plans_root_lock):
+    """Run the production shutdown sweep over ``plans_dir``.
+
+    A sweep belongs to the backend that owns the plans root, so the
+    test holds that root's instance lock while it sweeps — the same
+    precondition the real backend satisfies at boot.
+    """
+    plans_root_lock(plans_dir)
     return service_manager.reap_all_plans(
         plans_dir, reason="server_shutdown", caller="server.shutdown_sweep",
     )
@@ -190,7 +196,7 @@ def _dead_owner():
 # the cases
 # ---------------------------------------------------------------------------
 
-def test_a_live_owner_keeps_the_record(tmp_path):
+def test_a_live_owner_keeps_the_record(tmp_path, plans_root_lock):
     """A live owner means the record is not an orphan: leave it alone.
 
     ``plan-a`` holds a record whose owner is a living process; the
@@ -220,7 +226,7 @@ def test_a_live_owner_keeps_the_record(tmp_path):
             owner_pid=dead_owner_pid, plan_id="plan-b",
         )
 
-        reports = _sweep(plans_dir)
+        reports = _sweep(plans_dir, plans_root_lock)
 
         # --- plan-a: the owner is alive, so the record is left alone ---
         assert target_a.poll() is None, (
@@ -248,7 +254,9 @@ def test_a_live_owner_keeps_the_record(tmp_path):
         _cleanup(owner, target_a, target_b)
 
 
-def test_a_record_that_is_its_own_owner_is_not_collected(tmp_path):
+def test_a_record_that_is_its_own_owner_is_not_collected(
+    tmp_path, plans_root_lock,
+):
     """A record whose owner is itself is not an orphan either.
 
     The record says: "this process is owned by this process".  The
@@ -282,7 +290,7 @@ def test_a_record_that_is_its_own_owner_is_not_collected(tmp_path):
             owner_pid=dead_owner_pid, plan_id="plan-b",
         )
 
-        reports = _sweep(plans_dir)
+        reports = _sweep(plans_dir, plans_root_lock)
 
         assert target_a.poll() is None, (
             f"the sweep signalled pid {target_a.pid}, whose owner "
@@ -308,7 +316,9 @@ def test_a_record_that_is_its_own_owner_is_not_collected(tmp_path):
         _cleanup(target_a, target_b)
 
 
-def test_a_dead_owner_leaves_the_record_to_be_reaped(tmp_path):
+def test_a_dead_owner_leaves_the_record_to_be_reaped(
+    tmp_path, plans_root_lock,
+):
     """The negative control: a dead owner turns the record into an orphan.
 
     This is the same fixture as the cases above, with the owner
@@ -329,7 +339,7 @@ def test_a_dead_owner_leaves_the_record_to_be_reaped(tmp_path):
             owner_pid=dead_owner_pid, plan_id="plan-a",
         )
 
-        _sweep(plans_dir)
+        _sweep(plans_dir, plans_root_lock)
 
         target_a.wait(timeout=10)
         assert target_a.poll() is not None, (

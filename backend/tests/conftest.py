@@ -1256,6 +1256,43 @@ def isolated_plans_dir(monkeypatch, tmp_path):
     yield tmp_path / "plans"
 
 
+@pytest.fixture
+def plans_root_lock(tmp_path):
+    """Hold a data root's instance lock — the precondition for a sweep.
+
+    A sweep belongs to the backend that owns the plans root: the backend
+    takes that root's instance lock at boot, and ``reap_all_plans``
+    refuses to sweep a root this process does not hold the lock on.
+
+    A test that drives the production sweep therefore has to hold the
+    lock first — the same precondition the real backend satisfies.  The
+    fixture returns the ``acquire`` callable; call it with the plans
+    root the test is going to sweep.  The lock is released at teardown.
+
+    The state database lives in a directory of its own inside the test's
+    ``tmp_path``: the lock is taken on *that* file as well, and two
+    tests must never share it.
+    """
+    import instance_lock
+
+    held = []
+
+    def _acquire(plans_dir):
+        locks = instance_lock.acquire_instance_locks(
+            Path(plans_dir), tmp_path / "instance-lock" / "state.db",
+        )
+        held.append(locks)
+        return locks
+
+    yield _acquire
+
+    for locks in held:
+        try:
+            locks.release()
+        except Exception:  # noqa: BLE001 - teardown must not fail a test
+            pass
+
+
 @pytest.fixture(autouse=True)
 def hermetic_cc_switch_current_provider(monkeypatch):
     """Keep provider-selection tests off the operator's live CC Switch.
