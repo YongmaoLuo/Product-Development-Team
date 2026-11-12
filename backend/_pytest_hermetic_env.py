@@ -100,6 +100,11 @@ from typing import Optional
 # follows the resolver if either ever changes.
 from config_paths import STATE_DB, STATE_DB_ENV
 
+# The two truths of the plan context, named by the one module that owns
+# them (stdlib only, no backend imports).  The suite redirects the group,
+# not one variable of it -- see the block in ``install_hermetic_env``.
+from plan_env import PLAN_ID_ENV, PLANS_DIR_ENV, plan_env
+
 #: The home the process was *launched* with, recorded before
 #: :func:`install_hermetic_env` redirects ``$HOME``.  Named here rather than
 #: spelled at the call sites so the variable's name and its meaning cannot
@@ -154,6 +159,19 @@ class HermeticEnv:
 #: worker or a nested session re-enters with ``None`` and records its own
 #: (non-)ownership, which is exactly the case the rule is about.
 _INSTALLED_ENV: Optional[HermeticEnv] = None
+
+
+def _is_under(child, parent) -> bool:
+    """True when ``child`` is ``parent`` or lives under it.
+
+    Both sides are resolved first: on macOS ``/tmp`` is a symlink to
+    ``/private/tmp``, so a string comparison would call a path inside
+    the session root "outside" it.
+    """
+    try:
+        return Path(child).resolve().is_relative_to(Path(parent).resolve())
+    except (ValueError, OSError, TypeError):
+        return False
 
 
 def install_request_guard_header() -> None:
@@ -454,31 +472,49 @@ def install_hermetic_env() -> HermeticEnv:
     # as an in-flight plan and pushes a card for it -- which is how the junk
     # got to Feishu even after the DB was clean.
     #
-    # The value is DERIVED from the session root, so it has to follow the
-    # root when the root moves.  A worker that rescopes itself to
-    # ``<root>/<worker id>`` but keeps the inherited ``<root>/plans`` would
-    # leave all N xdist workers sharing ONE plans tree -- and the server
-    # takes a start-up ``flock`` on exactly that tree (one data root, one
-    # instance, see ``instance_lock.py``).  Two workers booting the app at
-    # the same time would then be two servers on one data root, and the
-    # second one is refused with ``InstanceLockHeld``.  Measured before
-    # this fix: 8 workers, one ``plans=`` value, and two workers' route
-    # tests refusing each other.
+    # The plan context is a GROUP, not four variables that can each be
+    # judged on their own.  The previous rule asked, per variable, "is
+    # this value derived from the previous session root, or was it set
+    # explicitly?"  That question cannot be answered: the coding agent
+    # injects ``PDT_PLANS_DIR`` into the settings it hands to every
+    # sub-agent, and the operator sets the very same variable by hand.
+    # The two writes are indistinguishable in the shape of the value, so
+    # the injected one -- the one pointing at the PRODUCTION tree -- was
+    # taken for an explicit override and kept, and the suite really did
+    # scan the live plans tree.
     #
-    # Only a value that is *derived from the previous root* is rewritten:
-    # ``setdefault``'s promise is that an explicit outer override wins,
-    # and the way to tell "derived" from "explicit" is to compare against
-    # the previous root's own plans directory.  A value that points
-    # anywhere else was set by the operator and is left alone -- the
-    # suite must not silently repoint a directory it was told to use.
+    # So the group is judged as a group.  If the inherited plans root
+    # does not live under this session's root, the suite is running
+    # inside somebody else's tree (the executor's, the operator's), and
+    # the whole group is redirected into the session root -- root and
+    # plan id together, so the two never disagree about which plan this
+    # is.  ``PDT_TEST_ALLOW_LIVE_PLANS=1`` is the escape hatch for the
+    # one diagnostic that genuinely wants the live tree; it is not set
+    # by default.
+    #
+    # A worker that rescopes itself to ``<root>/<worker id>`` but keeps
+    # the inherited ``<root>/plans`` would leave all N xdist workers
+    # sharing ONE plans tree -- and the server takes a start-up ``flock``
+    # on exactly that tree (one data root, one instance, see
+    # ``instance_lock.py``).  Two workers booting the app at the same
+    # time would then be two servers on one data root, and the second
+    # one is refused with ``InstanceLockHeld``.  Measured before this
+    # fix: 8 workers, one ``plans=`` value, and two workers' route
+    # tests refusing each other.  The group redirect covers that case
+    # too: the inherited root is not under the worker's own root, so the
+    # whole group moves to the worker's.
+    session_root = state_db_dir
+    _live_root = os.environ.get(PLANS_DIR_ENV)
     if (
-        inherited_session_root
-        and inherited_session_root != os.environ["PDT_TEST_SESSION_ROOT"]
-        and os.environ.get("PDT_PLANS_DIR")
-        == str(Path(inherited_session_root) / "plans")
+        _live_root
+        and not _is_under(_live_root, session_root)
+        and os.environ.get("PDT_TEST_ALLOW_LIVE_PLANS") != "1"
     ):
-        os.environ["PDT_PLANS_DIR"] = str(state_db_dir / "plans")
-    os.environ.setdefault("PDT_PLANS_DIR", str(state_db_dir / "plans"))
+        os.environ.update(
+            plan_env(os.environ.get(PLAN_ID_ENV), state_db_dir / "plans")
+        )
+    else:
+        os.environ.setdefault(PLANS_DIR_ENV, str(state_db_dir / "plans"))
 
     # The startup credential sweep is a machine-wide rewrite -- it walks the
     # real temp roots and overwrites credentials in the settings payloads it

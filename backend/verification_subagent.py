@@ -4264,8 +4264,10 @@ class SettingsJsonBuilder:
         * ``PDT_VP_ROUND`` — which round they happened in; the guard
           derives the ``round-<n>/`` marker directory from it.
 
-        ``PDT_VP_PLAN_DIR`` and ``PDT_VP_REFUSAL_DIR`` spell the same two
-        facts out for whoever reads the evidence back later.
+        ``PDT_VP_REFUSAL_DIR`` spells the second fact out for whoever
+        reads the evidence back later.  The plan directory itself is
+        named once, by ``PDT_VP_WRITE_SCOPE`` — a second copy of it
+        under another name is a copy that can drift.
         """
         if self.plan_dir is None:
             return {}
@@ -4282,7 +4284,6 @@ class SettingsJsonBuilder:
             "PDT_VP_WRITE_SCOPE": str(plan_dir),
             "PDT_VP_ID": str(self.vp_id),
             "PDT_VP_ROUND": str(round_no),
-            "PDT_VP_PLAN_DIR": str(plan_dir),
             "PDT_VP_REFUSAL_DIR": str(refusal_dir),
         }
 
