@@ -1085,6 +1085,84 @@ def _playwright_interpreter() -> Optional[str]:
     return None
 
 
+#: How long the browser driver may take.
+DRIVER_TIMEOUT_SECONDS = 180
+
+
+def _write_driver_log(log_path: Path, attempt: int, result) -> None:
+    """Write what the driver printed into *log_path*.
+
+    Every failed attempt is written down, and a second attempt is
+    appended to the first one's file: the evidence of the first crash
+    is evidence too, and a file that only holds the last attempt has
+    thrown the first one away.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    mode = "w" if attempt == 1 else "a"
+    with log_path.open(mode, encoding="utf-8") as handle:
+        handle.write(f"=== attempt {attempt} (exit {result.returncode}) ===\n")
+        handle.write("--- stdout ---\n")
+        handle.write(result.stdout)
+        handle.write("\n--- stderr ---\n")
+        handle.write(result.stderr)
+        handle.write("\n")
+
+
+def _drive_browser(command: List[str], log_path: Path) -> str:
+    """Run the browser driver and return what it printed.
+
+    The driver's own output is the evidence of what it did, and it is
+    too long for a failure message: a CI log truncates the message, and
+    a truncated traceback is no traceback at all.  So a driver that
+    fails writes its output to *log_path* — next to the screenshot the
+    case keeps, so that the two are read together — and the failure
+    names that file instead of carrying the text.
+
+    A driver that died before it printed anything is run once more.
+    That is the only failure that is retried: the driver printed
+    nothing at all and left a traceback behind, which is what a
+    machine that was busy looks like.  A driver that ran, printed its
+    answer and then failed has *concluded* something, and running it
+    again would only throw that conclusion away.
+    """
+    for attempt in (1, 2):
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=DRIVER_TIMEOUT_SECONDS,
+            check=False,
+            env=_driver_env(),
+        )
+        if result.returncode == 0:
+            return result.stdout
+
+        _write_driver_log(log_path, attempt, result)
+
+        combined = f"{result.stdout}\n{result.stderr}"
+        if "Executable doesn't exist" in combined or (
+            "playwright install" in combined
+        ):
+            pytest.skip(
+                "the Playwright driver is installed but its browser "
+                "binaries are not; the default path carries the "
+                "assertions"
+            )
+
+        died_before_printing = (
+            result.stdout.strip() == "" and "Traceback" in result.stderr
+        )
+        if attempt == 1 and died_before_printing:
+            continue
+        break
+
+    summary = result.stderr.strip()[:200]
+    raise AssertionError(
+        f"the browser driver failed (exit {result.returncode}); what it "
+        f"printed is in {log_path}; the end of its stderr was {summary!r}"
+    )
+
+
 #: The driver.  It replays the same sequence through Playwright's
 #: request context — the same two calls the browserless path makes —
 #: and then leaves a screenshot of the served page behind.
@@ -1226,7 +1304,7 @@ def test_browser_replays_the_same_delivery(booted):
     driver_script = workdir / "drive_replay.py"
     driver_script.write_text(_BROWSER_REPLAY, encoding="utf-8")
 
-    result = subprocess.run(
+    stdout = _drive_browser(
         [
             interpreter,
             str(driver_script),
@@ -1237,28 +1315,10 @@ def test_browser_replays_the_same_delivery(booted):
             QUESTION,
             screenshot,
         ],
-        capture_output=True,
-        text=True,
-        timeout=180,
-        check=False,
-        env=_driver_env(),
+        Path(screenshot).parent / "browser-driver.log",
     )
-    if result.returncode != 0:
-        combined = f"{result.stdout}\n{result.stderr}"
-        if "Executable doesn't exist" in combined or (
-            "playwright install" in combined
-        ):
-            pytest.skip(
-                "the Playwright driver is installed but its browser "
-                "binaries are not; the default path carries the "
-                "assertions"
-            )
-        raise AssertionError(
-            f"the browser driver failed (exit {result.returncode}); "
-            f"stdout={result.stdout!r} stderr={result.stderr!r}"
-        )
 
-    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    payload = json.loads(stdout.strip().splitlines()[-1])
     assert payload["create_status"] == 200, (
         f"the replayed creation call failed: {payload!r}"
     )
@@ -1303,7 +1363,7 @@ def test_browser_replays_the_missing_binary_delivery(booted_without_transport):
     driver_script = workdir / "drive_negative_replay.py"
     driver_script.write_text(_BROWSER_REPLAY, encoding="utf-8")
 
-    result = subprocess.run(
+    stdout = _drive_browser(
         [
             interpreter,
             str(driver_script),
@@ -1314,28 +1374,10 @@ def test_browser_replays_the_missing_binary_delivery(booted_without_transport):
             QUESTION,
             screenshot,
         ],
-        capture_output=True,
-        text=True,
-        timeout=180,
-        check=False,
-        env=_driver_env(),
+        Path(screenshot).parent / "browser-driver-negative.log",
     )
-    if result.returncode != 0:
-        combined = f"{result.stdout}\n{result.stderr}"
-        if "Executable doesn't exist" in combined or (
-            "playwright install" in combined
-        ):
-            pytest.skip(
-                "the Playwright driver is installed but its browser "
-                "binaries are not; the default path carries the "
-                "assertions"
-            )
-        raise AssertionError(
-            f"the browser driver failed (exit {result.returncode}); "
-            f"stdout={result.stdout!r} stderr={result.stderr!r}"
-        )
 
-    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    payload = json.loads(stdout.strip().splitlines()[-1])
     assert payload["create_status"] == 200, (
         f"the replayed creation call failed: {payload!r}"
     )

@@ -949,6 +949,25 @@ def _duration_seconds(text: str) -> Tuple[Optional[int], int]:
     return total, slack
 
 
+def _clock_readings(row: Dict[str, Any]) -> List[int]:
+    """The clocks a running row carries, in seconds.
+
+    A running plan is measured twice: ``running_sec`` is the plan's own
+    clock — how long the plan has been at it — and ``elapsed_sec`` is
+    the slot's clock — how long the slot has been held.  The panel draws
+    the plan's clock and falls back to the slot's clock for a listing
+    that carries no plan clock, so the case cannot tell which of the
+    two the panel drew; both are read here, and the panel's number has
+    to fit between them either way.
+    """
+    values: List[int] = []
+    for name in ("running_sec", "elapsed_sec"):
+        value = row.get(name)
+        if value is not None:
+            values.append(int(value))
+    return values
+
+
 # ---------------------------------------------------------------------------
 # The world: a server, a database, a plans tree, and the plans in them
 # ---------------------------------------------------------------------------
@@ -1984,8 +2003,20 @@ def test_panel_and_api_parity(world):
     _assert_seam(world)
     _wait_for_executors(world)
 
+    # The read model is read on both sides of the drive.  The panel
+    # draws a clock, and it drew it at a moment of its own: the panel
+    # polls, so the number it draws is the one it read on its last
+    # poll, and the driver reads the model again only after the panel
+    # is done and its screenshot has been taken.  No single reading of
+    # the read model therefore sits at the moment the panel drew its
+    # number — but two readings that surround the drive do, and the
+    # panel's number lies between them.
+    state_before = world.scheduler_state()
+
     report = world.drive([])
+
     state = report["api"]
+    state_after = world.scheduler_state()
     assert isinstance(state, dict) and "capacity" in state, (
         f"the API did not answer with a read model: {state!r}"
     )
@@ -2049,8 +2080,15 @@ def test_panel_and_api_parity(world):
         )
 
     # The running plans, row by row: the plan, and whether it may be
-    # interrupted.  The elapsed time is read twice — once by each side —
-    # so it is compared with the tolerance of a clock, not exactly.
+    # interrupted.  The elapsed time is a clock, and the two sides do
+    # not read it at the same moment: the panel draws the number it
+    # read on its last poll, and the driver reads the model again only
+    # once the panel is done.  So the panel's number is compared as
+    # what it is — one reading of the clock, taken somewhere inside
+    # the drive — and the two readings that surround the drive say
+    # where "somewhere inside" may be.  A number that falls between
+    # them is the same fact read at two ends; a number that falls
+    # outside them is a panel that drew something else.
     # The panel draws it as a duration and the read model carries
     # seconds, so the drawing is turned back into seconds first.
     panel_running = report["running"]
@@ -2058,6 +2096,15 @@ def test_panel_and_api_parity(world):
         f"the panel draws {len(panel_running)} running plans, the read model "
         f"carries {len(state['running'])}"
     )
+    # The two readings are indexed by the plan they are about: the
+    # order of the running plans is the scheduler's, and the two
+    # sides are not required to agree on it.
+    before_by_id = {
+        str(row["plan_id"]): row for row in state_before.get("running", [])
+    }
+    after_by_id = {
+        str(row["plan_id"]): row for row in state_after.get("running", [])
+    }
     for drawn, carried in zip(panel_running, state["running"]):
         assert drawn[0] == str(carried["plan_id"]), (
             f"the panel draws {drawn[0]!r} as running, the read model says "
@@ -2072,9 +2119,30 @@ def test_panel_and_api_parity(world):
             f"the panel draws {drawn[1]!r} for {drawn[0]!r}, which is not a "
             f"duration"
         )
-        assert abs(drawn_elapsed - int(carried["elapsed_sec"])) <= 2 + slack, (
-            f"the panel says {drawn[0]!r} has been running for {drawn_elapsed}s, "
-            f"the read model says {carried['elapsed_sec']}s"
+        plan_id = str(carried["plan_id"])
+        before_row = before_by_id.get(plan_id)
+        after_row = after_by_id.get(plan_id)
+        assert before_row is not None and after_row is not None, (
+            f"the read model does not carry {plan_id!r} on both sides of the "
+            f"drive: before the drive it carried {before_row!r}, after it "
+            f"carried {after_row!r}"
+        )
+        # The bounds are the smallest and the largest of the numbers the
+        # two readings carry: whichever clock the panel drew, its number
+        # was read inside the drive, and the clock it was read on only
+        # moves forward.
+        before_clocks = _clock_readings(before_row)
+        after_clocks = _clock_readings(after_row)
+        assert before_clocks and after_clocks, (
+            f"the read model carries no clock for {plan_id!r}: before the "
+            f"drive {before_row!r}, after it {after_row!r}"
+        )
+        lo = min(before_clocks + after_clocks)
+        hi = max(before_clocks + after_clocks)
+        assert lo - slack <= drawn_elapsed <= hi + slack, (
+            f"the panel says {drawn[0]!r} has been running for {drawn_elapsed}s; "
+            f"the read model read {before_clocks} before the drive and "
+            f"{after_clocks} after it"
         )
 
     # The two readings must also be the readings of the same server: the

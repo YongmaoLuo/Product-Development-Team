@@ -139,7 +139,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -698,6 +700,25 @@ def _write_scheduler_settings(path: Path) -> None:
     )
 
 
+def _open_snapshot_source(path: Path) -> sqlite3.Connection:
+    """Open a live SQLite database for reading, tolerating a lost WAL index.
+
+    A WAL database whose ``-shm`` index is gone cannot be opened
+    read-only: SQLite refuses to rebuild the index without write access
+    and answers ``unable to open database file``.  The read-write open
+    below is the way out — it lets SQLite rebuild the index (and
+    recover the ``-wal`` if there is one), and no statement issued here
+    writes to the source, so the live database is left as it was.
+    """
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    except sqlite3.OperationalError:
+        conn.close()
+        conn = sqlite3.connect(path)
+    return conn
+
+
 def _boot_panel_server(
     work: Path, script_dir: Path, settings_path: Path, launcher_path: Path
 ) -> Tuple[str, subprocess.Popen]:
@@ -709,16 +730,48 @@ def _boot_panel_server(
     leaves the scheduler switched off, so this server is pointed at a
     settings file of its own through the seam the server exposes.
 
-    Everything else is the reused boot's environment — the same state
-    database, the same plans tree, the same scripted model — because
-    the panel has to show the very plan the rest of this case parked.
+    The panel runs on a **snapshot** of the data root rather than on the
+    live one.  "One instance per data root" is a product invariant
+    now: the server takes a start-up ``flock`` on the plans tree and on
+    the state database, so a second process may not open the same root
+    — not even for the few seconds this panel needs.  The snapshot
+    carries the same state database and the same plans tree, so the
+    panel still shows the very plan the rest of this case parked; it is
+    a copy, not a second view of one root.
+
+    The copy of the database is taken with SQLite's backup API rather
+    than with a file copy: the live database is in WAL mode, and a
+    file-wise copy of a WAL database is a half-written database.
+
+    Everything else is the reused boot's environment — the same scripted
+    model — because the panel has to show the very plan the rest of
+    this case parked.
     """
+    panel_root = work / "panel-root"
+    panel_root.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(
+        work / "plans",
+        panel_root / "plans",
+        dirs_exist_ok=True,
+        # The live lock file is not part of the data: it belongs to the
+        # instance that holds the root, and the snapshot is a root of
+        # its own.
+        ignore=shutil.ignore_patterns(".pdt-instance.lock"),
+    )
+    src = _open_snapshot_source(work / "state.db")
+    dst = sqlite3.connect(panel_root / "state.db")
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+
     port = _H._free_port()
     env = dict(os.environ)
     env.update(
         {
-            "PDT_STATE_DB_PATH": str(work / "state.db"),
-            "PDT_PLANS_DIR": str(work / "plans"),
+            "PDT_STATE_DB_PATH": str(panel_root / "state.db"),
+            "PDT_PLANS_DIR": str(panel_root / "plans"),
             "PDT_HOST": "127.0.0.1",
             "PDT_PORT": str(port),
             "PDT_DEBUG_ROUTES": "1",

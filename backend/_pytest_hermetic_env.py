@@ -419,12 +419,16 @@ def install_hermetic_env() -> HermeticEnv:
     xdist_worker = os.environ.get("PYTEST_XDIST_WORKER") or ""
     session_root_owner = "_PDT_TEST_SESSION_ROOT_OWNER"
     state_root_owner_pid = None
-    if not os.environ.get("PDT_TEST_SESSION_ROOT"):
+    #: The root this process INHERITED, before any rescoping below.  Kept
+    #: because one variable is derived from it and has to be recomputed
+    #: together with it -- see the ``PDT_PLANS_DIR`` block further down.
+    inherited_session_root = os.environ.get("PDT_TEST_SESSION_ROOT")
+    if not inherited_session_root:
         os.environ["PDT_TEST_SESSION_ROOT"] = tempfile.mkdtemp(prefix="ac-test-state-")
         os.environ[session_root_owner] = ""
         state_root_owner_pid = os.getpid()
     elif xdist_worker and os.environ.get(session_root_owner) != xdist_worker:
-        worker_state_db_dir = Path(os.environ["PDT_TEST_SESSION_ROOT"]) / xdist_worker
+        worker_state_db_dir = Path(inherited_session_root) / xdist_worker
         worker_state_db_dir.mkdir(parents=True, exist_ok=True)
         os.environ["PDT_TEST_SESSION_ROOT"] = str(worker_state_db_dir)
         os.environ[session_root_owner] = xdist_worker
@@ -449,6 +453,31 @@ def install_hermetic_env() -> HermeticEnv:
     # startup sweep treats every ``plans/<id>/`` that still holds a state JSON
     # as an in-flight plan and pushes a card for it -- which is how the junk
     # got to Feishu even after the DB was clean.
+    #
+    # The value is DERIVED from the session root, so it has to follow the
+    # root when the root moves.  A worker that rescopes itself to
+    # ``<root>/<worker id>`` but keeps the inherited ``<root>/plans`` would
+    # leave all N xdist workers sharing ONE plans tree -- and the server
+    # takes a start-up ``flock`` on exactly that tree (one data root, one
+    # instance, see ``instance_lock.py``).  Two workers booting the app at
+    # the same time would then be two servers on one data root, and the
+    # second one is refused with ``InstanceLockHeld``.  Measured before
+    # this fix: 8 workers, one ``plans=`` value, and two workers' route
+    # tests refusing each other.
+    #
+    # Only a value that is *derived from the previous root* is rewritten:
+    # ``setdefault``'s promise is that an explicit outer override wins,
+    # and the way to tell "derived" from "explicit" is to compare against
+    # the previous root's own plans directory.  A value that points
+    # anywhere else was set by the operator and is left alone -- the
+    # suite must not silently repoint a directory it was told to use.
+    if (
+        inherited_session_root
+        and inherited_session_root != os.environ["PDT_TEST_SESSION_ROOT"]
+        and os.environ.get("PDT_PLANS_DIR")
+        == str(Path(inherited_session_root) / "plans")
+    ):
+        os.environ["PDT_PLANS_DIR"] = str(state_db_dir / "plans")
     os.environ.setdefault("PDT_PLANS_DIR", str(state_db_dir / "plans"))
 
     # The startup credential sweep is a machine-wide rewrite -- it walks the
