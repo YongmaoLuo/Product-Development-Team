@@ -48,6 +48,12 @@ if str(_BACKEND_DIR) not in sys.path:
 
 import server  # noqa: E402
 
+# The route module is imported **after** ``server``, and that order is not
+# a style choice: ``server`` imports the route module for its request
+# models, and the route module imports ``server`` for the shared helpers.
+# Importing the route module first trips that circular import.
+from routes.fast_lane import _stamp_project_dir  # noqa: E402
+
 # The import lane's own test file already owns the stub that scripts the
 # two calls the generator makes, the payload helper and the checkout
 # fixture.  They are used here rather than written a second time: a second
@@ -176,3 +182,55 @@ def test_the_import_does_not_promise_a_working_directory_it_cannot_use(
     assert not any("no project_dir could be resolved" in w for w in warnings), (
         warnings
     )
+
+
+def test_a_task_that_already_names_a_directory_keeps_it():
+    """The stamp fills a gap; it does not overrule a fact.
+
+    The stamp exists to put the request's checkout back onto tasks the
+    workspace gate emptied.  A task that names a directory of its own is
+    a fact the model produced and the audit already checked against the
+    request's — overwriting it would silently retarget that task at a
+    checkout it was never asked to work in.
+
+    This is pinned at the stamp rather than through the endpoint because
+    the endpoint cannot carry this input: ``validate_tasks`` refuses an
+    import whose task names a directory other than the request's, so a
+    task with a directory of its own never reaches the stamp through
+    ``POST /api/plan/import``.  The stamp's own behaviour — leave a
+    directory that is already there alone — is the contract, and it is
+    only observable here.
+    """
+    tasks_data = {
+        "project_dir": "",
+        "tasks": [
+            {"id": "T1", "title": "the task names no directory"},
+            {
+                "id": "T2",
+                "title": "the task names a directory of its own",
+                "project_dir": "/tmp/elsewhere",
+            },
+        ],
+    }
+
+    missing = _stamp_project_dir(tasks_data, "/tmp/the-request-checkout")
+
+    by_id = {task["id"]: task for task in tasks_data["tasks"]}
+
+    # The gap is filled: the task that named no directory gets the
+    # checkout the request named.
+    assert by_id["T1"]["project_dir"] == "/tmp/the-request-checkout"
+
+    # The fact is kept: the task that named a directory of its own still
+    # names it.  This is the assertion the case exists for.
+    assert by_id["T2"]["project_dir"] == "/tmp/elsewhere", (
+        f"the stamp overwrote a directory the task already named: "
+        f"{by_id['T2']['project_dir']!r}"
+    )
+
+    # Nothing is left without a directory, so no import is refused over a
+    # directory that could not be resolved.
+    assert missing == []
+
+    # The plan's own directory is filled the same way.
+    assert tasks_data["project_dir"] == "/tmp/the-request-checkout"
