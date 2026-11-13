@@ -484,6 +484,73 @@ def bind_hook_for_plan(
         return {}
 
 
+# ---------------------------------------------------------------------------
+# The checkout every task works in
+# ---------------------------------------------------------------------------
+
+
+def _stamp_project_dir(tasks_data: Dict[str, Any], project_dir: str) -> List[Any]:
+    """Put the plan's checkout on every task that has none.
+
+    The start path refuses a start that carries no directory
+    (``POST /api/execution/{id}/start``: "project_dir is required"), so a
+    task without one is a plan that can never be admitted: the scheduler
+    retries that admission every tick, and the plan sits at the head of
+    the line looking like it is waiting for a slot.
+
+    The lane cannot leave that to the model.  The workspace gate
+    (``validate_workspace``) clears the directory of every task that
+    points into the repository hosting this server — the framework
+    refuses to let a task work in the checkout that runs it — and the
+    task is then left with none, even though the request named the
+    checkout that task was supposed to work in.  The request's directory
+    is therefore put back on every task that has none.
+
+    A task that names a directory of its own keeps it: the model's own
+    path is a fact, and the audit has already checked it against the
+    request's.
+
+    Args:
+        tasks_data: the task list.  Mutated in place.
+        project_dir: the checkout the request named.  Empty means there
+            is nothing to put on the tasks.
+
+    Returns:
+        The ids of the tasks that still carry no directory.
+    """
+    target = (project_dir or "").strip()
+    tasks = tasks_data.get("tasks")
+    if not isinstance(tasks, list):
+        return []
+
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        own = str(task.get("project_dir") or "").strip()
+        if not own and target:
+            task["project_dir"] = target
+
+    if target and not str(tasks_data.get("project_dir") or "").strip():
+        tasks_data["project_dir"] = target
+
+    missing = [
+        task.get("id")
+        for task in tasks
+        if isinstance(task, dict)
+        and not str(task.get("project_dir") or "").strip()
+    ]
+
+    # The hardening gate ran before this step and saw the gap.  It is
+    # resolved now, so the warning it left behind must not reach the
+    # caller: that entry says a directory could not be resolved, and
+    # that is no longer true of these tasks.
+    harden = tasks_data.get("harden_warnings")
+    if isinstance(harden, dict) and "tasks_without_project_dir" in harden:
+        harden["tasks_without_project_dir"] = missing
+
+    return missing
+
+
 @router.post("/api/plan/import")
 def import_plan(req: ImportPlanRequest, request: Request):
     """Import external upstream material as a new plan, parked in ``queued``.
@@ -635,6 +702,29 @@ def import_plan(req: ImportPlanRequest, request: Request):
                 "error": "Generated tasks are not runnable",
                 "detail": str(exc),
                 "error_payload": exc.error_payload,
+                "plan_id": plan_id,
+            },
+        )
+
+    # The checkout every task works in.  The start path refuses a start
+    # without one, so a task that carries none is a plan that can never
+    # be admitted — and the workspace gate above is what cleared it: a
+    # task pointing into the repository hosting this server loses its
+    # directory there.  The request named the checkout; it goes back on
+    # every task that has none.
+    missing = _stamp_project_dir(tasks_data, project_dir)
+    if missing:
+        problems = [
+            f"task {task_id!r} carries no project_dir, and the request's "
+            "project_dir could not be put on it"
+            for task_id in missing
+        ]
+        _register_import_failed(plan_id, "; ".join(problems))
+        raise HTTPException(
+            422,
+            {
+                "error": "Generated tasks are not runnable",
+                "problems": problems,
                 "plan_id": plan_id,
             },
         )
@@ -940,6 +1030,27 @@ def revise_plan(plan_id: str, req: RevisePlanRequest):
             },
         )
 
+    # The plan's own checkout, put back on the tasks this revision left
+    # without one — the same step the import applies, and for the same
+    # reason: the start path refuses a start that carries no directory.
+    # ``_plan_project_dir`` read it off the plan's stored list, so the
+    # revision cannot retarget the plan at a different checkout.
+    missing = _stamp_project_dir(tasks_data, project_dir)
+    if missing:
+        problems = [
+            f"task {task_id!r} carries no project_dir, and the plan's own "
+            "project_dir could not be put on it"
+            for task_id in missing
+        ]
+        raise HTTPException(
+            400,
+            {
+                "error": "Revised task list is not a runnable plan",
+                "problems": problems,
+                "plan_id": plan_id,
+            },
+        )
+
     try:
         written = _persist_revised_tasks(plan_dir, tasks_data)
     except (CycleInTaskGraph, DanglingTaskDependency) as exc:
@@ -975,11 +1086,19 @@ def revise_plan(plan_id: str, req: RevisePlanRequest):
 def _harden_warnings(tasks_data: Dict[str, Any]) -> List[str]:
     """Render ``harden_for_execution``'s warnings as readable sentences.
 
-    Its two entries are the two things this lane refuses to call failures:
-    a task whose ``files_to_modify`` is the "intended a change, never named
-    the files" sentinel, and a task with no resolvable ``project_dir``.
-    Both are runnable; neither is something the caller can discover from
-    the response alone.
+    One entry is left to report: a task whose ``files_to_modify`` is the
+    "intended a change, never named the files" sentinel.  That one is
+    runnable — the executor decides which files to change — and it is
+    not something the caller can discover from the response alone.
+
+    The other entry of the hardening gate — a task with no resolvable
+    ``project_dir`` — is not a warning this lane passes on.  A task
+    without a directory cannot be started: the start path refuses a start
+    that carries none.  So the lane resolves it instead of reporting it.
+    The checkout the request named is stamped onto every task that has
+    none (``_stamp_project_dir``), and an import that still has a task
+    without one is refused rather than queued.  The entry is therefore
+    empty by the time this renders.
     """
     harden = tasks_data.get("harden_warnings")
     if not isinstance(harden, dict):
