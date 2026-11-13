@@ -5449,10 +5449,28 @@ def owners_path(plan_dir: Path) -> Path:
 
 def read_owners(plan_dir: Path) -> Dict[str, Any]:
     """Read the owner registry. Returns ``{}`` when absent or corrupt —
-    a damaged registry must not block a reap sweep."""
+    a damaged registry must not block a reap sweep.
+
+    "Corrupt" covers every way the file can fail to be a registry this
+    module wrote: it may not be there, it may not be JSON, and it may
+    not even be decodable — bytes that are not UTF-8 (a latin-1 or
+    utf-16 write, a truncated file) are the wreckage of something else
+    and cannot name an owner.  All of those answer ``{}``: the reader
+    is asked *who owns the role*, not *is this file well-formed*.
+
+    A ``UnicodeDecodeError`` is a ``ValueError``, and so is the
+    ``JSONDecodeError`` beside it — so one ``except`` clause covers
+    both, and neither escapes to the caller.  Deeply nested JSON is
+    the third kind of damage: ``json.loads`` raises ``RecursionError``
+    (a ``RuntimeError``) on a payload nested past the interpreter's
+    recursion limit, and that is a wrecked file rather than a
+    programming error, so it answers ``{}`` too.  It is deliberately
+    not ``except Exception``: this function interprets *file damage*,
+    and a programming error inside it must still be visible.
+    """
     try:
         data = json.loads(owners_path(plan_dir).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError, RecursionError):
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -5461,6 +5479,20 @@ def _write_owners(plan_dir: Path, payload: Dict[str, Any]) -> None:
     path = owners_path(plan_dir)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_dir():
+            # A directory in the registry's place is not a registry
+            # this module wrote, and a file cannot replace a directory
+            # (``Path.replace`` refuses it) — so it would stay there for
+            # ever, and every later claim would read "nobody owns the
+            # role" and then fail to take it.  The damage is
+            # permanent that way, and a permanent registry that can
+            # never be written blocks every round after this one.
+            #
+            # Only an EMPTY directory is removed (``rmdir`` refuses a
+            # directory that holds anything, and the refusal is caught
+            # below as a warning): nothing is ever removed recursively,
+            # and nothing inside a directory is ever touched.
+            path.rmdir()
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(
             json.dumps(payload, indent=2, ensure_ascii=False),
