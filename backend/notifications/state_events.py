@@ -80,12 +80,23 @@ logger = logging.getLogger(__name__)
 #                          genuine progress that renders to no visible
 #                          change — see ``_watch_stale_cards`` in
 #                          ``notifications/feishu_notifier``.
+#   plan_restarted      — NOT a plan-phase change: the same plan was
+#                          started AGAIN, so the execution's
+#                          ``started_at`` moved. The card for the old
+#                          run describes a run that is over; the
+#                          notifier rotates it (clears the persisted
+#                          message ids) and pushes a FRESH card for the
+#                          new run instead of editing the old one in
+#                          place. Raised by the exec-progress watch —
+#                          see ``_watch_execution_progress`` in
+#                          ``notifications/feishu_notifier``.
 
 KIND_PLAN_PHASE_CHANGED = "plan_phase_changed"
 KIND_TASK_STATE_CHANGED = "task_state_changed"
 KIND_VP_STATE_CHANGED = "vp_state_changed"
 KIND_PLAN_CLOSED = "plan_closed"
 KIND_STALE_REFRESH = "stale_refresh"
+KIND_PLAN_RESTARTED = "plan_restarted"
 
 
 # ---------------------------------------------------------------------------
