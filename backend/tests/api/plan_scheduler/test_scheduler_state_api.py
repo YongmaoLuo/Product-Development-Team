@@ -236,6 +236,13 @@ def test_state_key_set_closed(install_engine):
     A field that appears without being declared is a field the panel
     cannot render and the LUI cannot rely on, so the set is asserted
     exactly — in both directions.
+
+    The rows carry two more fields than the document does: the
+    ``phase`` — the routing layer's own word for what the plan is
+    doing — and the ``phase_label`` the route works out from it.  Both
+    are on every row of both lists, and a row that sometimes carried
+    them and sometimes did not would be a shape the panel cannot rely
+    on.
     """
     install_engine(
         {
@@ -267,6 +274,8 @@ def test_state_key_set_closed(install_engine):
         "promote_order",
         "due",
         "reason",
+        "phase",
+        "phase_label",
     }, sorted(body["queue"][0])
     assert set(body["running"][0]) == {
         "plan_id",
@@ -276,6 +285,8 @@ def test_state_key_set_closed(install_engine):
         "started_at",
         "evictable",
         "workspace",
+        "phase",
+        "phase_label",
     }, sorted(body["running"][0])
 
 

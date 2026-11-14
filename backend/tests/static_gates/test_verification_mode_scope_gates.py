@@ -681,6 +681,9 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 动作、failed 相位专属文案「重新排队执行」、重跑验证的两次请求）与调度面板改版
     # （视图重排、在跑运行时长、并行 Agent 数、容量下拉框），按本 gate 的既定流程
     # 重新钉住该文件的哈希。
+    # 2026-11-01：因「调度卡片按卡片渲染、默认收起、展开才请求详情」（task-12）改动了
+    # `frontend/app.js`，按本 gate 的既定流程把哈希前移到本分支的批准态。表内条目集合
+    # 与断言强度均不变：被钉文件的范围不变、sha256 仍逐字节比对。
     # 2026-11-01：因已批准的 VP-009 修复（f623224e「加载期的 503 不再变成未捕获的
     # Promise rejection，取证副本搬出被服务的 plans 树」）给该文件加了一层加载期的
     # 拒绝处理（`loadInBackground` / `renderPlansError` / `renderSidebarError`），
@@ -689,11 +692,21 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 该文件只有 f623224e 这一处改动（+95/-18），没有夹带别的改动。
     # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的范围、
     # sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-04：合入 origin/main —— 两侧的改动落在同一个文件上，但改的是**不同的
+    # 位置**：main 的 VP-009 加载期拒绝处理（`loadInBackground` / `renderPlansError` /
+    # `renderSidebarError`）与本分支的「调度卡片按卡片渲染、默认收起、展开才请求详情」
+    # 互不覆盖，故两边都保留；文件内容因此再次变化，按本 gate 的既定流程重新钉住
+    # 合并后的文件。
     # 2026-11-05：因「容量下拉框未应用的选择不被轮询抹掉」给该文件加了一层
     # 「未应用的选择」状态（`select.dataset.pending` 的置位与清除、
     # `renderSchedulerCapacity` 里受保护的 `select.value` 赋值），按本 gate 的既定流程
     # 重新钉住该文件的哈希。这是「移动冻结」而不是「放松门禁」：断言强度、被钉文件的
     # 范围与逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-07：合入 origin/main（2fe98191）—— 两侧的改动仍然落在同一个文件上，
+    # 改的还是**不同的位置**：main 的「未应用的选择」状态与本分支的「调度卡片按卡片
+    # 渲染、默认收起、展开才请求详情」互不覆盖，故两边都保留；文件内容因此再次
+    # 变化，按本 gate 的既定流程重新钉住合并后的文件。表内条目集合与断言强度不变：
+    # 被钉文件的范围不变、sha256 仍逐字节比对。
     # 2026-11-09：R4「容量下拉框不得自己跳数」的其余两处已批准改动也落在本文件 ——
     # 43bec418（2026-11-08）「切走视图时结束容量草稿并恢复服务端数字」（新增
     # `schedulerClearCapacityDraft`，`goHome` 切走视图时调用它把控件放回服务端数字）
@@ -707,11 +720,19 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 该文件只有 43bec418 与 448d67df 两处改动（+129/-7），没有夹带别的改动。
     # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的范围、
     # sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-14：合入 origin/main（316b360a）—— 两侧的改动落在同一文件的
+    # **不同位置**：main 的「容量下拉框不得自己跳数」（`schedulerClearCapacityDraft`
+    # / `schedulerApplyCapacity` / `#scheduler-capacity-notice`）与本分支的「调度
+    # 卡片按卡片渲染、默认收起、展开才请求详情」互不覆盖，故两边都保留；文件
+    # 内容因此再次变化，按本 gate 的既定流程把冻结基线前移到**合并态**哈希。
+    # 表内条目集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
     "frontend/app.js": (
-        "51ad1ae1f7f503b4d250e99b942c7241205691d7441f87b17d445d0daca1274e"
+        "5887449c12ffe12dd070e3732e1675c0d22f35e969fbf2532cc53e34f71fde9e"
     ),
+    # 2026-11-01：因「调度卡片容器与收起态样式」（task-11）改动了 `frontend/style.css`，
+    # 按本 gate 的既定流程把哈希前移到本分支的批准态；表内条目集合不变。
     "frontend/style.css": (
-        "0cab7b66dae8b5b693a9e8e4b5c4cda4f8651ae649512e81d8aa8c18a24f836b"
+        "2f1a86a32af180e47915a8d9ad3af479e500f5a401ce45b4edc4f302bec14202"
     ),
     # 2026-10-31：因本分支新增 `_repair_exit_writer`（修复轮退出事件的单一写入器）
     # 改动本文件，按本 gate 的既定流程重新钉住该文件的哈希。
@@ -723,12 +744,17 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 未改动任何既有分支；按本 gate 的既定流程把冻结基线移动到本分支的批准态哈希。
     # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的范围、
     # sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-01（本分支）：本次前移只涉及三个前端文件，本分支未改动
+    # `backend/verification_loop.py`。
     # 2026-11-01：合入 origin/main（PR #74）—— 两侧的改动都落在同一个文件的同一处
     # spawn 调用上，但改的是**不同的形参**：main 的「基线漂移合并场景经
     # `PDT_EXECUTOR_SCENE` 跨进程传给 executor 子进程」加的是 `scene` 形参与
     # `extra_env` 实参；本分支的「修复轮退出事件的单一写入器 `_repair_exit_writer` +
     # 回收器按 `repair_executor` 角色分序回收」加的是 `role` 实参。两者互不覆盖，
     # 故两边都保留；文件内容因此再次变化，按本 gate 的既定流程重新钉住合并后的文件。
+    # 2026-11-01（合入 PR #75 / base）：base 侧对 `backend/verification_loop.py` 的改动
+    # （`_repair_exit_writer` + 回收器按 `repair_executor` 角色分序回收）已随 base 合入，
+    # 合并后该文件的内容与本条哈希一致，故本条哈希在本次合并后保持不变。
     # 2026-11-03：本分支修「验证被判死后那一轮没有真正停下」——判死时按轮次的
     # token 收掉这一轮拥有的全部 coding-tool 子进程、强制释放轮次租约、让僵尸
     # 轮次写终态被拒、并给长 LLM 调用加进度行与墙上限。四处改动都落在本文件
@@ -739,6 +765,8 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # `routes.execution._enter_quota_wait` 重新可达；同时把「配额暂停的 repair 出口」
     # 归到 `waiting_for_quota` 且不再给已 park 的轮次写 `ended_at`。改动只落在本文件
     # 的 repair 出口与 park 判据，按本 gate 的既定流程重新钉住该文件。
+    # 2026-11-04：合入 origin/main 后，本条哈希与合并后文件的真实 sha256 一致，
+    # 保持不变。
     # 2026-11-04：preflight 被 binary freshness 挡下的轮次不再进入判定与修复链
     # —— 新增 `_binary_freshness_blocked_report` 与对应的 `_record_terminal(
     # "loop_stopped", BINARY_FRESHNESS_PREFLIGHT_ERROR_KIND)` 出口，插在
@@ -753,6 +781,8 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 2026-11-06（续）：根因链整条删除——本文件删掉 `_handle_root_cause_preflight`
     # 与其调用链（链的预检不再存在），其余轮次逻辑一字未动；按本 gate 的既定流程
     # 把冻结基线前移到删除后的批准态。这是「移动冻结」而不是「放松门禁」。
+    # 2026-11-07：合入 origin/main（2fe98191）后，本条哈希与合并后文件的真实
+    # sha256 仍然一致（两侧都未再改这个文件），保持不变。
     # 2026-11-08：修「确认修复时相位不是 verification_repairing 导致验证轮崩溃」
     # ——本文件**只改注释**：把「覆盖 status 就会让 orchestrator 的
     # `verification_failed` → `start_verification_repair` 路径跑起来」这句
@@ -763,6 +793,15 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 未改动；按本 gate 的既定流程重新钉住该文件。这是「移动冻结」而不是
     # 「放松门禁」：断言（mismatched == []）、被钉文件的范围与 sha256 逐字节
     # 比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-08：合入 origin/main（ba07388e，含 #119/#120/#123）—— 两侧的改动
+    # 落在**不同的文件**上：main 侧改了 `backend/verification_loop.py`（#123 的
+    # 注释修正）与 `backend/state_machine/repositories/execution_repository.py`
+    # （#120 的 `update_status` 可选 `stop_reason`），本分支只改了三个前端文件，
+    # 两边互不覆盖，故都保留。合并后 `backend/verification_loop.py` 的内容与
+    # main 侧逐字节相同，其真实 sha256 与下方所钉的值一致，故本条哈希在本次
+    # 合并后保持不变。这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、
+    # 被钉文件的范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
+    # 任何再编辑照样红。
     # 2026-11-09：本计划 task-7「修复轮的同步/异步路径也写兜底现场」已批准，
     # 改动本文件——新增 `_repair_stop_reason`（正数退出码写成
     # `repair_non_zero_exit:3`，负数信号写成 `repair_signal:9`），
@@ -890,6 +929,8 @@ FROZEN_SCHEDULER_SURFACE_SHA256: dict[str, str] = {
     # 2026-10-31（合入 main）：调度面板改版之上多回了「终态计划」区块 ——
     # failed 计划既不在队列里也不在「在跑」里，failed 相位的两个按钮画在
     # 这个区块里；同样按本 gate 的既定流程重新钉住哈希。
+    # 2026-11-01：因「调度卡片容器与收起态样式」（task-11）改动了 `frontend/index.html`，
+    # 按本 gate 的既定流程把哈希前移到本分支的批准态；表内条目集合不变。
     # 2026-11-09：448d67df（2026-11-08）「应用后以服务端应答的数字为准」在调度面板的
     # 标记里增加一处 `#scheduler-capacity-notice` 提示位（+1 行），用来显示
     # 「服务端规整为 N」——服务端给的数字与提交的不同时，提示位把那个数字说出来，
@@ -900,8 +941,14 @@ FROZEN_SCHEDULER_SURFACE_SHA256: dict[str, str] = {
     # 该文件只有 448d67df 这一处改动（+1 行），没有夹带别的改动。
     # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的范围、
     # sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-14：合入 origin/main（316b360a）—— 两侧的改动落在同一文件的
+    # **不同位置**：main 的「容量下拉框不得自己跳数」在标记里增加一处
+    # `#scheduler-capacity-notice` 提示位，与本分支的「调度卡片容器与收起态样式」
+    # 互不覆盖，故两边都保留；文件内容因此再次变化，按本 gate 的既定流程把
+    # 冻结基线前移到**合并态**哈希。表内条目集合与断言强度不变：被钉文件的
+    # 范围不变、sha256 仍逐字节比对。
     "frontend/index.html": (
-        "d98d19a9026ba6261acbfbb1fcde0b3716439d8f324cf6168f22a28252c6dce8"
+        "b5472f09abddedce158018fef47faa99c04f00e0af2462717981294e2b175a79"
     ),
 }
 

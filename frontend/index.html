@@ -62,7 +62,9 @@
             <!-- Scheduler view: the queue, the running plans, and the
                  four operator actions. The order of the queue and the
                  words on the reasons are the server's — see renderScheduler(). -->
-            <section id="scheduler-view" class="view hidden">
+            <!-- The plan cards start collapsed: the fold is a DOM
+                 attribute, so opening a card never changes a plan. -->
+            <section id="scheduler-view" class="view hidden" data-expanded="false">
                 <div class="view-header">
                     <h2>调度</h2>
                     <div class="view-header-actions">
@@ -122,6 +124,7 @@
                 <div id="scheduler-running-empty" class="empty-state">
                     <p>没有在跑的计划</p>
                 </div>
+                <div class="scheduler-plan-cards" id="scheduler-running-cards"></div>
                 <table id="scheduler-running-table" class="scheduler-table hidden">
                     <thead>
                         <tr>
@@ -139,6 +142,7 @@
                 <div id="scheduler-queue-empty" class="empty-state">
                     <p>队列为空</p>
                 </div>
+                <div class="scheduler-plan-cards" id="scheduler-queue-cards"></div>
                 <table id="scheduler-queue-table" class="scheduler-table hidden">
                     <thead>
                         <tr>

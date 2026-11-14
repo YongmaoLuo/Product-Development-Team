@@ -508,11 +508,12 @@ _SCHEDULER_DRIVER = r'''
 """Drive the scheduler panel and report the rows it shows.
 
 One question, two surfaces: what the plan list draws on its own, and
-what the scheduler panel draws.  The panel draws two tables: the
-**queue** and the running plans.  The queue is where a plan that is
-waiting is named — with the reason it is waiting and the actions a
-waiting plan can be given — so a plan the shutdown parked is named
-there, and the actions beside it are the ones an operator may press.
+what the scheduler panel draws.  The panel draws two blocks: the
+**queue** and the running plans, one card per plan.  The queue is
+where a plan that is waiting is named — with the reason it is waiting
+and the actions a waiting plan can be given — so a plan the shutdown
+parked is named there, and the actions beside it are the ones an
+operator may press.
 """
 import json
 import sys
@@ -566,20 +567,23 @@ def plan_cards(page):
 def panel_rows(page):
     """The queue the panel draws: ``(plan_id, reason, action buttons)``.
 
-    The queue's cells are the position, the plan, the number, the
-    priority, the promotion, the reason and the actions — so the plan
-    is the second cell, the reason the sixth, and the buttons are in
-    the last one.
+    The panel draws the waiting plans as **cards**, one per plan.  A
+    card carries the plan it is about in ``data-plan-id`` and the facts
+    the panel draws in ``data-fact`` attributes, so the plan is read
+    from the attribute, the reason from the fact the panel gave it,
+    and the buttons from the card's own action box.  The table the
+    panel used to draw the rows into (``#scheduler-queue-list``) is
+    still in the markup and carries no rows any more.
     """
     return page.evaluate(
         """() => Array.from(
-              document.querySelectorAll('#scheduler-queue-list tr')
-           ).map(row => {
-              const cells = row.querySelectorAll('td');
-              const actions = cells.length > 6 ? cells[6] : null;
+              document.querySelectorAll('#scheduler-queue-cards .scheduler-plan-card')
+           ).map(card => {
+              const reason = card.querySelector('[data-fact="reason"]');
+              const actions = card.querySelector('.scheduler-row-actions');
               return [
-                cells[1] ? cells[1].textContent.trim() : '',
-                cells[5] ? cells[5].textContent.trim() : '',
+                (card.dataset.planId || '').trim(),
+                reason ? (reason.dataset.value || '').trim() : '',
                 actions ? actions.querySelectorAll('button').length : 0,
               ];
            })"""
@@ -620,7 +624,13 @@ with sync_playwright() as driver:
 
     # The panel: the queue is the block that names a waiting plan.
     page.click("#btn-open-scheduler")
-    page.wait_for_selector("#scheduler-queue-list tr", timeout=30000)
+    # The panel draws the waiting plans as cards.  The table it used to
+    # draw the rows into is still in the markup and stays hidden, so a
+    # panel that drew rows in it again would make this wait time out.
+    page.wait_for_selector("#scheduler-queue-list", state="hidden", timeout=30000)
+    page.wait_for_selector(
+        "#scheduler-queue-cards .scheduler-plan-card", timeout=30000
+    )
     page.wait_for_timeout(500)
     report["rows"] = panel_rows(page)
     page.screenshot(

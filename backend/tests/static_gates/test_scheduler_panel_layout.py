@@ -27,8 +27,9 @@ in a source scan, so they are pinned here rather than at runtime.
 The rule
 --------
 * ``frontend/index.html``: the running block (its ``<h3>``, its empty
-  state and its table) comes before the queue block, and nothing else
-  is wedged between the two.
+  state and its **cards**) comes before the queue block, and nothing
+  else is wedged between the two.  Each block draws its plans as
+  cards, so the cards are what the block is made of.
 * The 「可操作的计划」 block is gone — its heading and its three element
   ids.
 * The 「终态计划」 block, which came back on 2026-10-31, is present
@@ -82,6 +83,16 @@ _REMOVED_WORDS = ("可操作的计划", "没有可操作的计划")
 _SUBTITLE_RE = re.compile(
     r"<h3[^>]*class=\"scheduler-subtitle\"[^>]*>(.*?)</h3>", re.DOTALL
 )
+
+#: The card container of each block.  The panel draws a block's plans
+#: as cards, so the cards are what the block is made of.
+_RUNNING_CARDS_ID = "scheduler-running-cards"
+_QUEUE_CARDS_ID = "scheduler-queue-cards"
+
+#: One fact of a card: the object that carries the name it is known by
+#: and the label it is drawn under.  A fact holds no object of its own,
+#: so it can be matched without counting braces.
+_FACT_RE = re.compile(r"\{[^{}]*?name:\s*\"(?P<name>[^\"]+)\"[^{}]*?\}", re.DOTALL)
 
 
 # ---------------------------------------------------------------------------
@@ -168,20 +179,37 @@ def _function_body(source: str, name: str) -> str:
     raise AssertionError(f"unterminated function {name}()")
 
 
+def _fact(body: str, name: str) -> str | None:
+    """Return the fact of *body* that is known by *name*.
+
+    A fact is the object a renderer hands to the card: it carries the
+    name it is known by, the label it is drawn under and the value it
+    shows.  It holds no object of its own, so it is matched without
+    counting braces.
+
+    Returns ``None`` when the body carries no such fact, so the caller
+    can fail with a message about the fact rather than about a regex.
+    """
+    for match in _FACT_RE.finditer(body):
+        if match.group("name") == name:
+            return match.group(0)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
 
-def test_running_table_before_queue_table() -> None:
+def test_running_cards_before_queue_cards() -> None:
     """The running block must be drawn before the queue block.
 
     The panel answers "what is running right now" before "what is
     waiting" — the queue is the remainder, and it used to sit above the
     answer.  The running block is a triple (heading, empty state,
-    table), and all three of them have to move together: a heading
-    above a table that lives further down is not a moved block, it is
-    a mismatched pair.
+    cards), and all three of them have to move together: a heading
+    above cards that live further down is not a moved block, it is a
+    mismatched pair.
 
     Nothing may be wedged between the two blocks either: a third block
     in the middle would put the answer back out of reach.
@@ -197,17 +225,17 @@ def test_running_table_before_queue_table() -> None:
     )
 
     running_empty_at = view.index('id="scheduler-running-empty"')
-    running_table_at = view.index('id="scheduler-running-table"')
+    running_cards_at = view.index(f'id="{_RUNNING_CARDS_ID}"')
     queue_empty_at = view.index('id="scheduler-queue-empty"')
-    queue_table_at = view.index('id="scheduler-queue-table"')
+    queue_cards_at = view.index(f'id="{_QUEUE_CARDS_ID}"')
 
-    assert running_at < running_empty_at < running_table_at < queue_at, (
+    assert running_at < running_empty_at < running_cards_at < queue_at, (
         "the running block is not whole: its heading, its empty state and "
-        "its table must all sit before the queue block's heading."
+        "its cards must all sit before the queue block's heading."
     )
-    assert queue_at < queue_empty_at < queue_table_at, (
+    assert queue_at < queue_empty_at < queue_cards_at, (
         "the queue block is not whole: its heading, its empty state and "
-        "its table must stay together."
+        "its cards must stay together."
     )
 
     between = [
@@ -274,32 +302,35 @@ def test_app_js_has_no_dangling_plans_call() -> None:
         )
 
 
-def test_queue_table_keeps_the_promotion_column() -> None:
-    """The queue must keep its 提升 column, and an absent promotion
+def test_queue_cards_keep_the_promotion_fact() -> None:
+    """The queue must keep its 提升 fact, and an absent promotion
     must still read as 「—」.
 
-    The column is the one number the queue adds to the plan list — how
-    far up the queue the plan was pushed — so removing a *block* must
-    not take a *column* with it.  The empty value stays a dash rather
-    than an empty cell: a blank cell reads as "not filled in yet",
-    while 「—」 reads as "there is nothing here", which is what an
+    The promotion is the one number the queue adds to the plan list —
+    how far up the queue the plan was pushed — so removing a *block*
+    must not take a *fact* with it.  The empty value stays a dash
+    rather than an empty cell: a blank cell reads as "not filled in
+    yet", while 「—」 reads as "there is nothing here", which is what an
     unpromoted plan means.
     """
-    view = _section_html(_source(_INDEX_HTML), "scheduler-view")
-
-    queue_table_at = view.index('id="scheduler-queue-table"')
-    header_end = view.index("</thead>", queue_table_at)
-    header = view[queue_table_at:header_end]
-    assert "提升" in header, (
-        "the queue table lost its 提升 column. The column is the queue's "
-        "own number — how far up the plan was pushed."
-    )
-
     body = _function_body(_source(_APP_JS), "renderSchedulerQueue")
+
     assert "promote_order" in body, (
         "renderSchedulerQueue() no longer reads promote_order; the 提升 "
-        "column would be empty for every row."
+        "fact would be empty for every card."
     )
+
+    fact = _fact(body, "promote_order")
+    assert fact is not None, (
+        "renderSchedulerQueue() has no promote_order fact any more; the "
+        "queue's own number — how far up the plan was pushed — would be "
+        "missing from every card."
+    )
+    assert 'label: "提升"' in fact, (
+        "the promote_order fact is not labelled 提升 any more; the card "
+        "would show a number nobody can read."
+    )
+
     assert '"—"' in body, (
         "renderSchedulerQueue() no longer falls back to 「—」 for a plan "
         "without a promotion. The dash says \"there is nothing here\"; an "

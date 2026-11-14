@@ -676,12 +676,16 @@ _GROUPING_SUFFIX = ")"
 #:
 #: Only the *producer* position is exempt.  The consumed side of the
 #: same command (``cp missing.txt out.txt``) still has to exist.
+#:
+#: ``install`` is here too (2026-11-01, 本分支的 VP-018 自建路径修复):
+#: ``install -m 755 src dst`` creates ``dst`` exactly like ``cp`` does.
 _PATH_CREATING_COMMANDS = {
     "ln": "last",
     "mkdir": "all",
     "touch": "all",
     "cp": "last",
     "mv": "last",
+    "install": "last",
 }
 
 #: An environment assignment in front of a command (``FOO=bar cmd``).
@@ -918,6 +922,21 @@ def _referenced_paths(entry: str, project_dir: Optional[Path] = None) -> List[st
     return referenced
 
 
+def _created_paths(entry: str) -> Set[str]:
+    """Repo-relative paths ``entry`` brings into being itself.
+
+    The counterpart of :func:`_referenced_paths`: the paths this entry
+    **creates** (``ln -s src dst`` creates ``dst``) rather than merely
+    reads.  Such a path is not an input the entry depends on, so the
+    existence check in :func:`validate_vp` does not apply to it.
+
+    Both halves are read from the same scan (:func:`_collect_entry_paths`),
+    so the two views can never disagree about where a command ends.
+    """
+    _referenced, created = _collect_entry_paths(entry)
+    return set(created)
+
+
 def _split_command_text(text: str) -> List[str]:
     """Split one command line into tokens, tolerating unbalanced quotes.
 
@@ -957,6 +976,22 @@ def _normalize_token(token: str) -> str:
     if not text:
         return ""
     return text.lstrip(_GROUPING_PREFIX).rstrip(_GROUPING_SUFFIX)
+
+
+def _token_ends_command(token: str) -> bool:
+    """Did this token carry the separator that ends its command?
+
+    ``backend/.venv;`` — the path and the separator are **one** token, so
+    the command ends there and the next token starts a new one.  A
+    separator that stands on its own (``&&`` / ``||`` / ``;`` …) is a
+    token of its own and is read as such; this is about the glued form.
+
+    Without this, the operand scan of the command *before* the
+    separator runs on into the next command and reads its words as its
+    own operands — ``ln -s src dst; bash run.sh`` would make ``run.sh``
+    the destination ``ln`` creates.
+    """
+    return len(token.rstrip(_COMMAND_SEPARATORS)) != len(token)
 
 
 def _shell_command_payload(tokens: List[str], index: int) -> Optional[int]:
@@ -1022,6 +1057,12 @@ def _command_operands(tokens: List[str], start: int) -> List[str]:
     The scan stops at the first separator: the operands belong to *this*
     command only.  ``--`` ends the option parsing — everything after it
     is an operand.
+
+    A separator **glued** to the end of a token (``backend/.venv;``)
+    ends the command too: that token is the command's last operand, and
+    the words after it belong to the next command.  Without this, ``ln
+    -s src dst; bash run.sh`` would make ``run.sh`` the destination
+    ``ln`` creates — and the created path would be wrong.
     """
     operands: List[str] = []
     options_done = False
@@ -1031,13 +1072,20 @@ def _command_operands(tokens: List[str], start: int) -> List[str]:
             # A separator (``&&`` / ``||`` / ``;`` …) or a lone bracket
             # ends this command.
             break
+        ends = _token_ends_command(token)
         if not options_done:
             if text == "--":
                 options_done = True
+                if ends:
+                    break
                 continue
             if text.startswith("-"):
+                if ends:
+                    break
                 continue
         operands.append(text)
+        if ends:
+            break
     return operands
 
 
@@ -1087,7 +1135,8 @@ def _collect_referenced_paths(
     at_command_start = True
 
     while index < len(tokens):
-        token = _normalize_token(tokens[index])
+        raw = tokens[index]
+        token = _normalize_token(raw)
         if not token:
             # A separator (``&&`` / ``||`` / ``;`` …): the next token
             # starts a new command.  A lone ``)`` lands here too — it is
@@ -1114,11 +1163,14 @@ def _collect_referenced_paths(
             continue
 
         if at_command_start and token == "cd" and index + 1 < len(tokens):
+            target_raw = tokens[index + 1]
             base = _resolve_cd_target(
-                base, _normalize_token(tokens[index + 1]),
+                base, _normalize_token(target_raw),
             )
             index += 2
-            at_command_start = False
+            # ``cd backend;`` — the command ends with its target, so the
+            # next token starts a new command.
+            at_command_start = _token_ends_command(target_raw)
             continue
 
         if at_command_start:
@@ -1129,7 +1181,10 @@ def _collect_referenced_paths(
         if _looks_like_path(token):
             out.append(_join_base(base, token))
 
-        at_command_start = False
+        # A token that carries the separator that ends its command
+        # (``backend/.venv;``) is the last token of that command: the
+        # next one starts a new one.
+        at_command_start = _token_ends_command(raw)
         index += 1
 
     return out
