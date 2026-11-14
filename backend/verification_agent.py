@@ -1845,6 +1845,156 @@ def _load_service_manager(project_dir: Any = None) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Which ``verification_ci_runner`` runs the gate? (2026-11-04, VP-012)
+# ---------------------------------------------------------------------------
+#
+# The 2026-11-04 round-4 failure repeated round 3's machine fact byte for
+# byte — the very same ``ci_entry 引用的路径不存在：backend/.venv)`` — and
+# differed only in the prose the judgment LLM wrote.  The loop therefore
+# read one defect as two ("the root cause has evolved") and opened a
+# root-cause task instead of a repair task.
+#
+# Why the same defect came back at all: the gate ran the **harness'**
+# runner, not the project's.  ``backend/__init__.py`` puts the *server's*
+# own ``backend/`` at ``sys.path[0]``, so the flat import
+# ``from verification_ci_runner import run_ci_verification`` resolved to
+# the checkout the long-running server had been started in — not to the
+# tree under test.  The project's fix was never executed.
+#
+# This is the same boundary :func:`_load_service_manager` already draws
+# ("the project's own module is loaded from its path, never from
+# ``sys.path``"), applied to the gate runner.
+
+
+#: The entry points the gate runner has to offer for the project's copy
+#: to be usable.  A project module that does not offer both is not
+#: usable here, and the loader falls back to the harness' copy.
+_CI_RUNNER_ENTRY_POINTS = ("run_ci_verification", "validate_vp")
+
+
+def _project_ci_runner_path(project_dir: Any) -> Optional[Path]:
+    """The project's own ``verification_ci_runner``, if it ships one.
+
+    ``<project_dir>/backend/verification_ci_runner.py`` — the layout every
+    ``backend/*.py`` module of this project family uses.
+    """
+    if not project_dir:
+        return None
+    try:
+        candidate = Path(project_dir) / "backend" / "verification_ci_runner.py"
+    except TypeError:
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def _load_ci_runner(project_dir: Any = None) -> Any:
+    """The ``verification_ci_runner`` module that belongs to *project_dir*.
+
+    Why this exists
+    ---------------
+    The gate a verification round runs must be **the project's** gate:
+    the round is about that tree, and a gate from another checkout
+    grades a deliverable the round never looked at.  While the runner
+    was imported by name, ``sys.path`` decided which copy ran — and
+    ``sys.path[0]`` is the *server's* own ``backend/``, so the runner
+    that ran was the one the server had been started with, whatever the
+    round was about.  On 2026-11-04 that is exactly what happened: the
+    tree under test carried the fix, the tree the server ran did not,
+    and the round reported the old tree's verdict three rounds running.
+
+    Resolution order:
+
+      1. ``<project_dir>/backend/verification_ci_runner.py`` — the
+         project's own module, loaded **from its path** (never from
+         ``sys.path``, so the harness' copy cannot shadow it);
+      2. The harness' own ``verification_ci_runner`` — the fallback, used
+         when the project ships no such module or when loading it fails.
+
+    The boundary this leaves behind
+    -------------------------------
+    The project's module does *flat* imports (``from bounded_subprocess
+    import run_bounded``, ``from credentials import _FD_ENV_PREFIX``) —
+    the convention every ``backend/*.py`` module follows, and the reason
+    ``backend/`` sits on ``sys.path``.  Those names therefore resolve to
+    the **harness'** copies, not to the project's.  That is acceptable as
+    long as the shared constants stay in step, and it is spelled out
+    here so it does not quietly become an implicit contract: if a
+    project ever needs its *own* ``bounded_subprocess``, the flat-import
+    convention has to change first.
+
+    Never raises — a project that cannot be loaded falls back to the
+    harness' module rather than taking the round down.
+    """
+    path = _project_ci_runner_path(project_dir)
+    if path is None:
+        import verification_ci_runner
+
+        return verification_ci_runner
+
+    try:
+        import hashlib
+        import importlib.util
+
+        # A name that is not ``verification_ci_runner``: ``sys.modules``
+        # already holds the harness' module under that name, and
+        # shadowing it would swap the harness' runner for the project's
+        # — the exact confusion this loader exists to prevent.  The
+        # digest keeps two projects apart when both are loaded in one
+        # process.
+        digest = hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:12]
+        module_name = f"pdt_project_ci_runner_{digest}"
+        spec = importlib.util.spec_from_file_location(module_name, str(path))
+        if spec is None or spec.loader is None:
+            raise ImportError(f"no loader for {path}")
+        module = importlib.util.module_from_spec(spec)
+        # Registered while it executes, so a module that looks itself up
+        # by ``__name__`` finds itself; removed again afterwards, so the
+        # registry keeps describing the harness' own modules.
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.modules.pop(module_name, None)
+        missing = [
+            name for name in _CI_RUNNER_ENTRY_POINTS
+            if not hasattr(module, name)
+        ]
+        if missing:
+            raise AttributeError(
+                f"{path} does not offer {', '.join(missing)}"
+            )
+        return module
+    except Exception as exc:  # noqa: BLE001 — a fallback, never a failure
+        logger.warning(
+            "[ci_runner] could not load the project's own "
+            "verification_ci_runner (%s); falling back to the harness' "
+            "copy: %s", path, exc,
+        )
+        import verification_ci_runner
+
+        return verification_ci_runner
+
+
+def _ci_runner_module_paths(project_dir: Any = None) -> List[str]:
+    """The files this round's gate runner actually runs from.
+
+    The freshness gate asks "is the code that is about to run the code
+    under test?".  This is the answer to that question: the file the
+    runner that will execute was loaded from.
+
+    Empty when the project ships no runner of its own — then the
+    harness' copy is the intended implementation and there is no
+    provenance claim to check.
+    """
+    path = _project_ci_runner_path(project_dir)
+    if path is None:
+        return []
+    module = _load_ci_runner(project_dir)
+    actual = getattr(module, "__file__", None)
+    return [str(actual)] if actual else []
+
+
+# ---------------------------------------------------------------------------
 # The round's service binding (2026-10-25, repair-r1-22)
 # ---------------------------------------------------------------------------
 #
@@ -2641,6 +2791,12 @@ def _failed_case_ids_from_evidence(evidence: Any) -> List[str]:
     rule that fired).  The junit fallback stays for evidence written by
     an older runner, which knew only the junit key.
 
+    2026-11-04: ``failure_identity`` is read **first**.  It is the
+    runner's own statement of what broke, and it also covers the gate
+    that never ran at all (rejected by the schema) — which has no
+    junit report to offer.  The junit node ids are the fallback, so
+    evidence written by earlier rounds keeps working.
+
     The set is deduplicated and sorted: the same case reported by two
     phases is one case, and a set is not a sequence.
     """
@@ -2651,6 +2807,15 @@ def _failed_case_ids_from_evidence(evidence: Any) -> List[str]:
         ids = {
             str(item).strip() for item in machine_written
             if str(item).strip()
+        }
+        if ids:
+            return sorted(ids)
+    identity = evidence.get("failure_identity")
+    if isinstance(identity, list):
+        ids = {
+            text for text in
+            (str(item or "").strip() for item in identity)
+            if text
         }
         if ids:
             return sorted(ids)
@@ -9053,6 +9218,17 @@ class Orchestrator:
             a verdict for a point the executor has no verdict for.  Such
             an entry keeps every field it came with.
 
+        2026-11-04: the executor's ``failed_assertions`` is backfilled
+        into the report entry **as well**.  The report is what the next
+        round reads to build the failure fingerprint, and the
+        fingerprint falls back to the judgment LLM's prose when it has
+        no machine-written ids — prose that differs every round, so the
+        same defect fingerprinted differently every round and the loop
+        read it as "the root cause has evolved".  The ids are the
+        executor's own record, so copying them changes nothing about
+        what the report says about the run; it only gives the
+        fingerprint something machine-written to hash.
+
         The report dict is updated **in place** and returned, so the
         caller may use the return value or ignore it.
         """
@@ -9105,6 +9281,20 @@ class Orchestrator:
                 failure_class_source = DEFAULT_FAILURE_CLASS_SOURCE
             entry["failure_class"] = failure_class
             entry["failure_class_source"] = failure_class_source
+            # 2026-11-04: the failing ids travel with the class — see the
+            # docstring.  Only the executor's own ids are copied, and
+            # only when it named some: an entry without them keeps the
+            # field it came with.
+            failed_assertions = source.get("failed_assertions")
+            if isinstance(failed_assertions, str):
+                failed_assertions = [failed_assertions]
+            if isinstance(failed_assertions, (list, tuple)):
+                ids = [
+                    str(item).strip() for item in failed_assertions
+                    if str(item).strip()
+                ]
+                if ids:
+                    entry["failed_assertions"] = sorted(set(ids))
         return report_data
 
     def _backfill_reuse_markers(
@@ -11140,6 +11330,12 @@ class Orchestrator:
 
         Never raises — :func:`verification_ci_runner.run_ci_verification`
         turns every failure mode into a FAILED verdict carrying its reason.
+
+        2026-11-04: the runner is loaded **from the project's tree**
+        (:func:`verification_ci_runner_loader.load_ci_runner`), not
+        imported by name.  A flat import resolved to whichever checkout
+        the long-running server had been started in, so the round graded
+        a tree it was not about.
 
         The round is handed to the runner **only when the runner can take
         it** (2026-11-10): the runner writes this round's copy of the
@@ -13977,8 +14173,16 @@ class Orchestrator:
         :func:`binary_freshness.check_binary_freshness` so the
         pre-flight hook (above) and this report-mutation method
         share the same FreshnessReport.
+
+        2026-11-04: the runner this round is going to run is named to
+        the check, so the gate can see that the code about to execute
+        comes from the tree under test.  The mtime check cannot see
+        that on its own — it only looks inside the tree it was handed.
         """
-        freshness = check_binary_freshness(self.project_dir)
+        freshness = check_binary_freshness(
+            self.project_dir,
+            expected_module_paths=_ci_runner_module_paths(self.project_dir),
+        )
         entry = freshness.to_framework_check_entry()
         report.setdefault("framework_checks", []).append(entry)
         if freshness.is_stale:
@@ -17040,9 +17244,30 @@ class Orchestrator:
         report it hands back.
         """
         freshness = check_binary_freshness(
-            self.project_dir, cache=self._freshness_cache,
+            self.project_dir,
+            cache=self._freshness_cache,
+            expected_module_paths=_ci_runner_module_paths(self.project_dir),
         )
         if not freshness.is_stale:
+            return None
+        if getattr(freshness, "provenance_violations", ()):
+            # 2026-11-04: a provenance failure is not a stale build — the
+            # bytes on disk are fine, they are just not the bytes this
+            # round is about.  There is nothing to rebuild; the fix is to
+            # load the right file.
+            #
+            # ``getattr`` on purpose: the freshness report is duck-typed
+            # by the callers' stubs, and a stand-in that predates the
+            # provenance dimension must not blow up the preflight.
+            #
+            # 2026-11-05 (merge): ``return None`` rather than a bare
+            # ``return`` — the method's contract is
+            # ``Optional[RebuildResult]`` and ``None`` is what "nothing
+            # was rebuilt" means to the round preflight that reads it.
+            logger.warning(
+                "[service_freshness] the code about to run does not come "
+                "from the tree under test: %s", freshness.detail,
+            )
             return None
         logger.warning(
             "[service_freshness] binary stale before service restart: "

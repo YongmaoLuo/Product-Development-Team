@@ -102,6 +102,10 @@ class FreshnessReport:
       * ``"SKIPPED"`` — project has no Rust/Python artefacts to
         check (e.g. JS-only repo). Downstream consumers treat
         SKIPPED as a no-op PASS.
+
+    ``provenance_violations`` names the modules that are about to run
+    but do **not** come from the tree under test (2026-11-04).  It is
+    empty unless the caller passed ``expected_module_paths``.
     """
 
     kind: str
@@ -112,6 +116,11 @@ class FreshnessReport:
     binary_path: Optional[str] = None
     newest_source_mtime: Optional[float] = None
     binary_mtime: Optional[float] = None
+    # Provenance dimension (see :func:`_provenance_report`): the
+    # modules that are about to run but do **not** come from the tree
+    # under test. Empty unless the caller passed
+    # ``expected_module_paths``.
+    provenance_violations: Tuple[str, ...] = ()
     # Scan-surface bookkeeping (see :func:`_tracked_py_files`).
     # ``scan_scope`` is ``'git_tracked'`` when the sources were taken
     # from git's index, ``'full_tree_fallback'`` when git could not be
@@ -161,6 +170,8 @@ class FreshnessReport:
             out["newest_source_mtime"] = self.newest_source_mtime
         if self.binary_mtime is not None:
             out["binary_mtime"] = self.binary_mtime
+        if self.provenance_violations:
+            out["provenance_violations"] = list(self.provenance_violations)
         return out
 
     def to_framework_check_entry(self) -> Dict[str, Any]:
@@ -724,10 +735,86 @@ def _check_pure_python(project_dir: Path) -> FreshnessReport:
     )
 
 
+def _is_under(path: Path, root: Path) -> bool:
+    """Is ``path`` inside ``root``?
+
+    Both sides are resolved first: the tree under test and the module
+    that is about to run are named by two different parties (the plan
+    and the loader), and neither of them promises an absolute path.
+    """
+    try:
+        resolved = Path(path).resolve()
+        base = Path(root).resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+    try:
+        resolved.relative_to(base)
+    except ValueError:
+        return False
+    return True
+
+
+def _provenance_report(
+    report: FreshnessReport,
+    project_dir: Path,
+    expected_module_paths: Any,
+) -> FreshnessReport:
+    """The provenance dimension: is the code that runs from *this* tree?
+
+    The mtime check can only see inside the tree it was handed — it
+    compares each ``.py`` with its sibling ``.pyc``.  That is the right
+    question for "is the bytecode in this tree older than its source",
+    and the wrong question for "is the code that is about to run in this
+    tree **at all**": the 2026-11-04 round ran a runner from a
+    *different* checkout (the one the long-running server had been
+    started in), and this gate reported ``PASSED`` for it — a guarantee
+    about a tree that was not being verified.
+
+    So the caller states which modules this round is going to run, and
+    a module that is not under ``project_dir`` is a FAILED freshness
+    report: the code is not the code under test.
+
+    The mtime verdict is kept as it is — this dimension *adds* a
+    reason, it does not replace one.
+    """
+    if not expected_module_paths:
+        return report
+    try:
+        paths = [Path(p) for p in expected_module_paths]
+    except (TypeError, ValueError):
+        return report
+
+    violations = [
+        str(p) for p in paths if not _is_under(p, project_dir)
+    ]
+    if not violations:
+        return report
+
+    detail = (
+        f"实际执行的模块来自 {violations[0]}，不在被测树 {project_dir} 下"
+        + (f"（共 {len(violations)} 个）" if len(violations) > 1 else "")
+    )
+    return FreshnessReport(
+        kind=report.kind,
+        status="FAILED",
+        detail=detail,
+        evidence=(
+            f"provenance violation: {detail}; "
+            f"the mtime verdict was {report.status} ({report.detail})"
+        ),
+        rebuild_command=report.rebuild_command,
+        binary_path=report.binary_path,
+        newest_source_mtime=report.newest_source_mtime,
+        binary_mtime=report.binary_mtime,
+        provenance_violations=tuple(violations),
+    )
+
+
 def check_binary_freshness(
     project_dir: Path,
     *,
     cache: Optional[FreshnessCache] = None,
+    expected_module_paths: Any = None,
 ) -> FreshnessReport:
     """One-shot freshness check, dispatching by project kind.
 
@@ -736,6 +823,22 @@ def check_binary_freshness(
     check, mtime syscalls included, whether or not a cache is passed.
     Passing one only builds a per-round record; see
     :class:`FreshnessCache`.
+
+    ``expected_module_paths`` (optional) is the **provenance**
+    dimension: the files of the modules this round is going to run.
+    A file that is not under ``project_dir`` makes the report FAILED
+    — the code that would run is not the code under test.  It is
+    opt-in: nobody passes paths, the verdict is exactly what it was.
+
+    What this gate does **not** cover
+    --------------------------------
+    It compares mtimes on disk, so it cannot see the **in-memory** state
+    of a long-running process: a server that imported a module before
+    the file was fixed keeps running the old code, and every mtime on
+    disk can be perfectly fresh.  That is why the runner is loaded
+    **from its path** (so a new load always reads the new bytes) and
+    why the provenance dimension exists at all — but neither of them
+    makes this gate sufficient.  It is necessary, not sufficient.
 
     Always returns a :class:`FreshnessReport`. Never raises — IO
     errors are converted to ``status="SKIPPED"`` with the error
@@ -771,6 +874,8 @@ def check_binary_freshness(
             detail=f"check failed: {exc}",
             evidence=f"{type(exc).__name__}: {exc}",
         )
+
+    report = _provenance_report(report, project_dir, expected_module_paths)
 
     if cache is not None:
         cache.put(report)
