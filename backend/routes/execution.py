@@ -71,6 +71,19 @@ from capacity_wait import WAIT_KIND_FIELD, quota_wait_event_data
 # ``server`` import above follows.
 import execution_log_tail
 
+# The bounded writer for the plan directory's logs, and the pump that
+# feeds it.  Imported by value: neither carries state a late binding
+# would have to preserve, and the bound they enforce is read when the
+# write happens — so a configuration change takes effect without a
+# reload.
+from bounded_log import RotatingLogSink, pump_stream_to_sink
+
+# The guardian of the log pipe — the reader that is not the backend, so
+# that a backend which dies does not take the executor's reader with it
+# (and the executor with it).  See :mod:`log_guardian` for why the pipe
+# needs one, and ``_BoundedLogPopen`` for where it is started.
+from log_guardian import spawn_guardian
+
 # The read model for "what may this plan's execution status be shown
 # as".  It is pure, and it lives in ``plan_status`` — the module that
 # owns "one plan, one status" — so the endpoint and the plan listing
@@ -1423,6 +1436,342 @@ def _executor_command(
     return cmd
 
 
+#: How long ``wait()`` waits for the log pump to finish after the child
+#: has exited.
+#:
+#: The pump is a thread reading the child's pipe, and the pipe ends
+#: when every process holding its write end closes it — the child, but
+#: also anything the child started that inherited the pipe.  A
+#: descendant that outlives the run therefore keeps the pump waiting,
+#: and the run's own bookkeeping must not wait for it: the join is
+#: bounded, and the log keeps whatever arrived.
+#:
+#: Five seconds is the same bound :mod:`bounded_subprocess` gives a
+#: signalled group's pipes.
+PUMP_JOIN_TIMEOUT = 5.0
+
+
+class _LineStream:
+    """A text stream whose ``read(n)`` hands back one line at a time.
+
+    A text-mode ``read(n)`` does not return what has arrived — it
+    blocks until ``n`` characters are there or the pipe ends.  A pump
+    built on it would leave the log empty until the child had written
+    64KB, which is the opposite of what the log is for: the status
+    page tails it while the run is going.
+
+    The newline is the unit the executor's own output already uses, so
+    reading a line at a time costs nothing and keeps the log live.
+    """
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+
+    def read(self, size: int = -1) -> str:
+        """The next line, or ``""`` once the stream has ended."""
+        return self._stream.readline()
+
+
+#: The stdlib's ``subprocess.Popen``, captured at import time.
+#:
+#: Python binds a base class when the class statement runs, so a class
+#: written as ``class _BoundedLogPopen(subprocess.Popen)`` keeps the
+#: class that was there when this module was imported — whatever
+#: replaces ``subprocess.Popen`` afterwards does not reach it.  That is
+#: the right behaviour for *inheriting* (a stand-in is not a class this
+#: could derive from), but it is also why the spawn cannot be the class
+#: itself: a stand-in installed later — a test that wants to intercept
+#: the spawn, a host that injects its own — would be bypassed, and the
+#: executor would really start.  So the snapshot is taken explicitly
+#: here, and the module-level :func:`Popen` below decides, at call
+#: time, which of the two applies.
+_STDLIB_POPEN = subprocess.Popen
+
+
+class _BoundedLogPopen(_STDLIB_POPEN):
+    """A ``Popen`` whose output is pumped into a bounded, rotating log.
+
+    What it is for
+    --------------
+    The executor's stdout used to be redirected straight into a file in
+    the plan directory.  That made the 64KB pipe deadlock impossible —
+    and it made the log unbounded, because a file nobody rotates grows
+    until the disk says stop.  One long run grew a single
+    ``repair_*.log`` past gigabytes.
+
+    Redirecting into a *bounded* writer means the child cannot write
+    into the file itself: that writer opens, appends and closes on
+    every write, so a rotation cannot leave the child writing into the
+    copy it just rotated aside.  The child's bytes therefore have to
+    come through a pipe, and somebody has to drain that pipe — which
+    is what this class is.
+
+    The contract
+    ------------
+    * **The pipe is always drained.**  A child blocked writing into a
+      pipe nobody reads never finishes, so the pump reads until EOF
+      whatever happens to the log.
+    * **The pipe is always drained by somebody.**  The pump is this
+      process's, and this process can die — a ``kill -9`` of the backend
+      closes the pipe's read end, and the executor's next write then
+      fails with ``EPIPE``, which kills an executor that writes a
+      heartbeat every hundred milliseconds.  So the pipe has a reader
+      that is not this process: the :mod:`log_guardian` guardian, which
+      holds the read end open and takes the draining over when this
+      process is gone.
+    * **The pump is joined by ``wait()``.**  When ``wait()`` returns,
+      the log holds everything the child wrote: a reader that takes
+      the tail gets the tail, not a half-written file.
+    * **The join is bounded.**  A descendant that inherited the pipe
+      can keep it open after the child is gone; ``wait()`` waits for
+      the child, then for the pump, but only for so long.
+    * **A timeout is a timeout.**  ``wait(timeout)`` that expires
+      raises ``TimeoutExpired`` and does *not* join the pump: the
+      child is still running, so its output is still coming.
+    * **A spawn that fails leaves nothing open.**  The sink is closed
+      and the error is re-raised as it was.
+    """
+
+    def __init__(self, *args: Any, log_sink: Any, **kwargs: Any) -> None:
+        """Start the child with its output on a pipe, and start the pump.
+
+        ``stdout``, ``stderr`` and the text settings are forced: the
+        pump reads text, and both streams go to the same log exactly
+        as they went to the same file before.
+        """
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.STDOUT
+        kwargs["text"] = True
+        kwargs["encoding"] = "utf-8"
+        kwargs["errors"] = "replace"
+        # The default (-1), not 0: the parent side of the pipe is
+        # buffered, so a read hands back what has arrived instead of
+        # waiting for a full buffer.
+        kwargs["bufsize"] = -1
+        try:
+            super().__init__(*args, **kwargs)
+        except BaseException:
+            # The sink was opened before the child was: a spawn that
+            # fails must not leave it open, and the error the caller
+            # sees must be the one that actually happened.
+            try:
+                log_sink.close()
+            except Exception:
+                pass
+            raise
+        self._log_sink = log_sink
+        self._pump_thread = threading.Thread(
+            target=self._pump_log,
+            name="pdt_log_pump",
+            daemon=True,
+        )
+        self._pump_thread.start()
+        self._guardian = self._start_guardian(log_sink)
+
+    def _start_guardian(self, log_sink: Any) -> Any:
+        """Start the guardian of the pipe — the reader that outlives us.
+
+        The pipe has one reader: this process.  A backend that is
+        killed takes its reader with it, and the executor's next write
+        into the pipe fails with ``EPIPE`` — which kills an executor
+        that writes a heartbeat every hundred milliseconds.  The
+        guardian holds the read end open, so the pipe never breaks, and
+        takes the draining over when this process is gone.
+
+        A guardian that cannot be started is not a failure: the run
+        goes on exactly as it would have without one.
+        """
+        try:
+            stdout = self.stdout
+            fileno = stdout.fileno() if stdout is not None else None
+            path = getattr(log_sink, "path", None)
+            if fileno is None or path is None:
+                return None
+            max_bytes = getattr(log_sink, "max_bytes", None)
+            return spawn_guardian(
+                log_fd=int(fileno),
+                log_path=Path(path),
+                backend_dir=_server._BACKEND_DIR,
+                max_bytes=int(max_bytes) if max_bytes else None,
+                child_pid=int(self.pid),
+            )
+        except Exception:  # noqa: BLE001 - the guardian is a protection, not a gate
+            return None
+
+    def _pump_log(self) -> None:
+        """Copy the child's output into the sink until the pipe ends."""
+        try:
+            pump_stream_to_sink(_LineStream(self.stdout), self._log_sink)
+        except Exception:  # noqa: BLE001 - the pump must not end the run
+            pass
+        finally:
+            self._close_sink()
+            self._release_guardian_reader()
+
+    def _release_guardian_reader(self) -> None:
+        """The pump is over: the backend is no longer the reader.
+
+        The guardian takes the pipe over from here — it is the only
+        reader left, and a pipe nobody drains is a pipe the executor
+        blocks on forever.  The backend's death does the same thing by
+        itself (the kernel closes its descriptors); this is the same
+        statement for the case where the backend is alive but has
+        stopped reading.
+
+        The guardian object is kept: the run still has to be able to
+        stop it when it ends.
+        """
+        guardian = getattr(self, "_guardian", None)
+        if guardian is None:
+            return
+        try:
+            guardian.release_reader()
+        except Exception:  # noqa: BLE001 - a protection, not a gate
+            pass
+
+    def _close_sink(self) -> None:
+        """Flush and close the sink — the log is complete once this ends."""
+        _close_log_sink(self._log_sink)
+
+    def wait(self, timeout: Optional[float] = None) -> int:
+        """Wait for the child, then for the log to be complete."""
+        try:
+            returncode = super().wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # The child is still running, so its output is still
+            # coming: joining the pump now would wait for a pipe that
+            # is still being written to.  The guardian stays too — the
+            # child is still writing into the pipe.
+            raise
+        self._join_pump()
+        self._stop_guardian()
+        return returncode
+
+    def _stop_guardian(self) -> None:
+        """The run is over: the guardian has nothing left to guard.
+
+        The guardian is a helper for the run, not a process of its own
+        to keep: it goes away with the run.  Stopping it is best-effort
+        — a guardian that cannot be stopped is residue, and it must not
+        turn a finished run into a failure.
+        """
+        guardian = getattr(self, "_guardian", None)
+        self._guardian = None
+        if guardian is None:
+            return
+        try:
+            guardian.stop()
+        except Exception:  # noqa: BLE001 - residue, not a failure
+            pass
+
+    def _join_pump(self) -> None:
+        """Wait for the pump to finish — but never for ever."""
+        self._pump_thread.join(PUMP_JOIN_TIMEOUT)
+
+
+def _close_log_sink(sink: Any) -> None:
+    """Flush and close a log sink — the log is complete once this ends.
+
+    Best-effort: a sink that cannot be closed must not mask the error
+    that is being reported — the error the caller cares about is the
+    one that actually happened, not the one a cleanup raised.
+    """
+    for name in ("flush", "close"):
+        close = getattr(sink, name, None)
+        if close is None:
+            continue
+        try:
+            close()
+        except Exception:
+            pass
+
+
+# The executor's spawn, under the name the spawn site uses.
+#
+# ``_BoundedLogPopen`` *is* a ``subprocess.Popen``; it only adds the
+# pump and the bounded writer behind it.  The name keeps the spawn site
+# reading like every other ``Popen`` call, and keeps the static gate
+# that proves "the executor is started in exactly one place" able to
+# find the spawn it looks for — that gate looks the construction up by
+# name.
+#
+# 2026-11-10: the name is a *function* now, not the class itself.  The
+# class cannot be the spawn site on its own: it is bound to the
+# stdlib's ``Popen`` at import time, so it would start the executor
+# even where something had replaced ``subprocess.Popen`` — and the
+# replacement is how a test intercepts the spawn.  The function below
+# looks the class up at call time instead, and the static gate still
+# finds the one construction it looks for by name.
+def Popen(*args: Any, log_sink: Any, **kwargs: Any) -> Any:
+    """Start the executor, pumping its output into ``log_sink``.
+
+    The lookup of ``subprocess.Popen`` happens here, when the child is
+    started — not when this module was imported.  That is what keeps
+    the seam effective: a test replaces ``subprocess.Popen`` to
+    intercept the spawn, and the replacement has to be the one that is
+    used.  A spawn bound to the class at import time would ignore the
+    replacement and start the real executor — the quietest way for a
+    test to stop testing what it says it tests.
+
+    Two paths, decided by that lookup:
+
+    * **Nobody replaced it** — the production case.  The child is
+      started through :class:`_BoundedLogPopen`, so its output goes
+      through the bounded, rotating log, and ``wait()`` still joins
+      the pump before it returns.
+    * **Somebody replaced it** — a test intercepting the spawn, or a
+      host injecting its own process class.  The stand-in *is* the
+      spawn then: it is called with the arguments the caller gave
+      (plus the envelope below), and whatever it returns is the
+      process the caller gets.
+
+    The stand-in is handed the envelope the executor has always been
+    launched with — its stdout is the log file, its stderr goes to
+    the same file, and it is unbuffered.  That envelope is a contract
+    rather than an implementation detail: the status route reads the
+    log, the stop path signals the process group, and the executor
+    resolves its own imports from the working directory.  A stand-in
+    handed a different envelope is not being handed the same spawn.
+
+    The error of a spawn that fails is the one that actually happened:
+    the stand-in's own exception, unchanged.
+    """
+    current = subprocess.Popen
+    if current is _STDLIB_POPEN:
+        return _BoundedLogPopen(*args, log_sink=log_sink, **kwargs)
+
+    # A stand-in is installed: it owns the spawn.  The sink is closed
+    # first — the stand-in knows nothing about a bounded writer, and
+    # nothing else would close it.
+    _close_log_sink(log_sink)
+
+    # The log file is opened for the stand-in's stdout.  It is opened
+    # for appending: the live log was truncated when the run started,
+    # and truncating it again would throw away what is already there.
+    log_file = open(str(log_sink.path), "a", encoding="utf-8")
+    try:
+        # Line buffering, so a reader that tails the log sees the
+        # child's output as it arrives.
+        log_file.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
+    call_kwargs = dict(kwargs)
+    call_kwargs.setdefault("stdout", log_file)
+    call_kwargs.setdefault("stderr", subprocess.STDOUT)
+    call_kwargs.setdefault("bufsize", 0)
+    try:
+        return current(*args, **call_kwargs)
+    finally:
+        # The child has its own copy of the descriptor, so the parent's
+        # copy is closed either way — the spawn succeeded, or it
+        # raised, and the error the caller sees is the stand-in's own.
+        try:
+            log_file.close()
+        except Exception:
+            pass
+
+
 def _spawn_executor_subprocess(
     plan_id: str,
     backend_dir: Path,
@@ -1474,6 +1823,27 @@ def _spawn_executor_subprocess(
     changes *what* runs and nothing else — the working directory, the
     session, the log file and the environment below are the same on
     both paths.
+
+    2026-10-31:
+
+    The log is bounded.  Redirecting the child's stdout straight into
+    a file made the pipe deadlock impossible, but it also made the log
+    unbounded: ``logs/repair_*.log`` and ``logs/executor_*.log`` were
+    bare files, and one long run grew one of them past gigabytes.
+
+    The fix cannot be "rotate the file the child writes into": a
+    writer that holds its handle open keeps writing into the copy it
+    just rotated aside.  So the child's bytes come through a pipe
+    again — a pipe that is *drained*, by the pump in
+    :class:`_BoundedLogPopen`, into the bounded writer of
+    :mod:`bounded_log`.  The deadlock the pipe used to risk is
+    prevented the way it is prevented everywhere else: somebody is
+    always reading, and a chunk that cannot be written is dropped
+    rather than allowed to stop the drain.
+
+    What the callers see does not move: the same ``(process, log_path)``
+    pair, the same path, and a log that is complete when ``wait()``
+    returns.
 
     Args:
         plan_id: identifies the plan — used for log file naming and
@@ -1554,17 +1924,24 @@ def _spawn_executor_subprocess(
         env.update(extra_env)
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_file = open(log_path, "w", encoding="utf-8")
 
-    # stdout/stderr → file (not PIPE) — avoids the 64KB pipe-buffer
-    # deadlock that hung R1-5 for 24h. ``bufsize=0`` + ``flush=True``
-    # on the log file ensures tail -f sees output in real time.
-    log_file.reconfigure(line_buffering=True)
-    process = subprocess.Popen(
+    # The live log exists before the child starts, and starts empty: a
+    # reader that asks for the log of a run that has not written
+    # anything yet must find a file, not a missing path.  The pump
+    # appends to it from here on.
+    log_path.write_bytes(b"")
+
+    sink = RotatingLogSink(log_path)
+
+    # stdout/stderr → a pipe the pump drains (not straight into the
+    # file) — the child cannot write into a file a rotation would move
+    # out from under it, and the drain is what keeps the 64KB
+    # pipe-buffer deadlock that hung R1-5 for 24h impossible.  The
+    # pump writes line by line, so tail -f still sees output in real
+    # time.
+    process = Popen(
         cmd,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        bufsize=0,
+        log_sink=sink,
         cwd=str(backend_dir),
         env=env,
         start_new_session=True,
