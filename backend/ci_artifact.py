@@ -127,6 +127,13 @@ CI_ARTIFACT_FIELDS: FrozenSet[str] = frozenset({
     "junit_stale_reports_removed",
     "failed_cases",
     "schema_issues",
+    # 2026-11-14: the **machine-written** identity of the failure — the
+    # ids of what broke, spelled out by the validator rather than by a
+    # model.  The runner writes it on both paths (the schema-failure
+    # path and the normal path), so the contract has to allow it; the
+    # key is spelled out literally on both sides so the derivation
+    # below can see it.
+    "failure_identity",
 })
 
 #: The keys every CI artifact carries, on every path.
