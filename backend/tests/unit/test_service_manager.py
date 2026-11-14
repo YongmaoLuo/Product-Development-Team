@@ -4420,6 +4420,96 @@ def test_a_declared_db_with_rows_still_refuses_an_empty_instance(tmp_path):
     assert sm._data_plane_is_acceptable(evidence, 4, _db_decl()) is False
 
 
+# ---------------------------------------------------------------------------
+# 2026-11-07 (VP-016): the instance's own answer decides when the database
+# it named cannot be read at all
+# ---------------------------------------------------------------------------
+#
+# The gate fell back to the round's own fixture whenever it could not read
+# the database the instance named.  A service that declares **and** answers
+# for one empty database of its own — a database that has not been created
+# yet — was refused for ever: the fixture held rows the copy never had and
+# never would have (2026-10-27, fact A, again).
+#
+# The instance's own answer is then the only fact about that database there
+# is, and it decides.
+
+
+def _unreadable_db_decl() -> ServiceDeclaration:
+    """A declaration naming a database that does not exist yet."""
+    return _decl(
+        name="api",
+        start_cmd=(
+            "export PDT_STATE_DB_PATH=$PWD/tmp/vp_load_rig/state.db "
+            "&& exec python -m api.server"
+        ),
+    )
+
+
+def test_an_instance_that_named_an_unreadable_db_is_judged_by_its_own_answer(
+    tmp_path, monkeypatch,
+):
+    """The declaration and the answer name one database — and it is not there.
+
+    There is no count of its own to be had, and the round's own fixture
+    says nothing about the database *this* instance serves.  The
+    instance's own answer is then the fact that decides: it says its
+    data plane holds no routing rows, so it is empty, and an empty
+    instance that serves the database it declared is acceptable
+    (2026-11-07, VP-016).
+    """
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "tmp" / "vp_load_rig" / "state.db"
+    assert not db.exists()
+    evidence = sm.DataPlaneEvidence(
+        verdict=sm.DATA_PLANE_EMPTY, plan_routing_rows=0,
+        state_db_path=str(db),
+    )
+
+    assert sm._data_plane_is_acceptable(
+        evidence, 4, _unreadable_db_decl(),
+    ) is True
+
+
+def test_an_instance_that_claims_rows_in_an_unreadable_db_is_refused(
+    tmp_path, monkeypatch,
+):
+    """The same unreadable database — but the instance claims rows in it.
+
+    A count the file cannot confirm is a contradiction: the instance says
+    its data plane holds routing rows while the verdict says it is empty.
+    Such an instance is refused, whatever the round's own fixture holds
+    (2026-11-07, VP-016).
+    """
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "tmp" / "vp_load_rig" / "state.db"
+    assert not db.exists()
+    evidence = sm.DataPlaneEvidence(
+        verdict=sm.DATA_PLANE_EMPTY, plan_routing_rows=3,
+        state_db_path=str(db),
+    )
+
+    assert sm._data_plane_is_acceptable(
+        evidence, 4, _unreadable_db_decl(),
+    ) is False
+
+
+def test_the_round_fixture_still_decides_when_no_db_is_named():
+    """Neither the declaration nor the answer names a database.
+
+    Then there is nothing of the instance's own to count, and the
+    round's own fixture is the only fact left — the judgement this
+    module made before (2026-11-07, VP-016).
+    """
+    decl = _decl(start_cmd="npx next dev -p 3000")
+    evidence = sm.DataPlaneEvidence(
+        verdict=sm.DATA_PLANE_EMPTY, plan_routing_rows=0, state_db_path="",
+    )
+
+    assert sm._data_plane_is_acceptable(evidence, 4, decl) is False
+    assert sm._data_plane_is_acceptable(evidence, 0, decl) is True
+
+
 def test_the_declared_state_db_path_is_read_off_the_declaration():
     """The declaration names the database — in the shape it spells it.
 

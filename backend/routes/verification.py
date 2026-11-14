@@ -17,7 +17,6 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from datetime import datetime
 import json
 import os
-import re
 import signal
 import sqlite3
 import threading
@@ -48,10 +47,6 @@ from verification_buckets import (
 # 模块级导入 —— 判定「这条 plan 走哪条分支」只有一个入口，见
 # :func:`plan_artifacts.detect`。
 from plan_artifacts import BRANCH_CONFLICT, detect
-
-# ``bounded_log`` 是叶子模块（只依赖 os / threading / pathlib / typing），所以这里可以
-# 安全地模块级导入 —— 轮转副本的命名规则只有一份实现，读侧与写侧不可能漂移。
-from bounded_log import rotated_log_paths
 
 router = APIRouter()
 
@@ -2459,106 +2454,6 @@ def get_verification_status(plan_id: str):
         raise HTTPException(404, {"error": "Plan not found", "detail": str(exc)})
 
 
-#: The suffix a rotated copy of a round log carries: ``<name>.1`` … ``<name>.N``.
-#: The highest number holds the oldest lines.
-_ROTATED_LOG_SUFFIX = re.compile(r"\.(\d+)$")
-
-
-def _rotated_copy_index(path: Path) -> Optional[int]:
-    """The copy number of a rotated log file, or ``None`` if it is not one.
-
-    ``None`` for every file that is not a rotated copy: the round log's
-    own name ends in ``.log``, and a file that merely looks like one
-    (``…log.bak``) holds no entries of this log.
-    """
-    match = _ROTATED_LOG_SUFFIX.search(path.name)
-    return int(match.group(1)) if match else None
-
-
-def _log_mtime(path: Path) -> float:
-    """The modification time of a log file, or ``0.0`` when it cannot be read.
-
-    A log is rotated aside while the plan runs, so a file that was there
-    a moment ago may be gone by the time it is read.  A reader that
-    raised on that would take the progress endpoint down with it, and
-    the file it lost is a file the plan has already moved on from.
-    """
-    try:
-        return path.stat().st_mtime
-    except OSError:
-        return 0.0
-
-
-def _log_family_candidates(base: Path) -> List[Path]:
-    """The files one round log's entries live in, oldest copy first.
-
-    The writer's rotation depth is the reader's depth
-    (:func:`bounded_log.rotated_log_paths`), and a copy that is still
-    on disk beyond that depth is included too — a copy that is there
-    holds entries, and a reader that cannot reach it loses them.
-
-    The order is chronological: the highest copy number holds the
-    oldest lines and the live file holds the newest, so a reader that
-    walks the candidates in order walks the entries in that order too.
-    A candidate that is not there is left out — most plans never
-    rotate, so most of the copies a reader looks for do not exist.
-    """
-    copies: Dict[int, Path] = {}
-    for candidate in rotated_log_paths(base):
-        index = _rotated_copy_index(candidate)
-        if index is not None and candidate.is_file():
-            copies[index] = candidate
-    for candidate in base.parent.glob(f"{base.name}.*"):
-        index = _rotated_copy_index(candidate)
-        if index is not None and candidate.is_file():
-            copies[index] = candidate
-
-    family = [copies[index] for index in sorted(copies, reverse=True)]
-    if base.is_file():
-        family.append(base)
-    return family
-
-
-def _round_log_families(logs_dir: Path) -> List[List[Path]]:
-    """Every round log's file family: the rotated copies, oldest first,
-    then the live file.
-
-    The verification round log is bounded and rotates (see
-    :mod:`bounded_log`): the live file keeps the newest lines and
-    everything before it lives in ``<name>.1`` … ``<name>.N``.  A
-    reader that reads only the live file loses the entries a rotation
-    moved aside — and what a rotation moves aside is the *old* half of
-    the log: the ``vp_start`` of a VP that is still running.
-
-    A family is rebuilt from its copies when the live file is gone (the
-    per-round cleanup archives it): the copy's name carries the live
-    file's name, so ``verification_1_x.log.1`` rebuilds
-    ``verification_1_x.log``.  This mirrors
-    ``verification_persistence.VerificationPersistenceManager._log_bases``.
-    """
-    bases: List[Path] = []
-    seen = set()
-    for path in sorted(logs_dir.glob("verification_*.log")):
-        if path.is_file() and path not in seen:
-            seen.add(path)
-            bases.append(path)
-
-    for copy_path in sorted(logs_dir.glob("verification_*.log.*")):
-        if not copy_path.is_file():
-            continue
-        if _rotated_copy_index(copy_path) is None:
-            continue
-        base = copy_path.with_name(copy_path.name[: copy_path.name.rindex(".")])
-        if base not in seen:
-            seen.add(base)
-            bases.append(base)
-
-    families = [_log_family_candidates(base) for base in bases]
-    # A family whose files all vanished between the two loops is empty,
-    # and an empty family has no newest member to compare.
-    return [family for family in families if family]
-
-
 def _read_latest_vp_start(plan_dir: Path, vp_id: str) -> Optional[str]:
     """Scan the round log files for the most recent ``vp_start`` event
     whose ``verification_point_id`` matches ``vp_id``.
@@ -2573,23 +2468,12 @@ def _read_latest_vp_start(plan_dir: Path, vp_id: str) -> Optional[str]:
     file with the largest round number contains the most recent
     run, so we sort by round (numeric) and return the first match
     we find. Round 0 is treated as a real round.
-
-    The round log rotates (see :mod:`bounded_log`), so the entries of
-    one round live in a *family* of files: the rotated copies
-    ``<name>.1`` … ``<name>.N`` and the live file.  All of them are
-    scanned — a rotation moves the *old* entries out of the live file,
-    and the entry this reader is looking for (the ``vp_start`` of a VP
-    that is still running) is exactly one of those.
     """
     logs_dir = plan_dir / "logs"
     if not logs_dir.exists():
         return None
 
-    log_files = [
-        candidate
-        for family in _round_log_families(logs_dir)
-        for candidate in family
-    ]
+    log_files = sorted(logs_dir.glob("verification_*.log"))
     if not log_files:
         return None
 
@@ -2606,7 +2490,7 @@ def _read_latest_vp_start(plan_dir: Path, vp_id: str) -> Optional[str]:
     # (The sibling ``_read_all_vp_starts`` scans every file and lets
     # the LAST write win keyed by round — that one also needs the same
     # treatment, see its comment.)
-    log_files.sort(key=_log_mtime, reverse=True)
+    log_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
 
     for log_file in log_files:
         try:
@@ -2646,22 +2530,12 @@ def _read_all_vp_starts(plan_dir: Path) -> Dict[str, str]:
     remembers the "primary" current VP via a semaphore-bounded
     scheduler, but the logs already record every parallel ``vp_start``
     so the dashboard can display all in-flight VPs at once.
-
-    The round log rotates (see :mod:`bounded_log`), so the entries of
-    one round live in a *family* of files: the rotated copies
-    ``<name>.1`` … ``<name>.N`` and the live file.  All of them are
-    scanned — a rotation moves the *old* entries out of the live file,
-    and a ``vp_start`` that was rotated out is still a ``vp_start``.
     """
     logs_dir = plan_dir / "logs"
     if not logs_dir.exists():
         return {}
 
-    log_files = [
-        candidate
-        for family in _round_log_families(logs_dir)
-        for candidate in family
-    ]
+    log_files = sorted(logs_dir.glob("verification_*.log"))
     if not log_files:
         return {}
 
@@ -2671,7 +2545,7 @@ def _read_all_vp_starts(plan_dir: Path) -> Dict[str, str]:
     # on verification restart, so yesterday's round-3 file outranked
     # today's round-2 file and supplied stale timestamps (same root
     # cause as the _read_latest_vp_start fix).
-    log_files.sort(key=_log_mtime)
+    log_files.sort(key=lambda p: p.stat().st_mtime)
 
     starts: Dict[str, str] = {}
     for log_file in log_files:
@@ -2729,71 +2603,55 @@ def _read_latest_round_state(
     free. The caller also needs ``last_vp_event`` to decide which of the
     two is genuinely the most recent thing that happened — that
     comparison cannot be made from either half alone.
-
-    One round is not one file.  The round log rotates (see
-    :mod:`bounded_log`): the live file keeps the newest lines and the
-    rotated copies ``<name>.1`` … ``<name>.N`` hold the ones before
-    them.  A ``vp_start`` is written early and its ``vp_complete``
-    late, so a rotation can land exactly between the two — and a reader
-    that reads one file sees half a VP, which is a VP that started and
-    never finished, which is a VP that is running.  So the whole family
-    of the newest round is read, oldest copy first, and only that
-    round's family: the earlier rounds' entries are not the current
-    ones.
     """
     logs_dir = plan_dir / "logs"
     if not logs_dir.exists():
         return {}, {}, {}
-    families = _round_log_families(logs_dir)
-    if not families:
+    log_files = sorted(
+        logs_dir.glob("verification_*.log"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    if not log_files:
         return {}, {}, {}
-    # The newest round is the family whose newest file was written last:
-    # the round counter is not monotonic (it resets on restart), so the
-    # modification time is what says which round is the current one.
-    family = max(families, key=lambda members: max(_log_mtime(m) for m in members))
     activity: Dict[str, Dict[str, str]] = {}
     judgment: Dict[str, Any] = {}
     last_vp: Dict[str, Any] = {}
-    for log_file in family:
-        try:
-            with open(log_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(entry, dict):
-                        continue
-                    et = entry.get("event_type")
-                    ts = entry.get("timestamp")
-                    vp_id = entry.get("verification_point_id")
-                    if et == "judgment_heartbeat":
-                        # Keep the LAST one, and only accept a usable
-                        # timestamp — a heartbeat with a malformed ts is not
-                        # a position in the timeline.
-                        if isinstance(ts, str):
-                            judgment = {
-                                "stage": (entry.get("data") or {}).get("stage")
-                                if isinstance(entry.get("data"), dict) else None,
-                                "vp_id": vp_id if isinstance(vp_id, str) else None,
-                                "ts": ts,
-                            }
-                        continue
-                    if et not in ("vp_start", "vp_complete"):
-                        continue
-                    if not isinstance(vp_id, str) or not isinstance(ts, str):
-                        continue
-                    slot = activity.setdefault(vp_id, {"start": "", "complete": ""})
-                    slot["start" if et == "vp_start" else "complete"] = ts
-                    last_vp = {"event_type": et, "vp_id": vp_id, "ts": ts}
-        except OSError:
-            # A file that cannot be read costs that file and nothing
-            # else: the round log is written while the plan runs, and
-            # the entries the other files hold are still the answer.
-            continue
+    try:
+        with open(log_files[-1], "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                et = entry.get("event_type")
+                ts = entry.get("timestamp")
+                vp_id = entry.get("verification_point_id")
+                if et == "judgment_heartbeat":
+                    # Keep the LAST one, and only accept a usable
+                    # timestamp — a heartbeat with a malformed ts is not
+                    # a position in the timeline.
+                    if isinstance(ts, str):
+                        judgment = {
+                            "stage": (entry.get("data") or {}).get("stage")
+                            if isinstance(entry.get("data"), dict) else None,
+                            "vp_id": vp_id if isinstance(vp_id, str) else None,
+                            "ts": ts,
+                        }
+                    continue
+                if et not in ("vp_start", "vp_complete"):
+                    continue
+                if not isinstance(vp_id, str) or not isinstance(ts, str):
+                    continue
+                slot = activity.setdefault(vp_id, {"start": "", "complete": ""})
+                slot["start" if et == "vp_start" else "complete"] = ts
+                last_vp = {"event_type": et, "vp_id": vp_id, "ts": ts}
+    except OSError:
+        return {}, {}, {}
     return activity, judgment, last_vp
 
 

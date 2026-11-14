@@ -53,6 +53,41 @@ backend/.venv/bin/python3 -m pytest backend/tests/<file>.py -xvs
     through a quota window, so it costs a 300 s timeout every run that
     reaches it.
 
+## CPU load tests
+
+A case that needs the host to be *busy* does not get to build its own busy
+loop. There is one sanctioned way to do it —
+`backend/tests/_load_rig.py::cpu_load` — and a static gate
+(`backend/tests/static_gates/test_no_ad_hoc_cpu_load_in_tests.py`) that
+fails the build when the test tree or `scripts/` grows a second one.
+
+```python
+from tests._load_rig import cpu_load
+
+def test_a_slow_path_still_returns_under_load() -> None:
+    with cpu_load(workers=2) as rig:
+        assert rig.iterations() >= 0
+```
+
+The rig starts real child processes, gives each one a counter slot, and
+**reclaims every one of them** when the block ends — including when the
+block ends by raising. Before it starts anything it asks the host whether
+it is idle; that question lives in `backend/tests/_host_load.py`, and a host
+already carrying someone else's work is skipped with the reason in the
+message rather than being measured.
+
+!!! warning "The load belongs to phase 3, never to the fast lane"
+    The rig makes the host busy on purpose, so a load case has to run
+    where a loaded host cannot invalidate the rest of the suite: phase 3,
+    the serial `time_sensitive or perf` phase of `scripts/run_tests.sh`
+    (the CI `time-sensitive` layer), and the nightly schedule.
+
+    The fast lane is parallel. A load case running there would have the
+    load and the parallel workers competing for the same cores, so the
+    number that came out describes the machine rather than the code under
+    test. `_load_rig` never runs outside phase 3 / nightly, and a load
+    case never runs in the fast lane at all.
+
 ## Running in parallel
 
 `pytest-xdist` is installed in `backend/.venv`.

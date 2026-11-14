@@ -18,6 +18,7 @@ import os
 import socket
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -130,6 +131,44 @@ def _stub_run(monkeypatch, lsof_out, ps_cmd_out, ps_lstart_out):
     )
 
 
+@contextmanager
+def _reserved_port():
+    """Hold an ephemeral port for the duration of the block.
+
+    The socket is bound but never listened on, and it is kept open, so
+    the number stays ours for as long as the block runs — nothing
+    accepts connections on it either, which is the premise the "no
+    listener" cases need.
+
+    A written-down port is a port another checkout may already hold,
+    and the case would then fail for a reason that has nothing to do
+    with what it is about.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    try:
+        yield sock.getsockname()[1]
+    finally:
+        sock.close()
+
+
+def _stub_port_is_listening(monkeypatch, result):
+    """Pin the corroborating connect probe to *result*.
+
+    Returns the list of ports the probe asked about, so a test can
+    assert the question was actually asked — a stub that silently
+    stops matching is worse than no stub (see _stub_run).
+    """
+    asked = []
+
+    def fake(port, host="127.0.0.1"):
+        asked.append(port)
+        return result
+
+    monkeypatch.setattr("service_freshness._port_is_listening", fake)
+    return asked
+
+
 def test_probe_listening_process(monkeypatch) -> None:
     from service_freshness import probe_port
     _stub_run(monkeypatch, "4984\n", "/proj/venv1/bin/uvicorn api.api_server:app",
@@ -142,7 +181,7 @@ def test_probe_listening_process(monkeypatch) -> None:
     assert probe.error == ""
 
 
-def _stub_no_listener(monkeypatch) -> None:
+def _stub_no_listener(monkeypatch):
     """把佐证探测固定成「没人听」。
 
     2026-11-08：``probe_port`` 在 ``lsof`` 说没人持有时会再用
@@ -154,29 +193,108 @@ def _stub_no_listener(monkeypatch) -> None:
 
     被测对象是 **lsof 分支**，不是佐证探测，所以这里把它固定住：用例不密封
     不是产品缺陷。断言与端口号一字不改。
+
+    2026-11-14：固定动作交给 ``_stub_port_is_listening`` 去做 —— 它做的是
+    同一件事（把佐证探测钉成「没人听」），但把**被问到的端口**也记了下来，
+    于是用例还能断言「这个问题真的被问了」，而不是只看到一个被钉死的
+    返回值。这里把那份记录一并返回，两侧的能力就都在了。
     """
-    monkeypatch.setattr(
-        "service_freshness._port_is_listening", lambda *a, **k: False,
-    )
+    return _stub_port_is_listening(monkeypatch, False)
 
 
 def test_probe_no_listener(monkeypatch) -> None:
     from service_freshness import probe_port
     _stub_run(monkeypatch, "", None, None)
-    _stub_no_listener(monkeypatch)
-    probe = probe_port(8080)
+    # The corroborating connect is pinned to "nothing answers here".
+    # Without this the case would read the host's real state for the
+    # port it happens to name, and a machine where something else is
+    # listening there would fail it for a reason that has nothing to
+    # do with what it is about.
+    #
+    # The pin itself is ``_stub_no_listener`` — the helper main's #162
+    # introduced for exactly this hazard — and the port is a reserved
+    # one rather than a written-down 8080, so the case cannot be moved
+    # by whatever else the host happens to be listening on.
+    asked = _stub_no_listener(monkeypatch)
+    with _reserved_port() as port:
+        probe = probe_port(port)
     assert probe.listening is False
     assert probe.pids == []
     assert probe.error == ""
+    # The probe really did ask the second question — a stub that
+    # silently stopped matching would leave this green for the wrong
+    # reason.
+    assert asked == [port]
 
 
 def test_probe_lsof_failure_sets_error(monkeypatch) -> None:
     from service_freshness import probe_port
     monkeypatch.setattr("service_freshness._run_probe_cmd", lambda *a, **k: None)
-    _stub_no_listener(monkeypatch)
-    probe = probe_port(8080)
+    # Same hazard as above, same two answers: the corroborating connect
+    # is pinned to "nothing answers here" (``_stub_no_listener``), and
+    # the port asked about is a reserved one rather than a written-down
+    # 8080 — so the case cannot be moved by the host's real port table.
+    asked = _stub_no_listener(monkeypatch)
+    with _reserved_port() as port:
+        probe = probe_port(port)
     assert probe.listening is False
     assert "lsof" in probe.error
+    assert asked == [port]
+
+
+def test_probe_reports_a_live_port_that_lsof_did_not_name(monkeypatch) -> None:
+    """The corroborating connect must be able to overrule an empty lsof.
+
+    lsof returning nothing means "nothing is listening" *or* "lsof is
+    missing" *or* "lsof timed out under load" — only the kernel's
+    connect answer tells those apart, and believing the empty lsof here
+    means declaring a live service stopped.
+
+    The socket below is real and `_port_is_listening` is deliberately
+    NOT stubbed: if the probe ever stopped asking the kernel, this
+    case would go green for the wrong reason.
+    """
+    from service_freshness import probe_port
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+    try:
+        _stub_run(monkeypatch, "", None, None)  # lsof: no holder
+        probe = probe_port(port)
+        assert probe.listening is True
+        assert "lsof reported no holder" in probe.error
+        assert "accepts connections" in probe.error
+    finally:
+        server.close()
+
+
+def test_probe_reports_a_live_port_when_lsof_failed(monkeypatch) -> None:
+    """A failed lsof must not be read as "the port is free".
+
+    Same real socket, same deliberately unstubbed corroboration: if
+    the probe ever stopped asking the kernel, this case would go green
+    for the wrong reason.
+    """
+    from service_freshness import probe_port
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+    try:
+        monkeypatch.setattr(
+            "service_freshness._run_probe_cmd", lambda *a, **k: None,
+        )
+        probe = probe_port(port)
+        assert probe.listening is True
+        assert "lsof" in probe.error
+        assert "port is listening but owner unknown" in probe.error
+    finally:
+        server.close()
 
 
 def test_probe_protected_port_refused() -> None:

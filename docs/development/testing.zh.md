@@ -49,6 +49,34 @@ backend/.venv/bin/python3 -m pytest backend/tests/<file>.py -xvs
     排不掉它的原因。那个文件会 sleep 过一整个配额窗口，所以每跑到它就要付
     一次 300 秒超时。
 
+## CPU 负载测试
+
+需要让机器「忙起来」的用例不能自己手搓忙循环。仓库里只有一个被认可的做法 ——
+`backend/tests/_load_rig.py::cpu_load` —— 而且有一道静态门禁
+（`backend/tests/static_gates/test_no_ad_hoc_cpu_load_in_tests.py`）在测试树或
+`scripts/` 里再长出第二种写法时把构建打红。
+
+```python
+from tests._load_rig import cpu_load
+
+def test_a_slow_path_still_returns_under_load() -> None:
+    with cpu_load(workers=2) as rig:
+        assert rig.iterations() >= 0
+```
+
+这个装置起的是真的子进程，每个进程占一个计数槽；块结束时**每一个都被收回来** ——
+包括块因为抛异常而结束的时候。它在起任何进程之前会先问一句「这台机器空闲吗」：
+判据在 `backend/tests/_host_load.py`，机器本来就扛着别的活的时候，用例会被 skip
+并把理由写进 skip 消息，而不是硬撑着去测。
+
+!!! warning "负载只属于 phase 3，绝不属于 fast lane"
+    装置是故意把机器跑忙的，所以负载用例必须待在一个「机器一忙就不会连累整套测试」
+    的地方：phase 3 —— `scripts/run_tests.sh` 里串行的 `time_sensitive or perf`
+    那一段（CI 的 `time-sensitive` 层）—— 以及 nightly 计划。
+
+    fast lane 是并行的，负载和并行 worker 抢同一批核，测出来的数字描述的是机器，
+    不是被测的代码。`_load_rig` 只在 phase 3 / nightly 里跑 —— fast lane 里一条都不跑。
+
 ## 并行跑
 
 `pytest-xdist` 已经装在 `backend/.venv` 里。下面这组数字取自一台 10 核机器（跑的

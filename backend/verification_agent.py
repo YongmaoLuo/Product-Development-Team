@@ -72,12 +72,6 @@ from verification_ci_runner import (
     E2E_METHOD,
     ENTRY_COMMAND_FIELD,
 )
-# 2026-11-09（PRD 缺陷三 / 验收标准 3）：计划目录下的框架日志一律有上限。
-# 轮次验证日志有**两个**写者 —— persistence 写 per-VP 的那半，
-# orchestrator 的 group log 写 group 级的那半 —— 而文件的上限只由写者
-# 决定：两个写者里少一个带轮转，整个文件就是无上限的。两个写者走同一个
-# ``append_bounded_line``，共用同一把 per-path 锁，所以不会互相撕裂。
-from bounded_log import append_bounded_line
 from verification_persistence import VerificationPersistenceManager
 from verification_profile import ExecutionProfileGenerator
 from verification_split import SplitDecision
@@ -7676,13 +7670,6 @@ class Orchestrator:
         + ``vp_count`` + ``data`` next to the timestamp so that an
         operator scanning the log can size each group at a glance.
 
-        The write goes through :func:`bounded_log.append_bounded_line`,
-        so the round log stays bounded: the file has two writers, and
-        a file is only as bounded as the least bounded of them.  The
-        bounded writer also takes the same per-path lock as the
-        persistence manager's, so the two writers cannot tear each
-        other's lines apart when one of them rotates the file.
-
         Output schema (one JSON object, one line, ``\\n`` terminated):
 
         ::
@@ -7703,7 +7690,7 @@ class Orchestrator:
         Boundary contract:
 
         * **Log file unwritable** — ``OSError``/``PermissionError``
-          from the underlying bounded write propagates to the
+          from the underlying ``open(..., "a")`` propagates to the
           caller verbatim. The caller is expected to catch it
           locally so the VP execution loop is not affected; this
           function deliberately does **not** swallow the error.
@@ -7742,10 +7729,8 @@ class Orchestrator:
             "data": data,
         }
 
-        append_bounded_line(
-            log_file,
-            json.dumps(entry, ensure_ascii=False) + "\n",
-        )
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     async def _execute_group(
         self,
