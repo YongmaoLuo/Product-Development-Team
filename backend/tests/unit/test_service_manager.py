@@ -513,22 +513,28 @@ def test_start_service_launches_detached_and_waits(project, monkeypatch):
     monkeypatch.setattr(sm, "_process_group_of", lambda pid: pid)
     monkeypatch.setattr(sm, "_process_start_epoch", lambda pid: 1.0)
 
-    runtime = sm.start_service(_decl(), project)
+    decl = _decl()
+    runtime = sm.start_service(decl, project)
 
     assert runtime.ready is True
     assert runtime.origin == "spawned"
     assert runtime.pid == 999999
-    # The spawn is told apart from every other subprocess by its shape:
-    # the CI gate's spawn registry costs one ``ps`` on this path, and
-    # that ``ps`` is a ``Popen`` call too.
-    spawns = [call for call in spawned if _is_the_service_spawn(call[0])]
-    assert len(spawns) == 1, (
-        "the spawn path started a different number of services: "
-        f"{spawned!r}"
+    # The service is the spawn that carries the declared command.  The
+    # spawn path is allowed to start other processes of its own, and a
+    # recorder that took "the last one" would watch one of those and
+    # call it the service.
+    service = [
+        call for call in spawned
+        if call[0] and call[0][-1] == decl.start_cmd
+    ]
+    assert len(service) == 1, (
+        f"the declared command reached {len(service)} spawns, not one: "
+        f"{[call[0][-1] for call in spawned]!r}"
     )
-    # Exactly one spawn is the service's own: the start path also probes
-    # the machine (``ps -o lstart=``), and a probe that is captured as
-    # the spawn leaves the assertions below reading the probe.
+    # The spawn is told apart from every other subprocess by its shape:
+    # the start path may also probe the machine (``ps -o lstart=``), and
+    # a probe that is captured as the spawn leaves the assertions below
+    # reading the probe.
     assert len(intercepted) == 1, (
         "the capture took %d spawns; only the service's own is meant to "
         "be captured" % len(intercepted)
@@ -536,7 +542,7 @@ def test_start_service_launches_detached_and_waits(project, monkeypatch):
     # The command is started through the wrapper: the wrapper's own
     # program comes first, and the declared command follows it verbatim
     # -- never re-parsed, never re-quoted.
-    argv, kwargs = spawns[0]
+    argv, kwargs = service[0]
     assert argv[0] == (sys.executable or "/usr/bin/python3")
     assert argv[1] == "-c"
     assert argv[3:] == ["/bin/bash", "-lc", "npx next dev -p 3000"]
@@ -709,6 +715,149 @@ def test_read_ledger_round_trips(tmp_path: Path):
 
     assert data["services"][0]["name"] == "api"
     assert data["services"][0]["pgid"] == 33
+
+
+def _ledger_holding_the_declared_port(pid: int = 1000):
+    """A service view whose only entry holds the declared port.
+
+    The **events** shape: the unified process ledger's service view
+    names the services it holds and nothing else — no plan, no
+    project.  That is the shape the whole-file ledger's ``plan_id``
+    key used to provide, and it is the shape every ledger of a plan
+    started on the unified ledger has.
+    """
+    return {
+        "services": [
+            {
+                "port": 3000,
+                "pid": pid,
+                "cwd": ".",
+                "start_cmd": "npx next dev -p 3000",
+            },
+        ],
+    }
+
+
+def test_a_ledger_record_belongs_to_the_plan_that_keeps_it(
+    tmp_path: Path, monkeypatch,
+):
+    """The holder of a port is attributed to the plan whose ledger records it.
+
+    A ledger that names no plan cannot be claimed by whoever happens to
+    be asking.  The ledger lives in the plan's own directory, so the
+    directory says whose service it is.
+
+    The attribution is what the ownership rules stand on.  Without it
+    the rules cannot tell the plans apart: another plan's service is
+    taken for our own leftover, stopped, and its port taken back --
+    and the round that was using it loses the service between two VPs.
+    """
+    other_plan = tmp_path / "other-plan"
+    other_plan.mkdir()
+    monkeypatch.setattr(
+        sm, "read_ledger", lambda plan_dir: _ledger_holding_the_declared_port(),
+    )
+
+    evidence = sm._ledger_holder_evidence(
+        other_plan, _decl(), _probe(3000, ["npx next dev -p 3000"]),
+    )
+
+    assert evidence is not None, "the ledger's record was not found"
+    assert evidence["plan_id"] == "other-plan", (
+        f"the record is attributed to {evidence['plan_id']!r}, not to the "
+        f"plan whose ledger keeps it"
+    )
+
+
+def test_another_plans_record_is_not_taken_for_our_leftover(
+    tmp_path: Path, monkeypatch,
+):
+    """Another plan's record on the declared port is not ours to reclaim."""
+    other_plan = tmp_path / "other-plan"
+    other_plan.mkdir()
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    monkeypatch.setattr(
+        sm, "read_ledger", lambda plan_dir: _ledger_holding_the_declared_port(),
+    )
+    # The ledger record is the only evidence there is: the holder cannot
+    # be placed in a workspace, so the weaker fallback has nothing to
+    # go by.
+    monkeypatch.setattr(
+        sm, "_workspace_evidence", lambda decl, proj, probe: None,
+    )
+
+    evidence = sm._holder_evidence(
+        _decl(), project_dir, _probe(3000, ["npx next dev -p 3000"]),
+        plan_dir=other_plan, plan_id="our-plan",
+    )
+
+    assert evidence is None, (
+        "another plan's ledger record was taken for our own leftover: "
+        f"{evidence!r}"
+    )
+
+
+def test_a_live_rounds_record_does_not_hide_our_own_leftover(
+    tmp_path: Path, monkeypatch,
+):
+    """Another round's live service must not cost this round its port.
+
+    Two plans' ledgers name the same port.  One belongs to a round that
+    is running right now: its service is **in use**, not a leftover.
+    The other belongs to this plan's earlier round: a leftover nobody
+    owns any more.
+
+    The search used to stop at the first record it met, so the live
+    round's record answered for the port and this round never found
+    its own leftover — it lost the port it had declared and had to
+    relocate.  The live record is now weighed against the record the
+    search ends up with instead of replacing it.
+    """
+    plans = tmp_path / "plans"
+    our_plan = plans / "our-plan"
+    other_plan = plans / "other-plan"
+    for plan in (our_plan, other_plan):
+        plan.mkdir(parents=True)
+        (plan / sm.LEDGER_FILENAME).write_text("{}\n", encoding="utf-8")
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+
+    ledgers = {
+        our_plan: {
+            "plan_id": "our-plan",
+            "services": [_entry(pid=4242, owner_token="")],
+        },
+        other_plan: {
+            "plan_id": "other-plan",
+            "services": [_entry(pid=1000, owner_token="live-token")],
+        },
+    }
+    monkeypatch.setattr(sm, "_plans_tree", lambda: plans)
+    monkeypatch.setattr(
+        sm, "read_ledger", lambda plan_dir: ledgers.get(Path(plan_dir), {}),
+    )
+    # The other plan's round is running right now.
+    monkeypatch.setattr(
+        sm, "live_service_owners", lambda plan_dir: ["live-token"],
+    )
+    probe = PortProbe(
+        port=3000, listening=True, pids=[1000, 4242],
+        cmdlines=["npx next dev -p 3000"], process_start_epoch=None,
+    )
+
+    evidence = sm._holder_evidence(
+        _decl(), project_dir, probe, plan_dir=None, plan_id="",
+    )
+
+    assert evidence is not None, (
+        "the live round's record hid this round's own leftover: "
+        f"{evidence!r}"
+    )
+    assert evidence["pid"] == 4242, (
+        f"the leftover that was reclaimed is pid {evidence['pid']}, not "
+        f"the one this plan's ledger records (4242)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -6173,3 +6322,95 @@ def test_the_stop_path_still_signals_a_service_whose_clock_read_was_late(
     finally:
         if runtime.pid:
             _force_cleanup(runtime.pid)
+
+
+# ---------------------------------------------------------------------------
+# The readiness wait's wall-clock bound
+# ---------------------------------------------------------------------------
+#
+# The bound is production's: ``service_manager._adaptive_ready_timeout``
+# (``backend/service_manager.py:3259``) -- the number the readiness
+# wait is given before it starts asking whether the service answers.  A
+# declared timeout is a promise made about a machine with nothing else
+# running on it, so the bound is widened with the host load; and it is
+# *never* shortened, because the declared value is the floor the caller
+# asked for.
+
+
+def test_adaptive_ready_timeout_widens_with_the_host_load(monkeypatch):
+    """A busy host gets more wall clock, not less.
+
+    The load average is twice the number of cpus, so the bound is
+    doubled: the service may be answering perfectly well and still miss
+    a wall clock that was measured on an idle machine.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (8.0, 8.0, 8.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 4)
+
+    assert sm._adaptive_ready_timeout(10.0) == 20.0, (
+        "the wait must be widened by the host's load"
+    )
+
+
+def test_adaptive_ready_timeout_never_shortens(monkeypatch):
+    """The declared bound is a floor, not a starting point.
+
+    A host with capacity to spare keeps the bound the caller declared:
+    the wait may grow, it may not shrink.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (0.5, 0.5, 0.5))
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+
+    assert sm._adaptive_ready_timeout(10.0) == 10.0, (
+        "a quiet host must not be given less wall clock than was declared"
+    )
+
+
+def test_adaptive_ready_timeout_keeps_the_declared_bound_at_the_cpus(
+    monkeypatch,
+):
+    """A host that is exactly as loaded as it is wide keeps its bound.
+
+    The load *equals* the number of cpus: the host is busy, but not
+    busier than it is wide.  The bound stands.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (4.0, 4.0, 4.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 4)
+
+    assert sm._adaptive_ready_timeout(10.0) == 10.0
+
+
+def test_adaptive_ready_timeout_stops_at_its_ceiling(monkeypatch):
+    """A pathological load cannot turn the wait into a hang.
+
+    The widening is capped, so a host that reports a load average of a
+    thousand still gets a bounded wait: a bound that grows without end
+    turns a service that will never come up into a wait that never
+    ends.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (1000.0, 1000.0, 1000.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 1)
+
+    assert sm._adaptive_ready_timeout(10.0) == 10.0 * sm._READY_TIMEOUT_MAX_FACTOR, (
+        "the widening must stop at its ceiling"
+    )
+
+
+@pytest.mark.parametrize("error", [OSError, AttributeError])
+def test_adaptive_ready_timeout_keeps_the_declared_bound_without_a_load(
+    monkeypatch, error,
+):
+    """A host that cannot report its load keeps the declared bound.
+
+    The bound is never read from the load when there is no load to
+    read: the declared value is the answer, and a host that cannot
+    answer the question must not cost the caller the wait it asked for.
+    """
+    def _no_load():
+        raise error("no load average here")
+
+    monkeypatch.setattr(os, "getloadavg", _no_load)
+
+    assert sm._adaptive_ready_timeout(10.0) == 10.0, (
+        "a host without a load average keeps the declared bound"
+    )

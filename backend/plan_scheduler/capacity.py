@@ -234,6 +234,31 @@ def _started_epoch(value: Any) -> Optional[float]:
     return None
 
 
+def _safe_priority(row: Any) -> int:
+    """Return the priority the slot carries, or ``0`` when it carries none.
+
+    A priority is a whole number.  A value that is missing, ``NULL``,
+    a boolean, a string or a number that is not whole reads as ``0`` —
+    the weight every plan carries when nothing says otherwise.
+
+    The reading never lifts a plan to the front of the order by
+    accident: a priority the ledger cannot read leaves the plan at the
+    ordinary weight, and the runtime decides among the plans that
+    share it.  A boolean is not a number here (``True`` is not ``1``),
+    and a string is not a number either — the priority is written down
+    as a number, and anything else is a value the ledger does not know
+    how to compare.
+    """
+    value = _field(row, "priority", 0)
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return 0
+
+
 def _to_iso(epoch: float) -> str:
     """Return the moment as the state database writes timestamps."""
     return (
@@ -423,8 +448,11 @@ class CapacityLedger:
 
         Each candidate carries what the policy needs to choose among
         them: the plan id, the moment the slot was taken, the moment the
-        plan was created (``None`` when that is unknown) and how long
-        the plan has been running.
+        plan was created (``None`` when that is unknown), how long the
+        plan has been running and **the priority the slot holds** — the
+        number the policy reads first, because the plan that stands
+        last in the line is the one that goes.  A priority the ledger
+        cannot read is ``0``.
 
         The order is the ledger's own — the runtime start first, ties
         broken by plan id — so two calls answer in the same order and a
@@ -438,9 +466,9 @@ class CapacityLedger:
 
         Returns:
             The plans that may be interrupted, each a dict of
-            ``plan_id``, ``acquired_at``, ``created_at`` and ``elapsed``.
-            Empty when there is nobody to interrupt, which is an answer
-            and not an error.
+            ``plan_id``, ``acquired_at``, ``created_at``, ``elapsed`` and
+            ``priority``.  Empty when there is nobody to interrupt,
+            which is an answer and not an error.
         """
         moment = _to_epoch(now)
         if moment is None:
@@ -477,6 +505,7 @@ class CapacityLedger:
                             "acquired_at": acquired,
                             "created_at": self._facts.plan_created_at(plan_id),
                             "elapsed": elapsed,
+                            "priority": _safe_priority(slot),
                         },
                     )
                 )

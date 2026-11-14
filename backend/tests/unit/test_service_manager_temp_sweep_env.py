@@ -126,6 +126,13 @@ def spawn(monkeypatch, project):
     replacement captures the ``env`` the child would have inherited,
     which is the only thing these pins are about.
 
+    The capture is of the spawn that carries the **declared command**.
+    The spawn path is allowed to start other processes of its own, and
+    a recorder that took "the last one" would hand back the
+    environment of one of those -- which is how a whole family of
+    these pins once read the environment of a ``ps`` census instead of
+    the environment of the service.
+
     The replacement takes the **service's** spawn and nothing else.
     The start path spawns subprocesses of its own besides the service:
     the ``ps`` probes that read a pid's start time -- the spawn marker
@@ -172,16 +179,22 @@ def spawn(monkeypatch, project):
     monkeypatch.setattr(sm, "_await_exit", lambda proc, timeout=2.0: (False, None))
 
     def _start(**kwargs):
-        runtime = sm.start_service(_decl(), project, **kwargs)
+        decl = _decl()
+        runtime = sm.start_service(decl, project, **kwargs)
         # The service's spawn is picked out of every call the recorder
-        # caught by its shape -- the start path's own probes are calls
-        # too, and a probe is not the service.
-        spawns = [call for call in calls if _is_the_service_spawn(call[0])]
-        assert len(spawns) == 1, (
-            "the service was never started: "
-            f"{calls!r}"
+        # caught.  The start path's own probes are calls too, and a probe
+        # is not the service: the spawn under test is the one that
+        # carries the declared command, and it is also the one whose
+        # shape says it is the service's own.
+        service = [
+            call for call in calls
+            if call[0] and call[0][-1] == decl.start_cmd
+        ]
+        assert len(service) == 1, (
+            f"the declared command reached {len(service)} spawns, not "
+            f"one: {[c[0][-1] for c in calls]!r}"
         )
-        spawn_kwargs = spawns[0][1]
+        spawn_kwargs = service[0][1]
         assert captured.get("env") is not None, "the service was never started"
         assert dict(spawn_kwargs.get("env") or {}) == captured["env"], (
             "the capture does not hold the environment the service's own "

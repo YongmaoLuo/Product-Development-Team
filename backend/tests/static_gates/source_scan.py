@@ -76,6 +76,7 @@ into someone else's terminal does not get it.
 
 from __future__ import annotations
 
+import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -143,6 +144,48 @@ SCAN_ROOTS: tuple[Path, ...] = (
     Path("tmp"),
     Path(".playwright-mcp"),
 )
+
+
+#: The roots that hold **runtime artifacts** rather than first-party
+#: source.
+#:
+#: A directory can be *tracked* and still be a place the application
+#: writes at run time.  ``tmp/`` is where the verification servers keep
+#: their logs and their per-round plan directories; ``.playwright-mcp/``
+#: is where the browser tooling keeps the page snapshots it captures.
+#: Both directories hold a handful of tracked files -- a README, a
+#: ``.gitignore``, a few sample fixtures -- and both are written to
+#: while the suite runs.
+#:
+#: Why the distinction matters
+#: --------------------------
+#: A gate that exists to catch a private name must read the files the
+#: repository **publishes**.  A page snapshot the browser tooling wrote
+#: three minutes ago is not published: it is not tracked, it is in
+#: ``.gitignore``, and no commit will ever contain it.  Reading it
+#: anyway makes the gate fail for the ordinary reason of "a tool wrote
+#: something on this machine" -- and it makes it fail on the machine
+#: that ran the browser step, and only on that machine.
+#:
+#: That is not hypothetical.  On 2026-11-01 the privacy gate failed on
+#: six home paths that were **all** inside untracked ``.playwright-mcp/``
+#: snapshots; the tracked files of the whole repository contained zero
+#: hits.  The gate was rejecting a batch of files that can never ship.
+#:
+#: So the two kinds of root are read two different ways:
+#:
+#: * a **source root** is walked on the filesystem, so a source file
+#:   that has not been committed yet is still read -- an uncommitted
+#:   change is exactly what a privacy gate has to catch;
+#: * a **runtime root** contributes only the files git **tracks** in it,
+#:   because those are the only ones that can end up in a commit.
+#:
+#: The tracked set is read from git itself (``git ls-files``) rather
+#: than from a hand-written list, so the two can never drift apart.
+RUNTIME_ROOTS: frozenset[Path] = frozenset({
+    Path("tmp"),
+    Path(".playwright-mcp"),
+})
 
 #: Directory names that look like first-party source but must never
 #: be scanned. Matched anywhere in a file's relative path's parts.
@@ -216,6 +259,66 @@ def resolve_root(root: Path) -> Path:
     ``<project>/scripts``) keeps working.
     """
     return root if root.is_absolute() else REPO_ROOT / root
+
+
+#: The runtime roots, in absolute form.  A caller may hold either the
+#: relative name (``tmp``) or the resolved path, and the two have to be
+#: told apart from the same answer.
+_RUNTIME_ROOT_PATHS: frozenset[Path] = frozenset(
+    resolve_root(root) for root in RUNTIME_ROOTS
+)
+
+
+def is_runtime_root(root: Path) -> bool:
+    """True iff *root* holds runtime artifacts rather than source.
+
+    Accepts the relative name and the resolved path alike, because the
+    walker is handed both: :data:`SCAN_ROOTS` holds names, and the walk
+    itself works from absolute paths.
+    """
+    return resolve_root(root) in _RUNTIME_ROOT_PATHS
+
+
+def tracked_files_under(root: Path) -> list[Path]:
+    """The files git tracks under *root*, as absolute paths.
+
+    The answer comes from ``git ls-files`` -- the index -- rather than
+    from a list kept beside this module, so it cannot drift away from
+    what the repository actually tracks.
+
+    Only files that are **on disk** are returned: the index can name a
+    file that has been deleted from the working tree, and a file that
+    is not there cannot be read, let alone scanned.
+
+    An empty list is returned when git cannot answer -- git missing, the
+    directory not being part of a checkout, the command failing.  The
+    caller then falls back to reading the root the way a source root is
+    read, which keeps the gate's teeth in an environment where the
+    tracked set is unavailable.
+    """
+    resolved = resolve_root(root)
+    try:
+        rel = resolved.relative_to(REPO_ROOT)
+    except ValueError:
+        return []
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "ls-files", "-z", "--", rel.as_posix()],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    tracked: list[Path] = []
+    for name in completed.stdout.split("\0"):
+        name = name.strip()
+        if not name:
+            continue
+        path = REPO_ROOT / name
+        if path.is_file():
+            tracked.append(path)
+    return sorted(tracked)
 
 
 def repo_relative(path: Path) -> Path:
@@ -318,15 +421,20 @@ def iter_first_party_sources(
     on the path being relative. A caller that needs the
     repository-root-relative form passes it through
     :func:`repo_relative`.
+
+    **What a root contributes depends on what the root is.**  A source
+    root is walked on the filesystem, so a source file that has not been
+    committed yet is still read -- an uncommitted change is exactly what
+    a privacy gate has to catch.  A runtime root (:data:`RUNTIME_ROOTS`)
+    contributes only the files git tracks in it, because the artifacts a
+    tool wrote there are not published and can never reach a commit.
     """
     seen: set[Path] = set()
     for root in roots:
         resolved = resolve_root(root)
         if not resolved.exists():
             continue
-        for path in sorted(resolved.rglob("*")):
-            if not path.is_file():
-                continue
+        for path in _candidate_files(root, resolved):
             try:
                 rel = path.relative_to(resolved)
             except ValueError:  # pragma: no cover - safety net only
@@ -336,4 +444,27 @@ def iter_first_party_sources(
             if path in seen:
                 continue
             seen.add(path)
+            yield path
+
+
+def _candidate_files(root: Path, resolved: Path) -> Iterator[Path]:
+    """The files *root* contributes to the scan.
+
+    A runtime root contributes only what git tracks in it.  A source
+    root contributes everything on disk, so that an uncommitted source
+    file is still read.
+
+    When the tracked set cannot be read -- git missing, or the directory
+    not being part of a checkout -- the runtime root falls back to the
+    filesystem walk.  That is the direction that keeps the gate's teeth:
+    a gate that silently stopped reading a directory because it could
+    not ask git would pass on the very files it exists to catch.
+    """
+    if is_runtime_root(root):
+        tracked = tracked_files_under(root)
+        if tracked:
+            yield from tracked
+            return
+    for path in sorted(resolved.rglob("*")):
+        if path.is_file():
             yield path

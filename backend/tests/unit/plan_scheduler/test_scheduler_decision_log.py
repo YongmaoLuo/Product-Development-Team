@@ -91,8 +91,11 @@ def _over_capacity_state() -> Dict[str, Any]:
     """Build a state that is one plan over its capacity.
 
     Two plans hold a slot and there is room for one, so exactly one of
-    them is interrupted.  The younger one (``plan-younger``, created
-    last) is the one the policy picks.
+    them is interrupted.  The two stand equal: neither carries a
+    priority (so both count as 0) and both have run for the same
+    ``elapsed`` (900).  The policy's third key therefore decides, and
+    the plan id in dictionary order wins — ``plan-older`` is the one
+    that is interrupted.
     """
     return {
         "capacity": 1,
@@ -181,8 +184,15 @@ def test_converge_over_capacity_warns_about_the_victims(
     with caplog.at_level(logging.INFO, logger="plan_scheduler.engine"):
         victims = engine._converge_over_capacity(_over_capacity_state())
 
-    assert victims == ["plan-younger"], (
-        f"the policy picks the youngest: {victims!r}"
+    # PRD §1: the victim is chosen in two stages — the priority first,
+    # and the runtime only among the plans that share it.  The old rule
+    # ("pick the youngest by ``created_at``") is gone, whole.  This
+    # fixture's two plans share both keys (neither carries a priority,
+    # so both count as 0, and both have run for 900 seconds), so the
+    # policy's third key decides: the plan id, in dictionary order.
+    # ``plan-older`` is therefore the one that is interrupted.
+    assert victims == ["plan-older"], (
+        f"the victim is decided by (-priority, elapsed, plan_id): {victims!r}"
     )
     warnings = [
         record for record in caplog.records if record.levelno >= logging.WARNING
@@ -192,8 +202,8 @@ def test_converge_over_capacity_warns_about_the_victims(
         f"{[r.getMessage() for r in caplog.records]!r}"
     )
     message = warnings[0].getMessage()
-    assert "plan-younger" in message, message
-    assert "plan-older" not in message, (
+    assert "plan-older" in message, message
+    assert "plan-younger" not in message, (
         f"only the interrupted plan is named: {message}"
     )
 
@@ -240,8 +250,12 @@ def test_converge_over_capacity_decisions_are_logged(
         for record in caplog.records
         if record.getMessage().startswith("scheduler decision:")
     ]
+    # PRD §1: the same two-stage rule as above — priority first, the
+    # runtime only among the plans that share it, and the plan id as
+    # the last key.  The two plans of this fixture stand equal on the
+    # first two keys, so the decision record names ``plan-older``.
     assert messages == [
-        "scheduler decision: action=stop plan_id=plan-younger reason=over_capacity"
+        "scheduler decision: action=stop plan_id=plan-older reason=over_capacity"
     ], messages
 
 

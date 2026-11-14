@@ -580,6 +580,30 @@ def _same_invocation(
     # the recorded entries, in order, and not on the length.
     return [part for part in live_parts[1:] if part in tail] == tail
 
+def _safe_priority(slot: Any) -> int:
+    """Return the priority the slot carries, or ``0`` when it carries none.
+
+    A priority is a whole number.  A value that is missing, ``NULL``,
+    a boolean, a string or a number that is not whole reads as ``0`` —
+    the weight every plan carries when nothing says otherwise.
+
+    The reading never lifts a plan to the front of the order by
+    accident: a priority the engine cannot read leaves the plan at the
+    ordinary weight, and the runtime decides among the plans that
+    share it.  A boolean is not a number here (``True`` is not ``1``),
+    and a string is not a number either — the priority is written down
+    as a number, and anything else is a value the engine does not know
+    how to compare.
+    """
+    value = slot.get("priority", 0) if hasattr(slot, "get") else 0
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return 0
+
 
 # ---------------------------------------------------------------------------
 # The engine
@@ -950,6 +974,19 @@ class PlanSchedulerEngine:
         over, and the takeover would evict the very work it had just
         taken over.
 
+        The **priority** is not reset.  The slot carries the weight the
+        caller gave the plan, and that weight is what the eviction rule
+        compares the running plans by: a bug plan at ``-10`` that came
+        back from the restart as an ordinary plan at ``0`` would give
+        way to a feature plan.  So the number the row holds is read
+        out before the row is taken over, and it is written back with
+        the new clock.
+
+        A plan that holds no row to carry the number over — one that
+        was started outside the scheduler — is given the number the
+        caller gave, read out of the plan's own artifact; a plan that
+        expresses no intent runs at the default, ``0``.
+
         Args:
             stamp: the timestamp to record on the adopted plans' rows.
 
@@ -963,19 +1000,32 @@ class PlanSchedulerEngine:
         }
 
         removed: List[str] = []
+        carried: Dict[str, int] = {}
         for slot in self._store.list_slots(self._conn):
             plan_id = str(slot.get("plan_id") or "")
-            if not plan_id or plan_id in working:
+            if not plan_id:
+                continue
+            if plan_id in working:
+                # The number the row holds, read out before the row
+                # is taken over: the takeover rewrites it, and the
+                # weight the plan runs at has to survive that.
+                carried[plan_id] = int(slot.get("priority") or 0)
                 continue
             self._store.delete_slot(self._conn, plan_id)
             removed.append(plan_id)
 
         adopted: List[str] = []
         for plan_id in sorted(working):
+            priority = carried.get(plan_id)
+            if priority is None:
+                # No row to carry the number over: the caller's own
+                # number is the one the plan runs at.
+                intended = self._intended_priority(plan_id)
+                priority = 0 if intended is None else int(intended)
             # The old row goes first: writing a slot does not restart
             # its clock, and the clock is the thing being reset.
             self._store.delete_slot(self._conn, plan_id)
-            self._store.upsert_slot(self._conn, plan_id, stamp)
+            self._store.upsert_slot(self._conn, plan_id, stamp, priority=priority)
             adopted.append(plan_id)
         return adopted, removed
 
@@ -1789,7 +1839,7 @@ class PlanSchedulerEngine:
                 # tick.  Only one plan at a time may work in it.
                 head["workspace_busy"] = True
                 return
-            self._admit(state, plan_id)
+            self._admit(state, plan_id, int(head.get("priority") or 0))
             if key is not None:
                 held.add(key)
             state["queued"] = queued[1:]
@@ -2132,7 +2182,7 @@ class PlanSchedulerEngine:
             return True
         return bool(self._ledger.workspace_busy(key))
 
-    def _admit(self, state: Dict[str, Any], plan_id: str) -> None:
+    def _admit(self, state: Dict[str, Any], plan_id: str, priority: int = 0) -> None:
         """Give a plan its slot and decide that it starts.
 
         The slot is written before the decision is made, and it carries
@@ -2142,12 +2192,23 @@ class PlanSchedulerEngine:
         store that refuses the write must not produce a decision that
         nothing backs.
 
+        The slot carries the **priority** as well, and it carries it
+        because this is the last moment it can: the queue row the
+        priority came from is taken out of the table the moment the
+        plan is admitted.  A running plan that was not given its
+        priority here can no longer be read for one at all.
+
         Args:
             state: the state the tick is deciding on — its ``used``
                 count goes up by one.
             plan_id: the plan that is admitted.
+            priority: the priority the plan runs at — the number the
+                queue row carried.  A plan nobody gave a number to
+                runs at 0.
         """
-        self._store.upsert_slot(self._conn, plan_id, _stamp(self._now()))
+        self._store.upsert_slot(
+            self._conn, plan_id, _stamp(self._now()), priority=int(priority)
+        )
         self._decide("admit", plan_id, "running")
         state["used"] = int(state["used"]) + 1
 
@@ -2324,21 +2385,33 @@ class PlanSchedulerEngine:
         scheduler's clock — it starts again from zero on every
         restart — so the plan's own start time travels with the row
         for whoever wants to say how long the plan has been at it.
+
+        The **slot** carries the priority the plan runs at, and the
+        row carries it too: the eviction rule compares the running
+        plans by the number the caller gave them, and a running row
+        without one cannot be compared at all.  A slot that holds no
+        priority — a row written before the column existed, or one the
+        store could not read — leaves the plan at the ordinary weight,
+        and so does a plan that has no slot row at all.
         """
-        acquired: Dict[str, float] = {}
+        held: Dict[str, Dict[str, Any]] = {}
         for slot in slots:
             plan_id = str(slot.get("plan_id") or "")
             if not plan_id:
                 continue
             moment = self._epoch(slot.get("acquired_at"))
-            acquired[plan_id] = moment if moment is not None else now
+            held[plan_id] = {
+                "acquired_at": moment if moment is not None else now,
+                "priority": _safe_priority(slot),
+            }
 
         running: List[Dict[str, Any]] = []
         for row in self._facts.active_plans():
             plan_id = str(row.get("plan_id") or "")
             if not plan_id:
                 continue
-            moment = acquired.get(plan_id, now)
+            held_slot = held.get(plan_id, {})
+            moment = held_slot.get("acquired_at", now)
             running.append(
                 {
                     "plan_id": plan_id,
@@ -2346,6 +2419,7 @@ class PlanSchedulerEngine:
                     "elapsed": max(0.0, now - moment),
                     "workspace": row.get("workspace"),
                     "started_at": row.get("started_at"),
+                    "priority": int(held_slot.get("priority", 0)),
                 }
             )
         return running

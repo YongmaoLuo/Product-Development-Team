@@ -477,6 +477,29 @@ def _reconcile_exec_pid(plan_dir: Path, plan_id: str, pid: int) -> str:
         return ACTION_CLEARED
 
     record = ledger_live_records(plan_dir).get(pid)
+
+    # Does the **scheduler** own the run?  A plan the scheduler
+    # admitted keeps running across a restart of the backend — the
+    # scheduler's own recovery adopts it and re-times its slot from the
+    # moment of the restart (``plan_scheduler.engine``'s recovery).
+    # Reaping it here would take away a run the scheduler is about to
+    # adopt, and the scheduler would never see it again.
+    #
+    # The question is asked **before** the identity is compared, and
+    # that order matters.  An executor the scheduler holds is the
+    # scheduler's business whatever its recorded identity says: a
+    # mismatch verdict would leave the run neither reaped nor adopted,
+    # and the read model would never settle -- the plan would sit in
+    # ``running`` for ever, with nothing waiting on it.
+    if scheduler_holds(plan_id):
+        _server.logger.warning(
+            "[startup_reconcile] plan=%s exec_pid=%s is held by the "
+            "scheduler; nothing was signalled",
+            plan_id,
+            pid,
+        )
+        return ACTION_ADOPTED
+
     if record is None or not identity_matches(
         identity,
         create_time=record.create_time,
@@ -508,22 +531,6 @@ def _reconcile_exec_pid(plan_dir: Path, plan_id: str, pid: int) -> str:
     # the backend that started it and nobody is left to own it, so it
     # is reaped by the ledger's own rules — children first, and the
     # identity checked again before every signal.
-    #
-    # Unless the **scheduler** owns the run: a plan the scheduler
-    # admitted keeps running across a restart of the backend — the
-    # scheduler's own recovery adopts it and re-times its slot from the
-    # moment of the restart (``plan_scheduler.engine``'s recovery).
-    # Reaping it here would take away a run the scheduler is about to
-    # adopt, and the scheduler would never see it again.
-    if scheduler_holds(plan_id):
-        _server.logger.warning(
-            "[startup_reconcile] plan=%s exec_pid=%s is held by the "
-            "scheduler; nothing was signalled",
-            plan_id,
-            pid,
-        )
-        return ACTION_ADOPTED
-
     reap_plan(plan_dir, plan_id, reason=STARTUP_RECONCILE_REASON)
     return ACTION_KILLED
 
@@ -823,7 +830,6 @@ SETTLED_IDENTITY_WINDOW = 0.1
 #: been seen to keep its command line, the probe does not wait for it
 #: again: the wait would cost every spawn and buy nothing.
 _UNREWRITTEN_ARGV0: Set[str] = set()
-
 
 def _settled_identity(pid: int, requested_argv0: Optional[str] = None) -> Optional[Any]:
     """The identity of ``pid`` as the kernel still describes it a moment later.
@@ -1768,7 +1774,6 @@ _QUOTA_WAIT_STOP_REASON = "waiting_for_quota"
 #: is the reason every later reader sees — a restart included.
 _CRASH_STOP_REASON = "process_died_unexpectedly"
 
-
 def _crash_stop_reason(returncode: int) -> str:
     """The reason a run ended, carrying the number that ended it.
 
@@ -1832,6 +1837,94 @@ def _is_crash_verdict(stop_reason: Optional[str]) -> bool:
         return True
     return stop_reason.startswith(_SIGNAL_STOP_REASON_PREFIX)
 
+
+#: The execution statuses that mean the run is over.  A run that is
+#: over has an end time; a parked run (``waiting_for_quota``) and a
+#: live one have not ended yet.  The same set the repository uses to
+#: decide that a pid has to go back to NULL.
+_TERMINAL_EXEC_STATUSES = frozenset({"completed", "failed", "stopped"})
+
+#: The provenance of a status answer: where the answer was read from.
+#: ``state_db`` means it was assembled from the durable
+#: ``plan_execution`` row; ``default`` means the library really holds
+#: no row for this plan and the answer is the empty default.
+#:
+#: The field exists because the two answers used to look alike.  A
+#: reader that got ``status=not_started`` with every other field null
+#: could not tell "this plan never ran" from "this process knows
+#: nothing about this plan" — and the second one is what a run that
+#: was dying looked like.  The answer now certifies itself.
+STATUS_DATA_SOURCE_STATE_DB = "state_db"
+STATUS_DATA_SOURCE_DEFAULT = "default"
+
+#: The fields the provenance of a status read carries.
+#:
+#: The block answers one question — **which database answered, and which
+#: row did it find** — and it answers it in facts rather than in a word:
+#: the database by path (so a reader knows WHICH file) and by inode (so
+#: a reader knows it is not a different file wearing the same name), the
+#: moment the read opened it, the row it found (by rowid and by the
+#: row's own stamp), and the verdict of the integrity check that ran
+#: before the row was trusted.
+#:
+#: It exists because the answer's own wording cannot say it.  A reader
+#: that got ``status=not_started`` with every other field null could
+#: not tell "this plan never ran" from "this instance cannot see the
+#: plan" — and the second one is what a dying run used to look like.
+#: A round that restarts the service inside the round is exactly where
+#: the two come apart: two instances can read two different snapshots of
+#: the same file and answer the same question differently.
+STATUS_SOURCE_FIELDS = (
+    "kind",
+    "state_db_path",
+    "state_db_inode",
+    "opened_at",
+    "row_updated_at",
+    "rowid",
+    "integrity",
+)
+
+#: The three states the library this instance reads can be in.
+#:
+#: * ``absent`` — there is no state database at all.  Nothing was ever
+#:   recorded by this instance, so the empty answer is the honest one.
+#: * ``unreadable`` — there is one and it could not be read.  This
+#:   instance cannot confirm anything, so it refuses rather than
+#:   answering.
+#: * ``readable`` — it was read, and what it holds is what the answer
+#:   is made of.
+LIBRARY_ABSENT = "absent"
+LIBRARY_UNREADABLE = "unreadable"
+LIBRARY_READABLE = "readable"
+
+#: The refusal's ``detail``.  It says what happened, not what the plan
+#: is: the caller is being told that this instance cannot answer, not
+#: that the plan never ran.
+STATUS_REFUSAL_DETAIL = "the execution state of this plan could not be read"
+
+
+class _ExecutionRead(NamedTuple):
+    """What one read of the durable state found — and where it read it.
+
+    ``row`` is the plan's ``plan_execution`` row (``None`` when the
+    library holds none), ``source`` is the provenance block, ``library``
+    is the state of the database the read tried to use, ``known`` says
+    whether the library holds a row of its own for this plan, and
+    ``populated`` says whether the library holds rows of its own at all.
+
+    ``phase`` is the plan's WORKFLOW phase (``plan_routing.current_phase``),
+    read on the same connection and the same snapshot as the row.  It is
+    the other half of the answer: the row says how the LAST run ended, the
+    phase says where the plan IS.  A reader that shows the row's verdict
+    without it re-runs the whole "stale verdict" bug on every request.
+    """
+
+    row: Optional[Dict[str, Any]]
+    source: Dict[str, Any]
+    library: str
+    known: bool
+    populated: bool
+    phase: str = ""
 
 #: The execution statuses that mean the run is over.  A run that is
 #: over has an end time; a parked run (``waiting_for_quota``) and a
@@ -2286,6 +2379,34 @@ def _park_shutdown_interrupted(
     must not leave the plan claiming to be running a task whose owner
     is gone.
 
+    The order of the two writes is load-bearing, and it is the
+    opposite of the one that reads most naturally.  The **phase goes
+    first and the row goes last**: the row is the commit point.
+
+    Parking is two writes, and the writer is a thread of a server that
+    is going away — the shutdown does not wait for it, so the thread
+    can be abandoned between the two writes.  Which write lands first
+    therefore decides what the next boot finds:
+
+    * abandoned **before the row write** → the row still says
+      ``running``, and a ``running`` row is exactly what the recovery
+      scan already knows how to reconcile: it asks the checkpoint,
+      finds the shutdown, and parks the plan for real — phase
+      included;
+    * the **phase write failed on its own** → the row says ``stopped``
+      with the shutdown's reason while the phase still says
+      ``executing``.  The phase write is best-effort (a plan that
+      cannot be written must not cost every other plan its recovery),
+      so this is a hole the ordering alone does not close: the next
+      boot repairs the phase by :func:`_restore_parked_phase`.
+
+    The other order — the row first — would leave the row saying
+    ``stopped`` and the phase still saying ``executing`` whenever the
+    thread was abandoned between the two: a plan that reads as live,
+    that the scheduler will never pick up again, and that nothing ever
+    repairs — a row that already carries a verdict is skipped by the
+    recovery scan, because a verdict is never judged twice.
+
     Nothing here raises.  This runs on the recovery path, where one
     plan's failure must not cost every other plan its recovery.
 
@@ -2315,6 +2436,35 @@ def _park_shutdown_interrupted(
             ended_at=datetime.now().isoformat(),
         )
 
+    # The task rows the dead executor owned are residue: they go back
+    # to ``pending`` before the phase write, so a failing phase write
+    # cannot leave the plan claiming to be running a task whose owner
+    # is gone.
+    try:
+        _reap_orphaned_in_progress_tasks(plan_id)
+    except Exception:  # noqa: BLE001 — a failed task write is not a failed park
+        _server.logger.exception("park: task write failed plan=%s", plan_id)
+
+    # The phase write is best-effort, and it is not the last word: the
+    # row below is the commit point, and it is written whether or not
+    # the phase could be written.  A plan whose plan directory cannot
+    # even be found gets its row and no phase — the boot repair
+    # (:func:`_restore_parked_phase`) puts the phase back.
+    try:
+        if plan_dir is None:
+            plan_dir = _server._plan_dir(plan_id)
+    except Exception:  # noqa: BLE001 — an unknown plan dir is not a failed park
+        _server.logger.exception("park: plan dir lookup failed plan=%s", plan_id)
+        plan_dir = None
+    if plan_dir is not None and plan_dir.exists():
+        try:
+            _server.PlanState(plan_dir).force_set_phase("queued")
+        except Exception:  # noqa: BLE001 — a failed phase write is not a failed scan
+            _server.logger.exception("park: phase write failed plan=%s", plan_id)
+
+    # The row is the commit point, and it is written LAST — see the
+    # docstring for why the order is the other way round from the one
+    # that reads most naturally.
     try:
         if execution_repo is not None:
             execution_repo.update_fields(
@@ -2338,25 +2488,83 @@ def _park_shutdown_interrupted(
     except Exception:  # noqa: BLE001 — a failed verdict write is not a failed scan
         _server.logger.exception("park: row write failed plan=%s", plan_id)
 
-    # The task rows still have to go back — before the phase write, so
-    # a failing phase write cannot leave the plan stuck in_progress.
-    try:
-        _reap_orphaned_in_progress_tasks(plan_id)
-    except Exception:  # noqa: BLE001 — a failed task write is not a failed park
-        _server.logger.exception("park: task write failed plan=%s", plan_id)
 
+def _is_a_shutdown_parked_run(row: Optional[Dict[str, Any]]) -> bool:
+    """Was this run parked by a server shutdown?
+
+    The verdict is the row's, and this is the one verdict shape that
+    names the server: ``stopped`` with the reason ``server_shutdown``.
+    A run the operator stopped, a crashed run and a quota-parked run
+    all say something else, and none of them may be moved back into the
+    waiting set.
+    """
+    from shutdown_checkpoint import SHUTDOWN_STOP_REASON
+
+    if not row:
+        return False
+    return (
+        str(row.get("exec_status") or "") == "stopped"
+        and str(row.get("stop_reason") or "") == SHUTDOWN_STOP_REASON
+    )
+
+
+def _restore_parked_phase(plan_id: str, plan_dir: Path) -> None:
+    """Put a shutdown-parked plan back into the waiting set.
+
+    The row says the server went down under the run, so the work was
+    interrupted rather than broken — and an interrupted plan belongs in
+    the waiting set, in the phase the scheduler picks it up from.  The
+    phase write that says so can be missing: the server that wrote the
+    row was dying, and the thread that wrote the row could be abandoned
+    before it wrote the phase.  A plan that keeps the phase of a live
+    run while its run is over is a plan the scheduler never picks up
+    again.
+
+    This is a repair, not a judgement: the row's verdict is taken as it
+    is — a verdict is never judged twice — and only the phase is moved
+    to agree with it.
+
+    Two phases are left alone:
+
+    * ``queued`` — the phase the repair would write; the plan is
+      already where it belongs;
+    * a terminal phase — a plan that has been *completed* or *failed*
+      since the shutdown was parked has moved on, and its row is an
+      old verdict rather than the current state.  Re-queueing such a
+      plan would resurrect work that is already done.
+
+    The phase is read from the same store it is written to
+    (``PlanState``), so the repair cannot disagree with the write that
+    follows it.
+
+    Nothing here raises.  This runs on the recovery path, where one
+    plan's failure must not cost every other plan its recovery.
+    """
     try:
-        if plan_dir is None:
-            plan_dir = _server._plan_dir(plan_id)
-    except Exception:  # noqa: BLE001 — an unknown plan dir is not a failed park
-        _server.logger.exception("park: plan dir lookup failed plan=%s", plan_id)
-        return
-    if not plan_dir.exists():
-        return
-    try:
-        _server.PlanState(plan_dir).force_set_phase("queued")
+        if not plan_dir.exists():
+            # No plan directory: there is no phase to repair, and
+            # writing one would invent a state nobody asked for.
+            return
+        plan_state = _server.PlanState(plan_dir)
+        current = plan_state.get_current_phase()
+        if current == "queued":
+            return
+        if current in _server._TERMINAL_PHASES:
+            # The plan has moved on since the shutdown was parked; the
+            # row's verdict is the older of the two.
+            return
+        plan_state.force_set_phase("queued")
+        _server.logger.warning(
+            "[startup_reconcile] plan=%s was parked by a shutdown but its "
+            "phase was never moved (was %r); it is queued again",
+            plan_id,
+            current,
+        )
     except Exception:  # noqa: BLE001 — a failed phase write is not a failed scan
-        _server.logger.exception("park: phase write failed plan=%s", plan_id)
+        _server.logger.exception(
+            "[startup_reconcile] could not restore the parked phase plan=%s",
+            plan_id,
+        )
 
 
 def _judge_process_dead(
@@ -2406,6 +2614,157 @@ def _judge_process_dead(
     # The row now carries the verdict; its stamp is the end time, and
     # this process's memory adopts it so the two never disagree.
     _adopt_row_verdict(plan_id, _persisted_execution_row(plan_id))
+    return True
+
+
+def _mark_failed_with_reason(
+    plan_id: str,
+    stop_reason: str,
+    state: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Write the failure verdict with the reason the caller named.
+
+    The crash verdict — ``_mark_failed_dead`` — writes the status, the
+    reason and the pid in one go, and the reason it writes is
+    ``process_died_unexpectedly``.  A run that ended some other way —
+    an executor that exited with a non-zero status — failed for a
+    reason of its own, and the reason is what tells the two apart for
+    every reader that comes after.
+
+    That helper cannot be the one to write it: it publishes the row's
+    status *before* this process's memory can carry the reason, and the
+    row's status is the signal a reader polls.  A reader that has just
+    seen ``failed`` would then be able to read a memory that still
+    says ``process_died_unexpectedly`` — the row and the memory would
+    disagree for exactly as long as the write takes, and a reader that
+    believes a pid means alive would read the crash's reason off a run
+    that never crashed.
+
+    So the verdict is written here, in the order that keeps the readers
+    in step.  This process's memory first — the reason is readable
+    before anything publishes the status — then the run's residue: the
+    task rows the dead executor held, and the plan's terminal phase.
+    The row is written last, and it carries the status and the reason
+    in one write, so the row never holds one without the other and a
+    reader that has seen ``failed`` can read the reason and the phase
+    that belong to it.
+
+    The row is written through :meth:`ExecutionRepository.update_status`
+    — the writer the run's own persist uses — so the status and the
+    reason land in one write, and a terminal status takes the pid with
+    it (a pid left on a row that says ``failed`` reads as a live
+    execution to every reader).
+
+    **The pid is not cleared in the memory here.**  The verdict says
+    the run is over; the pid says whether the *process* is gone, and
+    the two are not the same question — an executor that exited with a
+    non-zero status is the executor's own verdict, and its pid stays a
+    fact about the run.  The reader that adopts the verdict is the one
+    that takes the pid of a crashed process away
+    (:func:`_adopt_row_verdict`), so the dead pid is cleared by the
+    read that publishes the verdict, not by the write that produced it.
+
+    ``state`` is the caller's own record of the run.  The registry is
+    one process's view of a run, and it may no longer hold the entry: a
+    reader that answered a status poll between the start and the death
+    drops it, and a verdict that went through the registry would be
+    lost on the floor — the row would stay ``running`` for ever, and an
+    execution that had already died would read as one still going.
+    """
+    from state_machine.db.connection import open as open_db
+    from state_machine.db.schema import migrate
+    from state_machine.repositories.execution_repository import (
+        ExecutionRepository,
+        PlanNotFoundError as ExecPlanNotFoundError,
+    )
+    from verification_loop import _reap_orphaned_in_progress_tasks
+
+    lock = _server._execution_locks.setdefault(plan_id, threading.Lock())
+    with lock:
+        if state is None:
+            state = _server._execution_state.get(plan_id)
+        if not state or state.get("status") != "running":
+            # Another writer has judged the run already; a verdict is
+            # never written twice.
+            return
+        state["status"] = "failed"
+        state["stop_reason"] = stop_reason
+        state["ended_at"] = datetime.now().isoformat()
+
+    # The executor is gone, so the task rows it held are residue: hand
+    # them back to the scheduler before the phase write, so a failing
+    # phase write cannot leave the plan claiming a current task.
+    _reap_orphaned_in_progress_tasks(plan_id)
+
+    plan_dir = _server._plan_dir(plan_id)
+    if plan_dir.exists():
+        try:
+            ps = _server.PlanState(plan_dir)
+            if ps.get_current_phase() not in _server._TERMINAL_PHASES:
+                # Recovery context: override the normal transition
+                # rules — a plan may still be in ``ready`` if the
+                # server went down between the start and the crash.
+                ps.force_set_phase("failed")
+        except Exception:  # noqa: BLE001 — a failed phase write is not a failed verdict
+            pass
+
+    try:
+        persist_conn = open_db(_server._state_db_path())
+        try:
+            migrate(persist_conn)
+            ExecutionRepository(persist_conn).update_status(
+                plan_id,
+                "failed",
+                stop_reason=stop_reason,
+            )
+        finally:
+            persist_conn.close()
+    except ExecPlanNotFoundError:
+        pass
+
+
+def _judge_executor_dead(
+    plan_id: str,
+    plan_dir: Path,
+    stop_reason: str,
+    state: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Judge an executor that is gone — through the one verdict writer.
+
+    The watcher used to answer this question on its own: it wrote
+    ``failed`` and moved the plan to its terminal phase without ever
+    asking the shutdown checkpoint.  A run the *server* interrupted was
+    therefore reported as a run that *broke* — and because the verdict
+    was already on the row, the next boot's recovery scan had nothing
+    left to park.
+
+    Now the question is asked by the one writer that knows how to ask
+    it: a checkpoint that proves the server went down parks the run,
+    and everything else is a crash that keeps the reason the exit code
+    earned it.
+
+    **The verdict is written to the caller's own record of the run.**
+    The registry is one process's view of a run, and it may no longer
+    hold the entry — a reader that answered a status poll between the
+    start and the death drops it — so a verdict that went through the
+    registry was lost, and the row stayed ``running`` for ever: an
+    execution that had already died read as one that was still going.
+
+    Returns whether the run was judged.
+    """
+    if state is None:
+        state = _server._execution_state.get(plan_id)
+    if not state or state.get("status") != "running":
+        # Another writer has judged the run already; a verdict is
+        # never written twice.
+        return False
+    # The server went down under this run?  Then it is not a crash:
+    # the work was interrupted rather than broken, and the run is
+    # parked instead of failed.
+    if _shutdown_interrupted_this_run(plan_dir, state.get("started_at")):
+        _park_shutdown_interrupted(plan_id, plan_dir=plan_dir)
+        return True
+    _mark_failed_with_reason(plan_id, stop_reason, state=state)
     return True
 
 
@@ -4138,14 +4497,16 @@ def start_execution(
                     # :class:`_VerificationLoopOutcome`.
                     _server._settle_phase_after_verification_loop(plan_dir, loop_outcome)
                 elif process.returncode > 0:
-                    state["status"] = "failed"
-                    # The reason carries the exit code: ``non_zero_exit``
-                    # alone cannot tell exit 1 from exit 7.
-                    state["stop_reason"] = _crash_stop_reason(
-                        process.returncode
+                    # The executor reported a failure of its own, and
+                    # that is the reason the run ends with.  The verdict
+                    # is written by the one writer that asks the
+                    # shutdown checkpoint first: a run the *server*
+                    # interrupted is parked, not failed.
+                    _judge_executor_dead(
+                        plan_id, plan_dir,
+                        _crash_stop_reason(process.returncode),
+                        state=state,
                     )
-                    state["ended_at"] = datetime.now().isoformat()
-                    _server.PlanState(plan_dir).transition_to("failed")
                 elif _shutdown_interrupted_this_run(
                     plan_dir, state.get("started_at")
                 ):
@@ -4176,15 +4537,16 @@ def start_execution(
                             "executor_shutdown_park_failed plan=%s", plan_id
                         )
                 else:
-                    state["status"] = "failed"
-                    # A death by signal carries the signal number
-                    # (``signal:9``); a death that carries no number at
-                    # all keeps the reason it always had.
-                    state["stop_reason"] = _crash_stop_reason(
-                        process.returncode
+                    # The executor is gone without saying why — killed by
+                    # a signal, or by a shutdown that took the process
+                    # tree with it.  The checkpoint tells the two apart,
+                    # so the verdict is written by the same writer in
+                    # either case.
+                    _judge_executor_dead(
+                        plan_id, plan_dir,
+                        _crash_stop_reason(process.returncode),
+                        state=state,
                     )
-                    state["ended_at"] = datetime.now().isoformat()
-                    _server.PlanState(plan_dir).transition_to("failed")
             else:
                 # 2026-11-03: the run did NOT hand off to auto-verification
                 # — and nothing said so.  The durable-fact gate above can

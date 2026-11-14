@@ -554,6 +554,23 @@ FROZEN_REQUIREMENTS_HASH: str = (
 #: is the hash of exactly the fourteen objects that preceded it, and the
 #: new value is the hash of those same fourteen plus this one table.
 #:
+#: 2026-11-02 (victim priority): re-pinned once more.  The delta
+#: against the 2026-10-29 baseline is exactly one **column** on one
+#: existing table -- ``scheduler_slot`` gained ``priority INTEGER NOT
+#: DEFAULT 0``, because the queue's priority row is deleted the moment
+#: a plan is admitted and a running plan has to be readable for its
+#: priority.  It is a column and not a table, so the object list
+#: printed by the failing assertion is the same fifteen names as
+#: before, unchanged in number and in name; only the stored ``CREATE``
+#: text of ``scheduler_slot`` moved (SQLite rewrites that text when a
+#: column is added, so the hash moves with it).
+#:
+#: The delta was checked, not assumed: deleting the one ``priority``
+#: column line from the stored ``CREATE`` text of ``scheduler_slot``
+#: reproduces the previous baseline
+#: (``5ffab1223d67c64c0eb17147eaf479346b163d3dd8e6d0e19c31ddab71cfd521``)
+#: byte for byte, so nothing else in the schema moved.
+#:
 #: 2026-11-04 (root-cause report delivery): re-pinned once more.  The
 #: delta against the 2026-10-29 baseline is exactly two new columns on
 #: ``plan_tasks`` — ``deliverable`` and ``report_path``.  They carry the
@@ -564,8 +581,17 @@ FROZEN_REQUIREMENTS_HASH: str = (
 #: (``5ffab1223d67c64c0eb17147eaf479346b163d3dd8e6d0e19c31ddab71cfd521``)
 #: is the hash of exactly the objects that preceded it, and the new value
 #: is the hash of those same objects plus these two columns.
+#:
+#: Merging origin/main brings both deltas into one schema:
+#: ``scheduler_slot.priority`` and ``plan_tasks.deliverable`` /
+#: ``plan_tasks.report_path``.  The object list is therefore still the
+#: same fifteen names -- three columns on two existing tables, no table
+#: added and none removed -- and the frozen baseline moves to the hash of
+#: that merged schema.  This is a move of the frozen baseline, not a
+#: loosening of the gate: the assertion, the comparison and the object
+#: list are all unchanged, and the schema stays pinned byte for byte.
 FROZEN_SCHEMA_DDL_HASH: str = (
-    "099c1e4948f74efaeaf36337a81d961528d91481b46c8ea43aba0c3b58157dd1"
+    "ce628e4a82fbeb707799f9935d26fed4ce53c824b6e93652f6c380c9fad98650"
 )
 
 #: The phase merge renamed the waiting bucket to ``queued``. The rename
@@ -879,11 +905,22 @@ FROZEN_SCHEDULER_SURFACE_SHA256: dict[str, str] = {
     # 2026-10-29：因新增 `scheduler_setting` 表（容量的运行期覆盖）改动本文件，
     # 按本 gate 的既定流程重新钉住该文件的哈希；schema.py 的模块 docstring
     # 已同步改为「four ``scheduler_*`` tables」。
+    # 2026-11-02：因「victim 优先级」给 `scheduler_slot` 加了 `priority` 列
+    # （`priority INTEGER NOT NULL DEFAULT 0`，并对老库做 presence-guarded 的
+    # `ALTER TABLE`，schema 版本仍为 7）改动本文件，按本 gate 的既定流程重新
+    # 钉住该文件的哈希。schema.py 的内容变化是这一条 DDL 加上它的说明与升级
+    # 步骤；DDL 层面的 delta 只有一个列，没有别的表或列动过。
+    #
     # 2026-11-04（根因报告交付）：`plan_tasks` 新增 `deliverable` / `report_path`
     # 两列（报告型任务的交付通道：交付物是一份文件，地址在 `report_path`），
     # 同一次改动，按本 gate 的既定流程重新钉住该文件的哈希。
+    #
+    # 合并 origin/main 后两侧的改动同时在 schema.py 里：既有 `scheduler_slot`
+    # 的 `priority` 列，也有 `plan_tasks` 的那两列。文件哈希因此与两侧都不同，
+    # 按本 gate 的既定流程重新钉住合并态的哈希。这是「移动冻结」而不是「放松
+    # 门禁」——断言与逐字节比对的强度都不变，该文件此后仍被逐字节钉住。
     "backend/state_machine/db/schema.py": (
-        "7cb8f032d8b032c3ef96aa4f085e824d48c849ecca948b43ac7cc6a611413069"
+        "69de90baf6f5f2dbae8584ef82cbf3abdd787d4675ee8c36c7abe6746c26a408"
     ),
     # 2026-10-30：因调度面板改版（视图重排、在跑运行时长、并行 Agent 数、容量下拉框）
     # 改动本文件，按本 gate 的既定流程重新钉住该文件的哈希。

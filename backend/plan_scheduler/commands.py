@@ -40,10 +40,11 @@ owner rather than working the answer out a second time:
   capacity ledger.  The candidate set is the ledger's: a plan that is
   working *and* has been running for at least ``M`` seconds.
 * **"which of them do I interrupt?"** — the policy.  Among the
-  candidates it is the **youngest** one: the plan that took its slot
-  most recently, and therefore the one least likely to be wrapping up.
-  The same rule the tick's convergence uses, so the two triggers that
-  may interrupt somebody share one candidate set and one choice.
+  candidates it is the one that stands **last in the line**: the plan
+  with the largest priority number, and among the plans of that
+  priority the one that has run the shortest.  The same rule the
+  tick's convergence uses, so the two triggers that may interrupt
+  somebody share one candidate set and one choice.
 * **"may this plan move to another phase?"** — the lifecycle.  It owns
   the edge table; the executor asks it and takes the answer it gets.
   A second copy of the edges would be a second table that drifts.
@@ -562,9 +563,11 @@ class CommandExecutor:
         A start is the **only** action that may interrupt somebody, and
         it does so only when the capacity is full and there is a victim
         the rules allow: a plan that has been running for at least ``M``
-        seconds, and among those the youngest one.  With no such victim
-        the start does not happen — the plan stays at the head of the
-        queue and the command answers ``blocked_by_capacity``.
+        seconds, and among those the one that stands last in the line:
+        the largest priority number, and among those the shortest run.
+        With no such victim the start does not happen — the plan stays
+        at the head of the queue and the command answers
+        ``blocked_by_capacity``.
 
         A plan that is parked is put back into the queue first, through
         the lifecycle's own edge.  The lifecycle accepts ``stopped``;
@@ -764,18 +767,21 @@ class CommandExecutor:
 
         The candidate set is the ledger's — a plan that is working and
         has been running for at least ``M`` seconds — and the choice
-        among them is the policy's: the **youngest** one.  The tick's
-        convergence asks the same two questions, so the two triggers
-        that may interrupt somebody share one candidate set and one
-        choice.
+        among them is the policy's: the one that stands **last in the
+        line** — the largest priority number, and among those the
+        shortest run.  The tick's convergence asks the same two
+        questions, so the two triggers that may interrupt somebody
+        share one candidate set and one choice.
 
         The candidates are handed to the policy as the ledger gives
         them.  The executor does not rebuild the running set out of the
-        slot rows: those rows carry no creation time, and the creation
-        time is what tells the youngest plan from the others — so a
-        rebuilt set would pick the victim by when a slot was stamped
-        rather than by when the plan was made.  The slots are read once,
-        by the ledger, and the whole answer comes off that one read.
+        slot rows: those rows say when the slot was taken, not how long
+        the plan has been running — the runtime is measured from the
+        plan's own start — and the runtime is what tells the plans of
+        one priority apart.  A rebuilt set would pick the victim by
+        when a slot was stamped rather than by how long the plan has
+        been at it.  The slots are read once, by the ledger, and the
+        whole answer comes off that one read.
 
         Args:
             min_runtime: ``M`` — the runtime a plan is protected for.

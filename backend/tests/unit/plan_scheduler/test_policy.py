@@ -16,12 +16,15 @@ The contracts this file pins:
    ``M - 1`` seconds is not a candidate; ``M`` and ``M + 1`` are.  The
    default 600 seconds of protection is exactly that long — off by one
    and the protection is either void or a stall.
-2. **The victim is the youngest eligible plan.**  The plan that was
-   created most recently is the one that goes, not the one closest to
-   finishing.  A running entry that carries no creation time is judged
-   by the moment it took its slot — the rule the policy had before the
-   creation times were known.  (The creation-time ordering itself is
-   pinned in ``test_victim_creation_age.py``.)
+2. **The victim is the one that stands last in the line.**  The queue
+   orders plans by ascending priority, so the plan that stands last —
+   the larger priority number — is the one the scheduler can most afford
+   to interrupt.  Among plans of the same priority the one that has run
+   the **shortest** goes first, and a tie is broken by ``plan_id``.
+   Neither the creation time nor the slot timestamp has a say any more.
+   (The two stages of the order are pinned in
+   ``test_victim_priority_order.py``; that ``created_at`` is not read at
+   all is pinned in ``test_victim_creation_age.py``.)
 3. **No candidate is an answer, not a crash.**  An empty candidate set
    gives ``None``.
 4. **Convergence is bounded.**  The scheduler stops as soon as it fits
@@ -61,13 +64,20 @@ def _queued(plan_id: str = "p1", **flags) -> dict:
     return entry
 
 
-def _running(plan_id: str, elapsed: float, acquired_at: float) -> dict:
-    """A running plan: how long it has run, and when it took its slot.
+def _running(plan_id: str, elapsed: float, acquired_at: float, priority: int = 0) -> dict:
+    """A running plan: how long it has run, when it took its slot and
+    what the caller asked for.
 
-    The entry carries no creation time, so the policy falls back to the
-    slot time — which is what these cases are about.
+    The priority is the ordinary weight unless a case says otherwise:
+    the cases in this file are about the runtime, and the two stages of
+    the order are pinned in ``test_victim_priority_order.py``.
     """
-    return {"plan_id": plan_id, "elapsed": elapsed, "acquired_at": acquired_at}
+    return {
+        "plan_id": plan_id,
+        "elapsed": elapsed,
+        "acquired_at": acquired_at,
+        "priority": priority,
+    }
 
 
 def _snapshot(
@@ -140,6 +150,7 @@ _ADMISSION_CASES = [
             used=4,
             capacity=4,
             allow_evict=True,
+            min_runtime_seconds=600,
             running=[_running("r1", 10, 100)],
         ),
         "blocked_by_capacity",
@@ -151,6 +162,7 @@ _ADMISSION_CASES = [
             used=4,
             capacity=4,
             allow_evict=True,
+            min_runtime_seconds=600,
             running=[_running("r1", 600, 100)],
         ),
         "running",
@@ -180,20 +192,27 @@ def test_threshold_applies_to_every_candidate() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. The victim is the youngest eligible plan
+# 2. The victim is the shortest eligible plan
 # ---------------------------------------------------------------------------
 
 
-def test_victim_is_youngest_eligible() -> None:
-    """The plan that took its slot most recently is the one that goes."""
+def test_victim_is_the_shortest_eligible() -> None:
+    """The plan that has run the shortest is the one that goes.
+
+    The two plans carry the same priority, so the runtime is left to
+    decide — and it decides the other way round from the slot time:
+    ``long`` took its slot most recently, so the rule this file used to
+    pin would have picked it.  ``M`` is 60 seconds, so that both plans
+    are eligible and the runtime alone is what is left to decide.
+    """
     snapshot = _snapshot(
         running=[
-            _running("older", 900, 100),
-            _running("younger", 900, 200),
+            _running("long", 900, 200),
+            _running("short", 100, 100),
         ]
     )
 
-    assert select_victim(snapshot, 600) == "younger"
+    assert select_victim(snapshot, 60) == "short"
 
 
 def test_tie_is_broken_by_plan_id() -> None:
@@ -208,17 +227,22 @@ def test_tie_is_broken_by_plan_id() -> None:
     assert select_victim(snapshot, 600) == "alpha"
 
 
-def test_the_youngest_wins_whatever_order_the_entries_came_in() -> None:
-    """The victim's identity does not depend on the order of the running set."""
-    youngest_first = _snapshot(
-        running=[_running("younger", 900, 200), _running("older", 900, 100)]
+def test_the_shortest_wins_whatever_order_the_entries_came_in() -> None:
+    """The victim's identity does not depend on the order of the running set.
+
+    The same two plans with the same two runtimes and the same two slot
+    times — only the order the entries arrived in differs, and the
+    answer is the same either way.
+    """
+    shortest_first = _snapshot(
+        running=[_running("short", 100, 100), _running("long", 900, 200)]
     )
-    oldest_first = _snapshot(
-        running=[_running("older", 900, 100), _running("younger", 900, 200)]
+    longest_first = _snapshot(
+        running=[_running("long", 900, 200), _running("short", 100, 100)]
     )
 
-    assert select_victim(youngest_first, 600) == "younger"
-    assert select_victim(oldest_first, 600) == "younger"
+    assert select_victim(shortest_first, 60) == "short"
+    assert select_victim(longest_first, 60) == "short"
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +286,7 @@ def test_converge_stops_without_victim(monkeypatch) -> None:
     snapshot = _snapshot(
         used=6,
         capacity=4,
+        min_runtime_seconds=600,
         running=[_running(f"r{index}", 10, 100 + index) for index in range(6)],
     )
 
@@ -270,14 +295,28 @@ def test_converge_stops_without_victim(monkeypatch) -> None:
 
 
 def test_converge_converges_six_to_four() -> None:
-    """Six running plans and four slots: the two youngest are evicted."""
+    """Six running plans and four slots: the two shortest runs are evicted.
+
+    ``r0`` and ``r1`` have run the shortest and are interrupted first, in
+    that order.  The slot timestamps point the other way round — ``r5``
+    took its slot most recently — so the answer is the runtime's and not
+    the slot's.
+    """
     snapshot = _snapshot(
         used=6,
         capacity=4,
-        running=[_running(f"r{index}", 900, 100 + index) for index in range(6)],
+        min_runtime_seconds=60,
+        running=[
+            _running("r0", 100, 100),
+            _running("r1", 200, 101),
+            _running("r2", 900, 102),
+            _running("r3", 900, 103),
+            _running("r4", 900, 104),
+            _running("r5", 900, 105),
+        ],
     )
 
-    assert converge(snapshot, 4) == ["r5", "r4"]
+    assert converge(snapshot, 4) == ["r0", "r1"]
 
 
 def test_converge_stops_as_soon_as_it_fits() -> None:
@@ -306,14 +345,23 @@ def test_converge_never_exceeds_the_running_set() -> None:
 
 
 def test_converge_with_a_capacity_of_zero_empties_the_running_set() -> None:
-    """A capacity of zero is a coherent answer: nothing may run."""
+    """A capacity of zero is a coherent answer: nothing may run.
+
+    All three plans go, in the order they are to be interrupted: the
+    shortest run first.
+    """
     snapshot = _snapshot(
         used=3,
         capacity=0,
-        running=[_running(f"r{index}", 900, 100 + index) for index in range(3)],
+        min_runtime_seconds=60,
+        running=[
+            _running("r0", 100, 100),
+            _running("r1", 200, 101),
+            _running("r2", 900, 102),
+        ],
     )
 
-    assert converge(snapshot, 0) == ["r2", "r1", "r0"]
+    assert converge(snapshot, 0) == ["r0", "r1", "r2"]
 
 
 # ---------------------------------------------------------------------------

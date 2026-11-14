@@ -76,6 +76,21 @@ has reached ``M``.  Both are computed from the numbers the panel shows
 beside them, so a flag can never contradict the number it sits next
 to.
 
+The running row names the plan's weight
+---------------------------------------
+A running plan is not merely present: it is holding a slot, and when
+a slot has to be given up the running plans are compared by the
+**priority** the caller gave them — the one that stands last in the
+line goes first.  The row therefore carries that number, read off the
+state as it is.  The queued rows have always carried it, so a panel
+that could show the order of the plans *waiting* but not of the plans
+*running* was answering half the question.
+
+The number is read, not invented: a row that carries no usable
+priority — a slot written before the column existed, a ``NULL``, a
+value that is not a number — reads as ``0``, the ordinary weight every
+plan without a stated priority stands at.
+
 The capacity says where it came from
 -----------------------------------
 The scheduler's capacity comes from one of two places: the
@@ -370,6 +385,11 @@ def _running_view(state: Any, now: float, min_runtime: float) -> List[Dict[str, 
     the moment its slot was taken, and a rule read off the plan clock
     would let a scheduler restart make every long-running plan
     immediately evictable.
+
+    The row carries the plan's **priority** as well: the weight the
+    caller gave it, which is what the eviction rule compares the
+    running plans by.  It is read as it is — the sign is kept, and a
+    row that carries no usable number reads as ``0``.
     """
     view: List[Dict[str, Any]] = []
 
@@ -397,6 +417,11 @@ def _running_view(state: Any, now: float, min_runtime: float) -> List[Dict[str, 
                 # moment the slot was acquired.
                 "evictable": elapsed >= min_runtime,
                 "workspace": _field(row, "workspace", None),
+                # The weight the caller gave the plan — the number the
+                # eviction rule compares the running plans by.  Read as
+                # it is; a row without a usable one reads as ``0``,
+                # the ordinary weight.
+                "priority": int(_number(_field(row, "priority", 0), 0.0)),
             }
         )
 
