@@ -2,10 +2,12 @@
 
 背景
 ----
-本任务不新增任何 HTTP 端点。但"没有变化"是一句需要尺子的话：没有尺子，
-谁也证明不了。``app.openapi()`` 就是那把尺子——FastAPI 从挂载的路由和请求
-模型生成的那份 schema，就是这个服务对外承诺的全部形状（路径、方法、请求体
-模型、响应模型）。它变了，就是 HTTP 面变了。
+本文件不比对这个分支新增了什么，它比对的是"已批准的基线是什么"。有意新增
+的端点会被**纳进**基线（调度器的计划详情端点就是这样一个），增补基线时快照
+与指纹必须在同一个提交里一起更新。但"没有变化"是一句需要尺子的话：没有
+尺子，谁也证明不了。``app.openapi()`` 就是那把尺子——FastAPI 从挂载的路由
+和请求模型生成的那份 schema，就是这个服务对外承诺的全部形状（路径、方法、
+请求体模型、响应模型）。它变了，就是 HTTP 面变了。
 
 快照取的是**发布形态**的 app
 ---------------------------
@@ -32,9 +34,10 @@
 基线还有第二个锚点
 ------------------
 ``BASELINE_FINGERPRINT`` 是基线文件内容的指纹，它**提交在代码里**。快照
-文件本身是由测试生成的产物，不在版本库里；只靠那个文件的话，一次全新
-checkout 上的这道门禁是"自己跟自己比"的空转。指纹让这道门禁在没有快照
-文件的机器上同样会响——这正是本任务要的东西：一把谁都能验证的尺子。
+文件本身也提交在版本库里，但它的内容是由测试生成的产物（文件缺失时测试会
+自己生成一份）；只靠那个文件的话，一次全新 checkout 上的这道门禁是"自己跟
+自己比"的空转。指纹让这道门禁在没有快照文件的机器上同样会响——这正是本
+任务要的东西：一把谁都能验证的尺子。
 
 本文件不改任何生产代码
 ----------------------
@@ -69,7 +72,20 @@ SNAPSHOT_PATH = _TESTS_DIR / "openapi_snapshot.json"
 #: anchor: it travels with the code, so the gate still bites on a machine
 #: that has never seen the snapshot file.  Change it **only** together with
 #: a deliberate, reviewed change to the public HTTP contract.
-BASELINE_FINGERPRINT = "5ab6559c86075508078dd49fc88bbf959321d071fbfbd5cb708fc25712de2c28"
+#:
+#: 2026-11-01（合入 base / PR #75）：本分支与 base 两侧都动过 HTTP 契约基线，
+#: 合并后的对外形状既包含本分支新增的调度计划详情端点，也包含 base 侧对既有
+#: 端点的 schema 改动，故指纹按**合并后的 app 实际发布的 schema** 重新取，
+#: 并与 `openapi_snapshot.json` 在同一次合并里一起更新（两侧的文件内容是
+#: 同一次 Git 合并的结果，两者的指纹一致）。
+#:
+#: 2026-11-07（合入 origin/main / 2fe98191）：再次合并后对外形状又变了
+#: ——main 侧新增了端点/改了既有端点的 schema，本分支的调度计划详情端点
+#: 仍在里面。指纹按**合并后的树实际发布的 schema** 重新取（跑
+#: `pytest tests/api/test_openapi_unchanged.py` 拿实际值回填），并与
+#: `openapi_snapshot.json` 在同一次合并里一起更新：快照文件是这次 Git
+#: 合并的结果，它与合并后的树逐项相等，指纹与它一致。
+BASELINE_FINGERPRINT = "be49f1b2e917d905e81d890ab16e92e705c0d2eaefb7fe434bf79f40f8438cb0"
 
 #: The capture runs in its own process so the schema is the one a clean
 #: start produces: debug routes off, no schema cache carried over from

@@ -34,14 +34,17 @@ The five questions
     plan even before it has a queue row — and the order comes from the
     shared comparator in :mod:`plan_scheduler.queue`, so the panel, the
     admission check and the restart recovery cannot disagree about who
-    runs next.
+    runs next.  Each row carries the ``phase`` the plan is in, as the
+    routing row wrote it.
 ``active_plans()``
     Which plans are holding compute.  Two kinds of work hold compute:
     an execution subprocess, and a verification round.  The two sets are
     unioned and counted per plan, because a plan that does both holds
     one slot, not two.  Each row also carries the ``started_at`` of the
     plan's execution row — the moment the plan really began, which the
-    slot clock loses on every restart.
+    slot clock loses on every restart — and the ``phase`` the plan is
+    in, so that a caller can say what the plan is doing and not only
+    that it is working.
 ``has_pending_decision(plan_id)``
     Is a human being asked about this plan?  The answer is a *guard*,
     not a release: a pending decision keeps a plan from being mistaken
@@ -51,6 +54,18 @@ The five questions
     whatever names that directory goes by.
 ``start_spec(plan_id)``
     What starting this plan needs — derived, not remembered.
+
+The phase is passed on as it is
+-------------------------------
+Both kinds of row carry the phase the plan is in, read from
+``plan_routing.current_phase`` by the same :meth:`PlanFactsReader._phase`
+every other reader of the phase uses.  The facts layer does not map a
+phase to a label and does not translate a phase it has never seen: a
+label is the routing layer's business, and a second mapping here would
+be a second answer to the same question.  A plan with no routing row
+has no phase, and the row says ``None`` — the reader has no opinion
+about a plan it cannot date, and raising over a row that is allowed to
+be absent would take the scheduler down.
 
 The two sides of "is this plan working?"
 ----------------------------------------
@@ -78,6 +93,33 @@ When a plan satisfies both sides it is still **one** plan, and it
 appears once.  The execution side wins the tie: a live process is the
 stronger evidence of compute being held, and releasing the slot while
 that process is still running would be a slot that is not free.
+
+The third source: the injected live set
+---------------------------------------
+The two sides above are read from the rows, and the rows are only as
+fresh as the last time somebody wrote them.  A verification round that
+is started directly — not by the scheduler's own tick — may run for
+longer than the freshness window without refreshing its row, and when
+it does, the plan **vanishes** from the active set even though it is
+still calling a provider and burning CPU and memory.  A scheduler that
+cannot see a working plan admits another one on top of it, and the
+limit it enforces is not the limit that is real.
+
+Making the freshness window longer is not the answer: a longer window
+is still a guess about how long a live round may be quiet, and it has
+to be wrong in the safe direction every time it is wrong.  The answer
+is to ask the thing that actually knows — the process and the loop
+that are alive — and to take the **union** of that answer with the
+rows' answer, so neither source can subtract from the other.
+
+The live set is therefore *injected*: the reader is handed a callback
+that answers "which plan ids are alive right now?", and it asks the
+callback on every call.  The reader keeps its promise of holding no
+state about the plans it reports — the callback is asked every time,
+exactly like the rows are read every time.  A callback that raises
+degrades to the rows' answer and is reported as a warning: the
+callback is foreign code, and foreign code must not be able to take
+the scheduler down.
 
 The workspace key
 -----------------
@@ -194,6 +236,12 @@ VERIFICATION_STALE_SECONDS = 900.0
 #: terminal, but a crash never gets that far — so the status says what
 #: was intended and the pid says what is still there.
 _RUNNING_EXEC_STATUSES = frozenset({"running"})
+
+#: The side a plan is reported on when only the injected live set says
+#: it is working.  A plan nobody can see a subprocess for is a plan
+#: whose compute is held by a verification round, so that is the side
+#: it is reported on.
+_LIVE_SIDE = "verification"
 
 #: The sort key a plan without a queue row gets.  It has not been
 #: enqueued yet, so it belongs behind everything that has.
@@ -401,19 +449,28 @@ class PlanFactsReader:
         clock: the source of "now", in epoch seconds.  It is a
             parameter so that the freshness rule can be exercised
             without waiting fifteen minutes for it.
+        live_plan_ids: the callback that names the plans which are
+            alive right now, or ``None`` when there is no such source.
+            It is asked on every call to :meth:`active_plans`, and its
+            answer is unioned with the rows' answer rather than
+            replacing it.
     """
 
     def __init__(
         self,
         conn: sqlite3.Connection,
         project_root: Any,
-        *,
         clock: Optional[Callable[[], float]] = None,
+        live_plan_ids: Optional[Callable[[], set[str]]] = None,
     ) -> None:
         """Bind the reader to a connection and to the plans tree."""
         self._conn = conn
         self._project_root = Path(project_root)
         self._clock = clock if clock is not None else time.time
+        #: The callback that names the plans which are alive right
+        #: now.  ``None`` means there is no such source, and the
+        #: reader answers from the rows alone.
+        self._live_plan_ids_source = live_plan_ids
         self._missing_dir_warned: set[str] = set()
         #: The creation time of each plan, read once.  It is a fact
         #: about the filesystem that cannot drift — a directory's
@@ -447,10 +504,16 @@ class PlanFactsReader:
         left at the head of the queue would block every plan behind it
         for as long as the scheduler runs.
 
+        Each row also carries the ``phase`` the plan is in — the
+        routing row's own value, passed on as it is.  The facts layer
+        does not map a phase to a label: a label is the routing
+        layer's business, and a second mapping here would be a second
+        answer to the same question.
+
         Returns:
             The queued plans, each a dict of ``plan_id``, ``priority``,
-            ``seq`` and ``due``, in the order the shared comparator
-            gives.  Empty when nothing is waiting.
+            ``seq``, ``due`` and ``phase``, in the order the shared
+            comparator gives.  Empty when nothing is waiting.
         """
         rows = self._conn.execute(
             "SELECT r.plan_id, q.seq, q.priority, q.promote_order, "
@@ -477,6 +540,9 @@ class PlanFactsReader:
                         "priority": int(priority) if priority is not None else 0,
                         "seq": int(seq) if seq is not None else None,
                         "due": _is_due(next_run_at, now),
+                        # The phase the plan is in, read from the
+                        # routing row and passed on as it is.
+                        "phase": self._phase(plan_id),
                     },
                 )
             )
@@ -496,23 +562,41 @@ class PlanFactsReader:
         round).  A plan that satisfies both is **one** plan and appears
         once — it holds one slot, not two.
 
+        The injected live set joins that union.  It names the plans
+        that are alive right now even when their rows have gone quiet,
+        so a verification round that outlasts the freshness window
+        does not disappear from the answer and hand its slot to
+        somebody else.  A plan that both the rows and the callback name
+        is still **one** plan: the rows win the tie, because a running
+        subprocess is the stronger evidence of compute being held.
+
         Each row carries the ``side`` it is active on — ``execution`` or
         ``verification`` — and the ``workspace`` key it works in, so a
         caller can tell which rule releases it: the execution side is
         released when the process is gone, the verification side when
-        the round stops.
+        the round stops.  A plan that only the callback names is
+        reported on the verification side: it holds compute, but no
+        subprocess holds it.
 
         Each row also carries the ``started_at`` of the plan's
         execution row: the moment the plan really started, which the
         slot clock cannot say — a restart re-acquires every slot and
         starts the clock again.  The stamp is passed through as it was
         written; a plan with no execution row — one that is only
-        verifying — has no start time and says ``None``.
+        verifying, or one that only the callback knows about — has no
+        start time and says ``None``.
+
+        And each row carries the ``phase`` the plan is in — the
+        routing row's own value, passed on as it is, so that the
+        caller can say what the plan is doing rather than only that it
+        is working.  A plan with no routing row has no phase and says
+        ``None``; a phase nobody has a label for is still passed on
+        as it is, because the label is the routing layer's business.
 
         Returns:
             The active plans, each a dict of ``plan_id``, ``side``,
-            ``workspace`` and ``started_at``, ordered by plan id.
-            Empty when nothing is working.
+            ``workspace``, ``started_at`` and ``phase``, ordered by
+            plan id.  Empty when nothing is working.
         """
         routing = {
             row["plan_id"]: row["current_phase"]
@@ -543,14 +627,22 @@ class PlanFactsReader:
                 ).fetchall()
             )
         }
+        live = self._live_plan_ids()
 
         active: List[Dict[str, Any]] = []
-        for plan_id in sorted(set(routing) | set(execution) | set(verification)):
+        for plan_id in sorted(
+            set(routing) | set(execution) | set(verification) | live
+        ):
             side = self._execution_side(execution.get(plan_id))
             if side is None:
                 side = self._verification_side(
                     routing.get(plan_id), verification.get(plan_id)
                 )
+            if side is None and plan_id in live:
+                # The rows do not say this plan is working, but the
+                # live set does.  It holds compute all the same, and
+                # the round that holds it is a verification round.
+                side = _LIVE_SIDE
             if side is None:
                 continue
             active.append(
@@ -559,9 +651,52 @@ class PlanFactsReader:
                     "side": side,
                     "workspace": self.workspace_key(plan_id),
                     "started_at": _started_at_text(execution.get(plan_id)),
+                    # The phase the plan is in, read from the routing
+                    # row and passed on as it is.
+                    "phase": self._phase(plan_id),
                 }
             )
         return active
+
+    def _live_plan_ids(self) -> set[str]:
+        """Return the plan ids the injected callback says are alive.
+
+        The callback is somebody else's code, and somebody else's code
+        raises.  When it does, the answer degrades to the rows' answer
+        and the failure is reported as a warning: the scheduler must
+        not lose every plan it is watching over a helper's failure,
+        and it must not quietly count fewer plans than are running
+        either — that is the very mistake the live set exists to fix.
+
+        A callback that returns nothing at all — ``None``, an empty
+        set — says that nothing is alive, which is a legitimate
+        answer and not a failure.
+        """
+        source = self._live_plan_ids_source
+        if source is None:
+            return set()
+        try:
+            live = source()
+        except Exception as exc:  # the callback is foreign code
+            log.warning(
+                "the live plan set could not be read (%s); "
+                "falling back to the database's facts",
+                exc,
+            )
+            return set()
+        if live is None:
+            return set()
+        if isinstance(live, str):
+            return {live}
+        try:
+            return {str(plan_id) for plan_id in live}
+        except TypeError as exc:
+            log.warning(
+                "the live plan set is not a collection of plan ids (%s); "
+                "falling back to the database's facts",
+                exc,
+            )
+            return set()
 
     def _execution_side(self, row: Optional[Dict[str, Any]]) -> Optional[str]:
         """Return ``"execution"`` if the plan's subprocess is running.

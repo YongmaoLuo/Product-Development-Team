@@ -1924,6 +1924,11 @@ class PlanSchedulerEngine:
                 "priority": int(row.get("priority") or 0),
                 "seq": row.get("seq"),
                 "due": bool(row.get("due", True)),
+                # The phase the plan is in, as the facts read it and
+                # passed it on.  The value travels as it is: the
+                # engine does not map it to a label, because a label
+                # is the routing layer's business.
+                "phase": row.get("phase"),
             }
             for row in self._facts.queued_plans()
             if str(row.get("plan_id") or "")
@@ -1961,6 +1966,12 @@ class PlanSchedulerEngine:
         together, in the queue table's order — the order the shared
         comparator gives, which is the order the panel shows and the
         order the admission check reads.
+
+        Each row also carries the ``phase`` the plan is in, as the
+        facts read it: the line says what each waiting plan is, not
+        only that it is waiting.  The value travels as it is — the
+        engine does not map it to a label, because a label is the
+        routing layer's business.
         """
         waiting = {
             str(row["plan_id"]): row for row in state.get("waiting", [])
@@ -1977,6 +1988,10 @@ class PlanSchedulerEngine:
                     "priority": int(row.get("priority") or 0),
                     "seq": row.get("seq"),
                     "due": bool(fact.get("due", True)),
+                    # The phase the plan is in, as the facts read it
+                    # and passed it on.  The engine does not map it to
+                    # a label: the label is the routing layer's job.
+                    "phase": fact.get("phase"),
                     # A plan that is in the queue is waiting, and a
                     # waiting plan is neither paused nor parked.
                     "paused": False,
@@ -2013,6 +2028,12 @@ class PlanSchedulerEngine:
         wrong place.  The head's verdict is the policy's and says
         nothing about the plans behind it — so each of them is asked
         about the directory it works in.
+
+        Every row carries the phase the plan is in, as the facts read
+        it and the line passed it on.  The value travels as it is: the
+        engine does not map it to a label, because the label is the
+        routing layer's business and a second mapping here would be a
+        second answer to the same question.
         """
         rows = self._store.list_queue(self._conn)
         verdict = admission_verdict(state)
@@ -2022,15 +2043,20 @@ class PlanSchedulerEngine:
         }
         view: List[Dict[str, Any]] = []
         for row in rows:
-            if str(row.get("plan_id") or "") not in queued:
+            plan_id = str(row.get("plan_id") or "")
+            if plan_id not in queued:
                 continue
             entry = dict(row)
+            # The phase the plan is in, as the line read it — the
+            # facts' answer, passed on as it is.  The engine does not
+            # map it to a label: the label is the routing layer's job,
+            # and a second mapping here would be a second answer to
+            # the same question.
+            entry["phase"] = queued[plan_id].get("phase")
             if not view:
                 entry["reason"] = verdict
             else:
-                entry["reason"] = self._reason_behind(
-                    queued.get(str(row.get("plan_id") or ""))
-                )
+                entry["reason"] = self._reason_behind(queued.get(plan_id))
             view.append(entry)
         return view
 
@@ -2075,6 +2101,11 @@ class PlanSchedulerEngine:
         scheduler's clock — it starts again from zero on every
         restart — so the plan's own start time travels with the row
         for whoever wants to say how long the plan has been at it.
+
+        The phase the plan is in travels with it as well: the facts
+        read it from the routing row and the row carries it on,
+        unchanged, so that the panel can say what the plan is doing
+        and not only that it is working.
         """
         acquired: Dict[str, float] = {}
         for slot in slots:
@@ -2097,6 +2128,10 @@ class PlanSchedulerEngine:
                     "elapsed": max(0.0, now - moment),
                     "workspace": row.get("workspace"),
                     "started_at": row.get("started_at"),
+                    # The phase the plan is in, as the facts read it
+                    # and passed it on — the value is the plan's own,
+                    # not the engine's guess at it.
+                    "phase": row.get("phase"),
                 }
             )
         return running

@@ -25,6 +25,8 @@ What is pinned here
 -------------------
 ``test_queue_view_skips_missing_plan``
     The view holds the plan that is there and not the ghost that is not.
+``test_queue_view_row_carries_the_phase``
+    The view carries the phase the routing row holds.
 ``test_reconcile_removes_missing_plan_row``
     One tick later the ghost's row is gone from the table.
 ``test_empty_queue_view_is_empty``
@@ -311,6 +313,47 @@ def test_queue_view_skips_missing_plan(
         assert [row["plan_id"] for row in state["queue"]] == ["p1"], (
             "the view shows a plan that is not there: {0!r}".format(
                 state["queue"]
+            )
+        )
+    finally:
+        world.close()
+
+
+def test_queue_view_row_carries_the_phase(
+    db_factory: Any, plan_factory: Any
+) -> None:
+    """The view the panel reads carries the phase the plan is in.
+
+    The phase is the plan's own word — the routing row holds it — and
+    the view passes it on as it is, so the panel can say what the plan
+    is doing and not only that it is waiting.  The engine does not map
+    it to a label: the label is the routing layer's business.
+
+    The state is read through ``_read_state()``, the way the tick reads
+    it, so the whole way the phase travels is pinned and not only the
+    last hop of it.
+    """
+    world = _world(db_factory, plan_factory)
+    try:
+        _routing(world.conn, "p1", QUEUED)
+        _queue_row(world.conn, "p1", seq=1)
+
+        state = world.engine._read_state()
+
+        assert state["queued"], "the plan is in the line: {0!r}".format(
+            state["queued"]
+        )
+        assert state["queued"][0]["phase"] == QUEUED, (
+            "the line carries the phase the routing row holds: {0!r}".format(
+                state["queued"][0]
+            )
+        )
+        assert state["queue"], "the plan is in the view: {0!r}".format(
+            state["queue"]
+        )
+        assert state["queue"][0]["phase"] == QUEUED, (
+            "the view carries the phase the routing row holds: {0!r}".format(
+                state["queue"][0]
             )
         )
     finally:

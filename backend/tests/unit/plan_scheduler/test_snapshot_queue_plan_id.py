@@ -144,6 +144,7 @@ def test_queue_row_shape_matches_the_contract() -> None:
         "priority": 0,
         "promote_order": None,
         "due": True,
+        "phase": None,
         "reason": "waiting_for_slot",
     }
 
