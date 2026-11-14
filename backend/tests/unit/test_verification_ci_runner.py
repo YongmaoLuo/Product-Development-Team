@@ -7,6 +7,9 @@ Covers:
     selectors).
   * ``validate_vp`` — required field, narrowing rejection, and the
     repo-path existence check.
+  * ``validate_vp`` — a path the entry **creates** (``ln -s … backend/.venv``)
+    is not an input it depends on, so it is exempt from that check; a
+    path the entry only **reads** is not.
   * ``run_ci_verification`` — exit 0 → PASSED; non-zero / timeout /
     missing entry → FAILED with the reason; the audit artifact.
   * the per-phase junit evidence — the reports the gate writes are read
@@ -37,6 +40,7 @@ from verification_ci_runner import (  # noqa: E402
     MAX_JUNIT_FAILURES,
     STATUS_FAILED,
     STATUS_PASSED,
+    _created_paths,
     _referenced_paths,
     ci_timeout,
     looks_narrowed,
@@ -2031,6 +2035,259 @@ class TestPlanToExecutorSchemaKeepsE2eFields:
 
 
 # ---------------------------------------------------------------------------
+# validate_vp — self-healing entries (2026-11-01) under the plan-time
+# shape contract (2026-11-05, arch 决策点 2)
+# ---------------------------------------------------------------------------
+#
+# VP-018's entry creates the venv it then reads:
+#
+#     test -d backend/.venv || ln -s <elsewhere>/backend/.venv backend/.venv;
+#     bash scripts/run_tests.sh --lane all
+#
+# The path reader treated *every* path-like token as an input, so the
+# venv the entry brings into being itself was reported as "does not
+# exist" — the gate was rejected at the schema stage and not one
+# command ran.  The path was never missing: the entry creates it.
+#
+# The distinction that fixes it: a path the entry **creates** is not an
+# input it depends on; a path it only **reads** still is.  Both halves
+# are pinned below — the exemption must not become a blanket amnesty.
+#
+# The entry is an inline compound command, so the assertions about the
+# path semantics run it in its **执行期** form
+# (``require_single_entry=False``): the 形态契约 (2026-11-05) is a
+# *planning* contract — a plan that is written today must name one call
+# to the project adapter script — while the historical plans are not
+# rewritten and their compound entries still have to run.  The planning
+# side of the same entry is pinned in
+# :meth:`TestValidateVpSelfHealingEntry.test_the_same_entry_is_rejected_at_plan_time`.
+
+
+def _declared_vp018():
+    """VP-018 as the plan declares it — ``None`` when it is unreachable.
+
+    The plan is not part of this repository; the executor points at it
+    through ``PDT_PLAN_DIR``.
+    """
+    plan_dir = os.environ.get("PDT_PLAN_DIR")
+    if not plan_dir:
+        return None
+    plan_file = Path(plan_dir) / "verification_plan.json"
+    if not plan_file.is_file():
+        return None
+    plan = json.loads(plan_file.read_text(encoding="utf-8"))
+    for vp in plan.get("verification_points", []):
+        if vp.get("id") == "VP-018":
+            return vp
+    return None
+
+
+def _self_healing_entry() -> str:
+    """VP-018's entry, rebuilt.
+
+    The symlink's source is an absolute path — outside the repo, and
+    never existence-checked — so the entry is built at run time instead
+    of being written into this file as one developer's home directory.
+    """
+    source = Path.home() / "backend" / ".venv"
+    return (f"test -d backend/.venv || ln -s {source} backend/.venv; "
+            "bash scripts/run_tests.sh --lane all")
+
+
+class TestValidateVpSelfHealingEntry:
+    def test_entry_that_creates_its_own_venv_is_not_a_schema_issue(self, tmp_path):
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "run_tests.sh").write_text("#!/bin/sh\n")
+        entry = (
+            "test -d backend/.venv || ln -s /somewhere/else/backend/.venv "
+            "backend/.venv; bash scripts/run_tests.sh --lane all"
+        )
+        # 执行期形态：复合入口照旧要能跑，所以这里关掉「必须是对适配脚本的
+        # 一次调用」那道**规划期**契约（``require_single_entry=False``，
+        # 见 ``validate_vp`` 的 docstring）—— 下面断言的是**路径**语义。
+        assert validate_vp(
+            _vp(entry), project_dir=tmp_path, require_single_entry=False,
+        ) == []
+
+    def test_the_same_entry_is_rejected_at_plan_time(self, tmp_path):
+        # 规划期形态契约（2026-11-05, arch 决策点 2）：同一条复合入口在
+        # 规划期被退回 —— 新写的计划必须是对适配脚本的一次调用。
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "run_tests.sh").write_text("#!/bin/sh\n")
+        entry = (
+            "test -d backend/.venv || ln -s /somewhere/else/backend/.venv "
+            "backend/.venv; bash scripts/run_tests.sh --lane all"
+        )
+        issues = validate_vp(_vp(entry), project_dir=tmp_path)
+        assert len(issues) == 1
+        assert "含 shell 操作符" in issues[0].detail
+        assert "||" in issues[0].detail
+
+    def test_a_single_command_that_creates_a_path_passes_the_plan_time_check(
+        self, tmp_path,
+    ):
+        # 两条契约合起来的样子：规划期只认「一次调用」，执行期认「这条
+        # 入口自己建出来的路径不算输入」。一次调用 + 自建路径，两条都满足。
+        assert validate_vp(
+            _vp("ln -sfn /tmp/somewhere-venv backend/.venv"),
+            project_dir=tmp_path,
+        ) == []
+
+    def test_probe_without_creation_is_still_an_issue(self, tmp_path):
+        # Negative control: without the creating command the venv is an
+        # input, and a missing input is still an issue.
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "run_tests.sh").write_text("#!/bin/sh\n")
+        entry = "test -d backend/.venv && bash scripts/run_tests.sh --lane all"
+        issues = validate_vp(
+            _vp(entry), project_dir=tmp_path, require_single_entry=False,
+        )
+        assert len(issues) == 1
+        assert "backend/.venv" in issues[0].detail
+        assert "不存在" in issues[0].detail
+
+    def test_selfhealing_entry_still_requires_the_gate_script(self, tmp_path):
+        # The exemption must not carry over to the script the gate runs:
+        # a self-healing entry still needs the entry script to exist.
+        entry = (
+            "test -d backend/.venv || ln -s /somewhere/else/backend/.venv "
+            "backend/.venv; bash scripts/run_tests.sh --lane all"
+        )
+        issues = validate_vp(
+            _vp(entry), project_dir=tmp_path, require_single_entry=False,
+        )
+        assert len(issues) == 1
+        assert "scripts/run_tests.sh" in issues[0].detail
+        assert "不存在" in issues[0].detail
+
+    def test_existing_created_path_is_still_fine(self, tmp_path):
+        # The venv is already there — nothing is created, nothing to
+        # complain about.
+        (tmp_path / "backend" / ".venv").mkdir(parents=True)
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "run_tests.sh").write_text("#!/bin/sh\n")
+        entry = (
+            "test -d backend/.venv || ln -s /somewhere/else/backend/.venv "
+            "backend/.venv; bash scripts/run_tests.sh --lane all"
+        )
+        assert validate_vp(
+            _vp(entry), project_dir=tmp_path, require_single_entry=False,
+        ) == []
+
+    def test_the_source_of_a_created_path_is_still_required(self, tmp_path):
+        # ``ln -s <src> <dest>`` **reads** its source — only the
+        # destination is something the entry creates.  The exemption must
+        # not reach the source.
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "run_tests.sh").write_text("#!/bin/sh\n")
+        entry = (
+            "ln -s missing/backend/.venv backend/.venv; "
+            "bash scripts/run_tests.sh --lane all"
+        )
+        issues = validate_vp(
+            _vp(entry), project_dir=tmp_path, require_single_entry=False,
+        )
+        assert [i.detail for i in issues] == [
+            "ci_entry 引用的路径不存在：missing/backend/.venv",
+        ]
+
+
+class TestValidateVpAgainstTheRealCriteria:
+    """The criteria as they are actually declared, replayed.
+
+    The narrow cases above use a ``tmp_path`` and a hand-written entry.
+    This class replays the *real* one: VP-018's ``ci_entry``, read out of
+    the plan's own ``verification_plan.json``, against the *real* project
+    root — the directory that holds ``scripts/run_tests.sh``.
+
+    The plan is not part of this repository, so the executor points at it
+    through ``PDT_PLAN_DIR``.  Where it is not reachable the entry's shape
+    is rebuilt instead, which pins the same behaviour everywhere.
+    """
+
+    def test_the_declared_vp018_entry_is_not_a_schema_issue(self):
+        vp = _declared_vp018()
+        if vp is None:
+            pytest.skip(
+                "the plan's verification_plan.json is not reachable from here"
+            )
+        assert validate_vp(
+            vp, project_dir=_REPO_ROOT, require_single_entry=False,
+        ) == []
+
+    def test_a_self_healing_entry_in_the_repo_root_is_not_a_schema_issue(self):
+        # The same entry, rebuilt: the symlink's source is an absolute
+        # path — outside the repo, and never existence-checked — so it is
+        # built at run time instead of being written into this file as one
+        # developer's home directory.
+        assert validate_vp(
+            _vp(_self_healing_entry()), project_dir=_REPO_ROOT,
+            require_single_entry=False,
+        ) == []
+
+    def test_the_gate_script_of_the_real_entry_is_still_required(self):
+        # The exemption covers the venv the entry creates and nothing else:
+        # the script the gate runs is still an input.
+        entry = _self_healing_entry().replace(
+            "scripts/run_tests.sh", "scripts/does_not_exist.sh",
+        )
+        issues = validate_vp(
+            _vp(entry), project_dir=_REPO_ROOT, require_single_entry=False,
+        )
+        assert [i.detail for i in issues] == [
+            "ci_entry 引用的路径不存在：scripts/does_not_exist.sh",
+        ]
+
+
+class TestCreatedPaths:
+    """The paths an entry brings into being itself."""
+
+    def test_ln_destination_is_created(self):
+        created = _created_paths("ln -s /somewhere/.venv backend/.venv")
+        assert "backend/.venv" in created
+
+    def test_mkdir_target_is_created(self):
+        assert "backend/.venv" in _created_paths("mkdir -p backend/.venv")
+
+    def test_touch_target_is_created(self):
+        assert "backend/marker" in _created_paths("touch backend/marker")
+
+    def test_cp_destination_is_created_but_its_source_is_not(self):
+        created = _created_paths("cp scripts/a.sh scripts/b.sh")
+        assert "scripts/b.sh" in created
+        assert "scripts/a.sh" not in created
+
+    def test_mv_destination_is_created(self):
+        created = _created_paths("mv scripts/a.sh scripts/b.sh")
+        assert "scripts/b.sh" in created
+        assert "scripts/a.sh" not in created
+
+    def test_install_destination_is_created(self):
+        created = _created_paths("install -m 755 scripts/a.sh scripts/b.sh")
+        assert "scripts/b.sh" in created
+
+    def test_created_path_after_cd_is_resolved_against_it(self):
+        created = _created_paths("cd backend && ln -s /somewhere/.venv .venv")
+        assert "backend/.venv" in created
+
+    def test_created_path_inside_a_shell_payload_is_created(self):
+        created = _created_paths(
+            "bash -c 'cd backend && ln -s /somewhere/.venv .venv'"
+        )
+        assert "backend/.venv" in created
+
+    def test_a_command_that_creates_nothing_creates_no_path(self):
+        assert _created_paths("bash scripts/run_tests.sh --lane all") == set()
+
+    def test_the_glued_separator_ends_the_command_that_carries_it(self):
+        # ``backend/.venv;`` —— 路径和分隔符是**同一个** token，所以这条
+        # 命令到 ``;`` 就结束了：``ln`` 建的是 ``backend/.venv``，不是
+        # 下一条命令的 ``all``。
+        created = _created_paths(
+            "ln -s /somewhere/.venv backend/.venv; bash scripts/run_tests.sh --lane all"
+        )
+        assert created == {"backend/.venv"}
+
 # 轮次归属 — 取证副本按轮次另存，轮次写进载荷
 # ---------------------------------------------------------------------------
 #

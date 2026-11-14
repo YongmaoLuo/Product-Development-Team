@@ -1577,6 +1577,55 @@ main#app > .loading {
 .scheduler-action-result.error .scheduler-action-outcome { color: var(--danger); }
 .scheduler-action-result.error .scheduler-action-detail { color: var(--danger); }
 
+/* The scheduler's plan cards.  A plan is drawn as one card: a header
+   that says which plan it is, and a detail that holds the progress
+   lines.  The card starts folded — the detail is hidden until the
+   operator opens it — and the fold is a DOM attribute on the card, so
+   opening a card is never a change to the plan. */
+.scheduler-plan-cards {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 8px 0 12px;
+}
+
+.scheduler-plan-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    font-size: 13px;
+}
+
+.scheduler-plan-header {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    width: 100%;
+    padding: 10px 12px;
+    background: none;
+    border: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.scheduler-plan-header:hover { background: var(--surface2); }
+
+.scheduler-plan-detail {
+    padding: 10px 12px;
+    border-top: 1px solid var(--border);
+    color: var(--text-dim);
+}
+
+/* Folded is the default: a card that does not say it is open shows no
+   detail, so the only way to open a card is to say so. */
+.scheduler-plan-card .scheduler-plan-detail { display: none; }
+.scheduler-plan-card[data-expanded="false"] .scheduler-plan-detail { display: none; }
+.scheduler-plan-card[data-expanded="true"] .scheduler-plan-detail { display: block; }
+
 /* The scheduler's nav button in the sidebar. */
 .btn-nav {
     padding: 6px 12px;

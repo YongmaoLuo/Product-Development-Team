@@ -33,6 +33,21 @@ rendered as it stands: it falls back to a word the panel knows how to
 draw.  The panel is never handed a label it cannot display, and it is
 never handed one that means something else.
 
+The phase is passed on as it is
+-------------------------------
+A phase says what a plan is *doing* — executing, repairing,
+verifying — and it is the routing layer's own word: the plan's
+``plan_routing.current_phase``, read by the facts and carried on the
+row the engine writes into the state.  The snapshot does not know the
+phase vocabulary and does not map the phase to a label: a label is
+worked out further up, and a second mapping here would be a second
+answer to "what is this plan doing".
+
+A row that carries no phase says ``None``.  A state written before the
+phase existed is a normal thing to read, and answering "I don't know"
+is the right answer to it — raising here would take the whole read
+model down over a field that is allowed to be absent.
+
 The shape is closed
 -------------------
 The document has exactly six keys: ``capacity``, ``queue_length``,
@@ -235,6 +250,20 @@ def _now_iso() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _phase(row: Any) -> Optional[str]:
+    """Return the phase the plan is in, or ``None`` when it has none.
+
+    The phase is the routing layer's word and it is passed on as it
+    is — the snapshot does not know the phase vocabulary, and the label
+    a human reads is worked out further up.
+
+    A row that carries no phase answers ``None``: a state written
+    before the phase existed is a normal thing to read, and "I don't
+    know" is the right answer to it.
+    """
+    return _field(row, "phase", None)
+
+
 def _reason(row: Any) -> str:
     """Return the reason a queued plan is waiting, from the closed vocabulary.
 
@@ -275,6 +304,12 @@ def _queue_view(state: Any) -> List[Dict[str, Any]]:
     plan's own, and the flag is the facts' answer, read as due when the
     row does not carry one — a plan nothing has scheduled for is due,
     because nothing holds it back.
+
+    The row also carries the phase — what the plan is doing — as it
+    is.  A row without one says ``None`` rather than dropping the
+    field, because the field is part of the row's shape and a row
+    that sometimes has it and sometimes does not is a shape the panel
+    cannot rely on.
     """
     rows = sorted(_entries(state, "queue"), key=queue_key)
 
@@ -287,6 +322,7 @@ def _queue_view(state: Any) -> List[Dict[str, Any]]:
             "promote_order": _promote_order(row),
             "due": bool(_field(row, "due", True)),
             "reason": _reason(row),
+            "phase": _phase(row),
         }
         for position, row in enumerate(rows, start=1)
     ]
@@ -370,6 +406,12 @@ def _running_view(state: Any, now: float, min_runtime: float) -> List[Dict[str, 
     the moment its slot was taken, and a rule read off the plan clock
     would let a scheduler restart make every long-running plan
     immediately evictable.
+
+    The row carries the phase as well — what the plan is doing, in the
+    routing layer's own words — and a row without one says ``None``.
+    The phase is what tells the panel that "running" is not one thing
+    but several: a plan executing and a plan repairing both hold a
+    slot, and the operator has to be able to tell them apart.
     """
     view: List[Dict[str, Any]] = []
 
@@ -397,6 +439,7 @@ def _running_view(state: Any, now: float, min_runtime: float) -> List[Dict[str, 
                 # moment the slot was acquired.
                 "evictable": elapsed >= min_runtime,
                 "workspace": _field(row, "workspace", None),
+                "phase": _phase(row),
             }
         )
 

@@ -3291,6 +3291,46 @@
         "summary": "Set Capacity"
       }
     },
+    "/api/scheduler/plan/{plan_id}/detail": {
+      "get": {
+        "description": "Answer with one plan's progress \u2014 the card's own wording.\n\nThe scheduler's read model says **which** plans are queued and\nwhich are running.  When the operator opens one of them, the panel\nasks a second question \u2014 \"what is this plan doing right now?\" \u2014 and\nthat answer already exists: it is the Feishu progress card's body,\nthe same three sections (where the plan is, how the tasks are\ncounted, what is running this moment), worded by the same builders.\n\nSo this endpoint grows no second phrasing of it.  It asks the plan's\nstatus for where the plan is, asks the card's builder\n(``cards.build_progress_lines``) for the wording, and hands both on.\nA panel and a card that read the same lines cannot disagree about\nwhat a plan is doing.\n\nIt is a **read**, and it reads one thing only: the routing row's\nphase is the same before the call and after it.  A detail endpoint\nthat stamped a phase would be a second writer of the plan's state.\n\nTwo refusals, and they are told apart:\n\n* a **malformed** id is a bad request \u2014 the shared guard's own 400,\n  left alone;\n* a plan that is **not there** is a 404 that says so.\n\nA refusal of the third kind \u2014 this instance may not say whether the\nplan exists \u2014 travels on unchanged: it is the plans route's answer\nabout **its** data plane, and re-wording it here would replace a\ntrue statement with a vaguer one.",
+        "operationId": "get_scheduler_plan_detail_api_scheduler_plan__plan_id__detail_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Get Scheduler Plan Detail Api Scheduler Plan  Plan Id  Detail Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Scheduler Plan Detail"
+      }
+    },
     "/api/scheduler/state": {
       "get": {
         "description": "Answer with the scheduler's read model.\n\nThe engine's own snapshot: the six keys, the queue in the\nproduction order, the numbers the panel shows beside the flags\nthat describe them.\n\nA scheduler that is not running answers the empty document rather\nthan an error \u2014 the endpoint is what the panel polls, and an\nendpoint that fails when there is nothing to report leaves the\noperator with a broken panel and no way to tell an idle scheduler\nfrom a broken one.",

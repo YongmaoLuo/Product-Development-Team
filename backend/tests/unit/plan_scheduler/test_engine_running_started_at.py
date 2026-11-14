@@ -111,6 +111,7 @@ def test_running_view_passes_started_at(engine: Any) -> None:
             "acquired_at": 1793307600.0,
             "elapsed": 12.0,
             "workspace": None,
+            "phase": None,
             "started_at": "2026-10-29T20:04:26",
         }
     ]

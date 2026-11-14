@@ -952,9 +952,9 @@ def test_scheduler_panel_requeues_failed_plan(browser_world):
     button **clicked** — not called.
 
     The assertion is made against the **page**, because the page is
-    the thing under test: after the click, the plan's id is drawn in
-    the queue list.  The screenshot is the evidence that the panel was
-    really driven.
+    the thing under test: after the click, the plan is drawn in the
+    queue, as a card of its own.  The screenshot is the evidence that
+    the panel was really driven.
     """
     playwright = pytest.importorskip(
         "playwright.sync_api",
@@ -1006,9 +1006,17 @@ def test_scheduler_panel_requeues_failed_plan(browser_world):
             button.click()
 
             # The plan is in the line, and the line says so.
+            #
+            # The panel draws the queue as **cards** — one card per
+            # waiting plan — and the card carries the plan it is about in
+            # its own ``data-plan-id``.  The table the panel used to
+            # draw the rows into (``#scheduler-queue-list``) is still in
+            # the markup and carries no rows any more, so waiting on it
+            # waits for a node that can never carry the plan.
             page.wait_for_function(
-                "planId => (document.querySelector('#scheduler-queue-list')"
-                " || {}).innerText.includes(planId)",
+                "planId => Array.from(document.querySelectorAll("
+                "'#scheduler-queue-cards .scheduler-plan-card'))"
+                ".some(card => (card.dataset.planId || '') === planId)",
                 arg=plan_id,
                 timeout=10000,
             )

@@ -45,12 +45,12 @@ installed?
 
 How the four actions are issued
 -------------------------------
-The panel draws a waiting plan's buttons in its **queue** row: a
+The panel draws a waiting plan's buttons in its **queue** card: a
 promotion and a start.  It draws a pause for a plan that holds a slot,
 and it draws no resume at all.
 
 The promotion and the start are therefore **pressed** — the queue
-row's own ``.scheduler-action`` button, watched on its way out, so the
+card's own ``.scheduler-action`` button, watched on its way out, so the
 report can say that the request really carried the guard's header.
 The pause and the resume are **issued** as commands: the same endpoint
 the button would have called, the same header, the same server — what
@@ -281,8 +281,8 @@ A step names an action and a plan, and says how the action is
 issued:
 
 * ``"via": "panel"`` (the default) — the button the panel drew is
-  pressed.  A waiting plan's buttons are drawn in its **queue** row,
-  so the button that is pressed is the queue row's own
+  pressed.  A waiting plan's buttons are drawn in its **queue** card,
+  so the button that is pressed is the queue card's own
   ``.scheduler-action`` button;
 * ``"via": "api"`` — the command is issued as a command.  Two of the
   four actions have no button to press: the panel draws a promotion
@@ -332,7 +332,10 @@ from playwright.sync_api import Error, sync_playwright
 #: reads the panel and waits by it.
 sys.path.insert(0, os.environ["PDT_CASE_BACKEND_DIR"])
 from tests.e2e.plan_scheduler.test_scheduler_operator_e2e import (
+    QUEUE_CARD_SELECTOR,
+    RUNNING_CARD_SELECTOR,
     _wait_for_panel_parity,
+    read_cards,
     read_rows,
     read_running,
     served_state,
@@ -388,8 +391,28 @@ def read_capacity(page, prefix):
 
 
 def read_queue(page):
-    """The line, as the panel draws it."""
-    return read_rows(page, "#scheduler-queue-list tr")
+    """The line, as the panel draws it.
+
+    The panel draws the waiting plans as **cards**, one per plan, and
+    the cards are what is read here.  A card is read as the columns
+    the queue's table used to draw — the position, the plan, the
+    number, the priority, the promotion and the reason — so that what
+    the panel says about a plan is read the way it always was.  The
+    table the panel used to draw the rows into
+    (``#scheduler-queue-list``) is still in the markup and carries no
+    rows any more.
+    """
+    return [
+        [
+            row["facts"].get("position", ""),
+            row["plan_id"],
+            row["facts"].get("seq", ""),
+            row["facts"].get("priority", ""),
+            row["facts"].get("promote_order", ""),
+            row["facts"].get("reason", ""),
+        ]
+        for row in read_cards(page, QUEUE_CARD_SELECTOR)
+    ]
 
 
 def outcome_text(page):
@@ -530,16 +553,16 @@ def detail_text(detail):
 
 
 def press_queue_button(page, action, plan):
-    """Press the button the queue row of *plan* draws.
+    """Press the button the queue card of *plan* draws.
 
-    The panel draws a waiting plan's buttons in its queue row: a
+    The panel draws a waiting plan's buttons in its queue card: a
     promotion and a start.  The button is waited for, pressed, and the
     request it made is watched on its way out — the intercepted request
     is the proof that the button was really pressed, and the answer
     that comes back is the proof that the command was carried out.
     """
     selector = (
-        "#scheduler-queue-list button.scheduler-action"
+        "#scheduler-queue-cards button.scheduler-action"
         "[data-action='{0}'][data-plan='{1}']"
     ).format(action, plan)
     page.wait_for_selector(selector, timeout=30000)
@@ -1075,9 +1098,60 @@ def read_rows(page: Any, selector: str) -> List[List[str]]:
     )
 
 
+#: The two blocks of the panel, as the panel draws them: one card per
+#: waiting plan, and one card per plan that holds a slot.  A card
+#: carries the plan it is about in ``data-plan-id`` and the facts the
+#: panel draws in ``data-fact`` attributes.
+QUEUE_CARD_SELECTOR = "#scheduler-queue-cards .scheduler-plan-card"
+RUNNING_CARD_SELECTOR = "#scheduler-running-cards .scheduler-plan-card"
+
+
+def read_cards(page: Any, selector: str) -> List[Dict[str, Any]]:
+    """The cards the panel draws, read in one go.
+
+    The panel redraws its cards whenever it reads the model again, so a
+    card that was located a moment ago may be gone by the time it is
+    read.  Reading them all in one evaluation avoids that race: what is
+    read is what is on the page at that moment.
+
+    A card is read as the plan it is about and the facts it carries:
+    the plan comes from the card's own ``data-plan-id``, and every fact
+    from the ``data-fact`` attribute the renderer gave it.
+    """
+    return page.eval_on_selector_all(
+        selector,
+        """cards => cards.map(card => {
+               const facts = {};
+               card.querySelectorAll('[data-fact]').forEach(node => {
+                   facts[node.dataset.fact] = (node.dataset.value || '').trim();
+               });
+               return {
+                   plan_id: (card.dataset.planId || '').trim(),
+                   facts: facts,
+               };
+           })""",
+    )
+
+
 def read_running(page: Any) -> List[List[str]]:
-    """The running plans, as the panel draws them."""
-    return read_rows(page, "#scheduler-running-list tr")
+    """The running plans, as the panel draws them.
+
+    The panel draws them as cards too, and a card is read as the
+    columns the running table used to draw — the plan, the time it has
+    been running, whether it may be interrupted and its workspace.  The
+    table the panel used to draw the rows into
+    (``#scheduler-running-list``) is still in the markup and carries no
+    rows any more.
+    """
+    return [
+        [
+            row["plan_id"],
+            row["facts"].get("running_sec", ""),
+            row["facts"].get("evictable", ""),
+            row["facts"].get("workspace", ""),
+        ]
+        for row in read_cards(page, RUNNING_CARD_SELECTOR)
+    ]
 
 
 def served_state(
@@ -1644,7 +1718,7 @@ class _World:
 
         A step names an action and a plan, and says how the action is
         issued: ``"via": "panel"`` presses the button the panel drew
-        (the queue row's own button), and ``"via": "api"`` issues the
+        (the queue card's own button), and ``"via": "api"`` issues the
         command the panel draws no button for.  Nothing is simulated —
         the browser clicks the panel's own buttons and the report is
         what the panel then shows.

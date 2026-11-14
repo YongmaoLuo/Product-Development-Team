@@ -2324,17 +2324,312 @@ function schedulerActionButtons(planId, actions, phase) {
         .join(" ");
 }
 
+/** How long one cached detail stays worth reading.
+
+    The panel polls its read model every five seconds, and an open card
+    is meant to show what the plan is doing **now**.  A detail that is
+    kept for ever shows the operator the answer they saw when they
+    opened the card, which is the opposite of what an open card is for.
+
+    So a cached detail lives for one poll interval: long enough that
+    folding a card and opening it again is free, short enough that an
+    open card keeps up with the plan it is about. */
+const SCHEDULER_CARD_DETAIL_TTL_MS = 5000;
+
+/** The details a card has already fetched, keyed by the plan's id.
+
+    A card that is opened twice is asked for once: the second opening
+    reads what the first one brought back.  The cache is keyed by the
+    plan, so one plan's answer never stands in for another's.  Each
+    entry carries the moment it was fetched, so the panel can tell a
+    fresh answer from a stale one. */
+const _schedulerCardDetails = new Map();
+
+/** The failures a card's detail request ran into, keyed by the plan's
+    id.  A failure is remembered too: the panel repaints every five
+    seconds, and a plan whose detail cannot be read must go on saying
+    so instead of quietly going blank on the next repaint. */
+const _schedulerCardErrors = new Map();
+
+/** The plans whose detail is on its way.
+
+    A card that is opened asks for its detail, and the answer takes a
+    moment to arrive.  A repaint in between must not ask a second
+    time, so the plans that are being fetched are remembered until
+    their answer is here. */
+const _schedulerCardPending = new Set();
+
+/** The plans whose card the operator has opened.
+
+    The panel repaints every five seconds, and a card that is written
+    folded every time would fold itself out from under the operator
+    who opened it.  This set is what survives the repaint: the card is
+    written folded and then re-opened, and the detail it already has
+    is put back without asking for it again. */
+const _schedulerOpenCards = new Set();
+
+/** One plan's card.
+
+    The card is written **folded**: it says so with
+    ``data-expanded="false"`` and the stylesheet keeps the detail out
+    of sight.  Nothing is fetched while the card is folded — the
+    plan's progress lines are asked for when the operator opens the
+    card, and only then.
+
+    The card is drawn from the **row** and from nothing else.  The
+    header carries what the panel already knows about the plan: its
+    id, the phase the **backend** named (the panel does not translate
+    it), and the facts the row carries.  The actions are the row's
+    own — the renderer puts them on it — and they stay on the card
+    whether it is folded or open: they are the operator's buttons, not
+    the plan's progress.
+
+    The facts are the row's too, and the card does not go looking for
+    them: each side's renderer reads the fields it owns and hands the
+    card a list of facts to draw.  The two sides carry different
+    fields, and a card that read them itself would know about a row
+    it is only half of.
+
+    Every class the card's markup uses is one the stylesheet already
+    styles, and a fact is written with the name it is known by — so a
+    reader (or a test) can ask for ``running_sec`` and be answered
+    with the duration, rather than with a paragraph to take apart.
+
+    The actions sit **beside** the header, not inside it: the header
+    is a button, and a button inside a button is not markup — the
+    parser closes the outer one and the header comes out empty. */
+function schedulerCard(row) {
+    const item = row || {};
+    const planId = item.plan_id ? String(item.plan_id) : "";
+    const phaseLabel = item.phase_label ? String(item.phase_label) : "";
+    const facts = Array.isArray(item.facts) ? item.facts : [];
+
+    const factsHtml = facts
+        .map((fact) => {
+            const entry = fact || {};
+            const value = entry.value === null || entry.value === undefined
+                ? null
+                : String(entry.value);
+            if (value === null) return "";
+            const name = entry.name ? String(entry.name) : "";
+            const label = entry.label ? String(entry.label) : "";
+            return `<span data-fact="${escapeHtml(name)}" data-value="${escapeHtml(value)}">${escapeHtml(label)} ${escapeHtml(value)}</span>`;
+        })
+        .join("");
+
+    const actionsHtml = item.actions_html ? String(item.actions_html) : "";
+
+    return `<div class="scheduler-plan-card" data-expanded="false" data-plan-id="${escapeHtml(planId)}">
+        <button type="button" class="scheduler-plan-header" data-scheduler-toggle="${escapeHtml(planId)}">
+            <strong>${escapeHtml(planId || "—")}</strong>
+            <span>${escapeHtml(phaseLabel || "—")}</span>
+            ${factsHtml}
+        </button>
+        <div class="scheduler-row-actions">${actionsHtml}</div>
+        <div class="scheduler-plan-detail"></div>
+    </div>`;
+}
+
+/** The card of one plan, if the page is showing it. */
+function schedulerCardElement(planId) {
+    const id = planId ? String(planId) : "";
+    if (!id) return null;
+    const cards = document.querySelectorAll(".scheduler-plan-card");
+    for (const card of cards) {
+        if (card.dataset.planId === id) return card;
+    }
+    return null;
+}
+
+/** The lines a card shows when it is open.
+
+    The wording is the backend's — the same builders the progress card
+    uses — so the panel and the card cannot disagree about what a plan
+    is doing. */
+function schedulerCardDetailHtml(payload) {
+    const data = payload && typeof payload === "object" ? payload : {};
+    const lines = Array.isArray(data.lines) ? data.lines : [];
+    if (!lines.length) {
+        return "<p>这个计划还没有进度信息</p>";
+    }
+    return lines
+        .map((line) => {
+            const text = line && typeof line === "object" ? line.text : line;
+            return `<p>${escapeHtml(text == null ? "" : text)}</p>`;
+        })
+        .join("");
+}
+
+/** What a card says when its detail could not be read.
+
+    The failure is the plan's own and it is said in the plan's own
+    card: the other plans in the list are fine, and they must stay on
+    screen. */
+function schedulerCardErrorHtml(message) {
+    return `<p><span class="exec-badge failed">详情读取失败</span> ${escapeHtml(message || "未知错误")}</p>`;
+}
+
+/** Whether what a card shows has gone stale.
+
+    A cached detail is worth reading until it is older than the panel's
+    poll interval.  After that it says what the plan was doing a while
+    ago, and an open card has to ask again — an open card that never
+    catches up is a screenshot of the past.
+
+    A plan whose detail was never fetched is not stale: there is
+    nothing to be stale, and the card that has not been opened yet is
+    not the panel's to fetch. */
+function schedulerCardDetailStale(planId) {
+    const cached = _schedulerCardDetails.get(planId);
+    if (cached) {
+        return Date.now() - cached.at >= SCHEDULER_CARD_DETAIL_TTL_MS;
+    }
+    const failed = _schedulerCardErrors.get(planId);
+    if (failed) {
+        return Date.now() - failed.at >= SCHEDULER_CARD_DETAIL_TTL_MS;
+    }
+    return false;
+}
+
+/** Open one card, or fold it again.
+
+    Folding and opening are a **front-end** state: the card says which
+    it is with ``data-expanded`` and nothing else changes.  No write
+    endpoint is called — opening a card is the operator's business,
+    not the plan's.
+
+    Opening is the one moment the plan's progress lines are asked for.
+    A folded card is worth exactly what the panel already knows, and
+    asking for the rest of it up front would spend a request per plan
+    on every five-second poll.  A card that was opened before is not
+    asked again: the lines are kept, keyed by the plan's id, so
+    opening and folding and opening again is one request, not two.
+
+    A plan whose detail cannot be read says so **in its own card**:
+    the failure is that card's business, and a list that went blank
+    because one plan could not be read is a worse answer than a card
+    that says what went wrong. */
+async function toggleSchedulerCard(planId) {
+    const id = planId ? String(planId) : "";
+    const card = schedulerCardElement(id);
+    if (!card) return;
+
+    const detail = card.querySelector(".scheduler-plan-detail");
+    const wasExpanded = card.dataset.expanded === "true";
+
+    // The fold itself: the attribute, and nothing else.
+    card.dataset.expanded = wasExpanded ? "false" : "true";
+    if (wasExpanded) {
+        _schedulerOpenCards.delete(id);
+        return;
+    }
+    _schedulerOpenCards.add(id);
+
+    // Asked before?  Then the answer is already here — and asking
+    // again would be a second request for the same words.
+    const cached = _schedulerCardDetails.get(id);
+    if (cached) {
+        if (detail) detail.innerHTML = schedulerCardDetailHtml(cached.payload);
+        return;
+    }
+    const failed = _schedulerCardErrors.get(id);
+    if (failed) {
+        if (detail) detail.innerHTML = schedulerCardErrorHtml(failed.message);
+        return;
+    }
+
+    // Already on its way?  Then it is asked once, not twice.
+    if (_schedulerCardPending.has(id)) return;
+
+    _schedulerCardPending.add(id);
+    try {
+        const payload = await api(`/scheduler/plan/${encodeURIComponent(id)}/detail`);
+        _schedulerCardDetails.set(id, {payload: payload, at: Date.now()});
+        _schedulerCardErrors.delete(id);
+        // The panel redraws its cards every five seconds, and a
+        // redraw replaces the card the request was made from.  The
+        // answer goes to the card that is on the page now — an answer
+        // written into a card that is no longer there is an answer
+        // nobody reads.
+        const current = schedulerCardElement(id);
+        const currentDetail = current ? current.querySelector(".scheduler-plan-detail") : null;
+        if (currentDetail) currentDetail.innerHTML = schedulerCardDetailHtml(payload);
+    } catch (err) {
+        // The failure belongs to this card: say what went wrong here
+        // rather than leaving the list blank.
+        const message = err && err.message ? err.message : String(err || "");
+        _schedulerCardErrors.set(id, {message: message, at: Date.now()});
+        _schedulerCardDetails.delete(id);
+        const current = schedulerCardElement(id);
+        const currentDetail = current ? current.querySelector(".scheduler-plan-detail") : null;
+        if (currentDetail) currentDetail.innerHTML = schedulerCardErrorHtml(message);
+    } finally {
+        _schedulerCardPending.delete(id);
+    }
+}
+
+/** Put the cards the operator has opened back the way they left them.
+
+    The panel repaints every five seconds.  A card that was written
+    folded and left folded would close itself under the operator's
+    eyes, and the detail they had asked for would go with it — so the
+    open cards are re-opened after the repaint, and the detail they
+    already have is put back **without asking for it again**.
+
+    What they have may be stale, though: an open card is a window on
+    what the plan is doing now, and a window that shows the past is a
+    picture.  So a card whose detail has grown old is asked again —
+    the entry is dropped first, and the toggle does what it does for a
+    card that was never opened. */
+function schedulerRestoreOpenCards() {
+    for (const planId of Array.from(_schedulerOpenCards)) {
+        const card = schedulerCardElement(planId);
+        if (!card) {
+            // The plan is not on the page any more — it was finished,
+            // or it was taken off the queue.  There is nothing left to
+            // keep open.
+            _schedulerOpenCards.delete(planId);
+            continue;
+        }
+        // The answer is on its way: the card is opened, and what it
+        // shows is written into it when the answer arrives.
+        if (_schedulerCardPending.has(planId)) {
+            card.dataset.expanded = "true";
+            continue;
+        }
+        if (schedulerCardDetailStale(planId)) {
+            _schedulerCardDetails.delete(planId);
+            _schedulerCardErrors.delete(planId);
+            toggleSchedulerCard(planId);
+            continue;
+        }
+        card.dataset.expanded = "true";
+        const detail = card.querySelector(".scheduler-plan-detail");
+        if (!detail) continue;
+        const cached = _schedulerCardDetails.get(planId);
+        if (cached) {
+            detail.innerHTML = schedulerCardDetailHtml(cached.payload);
+        } else {
+            const failed = _schedulerCardErrors.get(planId);
+            if (failed) detail.innerHTML = schedulerCardErrorHtml(failed.message);
+        }
+    }
+}
+
 /** The queue, in the order the server gave it.  An empty queue is an
     empty state, not an error: "nothing is waiting" is a normal thing to
-    look at. */
+    look at.
+
+    The queue is drawn as **cards**, one per waiting plan, and every
+    card starts folded: a plan's progress lines are asked for when the
+    operator opens its card, not on every poll. */
 function renderSchedulerQueue(snapshot) {
     const rows = snapshot && Array.isArray(snapshot.queue) ? snapshot.queue : [];
-    const body = $("#scheduler-queue-list");
+    const body = $("#scheduler-queue-cards");
     if (!body) return;
 
     if (!rows.length) {
         body.innerHTML = "";
-        schedulerToggle($("#scheduler-queue-table"), false);
         schedulerToggle($("#scheduler-queue-empty"), true);
         return;
     }
@@ -2343,20 +2638,34 @@ function renderSchedulerQueue(snapshot) {
         .map((row) => {
             const item = row || {};
             const planId = item.plan_id ? String(item.plan_id) : "";
-            const promoted = item.promote_order === null || item.promote_order === undefined ? "—" : item.promote_order;
-            return `<tr>
-                <td>${escapeHtml(item.position)}</td>
-                <td>${escapeHtml(planId || "—")}</td>
-                <td>${escapeHtml(item.seq)}</td>
-                <td>${escapeHtml(item.priority)}</td>
-                <td>${escapeHtml(promoted)}</td>
-                <td>${escapeHtml(schedulerReasonText(item.reason))}</td>
-                <td class="scheduler-row-actions">${schedulerActionButtons(planId, ["promote", "start"])}</td>
-            </tr>`;
+            return schedulerCard({
+                ...item,
+                facts: [
+                    {name: "position", label: "位置", value: item.position},
+                    {name: "seq", label: "序号", value: item.seq},
+                    {name: "priority", label: "优先级", value: item.priority},
+                    // A plan that was never promoted reads as 「—」:
+                    // there is nothing here, not "not filled in yet".
+                    {
+                        name: "promote_order",
+                        label: "提升",
+                        value:
+                            item.promote_order === null ||
+                            item.promote_order === undefined
+                                ? "—"
+                                : item.promote_order,
+                    },
+                    {
+                        name: "reason",
+                        label: "原因",
+                        value: schedulerReasonText(item.reason),
+                    },
+                ],
+                actions_html: schedulerActionButtons(planId, ["promote", "start"]),
+            });
         })
         .join("");
 
-    schedulerToggle($("#scheduler-queue-table"), true);
     schedulerToggle($("#scheduler-queue-empty"), false);
 }
 
@@ -2391,15 +2700,18 @@ function schedulerDurationText(seconds) {
     The duration is the plan's own clock — how long the plan has been
     running — and it falls back to the slot clock, the time since the
     slot was acquired, for a listing that does not carry the plan
-    clock. */
+    clock.
+
+    The running plans are drawn as **cards**, one per plan, and every
+    card starts folded: a plan's progress lines are asked for when the
+    operator opens its card, not on every poll. */
 function renderSchedulerRunning(snapshot) {
     const rows = snapshot && Array.isArray(snapshot.running) ? snapshot.running : [];
-    const body = $("#scheduler-running-list");
+    const body = $("#scheduler-running-cards");
     if (!body) return;
 
     if (!rows.length) {
         body.innerHTML = "";
-        schedulerToggle($("#scheduler-running-table"), false);
         schedulerToggle($("#scheduler-running-empty"), true);
         return;
     }
@@ -2408,18 +2720,40 @@ function renderSchedulerRunning(snapshot) {
         .map((row) => {
             const item = row || {};
             const planId = item.plan_id ? String(item.plan_id) : "";
-            const duration = schedulerDurationText(item.running_sec ?? item.elapsed_sec);
-            return `<tr>
-                <td>${escapeHtml(planId || "—")}</td>
-                <td>${escapeHtml(duration)}</td>
-                <td>${escapeHtml(item.evictable ? "是" : "否")}</td>
-                <td>${escapeHtml(item.workspace || "—")}</td>
-                <td class="scheduler-row-actions">${schedulerActionButtons(planId, ["pause"])}</td>
-            </tr>`;
+            return schedulerCard({
+                ...item,
+                facts: [
+                    // The plan's own clock, and the slot clock it falls
+                    // back to for a listing that carries no plan clock.
+                    {
+                        name: "running_sec",
+                        label: "已运行",
+                        value: schedulerDurationText(
+                            item.running_sec ?? item.elapsed_sec
+                        ),
+                    },
+                    // The backend's own flag: the eviction rule is
+                    // measured against the slot clock, and the panel does
+                    // not recompute it.
+                    {
+                        name: "evictable",
+                        label: "可驱逐",
+                        value: item.evictable ? "是" : "否",
+                    },
+                    {
+                        name: "workspace",
+                        label: "工作区",
+                        value:
+                            item.workspace === null || item.workspace === undefined
+                                ? "—"
+                                : item.workspace,
+                    },
+                ],
+                actions_html: schedulerActionButtons(planId, ["pause"]),
+            });
         })
         .join("");
 
-    schedulerToggle($("#scheduler-running-table"), true);
     schedulerToggle($("#scheduler-running-empty"), false);
 }
 
@@ -2478,6 +2812,10 @@ function renderScheduler(snapshot) {
     renderSchedulerCapacity(data);
     renderSchedulerQueue(data);
     renderSchedulerRunning(data);
+    // The cards are written folded; the ones the operator opened are
+    // re-opened here, so a repaint does not close them under the
+    // operator's eyes.
+    schedulerRestoreOpenCards();
 }
 
 /** The failure each read last had, filed under the read that had it.
@@ -2863,6 +3201,25 @@ function bindSchedulerActions() {
     });
 }
 
+/** One listener for every card header: the cards are drawn by the
+    renderers, so they are bound by delegation rather than one by one.
+
+    The header is the card's own click target — the action buttons sit
+    beside it, not inside it, so a click on one of them is not a click
+    on the card. */
+function bindSchedulerCards() {
+    const root = $("#scheduler-view");
+    if (!root) return;
+    root.addEventListener("click", (event) => {
+        const target = event.target;
+        if (!target || !target.closest) return;
+        const header = target.closest(".scheduler-plan-header");
+        if (!header) return;
+        event.preventDefault();
+        toggleSchedulerCard(header.dataset.schedulerToggle);
+    });
+}
+
 // --- Event Bindings ---
 
 function goHome() {
@@ -3183,6 +3540,7 @@ function init() {
         }
     });
     bindSchedulerActions();
+    bindSchedulerCards();
 
     // Initial load.  None of these is waited for — they are fired and
     // forgotten, so each one carries its own rejection handler (see

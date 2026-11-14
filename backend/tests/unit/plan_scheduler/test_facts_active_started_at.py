@@ -124,6 +124,7 @@ def test_active_plan_carries_started_at(
             "plan_id": "p-1",
             "side": "execution",
             "workspace": None,
+            "phase": None,
             "started_at": started_at,
         }
     ]

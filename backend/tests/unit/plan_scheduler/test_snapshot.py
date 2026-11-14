@@ -243,6 +243,10 @@ def test_key_set_is_closed() -> None:
     A field that appears without being declared is a field the panel
     cannot render and the LUI cannot rely on; the key set is closed so
     that adding one is a decision rather than an accident.
+
+    The phase is one of the row's keys now — what the plan is doing,
+    in the routing layer's own words — and it is a key of **both** rows
+    and of neither of the document's six keys.
     """
     result = build(_state())
 
@@ -263,6 +267,7 @@ def test_key_set_is_closed() -> None:
         "promote_order",
         "due",
         "reason",
+        "phase",
     }
     assert set(result["running"][0]) == {
         "plan_id",
@@ -272,6 +277,7 @@ def test_key_set_is_closed() -> None:
         "started_at",
         "evictable",
         "workspace",
+        "phase",
     }
 
 
