@@ -2029,15 +2029,24 @@ class VerificationOrchestrator:
         or unreadable artifact yields no ids — the caller then falls back
         to the legacy fingerprint, which is worse but never wrong.
 
-        ``failed_cases`` is read first: it is the key that means the
-        same thing whether the gate ran (node ids) or never ran because
-        the entry was rejected (the schema rule that fired).  Without it
-        a rejected entry had **no** machine-written identity at all, so
-        the fingerprint fell back to the report's wording — and every
-        round that reworded its report looked like a new defect
-        (2026-11-05, VP-015: three fingerprints for one defect).  The
-        junit key stays as the fallback for artifacts an older runner
-        wrote.
+        Two machine-written keys are read before the junit node ids, and
+        both mean the same thing — "what broke, as the machine says it":
+
+        * ``failed_cases`` is read **first** (2026-11-06).  It is the key
+          that means the same thing whether the gate ran (node ids) or
+          never ran because the entry was rejected (the schema rule that
+          fired).  Without it a rejected entry had **no** machine-written
+          identity at all, so the fingerprint fell back to the report's
+          wording — and every round that reworded its report looked like
+          a new defect (2026-11-05, VP-015: three fingerprints for one
+          defect).
+        * ``failure_identity`` (2026-11-04) is the runner's own statement
+          of what broke, and it exists for the failure that has no junit
+          report at all — the gate that was rejected by the schema before
+          it ever ran.
+
+        The junit node ids are the fallback, so artifacts written by
+        earlier rounds (which have neither key) keep working.
         """
         if not vp_id:
             return []
@@ -2058,6 +2067,15 @@ class VerificationOrchestrator:
             }
             if ids:
                 return sorted(ids)
+        identity = payload.get("failure_identity")
+        if isinstance(identity, list):
+            ids = []
+            for item in identity:
+                text = str(item or "").strip()
+                if text:
+                    ids.append(text)
+            if ids:
+                return sorted(set(ids))
         failures = payload.get("junit_failures")
         if not isinstance(failures, list):
             return []

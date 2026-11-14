@@ -357,6 +357,86 @@ class TestValidateVpCompoundCommands:
 
 
 # ---------------------------------------------------------------------------
+# validate_vp — grouping parentheses (2026-11-04)
+# ---------------------------------------------------------------------------
+#
+# ``(test -e backend/.venv || ln -sfn … backend/.venv) && bash
+# scripts/run_tests.sh`` is an ordinary shell command line: the
+# parentheses are **reserved words**, they open and close a compound
+# command.
+#
+# The reader did not know that.  It kept the parenthesis glued to the
+# word next to it, so ``backend/.venv`` came out as ``backend/.venv)``,
+# that name was looked up, it was not found, and the whole gate was
+# rejected at the schema stage — the gate never ran a single command
+# and the whole-repo evidence was silently reduced to zero.  (The
+# paths were there all along; only the *name* was broken.)
+#
+# The parentheses have to be read the way the shell reads them: the
+# word next to them is the word without them, and a parenthesis that
+# stands on its own ends the command it belongs to.
+#
+# The entries below are compound commands, so they are checked the way
+# the **execution** path checks them (``require_single_entry=False``):
+# the 「one call to an adapter script」 contract is a *planning-time*
+# rule, and historical plans are not rewritten (2026-11-05).
+
+
+class TestValidateVpGroupingParentheses:
+    def test_the_closing_parenthesis_is_not_part_of_the_path(self):
+        paths = _referenced_paths(
+            "(test -e backend/.venv || ln -sfn /abs/backend/.venv "
+            "backend/.venv) && bash scripts/run_tests.sh"
+        )
+        assert "backend/.venv" in paths
+        assert "backend/.venv)" not in paths
+
+    def test_a_grouped_entry_passes_when_the_paths_exist(self, tmp_path):
+        (tmp_path / "backend").mkdir()
+        (tmp_path / "backend" / ".venv").mkdir()
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "run_tests.sh").write_text("#!/bin/sh\n")
+        entry = (
+            "(test -e backend/.venv || ln -sfn /abs/backend/.venv "
+            "backend/.venv) && bash scripts/run_tests.sh"
+        )
+        assert validate_vp(
+            _vp(entry), project_dir=tmp_path, require_single_entry=False,
+        ) == []
+
+    def test_a_missing_path_inside_a_group_is_still_an_issue(self, tmp_path):
+        # Negative control: reading the parentheses must not turn the
+        # existence check into a no-op.
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "run_tests.sh").write_text("#!/bin/sh\n")
+        entry = (
+            "(test -e backend/.nope || ln -sfn /abs/backend/.venv "
+            "backend/.venv) && bash scripts/run_tests.sh"
+        )
+        issues = validate_vp(
+            _vp(entry), project_dir=tmp_path, require_single_entry=False,
+        )
+        assert any("backend/.nope" in i.detail for i in issues)
+
+    def test_the_command_after_the_group_is_still_read(self, tmp_path):
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "run_tests.sh").write_text("#!/bin/sh\n")
+        paths = _referenced_paths("(true) && bash scripts/run_tests.sh")
+        assert "scripts/run_tests.sh" in paths
+
+    def test_a_group_does_not_hide_a_missing_path_of_the_next_command(
+        self, tmp_path,
+    ):
+        (tmp_path / "backend").mkdir()
+        (tmp_path / "backend" / ".venv").mkdir()
+        entry = "(test -e backend/.venv || true) && bash scripts/missing.sh"
+        issues = validate_vp(
+            _vp(entry), project_dir=tmp_path, require_single_entry=False,
+        )
+        assert any("scripts/missing.sh" in i.detail for i in issues)
+
+
+# ---------------------------------------------------------------------------
 # validate_vp — shell 分组括号与入口自建路径（2026-11-05）
 # ---------------------------------------------------------------------------
 #
@@ -1468,6 +1548,147 @@ class TestJunitEvidence:
         assert result.status == STATUS_PASSED
         assert result.evidence["junit_phases"] == []
         assert result.evidence["junit_failures"] == []
+
+
+# ---------------------------------------------------------------------------
+# Whose runner runs the gate? (2026-11-04, VP-012 round 4)
+# ---------------------------------------------------------------------------
+#
+# The round-4 failure repeated round 3's machine fact byte for byte
+# (``ci_entry 引用的路径不存在：backend/.venv)``) and differed only in
+# the prose — so the fingerprint changed and the round read one defect
+# as two.  The defect survived because the round ran the **harness'**
+# runner, not the project's: ``backend/__init__.py`` puts the server's
+# own ``backend/`` first on ``sys.path``, and the flat import resolved
+# there.  The project's own fix was never executed.
+#
+# These cases pin that the gate runs the runner of the tree under test,
+# and that a rejected gate always leaves a machine-written identity
+# behind.
+#
+# 2026-11-06: 「被测树」is decided by the loader — a tree counts as one
+# when it carries **both** ``backend/verification_ci_runner.py`` and
+# ``backend/pyproject.toml``（the latter is what says "this tree is the
+# framework"）.  The tree below is therefore built as a framework
+# checkout, so the project's own runner is the one that runs.
+
+
+#: A project-tree runner that skips the path-existence check the harness
+#: performs.  Its ``validate_vp`` is the discriminator: the harness'
+#: runner rejects a ``ci_entry`` that names a missing path, this one
+#: does not — so "no schema issue" can only mean "the project's runner
+#: ran".
+_PROJECT_RUNNER_WITHOUT_PATH_CHECK = '''
+"""A project-tree copy of the runner (stub)."""
+
+from typing import Any, Dict, List, Optional
+
+
+class SchemaIssue:
+    def __init__(self, vp_id: str, detail: str):
+        self.vp_id = vp_id
+        self.detail = detail
+
+    def to_dict(self) -> Dict[str, str]:
+        return {"vp_id": self.vp_id, "detail": self.detail}
+
+
+def validate_vp(vp: Any, *, project_dir: Optional[Any] = None) -> List[SchemaIssue]:
+    # No path-existence check — that is the difference from the harness'
+    # runner, and the discriminator these tests rely on.
+    return []
+
+
+def run_ci_verification(vp, *, project_dir=None, artifact_dir=None):
+    return _Result()
+
+
+class _Result:
+    """The shape the runner's verdict has (``CiRunResult``)."""
+
+    status = "PASSED"
+    reasons = ["project runner ran"]
+    evidence = {"vp_id": "project", "from": "project"}
+
+    def to_verdict_dict(self):
+        return {
+            "status": self.status,
+            "reasons": list(self.reasons),
+            "evidence": dict(self.evidence),
+        }
+'''
+
+
+class TestRunnerProvenance:
+    def test_the_projects_own_runner_is_the_one_that_runs(self, tmp_path):
+        """A4: the gate runs the tree under test's runner, not the harness'."""
+        from verification_agent import VerificationAgent
+
+        project = tmp_path / "project"
+        (project / "backend").mkdir(parents=True)
+        # The loader judges a tree by two files: the runner itself, and
+        # the manifest that says "this tree is the framework".
+        (project / "backend" / "pyproject.toml").write_text(
+            "[project]\nname = 'fake-backend'\n", encoding="utf-8",
+        )
+        (project / "backend" / "verification_ci_runner.py").write_text(
+            _PROJECT_RUNNER_WITHOUT_PATH_CHECK, encoding="utf-8",
+        )
+
+        class _Agent:
+            project_dir = project
+            plan_dir = tmp_path / "plan"
+
+            def _safe_log_freshness_event(self, *args, **kwargs):
+                return None
+
+            def _record_verifier_provenance(self, *args, **kwargs):
+                return None
+
+        _Agent._classify_full_ci_verdict = staticmethod(
+            VerificationAgent._classify_full_ci_verdict,
+        )
+
+        # A ``ci_entry`` naming a path that does not exist: the harness'
+        # runner would reject it in the schema stage, the project's one
+        # does not.
+        vp = _vp("bash scripts/nowhere.sh", id="VP-902")
+
+        verdict = VerificationAgent._run_full_ci_vp(_Agent(), vp)
+
+        assert verdict["status"] == "PASSED"
+        assert verdict["reasons"] == ["project runner ran"]
+
+    def test_a_rejected_gate_still_leaves_an_artifact(self, tmp_path):
+        """A5: the schema short-circuit used to return before the artifact,
+        so a failure left nothing machine-written behind."""
+        artifact = tmp_path / "vp_artifacts"
+
+        result = run_ci_verification(
+            _vp("bash scripts/nowhere.sh"), project_dir=tmp_path,
+            artifact_dir=artifact,
+        )
+
+        assert result.status == STATUS_FAILED
+        payload = json.loads(
+            (artifact / "VP-901" / "ci_output.json").read_text(encoding="utf-8")
+        )
+        assert payload["failure_identity"] == [
+            issue["detail"] for issue in payload["schema_issues"]
+        ]
+
+    def test_a_failed_gate_carries_a_machine_written_identity(self, tmp_path):
+        """A5: the identity is machine-written, so the fingerprint stops
+        hashing the judgment LLM's prose."""
+        result = run_ci_verification(
+            _vp("bash scripts/nowhere.sh"), project_dir=tmp_path,
+        )
+
+        identity = result.evidence["failure_identity"]
+        assert identity
+        assert identity == [
+            issue["detail"] for issue in result.evidence["schema_issues"]
+        ]
 
 
 # ---------------------------------------------------------------------------

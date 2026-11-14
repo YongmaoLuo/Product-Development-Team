@@ -1818,6 +1818,28 @@ def get_plan_status(plan_id: str):
         )
 
 
+def _is_verification_not_started(error: HTTPException) -> bool:
+    """Is this 404 the handler saying "verification has not started"?
+
+    ``get_verification_progress`` answers ``HTTPException(404, {"error":
+    "verification not started"})`` when the executor has not written a
+    progress state yet — the normal state of every plan that is still
+    executing.  So it is an **answer**, not a fault, and the snapshot
+    has to treat it as one.
+
+    The check is exact on purpose.  A 404 whose detail says something
+    else (the plan is not in the tree, a plain string) is a different
+    answer, and it keeps being logged as the failure it is — the
+    blanket ``except`` below stays in charge of everything this does
+    not recognise.
+    """
+    return (
+        error.status_code == 404
+        and isinstance(error.detail, dict)
+        and error.detail.get("error") == "verification not started"
+    )
+
+
 def _plan_status_payload(plan_id: str) -> Dict[str, Any]:
     """``PlanStatus`` + the three detail sections, read once.
 
@@ -1855,7 +1877,27 @@ def _plan_status_payload(plan_id: str) -> Dict[str, Any]:
     ):
         try:
             payload[key] = handler(plan_id)
-        except Exception:
+        except Exception as error:
+            if (
+                key == "verification"
+                and isinstance(error, HTTPException)
+                and _is_verification_not_started(error)
+            ):
+                # 2026-11-04: "verification not started" is a normal
+                # answer — the plan is still executing and the
+                # verification round has not begun.  It used to fall
+                # into the blanket handler below and be reported as a
+                # broken section: a full traceback at ERROR level,
+                # 2393 times in two hours, for every plan still
+                # running.  The section stays ``None`` (there is
+                # nothing to show yet) and the reason is said once,
+                # quietly, so an operator can still tell "not started
+                # yet" from "the section broke".
+                payload[key] = None
+                _server.logger.debug(
+                    "[plan_status] verification not started plan=%s", plan_id,
+                )
+                continue
             _server.logger.exception(
                 "[plan_status] %s section failed plan=%s", key, plan_id,
             )
