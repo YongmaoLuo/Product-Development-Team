@@ -373,6 +373,13 @@ _VALUE_FLAGS = frozenset({
 #: second spent noticing is a second the child cannot buy back.
 _READY_POLL_INTERVAL = 0.1
 
+#: How far the readiness wait's wall clock may be widened by the host
+#: load.  The bound is a ceiling on the *wait*, never on the promise:
+#: the declared timeout is what the service is told it has, and a
+#: bound that grows without end turns a service that will never come up
+#: into a wait that never ends.
+_READY_TIMEOUT_MAX_FACTOR = 3.0
+
 #: Markers that make a log line look like a real failure. Matching is
 #: case-sensitive on purpose: a summary line such as ``0 errors`` must
 #: not be mistaken for the error that killed the service.
@@ -1629,7 +1636,7 @@ def _protected_pids(
 
 #: The program a declared service is started through.
 #:
-#: It does three things, in this order:
+#: It does four things, in this order:
 #:
 #: 1. Drops the environment variables that name a descriptor. A
 #:    descriptor number only means something in the process that
@@ -1641,14 +1648,32 @@ def _protected_pids(
 #:    descriptor`` before it was ready. The launcher's own handoff is
 #:    untouched by this -- it execs the backend directly, where the
 #:    numbers are valid, and that path does not go through here.
-#: 2. Calls ``setsid()``, so the service runs in a session of its own
+#: 2. Names the child's own directory in ``PWD`` (2026-11-02). The
+#:    inherited ``PWD`` is the *parent's* directory, and it is inherited
+#:    verbatim -- ``bash`` does not repair a relative one -- so a backend
+#:    started with ``PWD=.`` hands every service it starts a ``PWD``
+#:    that names nothing. A service's ``start_cmd`` routinely builds its
+#:    file names from ``$PWD`` ("the executor lives at
+#:    ``$PWD/backend/tests/...``"), and those names are resolved against
+#:    the child's working directory: a relative ``PWD`` turns
+#:    ``<project>/backend/tests/...`` into
+#:    ``<project>/backend/./backend/tests/...`` -- a file that is not
+#:    there -- and every plan the service was started for dies before it
+#:    runs. The wrapper is the last place that knows the child's own
+#:    directory for sure, so that is where the child is told what its
+#:    ``PWD`` is.
+#: 3. Calls ``setsid()``, so the service runs in a session of its own
 #:    and outlives the backend that started it.
-#: 3. Execs the real command, unchanged.
+#: 4. Execs the real command, unchanged.
 _DETACHED_WRAPPER_SOURCE = (
     "import os,sys\n"
     "for _name in [k for k in os.environ if k.startswith("
     f"{_SECRET_FD_ENV_PREFIX!r})]:\n"
     "    del os.environ[_name]\n"
+    "try:\n"
+    "    os.environ['PWD']=os.getcwd()\n"
+    "except OSError:\n"
+    "    pass\n"
     "os.setsid()\n"
     "os.execvp(sys.argv[1], sys.argv[1:])\n"
 )
@@ -3456,6 +3481,36 @@ def wait_until_ready_with_evidence(
     return _wait_ready_with_evidence(decl, timeout_seconds)
 
 
+def _adaptive_ready_timeout(declared: float) -> float:
+    """The wall-clock bound for a readiness wait, widened by the host load.
+
+    A declared timeout is a promise made about a machine with nothing
+    else running on it.  Under a loaded host the service may be
+    answering perfectly well and still miss the wall clock — the poll
+    interval alone is a second, and a host that is running eighteen
+    workers spends seconds between two polls — and the round then
+    reports "not ready" about a service that was one poll away from
+    answering.
+
+    So the bound is widened with the load average, and **never**
+    shortened: the declared value is the floor the caller asked for.
+    The widening is capped (:data:`_READY_TIMEOUT_MAX_FACTOR`) so a
+    pathological load cannot turn the wait into a hang.
+
+    Never raises: a host that cannot report a load average keeps the
+    declared bound.
+    """
+    try:
+        load = os.getloadavg()[0]
+    except (OSError, AttributeError):  # pragma: no cover - no load on Windows
+        return declared
+    cpus = os.cpu_count() or 1
+    if load <= cpus:
+        # The host has capacity to spare: the declared bound stands.
+        return declared
+    return declared * min(load / cpus, _READY_TIMEOUT_MAX_FACTOR)
+
+
 def _wait_ready_with_evidence(
     decl: ServiceDeclaration, timeout_seconds: Optional[float] = None,
 ) -> Tuple[bool, DataPlaneEvidence]:
@@ -3509,8 +3564,12 @@ def _wait_ready_with_evidence(
     timeout = (
         decl.ready_timeout_seconds if timeout_seconds is None else timeout_seconds
     )
-    deadline = time.monotonic() + timeout
     started = time.monotonic()
+    # The wall clock is the *bound*, not the verdict: inside it, the
+    # verdict is the service's own answer (see the docstring).  A
+    # loaded host widens the bound, because a declared timeout is a
+    # promise made about an idle machine.
+    deadline = started + _adaptive_ready_timeout(timeout)
     expected_rows = _expected_routing_rows()
     evidence = DataPlaneEvidence()
     # The child, when the wait runs inside :func:`start_service`.  It is
@@ -3941,6 +4000,12 @@ def _register_spawned_service(runtime: ServiceRuntime) -> None:
             # it in.  The spawn path knows without asking: measuring it
             # by running ``ps`` would create a process the spawn is
             # not allowed to create.
+            #
+            # The value is handed over rather than derived again here:
+            # ``spawn_start_epoch`` renders the spawn clock we already
+            # hold in the unit the registry reads it in (whole seconds
+            # off that clock, the kernel's own tick count where the
+            # kernel can be asked for one), so the two stay comparable.
             start_epoch=module.spawn_start_epoch(
                 runtime.pid, spawned_at=runtime.start_epoch,
             ),
@@ -4088,6 +4153,18 @@ def start_service(
     # it is the only thing that can give it back.  The record is what
     # makes that possible -- and it is written after the clock above,
     # because the record says when the service started.
+    #
+    # The anchor above is the kernel's own record where the kernel can
+    # give one, and our own clock where it cannot: the probe prefers
+    # the in-process library and falls back to the system probe, and
+    # when neither can say, ``_spawn_anchor`` answers with the clock
+    # taken at the earliest moment the fork allows.  It is never
+    # "unknown", and that matters twice -- an anchor of ``None``
+    # silently disables the PID-reuse guard in ``_pid_reused`` (a
+    # recycled pid would then be signalled as if it were still ours),
+    # and the anchor must not be read late, because the comparison
+    # tolerates two seconds and a parent descheduled right after the
+    # fork can make our clock five seconds stale.
     _register_spawned_service(runtime)
     runtime.origin = "spawned"
 
@@ -5288,7 +5365,15 @@ def _ledger_holder_evidence(
         return {
             "source": "ledger",
             "plan_dir": str(plan_dir),
-            "plan_id": str(ledger.get("plan_id") or ""),
+            # The plan the record belongs to.  The ledger lives in the
+            # plan's own directory, so the directory says whose service
+            # it is — and it has to say it, because the ownership rules
+            # below cannot tell two plans apart without it.  The
+            # unified ledger's service view names no plan of its own,
+            # and an unattributed record is a record anybody may claim:
+            # that is how another plan's live service was taken for our
+            # own leftover, stopped, and its port taken back.
+            "plan_id": str(ledger.get("plan_id") or Path(plan_dir).name),
             "project_dir": str(ledger.get("project_dir") or ""),
             "pid": pid,
             "pgid": entry.get("pgid"),
@@ -5426,6 +5511,10 @@ def _holder_evidence(
             candidates = []
     ours: Optional[Dict[str, Any]] = None
     foreign = False
+    #: The records that name a process a **live** round owns, keyed by
+    #: the pid they name.  They are not leftovers, but they do not
+    #: answer the question either — see the loop below.
+    in_use: Dict[int, Dict[str, Any]] = {}
     for candidate in candidates:
         evidence = _ledger_holder_evidence(candidate, decl, probe)
         if evidence is None:
@@ -5436,14 +5525,23 @@ def _holder_evidence(
             # verdict outranks the weaker shape below: a running round's
             # service is never this round's to take, however much it
             # looks like our own leftover.
-            return None
+            #
+            # The search does not end here (2026-11-02).  It used to,
+            # and the cost was that another plan's live service could
+            # hide the record of *this* round's own leftover: the round
+            # lost the port it had declared and had to relocate.  The
+            # record is remembered instead, and weighed against the
+            # record the search ends up with.
+            in_use[int(evidence.get("pid") or 0)] = evidence
+            continue
         if _holder_is_pinned(candidate, evidence, decl):
             # Same verdict, a stronger witness (2026-10-25): a live
             # round has **pinned** that process.  The pin names the
             # process itself, so it holds even where the owner token
             # was empty — which is what the 2026-10-24 sweep walked
             # straight into.
-            return None
+            in_use[int(evidence.get("pid") or 0)] = evidence
+            continue
         if not _evidence_is_our_workspace(evidence, project_dir):
             # Another workspace's process: a positive "not ours".  It
             # outranks the fallback too — we do not touch what we
@@ -5460,7 +5558,14 @@ def _holder_evidence(
     if foreign:
         return None
     if ours is not None:
+        if int(ours.get("pid") or 0) in in_use:
+            # The very process our own ledger names is owned by a live
+            # round: it is in use, not a leftover.  That verdict still
+            # outranks the rest — but only for *this* process.
+            return None
         return ours
+    if in_use:
+        return None
     return _workspace_evidence(decl, project_dir, probe)
 
 

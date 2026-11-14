@@ -219,16 +219,48 @@ _GIT_ENV_EXTRA = {
     "GIT_COMMITTER_EMAIL": "pdt-e2e@example.invalid",
 }
 
+#: 变量名里带「仓库在哪」的那几个。``GIT_DIR`` / ``GIT_WORK_TREE`` /
+#: ``GIT_COMMON_DIR`` / ``GIT_INDEX_FILE`` / ``GIT_CEILING_DIRECTORIES``
+#: 一旦从调用者的 shell 继承下来，git 就会去那个地方找仓库，而不是去
+#: ``-C`` 指的目录：``git -C <repo> status --porcelain`` 于是以
+#: ``fatal: this operation must be run in a work tree`` 失败，而同一次调用
+#: 链里的 ``git worktree list`` 照样答得出来 —— 于是失败信息点名的正是
+#: 调用者问的那个 checkout。
+#:
+#: 摘掉这些键才是解法：补一个空值不行，git 把空值也当成设置。
+_GIT_LOCATING_VARS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_CEILING_DIRECTORIES",
+)
+
+
+def _git_env() -> Dict[str, str]:
+    """本文件里每一条 git 命令都在这个环境里跑。
+
+    形状与 ``tests/fixtures/verification_mode.py`` 里既有的写法一致：调用者
+    的环境，**摘掉**仓库定位变量，再把 git 的配置文件指向 ``os.devnull``
+    （开发者自己的 ``core.autocrlf`` / ``commit.gpgsign`` 之类不该决定这
+    条用例的结果）。
+    """
+    env = dict(os.environ)
+    for name in _GIT_LOCATING_VARS:
+        env.pop(name, None)
+    env.update(_GIT_ENV_EXTRA)
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_SYSTEM"] = os.devnull
+    return env
+
 
 def _git(repo: Path, *args: str) -> str:
     """在 ``repo`` 里跑一条 git 命令，返回 stdout（去掉尾部换行）。"""
-    env = dict(os.environ)
-    env.update(_GIT_ENV_EXTRA)
     proc = subprocess.run(
         ["git", "-C", str(repo), *args],
         capture_output=True,
         text=True,
-        env=env,
+        env=_git_env(),
         check=False,
     )
     if proc.returncode != 0:
@@ -242,6 +274,45 @@ def _git(repo: Path, *args: str) -> str:
 def _git_status(repo: Path) -> str:
     """``git status --porcelain`` 的原文（空串 = 干净）。"""
     return _git(repo, "status", "--porcelain")
+
+
+# ---------------------------------------------------------------------------
+# 钉子：git 环境真的摘掉了仓库定位变量
+# ---------------------------------------------------------------------------
+
+
+def test_git_env_isolates_repo_locators(
+    monkeypatch,
+) -> None:
+    """``_git_env()`` 摘掉仓库定位变量 —— 而且是在它们真的被设置时。
+
+    ``GIT_DIR`` / ``GIT_WORK_TREE`` / ``GIT_INDEX_FILE`` 说的是「仓库在
+    哪」。从调用者的 shell 继承下来时，它们盖过命令自带的 ``-C``，
+    git 于是跑到另一个 checkout 去回答问题。本文件每一条 git 命令都在
+    ``_git_env()``（``backend/tests/e2e/test_verification_mode_repair_round.py:240``）
+    给出的环境里跑，所以这个摘除必须是真的。
+
+    变量是先塞进 ``os.environ`` 再问的：只有被设置过的键才是有伤害的
+    形状 —— 没设置时「摘掉了」这句话是空洞的，摘不摘都一样。
+
+    另外两条配置路径被指向 ``os.devnull``：开发者自己的
+    ``core.autocrlf`` / ``commit.gpgsign`` 不该决定这条用例的结果。
+    """
+    monkeypatch.setenv("GIT_DIR", "/somewhere/else/.git")
+    monkeypatch.setenv("GIT_WORK_TREE", "/somewhere/else")
+    monkeypatch.setenv("GIT_INDEX_FILE", "/somewhere/else/.git/index")
+
+    env = _git_env()
+
+    assert "GIT_DIR" not in env, "GIT_DIR still points at another checkout"
+    assert "GIT_WORK_TREE" not in env, (
+        "GIT_WORK_TREE still points at another checkout"
+    )
+    assert "GIT_INDEX_FILE" not in env, (
+        "GIT_INDEX_FILE still points at another checkout"
+    )
+    assert env["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert env["GIT_CONFIG_SYSTEM"] == os.devnull
 
 
 # ---------------------------------------------------------------------------
@@ -897,8 +968,7 @@ def _run_command_at(repo: Path, commit: str, command: str, expect_ok: bool) -> N
     源仓库不能动（切分支、提交都不行），所以用 ``git archive`` 把那一棵树
     铺到临时目录再跑。
     """
-    env = dict(os.environ)
-    env.update(_GIT_ENV_EXTRA)
+    env = _git_env()
     archive = subprocess.run(
         ["git", "-C", str(repo), "archive", commit],
         capture_output=True,
@@ -980,6 +1050,7 @@ def _pdt_main_checkout() -> Path:
         ["git", "-C", str(repo_root), "worktree", "list", "--porcelain"],
         capture_output=True,
         text=True,
+        env=_git_env(),
         check=True,
     )
     for line in proc.stdout.splitlines():

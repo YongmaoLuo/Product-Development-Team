@@ -52,7 +52,7 @@ subsidiary_processes: []
 #     enabled: false               # the rollback switch — false stops scheduling
 #     dry_run: false               # decide only: write nothing, start nothing
 #     capacity: 4                  # how many plans may run at the same time
-#     min_runtime_seconds: 600     # how long a young run is left alone
+#     min_runtime_seconds: 0       # how long a young run is left alone (0 = none)
 #     tick_seconds: 5              # how long one tick waits before the next
 #     command_timeout_seconds: 30  # how long a single command may take
 #
@@ -60,10 +60,15 @@ subsidiary_processes: []
 # scheduler next to the old cron: turning the scheduler on is a
 # deliberate act, and turning it off is the way back.  A missing section
 # or a missing key leaves that setting on the loader's own default.
+#
+# `min_runtime_seconds` is 0, so no run is protected on age alone: the
+# plan that has run the shortest is the one the scheduler interrupts
+# first.  A young run is protected only when an operator asks for it by
+# setting this to a number of seconds.
 scheduler:
   enabled: false
   dry_run: false
   capacity: 4
-  min_runtime_seconds: 600
+  min_runtime_seconds: 0
   tick_seconds: 5
   command_timeout_seconds: 30

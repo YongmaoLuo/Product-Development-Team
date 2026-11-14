@@ -20,7 +20,10 @@ The pins
 --------
 1. The spawn the harness performs is the spawn production performs --
    the same keyword arguments, in the same shape.  Without this, a
-   difference in outcome could be a difference in the harness.
+   difference in outcome could be a difference in the harness.  The
+   count is taken over the **whole** capture: production's own spawn
+   is ``backend/service_manager.py:3751``, and one service start must
+   derive exactly one of it.
 2. ``stdin_mode`` names exactly one :mod:`subprocess` constant.
 3. A batch counts its ready and failed runs.
 4. Stopping a tree leaves no process behind.
@@ -253,15 +256,31 @@ def test_popen_kwargs_mirror_service_manager(tmp_path, monkeypatch):
     decl = ServiceDeclaration(
         name="repro", port=_free_port(), start_cmd="true", cwd=".",
     )
+
     service_manager.start_service(decl, tmp_path)
-    spawns = [
-        call for call in captured if _is_the_service_spawn(call[0])
-    ]
-    assert len(spawns) == 1, (
+    # The comparison object is the **whole** capture -- every spawn the
+    # start path made -- and not only the ones that happened to carry
+    # the declared command.  A second spawn that does *not* carry the
+    # command (a helper of the start path, a probe of its own) is
+    # exactly the "one service start derives a second Popen" shape
+    # this pin is here to catch, and a filter that kept only the
+    # command-carrying call would let it through the door.  The
+    # capture is already narrowed by shape (see ``_fake_popen``
+    # above), so the probes the start path forks for itself are not
+    # counted here -- what is counted is every spawn of the service
+    # itself.
+    production = captured
+    assert len(captured) == 1, (
+        f"production did not spawn exactly one service: {production!r}"
+    )
+    # The same spawn, told apart by its shape: the start path's own
+    # probes are calls too, and a probe is not the service.
+    shaped = [call for call in captured if _is_the_service_spawn(call[0])]
+    assert len(shaped) == 1, (
         "production did not spawn exactly one service: "
         f"{captured!r}"
     )
-    prod_args, prod_kwargs = spawns[0]
+    prod_args, prod_kwargs = production[0]
 
     cfg = spawn_repro.SpawnConfig(
         start_cmd=decl.start_cmd,
@@ -271,14 +290,17 @@ def test_popen_kwargs_mirror_service_manager(tmp_path, monkeypatch):
         env_extra=service_manager.service_env(decl),
     )
     spawn_repro.spawn_child(cfg)
-    spawns = [
-        call for call in captured if _is_the_service_spawn(call[0])
-    ]
-    assert len(spawns) == 2, (
+    both = captured
+    assert len(captured) == 2, (
+        f"the harness did not spawn exactly one service of its own: {both!r}"
+    )
+    # The same two spawns, told apart by their shape.
+    shaped = [call for call in captured if _is_the_service_spawn(call[0])]
+    assert len(shaped) == 2, (
         "the harness did not spawn exactly one service: "
         f"{captured!r}"
     )
-    harness_args, harness_kwargs = spawns[1]
+    harness_args, harness_kwargs = both[1]
 
     assert harness_args == prod_args
     assert set(harness_kwargs) - set(prod_kwargs) == {"close_fds"}

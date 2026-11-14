@@ -1144,6 +1144,17 @@ def register_spawned_process(
     recycled pid signalled by mistake is a process this run never
     started.
 
+    **The caller that started the process usually knows when it
+    started**, and saying so saves the registry a probe.  On macOS the
+    probe is a ``ps`` subprocess -- a fork and an exec on the spawn
+    path of every service -- and a spawn path that forks twice is a
+    spawn path whose second child can be mistaken for the first: a
+    test that patches ``subprocess.Popen`` to watch the spawn sees the
+    *census* process, not the service.  So ``start_epoch`` is the
+    caller's own reading of the clock, rendered the way
+    :func:`process_start_epoch` renders it -- whole seconds since the
+    epoch -- so the two remain comparable.
+
     The write is made under the registry's lock, so that it cannot
     land in a file that a cleanup pass is replacing at that very
     moment: a line appended to a file that is about to be replaced is
@@ -1161,23 +1172,28 @@ def register_spawned_process(
         return None
     if pid <= 1:
         return None
+    recorded_epoch = str(start_epoch).strip() if start_epoch is not None else ""
+    if not recorded_epoch:
+        # The caller did not say when the process started, so the only
+        # way to find out is to ask the system -- which costs a ``ps``
+        # on macOS.  It is read *before* the lock is taken: the
+        # registry's lock is not a place to spend that, because
+        # everything else in the run is waiting for it.
+        recorded_epoch = process_start_epoch(pid)
     entry: Dict[str, Any] = {
         "pid": pid,
         "pgid": int(pgid) if pgid else None,
         "kind": str(kind or ""),
         "name": str(name or ""),
         "owner_pid": os.getpid(),
-        # The start time is read *before* the lock is taken.  It costs a
-        # ``ps`` on macOS, and the registry's lock is not a place to
-        # spend that: everything else in the run is waiting for it.
-        # A caller that already knows when the process started passes
-        # that in -- the spawn path does, and it knows without asking
-        # the operating system, which is the only way a spawn can stay
-        # free of extra processes.
-        "start_epoch": (
-            start_epoch if start_epoch is not None
-            else process_start_epoch(pid)
-        ),
+        # The start time is read *before* the lock is taken (see above) --
+        # it costs a ``ps`` on macOS, and the registry's lock is not a place
+        # to spend that: everything else in the run is waiting for it.
+        # A caller that already knows when the process started passes that
+        # in -- the spawn path does, and it knows without asking the
+        # operating system, which is the only way a spawn can stay free of
+        # extra processes.
+        "start_epoch": recorded_epoch,
         "registered_at": time.time(),
     }
     line = json.dumps(entry, ensure_ascii=False) + "\n"
@@ -3031,6 +3047,14 @@ def _same_start(recorded: str, observed: str, tolerance: float = 0.0) -> bool:
     :func:`_start_tolerance`).  It is zero by default: a caller holding
     two readings of the same field needs no slack, and a caller that
     does not hold them must not be given any by accident.
+
+    A recorded reading and an observed one do not come from the same
+    clock: the record was written at spawn time, the observation is
+    taken now, and the second boundary can fall between them.  That
+    difference is what :func:`_start_tolerance` allows for -- and no
+    more, because a recycled pid reports a start time from a different
+    life, and telling the two apart is the whole point of carrying a
+    start time next to a pid.
     """
     try:
         return abs(float(recorded) - float(observed)) <= tolerance

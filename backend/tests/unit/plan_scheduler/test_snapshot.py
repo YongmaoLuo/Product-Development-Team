@@ -272,6 +272,7 @@ def test_key_set_is_closed() -> None:
         "started_at",
         "evictable",
         "workspace",
+        "priority",
     }
 
 

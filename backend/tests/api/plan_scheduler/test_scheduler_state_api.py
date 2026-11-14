@@ -276,6 +276,7 @@ def test_state_key_set_closed(install_engine):
         "started_at",
         "evictable",
         "workspace",
+        "priority",
     }, sorted(body["running"][0])
 
 

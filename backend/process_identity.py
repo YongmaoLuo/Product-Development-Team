@@ -38,14 +38,19 @@ Two limits belong to the sources, and the caller has to know about both.
   replaces ``argv[0]`` with the resolved path. A command line
   recorded right after a spawn can therefore differ from the same
   command line read a moment later. ``matches`` compares the first
-  two entries, so a rewritten ``argv[0]`` reads as a mismatch, which
-  is the safe direction: the caller refuses to signal.
+  two entries, and the executable is compared by *what it is* rather
+  than by how it is spelled: two spellings of one program are one
+  program. The rest of the rule is unchanged — a different program,
+  a different first argument, a different length, or a start time
+  that does not match is still a mismatch, and a mismatch is the safe
+  direction: the caller refuses to signal.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -248,6 +253,9 @@ def matches(
       start time from a different life;
     * the command lines must be the same length and their first two
       entries must agree — empty entries are padding and are ignored.
+      The *executable* may be spelled differently as long as both
+      spellings name the same program (see :func:`_same_executable`);
+      the first argument has to be the same one.
 
     Every check can only *prevent* a match. There is no reading of the
     arguments that makes a mismatched identity match.
@@ -445,12 +453,93 @@ def _cmdline_matches(
     equal. The rest of the line is not compared: a wrapper may add
     arguments of its own between the recording and the reading, and the
     executable plus its first argument are what identify the program.
+
+    **The executable may be spelled differently.**  A process that
+    re-executes itself -- which is what the macOS framework launcher
+    does -- is reported under its new ``argv[0]`` from then on, and the
+    recording made a moment earlier still names the old one.  The two
+    spellings are compared through :func:`_same_executable`, which
+    says yes when they name the same program and no otherwise.  The
+    first *argument* is never relaxed: ``-c`` and ``-m`` are different
+    invocations.
     """
     live_parts = _normalize_cmdline(live)
     expected_parts = _normalize_cmdline(expected)
     if len(live_parts) != len(expected_parts):
         return False
-    return (
-        list(live_parts[:CMDLINE_PREFIX_LEN])
-        == list(expected_parts[:CMDLINE_PREFIX_LEN])
-    )
+    if list(live_parts[:CMDLINE_PREFIX_LEN]) == list(expected_parts[:CMDLINE_PREFIX_LEN]):
+        return True
+    if len(live_parts) < CMDLINE_PREFIX_LEN or len(expected_parts) < CMDLINE_PREFIX_LEN:
+        return False
+    if live_parts[1] != expected_parts[1]:
+        return False
+    return _same_executable(live_parts[0], expected_parts[0])
+
+
+def _same_executable(first: str, second: str) -> bool:
+    """True when two ``argv[0]`` spellings name the same program.
+
+    Three ways to say yes, in the order they are cheapest to answer:
+
+    * the two strings are equal;
+    * they are the same file -- ``os.path.samefile`` answers that, and
+      it follows symlinks, so a virtual environment's ``bin/python``
+      and the interpreter it points at are the same file;
+    * they are the same **macOS framework bundle**.  A framework build
+      of Python is a launcher that re-executes the real interpreter
+      with a rewritten ``argv[0]`` -- its own path inside
+      ``Python.app``.  The launcher is not the interpreter (so
+      ``samefile`` says no), but it is the same interpreter, and the
+      version inside the bundle is what says which one.
+
+    A framework bundle holds one interpreter per version, so the
+    version is part of the answer: 3.11 and 3.12 are not the same
+    program, and neither is the launcher of one against the
+    interpreter of the other.
+    """
+    if first == second:
+        return True
+    try:
+        if os.path.samefile(first, second):
+            return True
+    except OSError:
+        # One of the paths does not exist, or cannot be stat'ed.  That
+        # is not evidence that they are the same program, so it falls
+        # through to the spelling comparison below.
+        pass
+    first_real = os.path.realpath(first)
+    second_real = os.path.realpath(second)
+    if first_real == second_real:
+        return True
+    first_bundle = _framework_bundle(first_real)
+    second_bundle = _framework_bundle(second_real)
+    if first_bundle is None or second_bundle is None:
+        return False
+    first_root, first_version = first_bundle
+    second_root, second_version = second_bundle
+    if first_root != second_root:
+        return False
+    if first_version and second_version:
+        return first_version == second_version
+    return True
+
+
+#: A macOS framework bundle: the ``.framework`` directory and the
+#: version inside it.  ``/…/Python.framework/Versions/3.11/…`` is the
+#: bundle ``/…/Python.framework`` at version ``3.11``.
+_FRAMEWORK_BUNDLE = re.compile(
+    r"^(?P<root>.*?\.framework)(?:/Versions/(?P<version>[^/]+))?(?=/|$)"
+)
+
+
+def _framework_bundle(path: str) -> Optional[Tuple[str, Optional[str]]]:
+    """The framework bundle *path* lives in, if it lives in one.
+
+    Returns the bundle's root and the version inside it -- the version
+    is ``None`` for a path that is inside the bundle but not under
+    ``Versions/``.
+    """
+    match = _FRAMEWORK_BUNDLE.match(path)
+    if match is None:
+        return None
+    return match.group("root"), match.group("version")

@@ -88,6 +88,11 @@ def test_running_view_passes_started_at(engine: Any) -> None:
     it and does not round it: what the facts said is what the row
     says, microseconds and all.  The elapsed time beside it is still
     the slot's clock, because that is what the eviction rule reads.
+
+    The row also carries the **priority** the plan runs at, and a slot
+    that holds none leaves the plan at the ordinary weight — so the
+    row says ``0`` here.  The slot's own priority travelling through
+    unchanged is pinned by ``test_engine_running_view_priority.py``.
     """
     engine._facts = _Facts(
         [
@@ -112,6 +117,7 @@ def test_running_view_passes_started_at(engine: Any) -> None:
             "elapsed": 12.0,
             "workspace": None,
             "started_at": "2026-10-29T20:04:26",
+            "priority": 0,
         }
     ]
 

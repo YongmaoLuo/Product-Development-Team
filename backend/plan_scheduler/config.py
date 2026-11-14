@@ -55,7 +55,15 @@ SECTION = "scheduler"
 DEFAULT_ENABLED = False
 DEFAULT_DRY_RUN = False
 DEFAULT_CAPACITY = 4
-DEFAULT_MIN_RUNTIME_SECONDS = 600.0
+#: How long a young run is protected for — **zero by default**.  The
+#: threshold is a mechanism, not a promise: an operator who wants a
+#: young run left alone sets it.  The default says that no run is
+#: protected on age alone, so the plan that has run the shortest is the
+#: one the scheduler may interrupt first.  A default above zero would
+#: keep the shortest runs out of the candidate set altogether, and the
+#: rule that interrupts the shortest run would never reach the plan it
+#: is about.
+DEFAULT_MIN_RUNTIME_SECONDS = 0.0
 DEFAULT_TICK_SECONDS = 5.0
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 30.0
 
@@ -69,7 +77,8 @@ class SchedulerConfig:
         dry_run: run the pipeline but change nothing.
         capacity: how many plans may run at the same time.
         min_runtime_seconds: how long a young run is left alone before
-            it may be converged.
+            it may be converged — zero by default, so no run is
+            protected on age alone.
         tick_seconds: how long one tick waits before the next one.
         command_timeout_seconds: how long a single command may take.
     """
