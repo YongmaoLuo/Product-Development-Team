@@ -638,6 +638,73 @@ def test_a_service_the_round_stopped_is_not_reported_as_a_death(
     assert "stopped by the round" in exits[0]["reason"], exits[0]
 
 
+def test_the_exit_is_recorded_before_the_runtime_says_it_is_dead(
+    round_dirs, fixture_db, started, monkeypatch,
+):
+    """The round can point at the death it announces.
+
+    The watcher publishes two things about a death: the fact that the
+    service is gone (``runtime.exit``) and the record of how it died
+    (the plan's event stream).  A reader that has seen the first must
+    be able to read the second -- otherwise the round announces a
+    death it cannot point at, which is the silence this watcher exists
+    to end (2026-10-26).
+
+    The other order leaves a window in which the runtime already says
+    "this is dead" while the event stream is still empty, and a reader
+    that reads it in that window sees no death at all.  That window is
+    narrow, which is exactly why it is only ever caught by accident:
+    on a busy host the reader gets there first often enough to fail.
+
+    So the order is pinned here, and pinned **deterministically**: the
+    recorder is wrapped, and the wrapper looks at the runtime at the
+    moment the recording happens.  No sleep, no retry, no polling --
+    the ordering *is* the assertion.
+    """
+    plan_dir, project_dir = round_dirs
+    runtime, declaration = _bring_up(plan_dir, project_dir)
+    started.append((runtime, declaration))
+
+    real_record = sm.record_process_event
+    seen: List[Tuple[str, Any]] = []
+
+    def spy(recorded_plan_dir, event, **kwargs):
+        # What the runtime says at the moment the death is written down.
+        seen.append((str(event), runtime.exit))
+        return real_record(recorded_plan_dir, event, **kwargs)
+
+    monkeypatch.setattr(sm, "record_process_event", spy)
+
+    _kill_service(runtime)
+    assert _wait_for(lambda: runtime.exit) is not None, (
+        "the watcher must notice that the service's process is gone"
+    )
+
+    exits = [entry for entry in seen if entry[0] == sm.PROCESS_EVENT_EXITED]
+    assert len(exits) == 1, (
+        f"the exit must be recorded exactly once; got {seen!r}"
+    )
+    assert exits[0][1] is None, (
+        "the death must be written down **before** the runtime says it "
+        f"is dead; at the moment of the recording the runtime already "
+        f"claimed {exits[0][1]!r}"
+    )
+
+    # And the reader sees it: once the runtime says the service is
+    # dead, the event is already on disk.  Read once -- no retry, no
+    # sleep: the ordering above is what makes this readable.
+    events = sm.read_process_events(plan_dir)
+    recorded = [
+        e for e in events if e.get("event") == sm.PROCESS_EVENT_EXITED
+    ]
+    assert len(recorded) == 1, (
+        "the exit must be readable the moment the runtime says the "
+        f"service is dead; got {events!r}"
+    )
+    assert recorded[0]["pid"] == runtime.pid
+    assert recorded[0]["port"] == runtime.port
+
+
 # ---------------------------------------------------------------------------
 # The port and the deadline this module's services get
 # ---------------------------------------------------------------------------

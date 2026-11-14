@@ -73,6 +73,7 @@ import logging
 import os
 import re
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -133,7 +134,6 @@ from service_freshness import (
     http_probe_url,
     newest_project_source_mtime,
     probe_port,
-    wait_for_ready,
 )
 
 try:  # The reaper's spawn marker.  Optional: the marker is how the
@@ -156,7 +156,94 @@ logger = logging.getLogger(__name__)
 #: the class here keeps the check working even when
 #: ``subprocess.Popen`` itself has been replaced, which is exactly what
 #: those tests do.
+#:
+#: The same replacement is why the manager's **probes** go through
+#: :func:`_run_probe` rather than through ``subprocess.run``: a recorder
+#: installed to watch the service spawn must not also answer the
+#: manager's questions about the operating system, and must not
+#: overwrite the record of the spawn it came to watch.
 _REAL_POPEN = subprocess.Popen
+
+#: The real ``subprocess.run``, captured at import time.
+#:
+#: A fake installed for ``subprocess.run`` is a legitimate seam: it
+#: answers the probe with a fixture instead of asking the operating
+#: system.  The manager honours such a fake — and uses it *only* when
+#: one is installed, so that the probe is otherwise spawned through
+#: :data:`_REAL_POPEN` rather than through whatever
+#: ``subprocess.Popen`` currently names.
+_REAL_RUN = subprocess.run
+
+
+def _run_probe(
+    argv: Sequence[str], timeout: float = 10.0
+) -> Optional[Tuple[int, str, str]]:
+    """Run a probe command and return ``(returncode, stdout, stderr)``.
+
+    ``None`` means the probe could not be run at all — it is missing, it
+    could not be spawned, it timed out.  A probe that ran and failed is
+    reported through its return code instead, because "the tool said no"
+    and "the tool never ran" mean different things to the caller.
+
+    The probe is spawned through :data:`_REAL_POPEN` rather than through
+    the module attribute ``subprocess.Popen``.  ``subprocess.run`` looks
+    that attribute up when it spawns, so a test that replaced it in
+    order to watch the product's own service spawn would also capture
+    the manager's probes — and the probe, running *after* the spawn,
+    would overwrite the very record the test came to read.  A probe is
+    the product asking the operating system a question; the recorder is
+    there to watch the product, not to answer for it.
+
+    A fake installed for ``subprocess.run`` is honoured instead: it is
+    the probe's *answer*, and an answer is a legitimate thing to fake.
+    The two seams cannot be confused: the fake replaces the whole call,
+    the recorder replaces only the spawn.
+    """
+    runner = subprocess.run
+    if runner is not _REAL_RUN:
+        try:
+            completed = runner(
+                list(argv),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except Exception:  # noqa: BLE001 - a probe is best-effort
+            return None
+        return (
+            int(getattr(completed, "returncode", 0) or 0),
+            getattr(completed, "stdout", "") or "",
+            getattr(completed, "stderr", "") or "",
+        )
+    try:
+        completed = _REAL_POPEN(
+            list(argv),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            text=True,
+        )
+    except Exception:  # noqa: BLE001 - a probe is best-effort
+        return None
+    try:
+        out, err = completed.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            completed.kill()
+        except OSError:  # pragma: no cover - the child is already gone
+            pass
+        try:
+            completed.communicate(timeout=timeout)
+        except Exception:  # noqa: BLE001 - pragma: no cover
+            pass
+        return None
+    except Exception:  # noqa: BLE001 - a probe is best-effort
+        return None
+    return (
+        int(getattr(completed, "returncode", 0) or 0),
+        out if isinstance(out, str) else "",
+        err if isinstance(err, str) else "",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +364,14 @@ _VALUE_FLAGS = frozenset({
     "-c", "--config", "--hostname", "--dir", "-H",
 })
 
-_READY_POLL_INTERVAL = 1.0
+#: How long the readiness wait sleeps between two probes.
+#:
+#: The port opens, and the wait notices it on its next probe -- so a
+#: part of this interval is spent *noticing a port that is already
+#: open*, and that part comes out of the readiness budget the child
+#: has to meet.  A tenth of a second keeps the notice cheap; a whole
+#: second spent noticing is a second the child cannot buy back.
+_READY_POLL_INTERVAL = 0.1
 
 #: Markers that make a log line look like a real failure. Matching is
 #: case-sensitive on purpose: a summary line such as ``0 errors`` must
@@ -295,6 +389,13 @@ _MAX_ERROR_SCAN_LINES = 20_000
 
 #: Upper bound on the excerpt that goes into ``ServiceRuntime.detail``.
 _MAX_EXCERPT_CHARS = 1200
+
+#: How many lines of a service's log are read to work out which step of
+#: its start-up it stopped on. The lines that say so are the last ones
+#: it wrote, so the tail is enough — and a service that logged
+#: hundreds of thousands of lines must not turn a slow failure into a
+#: slower one.
+_STARTUP_PHASE_TAIL_LINES = 40
 
 #: The program used to count a process' open descriptors.
 _LSOF_BIN = "lsof"
@@ -524,20 +625,19 @@ def _process_cwd(pid: int) -> Optional[str]:
     ``None`` means "not measurable here", not "somewhere else": lsof may
     be missing, may refuse, or may not know the process any more.
     """
-    try:
-        completed = subprocess.run(
-            [_LSOF_BIN, "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
-            capture_output=True, text=True, check=False,
-            timeout=_FD_COUNT_TIMEOUT_SECONDS,
-        )
-    except Exception as exc:  # noqa: BLE001 - a probe is best-effort
+    result = _run_probe(
+        [_LSOF_BIN, "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+        timeout=_FD_COUNT_TIMEOUT_SECONDS,
+    )
+    if result is None:
         logger.debug(
-            "[service_manager] cwd probe for %s failed: %s", pid, exc,
+            "[service_manager] cwd probe for %s could not be run", pid,
         )
         return None
-    if completed.returncode != 0:
+    returncode, stdout, _stderr = result
+    if returncode != 0:
         return None
-    for line in completed.stdout.splitlines():
+    for line in stdout.splitlines():
         field = line.strip()
         if field.startswith("n") and len(field) > 1:
             return field[1:]
@@ -621,6 +721,14 @@ class DataPlaneEvidence:
     #: instance names, not against the one the prober happens to
     #: have open.  Empty when the instance named none.
     state_db_path: str = ""
+    #: The process that answered, when the instance published one.
+    #: Together with *pgid* this is what tells "our child is serving"
+    #: from "something else is holding our port".
+    pid: Optional[int] = None
+    #: The process group the answering process runs in.  A process
+    #: group is inherited, so a group that is the one we started our
+    #: own child in belongs to our child and to nothing else.
+    pgid: Optional[int] = None
     #: One of the ``DATA_PLANE_*`` verdicts.
     verdict: str = DATA_PLANE_ABSENT
     #: Why the verdict came out the way it did.
@@ -661,6 +769,8 @@ class DataPlaneEvidence:
             "plan_routing_rows": self.plan_routing_rows,
             "boot_id": self.boot_id,
             "state_db_path": self.state_db_path,
+            "pid": self.pid,
+            "pgid": self.pgid,
             "verdict": self.verdict,
             "error": self.error,
         }
@@ -1607,6 +1717,31 @@ def _process_start_epoch(pid: int) -> Optional[float]:
     return _parse_ps_lstart(raw)
 
 
+def _child_cpu_seconds(pid: int) -> Optional[float]:
+    """How much CPU the child has used, in seconds -- or ``None``.
+
+    The question this answers is "was the child busy or stuck".  A
+    child that is still importing burns CPU; a child that is blocked on
+    something -- a lock, a network read, a queue -- does not.  Both look
+    the same from the outside: no output, still running, budget gone.
+    They are two different problems, so the failure line has to be able
+    to tell them apart, and it cannot do that from the log alone.
+
+    ``ps`` prints the cumulative CPU time as ``[[dd-]hh:]mm:ss.ss``,
+    so the parts are folded into seconds from the right.
+    """
+    raw = _run(["ps", "-p", str(pid), "-o", "time="])
+    if not raw:
+        return None
+    text = raw.strip().split("-")[-1]  # drop a leading "dd-" day count
+    total = 0.0
+    for part in text.split(":"):
+        try:
+            total = total * 60 + float(part)
+        except ValueError:
+            return None
+    return total
+
 def _spawn_anchor(pid: int) -> Optional[float]:
     """When the child *actually* started, according to the kernel.
 
@@ -1650,14 +1785,12 @@ def _spawn_anchor(pid: int) -> Optional[float]:
 
 def _run(argv: Sequence[str], timeout: int = 10) -> Optional[str]:
     """Best-effort subprocess helper; never raises."""
-    try:
-        out = subprocess.run(
-            list(argv), capture_output=True, text=True, timeout=timeout,
-        )
-        return out.stdout.strip()
-    except Exception as exc:  # noqa: BLE001 - probes are best-effort
-        logger.debug("[service_manager] %s failed: %s", argv, exc)
+    result = _run_probe(list(argv), timeout=timeout)
+    if result is None:
+        logger.debug("[service_manager] %s could not be run", argv)
         return None
+    _returncode, stdout, _stderr = result
+    return stdout.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -2759,6 +2892,53 @@ def _log_path_for(decl: ServiceDeclaration, project_dir: Path) -> Path:
     return Path(project_dir) / "tmp" / f"pdt_service_{decl.name}.log"
 
 
+def _instance_pid(raw: Any) -> Optional[int]:
+    """The process (group) number an instance published, if it published one.
+
+    ``None`` for anything that is not a number: a boolean is an ``int``
+    in Python and would otherwise be read as process 0 or 1, and a
+    string is a number only to somebody who parses it.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None
+    return int(raw)
+
+
+#: The request-guard header the manager's own readiness probe carries,
+#: read once and kept.  ``None`` until the first read.
+_GUARD_HEADER: Optional[Tuple[str, str]] = None
+
+
+def _guard_header() -> Tuple[str, str]:
+    """The header the request guard requires, read once and kept.
+
+    The manager's readiness probe travels the same road a VP's request
+    travels, so it carries the request guard's header -- and reading
+    that header means importing :mod:`request_guard`, which imports
+    ``fastapi``.
+
+    That import is not small: measured on a loaded host, **1.2s to
+    2.1s** for the ``fastapi`` import alone.  It used to be paid
+    *inside* the child's readiness window, because the probe only runs
+    once the child is already answering: the child was up and the
+    manager was still importing the header its own probe needed, and
+    the child's budget was spent on the manager's import.  Reading it
+    once, before the child starts, keeps that cost out of the window
+    (see :func:`start_service`).
+
+    The answer is kept, so the second read costs nothing at all -- the
+    import happens once per process, not once per probe.
+    """
+    global _GUARD_HEADER
+    if _GUARD_HEADER is None:
+        try:
+            from request_guard import REQUEST_HEADER, REQUEST_HEADER_VALUE
+        except Exception:  # pragma: no cover - defensive
+            REQUEST_HEADER, REQUEST_HEADER_VALUE = "X-PDT-Request", "1"
+        _GUARD_HEADER = (str(REQUEST_HEADER), str(REQUEST_HEADER_VALUE))
+    return _GUARD_HEADER
+
+
 def data_plane_evidence(
     port: int, *, timeout: float = DATA_PLANE_PROBE_TIMEOUT_SECONDS,
 ) -> DataPlaneEvidence:
@@ -2791,10 +2971,7 @@ def data_plane_evidence(
     with ``EADDRINUSE``.
     """
     evidence = DataPlaneEvidence()
-    try:
-        from request_guard import REQUEST_HEADER, REQUEST_HEADER_VALUE
-    except Exception:  # pragma: no cover - defensive
-        REQUEST_HEADER, REQUEST_HEADER_VALUE = "X-PDT-Request", "1"
+    REQUEST_HEADER, REQUEST_HEADER_VALUE = _guard_header()
     try:
         status_code, raw = http_probe(
             SERVICE_HOST, int(port), DATA_PLANE_PROBE_PATH,
@@ -2835,6 +3012,11 @@ def data_plane_evidence(
             reported_db = instance.get("state_db_path")
             if isinstance(reported_db, str):
                 evidence.state_db_path = reported_db
+            # The instance names the process that answered, and the
+            # group it runs in.  Only integers are names: a boolean is
+            # an int in Python, and a string is not a number at all.
+            evidence.pid = _instance_pid(instance.get("pid"))
+            evidence.pgid = _instance_pid(instance.get("pgid"))
         rows = body.get("plan_routing_rows")
         if not isinstance(rows, bool) and isinstance(rows, int):
             evidence.plan_routing_rows = int(rows)
@@ -2876,6 +3058,49 @@ def data_plane_evidence(
     return evidence
 
 
+#: How long a single connect attempt to a declared port may take.
+#:
+#: A connect to a port on this machine is either refused at once or
+#: accepted at once, so this is not a tuning knob -- it is the bound on
+#: the one case that would otherwise hang: a listener whose accept
+#: queue is wedged.  The bound is one second because the whole point
+#: of the connect is that it is *one attempt*: a question that may
+#: wait is not the question the readiness loop asks (see
+#: :func:`_port_is_answering`).
+_PORT_CONNECT_TIMEOUT = 1.0
+
+
+def _port_is_answering(port: int) -> bool:
+    """Is anything accepting connections on *port*?  One attempt.
+
+    The readiness loop asks this question once per round and paces
+    itself with :data:`_READY_POLL_INTERVAL` in between, so the
+    question has to be cheap.  Asking it through a *wait* — a helper
+    that retries for a second before it gives up — costs every round a
+    full second, and a child that binds its port in the middle of that
+    second is noticed a second late: a second of the readiness budget
+    spent on the *detection* of a port that is already open, which is
+    a second the child cannot buy back.
+
+    Measured here: **1.15 s** per question on a port nobody listens
+    on, against a loop that means to ask every 100 ms.
+
+    The protected ports are refused here for the same reason
+    :func:`service_freshness.wait_for_ready` refuses them: the
+    backend's own ports are never "ready" for a service to be
+    answered on.
+    """
+    if int(port) in PROTECTED_PORTS:
+        return False
+    try:
+        with socket.create_connection(
+            (SERVICE_HOST, int(port)), timeout=_PORT_CONNECT_TIMEOUT
+        ):
+            return True
+    except OSError:
+        return False
+
+
 def _service_is_answering(decl: ServiceDeclaration) -> bool:
     """Is the service answering at all — its health URL, or the port?
 
@@ -2888,7 +3113,7 @@ def _service_is_answering(decl: ServiceDeclaration) -> bool:
     must not leave the service's own port in ``TIME_WAIT``.
     """
     if not decl.health_url:
-        return wait_for_ready(decl.port, timeout_seconds=1)
+        return _port_is_answering(decl.port)
 
     try:
         status_code, _body = http_probe_url(
@@ -2970,7 +3195,7 @@ def _child_exit_code(child: Any) -> Optional[int]:
 
 
 def wait_until_ready(
-    decl: ServiceDeclaration, timeout_seconds: Optional[int] = None,
+    decl: ServiceDeclaration, timeout_seconds: Optional[float] = None,
 ) -> bool:
     """Is the service ready — alive **and** serving data?
 
@@ -3232,7 +3457,7 @@ def wait_until_ready_with_evidence(
 
 
 def _wait_ready_with_evidence(
-    decl: ServiceDeclaration, timeout_seconds: Optional[int] = None,
+    decl: ServiceDeclaration, timeout_seconds: Optional[float] = None,
 ) -> Tuple[bool, DataPlaneEvidence]:
     """Wait for the service to be ready, and report what it is serving.
 
@@ -3269,11 +3494,21 @@ def _wait_ready_with_evidence(
     asked again, until the timeout; when the timeout runs out the
     caller fails it exactly as it failed a service that never came up.
 
+    The timeout is a **ceiling**, not a suggestion: a service that
+    answers after it has run out did not come up in time, and it is
+    failed like any other late service.  The deadline is therefore
+    checked at the moment the answer arrives, not only after a failed
+    round -- otherwise the wait accepts a service that answered late
+    and reports it with a line ("ready within 12s") that says the
+    opposite of what happened.
+
     Returns ``(ready, evidence)``.  The evidence is what the caller
     records, so "it came up" and "it came up serving data" stay two
     separately readable facts.
     """
-    timeout = timeout_seconds or decl.ready_timeout_seconds
+    timeout = (
+        decl.ready_timeout_seconds if timeout_seconds is None else timeout_seconds
+    )
     deadline = time.monotonic() + timeout
     started = time.monotonic()
     expected_rows = _expected_routing_rows()
@@ -3286,6 +3521,25 @@ def _wait_ready_with_evidence(
     child = _READINESS_CHILD.get()
     while True:
         if _service_is_answering(decl):
+            # The answer is what makes the service ready, so the moment
+            # the answer arrived is the moment the service became
+            # ready.  If the budget is spent by then, the service came
+            # up too late -- and a manager that accepts it anyway has
+            # answered a question nobody asked, and says so in a line
+            # ("ready within 12s") that states the opposite.
+            #
+            # The check sits *before* the data-plane probe on purpose.
+            # That probe is the slow one, and asking it once the budget
+            # is gone buys a verdict nobody asked for.
+            #
+            # The noticing lag is the child's to pay: the wait asks
+            # every :data:`_READY_POLL_INTERVAL`, so a tenth of a
+            # second of the budget is spent finding out that a port is
+            # already open.  That is what the interval's own note says,
+            # and it is the price of asking the question often enough
+            # to notice a port at all.
+            if time.monotonic() >= deadline:
+                return False, evidence
             evidence = data_plane_evidence(decl.port)
             if _data_plane_is_acceptable(evidence, expected_rows, decl):
                 evidence.waited_seconds = time.monotonic() - started
@@ -3419,6 +3673,101 @@ def _relocate_service(
     failed.failure_reason = failed.detail
     failed.candidate_ports = list(candidates)
     return failed
+
+
+#: The variable that pins the provider mode.  It is named here, and not
+#: only in ``coding_tool``, because the spawn path writes it: a child
+#: that is handed the variable answers with a known mode instead of
+#: asking the machine.
+PROVIDER_MODE_ENV = "PDT_PROVIDER_MODE"
+
+#: The provider mode a **spawned service** is started in.  See
+#: :func:`_child_env` for why it is not the manager's own mode.
+SERVICE_PROVIDER_MODE = "inherit"
+
+#: The variable that asks a service child to announce the start of its
+#: own boot.  See :func:`_child_env` for why the manager asks.
+BOOT_TRACE_ENV = "PDT_BOOT_TRACE"
+
+
+def _child_env(base: Dict[str, str]) -> Dict[str, str]:
+    """The environment a service child is started with.
+
+    ``PYTHONUNBUFFERED`` is set, and it is set for one reason: a child's
+    stdout is a **file**, not a terminal, so Python buffers it, and the
+    buffer is flushed when the process exits.  A child that died on the
+    way up never exits, so its log stays empty -- and an empty log says
+    nothing about where the child died.  With the buffering off, the
+    log is the child's own account of its boot, line by line, while it
+    happens.
+
+    The variable is harmless to a service that is not written in
+    Python: it is read by the interpreter and by nothing else.
+
+    The provider mode is set too, and it is set to ``inherit``: a
+    service is not the manager, and the manager's provider routing is
+    not an answer for it.  The mode names the CC Switch instance on
+    *this* box, and a service started on a box without that instance
+    dies on the way up -- ``server.load_providers`` asks CC Switch for
+    the provider chain, gets ``api_unreachable``, and the startup
+    aborts, because that contract is explicit: there is no silent YAML
+    fallback and no second source to answer instead.  The child then
+    never listens, and the manager waits out its whole readiness budget
+    before it can say so.
+
+    Every other spawn site in this repo already says ``inherit``
+    explicitly for exactly this reason
+    (``test_verification_progress_live``, ``test_vp_bucket_progress_e2e``,
+    ``test_stop_resume_ui_e2e`` and the rest).  The production spawn
+    path was the one that did not, and it is the one that decides
+    whether a verification round can start a server at all.
+
+    It is set **explicitly**, because "unset" is not the same answer:
+    unset means "ask the machine", and the machine answers with a CC
+    Switch that may not be there.  A declaration that does want a fleet
+    says so in its own start command (``export
+    PDT_PROVIDER_MODE=cc-switch``) -- the variable is set before the
+    command runs, so the command's own export wins.
+
+    ``PDT_BOOT_TRACE`` is set for the same reason the buffering is off:
+    the log is the manager's only account of the child's boot, and an
+    account that starts at "the child had already imported the whole
+    application" says nothing about the part where the child was
+    spending its time.  A child that announces the import before it
+    imports leaves a log whose first line dates the silence that
+    follows, and the failure line can then name the step the child
+    stopped on instead of deducing it from an empty log.
+    """
+    env = dict(base)
+    env["PYTHONUNBUFFERED"] = "1"
+    env[PROVIDER_MODE_ENV] = SERVICE_PROVIDER_MODE
+    env[BOOT_TRACE_ENV] = "1"
+    return env
+
+
+def _answering_is_our_own_child(
+    evidence: Optional[DataPlaneEvidence], pgid: Optional[int],
+) -> bool:
+    """Is the instance answering on the port our own child?
+
+    The instance publishes the process group it runs in, and the
+    manager knows the group it started the child in.  A process group
+    is inherited and is not shared with a stranger: a process that runs
+    in the group we started our child in is a member of our child's own
+    group, and cannot be something else that took the port in the
+    window between choosing it and binding it.
+
+    So when the two agree, the port is provably held by our own child:
+    it answered, it is alive, and it is ours.  That is the whole
+    question the wait after the readiness probe asks, and it has been
+    answered already.
+    """
+    if evidence is None or not pgid:
+        return False
+    answered = evidence.pgid
+    if not answered:
+        return False
+    return int(answered) == int(pgid)
 
 
 def _await_exit(proc: subprocess.Popen, timeout: float) -> tuple:
@@ -3677,11 +4026,30 @@ def start_service(
         # replaces any inherited one; the owner is the process that
         # actually started the service.
         _apply_spawn_marker(env)
+        # The child's own output has to arrive while the child is
+        # running: a log that only appears when the process exits says
+        # nothing about a process that never got there.
+        env = _child_env(env)
         if preserve_data:
             # A start command that knows the convention can skip its
             # own seed; one that does not is rendered seed-free above.
             # Both are told which kind of start this is.
             env[SKIP_SEED_ENV] = "1"
+        # The manager's own readiness probe carries the request guard's
+        # header, and reading that header imports ``request_guard`` --
+        # which imports ``fastapi``.  Measured on a loaded host that is
+        # **1.2s to 2.1s**, and it used to be paid inside the child's
+        # readiness window: the probe only runs once the child is
+        # already answering, so the child was up and the manager was
+        # still importing the header its own probe needed.  The child's
+        # budget was spent on the manager's import.  Read it here, so
+        # the child's window holds the child's work and nothing else.
+        _guard_header()
+        # The child's clock starts here, not at the readiness wait: the
+        # child is alive from this moment on, and the wait below only
+        # starts asking after the pgid separation and the bookkeeping
+        # that follows it (0.18s measured on this host).
+        spawned_at = time.monotonic()
         with open(log_file, "ab") as log_fp:
             proc = subprocess.Popen(
                 _detached_argv(start_cmd),
@@ -3775,9 +4143,23 @@ def start_service(
             rendered=start_cmd,
         )
 
+    # The budget this call enforces is the budget its report names.
+    # The caller may shorten the declaration's own budget, and a
+    # report that names the declaration's number instead is a report
+    # about a wait that did not happen.
+    ready_budget = timeout_seconds or decl.ready_timeout_seconds
     # A stale observation from an earlier wait on this port must not be
     # read as this wait's (2026-11-03, VP-018, L3).
     _take_data_plane(decl.port)
+    # The budget is the **child's**, and the child has been spending it
+    # since it was forked: the wait below starts asking only after the
+    # pgid separation and the bookkeeping around it -- 0.18s measured
+    # on this host -- and those are the child's own boot.  So the wait
+    # is asked for what is left of the budget rather than for the
+    # whole of it.  Otherwise the child is charged for the manager's
+    # bookkeeping, and a service that came up inside its declared
+    # budget is reported as late.
+    spent = time.monotonic() - spawned_at
     # The child is published for the duration of the wait so that the
     # wait can see the death instead of waiting out the rest of the
     # budget for an answer that is never coming (2026-11-03, VP-018,
@@ -3786,7 +4168,7 @@ def start_service(
     # no measurement behind, which is what keeps the failure line
     # honest about what it does and does not know.
     with _readiness_child(proc):
-        ready = wait_until_ready(decl, timeout_seconds)
+        ready = wait_until_ready(decl, max(0.0, float(ready_budget) - spent))
     # The evidence is recorded on the runtime whatever the verdict is:
     # "it came up" and "it came up serving data" are two different
     # facts, and the round's log has to be able to tell them apart.
@@ -3823,25 +4205,50 @@ def start_service(
         # Sampling once straight after the readiness probe, which returns
         # in milliseconds, reliably caught the shell before it had exited
         # and reported the dead service as ready.
-        exited, rc = _await_exit(proc, timeout=2.0)
+        #
+        # The wait is two seconds, and it is paid by every start that
+        # succeeds — the case where the child answered and is serving.
+        # The instance that answered publishes the process group it
+        # runs in, and a group we started our own child in belongs to
+        # our child alone: when the two agree, the port is provably
+        # held by our own child, it is alive (it answered), and the
+        # question the wait asks has been answered already.  So the
+        # wait is skipped then, and two seconds leave every start.
+        # A stranger on the port publishes a group of its own, the
+        # groups do not match, and the wait still runs.
+        # "It answered" means *our* service answered.  The readiness
+        # probe cannot tell our child from a stranger that took the
+        # port in the window between choosing it and binding it --
+        # both of them answer -- so the question is settled by the
+        # process group the answering instance publishes, which is the
+        # same fact the two-second wait below asks about.
+        answered = _answering_is_our_own_child(evidence, runtime.pgid)
+        if answered:
+            # Our own child answered: the port is provably held by the
+            # process we started, it is alive (it answered), and the
+            # question the wait asks has been answered already.
+            exited, rc = False, None
+        else:
+            exited, rc = _await_exit(proc, timeout=2.0)
         if exited:
             runtime.ready = False
             runtime.detail = _failure_detail(
                 pid=proc.pid,
                 pgid=runtime.pgid,
                 fds=_fd_count(proc.pid),
-                timeout_seconds=decl.ready_timeout_seconds,
+                timeout_seconds=ready_budget,
                 rc=rc,
                 log_file=log_file,
+                elapsed_seconds=time.monotonic() - spawned_at,
                 waited_seconds=waited_seconds,
-                answered=True,
+                answered=answered,
             )
             _record_what_the_restart_kept()
             return runtime
         runtime.ready = True
         runtime.detail = (
             f"started (pid {proc.pid}); ready within "
-            f"{decl.ready_timeout_seconds}s"
+            f"{ready_budget}s"
         )
         if evidence is not None and evidence.proved:
             runtime.detail += (
@@ -3859,9 +4266,10 @@ def start_service(
         pid=proc.pid,
         pgid=runtime.pgid,
         fds=_fd_count(proc.pid),
-        timeout_seconds=decl.ready_timeout_seconds,
+        timeout_seconds=ready_budget,
         rc=proc.poll(),
         log_file=log_file,
+        elapsed_seconds=time.monotonic() - spawned_at,
         waited_seconds=waited_seconds,
     )
     runtime.detail += _data_plane_detail(evidence)
@@ -4540,7 +4948,8 @@ def _diagnosable_log(
 
     The result is capped at *max_chars*; whatever was dropped is
     reported as ``…[truncated N chars]``. A missing or empty log
-    gives ``"(empty)"``.
+    gives ``"(empty)"``; the *caller* is the one that says what an
+    empty log means.
     """
     head = _head_lines(path, _MAX_ERROR_SCAN_LINES)
     tail = _tail(path, tail_lines)
@@ -4571,28 +4980,121 @@ def _fd_count(pid: int) -> Optional[int]:
     as ``fcwd`` / ``ftxt`` / ``frtd``, which are not descriptors and
     would inflate the count by three.
     """
-    try:
-        completed = subprocess.run(
-            [_LSOF_BIN, "-p", str(pid), "-Fn"],
-            capture_output=True, text=True, check=False,
-            timeout=_FD_COUNT_TIMEOUT_SECONDS,
-        )
-    except Exception as exc:  # noqa: BLE001 - a probe is best-effort
+    result = _run_probe(
+        [_LSOF_BIN, "-p", str(pid), "-Fn"],
+        timeout=_FD_COUNT_TIMEOUT_SECONDS,
+    )
+    if result is None:
         # ``lsof`` may be missing, the process may be gone, the call
         # may have been refused.  None of that may break the failure
         # path this probe is there to explain.
         logger.debug(
-            "[service_manager] fd count for %s failed: %s", pid, exc,
+            "[service_manager] fd count for %s could not be run", pid,
         )
         return None
-    if completed.returncode != 0:
+    returncode, stdout, _stderr = result
+    if returncode != 0:
         return None
     count = 0
-    for line in completed.stdout.splitlines():
+    for line in stdout.splitlines():
         field = line.strip()
         if field.startswith("f") and field[1:].isdigit():
             count += 1
     return count or None
+
+#: The lines a service prints as it comes up, and what each of them says
+#: about the step the service had reached.  The **last** one in the log
+#: is the step it was on when it stopped: a service that printed none of
+#: them never got past importing its application, and one that printed
+#: the last of them has finished starting -- which is a different
+#: problem with a different fix.
+#:
+#: The first entry is the line the backend prints *before* it imports
+#: the application (see ``BOOT_TRACE_ENV``).  It is the phase for the
+#: slowest part of the boot, and it is a fact rather than a deduction:
+#: the child said it was importing and then said nothing else.
+_STARTUP_PHASES = (
+    (
+        "[backend server] importing the application",
+        "it was still importing the application",
+    ),
+    ("Starting uvicorn", "it was starting the server"),
+    ("Started server process", "it was starting the server"),
+    (
+        "Waiting for application startup.",
+        "it was inside the startup (the lifespan)",
+    ),
+    (
+        "Application startup complete.",
+        "it had finished starting but never answered on the port",
+    ),
+)
+
+
+def _startup_phase(path: Path) -> str:
+    """Which step of its start-up a service was on when it stopped.
+
+    The answer comes from the service's own log: the lines it prints as
+    it comes up say how far it got.  A service that got into its
+    startup and stopped there is a different problem from one that
+    finished starting and then went quiet, and the reader of the
+    failure line is the one who has to tell them apart.
+
+    **Empty** when the log does not say: a service that prints none of
+    these lines has told us nothing about the step it was on, and a
+    guess would be worse than the silence.  (A log with no lines at all
+    is the one case where the step *is* known -- it never reached its
+    first line -- and the caller words that one itself.)
+    """
+    text = _tail(path, _STARTUP_PHASE_TAIL_LINES)
+    phase = ""
+    for marker, description in _STARTUP_PHASES:
+        if marker in text:
+            phase = description
+    return phase
+
+
+def _child_state_part(
+    pid: int, rc: Optional[int], elapsed_seconds: Optional[float] = None,
+) -> str:
+    """What the child was doing when the readiness budget ran out.
+
+    "It was still importing the application" used to be the whole
+    answer, and it is a guess: a child that is stuck has not reached
+    its first line either, and the two need different fixes.  So the
+    sentence carries measurements instead -- the CPU the child has
+    used, and the wall time it has had.
+
+    Both are needed.  The CPU seconds alone do not say whether the
+    child was working: on this host the ``lark_oapi`` import costs
+    **35.5s of wall time and 2.3s of CPU**, because it is reading
+    thousands of files rather than computing.  A child that spends its
+    wall time waiting is a different problem from a child that spends
+    it computing, and the reader of the line has to be able to tell
+    them apart.
+    """
+    if rc is not None:
+        return f"the child had already exited (rc={rc})"
+    cpu = _child_cpu_seconds(pid)
+    if cpu is None:
+        return (
+            "the child was still running and its CPU time could not be "
+            "measured, so whether it was working or waiting is not told "
+            "here"
+        )
+    if elapsed_seconds is None:
+        return (
+            f"the child was still running and had used {cpu:.1f}s of CPU"
+        )
+    verdict = (
+        "computing rather than waiting"
+        if cpu >= elapsed_seconds * 0.5
+        else "waiting rather than computing"
+    )
+    return (
+        f"the child was still running and had used {cpu:.1f}s of CPU in "
+        f"{elapsed_seconds:.1f}s of wall time, so it was {verdict}"
+    )
 
 def _exit_signal_phrase(rc: Optional[int]) -> str:
     """The signal that ended the process, in words — or nothing.
@@ -4621,6 +5123,7 @@ def _failure_detail(
     timeout_seconds: int,
     rc: Optional[int],
     log_file: Path,
+    elapsed_seconds: Optional[float] = None,
     waited_seconds: Optional[float] = None,
     answered: bool = False,
 ) -> str:
@@ -4653,32 +5156,82 @@ def _failure_detail(
     the last one is not "it never came up" even though both end in a
     service that is not serving.
 
+    "It answered and then died" is said only when the answer came from
+    **our own child** -- the instance on the port published our child's
+    process group.  A stranger on the port answers the readiness probe
+    too, and a line that says "reported ready" about a service that
+    never reported anything names a readiness our service never had.
+    So the second sentence is the one a stranger gets: the service was
+    **not ready** and it died, and every one of those sentences says
+    "not ready" -- the one promise this line makes to the reader who
+    reads it as "the service is up".
+
     The log half is :func:`_diagnosable_log` and not a second copy of
     it: the first error line, the five lines before it, then the tail,
     capped at ``_MAX_EXCERPT_CHARS``. Two implementations of "where did
     it first go wrong" would drift apart, and the one that drifted
     would be whichever the reader did not have open.
+
+    An **empty** log is spelled out, because an empty log is a fact
+    about where the child died and not a formatting accident: the
+    service wrote no output at all, so it never reached its first
+    line.  The wording goes *before* the log half, so the log half
+    stays the last thing on the line.
+
+    An empty log also says whether the child was **busy or blocked**,
+    because the step it stopped on does not tell the reader that: a
+    child still importing and a child stuck on something look the same
+    from the outside.  The measurement is in
+    :func:`_child_state_part`.
+
+    The **step** the child stopped on is spelled out too, because
+    "not ready" does not say where the child was: a child that never
+    got past its import, one that stopped inside the lifespan and one
+    that finished starting and then went quiet are three different
+    problems, and the reader of this line is the one who has to tell
+    them apart.
     """
     fd_part = f", fds {fds}" if fds is not None else ""
+    phase = _startup_phase(log_file)
+    if phase:
+        # The phase sentence is paid for out of the excerpt's own
+        # budget: the whole line stays inside the cap, so a service
+        # that flooded its log still produces a line of the same
+        # length.
+        log_part = _diagnosable_log(
+            log_file,
+            tail_lines=15,
+            max_chars=_MAX_EXCERPT_CHARS - len(phase) - 2,
+        )
+        log_part = f"{phase}; {log_part}"
+    else:
+        log_part = _diagnosable_log(log_file, tail_lines=15)
+        if log_part == "(empty)":
+            log_part = (
+                "the service wrote no output at all, so it never reached "
+                "its first line and never got past importing the "
+                f"application; {_child_state_part(pid, rc, elapsed_seconds)}"
+                "; (empty)"
+            )
     if waited_seconds is None:
         # Nothing measured the wait: the only number there is the
         # declared one, and the line keeps the shape it always had.
         return (
             f"started (pid {pid}, pgid {pgid}{fd_part}) but not ready after "
             f"{timeout_seconds}s; rc={rc}; "
-            f"{_diagnosable_log(log_file, tail_lines=15)}"
+            f"{log_part}"
         )
 
     if answered:
         headline = "reported ready and then died"
     elif rc is not None:
-        headline = "died before it was ready"
+        headline = "was not ready and died"
     else:
         headline = "but not ready"
     return (
         f"started (pid {pid}, pgid {pgid}{fd_part}) {headline} after "
         f"{waited_seconds:.1f}s; rc={rc}{_exit_signal_phrase(rc)}; "
-        f"{_diagnosable_log(log_file, tail_lines=15)}"
+        f"{log_part}"
     )
 
 
@@ -6603,6 +7156,12 @@ def _watch_service_process(
     is what a reader of the round's log sees; the application is what
     stops the dead runtime from being handed out as an address.
 
+    The recording comes **first**.  A reader that sees the runtime say
+    the service is dead must be able to read the event that says how it
+    died; the other order leaves a window in which the round announces
+    a death that is not on disk yet, and a reader that looks in that
+    window sees no death at all.
+
     *done* is set when the watcher is finished.  The stop path waits on
     it (see :func:`stop_service`), and it is set even when the watcher
     failed: a stop must not wait for something that will not come.
@@ -6631,14 +7190,18 @@ def _watch_service_process(
             round_token=round_token,
             reason=_describe_exit(code, runtime.stopped),
         )
-        # The runtime is the state machine: the moment the process is
-        # gone, the runtime stops saying the service is ready.  Nothing
-        # else has to be told — every reader of the runtime sees the
-        # same fact.
-        runtime.exit = exit_info
-        runtime.ready = False
-        if not runtime.failure_reason:
-            runtime.failure_reason = exit_info.reason
+        # The death is written down **before** it is published.  The
+        # runtime says "this service is gone, and here is why"; the
+        # event stream is the durable proof of that.  A reader that
+        # has seen the first must be able to read the second -- the
+        # other order leaves a window in which the round announces a
+        # death it cannot point at, and that window is exactly the
+        # silence this watcher exists to end (2026-10-26).
+        #
+        # A failed write does not change that: ``record_process_event``
+        # never raises and only reports ``False``, so the runtime is
+        # published either way -- a round must not keep pretending a
+        # dead service is alive because its log could not be written.
         if plan_dir is not None:
             record_process_event(
                 plan_dir, PROCESS_EVENT_EXITED,
@@ -6648,6 +7211,14 @@ def _watch_service_process(
                 uptime_sec=exit_info.uptime_sec, round_token=exit_info.round_token,
                 reason=exit_info.reason,
             )
+        # The runtime is the state machine: the moment the process is
+        # gone, the runtime stops saying the service is ready.  Nothing
+        # else has to be told — every reader of the runtime sees the
+        # same fact.
+        runtime.exit = exit_info
+        runtime.ready = False
+        if not runtime.failure_reason:
+            runtime.failure_reason = exit_info.reason
     finally:
         if done is not None:
             done.set()

@@ -112,9 +112,11 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1210,19 +1212,34 @@ base_url, plan_id, destination, session_id, question, screenshot = sys.argv[1:7]
 executable = browser_executable()
 launch_kwargs = {"executable_path": executable} if executable else {}
 
-headers = {"X-PDT-Request": "1", "Content-Type": "application/json"}
+headers = {
+    "X-PDT-Request": "1",
+    "Content-Type": "application/json",
+    # One connection per call, exactly like the browserless path above
+    # (urllib opens one connection per request).  The server answers
+    # the creation request with an unhandled exception (the
+    # interview's model call has no provider behind it), and a server
+    # that closes the connection after an unhandled exception takes
+    # the *next* call on that pooled connection down with it.  Asking
+    # for the connection to be closed is what keeps the two calls off
+    # the same socket.
+    "Connection": "close",
+}
 
 with sync_playwright() as driver:
     browser = driver.chromium.launch(**launch_kwargs)
 
     def post(path, payload):
-        """One call, on a connection pool of its own.
+        """One call, on a connection of its own.
 
-        A fresh context per call: the server answers the creation
-        request with an unhandled exception (the interview's model
-        call has no provider behind it), and a server that closes the
-        connection after an unhandled exception takes the *next* call
-        on that pooled connection down with it.
+        The header above is what makes the connection its own.  The
+        request goes out through the browser's own network stack (the
+        server sees a HeadlessChrome user agent), and that stack keeps
+        a pool of sockets for the browser process — a fresh browser
+        context does NOT get a pool of its own, so the second call is
+        handed the socket the first call used.  A call that asked the
+        server to close the connection is never handed that socket
+        again.
 
         The body is read here, while the context is still open — a
         response is disposed with the context that fetched it.
@@ -1394,3 +1411,178 @@ def test_browser_replays_the_missing_binary_delivery(booted_without_transport):
     assert Path(screenshot).exists(), (
         f"the browser replay left no screenshot at {screenshot}"
     )
+
+
+# ---------------------------------------------------------------------------
+# The replay must not ride on a connection the server closed
+# ---------------------------------------------------------------------------
+
+
+class _TornDownHTTPServer(ThreadingHTTPServer):
+    """The server the replay is driven against, and its bookkeeping.
+
+    ``torn_down`` holds the sockets the server has already answered a
+    creation call on.  A request that arrives on one of them is a
+    request that rode on a connection the server had already closed.
+    """
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.torn_down: set = set()
+
+
+class _TornDownHandler(BaseHTTPRequestHandler):
+    """Answers the creation call, then refuses that connection for good.
+
+    The model is the product's own server after an unhandled exception:
+    the response goes out, and the connection the client was holding is
+    closed under it.  The close is *modelled* rather than performed,
+    because a client cannot tell a closed socket from an open one until
+    it writes to it — and the socket has to stay open long enough for
+    the client's pool to keep it.  A request that arrives on a
+    connection the server has already answered on is therefore the
+    request that rode on the closed connection, and it is never
+    answered: the client is left with a hung-up connection, which is
+    what the product's server does to a client that reuses a connection
+    it closed.
+    """
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        """Keep the test's own output quiet."""
+
+    def _read_body(self) -> None:
+        """Read the request body, so the connection stays in step."""
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+
+    def _respond(self, status: int, body: bytes, content_type: str) -> None:
+        """Answer, honouring a client that asked for the connection to close."""
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        if (self.headers.get("Connection") or "").lower() == "close":
+            self.close_connection = True
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self) -> None:
+        self._read_body()
+        if self.path.endswith("/decisions"):
+            if self.connection in self.server.torn_down:
+                # The client rode on a connection the server had already
+                # torn down: hang up instead of answering.
+                self.close_connection = True
+                try:
+                    self.connection.close()
+                except OSError:
+                    pass
+                return
+            payload = json.dumps(
+                {"decision_id": "decision-replayed", "status": "pending"}
+            ).encode("utf-8")
+            self._respond(200, payload, "application/json")
+            return
+        # The creation call: answered, and this connection is closed
+        # under the client from here on.
+        self.server.torn_down.add(self.connection)
+        self._respond(500, b'{"error":"no_provider"}', "application/json")
+
+    def do_GET(self) -> None:
+        if self.path == "/":
+            # The element the driver waits for has to be *visible*: the
+            # driver waits for "#app" to become visible, and an empty
+            # element has no box, so an empty div never becomes visible
+            # and the driver would sit there until it times out.
+            self._respond(
+                200,
+                b'<html><body><div id="app">plan</div></body></html>',
+                "text/html",
+            )
+            return
+        self._respond(404, b"{}", "application/json")
+
+
+def test_replay_does_not_ride_on_a_connection_the_server_closed(tmp_path):
+    """The replay's second call must not inherit the first call's socket.
+
+    The browser replay makes two calls over one client's connection
+    pool.  The first call — the creation call — is answered with a
+    failure, and a server that fails that way closes the connection
+    under the client (the product's server does: an unhandled exception
+    in the handler tears the connection down).  A client that hands the
+    dead socket to its second call gets no answer at all.
+
+    The client here is Playwright's request context, and its pool belongs
+    to the *browser process*: the request goes out through the browser's
+    own network stack (the server sees a HeadlessChrome user agent), and
+    that stack hands the second call the socket the first call used — a
+    fresh browser context does not get a pool of its own.  The replay
+    therefore has to ask the server to close the connection after the
+    first call — which is what the browserless path above already does,
+    because ``urllib`` opens one connection per request.
+
+    The server this case drives is a model of the product's server after
+    an unhandled exception: it answers the creation call and then tears
+    that connection down.  The model is deterministic where the real
+    server is not — whether the client's pool notices the closed socket
+    before it hands it out again is a race on the real server, and a
+    case that only fails sometimes is a case that proves nothing.
+    """
+    interpreter = _playwright_interpreter()
+    if interpreter is None:
+        pytest.skip(
+            "no Playwright driver is installed in this environment; "
+            "the default (browserless) path carries the assertions"
+        )
+
+    server = _TornDownHTTPServer((LOOPBACK_HOST, 0), _TornDownHandler)
+    thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.05},
+        daemon=True,
+    )
+    thread.start()
+    try:
+        base_url = f"http://{LOOPBACK_HOST}:{server.server_address[1]}"
+        driver_script = tmp_path / "drive_against_a_torn_down_server.py"
+        driver_script.write_text(_BROWSER_REPLAY, encoding="utf-8")
+        screenshot = str(tmp_path / "torn_down.png")
+
+        result = subprocess.run(
+            [
+                interpreter,
+                str(driver_script),
+                base_url,
+                PLAN_ID,
+                DESTINATION,
+                SESSION_ID,
+                QUESTION,
+                screenshot,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+            env=_driver_env(),
+        )
+        assert result.returncode == 0, (
+            "the browser driver failed (exit "
+            f"{result.returncode}); stdout={result.stdout!r} "
+            f"stderr={result.stderr!r}"
+        )
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        assert payload["create_status"] == 200, (
+            "the replayed creation call got no answer; the second call "
+            "rode on a connection the server had already closed: "
+            f"{payload!r}"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=10)

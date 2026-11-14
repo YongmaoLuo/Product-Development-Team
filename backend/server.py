@@ -2,6 +2,7 @@
 FastAPI Web Server for Spec-Driven Development System
 """
 
+import importlib.util
 import json
 import logging
 import math
@@ -14,8 +15,10 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import types
 import uuid
 import atexit
 from collections import deque
@@ -70,6 +73,22 @@ if not getattr(_root, "_ac_handler_installed", False):
     _root._ac_handler_installed = True
 _root.setLevel(_LOG_LEVEL)
 logger.setLevel(_LOG_LEVEL)
+
+# The manager that started this process reads the log to tell "the
+# child is still importing" from "the child is stuck in the start-up".
+# The import below is the slow part of the boot on a loaded host
+# (measured on this host: 0.65s on a quiet machine, 7-10s under
+# load), and the log says nothing at all until it is over -- so the
+# line is printed *before* the import, not after it.  A log whose last
+# line is this one says the child got no further than the import,
+# which is a fact; the empty log it replaces only ever said "it
+# stopped somewhere before its first line", which is a guess.
+#
+# It is asked for, not volunteered: a plain import in a test or in a
+# REPL stays quiet, and the manager's child environment is what turns
+# it on.
+if os.environ.get("PDT_BOOT_TRACE"):
+    print("[backend server] importing the application", flush=True)
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
@@ -1540,6 +1559,73 @@ def _stop_scheduler_engine(runtime: _SchedulerRuntime) -> None:
             )
 
 
+#: The directories a temporary file may live in, as this platform spells
+#: them.
+#:
+#: ``tempfile.gettempdir()`` alone is not enough: it answers with
+#: ``$TMPDIR`` when the environment carries one and with ``/tmp`` when it
+#: does not -- and a caller that hands a child a **whitelist**
+#: environment drops ``$TMPDIR`` on the way.  The child then believes
+#: the temporary directory is ``/tmp`` while the directory it was given
+#: lives under the platform's per-user temporary area (``/var/folders``
+#: on macOS).  Listing the spellings asks the question of the machine
+#: rather than of one process' environment.
+_TEMP_DIR_CANDIDATES = ("/tmp", "/var/tmp", "/usr/tmp", "/var/folders")
+
+
+def _temp_roots() -> List[Path]:
+    """Every directory this machine keeps its temporary files in.
+
+    The environment's own answers first (``TMPDIR`` and its two
+    aliases), then what :func:`tempfile.gettempdir` believes, then the
+    platform's fixed spellings.  Each one is resolved, because the two
+    spellings of one directory are not the same string everywhere: on
+    macOS ``/var`` is a symlink into ``/private/var``.
+    """
+    roots: List[Path] = []
+    for name in ("TMPDIR", "TEMP", "TMP"):
+        value = os.environ.get(name)
+        if value:
+            roots.append(Path(value))
+    try:
+        roots.append(Path(tempfile.gettempdir()))
+    except OSError:  # pragma: no cover - no temporary directory at all
+        pass
+    roots.extend(Path(name) for name in _TEMP_DIR_CANDIDATES)
+    resolved: List[Path] = []
+    for root in roots:
+        try:
+            resolved.append(root.resolve())
+        except OSError:  # pragma: no cover - an unresolvable root is no root
+            continue
+    return resolved
+
+
+def _plans_root_is_scratch(plans_dir: Optional[Path]) -> bool:
+    """Whether *plans_dir* is a scratch directory rather than a deployment's.
+
+    A scratch root is one that lives inside the system's temporary
+    directory: a test harness's copy of the plans tree, a one-off
+    reproducer's working directory, a scratch directory a caller made
+    for one run.  Nothing there is worth keeping, and — the part that
+    matters here — nothing there is worth *installing* on the machine.
+
+    A path that cannot be resolved is not scratch: the question is
+    "may this instance act", and an unanswerable question is not a
+    permission.  The same goes for a root nobody named at all.
+    """
+    if plans_dir is None:
+        return False
+    try:
+        resolved = Path(plans_dir).resolve()
+    except OSError:  # pragma: no cover - an unresolvable path is not scratch
+        return False
+    for root in _temp_roots():
+        if resolved == root or root in resolved.parents:
+            return True
+    return False
+
+
 def _orphan_reaper_may_act() -> bool:
     """Whether this process may let the reaper act on the machine.
 
@@ -1629,7 +1715,7 @@ def _install_orphan_reaper_marks() -> Optional[Dict[str, str]]:
 ORPHAN_REAPER_SCAN_START_GRACE_SECONDS = 1.0
 
 
-def _start_orphan_reaper() -> Optional[int]:
+def _start_orphan_reaper() -> Optional[threading.Thread]:
     """Scan once for orphans, then make sure the resident reaper is running.
 
     Two halves, each with a different job:
@@ -1654,6 +1740,33 @@ def _start_orphan_reaper() -> Optional[int]:
     returns.
 
     A reaper that is switched off does nothing at all.
+
+    A **scratch instance** does nothing at all either, and for a
+    different reason: both halves are machine-wide, and an instance
+    that was started for one scratch run has no business running them.
+    The scan reads every process on the box and the answer it produces
+    ("what did the *machine's* PDT leave behind?") is not a scratch
+    instance's question; the daemon is a detached process that outlives
+    the instance, keeps a core busy for as long as it lives and is
+    reclaimed by nobody.  The reaper's own configuration says which
+    root it would work under, and a root inside the temporary
+    directory is a scratch root -- the plans of a run that is over.
+
+    The two halves run on **a thread of their own**, for the same
+    reason the two boot sweeps run on one: the scan reads every process
+    on the machine and asks each of them who spawned it, which took
+    **36 s** here — measured, with the scan doing nothing but reading.
+    uvicorn binds the socket only after the lifespan returns, so a scan
+    on the readiness path is a port that stays closed for 36 s: the API
+    answers nothing for all of it, and every caller that waits for the
+    port times out on a machine that is merely busy.
+
+    The scan is housekeeping — it reclaims what a previous life of this
+    backend left behind, and the daemon reclaims the same leftovers
+    again 30 s later — so nothing that serves an API waits for it.  The
+    thread is returned so that the caller can join it: a test that
+    leaves a machine-wide scan running behind it leaves a process of
+    this machine reading every process of this machine.
     """
     if orphan_reaper is None:
         logger.warning("[orphan_reaper] unavailable; the startup scan is skipped")
@@ -1672,7 +1785,46 @@ def _start_orphan_reaper() -> Optional[int]:
     if not getattr(config, "enabled", True):
         return None
 
-    _start_orphan_reaper_scan(config)
+    plans_root = getattr(config, "plans_root", None)
+    if _plans_root_is_scratch(plans_root):
+        logger.info(
+            "[orphan_reaper] the plans root %s is a scratch directory; "
+            "no scan and no resident daemon are installed for it",
+            plans_root,
+        )
+        return None
+
+    thread = threading.Thread(
+        target=_run_orphan_reaper_startup,
+        args=(config,),
+        name="orphan_reaper_startup",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def _run_orphan_reaper_startup(config: Any) -> None:
+    """The scan, then the daemon — on the thread that was started for them.
+
+    The order is the one the backend has always used: the scan
+    reclaims what is already there, and the daemon takes over from
+    there.  A scan that raises costs the scan and nothing else — the
+    daemon is still started, because the daemon is the part that keeps
+    working after this backend is gone.
+
+    The scan itself runs on a thread of its own — see
+    :func:`_start_orphan_reaper_scan` — and this thread waits only long
+    enough for that scan to have *begun*
+    (:data:`ORPHAN_REAPER_SCAN_START_GRACE_SECONDS`) before it waits for
+    the scan to be *over*.  The daemon therefore takes over from a scan
+    that has finished, and the thread that is handed to the caller does
+    not leave a machine-wide scan running behind it: a test that leaves
+    one running behind it leaves a process of this machine reading every
+    process of this machine.
+    """
+    scan_thread = _start_orphan_reaper_scan(config)
+    scan_thread.join()
 
     try:
         # The daemon is *asked* to be exempted from the owner rule: it
@@ -1693,7 +1845,196 @@ def _start_orphan_reaper() -> Optional[int]:
             "[orphan_reaper] could not start the daemon; continuing",
             exc_info=True,
         )
+
+
+def _install_lazy_feishu_sdk() -> None:
+    """Put a cheap stand-in for the Feishu SDK in ``sys.modules``.
+
+    The SDK is a package of roughly ten thousand modules, and
+    importing it takes tens of seconds on a loaded machine.  The
+    client imports it *before* it looks at the credentials, so a
+    deployment with no Feishu configured pays that price for a
+    channel it will never push to -- and the backend's readiness is
+    measured against it.
+
+    The stand-in answers attribute reads from the real package and
+    loads it on the first read.  A client that finds no credentials
+    never reads an attribute, so the real package is never imported
+    at all; a client that does build a client pays the import once,
+    where it belongs.
+
+    The stdlib's own lazy loader is not used here: it loads on
+    *any* attribute read, and the import machinery reads
+    ``__path__`` on every module it touches -- which would load the
+    package on the very import this stand-in exists to make cheap.
+    """
+    if "lark_oapi" in sys.modules:
+        return
+
+    try:
+        spec = importlib.util.find_spec("lark_oapi")
+    except (ImportError, ValueError):
+        return
+    if spec is None or spec.loader is None:
+        # Not installed.  The client says so itself, and says it
+        # better than this function could.
+        return
+
+    loaded: Dict[str, Any] = {}
+    load_lock = threading.Lock()
+
+    def _load() -> Any:
+        """Import the real package, once."""
+        with load_lock:
+            if "module" not in loaded:
+                # The stand-in steps aside for the real import, so the
+                # import machinery does exactly what it would have done
+                # without us -- and ``sys.modules`` ends up holding the
+                # real package for everyone who imports it afterwards.
+                sys.modules.pop("lark_oapi", None)
+                import lark_oapi as real
+
+                loaded["module"] = real
+            return loaded["module"]
+
+    def _stand_in_getattr(name: str) -> Any:
+        if name.startswith("__") and name not in ("__all__", "__version__"):
+            # A dunder read must not load the package: the import
+            # machinery probes attributes like ``__path__`` on every
+            # module it touches, and a load there would defeat the
+            # point of the stand-in.  The attributes it probes are all
+            # on the stand-in already; this is the belt to that
+            # braces.
+            raise AttributeError(name)
+        return getattr(_load(), name)
+
+    stand_in = types.ModuleType("lark_oapi")
+    stand_in.__getattr__ = _stand_in_getattr  # type: ignore[attr-defined]
+    # The stand-in is a package and says so: the import machinery
+    # asks for ``__path__`` to decide whether it may look for
+    # submodules, and the answer has to come without loading
+    # anything.
+    stand_in.__path__ = list(spec.submodule_search_locations or [])  # type: ignore[attr-defined]
+    stand_in.__file__ = spec.origin  # type: ignore[attr-defined]
+    stand_in.__spec__ = spec  # type: ignore[attr-defined]
+    sys.modules["lark_oapi"] = stand_in
+
+
+def _install_lazy_httpx() -> Optional[types.ModuleType]:
+    """Put a cheap stand-in for ``httpx`` in ``sys.modules``.
+
+    The notification client imports ``httpx`` at module level, and the
+    notifier is imported *inside* the lifespan -- which is on the
+    readiness path, because uvicorn binds the socket only after the
+    lifespan returns.  So the library is imported on the very path
+    whose length decides whether this instance answers at all, and it
+    costs seconds of it on a loaded machine.
+
+    The stand-in answers an attribute read by loading the real library
+    and handing the attribute over.  A client that never pushes
+    anything never reads an attribute, so the real library is never
+    imported at all; a client that does push pays the import once,
+    where it belongs.
+
+    The same shape as :func:`_install_lazy_feishu_sdk`, and for the
+    same reason: the stdlib's own lazy loader loads on *any*
+    attribute read, and the import machinery reads ``__path__`` on
+    every module it touches -- which would load the library on the
+    very import this stand-in exists to make cheap.
+
+    Returns the stand-in, or ``None`` when there is nothing to defer:
+    the library is already imported, or it is not installed at all.
+    """
+    if "httpx" in sys.modules:
         return None
+
+    try:
+        spec = importlib.util.find_spec("httpx")
+    except (ImportError, ValueError):
+        return None
+    if spec is None or spec.loader is None:
+        # Not installed.  The client says so itself, and says it
+        # better than this function could.
+        return None
+
+    loaded: Dict[str, Any] = {}
+    load_lock = threading.Lock()
+
+    def _load() -> Any:
+        """Import the real library, once."""
+        with load_lock:
+            if "module" not in loaded:
+                # The stand-in steps aside for the real import, so the
+                # import machinery does exactly what it would have done
+                # without us -- and ``sys.modules`` ends up holding the
+                # real library for everyone who imports it afterwards.
+                #
+                # The import is a plain statement, the same shape as the
+                # Feishu SDK's stand-in above: an import target written
+                # out as a string is a path, and the gate in
+                # ``tests/static_gates/test_no_module_path_outside_the_repo.py``
+                # is right that a hand-written one is an execution slot.
+                # The library here is a declared dependency of this
+                # package, so the import machinery resolves it exactly
+                # the way every other import of it does.
+                sys.modules.pop("httpx", None)
+                import httpx as real
+
+                loaded["module"] = real
+            return loaded["module"]
+
+    def _stand_in_getattr(name: str) -> Any:
+        if name.startswith("__") and name not in ("__all__", "__version__"):
+            # A dunder read must not load the library: the import
+            # machinery probes attributes like ``__path__`` on every
+            # module it touches, and a load there would defeat the
+            # point of the stand-in.
+            raise AttributeError(name)
+        return getattr(_load(), name)
+
+    stand_in = types.ModuleType("httpx")
+    stand_in.__getattr__ = _stand_in_getattr  # type: ignore[attr-defined]
+    # The stand-in is a package and says so: the import machinery
+    # asks for ``__path__`` to decide whether it may look for
+    # submodules, and the answer has to come without loading
+    # anything.
+    stand_in.__path__ = list(spec.submodule_search_locations or [])  # type: ignore[attr-defined]
+    stand_in.__file__ = spec.origin  # type: ignore[attr-defined]
+    stand_in.__spec__ = spec  # type: ignore[attr-defined]
+    # How a reader tells the stand-in from the real thing.
+    stand_in.__dict__["__pdt_deferred__"] = "httpx"
+    sys.modules["httpx"] = stand_in
+    return stand_in
+
+
+def _feishu_transport_is_configured() -> bool:
+    """Whether the Feishu transport has what it needs to push a card.
+
+    The client asks for exactly two things: an app id (an index, so
+    it comes from the environment) and an app secret (a secret, so it
+    comes from the provider).  This asks the same question *without*
+    building the client -- and building the client is the expensive
+    part, because it imports the SDK.
+
+    The answer decides *how* the notifier is started, not whether it
+    runs: an unconfigured transport is started inline (it fails in
+    milliseconds and records why), a configured one is started on its
+    own thread (building its client imports the SDK, and that import
+    takes tens of seconds).
+    """
+    if not os.environ.get("FEISHU_APP_ID", "").strip():
+        return False
+    try:
+        import credentials
+
+        return bool(credentials.read_secret("feishu_app_secret"))
+    except Exception:
+        logger.warning(
+            "[feishu_notifier] the Feishu credentials could not be "
+            "read; the transport is treated as unconfigured",
+            exc_info=True,
+        )
+        return False
 
 
 def _start_orphan_reaper_scan(config) -> threading.Thread:
@@ -1846,7 +2187,14 @@ def _start_orphan_reaper_reensure() -> Optional[threading.Event]:
     * this process is a test process (``_orphan_reaper_may_act``),
       and the suite must never reap the developer's own processes;
     * the reaper is switched off (``PDT_ORPHAN_REAPER=0``, or any other
-      way of turning ``config.enabled`` off).
+      way of turning ``config.enabled`` off);
+    * the plans root is a **scratch** directory -- the same refusal the
+      boot's own scan makes, for the same reason.  The daemon is a
+      detached process that outlives this one and reads every process
+      on the machine every 30 s; an instance that was started for one
+      scratch run has no business installing one, and the promise the
+      boot makes ("no scan and no resident daemon are installed for
+      it") has to be kept by both halves.
 
     A thread that is already asking keeps asking: the ask is
     idempotent, but two threads asking every five minutes is twice the
@@ -1880,6 +2228,15 @@ def _start_orphan_reaper_reensure() -> Optional[threading.Event]:
         return None
 
     if not getattr(config, "enabled", True):
+        return None
+
+    plans_root = getattr(config, "plans_root", None)
+    if _plans_root_is_scratch(plans_root):
+        logger.info(
+            "[orphan_reaper] the plans root %s is a scratch directory; "
+            "the daemon is not re-ensured for it",
+            plans_root,
+        )
         return None
 
     stop = threading.Event()
@@ -2124,6 +2481,17 @@ class _FeishuNotifierHandle:
 FEISHU_NOTIFIER_JOIN_SECONDS = 60.0
 
 
+#: How long the boot waits for the notifier *object*.
+#:
+#: The object is what the application state carries, so a ready server
+#: can answer "is the notification channel on?" — and making it is
+#: cheap, because the SDK is imported by ``start()`` and not by the
+#: constructor.  The *client* — the part that takes tens of seconds — is
+#: never waited for.  The wait is bounded all the same: a notifier that
+#: is slow to make delays the boot by this budget and by no more.
+FEISHU_NOTIFIER_CONSTRUCT_TIMEOUT = 0.2
+
+
 def _start_feishu_notifier(app) -> _FeishuNotifierHandle:
     """Start the Feishu notifier on a thread of its own and return its handle.
 
@@ -2136,14 +2504,40 @@ def _start_feishu_notifier(app) -> _FeishuNotifierHandle:
 
     So the notifier is built on a thread of its own: ``app.state`` says
     ``None`` until it is up, and the boot does not wait for it.
+
+    What the boot *does* wait for is the notifier **object** — briefly,
+    and never for more than :data:`FEISHU_NOTIFIER_CONSTRUCT_TIMEOUT`.
+    The object is what the state carries, so a server that is ready can
+    answer questions about the notification channel; and the object is
+    cheap, because the SDK is imported by ``start()`` and not by the
+    constructor.
+
+    The thread is returned with the handle so that the shutdown can
+    wait for it: a notifier that comes up after the server is gone
+    would leave a worker thread behind.
     """
     handle = _FeishuNotifierHandle()
+    constructed = threading.Event()
 
     def _start() -> None:
         try:
+            # The notifier's HTTP library and the Feishu SDK are both
+            # deferred: a client that never pushes a card never reads an
+            # attribute of either, so neither of them is really
+            # imported.  The stand-ins are installed here, on the
+            # notifier's own thread, so the readiness path pays for
+            # neither of them.
+            _install_lazy_httpx()
+            _install_lazy_feishu_sdk()
+
             from notifications.feishu_notifier import FeishuNotifier
 
             notifier = FeishuNotifier()
+            # What the operator asks first is "is this channel on?".
+            # The answer is cheap — the credentials are read without
+            # building a client — and it is read here, on the notifier's
+            # own thread, so it costs the readiness path nothing.
+            configured = _feishu_transport_is_configured()
             with handle.lock:
                 if handle.stopping.is_set():
                     logger.warning(
@@ -2152,27 +2546,38 @@ def _start_feishu_notifier(app) -> _FeishuNotifierHandle:
                         "started"
                     )
                     return
-                notifier.start()
                 # The handle keeps the notifier it started: the shutdown
                 # stops *this* notifier, not whichever one the shared
                 # application state happens to carry.
                 handle.notifier = notifier
                 app.state.feishu_notifier = notifier
-                # 2026-09-11 plan v4: explicit warning so operators can
-                # see the per-plan rate limit (60s / card, independent
-                # across plans — different plans do NOT throttle each
-                # other). The FeishuNotifier .start() already logs
-                # "started (coalesce=..., min_interval=...)" — this line
-                # repeats the value with the v4 semantics for quick
-                # eyeball verification.  It is logged under the lock so
-                # that a failure here cannot leave a started notifier
-                # outside the handle's knowledge.
-                logger.warning(
-                    "[feishu_notifier] configured: min_interval=%.1fs "
-                    "(per-plan, independent across plans; "
-                    "1 push per card per N seconds)",
-                    notifier._min_interval_seconds,
-                )
+                # The object is published: a server that is ready can
+                # already answer questions about the channel.  The
+                # *starting* of the notifier is what takes the time, and
+                # that happens below, on this thread.
+                constructed.set()
+                if configured:
+                    # 2026-09-11 plan v4: explicit warning so operators can
+                    # see the per-plan rate limit (60s / card, independent
+                    # across plans — different plans do NOT throttle each
+                    # other). The FeishuNotifier .start() already logs
+                    # "started (coalesce=..., min_interval=...)" — this line
+                    # repeats the value with the v4 semantics for quick
+                    # eyeball verification.  It is logged under the lock so
+                    # that a failure here cannot leave a started notifier
+                    # outside the handle's knowledge.
+                    logger.warning(
+                        "[feishu_notifier] configured: min_interval=%.1fs "
+                        "(per-plan, independent across plans; "
+                        "1 push per card per N seconds)",
+                        notifier._min_interval_seconds,
+                    )
+                else:
+                    logger.warning(
+                        "[feishu_notifier] the transport is not configured; "
+                        "the notifier stays disabled and says why"
+                    )
+                notifier.start()
         except Exception:
             logger.exception(
                 "[feishu_notifier] failed to start; continuing without push"
@@ -2181,6 +2586,10 @@ def _start_feishu_notifier(app) -> _FeishuNotifierHandle:
             # published before the failure is this handle's, and the
             # shutdown stops it; one that was never published left the
             # state alone already.
+        finally:
+            # The boot waits for this: a notifier that failed to be made
+            # must not hold the boot for the whole budget.
+            constructed.set()
 
     # The state says "no notifier" until one is up.  A notifier that is
     # already published is *not* taken down here: this handle owns the
@@ -2191,21 +2600,41 @@ def _start_feishu_notifier(app) -> _FeishuNotifierHandle:
 
     thread = threading.Thread(
         target=_start,
-        name="feishu-notifier",
+        # Not "feishu-notifier": that is the name the notifier gives
+        # its own worker, and two threads with one name in a thread
+        # dump are two threads nobody can tell apart.
+        name="feishu-notifier-start",
         daemon=True,
     )
     handle.thread = thread
     thread.start()
+
+    # The notifier *object* is cheap to make; the client is not.  So the
+    # boot waits for the object, briefly, and never for the client.
+    constructed.wait(timeout=FEISHU_NOTIFIER_CONSTRUCT_TIMEOUT)
     return handle
 
 
-def _stop_feishu_notifier(app, handle: Optional[_FeishuNotifierHandle]) -> None:
+def _stop_feishu_notifier(
+    app,
+    handle: Optional[_FeishuNotifierHandle],
+    *,
+    keep_published: bool = False,
+) -> None:
     """Stop the Feishu notifier, if it ever came up.
 
     The notifier is built on its own thread, so the shutdown can run
     while it is still importing the SDK.  Stopping a notifier that is
     not there must not raise, and a notifier that comes up after the
     shutdown must not be started at all.
+
+    ``keep_published`` leaves the stopped notifier on the application
+    state.  The lifespan's shutdown asks for it, because the app is
+    going away: the state dies with it, and the notifier it carries is
+    the record of what the notification channel was — a reader that
+    asks after the shutdown gets that record instead of a hole.  Every
+    other caller leaves it off, because an app that is still serving
+    must never advertise a notifier it has already stopped.
     """
     if handle is None:
         return
@@ -2238,9 +2667,13 @@ def _stop_feishu_notifier(app, handle: Optional[_FeishuNotifierHandle]) -> None:
         logger.exception("[feishu_notifier] error on shutdown")
     finally:
         # The publication is only taken down when it still carries *this*
-        # notifier: another lifespan may have published its own.
+        # notifier: another lifespan may have published its own.  It is
+        # taken down at all only when the app is still serving — see
+        # ``keep_published``.
         with handle.lock:
-            if getattr(app.state, "feishu_notifier", None) is notifier:
+            if not keep_published and getattr(
+                app.state, "feishu_notifier", None
+            ) is notifier:
                 app.state.feishu_notifier = None
 
 
@@ -2394,7 +2827,10 @@ async def _lifespan(app):
     # layers running at the same time cannot make either of them kill
     # the same process twice.
     if _orphan_reaper_may_act():
-        _start_orphan_reaper()
+        # The scan is machine-wide and it is not on the readiness path:
+        # the thread is published so that whoever started it can join
+        # it, and the boot carries on without waiting for it.
+        app.state.orphan_reaper_startup = _start_orphan_reaper()
 
     # 2026-10-31: the periodic re-ensure.
     #
@@ -2502,6 +2938,15 @@ async def _lifespan(app):
     # not answering.  A broken Feishu configuration (missing creds,
     # missing lark-oapi) can still NEVER prevent the server from
     # accepting requests: it cannot even keep the boot waiting.
+    #
+    # The notifier never decides when this instance becomes ready: the
+    # slow part of it — building the client, which imports the SDK —
+    # runs on its own thread, and the unconfigured case fails in
+    # milliseconds.  A broken Feishu configuration still can NEVER
+    # prevent the server from accepting requests — that is what the
+    # try/except inside the helper says, and the thread is what makes
+    # it true of the *latency* as well as of the exception.  See
+    # ``_start_feishu_notifier``.
     feishu_notifier_handle = _start_feishu_notifier(app)
 
     # 2026-10-28: the PDT-native scheduler (architecture decision
@@ -2560,7 +3005,28 @@ async def _lifespan(app):
         # asking about the daemon in a world that is being taken apart.
         _stop_orphan_reaper_reensure()
         heartbeat_monitor.stop()
-        _stop_feishu_notifier(app, feishu_notifier_handle)
+        # The notifier is told first that the app is going away: a
+        # notifier that is still being built must not start a worker
+        # for a backend that no longer exists.  The helper does that,
+        # and it waits for the thread that is building the notifier
+        # *before* it stops the notifier: a thread that is still
+        # building the notifier would otherwise start a worker for a
+        # backend that no longer exists.  A thread that outlives the
+        # wait is a daemon and cannot keep the process alive.
+        #
+        # The notifier that is stopped is the one this lifespan
+        # started -- not the one on ``app.state``, which is only the
+        # latest when an app is booted more than once.
+        #
+        # The publication is *kept*: the app is going away, so the
+        # state it carries is no longer a statement about a live
+        # server, and the notifier on it is the record of what the
+        # notification channel was.  An app that is still serving must
+        # not advertise a notifier it has already stopped; this app is
+        # not serving any more.
+        _stop_feishu_notifier(
+            app, feishu_notifier_handle, keep_published=True
+        )
         _shutdown_all_executions()
         # 2026-11-04: the app is down, so this process is no longer the
         # backend.  The sweep above was the shutdown sweep; the atexit

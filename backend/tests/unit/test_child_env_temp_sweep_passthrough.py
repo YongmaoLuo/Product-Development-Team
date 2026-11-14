@@ -24,19 +24,58 @@ What is pinned here
 * the value the parent already holds is passed through **unchanged** —
   including ``"0"``, which means "do sweep".  The child is entitled to
   disagree with the default, and a hard-coded ``"1"`` would take that
-  decision away from whoever set it.
+  decision away from whoever set it;
+* the environment **production** hands to a spawned service carries the
+  provider mode, and the mode is ``inherit`` — see the section below.
 
 The other spawn sites do not need a rule of their own:
 ``test_server_signal_lifecycle.py`` copies ``os.environ`` wholesale (so
 it inherits the key by construction), and the FakeProcess-based tests
 never start a process at all.
+
+The provider mode a spawned service is started in
+--------------------------------------------------
+The third rule is about the **provider mode**, and it belongs to the
+same builder: the environment a service child is started with is
+``service_manager._child_env``, and production's own builder has the
+last word on it (the manual spawn harness calls that builder instead of
+keeping a copy of it — a copy is a second shape, and the second shape
+drifts).
+
+The mode names the CC Switch instance on *this* box.  A service started
+on a box without that instance dies on the way up:
+``server.load_providers`` asks CC Switch for the provider chain, gets
+``api_unreachable``, and the startup aborts — that contract is explicit:
+there is no silent YAML fallback and no second source to answer
+instead.  The child then never listens, and the manager waits out its
+whole readiness budget before it can say so.
+
+So the spawned child is started in ``inherit`` mode, and it is started
+there **explicitly**: "unset" is not the same answer — unset means "ask
+the machine", and the machine may not have a CC Switch at all.  Every
+other spawn site in this repo already says ``inherit`` explicitly for
+exactly this reason; the production spawn path was the one that did not,
+and it is the one that decides whether a verification round can start a
+server at all.
+
+A declaration that does want a fleet says so in its own start command
+(``export PDT_PROVIDER_MODE=cc-switch``): the variable is set before the
+command runs, so the command's own export wins.
 """
 
 from __future__ import annotations
 
+import socket
+import sys
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict
 
+_BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_DIR))
+
+import service_manager as sm  # noqa: E402
+from service_declaration import ServiceDeclaration  # noqa: E402
 from tests.api.test_vp_bucket_progress_e2e import _child_env as bucket_child_env
 from tests.integration.test_verification_progress_live import _child_env
 from tests.test_server_json_cleanup import _child_env as cleanup_child_env
@@ -44,6 +83,13 @@ from tests.test_server_json_cleanup import _child_env as cleanup_child_env
 #: The key ``utils.secret_sweep`` reads (``secret_sweep.DISABLE_ENV``).
 #: A non-empty value makes ``sweep_default_roots`` a no-op.
 SWEEP_KEY = "PDT_DISABLE_TEMP_SWEEP"
+
+#: The variable that pins the provider mode; see
+#: ``coding_tool._detect_inherit_mode`` for what the two modes mean.
+PROVIDER_MODE_KEY = "PDT_PROVIDER_MODE"
+
+#: The mode a spawned service is started in.
+INHERIT_MODE = "inherit"
 
 
 def _plans_root(tmp_path: Path) -> Path:
@@ -125,3 +171,84 @@ def test_explicit_value_is_passed_through(tmp_path, monkeypatch):
                 name, SWEEP_KEY, "0", env.get(SWEEP_KEY)
             )
         )
+
+
+# ---------------------------------------------------------------------------
+# The provider mode a spawned service is started in
+# ---------------------------------------------------------------------------
+
+
+def _free_port() -> int:
+    """A port nothing is listening on."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+class _FakeProc:
+    """A child that was never really started.
+
+    ``start_service`` polls the process once after the readiness wait;
+    a child that is still running is the boring case, and what this pin
+    is about is the environment, not the readiness verdict.
+    """
+
+    pid = 999999
+
+    def poll(self) -> None:
+        return None
+
+
+def _spawned_environment(monkeypatch, tmp_path) -> Dict[str, str]:
+    """The environment production hands to a spawned service.
+
+    ``Popen`` is replaced, so nothing is really started, and the
+    readiness probe is stubbed so it does not decide the outcome.
+    """
+    captured: Dict[str, Any] = {}
+
+    def _fake_popen(argv, **kwargs):
+        captured["env"] = dict(kwargs.get("env") or {})
+        return _FakeProc()
+
+    monkeypatch.setattr(sm.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(sm, "wait_until_ready", lambda decl, t=None: True)
+    # The child never existed, so there is nothing to wait for.
+    monkeypatch.setattr(
+        sm, "_await_exit", lambda proc, timeout=2.0: (False, None)
+    )
+
+    decl = ServiceDeclaration(
+        name="child-env",
+        port=_free_port(),
+        start_cmd="npx next dev -p 3000",
+        cwd=".",
+    )
+    sm.start_service(decl, tmp_path)
+    assert captured.get("env"), "the service was never started"
+    return captured["env"]
+
+
+def test_a_spawned_service_is_started_in_inherit_mode(tmp_path, monkeypatch):
+    """The spawned child's own provider mode is ``inherit``.
+
+    The manager's mode is a statement about the **manager's** machine:
+    it names the CC Switch instance the manager itself answers to.  A
+    service is not the manager, and it is started on a box that may not
+    have that instance at all -- where ``server.load_providers`` aborts
+    the startup on ``api_unreachable`` and the child never listens.
+
+    So the child is told to inherit, explicitly: "unset" would mean
+    "ask the machine", and the machine here may not have a CC Switch.
+    """
+    monkeypatch.setenv(PROVIDER_MODE_KEY, "cc-switch")
+
+    env = _spawned_environment(monkeypatch, tmp_path)
+
+    assert env.get(PROVIDER_MODE_KEY) == INHERIT_MODE, (
+        "the spawned service was handed the manager's provider mode "
+        "({0!r}); a service is not the manager, and the manager's "
+        "provider routing is not an answer for it".format(
+            env.get(PROVIDER_MODE_KEY)
+        )
+    )

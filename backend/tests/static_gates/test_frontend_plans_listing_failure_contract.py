@@ -41,6 +41,10 @@ The rule
 * ``loadSidebar()`` does not fall back to 「暂无计划」 after a failed
   read: it paints the failure too.  The sidebar's empty state is a
   statement about a read that *succeeded* and found nothing.
+* The sidebar's empty state says both halves — 「暂无计划」 and
+  「点击 + 新建」 — and it has exactly one renderer.  The failure
+  branch does not reuse that renderer: a refused read and an empty
+  plan tree must not look alike.
 * Every fire-and-forget load of the plans listing / sidebar / scheduler
   state carries a rejection handler: the call is either awaited or
   wrapped by the background loader.  A rejected promise nobody holds is
@@ -77,6 +81,17 @@ _BACKGROUND_LOADER = "loadInBackground"
 
 #: An error renderer: ``renderPlansError``, ``renderSidebarError``, …
 _ERROR_RENDERER = re.compile(r"\brender[A-Za-z]*Error\s*\(")
+
+#: The two halves of the sidebar's empty state.  The first says there
+#: is nothing to work on; the second says what the operator can do
+#: about it.  Both belong on the screen — an acceptance round that
+#: looks for one half and does not find it is a miss.
+_EMPTY_STATE_WORDS = ("暂无计划", "点击 + 新建")
+
+#: The container the sidebar is drawn into.  It is what distinguishes
+#: the sidebar's empty state from the plans view's own empty state,
+#: which carries the same 「暂无计划」 and a different call to action.
+_SIDEBAR_CONTAINER = "#sidebar-plans"
 
 
 def _source(path: Path) -> str:
@@ -270,6 +285,78 @@ def test_the_sidebar_does_not_paint_an_empty_list_after_a_failed_read() -> None:
         assert _ERROR_RENDERER.search(block), (
             "loadSidebar()'s catch paints nothing: the refusal leaves "
             "no trace on the screen."
+        )
+
+
+def test_a_successful_empty_read_paints_the_sidebar_empty_state() -> None:
+    """An empty plan tree must say 「暂无计划」 and 「点击 + 新建」.
+
+    The counterpart of the case above.  That one says the sidebar must
+    not claim an empty list after a *failed* read; this one says what
+    the sidebar says after a read that *succeeded* and found nothing —
+    and that the failure branch does not reuse the renderer that says
+    it.
+
+    Both halves of the empty state belong on the screen: 「暂无计划」
+    says there is nothing to work on, 「点击 + 新建」 says what to do
+    about it.  An acceptance round that looks for the first half and
+    does not find the second half is a miss, so the pair is pinned here
+    rather than left to whatever the page happens to render.
+
+    The empty state has exactly one home.  Two renderers painting it
+    would mean two answers to "what does an empty sidebar look like",
+    and one of them would eventually be the failure branch wearing the
+    success branch's clothes — the exact lie the case above forbids.
+    """
+    source = _source(_APP_JS)
+
+    empties = [
+        name
+        for name in _function_names(source)
+        if _SIDEBAR_CONTAINER in _function_body(source, name)
+        and "暂无计划" in _function_body(source, name)
+    ]
+    assert len(empties) == 1, (
+        "expected exactly one renderer that paints the sidebar's empty "
+        f"state, found {empties}. Two answers to 'what does an empty "
+        "sidebar look like' means one of them can drift into the "
+        "failure branch; a rename has to update this gate with it."
+    )
+
+    empty_body = _function_body(source, empties[0])
+    for word in _EMPTY_STATE_WORDS:
+        assert word in empty_body, (
+            f"the sidebar's empty state no longer says {word!r}. Both "
+            "halves are on the screen: 「暂无计划」 says there is nothing "
+            "to work on, 「点击 + 新建」 says what to do about it."
+        )
+
+    failures = [
+        name
+        for name in _function_names(source)
+        if re.fullmatch(r"render[A-Za-z]*Error", name)
+        and _SIDEBAR_CONTAINER in _function_body(source, name)
+    ]
+    assert failures, (
+        "no error renderer writes into the sidebar: the refusal has "
+        "nowhere to be shown, and the empty state is left to stand in "
+        "for it."
+    )
+    for name in failures:
+        failure_body = _function_body(source, name)
+        for word in _EMPTY_STATE_WORDS:
+            assert word not in failure_body, (
+                f"{name}() paints the empty state's words ({word!r}). A "
+                "refused read must not look like 'there are no plans'."
+            )
+
+    for block in _catch_blocks(_function_body(source, "loadSidebar")):
+        assert not re.search(
+            r"(?<![\w.$])" + re.escape(empties[0]) + r"\s*\(", block
+        ), (
+            f"loadSidebar()'s catch calls {empties[0]}() — the renderer "
+            "that paints the empty state. The failure branch must not "
+            "reuse the success branch's renderer."
         )
 
 
