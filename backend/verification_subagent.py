@@ -72,6 +72,9 @@ from verification_evidence import CHECKPOINTS_FILENAME
 # 前缀由 :mod:`verification_buckets` 统一给出，四个 BLOCKED 产出点共用同一份。
 from verification_buckets import blocked_reason
 from config_paths import resolve_plans_dir
+# 2026-10-31（计划日志有界轮转）：attempt 日志走有界追加，写入方不再
+# 裸 ``open(..., "a")`` —— 一个只涨不落的文件是没有上限的文件。
+from bounded_log import append_bounded_line
 # 2026-10-27（归因绑定点 · 验证点侧）：台账认 ``vp_id`` / ``round`` 两个
 # 归因坐标（``usage_registry``）。子 agent 是**验证会话的发起者** —— 它
 # 知道这次会话属于哪条验证点，所以验证点号由它绑。
@@ -3755,6 +3758,11 @@ class VerificationSubAgent:
         every operation is wrapped in a broad try/except. The file
         format is JSON-lines (one object per line), matching the
         convention used by ``plans/{plan_id}/execution.log``.
+
+        The write goes through :func:`bounded_log.append_bounded_line`,
+        so the attempt log is bounded: it records every heartbeat of
+        every attempt, and a file that only grows is a file with no
+        ceiling.
         """
         if log_path is None:
             return
@@ -3765,8 +3773,10 @@ class VerificationSubAgent:
                 "event": event,
                 "data": data,
             }
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            append_bounded_line(
+                log_path,
+                json.dumps(entry, ensure_ascii=False) + "\n",
+            )
         except Exception:
             # Never let logging failures propagate.
             pass

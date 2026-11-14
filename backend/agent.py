@@ -11,6 +11,7 @@ import subprocess
 import sys
 import re
 import json
+import math
 import time
 import threading
 import logging
@@ -52,6 +53,15 @@ from capacity_wait import (
     capacity_wait_poll_sec,
 )
 from bounded_subprocess import run_bounded
+# 2026-10-31 — the zero-progress guard.  A leaf module (stdlib only):
+# it counts the dispatch layers that changed nothing and knows when to
+# stop.  Importing it here carries no cycle risk — it does not import
+# this module.
+from progress_guard import (
+    ZERO_PROGRESS_STOP_REASON,
+    ZeroProgressGuard,
+    task_progress_snapshot,
+)
 from usage_registry import plan_usage_context
 from task_manager import TaskManager, CycleInTaskGraph
 from executor import Executor
@@ -965,6 +975,49 @@ REPAIR_MAX_BREAKDOWN_DEPTH = 2
 # always be satisfied by restructuring a little more, so only a count
 # bounds how far a single run may go.
 EXECUTOR_MAX_REFINEMENTS = 8
+
+# ---------------------------------------------------------------------------
+# Dispatch-phase failure budget (2026-10-31)
+# ---------------------------------------------------------------------------
+#
+# The accident: ``_pre_task_lock_hook`` runs INSIDE
+# ``_run_task_with_provider_slot`` but OUTSIDE
+# ``_execute_task_with_retry`` — and the executor is the only place that
+# records a task verdict.  A task whose ``files_to_modify`` names a
+# directory makes the hook raise; the raise unwound past the executor,
+# so the task stayed ``pending`` and the outer dispatcher re-picked it
+# forever.  Measured: 13.5 hours, ZERO LLM calls, no convergence.
+#
+# The fix is a bounded retry around the dispatch phase, and — the part
+# that actually stops the loop — a TERMINAL verdict when the budget runs
+# out.  A task that cannot be dispatched is a FAILED task, not a task
+# that gets another turn.
+#
+# Two attempts, not one: the first failure may be a transient lock
+# contention (another process held the file), and a transient failure
+# that permanently fails a task is its own kind of wrong verdict.  Two
+# is enough to absorb one transient and still terminate promptly.
+DEFAULT_DISPATCH_MAX_ATTEMPTS = 2
+
+#: Seconds to wait between two dispatch attempts.  Deliberately short:
+#: the wait buys a transient lock contention time to clear, and a long
+#: wait would multiply the cost of a task that is going to fail anyway
+#: (the budget is per task, and a layer runs many tasks at once).
+DEFAULT_DISPATCH_RETRY_BACKOFF_SECONDS = 0.5
+
+#: Env var overriding :data:`DEFAULT_DISPATCH_MAX_ATTEMPTS`.  Read per
+#: call, not cached: an operator who tightens the budget for a
+#: debugging run must not need a process restart to see it.
+DISPATCH_MAX_ATTEMPTS_ENV = "PDT_DISPATCH_MAX_ATTEMPTS"
+
+#: Env var overriding :data:`DEFAULT_DISPATCH_RETRY_BACKOFF_SECONDS`.
+DISPATCH_RETRY_BACKOFF_ENV = "PDT_DISPATCH_RETRY_BACKOFF_SECONDS"
+
+#: Prefix on the ``failure_reason`` a dispatch failure writes.  It says
+#: WHERE the task died — before the executor ever ran — which is the
+#: one fact an operator needs to tell "the task is broken" apart from
+#: "the task could not be started".
+DISPATCH_FAILURE_PREFIX = "dispatch_error: "
 
 
 def _filter_terminal_tasks(tasks: list[SubTask]) -> tuple[list[SubTask], int]:
@@ -4951,6 +5004,30 @@ class AutonomousAgent:
 
         controller = self._get_provider_controller()
 
+        # 2026-10-31 — the zero-progress guard.
+        #
+        # The loop reacts to a finished layer by dispatching the next
+        # one IMMEDIATELY, so a layer that ends with the task list
+        # exactly as it started is invisible from the outside: the
+        # loop sees the same tasks, dispatches the same work, and gets
+        # the same nothing back — at the same speed, as often as the
+        # loop runs.  A task whose dispatch keeps failing without ever
+        # touching its status is the shape of that spin: the run stays
+        # alive, the log keeps filling, and nothing says that no work
+        # is happening.
+        #
+        # The guard is the counter that ends it: it compares the task
+        # list before and after each layer, counts the layers that
+        # changed nothing, waits longer before each retry, and finally
+        # says stop — with a NAMED reason, so a run that gave up can be
+        # told apart from a run that finished and from a run that
+        # stopped because a person was needed.
+        #
+        # The guard reads no clock and touches no file; the knobs (the
+        # layer limit and the backoff) come from the environment, so a
+        # deployment can tighten them without a code change.
+        guard = ZeroProgressGuard()
+
         # Session-local counter: how many times each task_id has been
         # marked completed in this execution session. Combined with the
         # same-id loop guard below, this breaks the re-execute-after-
@@ -5010,6 +5087,20 @@ class AutonomousAgent:
             # the answer has to be able to release what it was holding.
             decision_blocked = self._decision_blocked_tasks(self.plan_id)
             active_tasks = self._get_active_tasks_for_scheduling(decision_blocked)
+
+            # The snapshot that BRACKETS this layer: what the task list
+            # looks like BEFORE the layer runs.  It is taken here, and
+            # not just before the gather, so that a ``continue`` in the
+            # same-id branch below cannot pair this layer's "after"
+            # with the PREVIOUS layer's "before" — a stale "before"
+            # would make a productive layer look quiet.
+            #
+            # The gated view (the same one the layer is picked from) is
+            # what is snapshotted, so the two snapshots of a layer are
+            # taken through the same lens and a task that merely
+            # becomes held by a HITL decision is not mistaken for
+            # work.
+            before_snapshot = task_progress_snapshot(active_tasks)
 
             if not active_tasks:
                 # The gate can empty this list without the plan being
@@ -5408,6 +5499,81 @@ class AutonomousAgent:
                 parent = self._find_parent_task(task)
                 if parent is not None:
                     self._aggregate_breakdown_verdict(parent)
+
+            # 2026-10-31 — did the layer change anything?
+            #
+            # The "after" snapshot is taken AFTER the parent-verdict
+            # roll-up above: a breakdown parent that just finished is
+            # a state change too, and a guard that looked before the
+            # roll-up would call a productive layer quiet.
+            #
+            # It is re-derived through the same gate the layer was
+            # picked through, so a task that a HITL decision started
+            # holding (and therefore left the active set) does not
+            # read as progress the run did not make.
+            after_snapshot = task_progress_snapshot(
+                self._get_active_tasks_for_scheduling(
+                    self._decision_blocked_tasks(self.plan_id)
+                )
+            )
+            if guard.observe(before_snapshot, after_snapshot):
+                quiet_layers = guard.zero_progress_layers
+                limit = guard.max_zero_progress_layers
+                if self.logger:
+                    self.logger.info(
+                        "layer_zero_progress",
+                        (
+                            f"Layer with task(s) {layer_task_ids} changed no "
+                            f"task state — {quiet_layers} consecutive quiet "
+                            f"layer(s), limit is {limit}"
+                        ),
+                        data={
+                            "task_ids": layer_task_ids,
+                            "zero_progress_layers": quiet_layers,
+                            "max_zero_progress_layers": limit,
+                        },
+                    )
+                if guard.should_stop():
+                    detail = (
+                        f"No task state changed for {quiet_layers} "
+                        f"consecutive dispatch layers (limit {limit}). "
+                        f"The run stopped instead of dispatching the "
+                        f"same work again."
+                    )
+                    self.task_manager.set_stop_reason(
+                        ZERO_PROGRESS_STOP_REASON, detail,
+                    )
+                    print(f"\n{'=' * 60}")
+                    print("STOPPED — NO PROGRESS")
+                    print(f"{'=' * 60}")
+                    print(detail)
+                    print(f"{'=' * 60}\n")
+                    if self.logger:
+                        self.logger.warning(
+                            "execution_stopped",
+                            "Stopped dispatching: consecutive layers changed "
+                            "no task state",
+                            data={
+                                "reason": ZERO_PROGRESS_STOP_REASON,
+                                "zero_progress_layers": quiet_layers,
+                                "max_zero_progress_layers": limit,
+                            },
+                        )
+                    break
+                # Not the limit yet: wait before the next layer.  The
+                # wait doubles per quiet layer (see the guard), because
+                # the layers that follow a broken one are likely to be
+                # broken too — a fast retry turns one incident into a
+                # thousand requests.
+                delay = guard.backoff_delay()
+                if delay > 0:
+                    if self.logger:
+                        self.logger.info(
+                            "zero_progress_backoff",
+                            f"Waiting {delay}s before the next layer",
+                            data={"delay_seconds": delay},
+                        )
+                    await asyncio.sleep(delay)
 
             total_tasks = len(self.task_manager.tasks)
 
@@ -5978,6 +6144,137 @@ class AutonomousAgent:
                 if self._in_flight_files.get(file_path) == task_id:
                     self._in_flight_files.pop(file_path, None)
 
+    def _dispatch_max_attempts(self) -> int:
+        """How many times a dispatch may fail before the task is failed.
+
+        Read from :data:`DISPATCH_MAX_ATTEMPTS_ENV` on EVERY call rather
+        than cached at construction: the budget is an operator knob, and
+        an operator who tightens it for a debugging run must see it take
+        effect without restarting the executor.
+
+        A malformed value falls back to :data:`DEFAULT_DISPATCH_MAX_ATTEMPTS`
+        rather than to "zero attempts".  Zero would mean "never try, never
+        fail" — a task that could neither run nor reach a verdict, which
+        is the very loop this budget exists to stop.  A typo in the
+        environment must not be able to reproduce the accident.
+        """
+        raw = os.environ.get(DISPATCH_MAX_ATTEMPTS_ENV, "").strip()
+        if raw:
+            try:
+                value = int(raw)
+            except ValueError:
+                value = 0
+            if value >= 1:
+                return value
+        return DEFAULT_DISPATCH_MAX_ATTEMPTS
+
+    def _dispatch_retry_backoff(self) -> float:
+        """Seconds to wait between two dispatch attempts.
+
+        Read per call from :data:`DISPATCH_RETRY_BACKOFF_ENV`, same
+        contract as :meth:`_dispatch_max_attempts`: a value that does not
+        parse, is not finite, or is negative falls back to
+        :data:`DEFAULT_DISPATCH_RETRY_BACKOFF_SECONDS`.  Zero is
+        accepted — it means "retry immediately", which is a legitimate
+        thing to ask for when the failure is not a lock wait.
+
+        "Not finite" is a separate clause from "negative" because
+        ``inf`` parses fine and is not negative: ``asyncio.sleep(inf)``
+        never returns, so the retry would hang forever and the task
+        would stay ``pending`` — the very accident this budget exists
+        to stop.  A number that cannot be waited on is not a wait.
+        """
+        raw = os.environ.get(DISPATCH_RETRY_BACKOFF_ENV, "").strip()
+        if raw:
+            try:
+                value = float(raw)
+            except ValueError:
+                value = -1.0
+            if math.isfinite(value) and value >= 0:
+                return value
+        return DEFAULT_DISPATCH_RETRY_BACKOFF_SECONDS
+
+    async def _acquire_task_locks(
+        self,
+        task: SubTask,
+    ) -> Optional[tuple[list[str], FileLockManager]]:
+        """Take the task's file locks, retrying a dispatch failure.
+
+        The pre-task lock hook is where a task that CANNOT be run is
+        discovered: a ``files_to_modify`` entry that names a directory,
+        a file already claimed by a sibling, a lock that times out.
+        Every one of those raises, and the raise used to travel straight
+        past :meth:`_execute_task_with_retry` — the only place that
+        records a verdict — so the task stayed ``pending`` and the outer
+        dispatcher re-picked it forever (13.5 hours, zero LLM calls).
+
+        So the hook is retried a bounded number of times, and when the
+        budget runs out the task is FAILED with the original message.
+        A task that cannot be dispatched is a failed task, not a task
+        that gets another turn.
+
+        Only THIS phase is retried.  An exception from
+        :meth:`_execute_task_with_retry` belongs to the executor, which
+        has its own retry / verdict machinery — swallowing it here would
+        hide a real failure behind a dispatch verdict.
+
+        ``asyncio.CancelledError`` is not caught: it derives from
+        ``BaseException`` (not ``Exception``) on Python 3.8+, so a
+        cancelled run tears down instead of retrying.
+
+        Returns:
+            ``(files, lock_manager)`` when the locks were taken, or
+            ``None`` when the dispatch failed terminally — in which case
+            the verdict has ALREADY been recorded on the task and the
+            caller must not run the executor.
+        """
+        max_attempts = self._dispatch_max_attempts()
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return self._pre_task_lock_hook(task)
+            except Exception as exc:
+                if attempt >= max_attempts:
+                    reason = f"{DISPATCH_FAILURE_PREFIX}{exc}"
+                    if self.logger:
+                        try:
+                            self.logger.error(
+                                "task_dispatch_failed",
+                                f"Task [{task.id}] could not be dispatched "
+                                f"after {attempt} attempt(s): {exc}",
+                                task_id=task.id,
+                                data={
+                                    "attempts": attempt,
+                                    "max_attempts": max_attempts,
+                                    "error": str(exc)[:500],
+                                },
+                            )
+                        except Exception:
+                            pass
+                    # The verdict. Without it the task stays pending and
+                    # the dispatcher loops on it forever.
+                    self.task_manager.record_task_failure(task.id, reason)
+                    return None
+                if self.logger:
+                    try:
+                        self.logger.warning(
+                            "task_dispatch_retry",
+                            f"Task [{task.id}] dispatch attempt {attempt}/"
+                            f"{max_attempts} failed: {exc}",
+                            task_id=task.id,
+                            data={
+                                "attempt": attempt,
+                                "max_attempts": max_attempts,
+                                "error": str(exc)[:500],
+                            },
+                        )
+                    except Exception:
+                        pass
+                backoff = self._dispatch_retry_backoff()
+                if backoff > 0:
+                    await asyncio.sleep(backoff)
+
     async def _run_task_with_provider_slot(
         self,
         task: SubTask,
@@ -5995,13 +6292,27 @@ class AutonomousAgent:
         check + OS-level locks) and the post-task hook releases the
         locks and clears the in-flight memory state. Both run inside
         the ``finally`` so an exception or cancellation still cleans up.
+
+        A failure of the DISPATCH phase (the pre-task lock hook) is
+        retried a bounded number of times and then turned into a failed
+        task — see :meth:`_acquire_task_locks`.  A failure of the
+        EXECUTION phase propagates unchanged: the executor owns that
+        verdict.
         """
         provider = self._resolve_provider_for_task(task)
         await controller.acquire(provider)
         files: list[str] = []
         lock_manager = FileLockManager()
         try:
-            files, lock_manager = self._pre_task_lock_hook(task)
+            acquired = await self._acquire_task_locks(task)
+            if acquired is None:
+                # The dispatch failed terminally: the verdict (status=failed
+                # plus the original message) is already recorded, so the
+                # task must not run.  Returning False is what the layer's
+                # gather sees — "this task did not run", not an exception
+                # it would have to interpret.
+                return False
+            files, lock_manager = acquired
 
             def _execute_in_task_ctx():
                 # Usage-registry attribution (2026-09-21): bind this
