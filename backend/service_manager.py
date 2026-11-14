@@ -5464,6 +5464,612 @@ def _holder_evidence(
     return _workspace_evidence(decl, project_dir, probe)
 
 
+# ---------------------------------------------------------------------------
+# Finding this plan's own instances (2026-11-13)
+# ---------------------------------------------------------------------------
+#
+# Rule 3 asks "is the holder of the **declared** port a leftover of
+# ours?", and it answers that question at the declared port only
+# (:func:`_ledger_holder_evidence`).  After a relocation that is the
+# wrong question: the round that had to move its service to a free port
+# left its own instance behind on that free port, and the declared port
+# says nothing about it.  The leftover keeps the plan's instance lock,
+# and every later attempt to start a service is refused with rc=3 — the
+# 2026-11-13 incident.
+#
+# :func:`own_service_instances` answers the *finding* question — this
+# plan's own live instances, on whatever port they sit.  It makes no
+# placement decision: adopting an instance, reaping a dead one and
+# relocating around a stranger are the caller's business.
+
+
+def _own_int(value: Any) -> Optional[int]:
+    """The integer a bookkeeping field names, or ``None``.
+
+    The books are written by another process and are read during an
+    incident, so every field is coerced rather than trusted.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if float(value).is_integer() else None
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _own_live_epoch(pid: int) -> Optional[float]:
+    """When the live process started, or ``None`` when it is gone.
+
+    ``None`` is the answer to "is this process still there?", and it is
+    the answer this module already gives everywhere else: a number
+    nobody holds is not evidence of anything.
+    """
+    try:
+        epoch = _process_start_epoch(pid)
+    except Exception:  # noqa: BLE001 - a probe is best-effort
+        return None
+    try:
+        return None if epoch is None else float(epoch)
+    except (TypeError, ValueError):
+        return None
+
+
+def _own_recorded_epoch(
+    raw: Dict[str, Any], source: str,
+) -> Optional[float]:
+    """The start time the book recorded for a process.
+
+    A pin records it as ``pid@epoch``; a ledger row records it as
+    ``start_epoch``.  ``None`` when the book recorded none — the
+    comparison against the live process then has nothing to compare,
+    and no recycled pid to rule out either.
+    """
+    if source == "pin":
+        boot_id = str(raw.get("boot_id") or "")
+        if "@" not in boot_id:
+            return None
+        try:
+            return float(boot_id.split("@", 1)[1])
+        except (TypeError, ValueError):
+            return None
+    value = raw.get("start_epoch")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _own_owner_token(raw: Dict[str, Any], source: str) -> str:
+    """The round that owns the instance, as the books record it.
+
+    A pin names the round in ``round_token`` — the very value the
+    ledger writes as ``owner_token``, because a round pins the
+    services it owns under that token.  A ledger row names it
+    outright.
+    """
+    key = "round_token" if source == "pin" else "owner_token"
+    return str(raw.get(key) or "")
+
+
+def _own_cmdline(
+    record: Any, raw: Dict[str, Any], sibling: Optional[Dict[str, Any]],
+) -> str:
+    """The command line that speaks for a process.
+
+    The live process' own command line is the strongest witness: it is
+    what the process is running *right now*.  The command the ledger
+    recorded is the fallback — the retired whole-file ledger of an
+    older plan carries the command we ran and no process records at
+    all, and that command is still a witness.
+    """
+    if record is not None:
+        parts = getattr(record, "cmdline", ()) or ()
+        text = " ".join(str(part) for part in parts).strip()
+        if text:
+            return text
+    for book in (raw, sibling):
+        if not isinstance(book, dict):
+            continue
+        text = str(book.get("start_cmd") or "").strip()
+        if text:
+            return text
+    return ""
+
+
+#: The trailing digits of an identity token are a version, not an identity.
+_VERSION_SUFFIX_RE = re.compile(r"\d+$")
+
+
+def _own_token_present(token: str, haystack: str) -> bool:
+    """Whether the command line carries this identity token.
+
+    A version suffix is not part of the identity.  The declaration says
+    ``python3`` and the process that runs it is homebrew's ``Python``
+    — that is the real instance of 2026-11-13 — so ``python3`` is not a
+    substring of its command line.  The stem is what names the
+    program; the version is which build of it happens to be installed.
+    """
+    if not token:
+        return False
+    if token.lower() in haystack:
+        return True
+    stem = _VERSION_SUFFIX_RE.sub("", token)
+    return bool(stem) and stem != token and stem.lower() in haystack
+
+
+def _own_runs_our_program(
+    decl: ServiceDeclaration, port: int, witness: str,
+) -> bool:
+    """Whether the command line is our program, on that port.
+
+    The tokens are the identity of the **program** — the last segment of
+    the declaration's command — because the setup the shell ran is not
+    carried by the process it started.  The declaration is rendered for
+    the port the instance actually holds, so a relocated instance is
+    compared against the command it was really started with.
+    """
+    tokens = program_tokens(render_declaration(decl, port).start_cmd)
+    if not tokens:
+        # Nothing to compare: better to say nothing than to call a
+        # stranger ours.
+        return False
+    haystack = witness.lower()
+    if not haystack:
+        return False
+    return all(_own_token_present(token, haystack) for token in tokens)
+
+
+def _own_live_records(plan_dir: Path) -> Dict[int, Any]:
+    """The live process records of the plan, by pid."""
+    try:
+        records = process_ledger.live_records(plan_dir) or {}
+    except Exception:  # noqa: BLE001 - a damaged ledger is not a verdict
+        return {}
+    out: Dict[int, Any] = {}
+    for pid, record in dict(records).items():
+        number = _own_int(pid)
+        if number is not None and number > 0:
+            out[number] = record
+    return out
+
+
+def _own_ledger_entries(plan_dir: Path) -> List[Dict[str, Any]]:
+    """The service rows of the plan's ledger."""
+    try:
+        ledger = read_ledger(plan_dir)
+    except Exception:  # noqa: BLE001 - a damaged ledger is not a verdict
+        return []
+    entries = ledger.get("services") if isinstance(ledger, dict) else None
+    if not isinstance(entries, list):
+        return []
+    return [entry for entry in entries if isinstance(entry, dict)]
+
+
+def _own_pins(plan_dir: Path) -> List[Dict[str, Any]]:
+    """The pins of the plan's live rounds."""
+    try:
+        pins = live_round_pins(plan_dir) or []
+    except Exception:  # noqa: BLE001 - a damaged pin file is not a verdict
+        return []
+    return [pin for pin in pins if isinstance(pin, dict)]
+
+
+def _own_instance(
+    raw: Dict[str, Any],
+    *,
+    source: str,
+    decl: ServiceDeclaration,
+    declared_port: int,
+    records: Dict[int, Any],
+    siblings: Dict[int, Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """The instance a bookkeeping record describes — or ``None``.
+
+    ``None`` means the record does not describe one of our live
+    instances, and the caller never hears about it.
+    """
+    name = str(raw.get("name") or "")
+    declared = _own_int(raw.get("declared_port"))
+    if declared is None:
+        declared = _own_int(raw.get("port"))
+    if name != decl.name and declared != declared_port:
+        # Not about this service at all: another service of the plan, or
+        # a record of something else entirely.
+        return None
+    pid = _own_int(raw.get("pid"))
+    if pid is None or pid <= 0:
+        return None
+    port = _own_int(raw.get("port"))
+    if port is None or port <= 0:
+        # An instance we cannot address is of no use to the caller.
+        return None
+
+    live_epoch = _own_live_epoch(pid)
+    if live_epoch is None:
+        # The process is gone.  A record of a process that is not there
+        # names nothing.
+        return None
+
+    recorded_epoch = _own_recorded_epoch(raw, source)
+    if recorded_epoch is not None and abs(
+        live_epoch - recorded_epoch
+    ) > CREATE_TIME_TOLERANCE:
+        # The number was recycled: whoever holds it now is somebody
+        # else, and our record says nothing about them.
+        return None
+
+    cmdline = _own_cmdline(records.get(pid), raw, siblings.get(pid))
+    if not cmdline:
+        # No witness at all: nothing says this process is ours.
+        return None
+    if not _own_runs_our_program(decl, port, cmdline):
+        # Our program is what makes it ours — the same program, run on
+        # the port this instance actually holds.  A stranger that
+        # happens to sit there is not ours, whatever the books say.
+        return None
+
+    return {
+        "name": name or decl.name,
+        "pid": pid,
+        "port": port,
+        "declared_port": (
+            declared if declared is not None else declared_port
+        ),
+        "source": source,
+        "start_epoch": (
+            recorded_epoch if recorded_epoch is not None else live_epoch
+        ),
+        "owner_token": _own_owner_token(raw, source),
+    }
+
+
+def own_service_instances(
+    plan_dir: Optional[Path],
+    decl: ServiceDeclaration,
+    project_dir: Path,
+    *,
+    plan_id: str = "",
+) -> List[Dict[str, Any]]:
+    """This plan's own **live** service instances, on whatever port they sit.
+
+    Two books of the plan are read: the **pins** of its live rounds and
+    its **ledger**.  Both name the processes this plan started, and both
+    name the port each of them actually holds — which is not necessarily
+    the declared one, because a round that had to relocate moved it.
+
+    A record describes one of our instances when all of the following
+    hold:
+
+    * it is about **this** service — its name is the declaration's name,
+      or its declared port is the declaration's port;
+    * the process it names is **alive** — a record of a process that is
+      gone names nothing;
+    * it is still **the same process** — the start time the book
+      recorded agrees with the live one, so a recycled pid is never
+      mistaken for our instance;
+    * it runs **our program** — the command line matches the
+      declaration as it would be run on that port
+      (:func:`render_declaration`).  This is what keeps a stranger out
+      of the answer.
+
+    Every answer carries ``name``, ``pid``, ``port``, ``declared_port``,
+    ``source`` (``"pin"`` or ``"ledger"``), ``start_epoch`` and
+    ``owner_token``.
+
+    Never raises: a book that cannot be read costs the records it
+    holds, not the caller's round.  A ``plan_dir`` of ``None`` — a plan
+    that does not know its own directory — answers ``[]``.
+
+    ``project_dir`` is part of the signature the callers use, but the
+    identity gate here is the **program** a process runs and not the
+    directory it runs in: an instance this plan started is ours
+    wherever it was started, and whether it may be adopted, reaped or
+    worked around is a placement decision this function does not make.
+    """
+    if plan_dir is None:
+        return []
+    plan_dir = Path(plan_dir)
+    declared_port = _own_int(decl.port)
+    if declared_port is None:
+        return []
+
+    records = _own_live_records(plan_dir)
+    ledger_entries = _own_ledger_entries(plan_dir)
+    pins = _own_pins(plan_dir)
+
+    siblings: Dict[int, Dict[str, Any]] = {}
+    for entry in ledger_entries:
+        pid = _own_int(entry.get("pid"))
+        if pid is not None and pid > 0:
+            siblings.setdefault(pid, entry)
+
+    books: List[Tuple[str, Dict[str, Any]]] = [("pin", pin) for pin in pins]
+    books += [("ledger", entry) for entry in ledger_entries]
+
+    found: Dict[int, Dict[str, Any]] = {}
+    for source, raw in books:
+        instance = _own_instance(
+            raw,
+            source=source,
+            decl=decl,
+            declared_port=declared_port,
+            records=records,
+            siblings=siblings,
+        )
+        if instance is None:
+            continue
+        # The same process in both books is one process.
+        found.setdefault(instance["pid"], instance)
+
+    if found:
+        logger.debug(
+            "[service_manager] plan %s has %d own service instance(s) of "
+            "%s: %s", plan_id or plan_dir.name, len(found), decl.name,
+            sorted(found),
+        )
+    return list(found.values())
+
+
+# ---------------------------------------------------------------------------
+# Adopting this plan's own instance (2026-11-13)
+# ---------------------------------------------------------------------------
+#
+# Rule 3 asks "is the holder of the **declared** port a leftover of
+# ours?" and answers it at the declared port only.  After a relocation
+# the leftover sits on **another** port, and rule 4 — which answers "the
+# declared port is held by a process we cannot identify" — used to
+# answer it by starting a *second* copy of the service on the same data
+# root.  The instance lock refuses exactly that (rc=3), so the round was
+# left with a service it could not have.
+#
+# The answer is to adopt: the instance this plan already started is the
+# service the round wants, on a port that works.  Nothing is started and
+# nothing is signalled — the round is simply pointed at it.
+
+
+def _probe_runs_our_program(
+    decl: ServiceDeclaration, port: int, probe: PortProbe,
+) -> bool:
+    """Whether the listener on *port* runs our program, as we run it there.
+
+    Two gates, both about identity:
+
+    * :func:`matches_declaration` compares the **whole** declaration with
+      the listener's command line.  It is the strict gate, and it fits a
+      declaration whose command *is* the program.
+    * :func:`_own_runs_our_program` compares the **program** — the last
+      segment of the declaration's command — with the same command line.
+      It is the gate that survives a declaration shaped like the ones
+      production writes (``source … && export … && exec python3 -m …``),
+      where the running process carries the program and none of the
+      setup, and an interpreter spelled ``python3`` while the process
+      runs ``…/Python``.
+
+    The declaration is rendered for the port the instance **actually**
+    holds, so a relocated instance is compared against the command it was
+    really started with.
+    """
+    if matches_declaration(render_declaration(decl, port), probe):
+        return True
+    return _own_runs_our_program(decl, port, " ".join(probe.cmdlines))
+
+
+def _own_instance_candidates(
+    decl: ServiceDeclaration,
+    project_dir: Path,
+    *,
+    plan_dir: Optional[Path],
+    plan_id: str = "",
+) -> List[Dict[str, Any]]:
+    """This plan's own instances of *decl* — the candidates adoption looks at.
+
+    The books are read **once** and the answer handed to both of the
+    questions rule 4 asks: "is one of ours usable?" (the adopter) and
+    "is one of ours left over?" (the reaper).  Both are about the same
+    list, and reading it twice could give two different answers.
+
+    Never raises: a book that cannot be read costs the records it holds,
+    not the caller's round.  A ``plan_dir`` of ``None`` — a plan that
+    does not know its own directory — answers ``[]``: without books
+    there is nothing of ours left behind, and nothing to sweep.
+    """
+    if plan_dir is None:
+        return []
+    try:
+        found = own_service_instances(
+            plan_dir, decl, Path(project_dir), plan_id=plan_id,
+        )
+    except Exception:  # noqa: BLE001 - a damaged book is not a verdict
+        return []
+    return [
+        record for record in (found or []) if isinstance(record, dict)
+    ]
+
+
+def _adopt_own_live_instance(
+    decl: ServiceDeclaration,
+    project_dir: Path,
+    *,
+    plan_dir: Optional[Path],
+    plan_id: str = "",
+    candidates: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[ServiceRuntime]:
+    """Adopt one of **this plan's own** live instances — or ``None``.
+
+    The instance this plan started in an earlier round is not a stranger:
+    it is the service the round wants, on a port that works.  So it is
+    adopted — the round is pointed at it, no second server is started on
+    the same data root, and the process that holds the **declared** port
+    is left completely alone.
+
+    The gate is deliberately narrow.  A candidate is adopted only when
+
+    * this plan's own books name it (see :func:`own_service_instances`),
+      and the process they name is still alive and still the same one;
+    * the port it sits on is **listening right now**;
+    * the process answering there runs **our program on that port**
+      (see :func:`_probe_runs_our_program`).
+
+    Anything else — no candidate, a port that went away, a command line
+    that does not match — answers ``None``, and the caller falls back to
+    the rule it would have used anyway.
+
+    ``candidates`` is the list :func:`_own_instance_candidates` read.
+    The caller passes it in so that the books are read once: the
+    adopter and the reaper then talk about the same residual.  Left
+    out, the books are read here.
+
+    Never raises: a failure to find an instance is an answer, not an
+    error.
+    """
+    if plan_dir is None:
+        # A plan that does not know its own directory has no books, and
+        # no books means nothing to adopt.
+        return None
+    if candidates is None:
+        candidates = _own_instance_candidates(
+            decl, project_dir, plan_dir=plan_dir, plan_id=plan_id,
+        )
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        port = _own_int(candidate.get("port"))
+        if port is None or port <= 0:
+            # An instance we cannot address is of no use to the caller.
+            continue
+        pid = _own_int(candidate.get("pid"))
+        try:
+            probe = probe_port(port)
+        except Exception:  # noqa: BLE001 - a probe never raises
+            continue
+        if not probe.listening:
+            # The port went away between the books being read and now.
+            continue
+        if not _probe_runs_our_program(decl, port, probe):
+            # Something else is answering there now.
+            continue
+
+        rendered = render_declaration(decl, port)
+        runtime = ServiceRuntime(
+            name=decl.name,
+            port=port,
+            declared_port=decl.port,
+            pid=pid,
+            start_cmd=rendered.start_cmd,
+            cwd=decl.cwd,
+            reap_on_exit=decl.reap_on_exit,
+        )
+        runtime.origin = "adopted"
+        runtime.ready = True
+        try:
+            runtime.start_epoch = float(candidate.get("start_epoch"))
+        except (TypeError, ValueError):
+            runtime.start_epoch = probe.process_start_epoch
+        runtime.pgid = _process_group_of(pid) if pid else None
+        runtime.detail = (
+            f"adopted this plan's live instance on port {port}"
+        )
+        # The address was not allocated by this round — it was already
+        # there, and it is this plan's own.  Say so, the way every other
+        # address decision is said (2026-10-25, repair-r1-25).
+        _ctx = _ADDRESS_EVENT_CONTEXT.get() or {}
+        _emit_address_event(
+            runtime, plan_dir, "reused",
+            run_id=str(_ctx.get("run_id") or "") or str(plan_id or ""),
+            round_token=str(_ctx.get("round_token") or ""),
+            old_port=None, new_port=port, declared_port=decl.port,
+            reason=(
+                f"adopted this plan's live instance of service "
+                f"{decl.name!r} on port {port}"
+            ),
+        )
+        logger.info(
+            "[service_manager] plan %s adopted its own instance of %s on "
+            "port %s (pid %s)", plan_id or Path(plan_dir).name, decl.name,
+            port, pid,
+        )
+        return runtime
+
+    return None
+
+
+def _reap_own_residual(
+    decl: ServiceDeclaration,
+    plan_dir: Path,
+    *,
+    plan_id: str = "",
+    candidates: Sequence[Dict[str, Any]] = (),
+) -> Optional[ReapReport]:
+    """Reap this plan's own **dead** residual — through the sanctioned path.
+
+    The residual is not signalled from here.  It is handed to
+    :func:`reap_services`, which is the only path that knows which
+    processes this plan owns, which of them a live round still needs and
+    which ones are strangers.  Its lock file and its pin record are what
+    make the next start fail (the instance lock answers rc=3), and they
+    go away through the rules that were written for them.
+
+    Two things this is **not**:
+
+    * a way to kill the stranger that holds the declared port — the reap
+      *reports* an unidentified holder (:attr:`ReapReport.foreign_ports`)
+      and never signals it;
+    * a sweep that runs when there is nothing of ours to sweep — the
+      caller asks for it only when the books name a candidate.
+
+    A reap that fails is a warning, not a verdict: the round still has
+    to get out of the way of the stranger, so the caller carries on and
+    relocates.
+
+    Returns the report, or ``None`` when the reap itself failed.
+    """
+    try:
+        report = reap_services(
+            plan_dir,
+            plan_id=plan_id,
+            reason="no adoptable own residual before relocation",
+            caller="service_manager._ensure_services",
+        )
+    except Exception as exc:  # noqa: BLE001 - a failed reap is not a verdict
+        logger.warning(
+            "[service_manager] reap before relocation failed for plan %s "
+            "(service %r): %s",
+            plan_id or Path(plan_dir).name, decl.name, exc,
+        )
+        return None
+
+    foreign = list(getattr(report, "foreign_ports", None) or [])
+    if foreign:
+        # A holder we could not identify is a stranger: it is reported,
+        # never signalled (see :func:`reap_services`).
+        logger.warning(
+            "[service_manager] reap before relocation left a foreign "
+            "holder on port(s) %s for plan %s; they are reported, never "
+            "signalled", foreign, plan_id or Path(plan_dir).name,
+        )
+    summary = (
+        report.to_dict() if hasattr(report, "to_dict") else repr(report)
+    )
+    logger.info(
+        "[service_manager] reaped the plan's own residual of service %r "
+        "before relocation (candidates=%s): %s",
+        decl.name,
+        [
+            [record.get("pid"), record.get("port")]
+            for record in candidates
+            if isinstance(record, dict)
+        ],
+        summary,
+    )
+    return report
+
+
 def _reclaim_reason(decl: ServiceDeclaration, evidence: Dict[str, Any]) -> str:
     """Why the declared port was taken back — in one sentence."""
     source = str(evidence.get("source") or "")
@@ -5666,8 +6272,15 @@ def ensure_services(
       3. Port held by *our own* leftover → reclaim the declared port:
          stop the leftover, start this round's copy on the declared
          port, and record why.
-      4. Port held by anything else → **refuse**: no kill, service
-         reported unready with a reason, its VPs get BLOCKED.
+      4. Port held by anything else → **get out of the way**: nothing is
+         killed.  First this plan's own instance of the very same
+         service is looked for on any port: a **live** one is adopted
+         (nothing is started), and a **dead** one is reaped through the
+         sanctioned path (:func:`reap_services`) before anything new is
+         started — its lock file and its pin record are what make the
+         next start fail (the instance lock answers rc=3).  Then the
+         round relocates: it starts its own copy on a free port and
+         points every VP at that.
 
     ``plan_dir`` / ``plan_id`` are what let the round recognise its own
     leftovers: the plan's ledger is the record of the processes this
@@ -5777,6 +6390,48 @@ def _ensure_services(
                     # cmdline matches the declaration is ours to kill; anything
                     # else is unknown and must not be touched — the round
                     # gets out of its way instead.)
+                    #
+                    # 2026-11-13: before we get out of the way, check
+                    # whether this plan already has a **live instance of
+                    # this very service** — on another port, left behind by
+                    # a round that had to relocate.  That instance is not a
+                    # stranger: it is the service the round wants, and
+                    # starting a second copy on the same data root is
+                    # refused by the instance lock (rc=3).  So it is
+                    # adopted, and nothing is started.
+                    #
+                    # The books are read once and the answer is used twice:
+                    # the adopter asks whether one of ours can be used, and
+                    # the reaper asks whether one of ours is left over.
+                    candidates = _own_instance_candidates(
+                        decl, project_dir,
+                        plan_dir=plan_dir, plan_id=plan_id,
+                    )
+                    adopted = _adopt_own_live_instance(
+                        decl, project_dir,
+                        plan_dir=plan_dir, plan_id=plan_id,
+                        candidates=candidates,
+                    )
+                    if adopted is not None:
+                        result.runtimes[name] = adopted
+                        continue
+                    # 2026-11-13 (B.1): our own instance exists but cannot
+                    # be used — it is dead, or it answers nothing.  Its
+                    # lock file and its pin record are still on disk, and
+                    # they are what makes the next start fail (the
+                    # instance lock answers rc=3).  So it is reaped —
+                    # through the sanctioned path, which knows what may be
+                    # signalled — **before** the round relocates and
+                    # starts a new instance.
+                    #
+                    # No candidate means no residual: a sweep with nothing
+                    # of ours to sweep can only take the services of a live
+                    # round with it, so it does not run.
+                    if candidates and plan_dir is not None:
+                        _reap_own_residual(
+                            decl, plan_dir,
+                            plan_id=plan_id, candidates=candidates,
+                        )
                     foreign = '; '.join(probe.cmdlines) or 'unknown'
                     runtime = _relocate_service(
                         decl, project_dir, foreign_cmdline=foreign,

@@ -202,6 +202,11 @@ FORBIDDEN_MODULE_PATHS: tuple[str, ...] = (
     ":(exclude)backend/verification_loop.py",
     ":(exclude)backend/state_machine/repositories/execution_repository.py",
     ":(exclude)backend/state_machine/repositories/plan_task_repository.py",
+    # 2026-11-14：base drift 阻塞的轮次必须留下一行可审计的轮次记录
+    # （`mark_round_blocked`），这条写入路径落在验证轮次仓库上。改动只有
+    # 这一个方法与它的审计字段，行为由
+    # ``test_verification_repository_round_blocked.py`` 逐条钉住。
+    ":(exclude)backend/state_machine/repositories/verification_repository.py",
     ":(exclude)backend/state_machine/db/schema.py",
 )
 
@@ -849,7 +854,10 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 这三个，一个不多一个不少）与 sha256 逐字节比对的强度都不变，该文件此后仍被
     # 逐字节钉住，任何再编辑照样红。
     "backend/verification_loop.py": (
-        "3207acacbbcea9c0c1091ef1789aa5f26a1405991bf54f2ab24fdc09c5b02f7e"
+    # 2026-11-14：本分支（base drift 轮次复用与审计、服务放置复用自家实例）的
+    # 已批准改动同样落在 `verification_loop.py`；与上面「轮次实例身份」的改动
+    # 合并后，冻结基线前移到**合并态**哈希。判定强度不变：仍是逐字节 sha256 比对。
+        "1275d125e7ced4fc39c21c664916b6ef60fc61034deb82a29386a0dbff1f208d"
     ),
 }
 

@@ -274,6 +274,8 @@ Arguments:
   1. the base url of the running server
   2. a JSON list of steps: ``[{"action": ..., "plan": ..., ...}, ...]``
   3. the directory the screenshots are written into
+  4. ``"1"`` when the panel has to be waited for until it draws the
+     read model it was fed, ``"0"`` when it does not
 
 A step names an action and a plan, and says how the action is
 issued:
@@ -295,20 +297,53 @@ what the line looks like now, and what is running.
 The requests the panel's buttons issue are intercepted on the way out,
 so the report can say whether they carried the request guard's header.
 The commands the case issues itself are recorded the same way, with
-the headers the request really carried.  The read model is read
-through the same session as well, at the same moment, so the panel and
-the API can be compared without the clock moving between the two
-reads.
+the headers the request really carried.
+
+The read model is read through the same session as well, and the two
+readings are taken one after the other with nothing costly in
+between: the screenshot of the scheduler view is taken **after** both,
+because a screenshot is evidence and not an input.  A screenshot in
+between would move the clock between the two readings — and the case's
+own tolerance is computed from that clock.
+
+The read model the **panel** was fed is recorded as well: the last
+answer the server gave the panel's own poll.  The panel draws what it
+read at its last poll, so the rows on the screen belong to that model
+and to no other; a comparison against a model read at another moment
+compares two answers to two different questions.
+
+Everything the case reads off the page is read at one moment, after
+the panel has drawn that model.  The panel draws the capacity widgets,
+the line and the running plans in one pass, out of one read model, so
+a widget read before the panel has drawn anything reads the panel's
+first frame — and the first frame of a page whose read failed is the
+empty read model, which says nothing is running.
 """
 import json
+import os
 import sys
 import time
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import Error, sync_playwright
+
+#: The case's own panel rules.  They are imported rather than copied:
+#: there is one definition of what the panel means, and the driver
+#: reads the panel and waits by it.
+sys.path.insert(0, os.environ["PDT_CASE_BACKEND_DIR"])
+from tests.e2e.plan_scheduler.test_scheduler_operator_e2e import (
+    _wait_for_panel_parity,
+    read_rows,
+    read_running,
+    served_state,
+)
 
 GUARD_HEADER = "x-pdt-request"
 GUARD_VALUE = "1"
+
+#: The read model's own endpoint.  The panel polls it, and the case
+#: reads it through the same session.
+STATE_PATH = "/api/scheduler/state"
 
 
 def browser_executable():
@@ -341,21 +376,6 @@ def browser_executable():
     return None
 
 
-def read_rows(page, selector):
-    """The cells of every row of a table, read in one go.
-
-    The panel redraws its tables whenever it reads the model again, so
-    a row that was located a moment ago may be gone by the time it is
-    read.  Reading the whole table in one evaluation avoids that race:
-    what is read is what is on the page at that moment.
-    """
-    return page.eval_on_selector_all(
-        selector,
-        """rows => rows.map(row => Array.from(row.querySelectorAll('td'))
-                                 .map(cell => cell.innerText.trim()))""",
-    )
-
-
 def read_capacity(page, prefix):
     """The capacity widget's numbers."""
     return {
@@ -370,11 +390,6 @@ def read_capacity(page, prefix):
 def read_queue(page):
     """The line, as the panel draws it."""
     return read_rows(page, "#scheduler-queue-list tr")
-
-
-def read_running(page):
-    """The running plans, as the panel draws them."""
-    return read_rows(page, "#scheduler-running-list tr")
 
 
 def outcome_text(page):
@@ -467,12 +482,22 @@ steps = json.loads(sys.argv[2])
 screens = Path(sys.argv[3])
 screens.mkdir(parents=True, exist_ok=True)
 
+#: Whether the panel has to be waited for until it draws the read
+#: model it was fed.
+parity = sys.argv[4] == "1"
+
 executable = browser_executable()
 launch_kwargs = {"executable_path": executable} if executable else {}
 
 seen = []
 answered = []
 api_actions = []
+
+#: The read models the **panel** was fed: every answer the server gave
+#: the panel's own poll, with the moment it arrived.  The panel draws
+#: what it read at its last poll, so the last entry is the model the
+#: rows on the screen were drawn from.
+served_states = []
 
 #: Who issued the request that is on its way out right now: the panel's
 #: own button, or the command the case issues itself.  The route
@@ -483,6 +508,16 @@ issued_by = {"source": "panel"}
 def is_action(url):
     """Whether the URL is one of the four actions' URLs."""
     return "/api/plan/" in url and "/scheduler/" in url
+
+
+def is_state(url):
+    """Whether the URL is the read model's own URL.
+
+    The URL is matched by its ending, so a query string or a trailing
+    slash does not hide it: the panel's poll and the case's own read go
+    to the same endpoint, and only the path says which one it is.
+    """
+    return url.split("?")[0].rstrip("/").endswith(STATE_PATH)
 
 
 def detail_text(detail):
@@ -610,6 +645,18 @@ with sync_playwright() as driver:
     def answered_request(response):
         if is_action(response.url):
             answered.append(response.url)
+        if is_state(response.url):
+            # The read model the panel was fed: the body the server
+            # answered the panel's own poll with.  A body that cannot be
+            # read is skipped rather than fatal — one unreadable answer
+            # must not stop the collection.
+            try:
+                served_states.append({
+                    "at": time.time(),
+                    "body": response.json(),
+                })
+            except (Error, ValueError):
+                pass
 
     page.on("response", answered_request)
     page.route("**/api/plan/*/scheduler/*", record)
@@ -618,25 +665,59 @@ with sync_playwright() as driver:
     page.wait_for_selector("#app", timeout=30000)
     page.wait_for_timeout(1000)
 
-    # The home page first: the capacity widget lives there.
-    home = read_capacity(page, "#scheduler-capacity")
+    # The home page first: the screenshot is the evidence of the page
+    # the operator opens.  The widgets on it are read further down,
+    # together with the rest of the panel -- a widget read before the
+    # panel has drawn anything reads the panel's first frame, and the
+    # first frame says nothing.
     page.screenshot(path=str(screens / "home.png"), full_page=True)
 
     # Then the scheduler view, the way the operator opens it.
     page.click("#btn-open-scheduler")
     page.wait_for_selector("#scheduler-view:not(.hidden)", timeout=30000)
     page.wait_for_timeout(1000)
+    if parity:
+        # The panel is given the time to draw the read model it was
+        # fed: the rows on the screen have to belong to that model
+        # before they are compared with it.
+        running, panel_state = _wait_for_panel_parity(page, served_states)
+    else:
+        # The number of the answers the server gave the panel is counted
+        # **before** the panel is read: an answer that lands during the
+        # reading was never fed to the panel, so it is not among the
+        # answers the drawing on the screen was drawn from.
+        served_count = len(served_states)
+        running = read_running(page)
+        # The read model the panel was fed: the last answer the server
+        # gave the panel's own poll before the panel was read.  The
+        # panel draws what it read at its last poll, so this is the
+        # model the rows above were drawn from.
+        panel_state = served_state(served_states[:served_count], time.time())
+
+    # The capacity widgets and the line, read now.  The panel draws
+    # them in one pass, out of one read model, so reading them here
+    # reads the same drawing the running plans above came from.
+    home = read_capacity(page, "#scheduler-capacity")
     view = read_capacity(page, "#scheduler-view-capacity")
     queue = read_queue(page)
-    running = read_running(page)
-    page.screenshot(path=str(screens / "scheduler.png"), full_page=True)
+    panel_read_at = time.time()
 
-    # The read model, read through the same session at the same moment:
-    # the panel and this answer are two readings of one server.
+    # The read model, read through the same session, straight after the
+    # panel was read: the two readings are one moment apart, because
+    # nothing that costs time comes between them.
     api_state = page.request.get(
-        url.rstrip("/") + "/api/scheduler/state",
+        url.rstrip("/") + STATE_PATH,
         headers={GUARD_HEADER: GUARD_VALUE},
     ).json()
+    api_read_at = time.time()
+
+    # How far apart the two readings are: the interval in which the
+    # clock may have moved between them.
+    read_gap = round(api_read_at - panel_read_at, 3)
+
+    # The screenshot is evidence and not an input, so it is taken after
+    # both readings rather than between them.
+    page.screenshot(path=str(screens / "scheduler.png"), full_page=True)
 
     observations = []
     for step in steps:
@@ -682,6 +763,8 @@ with sync_playwright() as driver:
         "queue": queue,
         "running": running,
         "api": api_state,
+        "panel_state": panel_state,
+        "read_gap": read_gap,
         "steps": observations,
         "requests": [entry for entry in seen if entry["source"] == "panel"],
         "api_actions": api_actions,
@@ -810,11 +893,16 @@ def _driver_env() -> Dict[str, str]:
     ``$HOME`` is pointed back at the home the run was launched with (the
     hermetic environment redirects it), so that Playwright finds the
     browser binaries it installed there.
+
+    ``PDT_CASE_BACKEND_DIR`` is where the case's own module lives: the
+    driver runs the case's panel rules rather than a copy of them, so
+    there is one definition of what the panel means.
     """
     env = dict(os.environ)
     real_home = os.environ.get("PDT_TEST_REAL_HOME")
     if real_home:
         env["HOME"] = real_home
+    env["PDT_CASE_BACKEND_DIR"] = str(BACKEND_DIR)
     return env
 
 
@@ -967,20 +1055,250 @@ def _clock_readings(row: Dict[str, Any]) -> List[int]:
     return values
 
 
-def _panel_clock(row: Dict[str, Any]) -> Optional[int]:
-    """The clock the panel draws for a running row, in seconds.
+# ---------------------------------------------------------------------------
+# The panel's own readers: the rows it draws, and the models it was fed
+# ---------------------------------------------------------------------------
 
-    The panel draws the **plan** clock — ``running_sec`` — and falls
-    back to the slot clock only when the plan clock is unknown.  That is
-    what ``frontend/app.js`` reads, verbatim:
-    ``item.running_sec ?? item.elapsed_sec``.  The read model carries
-    both clocks; this is the one the panel drew, and the one its number
-    is compared against.
+
+def read_rows(page: Any, selector: str) -> List[List[str]]:
+    """The cells of every row of a table, read in one go.
+
+    The panel redraws its tables whenever it reads the model again, so
+    a row that was located a moment ago may be gone by the time it is
+    read.  Reading the whole table in one evaluation avoids that race:
+    what is read is what is on the page at that moment.
     """
-    value = row.get("running_sec")
-    if value is None:
-        value = row.get("elapsed_sec")
-    return None if value is None else int(value)
+    return page.eval_on_selector_all(
+        selector,
+        """rows => rows.map(row => Array.from(row.querySelectorAll('td'))
+                                 .map(cell => cell.innerText.trim()))""",
+    )
+
+
+def read_running(page: Any) -> List[List[str]]:
+    """The running plans, as the panel draws them."""
+    return read_rows(page, "#scheduler-running-list tr")
+
+
+def served_state(
+    states: List[Dict[str, Any]], moment: float
+) -> Optional[Dict[str, Any]]:
+    """The read model the panel was fed by *moment*, or ``None``.
+
+    The panel is fed a model every few seconds and draws the one it
+    was fed last; the model that was fed before the panel was read is
+    the one its rows were drawn from.  A panel that was never fed one
+    has no model, and ``None`` says exactly that rather than a number.
+    """
+    chosen = None
+    for entry in states:
+        if entry["at"] <= moment:
+            chosen = entry
+    return None if chosen is None else chosen["body"]
+
+
+# ---------------------------------------------------------------------------
+# The panel's contract: the clock it draws, and how close two readings of
+# that clock have to be
+# ---------------------------------------------------------------------------
+
+#: How often the operator's panel re-reads the read model.  The panel
+#: draws what it read at its last poll, so a reading of the panel may
+#: be this old by the time it is compared with a reading of the API.
+#:
+#: The number is the panel's own: ``SCHEDULER_POLL_MS = 5000`` in
+#: ``frontend/app.js:2429``.
+PANEL_POLL_SECONDS: float = 5.0
+
+
+def _panel_clock_seconds(row: Dict[str, Any]) -> Optional[int]:
+    """The clock the panel draws for one running plan, in seconds.
+
+    The panel draws ``item.running_sec ?? item.elapsed_sec``
+    (``frontend/app.js:2223``) — the **plan** clock when the read model
+    carries one, and the **slot** clock only when it does not.
+
+    The operator's panel is what decides what a row shows, so a
+    comparison with the read model has to ask the question the panel
+    asked.  Asking the read model for ``elapsed_sec`` alone compares two
+    different clocks, and the two do not have to agree: the plan clock
+    keeps counting across a scheduler restart, while the slot clock
+    starts again from zero.
+
+    ``??`` is not ``||``: a plan clock of **zero** is a number the panel
+    draws, so zero is returned rather than treated as missing.
+    """
+    running = row.get("running_sec")
+    if running is not None:
+        return int(running)
+    elapsed = row.get("elapsed_sec")
+    if elapsed is not None:
+        return int(elapsed)
+    return None
+
+
+def _panel_parity_bound(read_gap: float, slack: int = 0) -> float:
+    """How far the panel's clock and the read model's may differ.
+
+    Three things add up here:
+
+    * the panel draws the model it read at its last poll, and that poll
+      is at most one period old (:data:`PANEL_POLL_SECONDS`);
+    * the reading itself takes time — *read_gap* is how long between
+      the panel's reading and this comparison's;
+    * the clock is counted in whole seconds, so two readings of one
+      moment can differ by a second — and *slack* is what the drawing
+      left out (an hour and a half is drawn ``1h 30m``).
+
+    A negative gap is not a gap: it is read as no gap at all.
+    """
+    gap = read_gap if read_gap > 0 else 0.0
+    return PANEL_POLL_SECONDS + gap + 1 + slack
+
+
+def _panel_rows_match(
+    drawn: List[List[str]], model: List[Dict[str, Any]]
+) -> Tuple[bool, str]:
+    """Whether the panel's running rows say what the read model says.
+
+    *drawn* is the running table as the panel draws it — a row is
+    ``[plan_id, duration, evictable, workspace]`` — and *model* is the
+    read model's own ``running`` list.
+
+    The duration is compared against the clock the **panel** draws
+    (:func:`_panel_clock_seconds`), and not against the slot clock: the
+    panel is the one that decided what to show, so it is the one whose
+    reading is compared.  The two clocks are told apart by
+    :func:`_panel_clock_seconds`; the tolerance that lets two readings
+    of one clock differ is :func:`_panel_parity_bound`.
+
+    Returns ``(True, "")`` when the two agree, and ``(False, why)``
+    with the reason when they do not.
+    """
+    if len(drawn) != len(model):
+        return False, (
+            f"the panel draws {len(drawn)} running plans, the read model "
+            f"carries {len(model)}"
+        )
+    for position, (row, carried) in enumerate(zip(drawn, model)):
+        if len(row) < 3:
+            return False, (
+                f"the panel's running row {position} has {len(row)} cells, "
+                f"which is not a row the panel draws"
+            )
+        plan_id = str(carried.get("plan_id", ""))
+        if row[0] != plan_id:
+            return False, (
+                f"the panel draws {row[0]!r} as running, the read model says "
+                f"{plan_id!r}"
+            )
+        evictable = bool(carried.get("evictable"))
+        expected_evictable = "是" if evictable else "否"
+        if row[2] != expected_evictable:
+            return False, (
+                f"the panel says {row[0]!r} may be interrupted is {row[2]!r}; "
+                f"the read model says evictable={carried.get('evictable')!r}"
+            )
+        drawn_seconds, slack = _duration_seconds(row[1])
+        if drawn_seconds is None:
+            return False, (
+                f"the panel draws {row[1]!r} for {row[0]!r}, which is not a "
+                f"duration"
+            )
+        clock = _panel_clock_seconds(carried)
+        if clock is None:
+            return False, (
+                f"the read model carries no clock for {row[0]!r}: neither "
+                f"running_sec nor elapsed_sec"
+            )
+        bound = _panel_parity_bound(0.0, slack)
+        if abs(drawn_seconds - clock) > bound:
+            return False, (
+                f"the panel says {row[0]!r} has been running for "
+                f"{drawn_seconds}s, the read model says {clock}s"
+            )
+    return True, ""
+
+
+def _panel_drew_the_model(
+    drawn: List[List[str]], model_rows: List[Dict[str, Any]]
+) -> Tuple[bool, str]:
+    """Whether the panel's running rows are the model's rows, second for second.
+
+    The panel draws one read model.  When it has drawn the model it was
+    fed, the duration it draws is that model's own clock — not a clock
+    read a moment earlier, and not another clock altogether.
+
+    :func:`_panel_rows_match` answers the same question for a drawing
+    that may be one poll period old; this one asks for the drawing of
+    **this** model, which is what the comparison is about.
+
+    Returns ``(True, "")`` when the two agree, and ``(False, why)``
+    with the reason when they do not.
+    """
+    matched, why = _panel_rows_match(drawn, model_rows)
+    if not matched:
+        return False, why
+    for row, carried in zip(drawn, model_rows):
+        drawn_seconds, slack = _duration_seconds(row[1])
+        clock = _panel_clock_seconds(carried)
+        if drawn_seconds is None or clock is None:
+            # _panel_rows_match has already refused a row without a
+            # duration or without a clock: there is nothing left to
+            # compare here.
+            continue
+        if abs(drawn_seconds - clock) > slack:
+            return False, (
+                f"the panel draws {row[0]!r} as running for {drawn_seconds}s, "
+                f"the read model it was fed says {clock}s"
+            )
+    return True, ""
+
+
+def _wait_for_panel_parity(
+    page: Any,
+    served_states: List[Dict[str, Any]],
+    timeout: float = 20.0,
+) -> Tuple[List[List[str]], Dict[str, Any]]:
+    """Wait until the panel draws the read model it was fed.
+
+    The panel is fed a model every few seconds and draws the one it
+    was fed last, so the rows on the screen may belong to a model that
+    is one poll period old — and, in the moment after a poll, to no
+    model at all yet.  A comparison is only a comparison of one
+    snapshot with itself when the panel has drawn the model it was
+    fed, so the case waits for that before it compares anything.
+
+    The models served **before** the panel is read are the ones the
+    rows may belong to: a response that arrives while the panel is
+    being read must not be taken for the model the panel drew.  The
+    count of the served models is taken before the panel is read for
+    that reason.
+
+    Returns the rows the panel draws and the read model they were
+    drawn from.  When the panel has not drawn that model within
+    *timeout* seconds, the wait fails with the reason it did not.
+    """
+    deadline = time.monotonic() + timeout
+    why = "the panel has not been fed a read model yet"
+    while True:
+        served_count = len(served_states)
+        drawn = read_running(page)
+        model = served_state(served_states[:served_count], time.time())
+        if model is None:
+            why = "the panel has not been fed a read model yet"
+        else:
+            matched, why = _panel_drew_the_model(
+                drawn, list(model.get("running") or [])
+            )
+            if matched:
+                return drawn, model
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"the panel did not draw the read model it was fed within "
+                f"{timeout:g}s: {why}"
+            )
+        page.wait_for_timeout(200)
 
 
 # ---------------------------------------------------------------------------
@@ -1319,7 +1637,9 @@ class _World:
 
     # -- the panel ----------------------------------------------------------
 
-    def drive(self, steps: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    def drive(
+        self, steps: Sequence[Dict[str, Any]], parity: bool = False
+    ) -> Dict[str, Any]:
         """Drive the panel through *steps* and report what it did.
 
         A step names an action and a plan, and says how the action is
@@ -1328,6 +1648,11 @@ class _World:
         command the panel draws no button for.  Nothing is simulated —
         the browser clicks the panel's own buttons and the report is
         what the panel then shows.
+
+        With *parity* the driver waits until the panel has drawn the
+        read model it was fed, and reports that model as
+        ``panel_state``: the rows on the screen belong to that model and
+        to no other, so they may be compared with it.
         """
         interpreter = _playwright_interpreter()
         if interpreter is None:
@@ -1346,6 +1671,7 @@ class _World:
                 f"{self.base_url}/",
                 json.dumps(list(steps), ensure_ascii=False),
                 str(SCREEN_DIR),
+                "1" if parity else "0",
             ],
             capture_output=True,
             text=True,
@@ -2014,6 +2340,13 @@ def test_panel_and_api_parity(world):
     answers with.  A panel that draws its own numbers is a second answer
     to the same question, and the operator has no way of telling which
     of the two the scheduler is using.
+
+    The running plans are compared with the read model **the panel was
+    fed**: the panel draws the model it read at its last poll, so that
+    model is the one its rows belong to.  The read model read through
+    the API afterwards is the same clock read a moment later, and how
+    far apart two readings of one clock may be is the panel's own poll
+    period plus the gap between the two readings.
     """
     _assert_seam(world)
     _wait_for_executors(world)
@@ -2028,8 +2361,11 @@ def test_panel_and_api_parity(world):
     # panel's number lies between them.
     state_before = world.scheduler_state()
 
-    report = world.drive([])
-
+    # The panel is waited for until it has drawn the read model it was
+    # fed, and that model is reported as ``panel_state``: the rows on
+    # the screen belong to that model and to no other, so they may be
+    # compared with it.
+    report = world.drive([], parity=True)
     state = report["api"]
     state_after = world.scheduler_state()
     assert isinstance(state, dict) and "capacity" in state, (
@@ -2095,45 +2431,104 @@ def test_panel_and_api_parity(world):
         )
 
     # The running plans, row by row: the plan, and whether it may be
-    # interrupted.  The elapsed time is a clock, and the two sides do
-    # not read it at the same moment: the panel draws the number it
-    # read on its last poll, and the driver reads the model again only
-    # once the panel is done.  So the panel's number is compared as
-    # what it is — one reading of the clock, taken somewhere inside
-    # the drive — and the two readings that surround the drive say
-    # where "somewhere inside" may be.  A number that falls between
-    # them is the same fact read at two ends; a number that falls
-    # outside them is a panel that drew something else.
-    # The panel draws it as a duration and the read model carries
-    # seconds, so the drawing is turned back into seconds first.
-    panel_running = report["running"]
-    assert len(panel_running) == len(state["running"]), (
-        f"the panel draws {len(panel_running)} running plans, the read model "
-        f"carries {len(state['running'])}"
+    # interrupted.  Two comparisons are made, and each of them is made
+    # with the model it belongs to.
+    #
+    # * the rows on the screen belong to the read model **the panel was
+    #   fed** — that model and to no other — so the rows are compared
+    #   with it, field by field;
+    # * the duration the panel draws is a clock, and the two sides do
+    #   not read it at the same moment: the panel draws the number it
+    #   read on its last poll, and the driver reads the model again
+    #   only once the panel is done.  So the panel's number is
+    #   compared as what it is — one reading of the clock, taken
+    #   somewhere inside the drive — and the two readings that
+    #   surround the drive say where "somewhere inside" may be.  A
+    #   number that falls between them is the same fact read at two
+    #   ends; a number that falls outside them is a panel that drew
+    #   something else.
+    #
+    # The panel draws a duration and the read model carries seconds,
+    # so the drawing is turned back into seconds first.
+    panel_state = report["panel_state"]
+    assert panel_state is not None, (
+        "the driver did not report the read model the panel was fed; the "
+        "panel's rows cannot be compared with a model that was never "
+        "captured"
     )
-    # The two readings are indexed by the plan they are about: the
-    # order of the running plans is the scheduler's, and the two
-    # sides are not required to agree on it.
+    served_running = list(panel_state.get("running") or [])
+    panel_running = report["running"]
+    assert len(panel_running) == len(served_running), (
+        f"the panel draws {len(panel_running)} running plans, the read model "
+        f"it was fed carries {len(served_running)}"
+    )
+
+    # The panel's rows are the rows of the model it was fed.
+    matched, why = _panel_rows_match(panel_running, served_running)
+    assert matched, (
+        f"the panel's running rows are not the rows of the read model it "
+        f"was fed: {why}"
+    )
+
+    # The read model read through the API afterwards carries the same
+    # running plans and says the same thing about each of them.  The
+    # two are indexed by the plan they are about: the order of the
+    # running plans is the scheduler's, and the two sides are not
+    # required to agree on it.
+    api_running = {
+        str(row["plan_id"]): row for row in state.get("running") or []
+    }
+    assert len(panel_running) == len(api_running), (
+        f"the panel draws {len(panel_running)} running plans, the read model "
+        f"carries {len(api_running)}"
+    )
+    for drawn in panel_running:
+        carried = api_running.get(str(drawn[0]))
+        assert carried is not None, (
+            f"the panel draws {drawn[0]!r} as running, the read model does "
+            f"not carry it"
+        )
+        assert drawn[2] == ("是" if carried["evictable"] else "否"), (
+            f"the panel says {drawn[0]!r} may be interrupted is {drawn[2]!r}; "
+            f"the read model says evictable={carried['evictable']!r}"
+        )
+
+    # The two readings that surround the drive, indexed the same way.
     before_by_id = {
         str(row["plan_id"]): row for row in state_before.get("running", [])
     }
     after_by_id = {
         str(row["plan_id"]): row for row in state_after.get("running", [])
     }
-    for drawn, carried in zip(panel_running, state["running"]):
-        assert drawn[0] == str(carried["plan_id"]), (
-            f"the panel draws {drawn[0]!r} as running, the read model says "
-            f"{carried['plan_id']!r}"
-        )
-        assert drawn[2] == ("是" if carried["evictable"] else "否"), (
-            f"the panel says {drawn[0]!r} may be interrupted is {drawn[2]!r}; "
-            f"the read model says evictable={carried['evictable']!r}"
-        )
+
+    for drawn, carried in zip(panel_running, served_running):
         drawn_elapsed, slack = _duration_seconds(drawn[1])
         assert drawn_elapsed is not None, (
             f"the panel draws {drawn[1]!r} for {drawn[0]!r}, which is not a "
             f"duration"
         )
+
+        # And the duration the panel draws is that model's own clock:
+        # the panel drew the model, so the two are one reading and not
+        # two.  The panel draws a duration and the read model carries
+        # seconds, so the drawing is turned back into seconds first;
+        # what the drawing leaves out — the seconds of an hour and a
+        # half — is the slack.
+        expected = _panel_clock_seconds(carried)
+        assert expected is not None, (
+            f"the read model the panel was fed carries no clock for "
+            f"{carried.get('plan_id')!r}: neither running_sec nor elapsed_sec"
+        )
+        assert abs(drawn_elapsed - expected) <= slack, (
+            f"the panel says {drawn[0]!r} has been running for {drawn_elapsed}s, "
+            f"the read model it was fed says {expected}s"
+        )
+
+        # The same number has to lie between the two readings that
+        # surround the drive: whichever clock the panel drew, its number
+        # was read inside the drive, and the clock it was read on only
+        # moves forward.
+        #
         # The panel draws the **plan** clock — ``running_sec`` — and falls
         # back to the slot clock only when the plan clock is unknown.
         # That is what ``frontend/app.js`` reads, verbatim:
@@ -2144,7 +2539,7 @@ def test_panel_and_api_parity(world):
         # scheduler was busy and green exactly when it was not.  The
         # read model carries both clocks; the one the panel drew is the
         # one compared here.
-        plan_id = str(carried["plan_id"])
+        plan_id = str(drawn[0])
         before_row = before_by_id.get(plan_id)
         after_row = after_by_id.get(plan_id)
         assert before_row is not None and after_row is not None, (
@@ -2166,8 +2561,8 @@ def test_panel_and_api_parity(world):
         # reading of the read model therefore sits at the moment the
         # panel drew its number — but two readings that surround the
         # drive do, and the panel's number lies between them.
-        before_clock = _panel_clock(before_row)
-        after_clock = _panel_clock(after_row)
+        before_clock = _panel_clock_seconds(before_row)
+        after_clock = _panel_clock_seconds(after_row)
         assert before_clock is not None and after_clock is not None, (
             f"the read model carries no clock the panel could draw for "
             f"{plan_id!r}: before the drive {before_row!r}, after it "
@@ -2193,6 +2588,38 @@ def test_panel_and_api_parity(world):
             f"the panel says {drawn[0]!r} has been running for {drawn_elapsed}s; "
             f"the read model read {before_clock}s before the drive and "
             f"{after_clock}s after it"
+        )
+
+    # The read model read through the API afterwards is the same clock
+    # read a moment later.  It may not be behind the model the panel
+    # was fed — a clock does not run backwards — and it may not be
+    # more than one poll period (plus the gap between the two
+    # readings) ahead of it: further apart than that is not one clock
+    # read twice, it is two different facts.
+    fresh_by_plan = {str(row["plan_id"]): row for row in state["running"]}
+    bound = _panel_parity_bound(report["read_gap"], 0)
+    for carried in served_running:
+        plan_id = str(carried.get("plan_id"))
+        fresh_row = fresh_by_plan.get(plan_id)
+        assert fresh_row is not None, (
+            f"the read model read now does not carry {plan_id!r} as running, "
+            f"though the model the panel was fed did"
+        )
+        fresh = _panel_clock_seconds(fresh_row)
+        assert fresh is not None, (
+            f"the read model read now carries no clock for {plan_id!r}: "
+            f"neither running_sec nor elapsed_sec"
+        )
+        expected = _panel_clock_seconds(carried)
+        assert expected is not None, (
+            f"the read model the panel was fed carries no clock for "
+            f"{plan_id!r}: neither running_sec nor elapsed_sec"
+        )
+        assert 0 <= fresh - expected <= bound, (
+            f"the read model read now says {plan_id!r} has been running for "
+            f"{fresh}s, the model the panel was fed says {expected}s: the "
+            f"two readings are not within one poll period plus the gap "
+            f"between them ({bound:g}s)"
         )
 
     # The two readings must also be the readings of the same server: the
@@ -2278,6 +2705,82 @@ def test_queue_survives_kill9(world):
     # executor of each of them is the same process as before the crash.
     for plan_id in after_slots:
         command = _process_command(_exec_pid(world, plan_id))
+        assert "deterministic_executor.py" in command, (
+            f"{plan_id}'s executor is not the stand-in after the restart: "
+            f"{command!r}"
+        )
+
+
+def _wait_for_readopted(
+    world: _World,
+    before: Dict[str, int],
+    timeout: float = 30.0,
+) -> Dict[str, Dict[str, Any]]:
+    """Wait until every run that outlived the backend has its row back.
+
+    Args:
+        world: the world the case runs in.
+        before: the pid each plan's executor had before the restart.
+        timeout: how long to wait for the rows to come back.
+
+    Returns:
+        The execution rows, keyed by plan id.
+
+    Raises:
+        AssertionError: when a run is still not written down in time.
+    """
+    deadline = time.monotonic() + timeout
+    rows: List[Dict[str, Any]] = []
+    while time.monotonic() < deadline:
+        rows = world.exec_rows()
+        by_plan = {str(row["plan_id"]): row for row in rows}
+        if all(
+            str(by_plan.get(plan_id, {}).get("exec_status") or "") == "running"
+            and by_plan.get(plan_id, {}).get("exec_pid")
+            for plan_id in before
+        ):
+            return by_plan
+        time.sleep(0.2)
+    raise AssertionError(
+        f"the runs that outlived the backend were not written back within "
+        f"{timeout}s; the execution rows were {rows!r} and the runs that were "
+        f"going were {before!r}"
+    )
+
+
+def test_a_run_that_outlived_the_backend_is_kept(world):
+    """The executor of a working plan outlives the backend — and so does its row.
+
+    A ``kill -9`` of the backend does not kill the executors it
+    spawned: the processes are in groups of their own and they go on.
+    The plan's execution row has to say the same thing after the
+    restart.
+
+    A row that says the run is over is a row the facts read as "not
+    working", and a plan that is not working is a plan whose slot may
+    be handed to somebody else — while the work is still going.  The
+    plan would then be counted twice: once as running and once as
+    waiting.
+    """
+    _assert_seam(world)
+    before = _wait_for_executors(world)
+
+    world.kill9()
+    world.start()
+
+    rows = _wait_for_readopted(world, before)
+
+    for plan_id, pid in before.items():
+        row = rows[plan_id]
+        assert str(row.get("exec_status") or "") == "running", (
+            f"{plan_id}'s run was written down as {row.get('exec_status')!r} "
+            f"after the restart; the executor (pid {pid}) outlived the backend"
+        )
+        assert int(row["exec_pid"]) == pid, (
+            f"{plan_id}'s row names pid {row['exec_pid']!r} after the "
+            f"restart; the run that was going was pid {pid}"
+        )
+        command = _process_command(pid)
         assert "deterministic_executor.py" in command, (
             f"{plan_id}'s executor is not the stand-in after the restart: "
             f"{command!r}"
