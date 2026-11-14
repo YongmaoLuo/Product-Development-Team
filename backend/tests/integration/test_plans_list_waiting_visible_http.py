@@ -74,6 +74,11 @@ from fastapi.testclient import TestClient
 
 import server
 
+# The rule the listing uses to tell a plan directory from somebody
+# else's bookkeeping under the plans root.  It is imported rather than
+# spelled out, so this test cannot drift away from the rule it pins.
+from routes.plans import PLAN_ARTIFACT_FILENAMES  # noqa: E402
+
 # The reaper keeps its own runtime state beside the plan artifacts, in a
 # directory whose name starts with a dot.  The constants are imported
 # rather than spelled out, so this test cannot drift away from the
@@ -107,6 +112,13 @@ NORMAL_ID = "20261024-vp-quota-normal"
 #: A plan that really failed.  ``failed`` IS terminal, so the default
 #: list must not show it.
 CRASH_ID = "20261024-vp-quota-crash"
+
+#: A plan the state database knows, whose artifacts have not been
+#: written yet: the directory is in the tree, the plan artifact is not.
+KNOWN_TO_DB_ID = "20261024-vp-quota-known-to-db"
+
+#: A plan on disk that the state database knows nothing about.
+UNKNOWN_TO_DB_ID = "20261024-vp-quota-unknown-to-db"
 
 #: The phase that must never be treated as terminal: the plan is parked,
 #: not dead.  The list filters on this value, so it is the whole
@@ -1159,4 +1171,230 @@ def test_a_reaper_state_dir_under_the_plans_root_does_not_make_the_listing_refus
     assert resp.headers.get(PLANS_DIR_HEADER) == str(plans_dir), (
         f"the answer must name the tree it read; got "
         f"{PLANS_DIR_HEADER}={resp.headers.get(PLANS_DIR_HEADER)!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# A directory that carries no plan artifact is not a plan
+# ---------------------------------------------------------------------------
+#
+# The verification round leaves its own bookkeeping under the plans root:
+# a directory whose only content is a ``reports/`` folder holding the
+# round's root-cause write-up.  That directory is not a plan — it holds
+# no plan artifact at all — but the listing counted EVERY non-dot
+# directory as tree evidence, so an instance that really had no plans
+# was told its data plane did not describe the tree: a 503 where the
+# truth was an empty list.
+#
+# The rule the listing needs is the one the rest of the framework
+# already uses: a directory is a plan when it carries a plan artifact
+# (``tasks.json`` and friends).  A directory that carries none is
+# somebody else's bookkeeping that happens to live under the plans root.
+#
+# The refusal itself is untouched: a directory that really IS a plan
+# (see the case above) still refuses when the database knows nothing
+# about it.
+
+
+def test_a_directory_holding_only_reports_does_not_make_the_listing_refuse(
+    tmp_path: Path,
+) -> None:
+    """A tree whose only directory holds no plan artifact answers ``[]``.
+
+    This instance has no plans: the only directory under its plans root
+    is a leftover archive that carries a ``reports/`` folder and no plan
+    artifact whatsoever.
+
+    So the listing must answer 200 with an empty array — the same answer
+    an instance with an empty tree gives — instead of refusing.  The
+    refusal would be a lie about the instance: it says "the database
+    behind this port is somebody else's", when the truth is "this
+    instance has no plans".
+    """
+    plans_dir = tmp_path / "plans"
+    plans_dir.mkdir(parents=True, exist_ok=True)
+
+    # The archive the verification round leaves behind: a directory with
+    # a reports folder and nothing that belongs to a plan.
+    archive_dir = plans_dir / "20261029-PDT-main-boot-readin"
+    (archive_dir / "reports").mkdir(parents=True, exist_ok=True)
+    (archive_dir / "reports" / "root-cause-VP-016.md").write_text(
+        "archive\n", encoding="utf-8",
+    )
+    assert not any(
+        (archive_dir / name).exists() for name in PLAN_ARTIFACT_FILENAMES
+    ), (
+        "this case is about a directory that carries NO plan artifact; "
+        "the fixture would stop testing what it claims to test"
+    )
+
+    # The state database EXISTS and holds no plan row: this instance
+    # really has no plans — it is not the "another instance's database"
+    # case the refusal above is about.
+    db_path = server._state_db_path()
+    _seed_state_db(db_path, ())
+    assert db_path.exists(), (
+        "this case is about an instance with no plans, not about a "
+        "missing database; the file must exist"
+    )
+
+    client = _client()
+    # The request carries the guard's first-party header, exactly as the
+    # verification probe that found the 503 sent it.
+    resp = client.get("/api/plans", headers={"X-PDT-Request": "1"})
+
+    assert resp.status_code == 200, (
+        f"an instance whose tree holds no plans must answer, not refuse; "
+        f"got {resp.status_code}: {resp.text!r}"
+    )
+    body = resp.json()
+    assert isinstance(body, list), (
+        f"the plans list must be a JSON array; got {type(body).__name__}"
+    )
+    assert body == [], (
+        f"a directory carrying no plan artifact is not a plan, so the list "
+        f"must be empty; got {body!r}"
+    )
+    assert resp.headers.get(DATA_SOURCE_HEADER) == SOURCE_STATE_DB, (
+        f"the answer must say it read the state database — the database "
+        f"exists and holds no plan row — and not that it degraded to a "
+        f"directory scan; got "
+        f"{DATA_SOURCE_HEADER}={resp.headers.get(DATA_SOURCE_HEADER)!r}"
+    )
+    assert resp.headers.get(PLANS_DIR_HEADER) == str(plans_dir), (
+        f"the answer must name the tree it read; got "
+        f"{PLANS_DIR_HEADER}={resp.headers.get(PLANS_DIR_HEADER)!r}"
+    )
+
+
+def test_a_directory_holding_only_a_verification_runs_output_is_not_a_plan(
+    tmp_path: Path,
+) -> None:
+    """A run's own bookkeeping is not the plan's artifact.
+
+    The boundary of the rule, pinned where it is easy to get wrong: a
+    verification round writes its OUTPUTS into the directory it was
+    pointed at (``verification_plan.json``, ``verification_report.json``,
+    the round scope, the logs).  A fixture that registers itself in the
+    served instance and then takes its rows away again leaves exactly
+    that directory behind — a directory full of a run's bookkeeping and
+    of no plan artifact at all.
+
+    So the listing must answer 200 with an empty array for such a tree:
+    the run's outputs say nothing about the state database, and treating
+    them as tree evidence refuses an instance that has no plans.
+    """
+    plans_dir = tmp_path / "plans"
+    plans_dir.mkdir(parents=True, exist_ok=True)
+
+    leftover = plans_dir / "pdt-e2e-vp015-0a526c3b"
+    leftover.mkdir(parents=True, exist_ok=True)
+    (leftover / "verification_plan.json").write_text(
+        '{"verification_points": []}\n', encoding="utf-8",
+    )
+    (leftover / "verification_report.json").write_text(
+        '{"overall_status": "passed"}\n', encoding="utf-8",
+    )
+    (leftover / "verification_round_scope.json").write_text(
+        '{"round": 1}\n', encoding="utf-8",
+    )
+    (leftover / "execution.log").write_text("log\n", encoding="utf-8")
+
+    db_path = server._state_db_path()
+    _seed_state_db(db_path, ())
+    assert db_path.exists(), (
+        "this case is about an instance with no plans, not about a "
+        "missing database; the file must exist"
+    )
+
+    client = _client()
+    resp = client.get("/api/plans", headers={"X-PDT-Request": "1"})
+
+    assert resp.status_code == 200, (
+        f"an instance whose tree holds no plans must answer, not refuse; "
+        f"got {resp.status_code}: {resp.text!r}"
+    )
+    body = resp.json()
+    assert isinstance(body, list), (
+        f"the plans list must be a JSON array; got {type(body).__name__}"
+    )
+    assert body == [], (
+        f"a run's outputs are not a plan artifact, so the list must be "
+        f"empty; got {body!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# A plan the database knows proves the database describes this tree
+# ---------------------------------------------------------------------------
+#
+# The rule above answers ONE question: "does the tree hold a plan?".  The
+# refusal answers a second one: "does the database describe THIS tree?".
+#
+# The two questions do not have the same evidence.  A plan whose
+# artifacts have not been written yet — a plan that was routed before its
+# task list landed — carries no plan artifact, so it cannot prove that
+# the tree HOLDS a plan.  But it is a plan the DATABASE knows, and its
+# directory is in THIS tree, so it does prove that the database
+# describes this tree — which is the question the refusal is about.
+#
+# Refusing there would be the same lie in a different costume: the
+# refusal says "the database behind this port is somebody else's", and
+# the database plainly is not — it knows a plan that lives right here.
+
+
+def test_a_plan_the_database_knows_proves_the_database_describes_this_tree(
+    tmp_path: Path,
+) -> None:
+    """A known plan in the tree means the listing answers, not refuses.
+
+    The tree holds two directories: one the database knows, whose
+    artifacts have not been written yet, and one that really is a plan
+    (it carries its task list) and that the database knows nothing
+    about.
+
+    The database knows a plan that lives in this tree, so the two halves
+    belong together and the listing must answer 200 — with the known
+    plan in it, because that plan is in this instance's database.
+    """
+    plans_dir = tmp_path / "plans"
+    plans_dir.mkdir(parents=True, exist_ok=True)
+
+    # A plan the database knows, whose artifacts have not been written
+    # yet: the directory is there, the plan artifact is not.
+    known_dir = plans_dir / KNOWN_TO_DB_ID
+    known_dir.mkdir(parents=True, exist_ok=True)
+    assert not any(
+        (known_dir / name).exists() for name in PLAN_ARTIFACT_FILENAMES
+    ), (
+        "this case is about a plan whose artifacts have not been written "
+        "yet; the fixture would stop testing what it claims to test"
+    )
+
+    # A plan on disk that the database does NOT know: it carries its
+    # task list, so the tree really does hold a plan.
+    _write_plan_dir(plans_dir, UNKNOWN_TO_DB_ID)
+
+    db_path = server._state_db_path()
+    _seed_state_db(db_path, ((KNOWN_TO_DB_ID, "ready", "not_started"),))
+    assert db_path.exists(), (
+        "this case is about a database that knows one plan of this tree, "
+        "not about a missing database; the file must exist"
+    )
+
+    client = _client()
+    resp = client.get("/api/plans", headers={"X-PDT-Request": "1"})
+
+    assert resp.status_code == 200, (
+        f"the database knows a plan that lives in this tree, so the "
+        f"listing must answer, not refuse; got {resp.status_code}: "
+        f"{resp.text!r}"
+    )
+    body = resp.json()
+    assert isinstance(body, list), (
+        f"the plans list must be a JSON array; got {type(body).__name__}"
+    )
+    assert KNOWN_TO_DB_ID in _plan_ids(body), (
+        f"the plan the database knows is this instance's plan and must be "
+        f"in the list; got {_plan_ids(body)!r}"
     )

@@ -1044,9 +1044,8 @@ def _clock_readings(row: Dict[str, Any]) -> List[int]:
     clock — how long the plan has been at it — and ``elapsed_sec`` is
     the slot's clock — how long the slot has been held.  The panel draws
     the plan's clock and falls back to the slot's clock for a listing
-    that carries no plan clock, so the case cannot tell which of the
-    two the panel drew; both are read here, and the panel's number has
-    to fit between them either way.
+    that carries no plan clock; both are read here, so a row is
+    described in full and a bound can be taken from either of them.
     """
     values: List[int] = []
     for name in ("running_sec", "elapsed_sec"):
@@ -2529,6 +2528,17 @@ def test_panel_and_api_parity(world):
         # surround the drive: whichever clock the panel drew, its number
         # was read inside the drive, and the clock it was read on only
         # moves forward.
+        #
+        # The panel draws the **plan** clock — ``running_sec`` — and falls
+        # back to the slot clock only when the plan clock is unknown.
+        # That is what ``frontend/app.js`` reads, verbatim:
+        # ``item.running_sec ?? item.elapsed_sec``.  Comparing the drawn
+        # duration against the *slot* clock compares two different
+        # quantities: the two differ by the whole time the plan spent
+        # waiting for a slot, so the case went red exactly when the
+        # scheduler was busy and green exactly when it was not.  The
+        # read model carries both clocks; the one the panel drew is the
+        # one compared here.
         plan_id = str(drawn[0])
         before_row = before_by_id.get(plan_id)
         after_row = after_by_id.get(plan_id)
@@ -2537,22 +2547,47 @@ def test_panel_and_api_parity(world):
             f"drive: before the drive it carried {before_row!r}, after it "
             f"carried {after_row!r}"
         )
-        # The bounds are the smallest and the largest of the numbers the
-        # two readings carry: whichever clock the panel drew, its number
-        # was read inside the drive, and the clock it was read on only
-        # moves forward.
         before_clocks = _clock_readings(before_row)
         after_clocks = _clock_readings(after_row)
         assert before_clocks and after_clocks, (
             f"the read model carries no clock for {plan_id!r}: before the "
             f"drive {before_row!r}, after it {after_row!r}"
         )
-        lo = min(before_clocks + after_clocks)
-        hi = max(before_clocks + after_clocks)
+        # The number the panel drew is one reading of the clock the
+        # panel draws, and it was read *inside* the drive: the panel
+        # polls, so the number it draws is the one it read on its last
+        # poll, and the driver reads the model again only after the
+        # panel is done and its screenshot has been taken.  No single
+        # reading of the read model therefore sits at the moment the
+        # panel drew its number — but two readings that surround the
+        # drive do, and the panel's number lies between them.
+        before_clock = _panel_clock_seconds(before_row)
+        after_clock = _panel_clock_seconds(after_row)
+        assert before_clock is not None and after_clock is not None, (
+            f"the read model carries no clock the panel could draw for "
+            f"{plan_id!r}: before the drive {before_row!r}, after it "
+            f"{after_row!r}"
+        )
+        # The bounds are the smallest and the largest of the numbers the
+        # two readings carry of the clock the panel drew: that clock
+        # only moves forward, and the panel's number was read inside the
+        # drive.  When the two readings disagree about which clock the
+        # panel drew — the plan clock appeared or disappeared between
+        # them — the bounds widen to every clock the two rows carry: the
+        # same fact, compared without pretending to know which clock it
+        # was.
+        before_is_plan = before_row.get("running_sec") is not None
+        after_is_plan = after_row.get("running_sec") is not None
+        if before_is_plan == after_is_plan:
+            lo = min(before_clock, after_clock)
+            hi = max(before_clock, after_clock)
+        else:
+            lo = min(before_clocks + after_clocks)
+            hi = max(before_clocks + after_clocks)
         assert lo - slack <= drawn_elapsed <= hi + slack, (
             f"the panel says {drawn[0]!r} has been running for {drawn_elapsed}s; "
-            f"the read model read {before_clocks} before the drive and "
-            f"{after_clocks} after it"
+            f"the read model read {before_clock}s before the drive and "
+            f"{after_clock}s after it"
         )
 
     # The read model read through the API afterwards is the same clock

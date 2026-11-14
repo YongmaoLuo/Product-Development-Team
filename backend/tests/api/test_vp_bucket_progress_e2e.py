@@ -284,6 +284,20 @@ def _child_env(plans_root: Path, state_db: Path) -> Dict[str, str]:
     里的 ``setdefault``），但那是**进程内**的：白名单 env 不继承父进程环
     境，于是子 server 照样做机器级清扫，lifespan 被拖到 18~21s。父进程已
     经有值就原样透传 —— 父进程说 ``"0"`` 就让子进程扫，谁定的谁说了算。
+
+    ``PDT_PROVIDER_MODE=inherit``：服务启动时要问 CC Switch 要 provider
+    链（``server.load_providers``），问的是 ``127.0.0.1:4000`` —— 一个
+    **别的进程**，带 2s 超时。白名单里少了这个变量，子 server 就按默认
+    的 ``cc-switch`` 模式去问；那台机器上 CC Switch 正在跑但正忙着的时候，
+    这次问就是一个 **connect timeout**，``load_providers`` 抛
+    ``ProviderOrderError``，lifespan 直接失败，进程以 rc=3 退出 —— 端口
+    永远不监听，健康检查只看到「子进程死了」。inherit 模式是这套代码自己
+    留的「这里没有 provider 集群」的配置，与 ``/progress`` 读的是哪张表
+    毫无关系，却决定了服务能不能起来。
+
+    ``PDT_ORPHAN_REAPER=0``：白名单是「不带就出事」，所以这里**要**带着
+    这个开关进去 —— 真服务一启动就会扫全机进程，还要留一个脱离本进程的
+    常驻 reaper。这是一次性服务，它没有资格去动跑它的这台机器。
     """
     return {
         "PATH": os.environ.get("PATH", ""),
@@ -292,7 +306,9 @@ def _child_env(plans_root: Path, state_db: Path) -> Dict[str, str]:
         "PYTHONPATH": str(_BACKEND_DIR.parent),
         "PDT_PLANS_DIR": str(plans_root),
         "PDT_STATE_DB_PATH": str(state_db),
+        "PDT_PROVIDER_MODE": "inherit",
         "PDT_DISABLE_TEMP_SWEEP": os.environ.get("PDT_DISABLE_TEMP_SWEEP", "1"),
+        "PDT_ORPHAN_REAPER": "0",
     }
 
 

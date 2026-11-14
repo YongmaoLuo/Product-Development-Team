@@ -284,6 +284,17 @@ def test_stopping_the_reensure_thread_joins_it(monkeypatch):
     monkeypatch.setenv(
         server_mod.ORPHAN_REAPER_ENSURE_INTERVAL_ENV, "0.05"
     )
+    # The premise, stated out loud: a **deployment's** plans root gets
+    # the re-ensure thread, a scratch one does not.  The test harness
+    # points ``PDT_PLANS_DIR`` at pytest's own ``tmp_path`` — which is
+    # a scratch directory — so without this the product would (correctly)
+    # refuse to start the thread and there would be nothing to stop.
+    # The product's refusal is not what this case is about: this one is
+    # about the thread's lifecycle, and it can only reach that thread
+    # once the premise holds.
+    monkeypatch.setattr(
+        server_mod, "_plans_root_is_scratch", lambda plans_dir: False
+    )
 
     rounds = []
     original_loop = server_mod._orphan_reaper_reensure_loop

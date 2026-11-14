@@ -41,6 +41,7 @@ import shlex
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -87,13 +88,14 @@ def clean_spawn_env(monkeypatch):
 
 
 class _Config:
-    """The one field of :class:`ReaperConfig` these hooks read."""
+    """The two fields of :class:`ReaperConfig` these hooks read."""
 
-    def __init__(self, enabled: bool = True) -> None:
+    def __init__(self, enabled: bool = True, plans_root=None) -> None:
         self.enabled = enabled
+        self.plans_root = plans_root
 
 
-def _drive_lifespan(monkeypatch: pytest.MonkeyPatch) -> None:
+def _drive_lifespan(monkeypatch: pytest.MonkeyPatch):
     """Enter ``server._lifespan`` against a fake app.
 
     The recovery helpers and the heartbeat are stubbed so the lifespan
@@ -106,6 +108,14 @@ def _drive_lifespan(monkeypatch: pytest.MonkeyPatch) -> None:
     be swept for real by every test in this file.  The thread is
     captured and joined before the helper returns, so no test leaves a
     sweep running behind it.
+
+    The reaper's own start-up thread is joined for the same reason: a
+    test that leaves a machine-wide scan running behind it leaves a
+    process of this machine's reading every process of this machine.
+
+    Returns the fake app and how long the lifespan itself took, which
+    is the readiness path and nothing else: the threads are joined
+    *after* the clock has stopped.
     """
     monkeypatch.setattr(server_mod, "_recover_execution_states", lambda plans_dir: None)
     monkeypatch.setattr(server_mod, "_recover_verification_states", lambda plans_dir: None)
@@ -133,13 +143,24 @@ def _drive_lifespan(monkeypatch: pytest.MonkeyPatch) -> None:
         async with server_mod._lifespan(fake_app):
             pass
 
+    started = time.monotonic()
     asyncio.run(_enter())
+    elapsed = time.monotonic() - started
 
     for thread in sweep_threads:
         thread.join(timeout=10)
         assert not thread.is_alive(), (
             "the boot-sweep thread outlived the test — it must be joined"
         )
+
+    reaper_thread = getattr(fake_app.state, "orphan_reaper_startup", None)
+    if isinstance(reaper_thread, threading.Thread):
+        reaper_thread.join(timeout=60)
+        assert not reaper_thread.is_alive(), (
+            "the reaper start-up thread outlived the test — it must be joined"
+        )
+
+    return fake_app, elapsed
 
 
 # --------------------------------------------------------------------------
@@ -344,6 +365,76 @@ def test_install_marks_writes_no_kind(clean_spawn_env):
 # --------------------------------------------------------------------------
 
 
+def _start_reaper_and_wait() -> None:
+    """Start the reaper's start-up and wait for its thread to finish.
+
+    The machine-wide scan runs on a thread of its own, so that it is
+    not on the boot's readiness path.  A test that wants to know what
+    the start-up did has to wait for that thread — and waiting is also
+    what keeps a test from leaving a machine-wide scan running behind
+    it.
+    """
+    thread = server_mod._start_orphan_reaper()
+    if isinstance(thread, threading.Thread):
+        thread.join(timeout=60)
+        assert not thread.is_alive(), (
+            "the reaper start-up thread outlived the test — it must be joined"
+        )
+
+
+def test_the_boot_does_not_wait_for_the_machine_wide_scan(monkeypatch):
+    """A slow scan must not keep the port closed.
+
+    The scan reads **every process on the machine** and asks each of
+    them who spawned it.  On a busy box that is not a moment: it took
+    **36 s** here, measured, with the scan doing nothing but reading.
+
+    uvicorn binds the socket only *after* the lifespan returns, so a
+    scan on the readiness path is a port that stays closed for the
+    length of the scan.  The API answers nothing for those 36 s, and
+    every caller that waits for the port times out on a machine that is
+    merely busy.
+
+    The scan is housekeeping — it reclaims what a previous life of the
+    backend left behind, and the daemon reclaims it again 30 s later —
+    so it belongs on a thread of its own, next to the two boot sweeps
+    that were moved off the readiness path for the same reason.
+
+    The scan still has to *happen*: a scan that is merely fast enough
+    to not matter is not the same thing as a scan that runs.
+    """
+    calls = []
+    scan_seconds = 2.0
+
+    def slow_scan(_config):
+        calls.append("run_once")
+        time.sleep(scan_seconds)
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(
+        server_mod.orphan_reaper,
+        "config_from_env",
+        lambda: _Config(enabled=True),
+    )
+    monkeypatch.setattr(server_mod.orphan_reaper, "run_once", slow_scan)
+    monkeypatch.setattr(
+        server_mod.orphan_reaper,
+        "ensure_daemon",
+        lambda cfg, **kwargs: calls.append("ensure_daemon"),
+    )
+
+    _app, elapsed = _drive_lifespan(monkeypatch)
+
+    assert elapsed < scan_seconds, (
+        f"the boot waited {elapsed:.2f}s for a machine-wide scan that "
+        f"takes {scan_seconds:.1f}s — the scan is on the readiness path"
+    )
+    assert calls == ["run_once", "ensure_daemon"], (
+        f"the scan must still happen, and the daemon must still be "
+        f"started after it; got {calls!r}"
+    )
+
+
 def test_start_calls_run_once_and_ensure_daemon(monkeypatch):
     """Starting the backend makes one pass and starts the resident reaper.
 
@@ -371,7 +462,7 @@ def test_start_calls_run_once_and_ensure_daemon(monkeypatch):
         lambda cfg, **kwargs: calls.append(("ensure_daemon", cfg)) or 4321,
     )
 
-    server_mod._start_orphan_reaper()
+    _start_reaper_and_wait()
 
     assert calls == [
         "config_from_env",
@@ -401,7 +492,7 @@ def test_disabled_env_skips_both(monkeypatch, clean_spawn_env):
     )
 
     server_mod._install_orphan_reaper_marks()
-    server_mod._start_orphan_reaper()
+    _start_reaper_and_wait()
 
     assert calls == []
     assert "PDT_SPAWN_OWNER_PID" not in os.environ
@@ -434,7 +525,7 @@ def test_run_once_failure_does_not_abort_startup(monkeypatch, caplog):
     )
 
     with caplog.at_level(logging.WARNING):
-        server_mod._start_orphan_reaper()
+        _start_reaper_and_wait()
 
     assert calls == ["run_once", "ensure_daemon"]
     assert any("orphan_reaper" in record.message for record in caplog.records)
@@ -460,7 +551,7 @@ def test_ensure_daemon_failure_does_not_abort_startup(monkeypatch, caplog):
     monkeypatch.setattr(server_mod.orphan_reaper, "ensure_daemon", boom)
 
     with caplog.at_level(logging.WARNING):
-        server_mod._start_orphan_reaper()
+        _start_reaper_and_wait()
 
     assert any("orphan_reaper" in record.message for record in caplog.records)
 
@@ -480,6 +571,107 @@ def test_missing_reaper_module_is_a_no_op(monkeypatch, clean_spawn_env):
 
 
 # --------------------------------------------------------------------------
+# A scratch root gets no reaper -- neither half
+# --------------------------------------------------------------------------
+
+
+def test_a_scratch_root_gets_no_scan_and_no_daemon(monkeypatch, tmp_path):
+    """A scratch plans root is not a deployment's.
+
+    The boot's scan refuses it, and says so: "no scan and no resident
+    daemon are installed for it".  Both halves are machine-wide -- the
+    scan reads every process on the box, and the daemon is a detached
+    process that outlives this one and keeps reading every process on
+    the box every 30 s -- and neither belongs to an instance that was
+    started for one scratch run.
+
+    The plans root here is a pytest ``tmp_path``: a directory the
+    machine keeps its temporary files in, and therefore a scratch
+    directory by the same rule the boot applies.
+    """
+    calls = []
+    config = _Config(enabled=True, plans_root=tmp_path / "plans")
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(
+        server_mod.orphan_reaper,
+        "config_from_env",
+        lambda: config,
+    )
+    monkeypatch.setattr(
+        server_mod.orphan_reaper,
+        "run_once",
+        lambda cfg: calls.append("run_once"),
+    )
+    monkeypatch.setattr(
+        server_mod.orphan_reaper,
+        "ensure_daemon",
+        lambda cfg: calls.append("ensure_daemon"),
+    )
+
+    _start_reaper_and_wait()
+
+    assert calls == [], (
+        f"a scratch plans root got the machine-wide reaper: {calls!r}"
+    )
+
+
+def test_the_reensure_installs_no_daemon_for_a_scratch_root(
+    monkeypatch, tmp_path,
+):
+    """The re-ensure is the other half of the same promise.
+
+    The boot's scan refuses a scratch root and says so out loud: "no
+    scan and no resident daemon are installed for it".  The re-ensure
+    is the *other* half of that contract -- it asks the machine for a
+    daemon every few minutes -- and it has to refuse the same root, or
+    the promise the boot makes is a promise only the boot keeps.
+
+    A daemon is a detached process: it outlives the instance that
+    started it, it reads every process on the machine, and it does
+    that every 30 s for as long as it lives.  A scratch instance that
+    leaves one behind has left a machine-wide scan running behind it --
+    on the machine of whoever ran the scratch run, for as long as the
+    daemon lives.
+
+    The interval is shortened so the ask happens inside the test: the
+    thread waits for the interval before its first ask, and a test
+    that waits five minutes for one ask is a test that never runs.
+    """
+    calls = []
+    config = _Config(enabled=True, plans_root=tmp_path / "plans")
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv(server_mod.ORPHAN_REAPER_ENSURE_INTERVAL_ENV, "0.01")
+    monkeypatch.setattr(
+        server_mod.orphan_reaper,
+        "config_from_env",
+        lambda: config,
+    )
+    monkeypatch.setattr(
+        server_mod.orphan_reaper,
+        "ensure_daemon",
+        lambda cfg: calls.append("ensure_daemon"),
+    )
+
+    stop = server_mod._start_orphan_reaper_reensure()
+    try:
+        if stop is not None:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not calls:
+                time.sleep(0.01)
+    finally:
+        server_mod._stop_orphan_reaper_reensure()
+
+    assert stop is None, (
+        "the re-ensure started a thread for a scratch plans root -- the "
+        "boot promises that no resident daemon is installed for one"
+    )
+    assert calls == [], (
+        f"the re-ensure installed a resident daemon for a scratch plans "
+        f"root: {calls!r}"
+    )
+
 # The daemon the backend starts does not outlive the backend
 # --------------------------------------------------------------------------
 #
@@ -517,10 +709,26 @@ def _launched_daemon(monkeypatch, tmp_path):
         return real_ensure(config, popen=_Popen(), **kwargs)
 
     monkeypatch.setenv("PDT_PLANS_DIR", str(tmp_path))
+    # The plans root is **not** a scratch one.  The boot installs no
+    # reaper for a scratch root -- both halves are machine-wide, and a
+    # scratch root is nobody's deployment -- and the question this
+    # helper asks ("may the daemon outlive its owner?") is a question
+    # about the daemon that *is* started.  So the decision is taken
+    # here, out loud; the root itself stays inside the temporary
+    # directory, so nothing this helper writes lands outside it.
+    monkeypatch.setattr(
+        server_mod, "_plans_root_is_scratch", lambda plans_dir: False,
+    )
     monkeypatch.setattr(server_mod.orphan_reaper, "run_once", lambda cfg: None)
     monkeypatch.setattr(server_mod.orphan_reaper, "ensure_daemon", _ensure)
 
-    server_mod._start_orphan_reaper()
+    # The boot starts the scan and the daemon on a thread of its own --
+    # the scan of a busy machine takes seconds, and nothing that serves
+    # an API waits for it -- so the daemon is not launched by the time
+    # the boot returns.  The thread is joined here, which is also what
+    # keeps this test from leaving a machine-wide scan running behind
+    # it.
+    _start_reaper_and_wait()
 
     assert launched, "the backend started no daemon at all"
     return launched[0]

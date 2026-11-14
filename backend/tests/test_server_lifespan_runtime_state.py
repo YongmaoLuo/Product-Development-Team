@@ -113,7 +113,9 @@ def _stub_boot_sweeps(server_module, monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
 
-def _drive_lifespan(server_module, monkeypatch: pytest.MonkeyPatch) -> Any:
+def _drive_lifespan(
+    server_module, monkeypatch: pytest.MonkeyPatch, app: Any = None,
+) -> Any:
     """Enter ``server._lifespan`` against a fake app and return the
     injected ``app.state.runtime_state``.
 
@@ -127,6 +129,13 @@ def _drive_lifespan(server_module, monkeypatch: pytest.MonkeyPatch) -> Any:
     sit on the readiness path, so they run in the background — and a
     test that left that thread running would be a test that left a
     background sweep of the developer's machine running.
+
+    *app* lets a caller supply its own app double.  The default one is
+    a :class:`MagicMock`, whose ``state`` invents an attribute for
+    every name — and a name that is invented is a name that reads as
+    "already set".  A contract that asks "is a worker already running?"
+    therefore needs an app that answers the way the real one does; see
+    :class:`_StateApp`.
     """
     monkeypatch.setattr(server_module, "_recover_execution_states", lambda plans_dir: None)
     monkeypatch.setattr(server_module, "_recover_verification_states", lambda plans_dir: None)
@@ -146,8 +155,11 @@ def _drive_lifespan(server_module, monkeypatch: pytest.MonkeyPatch) -> Any:
 
     monkeypatch.setattr(server_module, "_start_boot_sweeps", _capture)
 
-    fake_app = MagicMock()
-    fake_app.state = MagicMock()
+    if app is None:
+        fake_app = MagicMock()
+        fake_app.state = MagicMock()
+    else:
+        fake_app = app
 
     async def _enter() -> Any:
         async with server_module._lifespan(fake_app):
@@ -162,6 +174,33 @@ def _drive_lifespan(server_module, monkeypatch: pytest.MonkeyPatch) -> Any:
         )
 
     return injected
+
+
+class _State:
+    """A stand-in for ``starlette.datastructures.State``.
+
+    The real one answers ``None`` for a name nobody set.  A
+    :class:`MagicMock` invents one instead — and an invented attribute
+    reads as "already set", which is the wrong answer to the very
+    question the scheduler asks when it looks for a worker that is
+    already running.
+    """
+
+    def __init__(self) -> None:
+        self.__dict__["_values"] = {}
+
+    def __getattr__(self, name: str) -> Any:
+        return self.__dict__["_values"].get(name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        self.__dict__["_values"][name] = value
+
+
+class _StateApp:
+    """An app whose ``state`` answers the way the real one does."""
+
+    def __init__(self) -> None:
+        self.state = _State()
 
 
 # ---------------------------------------------------------------------------
@@ -430,3 +469,78 @@ def test_lifespan_tolerates_a_missing_sweep_module(
     injected = _drive_lifespan(server_module, monkeypatch)
 
     assert injected is not None
+
+
+# ---------------------------------------------------------------------------
+# Contract 6: the lifespan stops the scheduler worker it started
+# ---------------------------------------------------------------------------
+
+
+def test_the_lifespan_stops_the_scheduler_worker_it_started(
+    server_module, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scheduler's worker thread must not outlive the lifespan.
+
+    The scheduler is one worker thread.  It is started in the lifespan
+    and stopped in the lifespan's shutdown, and the shutdown only stops
+    the worker **it** started: a lifespan that finds a worker already
+    running does not own it.
+
+    That ownership is decided by the value the start call returns, so a
+    lifespan that starts the scheduler **twice** throws the ownership
+    away: the second start finds the worker the first one started,
+    reports "already running", and hands back a runtime that owns
+    nothing.  The shutdown then has nothing to stop, and the worker
+    keeps ticking after the application is gone.
+
+    The symptom is not hypothetical: the repository's own thread-leak
+    assertion (``tests/conftest.py``'s ``clean_execution_state``) fails
+    the teardown of every test that enters the lifespan, because a
+    ``PlanSchedulerEngine`` thread is still alive.
+
+    The app double matters here.  The default one in this module is a
+    :class:`MagicMock`, whose ``state`` invents a ``scheduler_engine``
+    attribute — and an invented attribute reads as "a worker is already
+    running", which hides the very defect under test.
+    """
+    started: list[Any] = []
+    stopped: list[Any] = []
+
+    class _FakeEngine:
+        """The scheduler engine, with only the two calls that matter."""
+
+        def __init__(self) -> None:
+            self.thread = None
+
+        def start(self) -> None:
+            started.append(self)
+
+        def stop(self, timeout: float = 30.0) -> None:
+            stopped.append(self)
+
+    engine = _FakeEngine()
+
+    def _fake_build() -> Any:
+        """Stand in for the builder, keeping its contract.
+
+        The real builder starts the worker itself and hands back the
+        runtime that owns it; a stand-in that only returned the runtime
+        would leave the worker unstarted and the contract untested.
+        """
+        engine.start()
+        return server_module._SchedulerRuntime(engine, None, True)
+
+    monkeypatch.setattr(server_module, "_build_scheduler_engine", _fake_build)
+
+    _drive_lifespan(server_module, monkeypatch, app=_StateApp())
+
+    assert len(started) == 1, (
+        "the lifespan started the scheduler's worker "
+        f"{len(started)} times; it must start it exactly once, or the "
+        "second start throws away the ownership that lets the "
+        "shutdown stop it"
+    )
+    assert stopped == started, (
+        "the scheduler worker the lifespan started was never stopped — "
+        "its thread outlives the test"
+    )

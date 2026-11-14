@@ -54,9 +54,11 @@ _REPO_ROOT = _BACKEND_DIR.parent
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
+#: 回收器的模块 —— 它是这台机器上唯一会装常驻后台进程的东西，所以这里
+#: 直接用它自己的常量，而不是把目录名再抄一遍。
 # 守护进程的回收入口。守护是「活得比启动它的进程更久」的东西，所以
 # 收掉 server 不会带走它 —— 收守护得单独收。
-import orphan_reaper  # noqa: E402
+import orphan_reaper  # noqa: E402  (after the sys.path fix-up above)
 
 
 #: 计划 id。每个用例各有各的 tmp 目录与 ``state.db``，所以同一个 id
@@ -318,6 +320,10 @@ def _child_env(plans_root: Path, state_db: Path, port: int) -> Dict[str, str]:
       **进程内**的：白名单 env 不继承父进程，于是子 server 照样做机器级
       清扫，lifespan 被拖到 18~21s，就绪等待（30s）差点不够用。父进程已经
       有值就原样透传 —— 谁定的谁说了算，父进程说 ``"0"`` 就让子进程扫。
+    * **不带 ``PDT_ORPHAN_REAPER`` 的开关。** 白名单是「不带就出事」，
+      所以这里**要**带着 ``PDT_ORPHAN_REAPER=0`` 进去：真服务一启动
+      就会扫全机进程，还要留一个脱离本进程的常驻 reaper。这是一次性
+      服务，它没有资格去动跑它的这台机器。
     """
     return {
         "PATH": os.environ.get("PATH", ""),
@@ -333,6 +339,7 @@ def _child_env(plans_root: Path, state_db: Path, port: int) -> Dict[str, str]:
         "PDT_ALLOWED_HOSTS": "127.0.0.1,localhost",
         "PDT_PROVIDER_MODE": "inherit",
         "PDT_DISABLE_TEMP_SWEEP": os.environ.get("PDT_DISABLE_TEMP_SWEEP", "1"),
+        "PDT_ORPHAN_REAPER": "0",
     }
 
 
@@ -610,3 +617,29 @@ def test_live_server_process_is_reclaimed(live_server: _LiveServer) -> None:
         "the server subprocess must be gone after the teardown"
     )
     _assert_port_released(port)
+
+
+@pytest.mark.integration
+def test_live_server_installs_no_machine_wide_reaper(
+    tmp_path: Path, live_server: _LiveServer
+) -> None:
+    """子 server 不得在机器上装常驻代理。
+
+    回收器（``orphan_reaper``）是**机器级**的东西：它的扫描读遍机器上
+    每个进程，它的 daemon 是脱离本进程的后台进程，会活得比 backend 久。
+    为一次临时运行（测试夹具的 plans 副本、复现脚本的一次性工作目录）
+    装上它，等于往机器上扔一个没人回收的后台进程：它活着的时候一直占着
+    一个核；而且它启动前那次机器级扫描会把 boot 拖长几十秒 —— 在别人
+    的机器上，这几十秒就是"子 server 起不来"。
+
+    回收器安装时会在 plans 根下建 ``.orphan_reaper/``（锁和日志都在那
+    儿），所以这个目录在不在，就是"装没装"的判据。
+    """
+    plans_root = tmp_path / "plans"
+    reaper_dir = plans_root / orphan_reaper.REAPER_DIRNAME
+
+    assert not reaper_dir.exists(), (
+        "the spawned server installed the machine-wide reaper under "
+        "{0}: a daemon started for a scratch run outlives it, keeps a "
+        "core busy and is reclaimed by nobody".format(reaper_dir)
+    )
