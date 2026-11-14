@@ -4938,6 +4938,64 @@ def _run_repair_execution_async(
 _TERMINAL_VERIFICATION_STATUSES = frozenset({"passed", "failed", "loop_stopped"})
 
 
+#: 2026-11-13: the verdict a repair callback writes when it refuses to
+#: start its round because ANOTHER live round already holds the plan's
+#: service-owner role.
+#:
+#: It is a chain-ending reason in its own right: the refused round
+#: dispatched nothing, and the plan is left with no round of its own —
+#: so a caller that ever reported it with a non-terminal status must
+#: not leave the plan parked in the verification family, looking as
+#: though a round were still running behind it.
+#:
+#: It lives here, next to the other terminal vocabularies, because
+#: ``server.VERIFICATION_TERMINAL_STOP_REASONS`` is the recorder's
+#: COMPATIBILITY set — it still ends the chain for a caller that
+#: reports a non-terminal status carrying a terminal reason, and this
+#: reason is one of them.
+SERVICE_OWNER_CLAIM_REFUSED_STOP_REASON = "service_owner_claim_refused"
+
+#: The stop reasons this module adds to the recorder's chain-ending
+#: set.  See :data:`SERVICE_OWNER_CLAIM_REFUSED_STOP_REASON`.
+_ROUND_INSTANCE_TERMINAL_STOP_REASONS = frozenset(
+    {SERVICE_OWNER_CLAIM_REFUSED_STOP_REASON},
+)
+
+
+def _terminal_write_ends_the_chain(
+    status: str,
+    stop_reason: str,
+    chain_ending: Optional[bool] = None,
+) -> bool:
+    """Whether a terminal write ends the verification chain.
+
+    2026-11-13: extracted from :func:`_persist_verification_terminal`
+    so the rule can be asked on its own.  It decides two things that
+    must not drift apart — whether the routing phase is moved out of
+    the verification family, and whether the plan is closed — so it
+    is stated once, here, and both the recorder and its tests read
+    it from here.
+
+    The rule:
+
+      * an explicit ``chain_ending`` wins — the caller knows whether
+        the executor subprocess is still in flight, and nothing here
+        may overrule it;
+      * otherwise the STATUS decides: ``passed`` / ``failed`` /
+        ``loop_stopped`` end the chain (the stop reason only
+        DESCRIBES the verdict);
+      * and a stop reason that ends a chain in its own right ends it
+        too, even when the status does not say so.
+    """
+    if chain_ending is not None:
+        return chain_ending
+    return (
+        status in _TERMINAL_VERIFICATION_STATUSES
+        or stop_reason in _server.VERIFICATION_TERMINAL_STOP_REASONS
+        or stop_reason in _ROUND_INSTANCE_TERMINAL_STOP_REASONS
+    )
+
+
 def _round_is_invalidated(plan_id: str, round_token: Any) -> bool:
     """Has ``round_token`` been declared dead for this plan's round?
 
@@ -5214,13 +5272,12 @@ def _persist_verification_terminal(
     #
     # Hoisted above step 2 (it used to be computed inside step 2's ``try``,
     # so an import failure there left it unbound for step 3).
-    _chain_ending = (
-        chain_ending
-        if chain_ending is not None
-        else (
-            status in _TERMINAL_VERIFICATION_STATUSES
-            or stop_reason in _server.VERIFICATION_TERMINAL_STOP_REASONS
-        )
+    #
+    # 2026-11-13: the rule itself lives in
+    # :func:`_terminal_write_ends_the_chain`, so the recorder and the
+    # tests that pin it cannot drift apart.
+    _chain_ending = _terminal_write_ends_the_chain(
+        status, stop_reason, chain_ending,
     )
 
     # ----- 2) Transition ``plan_routing.stage`` out of "verification_*" -----
@@ -8765,6 +8822,208 @@ def _round_token_of_state(plan_id: str) -> str:
     return _round_token_of(state.get("round_token"))
 
 
+def _new_round_instance_token() -> str:
+    """A fresh identity for one *instance* of a round.
+
+    A round instance is one run of the loop over one plan.  When the
+    repair-complete callback re-enters the verification it needs a name
+    of its own: the token it was handed belongs to the loop run that
+    has already ended, and a cleanup aimed at the new instance must not
+    reach the old one through a shared name.
+
+    So the identity is minted, not derived.  It carries the pid (a
+    registry left behind by a crashed backend must be recognisable as
+    stale) and a uuid (two live instances must never share a name), and
+    it carries **no round number** — an instance is a different
+    instance, not the next round.
+
+    Never raises.  A helper that throws, returns an empty string or
+    hands back something that is not a string leaves the instance
+    unnamed, and an unnamed instance cannot be addressed — so the
+    fallback mints the same shape locally instead.
+    """
+    try:
+        import service_manager
+        token = service_manager.new_owner_token("verification_loop")
+        if isinstance(token, str) and token.strip():
+            return token
+    except Exception:  # noqa: BLE001 — a name must never fail a round
+        pass
+    return f"verification_loop-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+
+
+def _round_instance_is_live(
+    plan_dir: Optional[Path], round_token: str,
+) -> bool:
+    """Whether the round instance named by ``round_token`` is still running.
+
+    The only evidence that an instance is alive is the plan's workflow
+    lease: the loop takes that lease for the duration of a round and
+    refreshes its heartbeat while it runs.  The registry of service
+    owners cannot answer this question — the owner it records is the
+    long-lived backend, so a token whose round was already released goes
+    on looking alive for ever, and the next round would inherit it.
+
+    The answer is deliberately one-sided: this function never TAKES a
+    lease, it only reports on one.  A plan with no lease has no live
+    instance, so a missing lease means "the round is over" — which is
+    what the caller needs in order to decide whether the next round may
+    take the plan over.
+
+    The lease's own staleness rule is the one that counts: a lease whose
+    holder died, or whose heartbeat stopped, is not held by a running
+    instance.
+
+    Never raises.  A liveness probe that throws would break the very
+    cleanup it is used by, so every uncertainty is answered "not alive".
+    """
+    if plan_dir is None:
+        return False
+    if not isinstance(round_token, str):
+        return False
+    token = round_token.strip()
+    if not token:
+        return False
+    try:
+        path = _verification_workflow_lease_path(Path(plan_dir))
+        holder = _read_verification_workflow_lease(path)
+        if not holder:
+            # No readable record — no lease, or a lease that names
+            # nobody.  Either way no instance holds it.
+            return False
+        if _round_token_of(holder.get("round_token")) != token:
+            # Somebody else's round — this token holds nothing.
+            return False
+        return _workflow_lease_stale_reason(path, holder) is None
+    except Exception:  # noqa: BLE001 — a probe must never raise
+        return False
+
+
+def _claim_round_instance_ownership(
+    plan_dir: Optional[Path], round_token: str,
+) -> bool:
+    """Claim the plan's "current service owner" role for this round.
+
+    ``register_service_owner(current=True)`` overwrites
+    ``current_owner`` unconditionally.  That is right for the round
+    that starts services and wrong for anybody else, because a round
+    that ended without releasing its token leaves a ``current_owner``
+    behind — and the next round would inherit it.  The services the
+    new round starts would then be stamped with a name that belongs to
+    a round that is over.
+
+    So the claim is made conditionally:
+
+      * nobody holds the role → take it;
+      * this round already holds it → take it again (idempotent);
+      * somebody else holds it AND that owner is still alive — it holds
+        a fresh workflow lease — → refuse, with a warning: a running
+        round keeps the role;
+      * somebody else holds it but is NOT alive — its lease is gone or
+        stale, so its round is over → take it over.
+
+    Liveness is judged by the plan's workflow lease
+    (:func:`_round_instance_is_live`), NOT by the owner registry: the
+    registry's owner is the long-lived backend, so a token whose round
+    was released keeps looking alive for ever, and the next round would
+    inherit it.
+
+    Returns whether the role is this round's.  Never raises: a registry
+    that cannot be read names nobody, and a damaged registry must not
+    stop a round from starting.
+
+    A round is named by a token, and only a STRING is a token.  A
+    number, a flag, a list, a dict or a blob of bytes names no round:
+    stringifying it would hand the role to a name that was never
+    minted — and the role is what the services of the next round are
+    stamped with.  The same holds for a plan directory that is not
+    there: the registry write creates the directory it writes into, so
+    a claim aimed at a missing path would bring a plan into being.
+    """
+    if plan_dir is None:
+        return False
+    if not isinstance(round_token, str):
+        return False
+    token = _round_token_of(round_token)
+    if not token:
+        return False
+    try:
+        if not Path(plan_dir).exists():
+            return False
+    except Exception:  # noqa: BLE001 — a claim must never raise
+        return False
+    registry = _server._service_owner_registry(plan_dir)
+    current = _round_token_of(
+        registry.get("current_owner") if isinstance(registry, dict) else None
+    )
+    if current and current != token:
+        if _round_instance_is_live(plan_dir, current):
+            _server.logger.warning(
+                "[verification_loop] the current service owner is still "
+                "alive, so the role was not claimed plan=%s owner=%s "
+                "round=%s", plan_dir, current, token,
+            )
+            return False
+    _server._register_service_owner(plan_dir, token, current=True)
+    # The claim is only worth anything if it took: read the registry
+    # back and answer from what it says now, not from what was asked.
+    registry = _server._service_owner_registry(plan_dir)
+    claimed = _round_token_of(
+        registry.get("current_owner") if isinstance(registry, dict) else None
+    )
+    return claimed == token
+
+
+def _release_handover_service_owner(
+    plan_dir: Optional[Path], previous_token: str,
+) -> bool:
+    """Release the role the round that handed over still holds.
+
+    2026-11-13: the repair callback is the CONTINUATION of the round
+    that scheduled the repair.  That round is over the moment it
+    dispatched the executor — its verdict is written and the chain
+    continues in the callback — so the ownership it leaves behind is
+    stale: the role answers "which round is starting services RIGHT
+    NOW", and the round that starts them is the callback's own.
+
+    Without this, the handing-over round's live lease would refuse the
+    re-entry's claim (:func:`_claim_round_instance_ownership` refuses
+    a live owner), and the repair chain would stop at its first
+    re-entry — with ``service_owner_claim_refused``, the plan ending
+    right after the repair that was supposed to continue it.
+
+    Only the role that still names ``previous_token`` is released: a
+    role that already moved on belongs to somebody else and is left
+    alone.  Releasing it while the handing-over round is still
+    unwinding is safe — that round releases the same role on its own
+    exit, and a release that finds the role already gone does nothing.
+
+    Returns whether a role was released.  Never raises: a stale role
+    must not stop a round from starting.
+    """
+    token = _round_token_of(previous_token)
+    if not token or plan_dir is None:
+        return False
+    try:
+        registry = _server._service_owner_registry(plan_dir)
+        current = _round_token_of(
+            registry.get("current_owner")
+            if isinstance(registry, dict) else None
+        )
+        if current != token:
+            # The role already moved on — it is somebody else's.
+            return False
+        _server._release_service_owner(plan_dir, token)
+        return True
+    except Exception:  # noqa: BLE001 — a stale role must not stop a round
+        _server.logger.warning(
+            "[verification_loop] could not release the handing-over "
+            "round's service owner plan=%s round=%s",
+            plan_dir, token, exc_info=True,
+        )
+        return False
+
+
 def _open_round_in_ledger(
     plan_dir: Optional[Path], round_token: str,
 ) -> None:
@@ -8844,6 +9103,105 @@ def _close_round_in_ledger(
         _server.logger.warning(
             "[verification_loop] could not close the round in the process "
             "ledger plan=%s round=%s", plan_dir, token, exc_info=True,
+        )
+
+
+def _end_round_instance(
+    plan_id: str,
+    plan_dir: Optional[Path],
+    round_token: str,
+    *,
+    terminal: bool,
+    reason: str = "verification_loop_exit",
+) -> None:
+    """End one round instance: close it, release it, maybe reap it.
+
+    The verification loop had this sequence inline, and the
+    repair-complete callback needs the same one — so it lives here, where
+    it can be called and tested on its own.
+
+    The ORDER is the contract:
+
+      1. **close** the round in the process ledger, so the ledger forgets
+         the tools this round owned;
+      2. **release** the service owner, so the owner registry stops
+         saying this round owns anything;
+      3. **reap** the services this round started — but only when the
+         exit is terminal.
+
+    The reap comes last because it aims at the entries a round owns: by
+    the time it fires the round is already closed and released, so a
+    newer round that inherited the registry cannot be reached through
+    it.  A reap *before* the release found a round that still looked
+    like it owned the services it was about to stop.
+
+    ``terminal=False`` is a hand-off: the loop returned while a repair
+    execution is still in flight, so the workflow has NOT exited and the
+    services the repair round is about to use must stay up.  A hand-off
+    closes and releases; it does not reap.
+
+    The pins are deliberately untouched.  A pin is released by the round
+    that wrote it, or by its TTL — not by an unrelated exit that happens
+    to be closing the same plan.
+
+    Never raises.  This runs on the exit path of a workflow: a cleanup
+    that turns a clean shutdown into a crash is worse than a cleanup
+    that skipped a step.  Each step is guarded on its own, so a failure
+    is logged and the steps after it still run.
+
+    A round is named by a token, and only a STRING is a token.  All
+    three steps are aimed at a round *by name*, so a token that is not
+    a string names no round and none of them may run: a cleanup aimed
+    at "whoever this is" would be aimed at somebody else's round.  The
+    same holds for a plan directory that is not there — nothing of that
+    round is on disk, and the release would create the directory it
+    writes the registry into.
+    """
+    if plan_dir is None:
+        return
+    if not isinstance(round_token, str):
+        return
+    token = _round_token_of(round_token)
+    if not token:
+        # An instance that cannot be named cannot be closed, released or
+        # reaped — and a cleanup aimed at "whoever this is" would be
+        # aimed at somebody else's round.
+        return
+    try:
+        if not Path(plan_dir).exists():
+            return
+    except Exception:  # noqa: BLE001 — the cleanup must never raise
+        return
+    try:
+        _close_round_in_ledger(plan_dir, token)
+    except Exception:  # noqa: BLE001 — the cleanup must never raise
+        _server.logger.warning(
+            "[verification_loop] could not close the round instance "
+            "plan=%s round=%s", plan_id, token, exc_info=True,
+        )
+    try:
+        _server._release_service_owner(plan_dir, token)
+    except Exception:  # noqa: BLE001 — the cleanup must never raise
+        _server.logger.warning(
+            "[verification_loop] could not release the service owner "
+            "plan=%s round=%s", plan_id, token, exc_info=True,
+        )
+    if not terminal:
+        _server.logger.info(
+            "[verification_loop] reap deferred plan=%s round=%s — a repair "
+            "execution is still in flight, the workflow has not exited "
+            "(reason=%s)", plan_id, token, reason,
+        )
+        return
+    try:
+        _server._reap_managed_services(
+            plan_id, plan_dir, reason, owner_token=token,
+        )
+    except Exception:  # noqa: BLE001 — the cleanup must never raise
+        _server.logger.warning(
+            "[verification_loop] could not reap the managed services "
+            "plan=%s round=%s reason=%s", plan_id, token, reason,
+            exc_info=True,
         )
 
 
@@ -9086,9 +9444,37 @@ def _make_repair_on_complete(
     to one — a tool that belongs to no round is a tool nobody may kill.
     It is empty when the caller has no round to name (the ``/start``
     resume path), and then nothing is opened and nothing is registered.
+
+    2026-11-13: the re-entry is a round INSTANCE of its own - it
+    mints a token, claims the plan's owner role, and releases it
+    on every exit path.  The instance mints a token of its own and
+    then owns it:
+
+      * **mint** — a fresh UUID.  Never the outer loop's token;
+        two live instances must never share a name, and a cleanup
+        aimed at one of them must not reach the other.
+      * **claim** — the plan's owner role.  REFUSED when a live
+        round already holds it: a running round keeps the role,
+        and the services it started are its own.
+      * **use** — the ledger scope, the state's stamp, the
+        preflight's services, the verdict.  All four name the
+        SAME instance.
+      * **release** — on every exit path, including the exception
+        path.
+      * **reap** — only when the round really ended.  A hand-off
+        (the repair executor is still in flight) releases but
+        does NOT reap: the workflow has not exited, and the
+        services the next round is about to use must stay up.
+
+    The ORDER is the contract: mint -> claim -> open the ledger
+    scope -> stamp the state -> preflight / dispatch.  Claiming
+    after the preflight would put the preflight's services back
+    into the ownerless state this whole change exists to remove.
     """
 
-    def _record_terminal(status: str, stop_reason: str):
+    def _record_terminal(
+        status: str, stop_reason: str, token: Optional[str] = None,
+    ):
         """Persist a terminal verification outcome for this plan.
 
         The loop's own ``_record_terminal`` (a closure over the same
@@ -9101,9 +9487,20 @@ def _make_repair_on_complete(
         overwrites that state, and a recorder that read it at write
         time would name the wrong round (and a dead round's verdict
         would land as if the live round had written it).
+
+        2026-11-13: ``token`` names the round INSTANCE the verdict
+        belongs to.  It is ``None`` for the verdicts this callback
+        writes BEFORE it enters a round of its own — the undrained
+        repair guard, the round budget — and those fall back to the
+        token the callback was built with: they belong to the round
+        that scheduled the repair, not to a round that does not exist
+        yet.  Once the callback has entered its own instance, every
+        verdict names THAT instance, so a verdict is never filed under
+        a round that did not produce it.
         """
         _server._record_verification_terminal(
-            plan_id, status, stop_reason, round_token=round_token,
+            plan_id, status, stop_reason,
+            round_token=_round_token_of(token) or round_token,
         )
 
     def _on_repair_complete(returncode: int) -> None:
@@ -9138,7 +9535,19 @@ def _make_repair_on_complete(
         :data:`_MAX_REPAIR_NOT_DRAINED_GUARDS` counter, which is
         unrelated to the round budget: this bounds "repair never
         drains", not "too many verification rounds".
+
+        2026-11-13: the re-entry is a round INSTANCE of its own; see
+        :func:`_make_repair_on_complete`.
         """
+        # 2026-11-13 — this callback's round INSTANCE: its own name and
+        # lifetime, LOCAL to this invocation (the pure-split branch
+        # re-enters this callback, so an enclosing-scope name would be
+        # overwritten by the recursive call).  ``_instance_terminal``:
+        # did the round really END?  Only an ended round reaps.
+        _instance_token = ""
+        _instance_plan_dir: Optional[Path] = None
+        _instance_terminal = False
+
         _server.logger.info(
             "[Auto-Verification] Repair execution finished plan=%s "
             "rc=%d — re-entering verification",
@@ -9233,6 +9642,15 @@ def _make_repair_on_complete(
             _clear_repair_not_drained_guard(plan_id)
 
         try:
+            # 2026-09-13: ``open_db`` and ``migrate`` are
+            # NOT in scope at the callback's enclosing closure
+            # (imports are localised to other helper functions
+            # in this file). Import here so the callback
+            # doesn't NameError on the very first line that
+            # touches the DB.
+            from state_machine.db.connection import open as open_db
+            from state_machine.db.schema import migrate as _migrate
+
             # 2026-09-12 (state machine closed-loop fix):
             # ``executing → verification`` is the proper
             # state-machine transition for the post-repair
@@ -9244,14 +9662,6 @@ def _make_repair_on_complete(
             # round 0 — the original ``begin_verification``
             # signature clobbered the round counter to 0 which
             # broke the monotonic invariant).
-            # 2026-09-13: ``open_db`` and ``migrate`` are
-            # NOT in scope at the callback's enclosing closure
-            # (imports are localised to other helper functions
-            # in this file). Import here so the callback
-            # doesn't NameError on the very first line that
-            # touches the DB.
-            from state_machine.db.connection import open as open_db
-            from state_machine.db.schema import migrate as _migrate
             plan_dir = _server._plan_dir(plan_id)
             if plan_dir.exists():
                 ps = _server.PlanState(plan_dir)
@@ -9311,10 +9721,71 @@ def _make_repair_on_complete(
                     "since 2026-09-15)",
                     plan_id, _next_round, _new_max,
                 )
+                # The budget is spent, so NO round instance is entered:
+                # there is no round to own, and minting one would put
+                # a name in the owner registry for a round that never
+                # ran.  The verdict belongs to the round that
+                # scheduled the repair.
                 _record_terminal(
                     "loop_stopped", "max_rounds_reached",
                 )
                 return
+
+            # ------------------------------------------------------------------
+            # 2026-11-13 — enter THIS round instance.
+            #
+            # The order below is the contract:
+            #
+            #   1. mint the instance's own token;
+            #   2. claim the plan's "current service owner" role — a
+            #      live round that holds it keeps it, and this round
+            #      refuses to start;
+            #   3. open the ledger scope under that token;
+            #   4. stamp the token onto the in-memory state, so the
+            #      watchdog knows which round to clean up;
+            #   5. preflight / dispatch.
+            #
+            # The claim comes BEFORE the preflight on purpose: the
+            # services the preflight brings up are recorded under the
+            # plan's current owner, and an ownerless service is one
+            # nobody may reap.  Claiming afterwards would put them
+            # back into the state this whole change exists to remove.
+            # ------------------------------------------------------------------
+            _instance_token = _new_round_instance_token()
+            _instance_plan_dir = plan_dir
+            # The round that scheduled this repair handed the plan over
+            # to this one, and the ownership it left behind is stale —
+            # it must not refuse this round's claim.  See
+            # :func:`_release_handover_service_owner`.
+            _release_handover_service_owner(plan_dir, round_token)
+            if not _claim_round_instance_ownership(
+                plan_dir, _instance_token,
+            ):
+                _server.logger.warning(
+                    "[Auto-Verification] repair callback: another live "
+                    "round holds the plan's service-owner role — NOT "
+                    "starting this round plan=%s round=%s",
+                    plan_id, _instance_token,
+                )
+                # This round started no service, so it reaps nothing;
+                # the finally below still releases its name.
+                _record_terminal(
+                    "failed", SERVICE_OWNER_CLAIM_REFUSED_STOP_REASON,
+                    token=_instance_token,
+                )
+                return
+            _open_round_in_ledger(plan_dir, _instance_token)
+            try:
+                _stamp_round_token(plan_id, _instance_token)
+            except Exception:  # noqa: BLE001 — the stamp must not stop
+                # the round: it only tells the watchdog WHICH round to
+                # clean up, and a round that cannot say so is still a
+                # round that can be cleaned up by its own exit.
+                _server.logger.warning(
+                    "[verification_loop] could not stamp the round token "
+                    "plan=%s round=%s", plan_id, _instance_token,
+                    exc_info=True,
+                )
 
             # 2026-09-12: replace the raw routing CAS
             # (lines 6223-6260 below in the OLD version) with
@@ -9340,7 +9811,13 @@ def _make_repair_on_complete(
                 # has to be opened again for the tool this callback creates
                 # to belong to one — a tool that belongs to no round is a
                 # tool nobody may kill.
-                _open_round_in_ledger(plan_dir, round_token)
+                # 2026-11-13: the scope is opened under THIS instance's
+                # own token — here and again when the instance was
+                # entered above.  The tool this round creates then
+                # belongs to the round that is running it, and not to
+                # the dead round whose token the callback used to
+                # carry.
+                _open_round_in_ledger(plan_dir, _instance_token)
                 try:
                     _coding_tool = _server.create_coding_tool(
                         tool, cwd=str(project_dir), scene="verification",
@@ -9354,7 +9831,9 @@ def _make_repair_on_complete(
                     # itself — ``create_coding_tool`` builds a
                     # verification-scene tool, and that tool carries
                     # the ceiling from its own constructor.
-                    _register_round_tool(plan_dir, round_token, _coding_tool)
+                    _register_round_tool(
+                        plan_dir, _instance_token, _coding_tool,
+                    )
                     _verif_repo = None
                     try:
                         _vc, _vr2, _vv = _server._open_verification_state()
@@ -9389,7 +9868,7 @@ def _make_repair_on_complete(
                         resume=True,
                     )
                 finally:
-                    _close_round_in_ledger(plan_dir, round_token)
+                    _close_round_in_ledger(plan_dir, _instance_token)
                 if _round_conflict is not None:
                     # 2026-10-25: another live round owns this plan, so
                     # this re-entry dispatched no VP.  The repair chain
@@ -9426,7 +9905,9 @@ def _make_repair_on_complete(
                 if _binary_freshness_blocked_report(_report) is not None:
                     _record_terminal(
                         "loop_stopped", BINARY_FRESHNESS_PREFLIGHT_ERROR_KIND,
+                        token=_instance_token,
                     )
+                    _instance_terminal = True
                     return
                 # 2026-10-30 (VP-012): the round was blocked by the
                 # base-drift check — the branch had drifted away from
@@ -9470,7 +9951,9 @@ def _make_repair_on_complete(
                     )
                     _record_terminal(
                         "loop_stopped", BASE_DRIFT_CONFLICTS_STOP_REASON,
+                        token=_instance_token,
                     )
+                    _instance_terminal = True
                     return
                 # The round has run against the addresses the ledger
                 # names — write them down (2026-10-25, repair-r1-25).
@@ -9617,12 +10100,17 @@ def _make_repair_on_complete(
                         on_complete=_on_repair_complete,
                     )
                 elif _result.get("status") == "passed":
-                    _record_terminal("passed", None)
+                    _record_terminal(
+                        "passed", None, token=_instance_token,
+                    )
+                    _instance_terminal = True
                 elif _result.get("status") == "loop_stopped":
                     _record_terminal(
                         "loop_stopped",
                         _result.get("stop_reason"),
+                        token=_instance_token,
                     )
+                    _instance_terminal = True
                 elif _round_is_pure_split(_result):
                     # 2026-09-14: this round's only
                     # forward work is a VP split — nothing for the
@@ -9639,7 +10127,9 @@ def _make_repair_on_complete(
                         )
                         _record_terminal(
                             "loop_stopped", "max_rounds_reached",
+                            token=_instance_token,
                         )
+                        _instance_terminal = True
                     else:
                         _server.logger.warning(
                             "[Auto-Verification] Post-repair round %d "
@@ -9673,7 +10163,7 @@ def _make_repair_on_complete(
                         or "no_repair_tasks",
                         chain_ending=False,
                         rollback_to_ready=False,
-                        round_token=round_token,
+                        round_token=_instance_token,
                     )
                     _server.logger.warning(
                         "[Auto-Verification] Post-repair round %d: no "
@@ -9703,7 +10193,9 @@ def _make_repair_on_complete(
                         )
                         _record_terminal(
                             "failed", "post_repair_reroute_failed",
+                            token=_instance_token,
                         )
+                        _instance_terminal = True
                     else:
                         _server._run_repair_execution_async(
                             plan_id, project_dir, tool=tool,
@@ -9717,6 +10209,7 @@ def _make_repair_on_complete(
                 )
                 _record_terminal(
                     "failed", "post_repair_verification_crashed",
+                    token=_instance_token,
                 )
         except Exception:
             _server.logger.exception(
@@ -9727,9 +10220,30 @@ def _make_repair_on_complete(
             try:
                 _record_terminal(
                     "failed", "repair_callback_crashed",
+                    token=_instance_token,
                 )
             except Exception:
                 pass
+        finally:
+            # 2026-11-13 — this instance's own exit.
+            #
+            # The instance releases its name on EVERY path — the
+            # terminal ones, the hand-off, the exception.  A name
+            # left in the owner registry is a role nobody can take
+            # over: the next round would find an owner it may not
+            # displace, and the services of a round that is over would
+            # stay recorded under it.
+            #
+            # It reaps only when the round really ENDED.  A hand-off
+            # (the repair executor is still in flight) and an
+            # exception leave the services running: the workflow has
+            # not exited, and the next round is about to use them.
+            if _instance_token and _instance_plan_dir is not None:
+                _end_round_instance(
+                    plan_id, _instance_plan_dir, _instance_token,
+                    terminal=_instance_terminal,
+                    reason="repair_round_instance_exit",
+                )
     return _on_repair_complete
 
 

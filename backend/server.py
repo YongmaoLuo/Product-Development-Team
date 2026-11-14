@@ -207,6 +207,28 @@ except Exception:  # noqa: BLE001
     _register_owner = None
     _release_owner = None
 
+# The registry READER is imported on its own, deliberately NOT in the
+# block above.  Those three are the write side of the owner registry,
+# and a round cannot start without them; a copy of ``service_manager``
+# that cannot read the registry must not take them down with it.
+try:  # pragma: no cover - the repo always ships service_manager.py
+    from service_manager import (
+        read_owners as _read_service_owners,
+    )
+except Exception:  # noqa: BLE001
+    _read_service_owners = None
+
+# The registry's file name — the file the write side writes.  It is
+# the reader of last resort (see ``_service_owner_registry``), so it is
+# imported separately as well: a missing constant must not take the
+# reader above down with it.
+try:  # pragma: no cover - the repo always ships service_manager.py
+    from service_manager import (
+        OWNERS_FILENAME as _OWNERS_FILENAME,
+    )
+except Exception:  # noqa: BLE001
+    _OWNERS_FILENAME = "service_owners.json"
+
 # ---------------------------------------------------------------------------
 # shutdown_checkpoint (the shutdown checkpoint writer) — resolved once, at
 # import time
@@ -4768,6 +4790,46 @@ def _release_service_owner(plan_dir: Path, owner_token: str) -> None:
         logger.exception(
             "[service_manager] owner release failed for %s", owner_token,
         )
+
+
+def _service_owner_registry(plan_dir: Optional[Path]) -> Dict[str, Any]:
+    """The owner registry of ``plan_dir`` — ``{}`` when it says nothing.
+
+    The registry answers one question: which round is the one that is
+    *starting services right now* (``current_owner``).  The verification
+    loop has to be able to ask that question BEFORE it claims the
+    role, and the answer must never be able to break a round — so
+    every failure (a missing file, a corrupt file, a reader that
+    raises) is answered "nobody owns the role".
+
+    ``service_manager.read_owners`` is the reader the write side uses,
+    so it is tried first.  When it is missing (an older copy of the
+    module) or raises, the registry file is read directly — the SAME
+    file, at the same path the write side writes.  That is not a
+    detail: the registry lives on disk precisely because two module
+    instances (the backend's copy and the project's copy) may share
+    one plan directory, and the disk is the only state they share.
+
+    Never raises.
+    """
+    if plan_dir is None:
+        return {}
+    if _read_service_owners is not None:
+        try:
+            data = _read_service_owners(plan_dir)
+        except Exception:  # noqa: BLE001 - an unreadable registry names nobody
+            logger.warning(
+                "[service_manager] the owner registry could not be read "
+                "plan=%s", plan_dir, exc_info=True,
+            )
+        else:
+            return data if isinstance(data, dict) else {}
+    try:
+        raw = (Path(plan_dir) / _OWNERS_FILENAME).read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except Exception:  # noqa: BLE001 - a damaged registry names nobody
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _reap_managed_services(

@@ -819,8 +819,37 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的
     # 范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
     # 任何再编辑照样红。
+    # 2026-11-13：本分支已批准的「轮次实例身份」改动落在 `verification_loop.py` 上 ——
+    #   * 新增按**实例**铸造的 round token `_new_round_instance_token()`：token 形如
+    #     `verification_loop-<pid>-<uuid>`（带 pid 是为了让崩溃后遗留的注册表能被认出
+    #     已陈旧），**不含轮次号** —— 一个实例是另一个实例，不是「下一轮」；
+    #   * 新增 `_claim_round_instance_ownership()` 的**条件抢占**：无人持有 → 取；
+    #     本轮已持有 → 幂等地再取；别人持有且**仍然活着**（工作流租约还在）→ 让位
+    #     并记 WARNING（活着的轮次保留该角色）；别人持有但已经结束（租约没了或过期）
+    #     → 接管。存活与否按工作流租约判定，不按 owner 注册表判定；
+    #   * 新增 `_release_handover_service_owner()`：交棒的那一轮在派完 executor 之后
+    #     就已经结束，它留下的 owner 是陈旧的；交棒时把该角色释放掉，repair 重入才
+    #     不会被「仍然活着的 owner」拒掉（否则停在第一次重入，止于
+    #     `service_owner_claim_refused`）；
+    #   * 新增 `_end_round_instance()`：结束一个实例的顺序是 **close → release → reap**，
+    #     reap 放在最后（那时本轮已关闭并释放，新一轮不会经由旧注册表被波及），
+    #     而 `terminal=False` 的**交棒不 reap**（修复轮还要接着用这些服务）；
+    #   * 新增 `SERVICE_OWNER_CLAIM_REFUSED_STOP_REASON` 与 `_terminal_write_ends_the_chain()`：
+    #     「拒绝认领」是一条自己就终结链的理由；该判定规则从
+    #     `_persist_verification_terminal` 里提出成独立函数，录制方与钉住它的测试
+    #     读同一处，不会各自漂移；
+    #   * VP-008 的**安全侧收敛**：`claim` / `end` 对**非字符串 token** 一律不作为
+    #     （数字、布尔、列表、字典、bytes 都不指名任何一轮），对**不存在的 plan_dir**
+    #     一律不落盘（注册表写入会把它要写的目录建出来）。
+    # 改动相对上一版冻结基线（4cb12a87…）为 +536/-22，全部落在本文件，没有夹带别的改动；
+    # 按本 gate 的既定流程把冻结基线前移到本分支的批准态哈希 —— 哈希取 VP-008 落地
+    # **之后**的读数（先钉 c4bc9b12… 会被 VP-008 的一次落地再次漂移）。
+    # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的范围
+    # （仍是 `frontend/app.js` / `frontend/style.css` / `backend/verification_loop.py`
+    # 这三个，一个不多一个不少）与 sha256 逐字节比对的强度都不变，该文件此后仍被
+    # 逐字节钉住，任何再编辑照样红。
     "backend/verification_loop.py": (
-        "4cb12a8761b9a3567a8149dd3ebd90f32879b21f1ecd53d47a86e2956e7122de"
+        "3207acacbbcea9c0c1091ef1789aa5f26a1405991bf54f2ab24fdc09c5b02f7e"
     ),
 }
 
