@@ -3274,6 +3274,13 @@ def _data_plane_is_acceptable(
       * only **one** of the two names anything → that one decides;
       * **neither** names anything → the round's own count decides, as
         it did before.
+
+    A database that **is** named but cannot be read at all — it has not
+    been created yet, or it is not this process's to open — carries no
+    count of its own, and the round's own fixture says nothing about
+    the database *this* instance serves.  The instance's own answer is
+    then the only fact about that database there is, and it decides
+    (2026-11-07, VP-016).
     """
     if evidence.verdict in (DATA_PLANE_ABSENT, DATA_PLANE_UNREACHABLE):
         return True
@@ -3301,9 +3308,24 @@ def _data_plane_is_acceptable(
         rows = _routing_rows_in(reported)
     elif declared:
         rows = _routing_rows_in(declared)
+    if rows is None and (declared or reported):
+        # A database **was** named — the one the instance declared, or the
+        # one it answered for — but it cannot be read at all: it has not
+        # been created yet, or it is not this process's to open.  There is
+        # no count of its own to be had, and the round's own fixture says
+        # nothing about the database *this* instance serves (2026-10-27,
+        # fact A).  The instance's own answer is the only fact about that
+        # database there is, and it decides (2026-11-07, VP-016).
+        answered = evidence.plan_routing_rows
+        if answered is None:
+            # The verdict already says "no routing rows"; the count is
+            # that same statement in numbers, and it was not published.
+            return True
+        return answered == 0
     if rows is None:
-        # No count of its own: the round's fixture is the only fact
-        # left, and it is the judgement this module made before.
+        # Neither the declaration nor the answer names a database: the
+        # round's own fixture is the only fact left, and it is the
+        # judgement this module made before.
         return not (expected_rows or 0) > 0
     return rows == 0
 

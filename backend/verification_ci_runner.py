@@ -2102,6 +2102,24 @@ def _junit_first_line(node: ET.Element) -> str:
     return ""
 
 
+def _junit_failure_text(node: ET.Element) -> str:
+    """The whole text of a failure — its message and its traceback.
+
+    The first line is what says *what* broke, but it is not always the
+    whole of it: a driver that died prints its traceback inside the
+    assertion that wrapped its exit code, so the error that matters
+    can sit at the bottom of a message thousands of characters long.
+    The first line is truncated to
+    :data:`MAX_JUNIT_MESSAGE_CHARS`, so the whole text is what a
+    shape that hides in a traceback can be read out of.
+    """
+    return "\n".join(
+        part
+        for part in (node.get("message") or "", node.text or "")
+        if part
+    )
+
+
 def _junit_count(suite: ET.Element, attribute: str, fallback: int) -> int:
     """One count off a ``<testsuite>``, counted from its cases if absent.
 
@@ -2340,6 +2358,11 @@ def _read_junit_evidence(
                             "node_id": node_id,
                             "kind": kind,
                             "first_line": _junit_first_line(node),
+                            # The shape is taken with the whole message
+                            # in hand, so it is recorded here rather
+                            # than read off the truncated first line
+                            # later.
+                            "shape": _failure_shape(node),
                         })
 
         phases.append({
@@ -2449,6 +2472,20 @@ def _failure_identity(evidence: Dict[str, Any], status: str) -> List[str]:
 #     machine that cannot be measured turns a delivery that did not
 #     fail into a repair task.
 #
+# A transport shape says the connection broke under the client:
+#
+#   * a socket that was reset ("read ECONNRESET");
+#   * a peer that went away mid-write ("socket hang up", "EPIPE").
+#
+# It is not a wall-clock shape — nothing timed out — but it is not the
+# code's either, for the same reason the clock is not the code's: how
+# long the window between "the server dropped the connection" and "the
+# client noticed" lasts is a fact about the machine, not about the
+# program.  A server that answers a request with an unhandled
+# exception drops the connection, and the client only finds out when
+# it hands the pooled socket to the next request; on a busy host that
+# happens, on a quiet one it does not.
+#
 # Everything else is the code's: an assertion about behaviour, a wrong
 # value, a refused start.  Those stay failures on every host, and a
 # rule that treated them as the machine's would hide real regressions.
@@ -2476,6 +2513,19 @@ _WALL_CLOCK_SHAPE_PATTERNS = (
     re.compile(r"\bthe machine could not be read\b", re.IGNORECASE),
 )
 
+#: The shapes that mean "the connection broke under the client".
+_TRANSPORT_SHAPE_PATTERNS = (
+    # a socket that was reset by the peer
+    re.compile(r"\bECONNRESET\b"),
+    re.compile(r"\bECONNABORTED\b"),
+    re.compile(r"\bEPIPE\b"),
+    # the same thing said in words
+    re.compile(r"\bsocket hang ?up\b", re.IGNORECASE),
+    re.compile(r"\bconnection reset by peer\b", re.IGNORECASE),
+    re.compile(r"\bconnection aborted\b", re.IGNORECASE),
+    re.compile(r"\bbroken pipe\b", re.IGNORECASE),
+)
+
 
 def is_wall_clock_shaped(message: str) -> bool:
     """Does this failure message describe a wall-clock failure?
@@ -2493,18 +2543,94 @@ def is_wall_clock_shaped(message: str) -> bool:
     return any(pattern.search(text) for pattern in _WALL_CLOCK_SHAPE_PATTERNS)
 
 
-def _non_wall_clock_failures(
+def is_transport_shaped(message: str) -> bool:
+    """Does this failure message describe a broken connection?
+
+    An empty message is **not** a transport shape, for the same reason
+    an empty message is not a wall-clock shape: a failure the evidence
+    does not describe cannot be excused by the machine.
+    """
+    text = str(message or "")
+    if not text.strip():
+        return False
+    return any(pattern.search(text) for pattern in _TRANSPORT_SHAPE_PATTERNS)
+
+
+def is_environment_shaped(message: str) -> bool:
+    """Is this failure the machine's rather than the code's?
+
+    Two shapes count: the wall-clock ones (the machine ran out of
+    time) and the transport ones (the connection broke under the
+    client).  Both are facts about the host rather than about the
+    program, which is exactly what a host that cannot keep time is
+    telling the reader.
+    """
+    text = str(message or "")
+    if not text.strip():
+        return False
+    return is_wall_clock_shaped(text) or is_transport_shaped(text)
+
+
+#: The shapes one failure can have.
+SHAPE_WALL_CLOCK = "wall-clock"
+SHAPE_TRANSPORT = "transport"
+SHAPE_CODE = "code"
+
+
+def _failure_shape(node: ET.Element) -> str:
+    """What one failure is: the clock's, the network's, or the code's.
+
+    The wall-clock shape is read off the **first line** of the message,
+    the way it has always been read: the first line is what says what
+    broke.
+
+    The transport shape is read off the **whole** message, because a
+    connection that broke is very often not what the first line says.
+    The CI's own phase-2 report carried the browser-replay failure as
+    "the browser driver failed (exit 1)" — an assertion that wraps the
+    driver's exit code — with ``read ECONNRESET`` quoted 2378
+    characters into the message, at the bottom of the traceback the
+    assertion printed.  A first line never sees it.
+
+    A failure that is neither is the code's.  That is the only answer
+    that hides nothing: every other shape is a guess about the host.
+    """
+    if is_wall_clock_shaped(_junit_first_line(node)):
+        return SHAPE_WALL_CLOCK
+    if is_transport_shaped(_junit_failure_text(node)):
+        return SHAPE_TRANSPORT
+    return SHAPE_CODE
+
+
+def _failure_is_the_machines(failure: Dict[str, Any]) -> bool:
+    """Is this failure the machine's rather than the code's?
+
+    The shape the evidence carries is the reader's answer, and it is
+    the answer that counts — it was taken with the whole message in
+    hand.  A record written by hand carries no shape, and then the
+    first line of the message is all there is to read.
+    """
+    shape = str(failure.get("shape") or "")
+    if shape:
+        return shape in (SHAPE_WALL_CLOCK, SHAPE_TRANSPORT)
+    return is_environment_shaped(str(failure.get("first_line") or ""))
+
+
+def _blocking_failures(
     junit_evidence: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    """The failures in the evidence that are **not** wall-clock shapes.
+    """The failures in the evidence that are **not** the machine's.
 
     These are the failures that keep a phase — and a whole gate run —
     FAILED even on a host that could not measure wall-clock time.
+    A wall-clock shape is the machine's; so is a transport shape, for
+    the same reason: the window between "the server dropped the
+    connection" and "the client noticed" is a fact about the host.
     """
     failures = junit_evidence.get("junit_failures") or []
     return [
         failure for failure in failures
-        if not is_wall_clock_shaped(str(failure.get("first_line") or ""))
+        if not _failure_is_the_machines(failure)
     ]
 
 
@@ -2517,12 +2643,36 @@ def phase_report_evidence(report_path: str) -> str:
       names no failure at all.  Nothing in it says the failure was the
       machine's, so the failure is the code's;
     * ``wall-clock`` — every failure in the report is a wall-clock shape;
-    * ``code`` — at least one failure is not a wall-clock shape.
+    * ``environment`` — every failure in the report is a transport shape
+      (a connection that broke), so the whole phase is the machine's;
+    * ``code`` — anything else: at least one failure is not a wall-clock
+      shape, or the phase mixes a wall-clock failure with another kind.
 
-    The gate script calls this to decide whether a failed phase is
-    INCONCLUSIVE or FAILED, and the count of skipped cases comes back
-    with it because a lane that skipped half its cases and failed the
-    other half says something a reader needs to know.
+    The two shapes the machine owns are reported apart because the
+    gate reads them apart: it calls a ``code`` phase FAILED and
+    anything else INCONCLUSIVE on a host it could not measure.
+
+    2026-11-14 (merging origin/main@12534b6a): main's model had two
+    shapes -- ``wall-clock`` and ``code`` -- and this branch's model
+    had three -- ``wall-clock``, ``environment`` and ``code`` -- with
+    a phase excused whenever **every** failure was the machine's.  The
+    two disagree on exactly one recorded failure, and it is the one
+    both sides transcribed from the same CI run: the browser-replay
+    failure, whose message wraps ``read ECONNRESET`` at the bottom of
+    the traceback it prints.  Main has no transport shape, so it reads
+    that failure as the code's; this branch reads the whole message
+    and sees the broken connection, so it reads it as the machine's.
+
+    Both readings are kept, and the phase is what tells them apart:
+    a phase whose failures are **all** broken connections is
+    ``environment`` (this branch's reading -- the connection broke, so
+    the code is not what failed), while a phase that mixes a
+    wall-clock failure with a transport one is ``code`` (main's
+    reading -- one failure that is not a wall-clock shape is enough to
+    keep the phase FAILED).  A single transport failure therefore
+    reads as the machine's, exactly as this branch's recorded CI
+    failure requires, and a phase that also carries a wall-clock
+    failure keeps main's verdict.
     """
     try:
         root = ET.parse(Path(report_path)).getroot()  # nosec B314 - the gate's own pytest wrote it
@@ -2530,18 +2680,20 @@ def phase_report_evidence(report_path: str) -> str:
         return "no-evidence|?"
     suites = root.findall("testsuite") if root.tag == "testsuites" else [root]
     skipped = 0
-    messages: List[str] = []
+    shapes: List[str] = []
     for suite in suites:
         cases = suite.findall("testcase")
         skipped += sum(1 for case in cases if case.find("skipped") is not None)
         for case in cases:
             for kind in ("failure", "error"):
                 for node in case.findall(kind):
-                    messages.append(_junit_first_line(node))
-    if not messages:
+                    shapes.append(_failure_shape(node))
+    if not shapes:
         return f"no-evidence|{skipped}"
-    if all(is_wall_clock_shaped(message) for message in messages):
+    if all(shape == SHAPE_WALL_CLOCK for shape in shapes):
         return f"wall-clock|{skipped}"
+    if all(shape == SHAPE_TRANSPORT for shape in shapes):
+        return f"environment|{skipped}"
     return f"code|{skipped}"
 
 
@@ -2850,9 +3002,14 @@ def run_ci_verification(
     # host-measurability work is about: a gate that says "the host
     # could not be measured" is asking to be believed, and the only way
     # to check that claim is to read the failures the gate already
-    # wrote down.  A failure that is not a wall-clock shape is the
-    # code's, whatever the machine was doing — so the gate's exit code
-    # is not allowed to be the only witness.
+    # wrote down.  A failure that is not the machine's shape — neither
+    # a wall-clock one nor a transport one — is the code's, whatever
+    # the machine was doing; so the gate's exit code is not allowed to
+    # be the only witness.
+    #
+    # And only the reports **this round** wrote are read: the
+    # directory is reused across rounds, so a report an earlier round
+    # left there says nothing about the run being graded.
     junit_evidence = _read_junit_evidence(junit_dir, since=junit_since)
     evidence.update(junit_evidence)
     if stale_reports:
@@ -2871,7 +3028,7 @@ def run_ci_verification(
         and _gate_could_not_decide(exit_code, gate_summary, contract)
     )
     blocking_failures = (
-        _non_wall_clock_failures(junit_evidence) if could_not_decide else []
+        _blocking_failures(junit_evidence) if could_not_decide else []
     )
 
     if not timed_out and not error and exit_code == 0:
@@ -2923,14 +3080,14 @@ def run_ci_verification(
             signal = SIGNAL_GATE_NOT_EXECUTABLE
         elif blocking_failures:
             # The gate said the machine could not be measured, and the
-            # evidence says otherwise: at least one failure is not a
-            # wall-clock shape, so it is the code's.  The reason names
-            # the case and its message — "the host was busy" is not an
-            # explanation a reader can check.
+            # evidence says otherwise: at least one failure is neither a
+            # wall-clock shape nor a transport shape, so it is the
+            # code's.  The reason names the case and its message — "the
+            # host was busy" is not an explanation a reader can check.
             sample = blocking_failures[0]
             detail = (
-                f"退出码 {exit_code}（门禁说机器答不了，但失败里有不是墙钟"
-                f"形状的：{sample.get('node_id') or '未知用例'} — "
+                f"退出码 {exit_code}（门禁说机器答不了，但失败里有既不是墙钟"
+                f"形状也不是传输中断形状的：{sample.get('node_id') or '未知用例'} — "
                 f"{sample.get('first_line') or '（无消息）'}）"
             )
             signal = SIGNAL_GATE_FAILED

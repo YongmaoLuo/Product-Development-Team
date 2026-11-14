@@ -56,7 +56,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import re
 import sys
 import time
@@ -64,7 +63,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Final, Iterable, Mapping, Sequence
 
-from bounded_log import rotated_log_paths
 from framework.clock import utcnow_iso
 from framework.ids import InvalidPlanIdError, validate_plan_id
 from config_paths import resolve_state_db_path
@@ -366,34 +364,6 @@ class DeadLoopDetector:
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class _LogFile:
-    """How far one log file has been read.
-
-    ``key`` identifies the file itself — ``(st_dev, st_ino)``.  The
-    execution log rotates: the live log is renamed to
-    ``execution.log.1`` and a fresh live log takes its place.  A
-    rename keeps the inode, so a file's *identity* survives a rotation
-    even though its name does not — which is what lets the reader keep
-    its place in the renamed file instead of starting over in it.
-
-    ``index`` is where the file sat in the rotation chain when it was
-    read — 0 for the live log, 1 for ``<name>.1`` and so on.  A
-    rotation only ever moves a file *up* the chain, so an identity
-    that turns up further down the chain than it was last seen is a
-    different file that inherited a deleted file's inode.
-
-    ``consumed`` is the number of lines of this file that have already
-    been folded into the detector, and ``size`` the byte size the file
-    had when it was read.
-    """
-
-    key: tuple[int, int]
-    index: int
-    consumed: int
-    size: int
-
-
 class Watchdog:
     """Poll one plan directory and detect dead loops.
 
@@ -401,12 +371,6 @@ class Watchdog:
     how many lines it has already consumed so re-polling an unchanged
     log produces no new observations (otherwise a quiet daemon would
     trip the threshold purely by being polled three times).
-
-    The log rotates, so "the lines already consumed" are counted per
-    *file* rather than per position in the live log: the reader looks
-    at the rotated copies too, and a failure that has been rotated
-    aside is still seen.  A reader that only looked at the live log
-    would lose exactly the entries a dead loop is made of.
     """
 
     def __init__(
@@ -420,16 +384,11 @@ class Watchdog:
         self.plans_root = Path(plans_root)
         self.detector = DeadLoopDetector(threshold=threshold)
         self._on_trigger = on_trigger
-        # Lines already folded into the detector, keyed by the identity
-        # of the file they came from (``(st_dev, st_ino)``).  The log
-        # rotates, so the live log's line count is not a position that
-        # survives: the live log is renamed to ``execution.log.1`` and
-        # a fresh live log takes its place, and a line count carried
-        # from the old file into the new one skips the new file's first
-        # entries — the entries a rotation makes invisible.  Keying on
-        # the file's identity keeps the renamed file's place (a rename
-        # keeps the inode) and starts the new live log at zero.
-        self._consumed_by_file: dict[tuple[int, int], _LogFile] = {}
+        # Number of ``execution.log`` lines already folded into the
+        # detector. Re-reading the file from the top on every poll is
+        # cheap enough (the log rotates at 10 MB) and avoids byte-offset
+        # bookkeeping that a rotation would invalidate.
+        self._consumed_lines = 0
         # Guards the ``on_trigger`` hook so a plan that stays dead does
         # not re-invoke the action sequence on every subsequent poll.
         self._trigger_fired = False
@@ -515,161 +474,37 @@ class Watchdog:
         return compute_progress_token(rows)
 
     def _read_new_failures(self) -> list[dict[str, Any]]:
-        """Return failure entries appended since the previous poll.
+        """Return failure entries appended since the previous poll."""
+        try:
+            lines = self.log_file.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()
+        except OSError:
+            return []
 
-        The entries are read from the rotated copies first — oldest
-        first — and from the live log last, which is the order
-        ``pause_state`` and ``execution_log_tail`` read them in: a
-        rotation only moves *old* lines out of the way, so this is the
-        chronological order.  A failure that has been rotated aside is
-        still read, so a rotation cannot hide a dead loop from the
-        detector.
+        if len(lines) < self._consumed_lines:
+            # The log rotated underneath us; restart from the top of the
+            # new file rather than silently skipping its contents.
+            self._consumed_lines = 0
 
-        A log that is not there at all — neither live nor rotated —
-        simply yields no new entries.  This reader never raises: the
-        watchdog polls a directory another process is writing to, and
-        a missing file is silence, not an error.
-        """
+        fresh = lines[self._consumed_lines :]
+        self._consumed_lines = len(lines)
+
         failures: list[dict[str, Any]] = []
-        present: set[tuple[int, int]] = set()
-        for path in self._log_candidates():
-            read = self._read_file(path)
-            if read is None:
+        for line in fresh:
+            line = line.strip()
+            if not line:
                 continue
-            snapshot, fresh = read
-            present.add(snapshot.key)
-            self._consumed_by_file[snapshot.key] = snapshot
-            for line in fresh:
-                entry = self._parse_entry(line)
-                if entry is not None and self._is_failure(entry):
-                    failures.append(entry)
-        self._forget_absent_files(present)
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            if not self._is_failure(entry):
+                continue
+            failures.append(entry)
         return failures
-
-    def _log_candidates(self) -> list[Path]:
-        """The files the failures may live in, oldest first.
-
-        The rotated copies come first — the highest number holds the
-        oldest lines — and the live log comes last, because the live
-        log holds the newest ones.
-        """
-        return [*rotated_log_paths(self.log_file), self.log_file]
-
-    def _read_file(self, path: Path) -> tuple[_LogFile, list[str]] | None:
-        """Read the lines of ``path`` that the detector has not seen.
-
-        Returns the file's bookkeeping entry and its new lines, or
-        ``None`` when the file cannot be read.
-
-        The identity comes from the open handle, so it is the identity
-        of the file that was actually read: a rotation that happens
-        while the log is being read cannot make the reader attribute
-        one file's lines to another.
-        """
-        index = self._chain_index(path)
-        try:
-            info = path.stat()
-        except OSError:
-            return None
-        key = (info.st_dev, info.st_ino)
-        known = self._consumed_by_file.get(key)
-        if known is not None and known.size == info.st_size and known.index <= index:
-            # Nothing was appended since the last read, and the file is
-            # still the same file in the chain.  It is not read again,
-            # so a poll costs what was written rather than what the log
-            # has grown to.
-            if known.index == index:
-                return known, []
-            # The file moved up the chain — a rotation renamed it.
-            moved = _LogFile(
-                key=known.key,
-                index=index,
-                consumed=known.consumed,
-                size=known.size,
-            )
-            return moved, []
-
-        try:
-            with path.open("r", encoding="utf-8", errors="replace") as handle:
-                identity = os.fstat(handle.fileno())
-                lines = handle.read().splitlines()
-        except OSError:
-            return None
-
-        current_key = (identity.st_dev, identity.st_ino)
-        consumed = 0
-        previous = self._consumed_by_file.get(current_key)
-        if previous is not None:
-            consumed = previous.consumed
-            if previous.index > index:
-                # A file only moves up the rotation chain, so this
-                # identity turning up further down the chain than it
-                # was last seen is a new file that inherited the inode
-                # of a deleted one.  Read it from the top.
-                consumed = 0
-            elif previous.size > identity.st_size or len(lines) < consumed:
-                # The file is shorter than it was when it was read: it
-                # was truncated in place, so what is in it now is not
-                # what was there before.  Read it from the top rather
-                # than skipping the top of the new contents.
-                consumed = 0
-        snapshot = _LogFile(
-            key=current_key,
-            index=index,
-            consumed=len(lines),
-            size=identity.st_size,
-        )
-        return snapshot, lines[consumed:]
-
-    def _chain_index(self, path: Path) -> int:
-        """Where a file sits in the rotation chain.
-
-        The live log starts the chain (0) and ``<name>.1`` is 1,
-        ``<name>.2`` is 2 — the chain a rotation moves a file up.
-        """
-        live_name = self.log_file.name
-        name = path.name
-        if name == live_name:
-            return 0
-        prefix = live_name + "."
-        if name.startswith(prefix):
-            suffix = name[len(prefix) :]
-            if suffix.isdigit():
-                return int(suffix)
-        return 0
-
-    def _forget_absent_files(self, present: set[tuple[int, int]]) -> None:
-        """Forget the files that are no longer there.
-
-        A rotated copy that falls past the backup count is deleted, and
-        the operating system may hand a deleted file's inode to a new
-        file.  A position kept for a file that is gone would let the
-        recycled inode inherit the position of the file it replaced,
-        and the new file's first lines would be skipped.
-        """
-        for key in list(self._consumed_by_file):
-            if key not in present:
-                del self._consumed_by_file[key]
-
-    @staticmethod
-    def _parse_entry(line: str) -> dict[str, Any] | None:
-        """The log entry a line holds, or ``None`` if it holds none.
-
-        A line that is not JSON, or that is JSON but not an object, is
-        skipped: the log holds an entry for every event the executor
-        emits, and a torn line must not take the lines around it
-        down with it.
-        """
-        text = line.strip()
-        if not text:
-            return None
-        try:
-            entry = json.loads(text)
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(entry, dict):
-            return None
-        return entry
 
     @staticmethod
     def _is_failure(entry: Mapping[str, Any]) -> bool:

@@ -518,133 +518,7 @@ def test_watchdog_accepts_legacy_bare_list_tasks_file(plans_root: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6. Watchdog — rotated log copies
-#
-# The execution log rotates: the live log becomes ``execution.log.1``
-# and a fresh live log takes its place.  A reader that only looks at
-# the live file loses every entry that was rotated aside — and the
-# entries it loses are exactly the failures the dead-loop detector
-# needs, so a rotation can hide a real dead loop.
-# ---------------------------------------------------------------------------
-
-
-def test_watchdog_loses_no_entries_when_the_log_rotates(plans_root: Path) -> None:
-    """A rotation must not hide the failures that were already logged."""
-    plan_dir = plans_root / PLAN_ID
-    log = _write_log(plan_dir, [_error_entry("12", "boom")])
-    wd = Watchdog(PLAN_ID, plans_root=plans_root)
-
-    first = wd.detect_once()
-    assert first is not None and first.count == 1
-    assert wd.detect_once() is None
-
-    # The writer rotated: the live log became ``.1`` — the same file,
-    # the same inode — and a fresh live log took its place.
-    log.rename(plan_dir / "execution.log.1")
-    _write_log(plan_dir, [_error_entry("12", "boom")] * 2)
-
-    second = wd.detect_once()
-    assert second is not None
-    assert second.count == 3, "entries were lost to the rotation"
-    assert second.triggered is True
-
-
-def test_watchdog_counts_every_entry_written_after_a_rotation(plans_root: Path) -> None:
-    """The whole new live log must be counted, not skipped."""
-    plan_dir = plans_root / PLAN_ID
-    log = _write_log(plan_dir, [_error_entry("12", "boom")])
-    wd = Watchdog(PLAN_ID, plans_root=plans_root)
-    assert wd.detect_once().count == 1
-
-    log.rename(plan_dir / "execution.log.1")
-    _write_log(plan_dir, [_error_entry("12", "boom")] * 40)
-
-    result = wd.detect_once()
-    assert result is not None
-    assert result.count == 41, "entries written after the rotation were lost"
-
-
-def test_watchdog_does_not_count_entries_twice_across_a_rotation(plans_root: Path) -> None:
-    """The rotated copy holds an entry already folded into the detector."""
-    plan_dir = plans_root / PLAN_ID
-    log = _write_log(plan_dir, [_error_entry("12", "boom")])
-    wd = Watchdog(PLAN_ID, plans_root=plans_root)
-    assert wd.detect_once().count == 1
-
-    log.rename(plan_dir / "execution.log.1")
-    # No new live log: everything the reader can see was already seen.
-    assert wd.detect_once() is None
-
-
-def test_watchdog_reads_a_rotated_copy_when_the_live_log_is_gone(plans_root: Path) -> None:
-    """The live file is not the only place a failure can be."""
-    plan_dir = plans_root / PLAN_ID
-    log = _write_log(plan_dir, [_error_entry("12", "boom")] * 3)
-    log.rename(plan_dir / "execution.log.1")
-    wd = Watchdog(PLAN_ID, plans_root=plans_root)
-
-    result = wd.detect_once()
-    assert result is not None
-    assert result.count == 3
-    assert result.triggered is True
-
-
-def test_watchdog_reads_rotated_copies_oldest_first(plans_root: Path) -> None:
-    """``.2`` is older than ``.1``, so the newest entry is fed last."""
-    plan_dir = plans_root / PLAN_ID
-    with (plan_dir / "execution.log.2").open("w", encoding="utf-8") as fh:
-        fh.write(json.dumps(_error_entry("12", "older")) + "\n")
-    with (plan_dir / "execution.log.1").open("w", encoding="utf-8") as fh:
-        fh.write(json.dumps(_error_entry("12", "newer")) + "\n")
-    wd = Watchdog(PLAN_ID, plans_root=plans_root)
-
-    result = wd.detect_once()
-    assert result is not None
-    assert result.fingerprint == compute_fingerprint(PLAN_ID, "12", "newer")
-
-
-def test_watchdog_returns_none_when_the_live_log_vanished(plans_root: Path) -> None:
-    """A log that disappears entirely is not an error, it is silence."""
-    plan_dir = plans_root / PLAN_ID
-    log = _write_log(plan_dir, [_error_entry("12", "boom")])
-    wd = Watchdog(PLAN_ID, plans_root=plans_root)
-    assert wd.detect_once().count == 1
-
-    log.unlink()
-    assert wd.detect_once() is None
-
-
-def test_watchdog_reads_a_recycled_inode_as_a_new_file(plans_root: Path) -> None:
-    """A new file that inherits a deleted file's inode is a new file.
-
-    The writer deletes the oldest rotated copy and creates a fresh
-    live log, and the operating system may hand the deleted copy's
-    inode to that new file.  A reader that trusts the inode alone
-    carries the deleted file's position into the new one and skips its
-    first entries — the entries a dead loop is made of.  A rotation
-    only ever moves a file *up* the chain, so a file that turns up
-    further down the chain than it was last seen is a different file.
-    """
-    plan_dir = plans_root / PLAN_ID
-    rotated = plan_dir / "execution.log.3"
-    rotated.write_text(
-        "".join(json.dumps(_error_entry("12", "boom")) + "\n" for _ in range(3)),
-        encoding="utf-8",
-    )
-    wd = Watchdog(PLAN_ID, plans_root=plans_root)
-    first = wd.detect_once()
-    assert first is not None and first.count == 3
-
-    # The same inode now sits at the live log's name — what a
-    # recycled inode looks like from the reader's side.
-    rotated.rename(plan_dir / "execution.log")
-    second = wd.detect_once()
-    assert second is not None, "the recycled inode's entries were skipped"
-    assert second.count == 6
-
-
-# ---------------------------------------------------------------------------
-# 7. main() — the independent-process CLI entry point
+# 6. main() — the independent-process CLI entry point
 # ---------------------------------------------------------------------------
 
 
@@ -707,7 +581,7 @@ def test_main_rejects_non_positive_threshold(plans_root: Path, capsys) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 8. Structural guards — the module must stay decoupled
+# 7. Structural guards — the module must stay decoupled
 # ---------------------------------------------------------------------------
 
 

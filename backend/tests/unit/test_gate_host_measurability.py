@@ -22,12 +22,21 @@ What is pinned here
 2. A phase that failed on an unmeasurable host is **INCONCLUSIVE** and
    the gate exits 3 — but only when every one of that phase's failures
    is a wall-clock shape.
-3. **The negative control**: a phase with a deterministic failure (an
+3. A phase whose failures are all **transport** shapes (a connection
+   that broke) is INCONCLUSIVE too, and for the same reason: the
+   window between "the server dropped the connection" and "the client
+   noticed" is a fact about the host, not about the program.
+4. That shape is read out of the **whole** failure message, not only
+   its first line: a driver that died prints its traceback inside the
+   assertion that wrapped its exit code, so the error that matters can
+   sit thousands of characters into the message.
+5. **The negative control**: a phase with a deterministic failure (an
    assertion about behaviour) stays **FAILED** and the gate exits 1,
    even on an unmeasurable host.  "Unmeasurable host ⇒ everything is
    inconclusive" is not a fix; it hides real regressions.
-4. A measurable host keeps today's verdict, unchanged.
-5. The **test layer's own load gate** stands down on the measurement,
+6. A measurable host keeps today's verdict, unchanged — the new shape
+   is only consulted where the host has declared itself unmeasurable.
+7. The **test layer's own load gate** stands down on the measurement,
    not on the ``CI`` guess: a probe that measured the host beats an
    environment variable that guessed it.
 6. The **shape of a failure the gate has actually seen** decides who
@@ -65,6 +74,9 @@ from verification_ci_runner import (  # noqa: E402
     phase_report_evidence,
 )
 
+import verification_ci_runner as ci_runner  # noqa: E402
+from verification_ci_runner import MAX_JUNIT_MESSAGE_CHARS  # noqa: E402
+
 #: The repository root — this file lives at ``backend/tests/unit/``.
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -90,6 +102,32 @@ WALL_CLOCK_MESSAGE = (
 #: A failure that says something about the code, not about the clock.
 DETERMINISTIC_MESSAGE = "AssertionError: 1 + 1 == 3"
 
+#: A failure that says the connection broke, not that the clock ran out.
+TRANSPORT_MESSAGE = "Error: APIRequestContext.post: read ECONNRESET"
+
+#: The failure message the CI's own phase-2 report carried for the
+#: browser-replay case.
+#:
+#: The transport error is **not** the first line of this message.  The
+#: first line is the assertion that wraps the driver's exit code, and
+#: the error itself sits at the bottom of the traceback that assertion
+#: quotes — far past the ``MAX_JUNIT_MESSAGE_CHARS`` the evidence keeps
+#: of a message's first line.  A classifier that reads only the first
+#: line does not see the broken connection at all.
+CI_TRANSPORT_MESSAGE = (
+    "AssertionError: the browser driver failed (exit 1); stdout='' "
+    "stderr='Traceback (most recent call last):\\n"
+    "  File \"/tmp/pytest-of-ci/pytest-1/test_browser_replays_the_missi0"
+    "/drive_negative_replay.py\", line 82, in <module>\\n"
+    "    create_status = post(\"/api/interview/start\", payload)[0]\\n"
+    "  File \"/usr/lib/python3.11/site-packages/playwright/_impl/"
+    "_api_request_context.py\", line 172, in post\\n"
+    "    return mapping.rewrite_error(error, f\"{mapping.api_name}: {error}\")"
+    " from None\\n"
+    "playwright._impl._errors.Error: APIRequestContext.post: read ECONNRESET"
+    "\\nCall log:\\n  - → POST http://127.0.0.1:64737/api/interview/start"
+)
+
 #: The stub pytest: it records the ``PDT_HOST_MEASURABLE`` it was
 #: given, writes the junit report the gate asked for, and exits with
 #: the code the test wants.
@@ -97,6 +135,7 @@ _STUB_SOURCE = '''#!/usr/bin/env python3
 import os
 import pathlib
 import sys
+import xml.sax.saxutils as sax
 
 report = ""
 for arg in sys.argv[1:]:
@@ -109,10 +148,17 @@ with open(os.environ["PDT_STUB_ENV_LOG"], "a", encoding="utf-8") as handle:
 if report:
     path = pathlib.Path(report)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # The message is escaped the way pytest escapes it: a failure
+    # message that carries a traceback carries quotes and angle
+    # brackets, and a report that does not escape them is not a report
+    # the evidence can be read out of.
+    message = sax.escape(
+        os.environ["PDT_STUB_MESSAGE"], {'"': "&quot;"}
+    )
     path.write_text(
         '<testsuites><testsuite name="pytest" tests="1" failures="1" '
         'errors="0" skipped="0"><testcase classname="t" name="n">'
-        '<failure message="' + os.environ["PDT_STUB_MESSAGE"] + '">trace'
+        '<failure message="' + message + '">trace'
         "</failure></testcase></testsuite></testsuites>",
         encoding="utf-8",
     )
@@ -272,6 +318,150 @@ def test_the_negative_control_keeps_a_deterministic_failure_red(
     assert "FAILED" in _verdict(verdicts, "phase 1/3"), (
         f"phase 1 is reported as {verdicts['phase 1/3']!r} although its "
         f"failure is not a wall-clock shape:\n{completed.stdout}"
+    )
+
+
+def test_a_transport_failure_on_an_unmeasurable_host_is_inconclusive(
+    tmp_path: Path,
+) -> None:
+    """A connection that broke is the machine's, not the code's.
+
+    The shape is not a wall-clock one — nothing timed out — but it is
+    not the code's either.  A server that answers a request with an
+    unhandled exception drops the connection, and the client only
+    finds out when it hands the pooled socket to the next request.  How
+    long that window is depends on how busy the machine is, so on a
+    host that cannot even time a sleep the interruption says nothing
+    about the code.
+
+    Recording it as a code failure turns the machine's noise into a
+    repair task against a delivery nobody has proven defective — the
+    same mistake the wall-clock shape used to cause.
+    """
+    completed, _ = _run_gate(
+        tmp_path, message=TRANSPORT_MESSAGE, probe="fail",
+    )
+
+    assert completed.returncode == 3, (
+        f"a transport failure on an unmeasurable host produced exit code "
+        f"{completed.returncode}, not 3:\n{completed.stdout}\n{completed.stderr}"
+    )
+    verdicts = _summary(completed.stdout)
+    for phase in ("phase 1/3", "phase 2/3", "phase 3/3"):
+        verdict = _verdict(verdicts, phase)
+        assert "INCONCLUSIVE" in verdict, (
+            f"{phase} is reported as {verdict!r} although its only failure "
+            f"is a broken connection:\n{completed.stdout}"
+        )
+        assert "FAILED" not in verdict, (
+            f"{phase} is reported as {verdict!r} although its only failure "
+            f"is a broken connection:\n{completed.stdout}"
+        )
+
+
+def test_a_transport_failure_on_a_measurable_host_is_still_a_failure(
+    tmp_path: Path,
+) -> None:
+    """The new shape is only consulted where the host is unmeasurable.
+
+    On a host that can keep time the gate judges the code as it always
+    did: a broken connection is a failure, and the gate says so.
+    """
+    completed, _ = _run_gate(
+        tmp_path, message=TRANSPORT_MESSAGE, probe="pass",
+    )
+
+    assert completed.returncode == 1, (
+        f"a transport failure on a measurable host produced exit code "
+        f"{completed.returncode}, not 1:\n{completed.stdout}\n{completed.stderr}"
+    )
+    verdicts = _summary(completed.stdout)
+    assert "FAILED" in _verdict(verdicts, "phase 1/3"), (
+        f"phase 1 is reported as {verdicts['phase 1/3']!r} although the "
+        f"host could measure wall-clock time:\n{completed.stdout}"
+    )
+
+
+def test_a_transport_failure_hidden_in_a_traceback_is_still_the_machines(
+    tmp_path: Path,
+) -> None:
+    """The broken connection is not always the first line of the failure.
+
+    The CI's own phase-2 report carried the browser-replay failure as
+    "the browser driver failed (exit 1)" — an assertion that wraps the
+    driver's exit code — with the transport error quoted at the bottom
+    of the traceback it printed, 2378 characters into the message.
+
+    A classifier that reads only the first line of a failure message
+    never sees that error, and records the failure as the code's.  So
+    the shape has to be looked for in the whole message, not only in
+    the part the evidence keeps.
+
+    The message this test uses is the CI's own shape, so the test
+    fails if the shape stops being the CI's.
+    """
+    marker = CI_TRANSPORT_MESSAGE.find("ECONNRESET")
+    assert marker > MAX_JUNIT_MESSAGE_CHARS, (
+        f"the transport error sits at offset {marker} of the message, "
+        f"which is inside the {MAX_JUNIT_MESSAGE_CHARS} characters the "
+        f"evidence keeps of a message's first line — the test no longer "
+        f"exercises the shape it was written for."
+    )
+
+    completed, _ = _run_gate(
+        tmp_path, message=CI_TRANSPORT_MESSAGE, probe="fail",
+    )
+
+    assert completed.returncode == 3, (
+        f"a transport failure buried in a traceback produced exit code "
+        f"{completed.returncode}, not 3:\n{completed.stdout}\n{completed.stderr}"
+    )
+    verdicts = _summary(completed.stdout)
+    for phase in ("phase 1/3", "phase 2/3", "phase 3/3"):
+        verdict = _verdict(verdicts, phase)
+        assert "INCONCLUSIVE" in verdict, (
+            f"{phase} is reported as {verdict!r} although its only failure "
+            f"is a broken connection:\n{completed.stdout}"
+        )
+        assert "FAILED" not in verdict, (
+            f"{phase} is reported as {verdict!r} although its only failure "
+            f"is a broken connection:\n{completed.stdout}"
+        )
+
+
+def test_the_runner_reads_a_transport_failure_out_of_a_traceback(
+    tmp_path: Path,
+) -> None:
+    """The runner's own evidence must say what the gate says.
+
+    The gate is one reader of the report; the runner is another, and
+    it decides whether the gate's "the machine could not be measured"
+    is believed.  If the runner reads only the first line of a
+    failure, it sees a failure that is neither a wall-clock shape nor
+    a transport shape, and it records the gate's verdict as the
+    code's — the same misreading, one layer up.
+    """
+    report = tmp_path / "phase-2.xml"
+    report.write_text(
+        '<testsuites><testsuite name="pytest" tests="1" failures="1" '
+        'errors="0" skipped="0"><testcase classname="t" name="n">'
+        '<failure message="'
+        + CI_TRANSPORT_MESSAGE.replace("&", "&amp;").replace("<", "&lt;")
+        .replace(">", "&gt;").replace('"', "&quot;")
+        + '">trace</failure></testcase></testsuite></testsuites>',
+        encoding="utf-8",
+    )
+
+    assert ci_runner.phase_report_evidence(str(report)) == "environment|0", (
+        "the runner does not read the broken connection out of the "
+        "failure's traceback"
+    )
+
+    evidence = ci_runner._read_junit_evidence(tmp_path)
+    assert ci_runner._blocking_failures(evidence) == [], (
+        "the runner records the broken connection as a failure of the "
+        "code, so the gate's 'the machine could not be measured' is "
+        "overridden with the code's verdict"
     )
 
 

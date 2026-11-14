@@ -71,10 +71,18 @@ from verification_evidence import CHECKPOINTS_FILENAME
 # ``BLOCKED — `` 前缀 —— 读报告的人要一眼看出「验不下去」而不是「验了没过」。
 # 前缀由 :mod:`verification_buckets` 统一给出，四个 BLOCKED 产出点共用同一份。
 from verification_buckets import blocked_reason
+# 2026-11-08（依据契约自愈）：子 agent 自己也要核对本轮写出的依据产物 ——
+# 框架侧的核对（``verification_agent._apply_evidence_check``）发生在子 agent
+# 退出之后，那时已经没有人能补那份产物了，所以一次读取就能补齐的缺陷会把
+# 整条验证点判死。
+#
+# 模块级导入是刻意的：核对要走与框架侧**同一份**判据
+# （``verification_evidence``）。两边各写一套，早晚漂成两个答案。
+from verification_evidence import (
+    EVIDENCE_REQUIRED_METHODS,
+    verify_evidence,
+)
 from config_paths import resolve_plans_dir
-# 2026-10-31（计划日志有界轮转）：attempt 日志走有界追加，写入方不再
-# 裸 ``open(..., "a")`` —— 一个只涨不落的文件是没有上限的文件。
-from bounded_log import append_bounded_line
 # 2026-10-27（归因绑定点 · 验证点侧）：台账认 ``vp_id`` / ``round`` 两个
 # 归因坐标（``usage_registry``）。子 agent 是**验证会话的发起者** —— 它
 # 知道这次会话属于哪条验证点，所以验证点号由它绑。
@@ -994,6 +1002,14 @@ class VerificationSubAgent:
     # verdict at all by the time the outer cap fires. Outer cap is
     # flat ``HARD_WALL_CLOCK_CAP_SECONDS = 3600`` (2026-09-13 plan),
     # narrowed per method since 2026-11-05 (see ``wall_clock_cap()``).
+    #
+    # 2026-11-08（依据契约自愈）：本轮重试要带进 prompt 的**依据缺陷原文**
+    # —— 框架核对产物时给出的每一条 complaint（"citations[49] 缺少 snippet"）。
+    # 空列表 = 这一轮不是「依据不合格」触发的重试，于是 prompt 用通用的
+    # 重试措辞。它是实例状态而不是参数：``_build_prompt`` 的签名被若干测试
+    # 替身覆盖过（``_build_prompt(self, vp_node, attempt)``），加参数会把
+    # 那些替身炸掉。
+    pending_evidence_issues: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # Resolve the template eagerly so construction fails fast for
@@ -1665,6 +1681,19 @@ class VerificationSubAgent:
         loop short-circuits on BLOCKED (no retry) and, when the budget
         is exhausted by malfunctions, synthesizes a FAILED verdict
         from the last error.
+
+        2026-11-08（依据契约自愈）：还有一种情况既不是 finding 也不是
+        malfunction —— **依据产物不完整**。子 agent 交了 PASSED，但它写出
+        的 citations.json 少一条原文（VP-015 第 1 轮：51 条引用里
+        citations[49] 的 snippet 是空串），框架侧核对会把这条 PASSED 改判
+        FAILED；可框架侧核对发生在子 agent **退出之后**，那时已经没有人
+        能补那份产物了。于是「再读一次就能补齐」的缺陷把整条验证点判死，
+        下一轮还得从头重跑一遍 review。
+
+        所以 PASSED 在返回之前先核对一次本轮写出的产物；不合格就给一次
+        重试，并把框架自己的 complaint 带进下一次 prompt。那一次重试是
+        **独立的预算**：它不挪用 parse-error 的重试（那是给「答案不是
+        Verdict」的协议故障用的），自己也只给一次。
         """
         last_error: Optional[str] = None
         # Whether ``last_error`` describes a verdict-parse failure (the
@@ -1683,8 +1712,26 @@ class VerificationSubAgent:
         # consume the normal retry budget like any other failure; a VP
         # that still fails goes to repair / split instead of retrying.
         total_attempts = self.max_retries + 1
+        # 2026-11-08（依据契约自愈）：依据缺陷自带一次重试，**不挪用**
+        # parse-error 的重试预算 —— 两者是不同的东西。所以循环上界默认是
+        # ``total_attempts``，只有「依据核对判它不合格」这一种情况会 +1，
+        # 且只加一次。
+        attempt_budget = total_attempts
+        evidence_retry_used = False
+        # The PASSED whose artifact did not hold up.  When the retry
+        # attempt itself malfunctions, this is the verdict that comes
+        # back: the framework downgrades it for its evidence exactly as
+        # it did before this change, and the operator reads WHICH
+        # citations were broken instead of a protocol garble.
+        evidence_failed_verdict: Optional[Verdict] = None
+        attempt = 0
+        # A stale list from an earlier run of this instance would put the
+        # wrong complaint into this run's first prompt.
+        self.pending_evidence_issues = []
 
-        for attempt in range(total_attempts):
+        while attempt < attempt_budget:
+            attempt_no = attempt
+            attempt += 1
             # 2026-11-08（VP-028 归因 · 层一）：本次 attempt 独占一个会话
             # 句柄。没有它，派发层自己挑会话，续跑时子 agent 只能对着别人
             # 的记录继续 —— round 24 就是这样：判 VP-028 的 attempt 答了
@@ -1692,8 +1739,10 @@ class VerificationSubAgent:
             session = _new_attempt_session(vp_node)
             self._write_log(log_path, "attempt_started", {
                 "vp_id": vp_node.get("id", "unknown"),
-                "attempt": attempt,
-                "max_attempts": total_attempts,
+                "attempt": attempt_no,
+                # 循环上界就是本 attempt 的预算：依据契约自愈会给它 +1，
+                # 所以这里报的是**本轮实际可用的 attempt 数**。
+                "max_attempts": attempt_budget,
                 # 这是**申请**的会话（本次 attempt 生成的固定 id）；
                 # ``attempt_completed`` 里记的是**作答**的会话 ——
                 # provider 切换可能换 id，记录要能回答"哪段对话答的"。
@@ -1706,7 +1755,7 @@ class VerificationSubAgent:
                     coding_tool=coding_tool,
                     settings_path=settings_path,
                     log_path=log_path,
-                    attempt=attempt,
+                    attempt=attempt_no,
                     project_dir=project_dir,
                     excluded_providers=excluded_providers,
                     artifact_dir=artifact_dir,
@@ -1739,7 +1788,7 @@ class VerificationSubAgent:
                 last_error = f"VerdictParseError: {e}"
                 last_error_is_parse_error = True
                 self._write_log(log_path, "verdict_parse_error", {
-                    "attempt": attempt,
+                    "attempt": attempt_no,
                     "error": last_error,
                     # The raw payload the sub-agent produced rides along
                     # on the exception (see ``_execute_attempt``'s
@@ -1749,13 +1798,17 @@ class VerificationSubAgent:
                         getattr(e, "raw_output_head", "") or (str(e) or "")
                     )[:400],
                 })
-                if attempt < self.max_retries:
+                if attempt_no < self.max_retries:
                     # Bounded exponential backoff: 1s, 2s, 4s, ...
                     # so we don't hammer the LLM while still
                     # giving the provider time to recover.
-                    backoff = 2 ** attempt
+                    #
+                    # The condition is the PARSE-ERROR budget, not the
+                    # loop's bound: the evidence retry has its own
+                    # attempt and must not spend this one (2026-11-08).
+                    backoff = 2 ** attempt_no
                     self._write_log(log_path, "verdict_parse_retry", {
-                        "attempt": attempt,
+                        "attempt": attempt_no,
                         "backoff_sec": backoff,
                     })
                     await asyncio.sleep(backoff)
@@ -1780,7 +1833,7 @@ class VerificationSubAgent:
                 self._watchdog_retry_used = True
                 self._write_log(log_path, "sub_agent_kill_retry", {
                     "vp_id": vp_node.get("id", "unknown"),
-                    "attempt": attempt,
+                    "attempt": attempt_no,
                     "kill_count": e.kill_count,
                 })
                 continue
@@ -1799,7 +1852,7 @@ class VerificationSubAgent:
                 # touch it again.
                 self._write_log(log_path, "stuck_sub_agent_routed_to_summarizer", {
                     "vp_id": e.vp_id,
-                    "attempt": attempt,
+                    "attempt": attempt_no,
                     "elapsed": e.elapsed,
                     "threshold": e.threshold,
                     "output_file": e.output_file,
@@ -1827,21 +1880,21 @@ class VerificationSubAgent:
                 last_error = str(e)
                 last_error_is_parse_error = False
                 self._write_log(log_path, "attempt_exception", {
-                    "attempt": attempt,
+                    "attempt": attempt_no,
                     "error": last_error,
                 })
-                if attempt < self.max_retries:
+                if attempt_no < self.max_retries:
                     await self._self_heal(
                         vp_node=vp_node,
                         last_verdict=None,
                         last_error=last_error,
                         log_path=log_path,
-                        attempt=attempt,
+                        attempt=attempt_no,
                     )
                 continue
 
             self._write_log(log_path, "attempt_completed", {
-                "attempt": attempt,
+                "attempt": attempt_no,
                 "verdict": verdict.verdict,
                 "reasons": verdict.reasons,
                 # 作答的会话（句柄最终记下的那个）。provider 切换可能
@@ -1850,6 +1903,34 @@ class VerificationSubAgent:
             })
 
             if verdict.verdict == "PASSED":
+                # 2026-11-08（依据契约自愈）：PASSED 在返回之前先核对本轮
+                # 写出的依据产物。框架侧的核对（``_apply_evidence_check``）
+                # 发生在子 agent 退出之后，那时已经没有人能补那份产物了 ——
+                # 一次读取就能补齐的缺陷会把整条验证点判死。
+                #
+                # **只查 PASSED**：FAILED / BLOCKED 本来就不欠引用
+                # （``verification_evidence`` 的模块注释：Only PASSED is
+                # inspected），不能因为缺引用去重试它们。
+                issues = self._evidence_contract_issues(vp_node, project_dir)
+                if issues:
+                    evidence_failed_verdict = verdict
+                    if evidence_retry_used:
+                        # The one evidence retry is spent.  The verdict
+                        # goes back as it is — the framework downgrades it
+                        # downstream, exactly as it did before.  No new
+                        # pass path is created here.
+                        return verdict
+                    evidence_retry_used = True
+                    # One extra attempt, and only one: the evidence retry
+                    # does not spend the parse-error budget.
+                    attempt_budget = total_attempts + 1
+                    self.pending_evidence_issues = issues
+                    self._write_log(log_path, "evidence_contract_retry", {
+                        "vp_id": vp_node.get("id", "unknown"),
+                        "attempt": attempt_no,
+                        "issues": issues,
+                    })
+                    continue
                 return verdict
             if verdict.verdict == "BLOCKED":
                 # Security net is intentional — no retry, no heal.
@@ -1868,10 +1949,17 @@ class VerificationSubAgent:
             # independence.
             return verdict
 
-        # Budget exhausted by ATTEMPT MALFUNCTIONS only (a clean FAILED
+        # The budget ran out on ATTEMPT MALFUNCTIONS (a clean FAILED
         # verdict never reaches this point — it returns above). Per PRD
         # decision point 3 (zero-tolerance for skipping), we never
         # coerce this to SKIPPED; it's a hard FAILED.
+        #
+        # 2026-11-08（依据契约自愈）：如果手上已经有一份「依据不合格」的
+        # PASSED，而它后面的重试都出了故障，那么交回这一份才是诚实的 ——
+        # 框架会照旧按依据缺陷把它改判 FAILED，操作者读到的是「哪几条引用
+        # 站不住」，而不是一次协议乱码。
+        if evidence_failed_verdict is not None:
+            return evidence_failed_verdict
         #
         # 2026-10-23: the wording names WHICH malfunction ate the
         # budget. An unparseable verdict (the sub-agent's answer did
@@ -1883,7 +1971,7 @@ class VerificationSubAgent:
         # nonsense.
         if last_error_is_parse_error:
             exhausted_reason = (
-                f"verdict unparseable after {total_attempts} attempts: "
+                f"verdict unparseable after {attempt} attempts: "
                 f"{last_error or 'unknown error'}"
             )
         else:
@@ -1909,6 +1997,60 @@ class VerificationSubAgent:
             failure_class=INFRA_FAILURE_CLASS,
             failure_class_source=DETERMINISTIC_FAILURE_CLASS_SOURCE,
         )
+
+    def _evidence_contract_issues(
+        self,
+        vp_node: Dict[str, Any],
+        project_dir: Optional[Path] = None,
+    ) -> List[str]:
+        """What the framework's evidence check says about this attempt.
+
+        The same check the framework runs downstream
+        (``verification_agent._apply_evidence_check`` → ``apply_to_verdict``
+        → ``verify_evidence``), run **here**, while the sub-agent that
+        wrote the artifact is still here to complete it.
+
+        Returns one string per issue, in the form the prompt quotes
+        (``[kind] detail``), or ``[]`` when there is nothing to complain
+        about — including every case where the check cannot be run at
+        all (a method with no evidence contract, no artifact directory, no
+        project directory to resolve the citations against).  A check
+        that cannot be run is not a complaint.
+        """
+        method = str(
+            vp_node.get("verification_method") or self.method or ""
+        ).strip()
+        if method not in EVIDENCE_REQUIRED_METHODS:
+            return []
+
+        # The plan directory is derived from the artifact directory the
+        # orchestrator set (``<plan_dir>/vp_artifacts/<vp_id>``) — the
+        # sub-agent is told where to write, never where the plan lives.
+        artifact_dir = str(vp_node.get("evidence_artifact_dir") or "").strip()
+        if not artifact_dir:
+            return []
+        plan_dir_text = plan_dir_of_artifact_dir(artifact_dir)
+        if not plan_dir_text:
+            return []
+
+        root = project_dir or vp_node.get("project_root")
+        if not root:
+            return []
+
+        try:
+            issues = verify_evidence(
+                method,
+                Path(plan_dir_text),
+                Path(str(root)),
+                str(vp_node.get("id", "unknown")),
+            )
+        except Exception as exc:  # noqa: BLE001 - the check never raises
+            self.logger.warning(
+                "[evidence_contract] check failed for %s (%s): %s",
+                vp_node.get("id", "unknown"), method, exc,
+            )
+            return []
+        return [f"[{issue.kind}] {issue.detail}" for issue in issues]
 
     async def _execute_attempt(
         self,
@@ -3494,15 +3636,75 @@ class VerificationSubAgent:
 
         if attempt > 0:
             parts.append("")
-            parts.append(
-                f"Retry attempt {attempt + 1}/{self.max_retries + 1}: "
-                "the previous attempt failed. Analyse the failure, "
-                "fix the underlying issue (edit code, install a "
-                "missing dependency, or tweak config), then re-run "
-                "the test_command and report the verdict."
-            )
+            if self.pending_evidence_issues:
+                # 2026-11-08（依据契约自愈）：这一轮的重试是**依据产物不合格**
+                # 触发的，不是「分析失败、改代码、重跑 test_command」。那句话
+                # 会把验证 agent 送进被验证的仓库 —— 那个方法的作用域是只读，
+                # 验证独立性也不许它改代码。所以这里换成「补齐产物」的措辞，
+                # 并把框架自己的 complaint 原文带进来：子 agent 知道该补哪一
+                # 条引用、补什么原文。
+                parts.extend(self._evidence_retry_block(vp_node))
+            else:
+                parts.append(
+                    f"Retry attempt {attempt + 1}/{self.max_retries + 1}: "
+                    "the previous attempt failed. Analyse the failure, "
+                    "fix the underlying issue (edit code, install a "
+                    "missing dependency, or tweak config), then re-run "
+                    "the test_command and report the verdict."
+                )
         parts.extend(self._evidence_contract(vp_node))
         return "\n".join(parts)
+
+    def _evidence_retry_block(self, vp_node: Dict[str, Any]) -> List[str]:
+        """The retry hint for an attempt that failed the evidence check.
+
+        The generic retry wording ("analyse the failure, fix the
+        underlying issue (edit code, install a missing dependency, or
+        tweak config), then re-run the test_command") is wrong here: the
+        verdict was not disputed, only the artifact it shipped with was
+        incomplete, and the repository under verification is READ-ONLY
+        for a verification agent — sending it in to "fix the issue" would
+        corrupt the very independence the method depends on.
+
+        So this block asks for exactly one thing: rewrite the artifact,
+        with the framework's own complaints quoted verbatim so the
+        sub-agent knows which entry to complete and with what text.
+        """
+        method = str(
+            vp_node.get("verification_method") or self.method or ""
+        ).strip()
+        artifact_dir = str(vp_node.get("evidence_artifact_dir") or "").strip()
+        filename = (
+            "citations.json" if method == "code_review" else "checkpoints.json"
+        )
+        artifact_path = (
+            str(Path(artifact_dir) / filename) if artifact_dir else filename
+        )
+        block = [
+            f"Retry attempt — the previous attempt's EVIDENCE ARTIFACT did "
+            f"not satisfy the evidence contract. Your conclusion was not "
+            f"disputed: only the artifact you shipped with it was "
+            f"incomplete.",
+            "",
+            f"DO NOT change the repository under verification: it is "
+            f"READ-ONLY for you, and a verification agent that edits what "
+            f"it is verifying is not a verification. Fix ONLY the "
+            f"evidence artifact:",
+            f"    {artifact_path}",
+            "",
+            "The framework rejected these entries — each one is a concrete "
+            "thing to complete, with the text it expects there:",
+        ]
+        for issue in self.pending_evidence_issues:
+            block.append(f"  - {issue}")
+        block.append("")
+        block.append(
+            f"Rewrite {artifact_path} so every entry carries what the "
+            "contract asks for (the quoted text you actually read there, "
+            "the real line number, the path relative to the project root), "
+            "then report the verdict again."
+        )
+        return block
 
     def _evidence_contract(self, vp_node: Dict[str, Any]) -> List[str]:
         """The "prove your conclusion" block for the LLM-judged methods.
@@ -3758,11 +3960,6 @@ class VerificationSubAgent:
         every operation is wrapped in a broad try/except. The file
         format is JSON-lines (one object per line), matching the
         convention used by ``plans/{plan_id}/execution.log``.
-
-        The write goes through :func:`bounded_log.append_bounded_line`,
-        so the attempt log is bounded: it records every heartbeat of
-        every attempt, and a file that only grows is a file with no
-        ceiling.
         """
         if log_path is None:
             return
@@ -3773,10 +3970,8 @@ class VerificationSubAgent:
                 "event": event,
                 "data": data,
             }
-            append_bounded_line(
-                log_path,
-                json.dumps(entry, ensure_ascii=False) + "\n",
-            )
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception:
             # Never let logging failures propagate.
             pass

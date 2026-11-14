@@ -211,6 +211,12 @@ TICK_SECONDS: float = 0.5
 REQUEST_HEADER: str = "X-PDT-Request"
 REQUEST_HEADER_VALUE: str = "1"
 
+#: The read model's own endpoint.  The panel polls it, and the case
+#: reads it through the same session; the driver the case runs imports
+#: it from here, so that there is one spelling of the endpoint and not
+#: two.
+STATE_PATH: str = "/api/scheduler/state"
+
 #: The state machine's phase a plan waits in.
 QUEUED_PHASE: str = "queued"
 
@@ -318,6 +324,11 @@ the line and the running plans in one pass, out of one read model, so
 a widget read before the panel has drawn anything reads the panel's
 first frame — and the first frame of a page whose read failed is the
 empty read model, which says nothing is running.
+
+The read model is sampled on **both** sides of the panel's own reading
+as well: once before the panel reads and once after it, so the panel's
+drawing is bracketed by two readings of the same server and the window
+between them is measured rather than assumed.
 """
 import json
 import os
@@ -334,6 +345,7 @@ sys.path.insert(0, os.environ["PDT_CASE_BACKEND_DIR"])
 from tests.e2e.plan_scheduler.test_scheduler_operator_e2e import (
     QUEUE_CARD_SELECTOR,
     RUNNING_CARD_SELECTOR,
+    STATE_PATH,
     _wait_for_panel_parity,
     read_cards,
     read_rows,
@@ -343,10 +355,6 @@ from tests.e2e.plan_scheduler.test_scheduler_operator_e2e import (
 
 GUARD_HEADER = "x-pdt-request"
 GUARD_VALUE = "1"
-
-#: The read model's own endpoint.  The panel polls it, and the case
-#: reads it through the same session.
-STATE_PATH = "/api/scheduler/state"
 
 
 def browser_executable():
@@ -536,9 +544,11 @@ def is_action(url):
 def is_state(url):
     """Whether the URL is the read model's own URL.
 
-    The URL is matched by its ending, so a query string or a trailing
-    slash does not hide it: the panel's poll and the case's own read go
-    to the same endpoint, and only the path says which one it is.
+    The read model the panel polls and the case reads is at
+    /api/scheduler/state, and the URL is matched by its ending, so a
+    query string or a trailing slash does not hide it: the panel's
+    poll and the case's own read go to the same endpoint, and only the
+    path says which one it is.
     """
     return url.split("?")[0].rstrip("/").endswith(STATE_PATH)
 
@@ -698,6 +708,19 @@ with sync_playwright() as driver:
     # Then the scheduler view, the way the operator opens it.
     page.click("#btn-open-scheduler")
     page.wait_for_selector("#scheduler-view:not(.hidden)", timeout=30000)
+
+    # The read model is sampled *around* the panel's own reading, so the
+    # two readings are bracketed: the panel drew its durations at some
+    # moment between the two samples, and the window between them is
+    # the whole of the uncertainty there is.  The first sample is taken
+    # as soon as the view is open, because the panel's first drawing is
+    # the freshest one it will ever show for this view.
+    api_before_at = time.time()
+    api_state_before = page.request.get(
+        url.rstrip("/") + "/api/scheduler/state",
+        headers={GUARD_HEADER: GUARD_VALUE},
+    ).json()
+
     page.wait_for_timeout(1000)
     if parity:
         # The panel is given the time to draw the read model it was
@@ -737,6 +760,16 @@ with sync_playwright() as driver:
     # How far apart the two readings are: the interval in which the
     # clock may have moved between them.
     read_gap = round(api_read_at - panel_read_at, 3)
+
+    # The read model is sampled **again**, on the far side of the
+    # panel's own reading: the sample taken before the panel was read
+    # and this one bracket the panel's drawing, and the window between
+    # the two is the whole of the uncertainty there is.
+    api_after_at = time.time()
+    api_state_after = page.request.get(
+        url.rstrip("/") + "/api/scheduler/state",
+        headers={GUARD_HEADER: GUARD_VALUE},
+    ).json()
 
     # The screenshot is evidence and not an input, so it is taken after
     # both readings rather than between them.
@@ -786,6 +819,9 @@ with sync_playwright() as driver:
         "queue": queue,
         "running": running,
         "api": api_state,
+        "api_before": api_state_before,
+        "api_after": api_state_after,
+        "api_window_sec": round(api_after_at - api_before_at, 3),
         "panel_state": panel_state,
         "read_gap": read_gap,
         "steps": observations,
@@ -1060,6 +1096,30 @@ def _duration_seconds(text: str) -> Tuple[Optional[int], int]:
     return total, slack
 
 
+def _panel_clock(row: Dict[str, Any]) -> int:
+    """The clock the panel draws for a running row, in seconds.
+
+    The panel draws the **plan** clock — ``running_sec``, the time
+    since the plan itself started — and falls back to the **slot**
+    clock — ``elapsed_sec``, the time since the slot was acquired —
+    when the plan clock is missing.  The two are not two readings of
+    the same fact: the slot clock starts again at zero whenever the
+    scheduler restarts, and the plan clock does not.
+
+    The fallback is nullish, and it has to be: a plan that started a
+    moment ago has a plan clock of ``0``, and a falsy test would throw
+    that number away and read the slot clock instead.
+
+    This is the same rule the panel itself applies
+    (``frontend/app.js``: ``item.running_sec ?? item.elapsed_sec``),
+    so the comparison reads the clock the panel drew.
+    """
+    running = row.get("running_sec")
+    if running is None:
+        return int(row["elapsed_sec"])
+    return int(running)
+
+
 def _clock_readings(row: Dict[str, Any]) -> List[int]:
     """The clocks a running row carries, in seconds.
 
@@ -1067,8 +1127,18 @@ def _clock_readings(row: Dict[str, Any]) -> List[int]:
     clock — how long the plan has been at it — and ``elapsed_sec`` is
     the slot's clock — how long the slot has been held.  The panel draws
     the plan's clock and falls back to the slot's clock for a listing
-    that carries no plan clock; both are read here, so a row is
-    described in full and a bound can be taken from either of them.
+    that carries no plan clock, so the case cannot tell which of the
+    two the panel drew; both are read here, and the panel's number has
+    to fit between them either way.
+
+    This is the **interval** reading of the same row: ``_panel_clock``
+    answers "which clock did the panel draw", this one answers "which
+    clocks could it have drawn".  The comparison needs both: the first
+    to hold the panel to the clock it chose, the second to keep the
+    assertion honest about a listing that carries no plan clock.
+
+    A row that carries no plan clock is described in full as well, so a
+    bound can be taken from either of the two clocks it carries.
     """
     values: List[int] = []
     for name in ("running_sec", "elapsed_sec"):
@@ -2524,14 +2594,40 @@ def test_panel_and_api_parity(world):
     #
     # The panel draws a duration and the read model carries seconds,
     # so the drawing is turned back into seconds first.
+    #
+    # Two further rules make the comparison mean something:
+    #
+    # * it reads the clock the panel draws — the **plan** clock, with
+    #   the slot clock as the fallback the panel itself uses.  Reading
+    #   the slot clock instead compares two different facts, and the
+    #   difference between them is a floor rather than an error;
+    # * its tolerance is derived from the **measured** window between
+    #   the two samples of the read model that bracket the panel's own
+    #   reading.  A constant tolerance only holds on a host that
+    #   measures time the way it was written down — which is how a
+    #   case that is green on a quiet machine goes red on a busy one.
     panel_state = report["panel_state"]
     assert panel_state is not None, (
         "the driver did not report the read model the panel was fed; the "
         "panel's rows cannot be compared with a model that was never "
         "captured"
     )
+    # The bracket: the read model sampled on both sides of the panel's
+    # own reading, and the window between the two samples.
+    window = float(report["api_window_sec"])
+    tolerance = window + 1
+    before_rows = {
+        str(row["plan_id"]): row for row in report["api_before"]["running"]
+    }
+    after_rows = {
+        str(row["plan_id"]): row for row in report["api_after"]["running"]
+    }
     served_running = list(panel_state.get("running") or [])
     panel_running = report["running"]
+    assert len(panel_running) == len(state["running"]), (
+        f"the panel draws {len(panel_running)} running plans, the read model "
+        f"carries {len(state['running'])}"
+    )
     assert len(panel_running) == len(served_running), (
         f"the panel draws {len(panel_running)} running plans, the read model "
         f"it was fed carries {len(served_running)}"
@@ -2581,7 +2677,6 @@ def test_panel_and_api_parity(world):
             f"the panel draws {drawn[1]!r} for {drawn[0]!r}, which is not a "
             f"duration"
         )
-
         # And the duration the panel draws is that model's own clock:
         # the panel drew the model, so the two are one reading and not
         # two.  The panel draws a duration and the read model carries
@@ -2614,6 +2709,30 @@ def test_panel_and_api_parity(world):
         # read model carries both clocks; the one the panel drew is the
         # one compared here.
         plan_id = str(drawn[0])
+        # The tight bracket: the read model sampled on both sides of the
+        # panel's own reading, so the panel's number has to fall between
+        # the two samples of the clock the panel draws, within the
+        # measured window between them.
+        before_value = _panel_clock(before_rows[plan_id])
+        after_value = _panel_clock(after_rows[plan_id])
+        assert before_value <= after_value, (
+            f"the read model's own plan clock for {plan_id!r} went backwards: "
+            f"{before_value}s before the panel's drawing and {after_value}s "
+            f"after it"
+        )
+        lower = before_value - tolerance - slack
+        upper = after_value + tolerance
+        assert lower <= drawn_elapsed <= upper, (
+            f"the panel says {plan_id!r} has been running for {drawn_elapsed}s; "
+            f"the read model says {before_value}s before the panel's drawing "
+            f"and {after_value}s after it, over a sampling window of "
+            f"{window}s"
+        )
+        # The wide bracket: the read model read on both sides of the
+        # whole drive.  Whichever clock the panel drew, its number was
+        # read inside the drive, and the clock it was read on only moves
+        # forward — so the number has to fit between the smallest and the
+        # largest of the clocks the two readings carry.
         before_row = before_by_id.get(plan_id)
         after_row = after_by_id.get(plan_id)
         assert before_row is not None and after_row is not None, (
