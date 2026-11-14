@@ -4355,6 +4355,60 @@ def _mark_verification_round_running(plan_id: str, round_num: int) -> None:
         state["thread"] = threading.current_thread()
 
 
+def _round_was_blocked_by_base_drift(
+    current_row: Optional[Dict[str, Any]],
+) -> bool:
+    """Was the round this row describes blocked by a base-drift conflict?
+
+    A round the base-drift check blocked dispatched **nothing**: the
+    branch had drifted away from its base, merging the base back left
+    conflicts, and the round therefore has no verdict — nobody ever
+    looked at the product.  Such a round is not a failed round, it is a
+    round that did not happen, and it must not be charged to the plan's
+    round budget.
+
+    The block is recognised from either of the two places the reason
+    reaches the row:
+
+      * the ``verification_stop_reason`` column, which is where the
+        repository writes it (see ``mark_round_blocked``);
+      * the ``results`` envelope the round itself wrote down, which
+        carries the same ``stop_reason`` word.
+
+    Both are consulted because the two are written by different call
+    sites: a row that carries only one of them is still a blocked row,
+    and treating it as an ordinary finished round would spend the
+    plan's budget on a round that never ran.
+
+    Everything else — no row, no reason, another reason — is not a
+    base-drift block.  In particular a round that really ran and ended
+    with a verdict (``max_rounds_reached``,
+    ``same_failure_repeated_after_max_attempts``, ...) is NOT blocked
+    and keeps advancing as before.
+    """
+    if not current_row:
+        return False
+
+    reason = str(current_row.get("verification_stop_reason") or "")
+    if reason == BASE_DRIFT_CONFLICTS_STOP_REASON:
+        return True
+
+    # The envelope may still be raw JSON on the row (the repository
+    # decodes it, a row read straight out of SQLite does not).
+    envelope = current_row.get("results")
+    if isinstance(envelope, str):
+        try:
+            envelope = json.loads(envelope)
+        except (TypeError, ValueError):
+            return False
+    if not isinstance(envelope, dict):
+        return False
+    return (
+        str(envelope.get("stop_reason") or "")
+        == BASE_DRIFT_CONFLICTS_STOP_REASON
+    )
+
+
 def _plan_next_round(
     current_row: Optional[Dict[str, Any]],
 ) -> Tuple[int, int, bool]:
@@ -4380,12 +4434,19 @@ def _plan_next_round(
     Scope -- read this before reusing the function:
 
     _plan_next_round answers "which round comes after a round that REALLY
-    finished": it always returns current.round + 1. It is NOT the resume
-    decision. POST /api/verification/{id}/start asks _resolve_start_round
-    instead, which returns the interrupted round itself when the plan
-    carries a pause checkpoint or a running / loop_stopped row. The two are
-    deliberately separate: a finished round advances, an interrupted round
-    does not.
+    finished": for such a round it returns current.round + 1.  The one
+    exception is a round that was BLOCKED before it dispatched anything
+    (a base-drift conflict): that round has no verdict at all, so it is
+    re-run under the SAME number and does not spend the plan's budget.
+    A blocked round therefore reuses its number, and is never exhausted
+    by the reuse — it has not run yet.
+
+    It is NOT the resume decision. POST /api/verification/{id}/start
+    asks _resolve_start_round instead, which returns the interrupted
+    round itself when the plan carries a pause checkpoint or a running /
+    loop_stopped row. The two are deliberately separate: a finished
+    round advances, an interrupted round does not, and a blocked round
+    is re-run in place.
     """
     if not current_row:
         # No row yet: the plan starts at round 1 against the default cap.
@@ -4393,7 +4454,21 @@ def _plan_next_round(
     max_rounds = int(
         current_row.get("max_rounds") or _server.DEFAULT_MAX_VERIFICATION_ROUNDS
     )
-    next_round = int(current_row.get("round") or 0) + 1
+    current_round = int(current_row.get("round") or 0)
+    if _round_was_blocked_by_base_drift(current_row):
+        # 2026-11-13 — the round was blocked by the base-drift check
+        # before it dispatched a single verification point, so nobody
+        # ever looked at the product and the round spent no budget.
+        # Re-run it under the number it was blocked at: the verdict,
+        # the report and the repair tasks of the eventual real round
+        # then all carry the number the plan was on.
+        #
+        # ``max(1, ...)`` because round 0 means "no round has run yet"
+        # everywhere else in this codebase — a blocked row numbered 0
+        # re-runs as round 1.
+        next_round = max(1, current_round)
+        return next_round, max_rounds, next_round > max_rounds
+    next_round = current_round + 1
     return next_round, max_rounds, next_round > max_rounds
 
 
@@ -8672,6 +8747,133 @@ def _base_drift_round_action(report: Any) -> Optional[str]:
     return "repair" if task_id else "stop"
 
 
+#: The event a round blocked by a base-drift conflict writes before it
+#: hands the plan to the executor.
+BASE_DRIFT_ROUND_BLOCKED_EVENT = "base_drift_round_blocked"
+
+#: The status the blocked-round envelope carries.
+BASE_DRIFT_ROUND_BLOCKED_STATUS = "base_drift_blocked"
+
+#: Who recorded the blocked-round envelope.  The marker is what tells
+#: ``repair_stale_terminal_state`` that this row is NOT a half-written
+#: terminal verdict — a blocked round is re-run, not healed.
+BASE_DRIFT_ROUND_BLOCK_RECORDER = "_base_drift_round_block"
+
+
+def _record_base_drift_round_block(
+    plan_id: str,
+    round_token: Any,
+    blocked: Any,
+    *,
+    repair_task_id: str = "",
+) -> None:
+    """Write down that the round was blocked by a base-drift conflict.
+
+    2026-11-13: the two hand-off points — the repair callback
+    (:func:`_make_repair_on_complete`) and the auto-loop's own round —
+    dispatched the base merge and returned, and the round row said
+    **nothing**.  The next round therefore had no evidence that the
+    previous one was blocked, and the round counter was bumped for a
+    round that never ran.
+
+    Two things are written, and they are independent:
+
+    * the round row (``plan_verification``) — the stop reason
+      ``base_drift_conflicts`` and an envelope naming the repair task
+      the conflict became.  The row keeps its status and its round
+      number: the round is *blocked*, not finished, and it is re-run
+      under the SAME number (see ``mark_round_blocked`` and
+      :func:`_plan_next_round`);
+    * one audit event in the plan's own ``execution.log`` — the
+      conflict's evidence, so an operator can read what blocked the
+      round without opening the database.
+
+    Both writes are best-effort.  An audit write that fails must not
+    take the hand-off down with it: the merge is what unblocks the
+    plan, and a plan whose audit trail has a hole is a smaller problem
+    than a plan whose merge never ran.
+
+    Args:
+        plan_id: The plan whose round was blocked.
+        round_token: The round's token — the event names it so the
+            reader can tell which round the block belongs to.
+        blocked: The conflict's own evidence (the blocked report).  It
+            travels with the event; the row carries the reason.
+        repair_task_id: The repair task the conflict became, when it
+            became one.
+    """
+    envelope = {
+        "status": BASE_DRIFT_ROUND_BLOCKED_STATUS,
+        "stop_reason": BASE_DRIFT_CONFLICTS_STOP_REASON,
+        "base_drift_repair_task_id": str(repair_task_id or ""),
+        "recorded_by": BASE_DRIFT_ROUND_BLOCK_RECORDER,
+    }
+    evidence = dict(blocked) if isinstance(blocked, dict) else {}
+
+    # 1) The round row.  ``mark_round_blocked`` keeps the round's
+    #    status and its number — the round is blocked, not finished.
+    try:
+        conn, _routing_repo, verif_repo = _server._open_verification_state()
+        try:
+            verif_repo.mark_round_blocked(
+                plan_id,
+                reason=BASE_DRIFT_CONFLICTS_STOP_REASON,
+                results=envelope,
+            )
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 — a lost handle is enough
+                pass
+    except Exception as exc:  # noqa: BLE001 — the audit write never blocks
+        try:
+            _server.logger.warning(
+                "[base_drift] the blocked-round row did not land "
+                "(plan=%s): %s", plan_id, exc,
+            )
+        except Exception:  # noqa: BLE001 — even the warning must not raise
+            pass
+
+    # 2) The audit event, in the plan's own execution log.  A plan
+    #    whose directory is not there has no log to write to, and
+    #    creating one would invent a plan — so the event is skipped and
+    #    the row above still stands.
+    try:
+        plan_dir = _server._plan_dir(plan_id)
+    except Exception:  # noqa: BLE001 — a bad plan id names no directory
+        plan_dir = None
+    if plan_dir is None or not Path(plan_dir).is_dir():
+        return
+    try:
+        plan_logger = _verification_event_logger(Path(plan_dir))
+        if plan_logger is not None:
+            plan_logger.warning(
+                BASE_DRIFT_ROUND_BLOCKED_EVENT,
+                f"{BASE_DRIFT_CONFLICTS_STOP_REASON}: the round was blocked "
+                f"by a base-drift conflict",
+                data={
+                    "plan_id": plan_id,
+                    "status": BASE_DRIFT_ROUND_BLOCKED_STATUS,
+                    "stop_reason": BASE_DRIFT_CONFLICTS_STOP_REASON,
+                    "error_kind": BASE_DRIFT_CONFLICTS_STOP_REASON,
+                    "reason_code": BASE_DRIFT_CONFLICTS_STOP_REASON,
+                    "base_drift_repair_task_id": envelope[
+                        "base_drift_repair_task_id"
+                    ],
+                    "round_token": _round_token_of(round_token),
+                    "base_drift": evidence,
+                },
+            )
+    except Exception as exc:  # noqa: BLE001 — the audit write never blocks
+        try:
+            _server.logger.warning(
+                "[base_drift] the blocked-round event did not land "
+                "(plan=%s): %s", plan_id, exc,
+            )
+        except Exception:  # noqa: BLE001 — even the warning must not raise
+            pass
+
+
 class _VerificationLoopOutcome:
     """Whether the loop ended the workflow or handed it off.
 
@@ -9934,6 +10136,19 @@ def _make_repair_on_complete(
                         # fix, so the executor runs under the merge's own
                         # provider-routing scene.  The scene reaches the
                         # child process through the environment.
+                        #
+                        # The blocked round is written down FIRST: the
+                        # row and the audit event are the evidence that
+                        # this round never ran, and the hand-off must
+                        # not leave the plan without them.
+                        _record_base_drift_round_block(
+                            plan_id,
+                            round_token,
+                            _base_drift_blocked,
+                            repair_task_id=str(
+                                _report.get("base_drift_repair_task_id") or ""
+                            ),
+                        )
                         _server._run_repair_execution_async(
                             plan_id, project_dir, tool=tool,
                             on_complete=_on_repair_complete,
@@ -10706,6 +10921,19 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                         # so the executor runs under the merge's own
                         # provider-routing scene.  The scene reaches the
                         # child process through the environment.
+                        #
+                        # The blocked round is written down FIRST: the
+                        # row and the audit event are the evidence that
+                        # this round never ran, and the hand-off must
+                        # not leave the plan without them.
+                        _record_base_drift_round_block(
+                            plan_id,
+                            round_token,
+                            _base_drift_blocked,
+                            repair_task_id=str(
+                                report.get("base_drift_repair_task_id") or ""
+                            ),
+                        )
                         _base_drift_on_complete = _make_repair_on_complete(
                             plan_id, project_dir, tool,
                             round_token=round_token,

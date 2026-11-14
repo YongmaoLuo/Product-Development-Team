@@ -32,10 +32,11 @@
 对着**被服务的实例**走的那一条是真端到端：
 :func:`test_browser_relocates_a_held_port_and_shows_a_result` 与
 :func:`test_the_served_route_starts_the_instance_when_none_is_running`。
-那个实例是照操作员的样子起的 —— 没有 ``PDT_LLM_MODE=scripted`` 这样的模型
-替身 —— 所以验证轮的裁决会真的去调模型、真烧 token。因此这两条带
-``@pytest.mark.real_model``：CI（``CI=true``）自动跳过它们（见
-``tests/conftest.py``），只有本机 nightly 用 ``-m real_model`` 才跑。
+被服务的那个实例若是**已经在跑、且是这一轮的**，它一个字都不改 —— 没有
+``PDT_LLM_MODE=scripted`` 这样的模型替身，所以验证轮的裁决会真的去调模型、
+真烧 token。因此这两条带 ``@pytest.mark.real_model``：CI（``CI=true``）自动
+跳过它们（见 ``tests/conftest.py``），只有本机 nightly 用 ``-m real_model``
+才跑。（**这一轮自己起**的那个实例带着模型替身：见「被服务的实例从哪来」。）
 
 对着**这一轮自己起的私有后端**走的那一条
 （:func:`test_browser_relocates_a_held_port_on_a_private_server_and_shows_a_result`）
@@ -46,30 +47,45 @@
 ------------------
 
 判据要的是「人对着**已经在跑的那个实例**点验证」这条链。那个实例此刻是不是
-跑着，是**机器的状态**，不是产品的行为 —— 所以这条路线自己负责让它存在：
+跑着、是**谁的**实例，是**机器的状态**，不是产品的行为 —— 所以这条路线自己
+负责让它存在：
 
-* 实例**已经在跑**（这一轮自己起的那个，或框架替这一轮起的那一个）→ 就用它；
-* 实例**没有在跑** → 按这一轮自己的 'api' 服务声明的方式起一个：同一个解释
+* **什么都没有** → 按这一轮自己的 'api' 服务声明的方式起一个：同一个解释
   器、同一个工程目录、同一棵 ``plans/`` 树、同一个状态库、同一个端口、
   同样的 ``PDT_ORPHAN_REAPER=0``。
+* **有，而且它是这一轮的**（它公布的 ``plans/`` 树与状态库就是这一轮要用的
+  那两个）→ 就用它，一个字都不改。
+* **有，但它是别人的** → **不采纳**，也**不碰**。它服务的是**另一个**
+  checkout 的 plans 树和状态库；采纳它等于把那个 checkout 的状态当成这一
+  轮的结果报出来，而夹具也会落进一棵这条链从不拥有的树。身份认不出来
+  的进程**不是我们的**，我们不杀它 —— 它照旧答话、我们从旁边走开，这一轮
+  自己在**一个空闲端口**上起一个**自己工作树**的实例顶上。
 
-起起来的那个实例**在这次跑完之后继续跑着** —— 它是这一轮的被服务实例，判据
-的最后一步（以及人自己的那一次检查）读的就是它的 ``GET /api/plans``。它的
-pid 和它的日志写在同一个目录里，找得到、也停得掉。
+在**默认地址**上起起来的那个实例**在这次跑完之后继续跑着** —— 它是这一轮
+的被服务实例，判据的最后一步（以及人自己的那一次检查）读的就是它的
+``GET /api/plans``。它的 pid 和它的日志写在同一个目录里，找得到、也停得掉。
+**顶替**别人的那一个不同：它是这一轮自己的，用完就收掉（见
+``_ensure_served_instance`` 的返回值与用例的 ``finally``），不然每跑一次
+就漏一个常驻服务。
 
 两条路径都**显式钉住** ``PDT_PLANS_DIR`` / ``PDT_STATE_DB_PATH``：一次任务运
 行的环境变量把 ``PDT_PLANS_DIR`` 指向**另一个** checkout 的 plans 树，一个照
 它解析的实例会去服务一棵这条链从不碰的树。
 
-唯一的替身是模型 —— 那是仓库自己留的缝：``PDT_LLM_MODE=scripted`` 把每一
-次模型调用换成磁盘上的固定回答。不换的话，Phase 3 的裁决会真的去调模型：
-不可复现，还烧钱。对着**被服务的实例**走的那条路线没有这个替身，于是 Phase 3
-的裁决会失败，而框架会把这一轮的执行结果落成一份确定性的兜底报告 —— 轮次
-照样结束，徽标照样落到终态。
+替身有两样，都是仓库自己留的缝：
+
+* **模型** —— ``PDT_LLM_MODE=scripted`` 把每一次模型调用换成磁盘上的固定回
+  答。不换的话，Phase 3 的裁决会真的去调模型：不可复现，还烧钱，而且一次
+  调用就能把浏览器驱动自己的等待窗口（240s）用光 —— 徽标就停在「验证中」。
+  **这一轮自己起的实例**（没有实例可用的那一种，和顶替别人的那一种）都带
+  这个替身；**已经在跑、且是这一轮的**那一个一个字都不改，它的裁决会真的
+  去调模型 —— 那才是「对着已经在跑的那个实例点验证」的完整形态。
+* **provider** —— 见下一段。
 
 provider 的配置分两种情形，区别在于**那个实例是谁起的**：
 
-* **这一轮自己起的实例**（机器上没有实例在跑时）→ 由这条测试来定配置：
+* **这一轮自己起的实例**（机器上没有实例在跑时，或顶替别人的那一个）→ 由
+  这条测试来定配置：
   ``PDT_PROVIDER_MODE=inherit``（不连 CC Switch，不需要 provider 链）、
   ``PDT_PROVIDER_CAPACITY_FILE`` 指向一个不存在的文件、
   ``PDT_DISABLE_FALSIFIABILITY_PROBE=1``。不这么定，子进程会继承测试进程
@@ -140,6 +156,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -871,6 +888,107 @@ def _require_instance_fields(
             )
 
 
+def _resolved_path(path: Path) -> Optional[Path]:
+    """*path* resolved to its real location, or ``None`` when it cannot be.
+
+    Resolution is what makes the comparison honest: the same directory
+    is ``/tmp/x`` on one machine and ``/private/tmp/x`` on another (and
+    ``/var/...`` versus ``/private/var/...`` on macOS), so the two sides
+    are compared after both have been resolved.
+    """
+    try:
+        return Path(path).resolve()
+    except OSError:
+        return None
+
+
+def _expected_data_root(
+    plans_dir: Optional[Path] = None, state_db: Optional[Path] = None,
+) -> Tuple[Path, Path]:
+    """The plans tree and the database this walk is allowed to be served.
+
+    A walk that names its own data root (the caller passes them) gets
+    exactly those; a walk that names none gets **this checkout's** --
+    the same root :func:`_start_served_instance` serves by default.
+    """
+    return (
+        Path(plans_dir) if plans_dir is not None else PROJECT_ROOT / "plans",
+        Path(state_db) if state_db is not None else PROJECT_ROOT / ".pdt" / "state.db",
+    )
+
+
+def _instance_belongs_to_this_walk(
+    instance: Dict[str, Any], plans_dir: Optional[Path] = None,
+    state_db: Optional[Path] = None,
+) -> bool:
+    """Is the instance that answered **this** walk's instance?
+
+    Something answering ``/health/data`` is not thereby this walk's
+    instance: it may be serving **another checkout's** plans tree and
+    another checkout's database.  Walking it would report that
+    checkout's state as this walk's result -- and the fixture this walk
+    registers would land in a tree this acceptance never owns.
+
+    The rule is therefore identity, not reachability: the tree and the
+    database the instance publishes must be the ones this walk means to
+    use.  A process that fails the rule is not ours to stop either (see
+    :func:`_ensure_served_instance`), so the answer here only decides
+    whether the instance is **adopted**, never whether it is killed.
+    """
+    expected_plans, expected_db = _expected_data_root(plans_dir, state_db)
+    for published, expected in (
+        (instance.get("plans_dir"), expected_plans),
+        (instance.get("state_db_path"), expected_db),
+    ):
+        if not published:
+            return False
+        left = _resolved_path(Path(str(published)))
+        right = _resolved_path(expected)
+        if left is None or right is None or left != right:
+            return False
+    return True
+
+
+def _serve_a_foreign_instance(port: int) -> Any:
+    """Something on *port* that answers like an instance -- somebody else's.
+
+    It publishes a fact sheet naming **another checkout's** plans tree
+    and database: exactly the shape of the instance a walk must refuse
+    to adopt.  It answers ``/health/data`` and nothing else, and it
+    keeps answering until this test shuts it down -- the walk has to
+    decide about it without ever stopping it.
+    """
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - the http.server spelling
+            body = json.dumps(
+                {
+                    "status": "ok",
+                    "plan_routing_rows": 0,
+                    "instance": {
+                        "boot_id": "foreign-boot-id",
+                        "pid": os.getpid(),
+                        "plans_dir": "/somewhere/else/plans",
+                        "state_db_path": "/somewhere/else/.pdt/state.db",
+                    },
+                },
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
 def _served_instance_runtime_dir(port: int) -> Path:
     """Where the log and the pid of a served instance are kept.
 
@@ -886,7 +1004,7 @@ def _served_instance_runtime_dir(port: int) -> Path:
 
 def _start_served_instance(
     base_url: str, *, plans_dir: Optional[Path] = None,
-    state_db: Optional[Path] = None,
+    state_db: Optional[Path] = None, scripted: bool = False,
 ) -> subprocess.Popen:
     """Start the instance the acceptance walks.
 
@@ -913,6 +1031,16 @@ def _start_served_instance(
     capacity file that does not exist and the falsifiability probe
     disabled.  An instance that was **already running** is used as it
     is; its configuration is not touched.
+
+    With ``scripted`` the model is replaced too, the way
+    :func:`_boot_server` replaces it: ``PDT_LLM_MODE=scripted`` plus the
+    answers on disk.  An instance this test starts stands in for an
+    instance it could not adopt (see :func:`_ensure_served_instance`),
+    and a stand-in that reaches for a real model is neither
+    reproducible nor free -- one model call runs for minutes, and the
+    browser driver's own waiting window is shorter than that.  An
+    instance that was **already running** is used as it is: its model
+    configuration is not this test's to change.
     """
     parsed = urllib.parse.urlsplit(base_url)
     host = parsed.hostname or "127.0.0.1"
@@ -959,6 +1087,11 @@ def _start_served_instance(
             "PYTHONPATH": f"{BACKEND_DIR}{os.pathsep}{env.get('PYTHONPATH', '')}",
         }
     )
+    if scripted:
+        script_dir = runtime / "llm"
+        _write_scripted_llm(script_dir)
+        env["PDT_LLM_MODE"] = "scripted"
+        env["PDT_LLM_SCRIPT_DIR"] = str(script_dir)
     env.pop("ANTHROPIC_BASE_URL", None)
     # A throwaway instance has no secret to receive, and a stale
     # descriptor number must never be closed by a process that never
@@ -995,40 +1128,82 @@ def _start_served_instance(
 def _ensure_served_instance(
     base_url: str, *, plans_dir: Optional[Path] = None,
     state_db: Optional[Path] = None,
-) -> Tuple[Dict[str, Any], Optional[subprocess.Popen]]:
-    """The instance the acceptance walks, up and answering.
+) -> Tuple[Dict[str, Any], Optional[subprocess.Popen], str]:
+    """The instance the acceptance walks, up and answering -- and its address.
 
-    An instance that is **already running** is used as it is -- that is
-    the case the acceptance is about: the round's own service, serving
-    the plans tree this walk puts a fixture into.
+    Three things can be true about the address this walk was pointed at:
 
-    An instance that is **not running** is started here, the way the
-    round's service starts it.  Whether somebody else started it first
-    is a fact about the machine, not about the product; a walk that
-    only works when the machine happens to be ready reports the
-    machine's state instead of the behaviour.
+    * **nothing is there** -> the round's own service is started there,
+      the way the round's service starts it.  It keeps running: it is
+      the environment's served instance, and the acceptance's last step
+      reads ``GET /api/plans`` on it.
 
-    Returns the instance's fact sheet and the process this call
-    started (``None`` when the instance was already up -- that process
-    is not ours to stop).
+    * **an instance is there, and it is this walk's** (its tree and its
+      database are the ones this walk means to use) -> it is used as it
+      is.  That is the case the acceptance is about: the round's own
+      service, serving the plans tree this walk puts a fixture into.
+
+    * **an instance is there, and it is somebody else's** -> it is
+      **not adopted** and **not touched**.  It may be serving another
+      checkout's tree and another checkout's database, and walking it
+      would report that checkout's state as this walk's result.  A
+      process whose identity cannot be established is not ours to stop,
+      so it is left exactly as it was found -- answering, untouched --
+      and the walk gets an instance of its own on a free port instead.
+
+    Whether somebody else started the instance first is a fact about the
+    machine, not about the product; a walk that only works when the
+    machine happens to be ready reports the machine's state instead of
+    the behaviour.
+
+    Returns the instance's fact sheet, the process this call started
+    (``None`` when the instance was already up -- that process is not
+    ours to stop) and **the address the walk has to talk to**: the
+    address asked for, unless the instance there turned out to be
+    somebody else's and the walk got one of its own.
     """
+
+    def _start_an_instance(
+        address: str,
+    ) -> Tuple[Dict[str, Any], subprocess.Popen]:
+        """Start an instance at *address* and wait for its fact sheet."""
+        started = _start_served_instance(
+            address, plans_dir=plans_dir, state_db=state_db, scripted=True,
+        )
+        try:
+            fact_sheet = _wait_for_the_instance(address)
+            if fact_sheet is None:
+                pytest.fail(
+                    f"the instance this test started at {address} does not "
+                    "answer /health/data (something else may be answering "
+                    "there); its log is under "
+                    f"{Path(tempfile.gettempdir()) / 'pdt-e2e-served-instance'}"
+                )
+            _require_instance_fields(fact_sheet, address)
+        except BaseException:
+            # An instance nobody can talk to is not left running.
+            _teardown_server(started)
+            raise
+        return fact_sheet, started
+
     instance = _served_instance_probe(base_url)
     if instance is None:
-        started = _start_served_instance(
-            base_url, plans_dir=plans_dir, state_db=state_db,
-        )
-        instance = _wait_for_the_instance(base_url)
-        if instance is None:
-            pytest.fail(
-                f"the instance this test started at {base_url} does not "
-                "answer /health/data (something else may be answering "
-                "there); its log is under "
-                f"{Path(tempfile.gettempdir()) / 'pdt-e2e-served-instance'}"
-            )
-        _require_instance_fields(instance, base_url)
-        return instance, started
+        instance, started = _start_an_instance(base_url)
+        return instance, started, base_url
+
     _require_instance_fields(instance, base_url)
-    return instance, None
+    if _instance_belongs_to_this_walk(instance, plans_dir, state_db):
+        # The instance on this address is this walk's: it is used as it
+        # is, and its configuration is not this test's to change.
+        return instance, None, base_url
+
+    # Somebody else's instance is on the address this walk was pointed
+    # at.  It is not ours to stop -- so it is left alone, untouched --
+    # and the walk gets an instance of its own on a port the kernel
+    # says is free right now.
+    replacement_url = f"http://127.0.0.1:{_free_port()}"
+    instance, started = _start_an_instance(replacement_url)
+    return instance, started, replacement_url
 
 
 def _wait_for_the_instance(
@@ -1600,12 +1775,20 @@ def test_browser_relocates_a_held_port_and_shows_a_result(
     fixture is registered the way a real plan is registered, and taken
     out again when the round is over.
     """
-    base_url = _served_base_url()
+    requested_base_url = _served_base_url()
     # The instance this walk uses: the one that is already running, or
     # the one this call starts (and leaves running -- it is the
     # environment's served instance, and the acceptance's last step
     # reads ``GET /api/plans`` on it).
-    instance, _started_instance = _ensure_served_instance(base_url)
+    #
+    # The address the walk really talks to is the one this call hands
+    # back: when the instance on the requested address turned out to be
+    # somebody else's, the walk got an instance of its own instead --
+    # and every address below is derived from that one.
+    instance, _started_instance, effective_base_url = _ensure_served_instance(
+        requested_base_url,
+    )
+    base_url = effective_base_url
     plans_dir = Path(instance["plans_dir"])
     state_db = Path(instance["state_db_path"])
     boot_id = instance["boot_id"]
@@ -1873,6 +2056,16 @@ def test_browser_relocates_a_held_port_and_shows_a_result(
         cleaned = _remove_fixture_plan(
             plan_dir, state_db, fixture_id, base_url,
         )
+        # An instance this walk started **in place of** the one on the
+        # requested address is the walk's own: it is stopped here, so a
+        # run does not leave a resident server behind.  An instance that
+        # was started **at** the requested address is the environment's
+        # served instance, and it keeps running.
+        if (
+            _started_instance is not None
+            and effective_base_url != requested_base_url
+        ):
+            _teardown_server(_started_instance)
 
     # The served instance has to be exactly as it was found: its plans
     # tree free of the fixture and its listing answering again.  A
@@ -1908,7 +2101,7 @@ def test_the_served_route_starts_the_instance_when_none_is_running(
     plans_dir.mkdir(parents=True, exist_ok=True)
     state_db = tmp_path / "state.db"
 
-    instance, started = _ensure_served_instance(
+    instance, started, _effective_base_url = _ensure_served_instance(
         base_url, plans_dir=plans_dir, state_db=state_db,
     )
     try:
@@ -1920,6 +2113,58 @@ def test_the_served_route_starts_the_instance_when_none_is_running(
     finally:
         if started is not None:
             _teardown_server(started)
+
+
+@pytest.mark.timeout(180)
+def test_an_instance_that_is_not_ours_is_neither_walked_nor_stopped(
+    tmp_path: Path,
+):
+    """The identity rule: reachability is not identity.
+
+    Something answering ``/health/data`` on the default address is not
+    thereby **this walk's** instance -- it may be serving another
+    checkout's plans tree and another checkout's database, and walking
+    it would report that checkout's state as this walk's result.
+
+    So the walk refuses it.  And refusing it is not the same as
+    stopping it: a process whose identity cannot be established is not
+    ours to kill, so it is left exactly as it was found -- answering,
+    untouched -- and the walk gets an instance of its own instead.
+    """
+    port = _free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    stranger = _serve_a_foreign_instance(port)
+    plans_dir = tmp_path / "plans"
+    plans_dir.mkdir(parents=True, exist_ok=True)
+    state_db = tmp_path / "state.db"
+
+    started: Optional[subprocess.Popen] = None
+    try:
+        instance, started, effective_base_url = _ensure_served_instance(
+            base_url, plans_dir=plans_dir, state_db=state_db,
+        )
+
+        # --- the foreign instance was not walked --------------------
+        assert effective_base_url != base_url, (
+            "the walk adopted the instance on the default address even "
+            "though it serves another checkout's tree and database"
+        )
+        assert started is not None, (
+            "the walk did not start an instance of its own"
+        )
+        assert Path(instance["plans_dir"]).resolve() == plans_dir.resolve()
+        assert Path(instance["state_db_path"]).resolve() == state_db.resolve()
+
+        # --- and it was not stopped either --------------------------
+        assert _served_instance_probe(base_url) is not None, (
+            "the instance on the default address stopped answering; a "
+            "process this walk cannot identify as its own is not ours "
+            "to kill"
+        )
+    finally:
+        _teardown_server(started)
+        stranger.shutdown()
+        stranger.server_close()
 
 
 # ---------------------------------------------------------------------------

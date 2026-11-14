@@ -444,25 +444,13 @@ class VerificationRepository:
         # given first.  A missing row is NOT treated as "already
         # terminal" — it falls through to ``_update`` below, which
         # raises ``KeyError`` as it always has.
-        row = self.current(plan_id)
-        if row is not None:
-            kept_reason = row.get("verification_stop_reason")
-            if (
-                row.get("verification_status") in _TERMINAL_VERIFICATION_STATUSES
-                and kept_reason
-            ):
-                logger.info(
-                    "verification_stop_reason_kept plan=%s kept=%s attempted=%s",
-                    plan_id,
-                    kept_reason,
-                    reason,
-                )
-                # Early return — skip the write, the ``plan_closed``
-                # re-publish (a second close for a round that is
-                # already closed) and the post-write invariant check
-                # (which would assert against a status we are not
-                # writing any more).
-                return
+        if self._stop_reason_is_write_once(plan_id, reason):
+            # Early return — skip the write, the ``plan_closed``
+            # re-publish (a second close for a round that is
+            # already closed) and the post-write invariant check
+            # (which would assert against a status we are not
+            # writing any more).
+            return
 
         self._update(
             plan_id,
@@ -485,6 +473,103 @@ class VerificationRepository:
         # the row matches the expected end-state; if it doesn't, raise
         # loudly instead of letting the silent drift reach the dashboard.
         self._assert_terminal_state_consistent(plan_id, expected_status=status)
+
+    def _stop_reason_is_write_once(self, plan_id: str, reason: str) -> bool:
+        """Is the stop reason of this round already fixed?
+
+        A terminal round keeps the reason it was given first (2026-11-03):
+        a plan that had already ended its round with
+        ``base_drift_conflicts`` must not have that cause rewritten by a
+        later, less specific stop.  This is the ONE judgement behind
+        that rule — :meth:`mark_stopped` and :meth:`mark_round_blocked`
+        share it so the two writers cannot drift apart and grow a
+        second, subtly different write-once semantics.
+
+        A missing row is NOT treated as "already terminal" — it returns
+        ``False`` so the caller's write raises ``KeyError`` as it
+        always has.
+
+        Args:
+            plan_id: The plan whose round is being written.
+            reason: The reason the caller wants to record; only used for the log line when the existing reason wins.
+
+        Returns:
+            ``True`` when the row already carries a stop reason on a
+            terminal round (the write must be skipped), ``False``
+            otherwise.
+        """
+        row = self.current(plan_id)
+        if row is None:
+            return False
+        kept_reason = row.get("verification_stop_reason")
+        if (
+            row.get("verification_status") in _TERMINAL_VERIFICATION_STATUSES
+            and kept_reason
+        ):
+            logger.info(
+                "verification_stop_reason_kept plan=%s kept=%s attempted=%s",
+                plan_id,
+                kept_reason,
+                reason,
+            )
+            return True
+        return False
+
+    def mark_round_blocked(
+        self,
+        plan_id: str,
+        *,
+        reason: str,
+        results: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Record that the current round was blocked — without ending it.
+
+        2026-11-13: a round that ends on a base-drift conflict left no
+        persistent trace on the row.  The next round then had no evidence
+        that the previous one was blocked, so the round counter was
+        bumped for a round that never really ran.  This method writes the
+        trace WITHOUT moving the round's status: the round is *blocked*,
+        not finished, and it is expected to be re-run under the SAME
+        round number.
+
+        The write-once semantics are the ones
+        :meth:`mark_stopped` already has, expressed through the same
+        judgement (:meth:`_stop_reason_is_write_once`): a terminal round
+        that already carries a reason keeps it, and the attempted
+        overwrite is only logged.
+
+        Unlike :meth:`mark_stopped` this method does NOT write
+        ``verification_status``, does NOT fire ``plan_closed`` (the plan
+        is not finished) and does NOT run the post-write terminal
+        invariant check (there is no terminal status to check against).
+        ``verification_status`` / ``round`` / ``max_rounds`` are never
+        touched.
+
+        Args:
+            plan_id: The plan whose round was blocked.
+            reason: Why the round was blocked (e.g.
+                ``base_drift_conflicts``).
+            results: Optional envelope stored verbatim in the ``results``
+                column.  It is deliberately NOT stamped with
+                ``_persist_verification_terminal`` — this is a blocked
+                round, not a terminal verdict, so
+                :meth:`repair_stale_terminal_state` must leave the row
+                alone instead of healing it into a terminal status.
+                ``None`` writes no envelope at all.
+
+        Raises:
+            KeyError: when the plan has no verification row.
+        """
+        if self._stop_reason_is_write_once(plan_id, reason):
+            # Early return — skip the write entirely, exactly like
+            # ``mark_stopped`` does on the same row: the reason is
+            # fixed, and nothing else about the row may change.
+            return
+
+        fields: dict[str, Any] = {"verification_stop_reason": reason}
+        if results is not None:
+            fields["results"] = results
+        self._update(plan_id, **fields)
 
     def _assert_terminal_state_consistent(
         self, plan_id: str, expected_status: str,
