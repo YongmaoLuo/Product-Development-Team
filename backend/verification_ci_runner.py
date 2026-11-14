@@ -127,6 +127,29 @@ e2e 的两个子类（2026-11-04，arch 决策点 7）
 ``timeout`` 是 ``infra``（重试，不计入交付），``gate_failed`` 才是
 ``deliverable_defect``。
 
+退出码集合来自契约（2026-11-02）
+--------------------------------
+上表的 3 是**框架的缺省**：本仓的门禁恰好用 3 表示「机器答不了」。每个 Plan
+可以在自己的 ``<plan_dir>/ci_contract.json`` 里声明**哪些退出码表示「没能判
+定」** —— 判定读的是那份契约（见 :mod:`ci_contract`），契约不存在或坏了就
+回落框架默认，所以不写契约的 Plan 判定与引入契约之前逐字一致。
+
+预算与摘要格式也来自契约（2026-11-02）
+------------------------------------
+同一份契约还回答另外两个问题，都是**本仓门禁的形状**而不是门禁的通例：
+
+* ``budget_source`` / ``budget_seconds`` —— 预算从哪来。缺省是读门禁脚本
+  自己声明的预算（``GATE_BUDGET_SECONDS_*``）；契约写
+  ``budget_source: "contract"`` 时用契约写的 ``budget_seconds``，那是
+  「门禁脚本不按本仓的形状发布预算」的项目自己的说法。预算的来源顺序是
+  环境变量 ``GATE_BUDGET_SECONDS``（运维覆盖，两边读同一个变量）→ 契约
+  → 门禁脚本 → VP 自己声明的 ``ci_timeout_seconds``。
+* ``summary_format`` —— 门禁的输出是不是本仓的摘要格式。缺省是**不解析**
+  （契约没声明格式，就不替它猜一个）；声明 ``"gate_v1"`` 才按本仓格式
+  解析。契约说不解析时，证据里的 ``gate_summary`` 是空的、
+  ``lane_summaries`` 是空的 —— 「什么都不知道」比「按错误的格式读出来的
+  东西」诚实。
+
 证据（2026-10-31，VP-020）
 --------------------------
 以前只保留 stdout 的**末尾** 4000 字符。被预算杀掉的那一刻，末尾是第二条
@@ -196,6 +219,16 @@ full_ci 的唯一判据**）还另存一份 ``ci_output.round-<n>.json``：
 
 副本写不出来**不改变判决**：判决在写副本之前就定了，取证是事后追认的
 东西，不是判定的输入。
+
+同一个目录跨轮复用
+------------------
+这个目录是**按验证点命名**的，所以一轮又一轮跑的是同一个目录 —— 上一轮写
+进去的报告不会被清掉，读的时候又"目录里有什么就读什么"，于是**上一轮的失败
+被当成本轮的失败读回来**。所以门禁启动之前先把这个目录下遗留的
+``phase-*.xml`` 删掉（只删这个模式，目录本身和旁边的审计副本不动），读的时候
+也只认**本轮**写出来的报告 —— 判据是**写下来的时刻**而不是目录里的文件名：
+比门禁启动早的，一律不算本轮的证据（删不掉的那几份同样如此：它们没有被改写，
+所以比门禁启动早）。
 
 两套证据互不越界
 ----------------
@@ -267,6 +300,53 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from bounded_subprocess import run_bounded
 from credentials import _FD_ENV_PREFIX as _SECRET_FD_ENV_PREFIX
+
+
+def _load_ci_contract() -> Tuple[Any, str]:
+    """The ``ci_contract`` module that belongs to **this** runner.
+
+    This runner is loaded **by path** — the tree under test's own copy,
+    reloaded every round — so a flat ``from ci_contract import ...``
+    resolves through ``sys.path``: the *harness'* copy sits there, and
+    the tree's copy usually does not.  On 2026-11-06 that made the
+    tree's runner un-loadable at all
+    (``ModuleNotFoundError: No module named 'ci_contract'``); the
+    loader fell back to the harness' copy, and the plan's contract was
+    read by **nobody** — the feature was dark, and the verdict said so
+    only in a field nobody was looking at.
+
+    The module **next to this file** is the one that belongs to it, so
+    it is loaded from this file's own directory.  A flat import is the
+    fallback for a runner that travels without its sibling.
+
+    Returns the module and the file it was read from ("" when the
+    module does not say where it came from).
+    """
+    sibling = Path(__file__).resolve().parent / "ci_contract.py"
+    if sibling.is_file():
+        digest = hashlib.sha1(str(sibling).encode("utf-8")).hexdigest()[:12]
+        name = f"pdt_project_ci_contract_{digest}"
+        spec = importlib.util.spec_from_file_location(name, str(sibling))
+        if spec is not None and spec.loader is not None:
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            try:
+                spec.loader.exec_module(module)
+            finally:
+                sys.modules.pop(name, None)
+            return module, str(sibling)
+    import ci_contract  # noqa: PLC0415 - the fallback, by the old spelling
+
+    return ci_contract, str(getattr(ci_contract, "__file__", "") or "")
+
+
+_ci_contract, ci_contract_module_path = _load_ci_contract()
+
+BUDGET_SOURCE_CONTRACT = _ci_contract.BUDGET_SOURCE_CONTRACT
+FRAMEWORK_INCONCLUSIVE_EXIT_CODES = _ci_contract.FRAMEWORK_INCONCLUSIVE_EXIT_CODES
+CONTRACT_FILENAME = _ci_contract.CONTRACT_FILENAME
+CiContract = _ci_contract.CiContract
+load_ci_contract = _ci_contract.load_ci_contract
 
 logger = logging.getLogger(__name__)
 
@@ -483,7 +563,12 @@ MAX_OUTPUT_CHARS = 4000
 #: decide" (the host could not be measured, or a phase called itself
 #: inconclusive). It is **not** a code failure, and it is not the same
 #: thing as exit 1.
-GATE_INCONCLUSIVE_EXIT_CODE = 3
+#:
+#: This is the framework's **default**, not a fact about every gate:
+#: a plan declares its own exit codes in ``<plan_dir>/ci_contract.json``
+#: (see :mod:`ci_contract`), and the runner reads that declaration.  The
+#: number here is what a plan that writes no contract gets.
+GATE_INCONCLUSIVE_EXIT_CODE = FRAMEWORK_INCONCLUSIVE_EXIT_CODES[0]
 
 #: The machine-readable signals this runner emits. They are the names
 #: :mod:`verification.failure_triage` knows, so the four-class triage
@@ -591,6 +676,21 @@ REAP_OWNER_TIMEOUT_SECONDS = 5.0
 
 #: How long one wait between two sweeps sleeps.
 REAP_POLL_SECONDS = 0.25
+
+#: How much slack a junit report's timestamp is given when it is checked
+#: against the instant the gate started.
+#:
+#: A filesystem that stores an mtime with one-second resolution rounds
+#: it **down**, so a report written a fraction of a second after the
+#: gate started can carry a timestamp slightly *before* the gate
+#: started.  One second of slack covers that rounding.
+#:
+#: The slack does not let an earlier round's report in: the runner
+#: deletes those before the gate starts (see
+#: :func:`_clear_stale_junit_reports`), and a report that survived the
+#: deletion because it could not be removed is older than the gate
+#: start all the same.
+JUNIT_MTIME_SLACK_SECONDS = 1.0
 
 #: 结构性收窄标记 —— 一条 ``ci_entry`` 命中任何一个，说明它指的不是"整仓"，
 #: 而是"某个测试子集"。``full_ci`` 的职责是整仓门禁，收窄过的入口属于
@@ -1390,6 +1490,7 @@ def _entry_of(vp: Dict[str, Any]) -> str:
 def gate_budget_seconds(
     project_dir: Optional[Path],
     entry: Optional[str] = None,
+    contract: Optional[CiContract] = None,
 ) -> Optional[int]:
     """The budget the gate declares for the run *entry* asks for.
 
@@ -1406,12 +1507,28 @@ def gate_budget_seconds(
     reads the same variable, so an operator who raises the budget raises
     it on both sides of the fence.
 
+    *contract* is the plan's own declaration about its gate (see
+    :mod:`ci_contract`).  A contract that says ``budget_source:
+    "contract"`` declares the budget itself — that is the case of a
+    gate whose script does not publish a budget the way this
+    repository's does.  The order of the sources is:
+
+    1. ``GATE_BUDGET_SECONDS`` in the environment (the operator's
+       override, read by the gate as well);
+    2. the contract's ``budget_seconds`` (when the contract declares
+       one);
+    3. the budget the gate script publishes;
+    4. nothing — the caller falls back to the VP's own declaration.
+
     ``None`` means "the gate declares no budget" — the caller falls back
     to the historical default.
     """
     override = os.environ.get("GATE_BUDGET_SECONDS", "").strip()
     if override.isdigit() and int(override) > 0:
         return int(override)
+    declared = _contract_budget_seconds(contract)
+    if declared is not None:
+        return declared
     if project_dir is None:
         return None
     script = Path(project_dir).joinpath(*GATE_SCRIPT_RELATIVE_PATH)
@@ -1426,6 +1543,25 @@ def gate_budget_seconds(
     if not budgets:
         return None
     return budgets.get(_lane_of(entry), budgets.get("all"))
+
+
+def _contract_budget_seconds(contract: Optional[CiContract]) -> Optional[int]:
+    """The budget the contract declares, when it declares a usable one.
+
+    ``None`` means "the contract declares no budget" — the caller falls
+    back to the gate's own script, exactly as it did before contracts
+    existed.  A contract that asks for the budget but does not give a
+    usable number falls back the same way: a broken declaration must
+    not raise, and must not invent a budget.
+    """
+    if contract is None:
+        return None
+    if contract.budget_source != BUDGET_SOURCE_CONTRACT:
+        return None
+    seconds = contract.budget_seconds
+    if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds <= 0:
+        return None
+    return seconds
 
 
 def _lane_of(entry: Optional[str]) -> str:
@@ -1513,6 +1649,7 @@ def ci_timeout(
     *,
     project_dir: Optional[Path] = None,
     entry: Optional[str] = None,
+    contract: Optional[CiContract] = None,
 ) -> int:
     """The watchdog's budget for this VP.
 
@@ -1539,10 +1676,14 @@ def ci_timeout(
 
     The floor is a floor, not a new ceiling: a plan that declares
     *more* than the floor keeps its own number.
+
+    *contract* is the plan's own declaration about its gate: a contract
+    that declares the budget itself is read the same way as a budget
+    the gate script publishes (see :func:`gate_budget_seconds`).
     """
     declared = _declared_ci_timeout(vp)
     value = DEFAULT_CI_TIMEOUT_SECONDS if declared is None else declared
-    budget = gate_budget_seconds(project_dir, entry)
+    budget = gate_budget_seconds(project_dir, entry, contract=contract)
     if budget is not None:
         # The gate declares its own budget: the watchdog is that budget
         # plus a margin, never shorter than the gate.
@@ -1961,12 +2102,38 @@ def _clear_stale_junit_reports(junit_dir: Optional[Path]) -> List[str]:
                 path, exc,
             )
             continue
+            logger.warning(
+                "[ci_runner] could not remove the stale junit report %s: %s",
+                path, exc,
+            )
+            continue
         removed.append(path.name)
     return removed
 
 
+def _junit_written_since(path: Path, since: float) -> bool:
+    """Whether *path* was written after the gate started.
+
+    A report that predates the gate belongs to an earlier round: the
+    directory is reused, so its presence says nothing about the run
+    being graded.  The timestamp is read with
+    :data:`JUNIT_MTIME_SLACK_SECONDS` of slack, because a filesystem
+    that stores an mtime with one-second resolution rounds it **down**
+    and would otherwise reject a report written a fraction of a second
+    after the gate started.
+    """
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:  # noqa: BLE001 - a report that cannot be dated is not read
+        return False
+    return mtime >= since - JUNIT_MTIME_SLACK_SECONDS
+
+
 def _read_junit_evidence(
     junit_dir: Optional[Path],
+    *,
+    since: Optional[float] = None,
+
 ) -> Dict[str, Any]:
     """The per-phase junit evidence a gate run left behind.
 
@@ -1990,6 +2157,12 @@ def _read_junit_evidence(
     called: the entry is the project's to choose, and a name the
     framework recognises would be a name it would also mis-recognise
     somewhere else.
+
+    Only the reports **this round** wrote are read.  The directory is
+    reused across rounds, so what is found in it may belong to a run
+    that has already been graded; *since* is the instant the gate
+    started, and a report older than that says nothing about the run
+    being graded.
     """
     evidence: Dict[str, Any] = {
         "junit_phases": [],
@@ -2029,6 +2202,19 @@ def _read_junit_evidence(
         evidence["junit_error"] = f"{type(exc).__name__}: {exc}"
         return evidence
 
+    if since is not None:
+        # A report this round did not write is not this round's
+        # evidence: the directory is reused across rounds, so what is
+        # found there may belong to a run that has already been graded.
+        # The filter runs **before** the availability decision below,
+        # so "this run produced no report" is a statement about this
+        # run even when a report of an earlier round survived the
+        # deletion that precedes it.
+        reports = [
+            path for path in reports
+            if _junit_written_since(path, since)
+        ]
+
     if not reports:
         # Nothing in the directory the run started from an empty one:
         # this run wrote no report.  A gate that ran the whole-repo
@@ -2047,15 +2233,19 @@ def _read_junit_evidence(
 
     for path in reports:
         phase = _junit_phase_number(path)
-        # The report is not foreign input: this process created the
-        # directory it lives in for this very run
-        # (:data:`GATE_JUNIT_DIR_ENV`), and the pytest that writes
-        # ``phase-<n>.xml`` into it is the one the gate script
+        # The report is not foreign input: only the reports **this
+        # round** wrote are read (the filter above), and the pytest
+        # that writes ``phase-<n>.xml`` is the one the gate script
         # (``scripts/run_tests.sh``) started on the repository's own
         # test suite.  The gate therefore already runs code that can
         # execute arbitrary commands on this machine, so parsing the
         # report it wrote grants no capability that was not there
         # before.
+        #
+        # The directory itself is *not* new — it is named after the
+        # verification point and is reused across rounds — so "the
+        # report is the gate's own" is established by the round the
+        # report was written in, not by the directory it lives in.
         #
         # ``defusedxml`` is deliberately not introduced here: it is not
         # a declared dependency of this repository, and adding a
@@ -2189,19 +2379,26 @@ def _failure_identity(evidence: Dict[str, Any], status: str) -> List[str]:
 # produced it: the messages are written by the cases themselves, so the
 # shape is what is left when the case's own name is gone.
 #
-# A wall-clock shape says the machine ran out of time:
+# A wall-clock shape says the machine could not answer:
 #
-#   * a service that was not ready in time ("not ready after 90s");
-#   * a run that did not settle in time ("did not settle within 120.0s");
-#   * a subprocess the clock killed ("timed out after 120 seconds");
-#   * a budget that was exceeded ("took 2441.8 ms (budget 200 ms)");
-#   * a wall-clock bound that was missed ("to finish in < 2s, got 5.94s").
+#   * it had no time -- a service that was not ready in time ("not ready
+#     after 90s"), a run that did not settle in time ("did not settle
+#     within 120.0s"), a subprocess the clock killed ("timed out after
+#     120 seconds"), a budget that was exceeded ("took 2441.8 ms
+#     (budget 200 ms)"), a wall-clock bound that was missed ("to finish
+#     in < 2s, got 5.94s");
+#   * or it could not be read at all -- a census the machine could not
+#     answer ("the machine could not be read for this census").  An
+#     answer nobody could read is the machine's answer and not a
+#     statement about the code: recording it as a code failure is how a
+#     machine that cannot be measured turns a delivery that did not
+#     fail into a repair task.
 #
 # Everything else is the code's: an assertion about behaviour, a wrong
 # value, a refused start.  Those stay failures on every host, and a
 # rule that treated them as the machine's would hide real regressions.
 
-#: The shapes that mean "the machine ran out of time".
+#: The shapes that mean "the machine could not answer".
 _WALL_CLOCK_SHAPE_PATTERNS = (
     # a service that did not answer in time
     re.compile(r"\bnot ready (?:after|within)\b", re.IGNORECASE),
@@ -2220,11 +2417,17 @@ _WALL_CLOCK_SHAPE_PATTERNS = (
     # a wall-clock bound that was missed
     re.compile(r"\bfinish in\b.*\bgot\b", re.IGNORECASE),
     re.compile(r"\bexpected\b.*\bin <\s*[\d.]+s\b", re.IGNORECASE),
+    # a machine that could not be read at all
+    re.compile(r"\bthe machine could not be read\b", re.IGNORECASE),
 )
 
 
 def is_wall_clock_shaped(message: str) -> bool:
     """Does this failure message describe a wall-clock failure?
+
+    "Wall-clock" here is the machine's inability to answer: it ran out
+    of time, or it could not be read at all.  A message that says the
+    machine could not be read is one of those shapes.
 
     An empty message is **not** a wall-clock shape: a failure the
     evidence does not describe cannot be excused by the machine.
@@ -2292,7 +2495,9 @@ def run_ci_verification(
     *,
     project_dir: Path,
     artifact_dir: Optional[Path] = None,
+    plan_dir: Optional[Path] = None,
     round_no: Optional[int] = None,
+
 ) -> CiRunResult:
     """Run one ``full_ci`` gate (or one ``e2e`` command entry) and grade it
     on the exit code.
@@ -2305,6 +2510,14 @@ def run_ci_verification(
     thing: **a command whose exit code is the verdict**.  A ``full_ci`` VP
     runs its ``ci_entry``; an ``e2e`` command point runs its
     ``entry_command`` — and neither of them opens an LLM session.
+
+    *plan_dir* is where the plan's own CI contract lives
+    (``<plan_dir>/ci_contract.json``): the plan declares which exit codes
+    mean "the gate could not decide", where its gate's budget comes from
+    and whether its gate's output is in the framework's summary format
+    (see :mod:`ci_contract`).  A plan that writes no contract gets the
+    framework's default, and its verdict is exactly the one it has always
+    been.
 
     Whatever happens, the run leaves a **machine-written** identity
     behind (:data:`FAILURE_IDENTITY_FIELD`) and — when an artifact
@@ -2328,6 +2541,18 @@ def run_ci_verification(
     """
     vp_id = str(vp.get("id", "unknown"))
     result = CiRunResult()
+    try:
+        contract = load_ci_contract(plan_dir)
+    except Exception as exc:
+        # 契约是**输入**，不是判据。读契约的那个模块承诺自己绝不抛，但它
+        # 的承诺不该由门禁的正确性来兜底：契约加载器因为任何原因炸了，
+        # 门禁照样要跑，判定照样用框架默认。
+        logger.warning(
+            "verification_ci_runner: the CI contract could not be loaded "
+            "(%s) — using framework defaults",
+            exc,
+        )
+        contract = CiContract(error=f"the contract could not be loaded: {exc}")
 
     issues = validate_vp(
         vp, project_dir=project_dir, require_single_entry=False,
@@ -2337,6 +2562,10 @@ def run_ci_verification(
         result.evidence = {
             "vp_id": vp_id,
             "schema_issues": [i.to_dict() for i in issues],
+            # 2026-11-02: the declaration this verdict was based on —
+            # which exit codes mean "could not decide", and whether that
+            # declaration was usable at all.
+            "ci_contract": contract.to_evidence(),
             # 2026-11-04: the schema's own words ARE the machine-written
             # identity — they are produced by the validator, not by a
             # model, and they are the same in every round that hits the
@@ -2382,8 +2611,14 @@ def run_ci_verification(
     label = E2E_METHOD if is_e2e else "full_ci"
     entry_key = ENTRY_COMMAND_FIELD if is_e2e else CI_ENTRY_FIELD
     project_dir = Path(project_dir)
-    timeout = ci_timeout(vp, project_dir=project_dir, entry=entry)
-    declared_budget = gate_budget_seconds(project_dir, entry)
+    timeout = ci_timeout(vp, project_dir=project_dir, entry=entry, contract=contract)
+    declared_budget = gate_budget_seconds(project_dir, entry, contract=contract)
+    # A contract that does not name a summary format has not promised that
+    # its gate's output looks like this repository's gate — so nothing is
+    # parsed.  Reading a foreign format with this repository's patterns
+    # would put a wrong reading into the evidence, and "nothing is known"
+    # is the true thing to say.
+    parse_summary = contract.parses_summary()
 
     started = time.monotonic()
     exit_code: Optional[int] = None
@@ -2434,6 +2669,11 @@ def run_ci_verification(
             )
         else:
             junit_dir = candidate
+            # The directory is named after the verification point, so it
+            # is the **same** directory round after round.  What an
+            # earlier round wrote into it is not this round's evidence —
+            # so it is deleted before the gate is started, below, and
+            # the reader sees only what this round wrote.
             gate_env[GATE_JUNIT_DIR_ENV] = str(candidate)
 
     # The reports of an earlier round are still in that directory -- it
@@ -2441,6 +2681,12 @@ def run_ci_verification(
     # run.  They go before the gate starts, so that whatever is in the
     # directory afterwards was written by this run.
     stale_reports = _clear_stale_junit_reports(junit_dir)
+
+    # The instant the gate starts.  A junit report written before it
+    # belongs to an earlier round: the directory is reused, so its
+    # presence says nothing about the run being graded.
+    junit_since = time.time()
+
 
     try:
         try:
@@ -2458,7 +2704,8 @@ def run_ci_verification(
             timed_out = True
             stdout = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
             stderr = (exc.stderr or "") if isinstance(exc.stderr, str) else ""
-            gate_summary = parse_gate_summary(stdout)
+            if parse_summary:
+                gate_summary = parse_gate_summary(stdout)
             error = _timeout_reason(
                 timeout,
                 time.monotonic() - started,
@@ -2482,7 +2729,7 @@ def run_ci_verification(
     stdout_tail = stdout[-MAX_OUTPUT_CHARS:]
     stderr_head = stderr[:MAX_OUTPUT_CHARS]
     stderr_tail = stderr[-MAX_OUTPUT_CHARS:]
-    if not gate_summary:
+    if parse_summary and not gate_summary:
         gate_summary = parse_gate_summary(stdout)
 
     # The gate's own account of itself, lifted to the top level of the
@@ -2508,7 +2755,7 @@ def run_ci_verification(
         "stdout_tail": stdout_tail,
         "stderr_head": stderr_head,
         "stderr_tail": stderr_tail,
-        "lane_summaries": lane_summaries(stdout),
+        "lane_summaries": lane_summaries(stdout) if parse_summary else [],
         "ci_timeout_seconds": timeout,
         "gate_budget_seconds": declared_budget,
         "gate_summary": gate_summary,
@@ -2521,6 +2768,10 @@ def run_ci_verification(
         "spawned_processes_all_given_back": not outstanding,
         "budget_exhausted_in": exhausted_in,
         "gate_elapsed_seconds": gate_elapsed,
+        # The declaration this verdict was based on: which exit codes
+        # mean "could not decide", and whether that declaration was
+        # usable at all.
+        "ci_contract": contract.to_evidence(),
         # 2026-11-05: the verdict says which file judged it — the same
         # question the schema-failure path answers, asked of the normal
         # path too.
@@ -2547,7 +2798,7 @@ def run_ci_verification(
     # wrote down.  A failure that is not a wall-clock shape is the
     # code's, whatever the machine was doing — so the gate's exit code
     # is not allowed to be the only witness.
-    junit_evidence = _read_junit_evidence(junit_dir)
+    junit_evidence = _read_junit_evidence(junit_dir, since=junit_since)
     evidence.update(junit_evidence)
     if stale_reports:
         # The reports of an earlier round that were in the way.  They
@@ -2562,7 +2813,7 @@ def run_ci_verification(
     could_not_decide = (
         not timed_out
         and not error
-        and _gate_could_not_decide(exit_code, gate_summary)
+        and _gate_could_not_decide(exit_code, gate_summary, contract)
     )
     blocking_failures = (
         _non_wall_clock_failures(junit_evidence) if could_not_decide else []
@@ -2628,7 +2879,7 @@ def run_ci_verification(
                 f"{sample.get('first_line') or '（无消息）'}）"
             )
             signal = SIGNAL_GATE_FAILED
-        elif exit_code == GATE_INCONCLUSIVE_EXIT_CODE:
+        elif exit_code in contract.inconclusive_exit_codes:
             detail = (
                 f"退出码 {exit_code}（机器答不了：宿主不可测或某条 lane 自称"
                 f"不确定，这不是代码失败）"
@@ -2665,6 +2916,7 @@ def run_ci_verification(
 def _gate_could_not_decide(
     exit_code: Optional[int],
     summary: Dict[str, Any],
+    contract: CiContract,
 ) -> bool:
     """Did the gate stop without saying anything about the code?
 
@@ -2676,24 +2928,35 @@ def _gate_could_not_decide(
       (``gate budget exhausted in: …``);
     * it declares itself INCONCLUSIVE (``gate: INCONCLUSIVE (exit 3)``)
       — which stands on its own even when no phase could be parsed;
-    * it exits 3 — the code the gate uses for a run that could not
-      decide (``scripts/run_tests.sh`` uses 0 for a pass, 1 for a failed
-      phase, 3 for a run that could not decide);
+    * it exits with a code the plan declared inconclusive — the codes
+      come from the plan's own contract (``<plan_dir>/ci_contract.json``),
+      and the framework's default is the set in
+      :data:`ci_contract.FRAMEWORK_INCONCLUSIVE_EXIT_CODES`
+      (``scripts/run_tests.sh`` uses 0 for a pass, 1 for a failed phase,
+      3 for a run that could not decide) — so a plan that writes no
+      contract still gets the historical "exit 3" rule;
     * **it says the host could not be measured**
       (``host measurability: the host cannot measure wall-clock …``).
       That is a declaration about the machine, and it stands even when
       the gate's exit code was 1 — which is exactly what a gate that
       measured the host after judging the phase used to do.
 
-    A run whose summary says nothing at all is not a gate that spoke:
-    there is no declaration to read, and the historical FAILED verdict
-    stands.
+    A **declared** code stands on its own: a plan that says "7 means my
+    gate could not decide" has said it, whether or not the gate printed
+    a summary.  Without a contract the historical rule applies: a run
+    whose summary says nothing at all is not a gate that spoke, there is
+    no declaration to read, and the FAILED verdict stands.
     """
+    if contract.applied and exit_code in contract.inconclusive_exit_codes:
+        # The plan declared this code.  Its word is the declaration the
+        # framework was missing — a gate that cannot be measured must
+        # not be filed as a broken deliverable.
+        return True
     if not _summary_has_content(summary):
         return False
     if str(summary.get("budget_exhausted_in") or ""):
         return True
-    if exit_code == 3:
+    if exit_code in contract.inconclusive_exit_codes:
         return True
     if str(summary.get("verdict") or "").upper() == STATUS_INCONCLUSIVE:
         return True

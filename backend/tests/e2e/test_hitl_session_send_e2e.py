@@ -105,7 +105,9 @@ is a test that makes the next one fail for the wrong reason.
 from __future__ import annotations
 
 import json
+import http.client
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -284,6 +286,38 @@ def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind((LOOPBACK_HOST, 0))
         return sock.getsockname()[1]
+
+
+def _host_and_port(base_url: str) -> Tuple[str, int]:
+    """The host and the port a ``base_url`` names."""
+    without_scheme = base_url.split("://", 1)[-1]
+    host, _, port = without_scheme.partition(":")
+    return host, int(port)
+
+
+#: One line of uvicorn's access log: the client's address, the request
+#: line, and the status.  The client's **port** is the connection — two
+#: requests from one port came in on one socket, and that is what tells
+#: a replay that shared its connections from one that did not.
+_ACCESS_LINE = re.compile(
+    r"INFO:\s+(?P<addr>\S+):(?P<port>\d+)\s+-\s+"
+    r"\"(?P<method>[A-Z]+)\s+(?P<path>\S+)\s+HTTP"
+)
+
+
+def _client_ports(log_path: Path, path: str) -> List[str]:
+    """The client ports the server saw for the requests to ``path``."""
+    ports: List[str] = []
+    if not log_path.exists():
+        return ports
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    for line in text.splitlines():
+        match = _ACCESS_LINE.search(line)
+        if match is None:
+            continue
+        if match.group("path") == path:
+            ports.append(match.group("port"))
+    return ports
 
 
 def _wait_for_server(base_url: str, timeout: float = SERVER_BOOT_TIMEOUT_SEC) -> None:
@@ -853,6 +887,163 @@ def test_session_receives_decision_message(booted):
 
 
 # ---------------------------------------------------------------------------
+# The connection a failed request leaves behind
+# ---------------------------------------------------------------------------
+#
+# 2026-11-06: the browser replay of the sequence above died on
+# ``read ECONNRESET`` when it asked for the decision.  Nothing was
+# wrong with the decision — the request that failed was the *interview*
+# before it, and the server answered that one with an unhandled
+# exception (the coding tool this suite pins is not installed, so the
+# model call has nothing behind it).
+#
+# An exception that escapes a handler is answered, and then the
+# connection is closed: Starlette's server-error middleware sends the
+# answer and re-raises, and uvicorn closes the transport as soon as it
+# sees the exception.  The client was never told — the answer carried
+# no ``Connection: close`` — so it kept the socket in its pool, and the
+# next request on that socket was answered by a reset instead of by the
+# product.
+#
+# Two halves answer that, and both of them are pinned here:
+#
+# * the **endpoint** answers with JSON even when it cannot do what it
+#   was asked, so the failure never leaves the handler (the case
+#   below);
+# * the **client** asks for a connection of its own on every call, so
+#   a connection the server closed without saying so is never the one
+#   the next call goes out on (the browser replay, below).
+#
+# The third half — a 500 that announces the close — belongs to the
+# server's catch-all handler in ``backend/server.py``, which is not in
+# this task's declaration; the attempt report carries it.
+
+
+@pytest.fixture
+def booted_without_a_store(tmp_path):
+    """A running backend whose store cannot be opened.
+
+    Its own server, because an unusable state database is a property of
+    the server: the path the store would have to create sits inside a
+    **file**, so the store cannot create the database it wants and
+    every write against it fails.
+
+    The database is reached **through a symlink**, and that is the whole
+    point of the fixture.  The path the server is handed has to have a
+    directory for a parent, because the instance lock the server takes
+    before it binds its socket is written next to the database
+    (``<database>.instance.lock``, in ``backend/instance_lock.py``) and
+    that lock's ``mkdir`` has to succeed.  A database whose **parent**
+    is a file therefore refuses the *boot* — the lock's ``mkdir`` raises
+    ``FileExistsError`` out of the lifespan, uvicorn exits, and the port
+    is never opened — which is a different failure from the one this
+    case is about: this case is about a server that runs and answers,
+    not about a server that never starts.  The symlink keeps the
+    parent a directory (the lock is taken) and puts the *database*
+    where it cannot be created.
+
+    A directory in the database's place would not do either: the server
+    heals that one (it moves the unreadable file aside and starts a
+    fresh database), and a healed store answers the request normally.
+    """
+    workdir = tmp_path
+    blocker = workdir / "blocked"
+    blocker.write_text("not a directory\n", encoding="utf-8")
+    # The symlink is dangling on purpose: it resolves into the blocker,
+    # so the database can neither be found nor created, and the startup
+    # guard leaves it alone (it only touches a database that exists).
+    database = workdir / "state.db"
+    database.symlink_to(blocker / "state.db")
+    base_url, proc = boot_server(
+        workdir, {"PDT_STATE_DB_PATH": str(database)}
+    )
+    try:
+        yield base_url, workdir
+    finally:
+        shutdown_server(proc)
+
+
+def test_a_decision_that_cannot_be_created_still_answers(
+    booted_without_a_store,
+):
+    """A decision that cannot be stored is answered, not a reset.
+
+    The plan's store cannot be opened — the state database cannot be
+    created — so the decision cannot be created.  The endpoint has to
+    answer anyway — with JSON, on the connection the caller already
+    has.
+
+    The same connection, on purpose: a client that opens a fresh
+    connection for every request cannot see this at all, and it is
+    exactly the client that pools connections — browsers, agents,
+    every long-lived client — that breaks.
+
+    2026-11-06: an exception that escapes a handler is answered and
+    then the connection is closed without saying so, so the *next*
+    request on that connection is answered by a reset instead of by
+    the product.  That is what killed the browser replay.
+    """
+    base_url, workdir = booted_without_a_store
+    host, port = _host_and_port(base_url)
+
+    broken_plan = "e2e-broken-plan"
+
+    connection = http.client.HTTPConnection(host, port, timeout=30)
+    try:
+        connection.request(
+            "POST",
+            f"/api/hitl/{broken_plan}/decisions",
+            body=json.dumps(
+                {
+                    "question": QUESTION,
+                    "options": OPTIONS,
+                    "default_option": DEFAULT_OPTION,
+                }
+            ),
+            headers={
+                REQUEST_HEADER: REQUEST_HEADER_VALUE,
+                "Content-Type": "application/json",
+                "Host": LOOPBACK_HOST,
+            },
+        )
+        response = connection.getresponse()
+        body = response.read()
+        assert response.status >= 400, (
+            f"the decision could not be created; the endpoint answered "
+            f"{response.status}: {body!r}"
+        )
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except ValueError:
+            raise AssertionError(
+                f"the endpoint answered with something that is not JSON: "
+                f"{body!r}"
+            )
+        assert "error" in payload, (
+            f"the endpoint's answer names no error: {payload!r}"
+        )
+
+        # And the connection is still the caller's to use — the answer
+        # above did not take it down with it.
+        connection.request(
+            "GET",
+            "/health",
+            headers={
+                REQUEST_HEADER: REQUEST_HEADER_VALUE,
+                "Host": LOOPBACK_HOST,
+            },
+        )
+        follow_up = connection.getresponse()
+        follow_up_body = follow_up.read()
+        assert follow_up.status == 200, (
+            f"the request that followed the failure was answered with "
+            f"{follow_up.status}: {follow_up_body!r}"
+        )
+    finally:
+        connection.close()
+
+
+# ---------------------------------------------------------------------------
 # The negative control
 # ---------------------------------------------------------------------------
 #
@@ -1215,6 +1406,16 @@ launch_kwargs = {"executable_path": executable} if executable else {}
 headers = {
     "X-PDT-Request": "1",
     "Content-Type": "application/json",
+    # One call, one connection.  A fresh context per call is *not* a
+    # fresh connection: the request context pools its sockets for the
+    # whole driver process, so the socket a failed request left behind
+    # is the socket the next request goes out on -- and a server that
+    # closes the connection after an unhandled exception closes it
+    # without saying so (2026-11-06: the browser replay died on
+    # ``read ECONNRESET``).  Asking for the close makes the pool hand
+    # out a new connection for the next call, which is what this
+    # driver always meant to do.
+    #
     # One connection per call, exactly like the browserless path above
     # (urllib opens one connection per request).  The server answers
     # the creation request with an unhandled exception (the
@@ -1349,6 +1550,30 @@ def test_browser_replays_the_same_delivery(booted):
     )
     assert Path(screenshot).exists(), (
         f"the browser replay left no screenshot at {screenshot}"
+    )
+
+    # The two calls went out on two connections.  This is the whole of
+    # the 2026-11-06 failure: the interview failed, the server closed
+    # the connection without saying so, and the request context — which
+    # pools its sockets for the whole driver process, whatever context
+    # it fetches them in — sent the decision on the socket that was
+    # already dead.  The driver asks for a connection of its own on
+    # every call, and the server's access log is where that shows.
+    log_path = workdir / "logs" / LOG_FILENAME
+    interview_ports = _client_ports(log_path, "/api/interview/start")
+    decision_ports = _client_ports(log_path, f"/api/hitl/{PLAN_ID}/decisions")
+    assert interview_ports, (
+        f"the server's log names no request to /api/interview/start; it "
+        f"is at {log_path}"
+    )
+    assert decision_ports, (
+        f"the server's log names no request to /api/hitl/{PLAN_ID}/decisions; "
+        f"it is at {log_path}"
+    )
+    assert interview_ports[-1] != decision_ports[-1], (
+        "the browser replay sent both calls on one connection (client "
+        f"port {decision_ports[-1]}); a request that failed takes the "
+        "next request down with it"
     )
 
 

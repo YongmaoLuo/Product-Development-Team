@@ -96,6 +96,7 @@ from typing import (
     Sequence,
     Set,
     Tuple,
+    TYPE_CHECKING,
 )
 
 from credentials import _FD_ENV_PREFIX as _SECRET_FD_ENV_PREFIX
@@ -142,6 +143,13 @@ try:  # The reaper's spawn marker.  Optional: the marker is how the
     import orphan_reaper
 except Exception:  # pragma: no cover - the marker is best-effort
     orphan_reaper = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:  # pragma: no cover - the annotation only
+    # The tracked seed plans.  The module is **not** imported at
+    # runtime: it is loaded from its path (see :func:`_plan_seed_module`),
+    # because a flat import of a module that exists only in this tree
+    # makes this one fail to load under the framework's loader.
+    import plan_seed
 
 logger = logging.getLogger(__name__)
 
@@ -4548,6 +4556,19 @@ def _resolve_data_path(raw: str, workdir: Path) -> Path:
     return Path(workdir) / candidate
 
 
+def resolve_declared_data_path(raw: str, workdir: Path) -> Path:
+    """Where a path a start command names actually is.
+
+    The public form of :func:`_resolve_data_path`.  A module outside
+    this one — the plan seed — has to be able to ask where a declared
+    path is, and it has to ask the *same* question this module answers:
+    two readings of ``$(pwd)`` would put the seed in a different
+    directory than the service serves, which is the one mistake that
+    would leave the plan cards missing without anything failing.
+    """
+    return _resolve_data_path(raw, workdir)
+
+
 def _state_db_path(
     data_paths: Sequence[str], workdir: Path,
 ) -> Optional[Path]:
@@ -6541,6 +6562,38 @@ def _ensure_services(
                 runtime = start_service(decl, project_dir)
             result.runtimes[name] = runtime
 
+    # 2026-11-07 (VP-019): the tracked seed plans have to reach the
+    # service's own plans root.  Until now the only copy that ever got
+    # there was the inline heredoc inside the plan's start command —
+    # plan *data*, which the repository does not track — so a clean
+    # checkout had no way to make the two CI-contract plan cards appear.
+    # The service's own declaration says which seeds it wants and where
+    # they belong, so the tracked bytes are materialised here.
+    #
+    # Three properties this placement buys:
+    #
+    #   * it happens **after** the service is ready — the start command
+    #     removes its own state directory and replays its inline seed
+    #     before the service answers, so a seed written earlier would be
+    #     deleted again;
+    #   * it hangs on the **ensure** path rather than inside
+    #     ``start_service``, so a service this round *adopted* — one
+    #     that was already running — converges as well;
+    #   * a restart inside a round needs no special case: the seed
+    #     writes fixed tracked bytes and never overwrites an existing
+    #     state row, so the round's data is not rebuilt.
+    for name, runtime in result.runtimes.items():
+        decl = declarations.get(name)
+        if decl is None or not runtime.ready:
+            continue
+        try:
+            _seed_service_plans(decl, project_dir)
+        except Exception as exc:  # noqa: BLE001 - a seed never aborts a round
+            logger.warning(
+                "[service_manager] could not seed the plans of service %r: %s",
+                name, exc,
+            )
+
     # 2026-10-25: every runtime now carries the **data plane** it was
     # found on, so the round's log can answer "it came up — but did it
     # come up serving data?".  The services the round started were
@@ -6560,6 +6613,138 @@ def _ensure_services(
 
     result.duration_seconds = time.monotonic() - start
     return result
+
+
+#: The tracked seed module, once it has been looked for.  ``None``
+#: means it could not be loaded — the seed is then not written, and the
+#: service still starts.
+_PLAN_SEED: Any = None
+
+#: Whether the seed module has been looked for already.  The lookup
+#: happens once: a module that cannot be loaded does not become
+#: loadable later, and every attempt costs a filesystem read and a
+#: warning line.
+_PLAN_SEED_LOOKED_FOR = False
+
+
+def _plan_seed_module() -> Any:
+    """The tracked seed module — loaded from its path, or ``None``.
+
+    Why it is loaded from its path
+    ------------------------------
+    The framework loads *this* module from its path as well (see
+    ``verification_agent._load_service_manager``): with the harness'
+    ``backend/`` on ``sys.path`` and this project's ``backend/`` —
+    where ``plan_seed.py`` lives — *not* on it.  A flat
+    ``import plan_seed`` therefore resolved to nothing, the whole
+    module failed to load, and the framework turned that failure into
+    one warning line and a fallback to its own copy of this module: the
+    tracked seed never reached the service's plans root, and the wiring
+    that was supposed to put it there had never run at all.
+
+    So the seed module is loaded the way this module is: from its
+    path, under a name of its own, registered in ``sys.modules`` only
+    while it executes.
+
+    Never raises: a seed that cannot be loaded is a seed that is not
+    written, not a service that does not start.
+    """
+    global _PLAN_SEED, _PLAN_SEED_LOOKED_FOR
+    if not _PLAN_SEED_LOOKED_FOR:
+        _PLAN_SEED_LOOKED_FOR = True
+        _PLAN_SEED = _load_plan_seed_by_path()
+    return _PLAN_SEED
+
+
+def _load_plan_seed_by_path() -> Any:
+    """Load ``plan_seed.py`` from beside this module — or ``None``."""
+    path = Path(__file__).resolve().parent / "plan_seed.py"
+    try:
+        import hashlib
+        import importlib.util
+
+        # A name that is not ``plan_seed``: the flat name belongs to
+        # whichever copy is on ``sys.path``, and shadowing it would
+        # swap the harness' module for this project's.  The digest
+        # keeps two projects apart when both are loaded in one process.
+        digest = hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:12]
+        module_name = f"pdt_project_plan_seed_{digest}"
+        spec = importlib.util.spec_from_file_location(module_name, str(path))
+        if spec is None or spec.loader is None:
+            raise ImportError(f"no loader for {path}")
+        module = importlib.util.module_from_spec(spec)
+        # Registered while it executes, so a module that looks itself
+        # up by ``__name__`` finds itself; removed again afterwards, so
+        # the registry keeps describing the harness' own modules.
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.modules.pop(module_name, None)
+        return module
+    except Exception as exc:  # noqa: BLE001 — a missing seed, not a dead module
+        logger.warning(
+            "[service_manager] could not load the tracked plan seed (%s); "
+            "the plans root is not seeded: %s",
+            path, exc,
+        )
+        return None
+
+
+def _seed_service_plans(
+    decl: ServiceDeclaration, project_dir: Path,
+) -> Optional[plan_seed.SeedResult]:
+    """Materialise the tracked seed plans into the service's own plans root.
+
+    The CI-contract seed plans are tracked in the repository
+    (``backend/tests/fixtures/plans/``), and the service that serves
+    them has to serve *those* bytes: the copy the plan's own start
+    command writes inline is a re-serialised lookalike, and it lives in
+    plan data the repository does not track.
+
+    Only a declaration that **names** the seed ids is seeded, and only
+    into the plans root that same declaration names.  A service that
+    does not ask for the seed is left exactly as it was — not one byte
+    written.
+
+    The readers — how a start command's environment is read and how a
+    path it names is resolved — are **this module's own**.  They are
+    handed to the seed rather than looked up inside it: a seed that
+    imported a service manager would find the harness' copy, which
+    knows nothing about this project's declarations.
+
+    Args:
+        decl: the service's own declaration.
+        project_dir: the project directory the service runs in.
+
+    Returns:
+        What was seeded, or ``None`` when this service wants no seed.
+    """
+    seed_module = _plan_seed_module()
+    if seed_module is None:
+        return None
+    workdir = Path(project_dir) / decl.cwd
+    targets = seed_module.seed_targets(
+        decl.start_cmd,
+        workdir,
+        env_reader=start_cmd_env,
+        path_resolver=resolve_declared_data_path,
+    )
+    if not targets.plan_ids:
+        return None
+    if targets.plans_root is None:
+        logger.warning(
+            "[service_manager] service %r names the seed plans but names "
+            "no plans root; nothing was seeded",
+            decl.name,
+        )
+        return None
+    return seed_module.seed_plans(
+        targets.plans_root,
+        state_db_path=targets.state_db_path,
+        write_state=targets.state_db_path is not None,
+        plan_ids=targets.plan_ids,
+    )
 
 
 def _record_data_plane(runtime: ServiceRuntime) -> ServiceRuntime:

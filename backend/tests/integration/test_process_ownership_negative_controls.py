@@ -1287,8 +1287,17 @@ def test_n3_executor_sigterm_kills_children_and_releases_lock(tmp_path):
             )
         )
 
+        # The wording names the wait that ran out, and not only the
+        # answer: the gate reads the *shape* of a failure to decide
+        # whether the machine or the code owns it, and "it waited and
+        # the wait ran out" is the machine's shape.  A message that said
+        # only "the children are still running" would be
+        # indistinguishable from a code failure, and a busy host would
+        # turn this control into a repair task against a delivery that
+        # did not fail.
         assert _wait_until_gone(children, 30), (
-            "the executor left its children running"
+            "the executor left its children running: the children did not "
+            "settle within 30s of the SIGTERM"
         )
         assert executor_lock.is_held(plan_dir) is False, (
             "the executor died without giving the plan's lock back"
@@ -1572,3 +1581,243 @@ def test_negative_controls_never_touch_foreign_processes(tmp_path):
             tree.cleanup()
         _kill_process(foreign)
         _kill_pid(foreign.pid)
+
+
+# ---------------------------------------------------------------------------
+# the machine reads: "could not be read" is not "there is none"
+# ---------------------------------------------------------------------------
+#
+# 2026-11-06: the whole-repo gate ran on a machine whose load average
+# was 39, and two of its cases failed for the same reason.  The reaper
+# asked the kernel for a process's identity and the read did not come
+# back; the process was recorded as "already gone at reap time", so it
+# left the live set, and the executor left its children running.  The
+# census asked for the process table, the read did not come back, and
+# the root was reported as carrying no daemon at all.
+#
+# A read that fails is not a reading that says "none".  The three
+# cases below pin that difference.
+
+
+def test_a_liveness_probe_is_not_audited(tmp_path, monkeypatch):
+    """A liveness probe is recorded -- but never as a signal that was sent.
+
+    ``os.kill(pid, 0)`` sends nothing: it asks the kernel whether the
+    pid exists.  It is also the most frequent call in the system --
+    every liveness poll of every waiter, several times a second per
+    process -- and each record costs a stack extraction and a file
+    write.  On the machine the whole-repo gate ran on (load average
+    39) three quarters of the records were signal-0 probes, and an
+    early return for ``sig == 0`` was tried to answer that (2026-11-08,
+    commit 0280eb4d).
+
+    That early return was withdrawn, because it removed the most common
+    kind of call from the records entirely -- and "signal 0 was never
+    recorded" is exactly the blind spot an audit cannot afford.  This
+    case now pins the contract that replaced it:
+
+    * A probe **is** written down.  It is a call that reached the
+      kernel, and the account of what this process asked the kernel to
+      do does not get to omit a class of calls.
+    * A probe is **never** recorded as a signal that was *sent*.  It
+      sends nothing, so the only outcome it can carry is "attempted" --
+      and that is what the name of this case means: the probe is not
+      audited as a delivered signal.
+    * The **cost** of writing the probes is answered by a cap
+      (``KILL_AUDIT_MAX_RECORDS``), not by a filter.  A cap keeps the
+      newest evidence; a filter deletes the evidence, which is the
+      blind spot again.  The cap itself is pinned by
+      ``test_kill_audit.py::test_the_cap_stops_writing_after_the_limit``
+      in ``backend/tests/unit/``; this case only confirms that the
+      records in front of it still live under it, and does not raise a
+      second cap case of its own.
+
+    The name of this case is deliberately the one it has always had:
+    the node id is registered in the plan that produced this work, and
+    renaming it would leave that id unresolvable.  The contract it
+    pins is the one above.
+    """
+    import kill_audit
+
+    audit_dir = tmp_path / "kill-audit"
+    monkeypatch.setenv(kill_audit.KILL_AUDIT_DIR_ENV, str(audit_dir))
+    monkeypatch.setattr(kill_audit, "_kill_audit_count", 0)
+
+    os.kill(os.getpid(), 0)
+
+    child = subprocess.Popen(
+        [sys.executable, "-u", "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        os.kill(child.pid, signal.SIGTERM)
+    finally:
+        child.wait(timeout=10)
+
+    records = []
+    for path in sorted(audit_dir.glob("kill-audit-*.jsonl")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                records.append(json.loads(line))
+
+    # (1) The probe reached the kernel, so it is written down.
+    probes = [
+        r for r in records
+        if r.get("kind") == "kill"
+        and int(r.get("target") or 0) == os.getpid()
+        and int(r.get("signal") or 0) == 0
+    ]
+    assert probes, (
+        "os.kill(os.getpid(), 0) reached the kernel and nothing was "
+        "written down about it; the records were: {}".format(records)
+    )
+
+    # (2) A probe sends nothing, so it is never recorded as one that
+    #     was sent -- only as an attempt.
+    every_probe = [
+        r for r in records if int(r.get("signal") or 0) == 0
+    ]
+    for probe in every_probe:
+        assert probe.get("outcome") == kill_audit.OUTCOME_ATTEMPTED, (
+            "a liveness probe sends nothing at all, so it can only ever "
+            "be recorded as an attempt; it was recorded as {}".format(
+                probe.get("outcome")
+            )
+        )
+
+    # (3) The cost of writing the probes is bounded by the cap, not by
+    #     a filter that would delete them.
+    assert len(records) <= kill_audit.KILL_AUDIT_MAX_RECORDS, (
+        "the audit wrote {} records, past the cap of {}".format(
+            len(records), kill_audit.KILL_AUDIT_MAX_RECORDS
+        )
+    )
+
+    # (4) The real signal is still written down, with its target.
+    kills = [
+        r for r in records
+        if int(r.get("signal") or 0) == signal.SIGTERM
+        and int(r.get("target") or 0) == child.pid
+    ]
+    assert kills, (
+        "the audit recorded no SIGTERM for the child it signalled: {}".format(
+            records
+        )
+    )
+
+
+def test_a_read_that_fails_once_is_asked_again(monkeypatch):
+    """A machine that did not answer the first time is asked again.
+
+    A read that fails because the machine is busy is not the same as a
+    machine that cannot be read at all, and the difference is worth one
+    bounded retry.  The reaper's answer to "there is nothing there"
+    must not be the answer to "I could not look".
+    """
+    monkeypatch.setattr(process_identity, "psutil", None)
+
+    real_run = process_identity.subprocess.run
+    calls = []
+
+    def flaky(*args, **kwargs):
+        command = args[0] if args else kwargs.get("args")
+        if (
+            isinstance(command, (list, tuple))
+            and command
+            and command[0] == "ps"
+        ):
+            calls.append(command)
+            if len(calls) == 1:
+                raise OSError("the machine is busy")
+        return real_run(*args, **kwargs)
+
+    class _OnlyRun:
+        """``subprocess`` as the identity module sees it."""
+
+        run = staticmethod(flaky)
+
+    monkeypatch.setattr(process_identity, "subprocess", _OnlyRun)
+
+    identity = process_identity.probe(os.getpid())
+
+    assert identity is not None, (
+        "the machine was asked once, did not answer, and was believed to "
+        "be empty"
+    )
+    assert len(calls) >= 2, (
+        "the machine was asked {} time(s); a read that fails is asked again "
+        "before it is believed".format(len(calls))
+    )
+
+
+def test_an_unreadable_machine_is_not_a_machine_with_nothing_on_it(
+    tmp_path, monkeypatch,
+):
+    """A machine that cannot be read has not said the process is gone.
+
+    2026-11-06: the reaper asked the kernel for an identity, the read
+    did not come back, and the process was recorded as "already gone at
+    reap time".  The record left the live set, so nothing ever swept
+    it up again, and the executor left its children running.
+
+    Two readings, and the reaper has to tell them apart: "the machine
+    could not be read" and "the machine says there is nothing there".
+    The second one ends a record; the first one must not.
+    """
+    plan_id = _plan_id("unreadable")
+    plan_dir = tmp_path / "plans" / plan_id
+    plan_dir.mkdir(parents=True)
+
+    child = subprocess.Popen(
+        [sys.executable, "-u", "-c", "import time; time.sleep(300)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        _record_in_ledger(plan_dir, child, role="tool", plan_id=plan_id)
+
+        # The machine cannot be read: the **identity** question — the
+        # one that forks ``ps`` — does not come back.
+        #
+        # The liveness question is left alone on purpose: it is asked
+        # with a syscall (``os.kill(pid, 0)``) and with ``psutil``,
+        # neither of which forks and neither of which times out, so it
+        # answers even on a machine that is too busy to run ``ps``.
+        # That is the whole difference the two readings make: the
+        # identity is unreadable, the process is still there.
+        monkeypatch.setattr(process_identity, "probe", lambda pid: None)
+        monkeypatch.setattr(
+            process_identity,
+            "probe_result",
+            lambda pid: (None, False),
+            raising=False,
+        )
+
+        outcome = process_reaper.reap_plan(
+            plan_dir, plan_id, reason="the machine cannot be read",
+        )
+
+        assert _ALIVE(child.pid), (
+            "the reaper signalled a process it could not identify"
+        )
+        events = ledger.read_events(plan_dir)
+        gone = [
+            event for event in events
+            if event.get("detail") == "already gone at reap time"
+        ]
+        assert not gone, (
+            "the record was filed as gone although the machine could not be "
+            "read: {}".format(gone)
+        )
+        assert child.pid in ledger.live_records(plan_dir), (
+            "the record left the live set, so nothing will ever sweep it up "
+            "again"
+        )
+        assert outcome.failed, (
+            "the reaper reported no failure: the machine could not be read"
+        )
+    finally:
+        _kill_process(child)
+        _kill_pid(child.pid)

@@ -1583,11 +1583,25 @@ try:
     wait=float(os.environ.get("PDT_LOCK_TIMEOUT","300") or 300)
 except ValueError:
     wait=300.0
+# The broker's own socket budget is ``wait + 30`` (file_lock_protocol:
+# ``timeout=float(timeout) + 30.0``), so the broker ALWAYS answers by
+# then -- with rc=3 (busy), rc=5 (deadlock) or a failure of its own.
+# This subprocess ceiling is therefore the granted wait plus that
+# protocol margin (30) plus 5 seconds of interpreter start-up: 35.
+#
+# It used to be ``wait + 60``, which let the SUBPROCESS outlive the
+# answer the caller is waiting for: a caller bounding the hook at N
+# seconds saw ``TimeoutExpired`` -- the process simply killed -- and
+# never learned the guard's verdict, so "could not get the lock in
+# time" was indistinguishable from "the machine was too busy to answer".
+# That is how a saturated host got recorded as a code failure. At
+# ``wait + 35`` the guard's degraded-allow branch fires FIRST and the
+# caller always gets an answer.
 try:
     proc=subprocess.run(
         [sys.executable, cli, "acquire", "--task", task, "--path", rp,
          "--timeout", str(wait)],
-        capture_output=True, text=True, timeout=wait+60)
+        capture_output=True, text=True, timeout=wait+35)
 except Exception as exc:
     print("[pdt-lock] broker call failed (" + type(exc).__name__
           + "); allowing the edit", file=sys.stderr)
@@ -1627,13 +1641,42 @@ def _materialise_guard_script(path: Path) -> None:
     ``os.replace`` is atomic on POSIX, so a reader sees either the
     previous complete script or the new complete one.
 
-    The temp name carries the pid: every writer in a parallel test run is
-    a different process, and two of them must not share a scratch path
-    they both truncate.
+    The scratch name carries the pid AND a per-write unique id. The pid
+    alone is not enough, because a process is not the same thing as a
+    writer: a parallel test run has several processes, but ONE process
+    can also have several writers at once (the repository's own
+    concurrency test re-materialises this script from threads). Two
+    writers that share a scratch path do not merely tidy up badly --
+    writer B truncates the file writer A is about to publish, so A can
+    publish a half-written guard (readers then see a 0-byte script, the
+    exact CI symptom above) and B afterwards finds its scratch file
+    already renamed away (``FileNotFoundError``).
+
+    So every write owns its scratch path: pid to keep writers of
+    different processes apart, plus a unique id so two writers inside
+    one process never collide. The publish stays ``os.replace``, which
+    is what makes "a reader never sees a half-written script" true. No
+    lock is used: uniqueness plus an atomic replace is the guarantee,
+    and locking would serialise the writes instead of fixing them.
+
+    Because every write now has a name of its own, a write that FAILS
+    would strand a scratch file nobody will ever collect -- the old
+    pid-only name could strand at most one. So a failed write removes
+    its own scratch file and re-raises; the published path keeps the
+    previous complete script either way.
     """
-    tmp = path.with_name(path.name + "." + str(os.getpid()) + ".tmp")
-    tmp.write_text(_EDIT_WRITE_FORMAL_REPO_GUARD_SRC, encoding="utf-8")
-    os.replace(tmp, path)
+    tmp = path.with_name(
+        path.name + "." + str(os.getpid()) + "." + uuid.uuid4().hex + ".tmp"
+    )
+    try:
+        tmp.write_text(_EDIT_WRITE_FORMAL_REPO_GUARD_SRC, encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def _ensure_guard_hook_path() -> Path:

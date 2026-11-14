@@ -36,6 +36,19 @@ from file_lock_protocol import socket_path  # noqa: E402
 
 _REAL_HOME_ENV = "PDT_TEST_REAL_HOME"
 
+#: How long the caller waits for one guard-hook spawn.
+#:
+#: The guard is a separate process, and on a loaded host the interpreter
+#: alone can take the better part of a minute to come up.  The broker path
+#: starts a SECOND interpreter (the lock CLI) on top of that, so the whole
+#: path costs roughly two spawns.  A ceiling below that makes the CALLER
+#: die before the guard has rendered its verdict -- the case then reports
+#: a broken contract for what is really a slow machine.
+#:
+#: This is the test's own waiting ceiling and nothing else: no exit code,
+#: no stderr match, no assertion and no lock-table check moves with it.
+_HOOK_SPAWN_TIMEOUT_S = 150
+
 
 def _real_home() -> Path:
     """The home this run was launched with -- not the redirected one.
@@ -118,7 +131,7 @@ def _run_hook(workspace, target, *, broker_on, task_id="t1", extra_env=None):
         capture_output=True,
         text=True,
         env=env,
-        timeout=60,
+        timeout=_HOOK_SPAWN_TIMEOUT_S,
     )
     return proc.returncode, proc.stderr
 
@@ -197,6 +210,7 @@ def test_the_same_task_editing_twice_is_not_refused(workspace, broker):
 # ---------------------------------------------------------------------------
 # degradation
 # ---------------------------------------------------------------------------
+@pytest.mark.timeout(600)
 def test_no_broker_configured_is_a_silent_pass(workspace):
     """Standalone ``coding_tool`` use must be unchanged.
 
@@ -246,6 +260,7 @@ def test_plan_state_files_are_not_brokered(workspace, broker):
     assert "another task" not in stderr
 
 
+@pytest.mark.timeout(600)
 def test_plan_state_files_are_allowed_outside_scratch(workspace):
     """``plans/`` is allowed on its own account, not because it is scratch.
 

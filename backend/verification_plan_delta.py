@@ -281,6 +281,11 @@ def vp_definition_gaps(vp: Dict[str, Any]) -> List[str]:
     号已经发出去了，条目却被整条丢掉，于是分配账本上留下一个没有定义的
     占位 id。把判据提到发号之前，缺定义的条目连号都拿不到。
 
+    2026-11-06（VP-018）：``api_test`` 的断言载荷也在这里查。裸成员名
+    （``json_path: "decision_id"``）不是路径 —— 执行器解析不出来，那条
+    判据跑出来的失败是「subject not found」，读起来像产品缺陷（VP-018 就是
+    这么被修了一轮，其实产品完全正常）。路径写法在**发号之前**就要说清。
+
     2026-11-08（repair-04 / VP-024）：判据只看 title 与 method，于是
     **方法自己必需的字段**没人管 —— 一条 ``verification_method`` 是
     ``full_ci`` 却**没有 ``ci_entry``** 的 VP 在 ``apply_delta`` 里照样拿到
@@ -306,6 +311,14 @@ def vp_definition_gaps(vp: Dict[str, Any]) -> List[str]:
             f"verification_method {method or '(missing)'} 不在 "
             f"{list(SUPPORTED_METHODS)} 里"
         )
+    # 2026-11-09（repair-18）：本文件与 base 合并时，两侧改的是这一段 ——
+    # ``api_test`` 的断言载荷检查来自本分支，``full_ci`` 的 ``ci_entry``
+    # 检查来自 base。冲突按「两侧意图都保留」解决，于是两条检查挂在同一
+    # 条 if/elif 链上（``elif`` 挂的是 ``api_test``）。**两支都要留着**：
+    # 删掉 ``full_ci`` 那一支，``vp_definition_gaps`` 就不再拦「缺
+    # ci_entry 的 full_ci」，那条判据会一路跑到 schema 校验才被拒。
+    if method == "api_test":
+        gaps.extend(_api_test_assertion_gaps(vp))
     elif method == "full_ci":
         # 整仓门禁的判定依据**就是**这条入口的退出码：没有入口，这条 VP
         # 跑不出任何结论 —— 与 ``verification_ci_runner.validate_vp`` 的
@@ -316,6 +329,68 @@ def vp_definition_gaps(vp: Dict[str, Any]) -> List[str]:
                 "full_ci 必须给出 ci_entry"
                 "（整仓门禁的判定依据就是这条入口的退出码）"
             )
+    return gaps
+
+
+#: 每一条 ``json_path`` 都必须以它开头。
+#:
+#: 2026-11-06（VP-018）：执行器解析的是 ``$.a.b`` 这一族路径 —— 裸成员名
+#: （``a``）**不是**路径，它解析不出来。于是那条断言报的是「subject not
+#: found」，读起来像产品没返回那个字段，而响应体里其实什么都有（VP-018 的
+#: 四条断言就是这么被误判成产品缺陷、整整修了一轮的）。判据写错这件事本身
+#: 是信号，必须在**校验层**就说出来。
+JSON_PATH_ROOT = "$"
+
+
+def json_path_root_error(path: Any) -> Optional[str]:
+    """``path`` 不是一条可用的 ``json_path`` 时的原因；可用则返回 ``None``。
+
+    可用 = 以 ``$`` 开头（``$.a`` / ``$.a[0].b``）。裸成员名（``a``）不是
+    路径：执行器解析不出来，断言于是报「subject not found」—— 读起来像产品
+    没返回那个字段，其实字段就在响应体里。
+
+    这条要求在**校验层**（:func:`vp_definition_gaps`）就该说出来：判据写错是
+    判据的问题，不是交付物的问题，让它在执行期变成 4 条看不懂的失败，只会让
+    下一轮把同一件事再当成产品缺陷修一遍。
+
+    2026-11-08：这段实现原本住在 ``verification_api_runner`` 里。那个模块是
+    本仓的**冻结面**（``backend/tests/static_gates/
+    test_verification_mode_scope_gates.py`` 把它整份钉在基线上），改动它会
+    让整仓门禁失败。于是判据搬到这里 —— 本模块不在冻结面里，且它才是真正
+    下发判据的地方：写不进来的判据**到不了**执行器，"裸路径悄悄通过"因此
+    在机制上不成立，而不只是"多半不会"。
+    """
+    if not isinstance(path, str) or not path.strip():
+        return "json_path 必须是非空字符串"
+    if not path.startswith(JSON_PATH_ROOT):
+        return (
+            f"json_path 必须以 `{JSON_PATH_ROOT}` 开头（收到 {path!r}）；"
+            f"应写成 `{JSON_PATH_ROOT}.{path}`"
+        )
+    return None
+
+
+def _api_test_assertion_gaps(vp: Dict[str, Any]) -> List[str]:
+    """``api_test`` 的断言载荷里，写法用不了的地方。
+
+    只查 ``json_path``：它必须是带 ``$`` 根的路径（``$.decision_id``）。
+    裸成员名解析不出来，判据因此跑不出结论 —— 而它跑出来的失败长成
+    「subject not found」的样子，读起来像产品没返回字段。
+
+    其余的键（主体 / 比较符 / 空比较符）由 ``verification_api_runner`` 的
+    schema 校验管：护栏（``verification_agent._plan_delta_guard``）在落盘前
+    还会再查一遍，两道关卡看的是同一份词汇表。
+    """
+    assertions = vp.get("assertions")
+    if not isinstance(assertions, list):
+        return []
+    gaps: List[str] = []
+    for index, assertion in enumerate(assertions):
+        if not isinstance(assertion, dict) or "json_path" not in assertion:
+            continue
+        reason = json_path_root_error(assertion.get("json_path"))
+        if reason is not None:
+            gaps.append(f"assertions[{index}].{reason}")
     return gaps
 
 
@@ -407,6 +482,10 @@ DELTA_SYSTEM_PROMPT = f"""你是资深测试架构师，负责维护一份**已�
      （`equals` / `contains` / `not_contains` / `exists` / `length_gte` / …），
      而 `status` / `body_contains` / `body_not_contains` 自带期望值，不要再
      加比较符。
+   - **`json_path` 必须以 `$` 开头**：`$.decision_id` / `$.items[0].id`。
+     裸成员名（`decision_id`）**不是**路径 —— 框架解析不出来，那条断言会
+     报「subject not found」，读起来像产品没返回字段，而字段其实就在响应
+     体里。写错路径的新增会被挡在计划之外（连 id 都不会发出去）。
 
 8. **打 `{_GUARDED_PREFIX}` 的请求必须带上仓库强制的守卫头**：
    `{GUARD_HEADER_SPEC}`（见 `backend/request_guard.py`）。不带这个头的

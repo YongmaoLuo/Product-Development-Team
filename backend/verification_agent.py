@@ -57,6 +57,10 @@ from verification_executor import (
     # 写侧标了复用、读侧认不出来，报告里就看不出哪条是复用的。
     REUSED_FROM_ROUND_FIELD,
     VERDICT_ROUND_FIELD,
+    # 2026-11-09（判定/记账层）：「终态成功」的集合同样从执行侧借 ——
+    # 门禁的语义（什么算通过）是执行器定的，记账层只是照着它判
+    # 「这个关卡的前置是不是都好了」。这里写第二份，两边迟早漂。
+    _TERMINAL_SUCCESS_STATUSES,
 )
 # e2e 的两个子类与它们的字段名同样从执行侧借（``verification_ci_runner`` 是
 # 判定 e2e 能不能跑的那一层）。**同一份常量、不写第二遍**：字段名漂一次，
@@ -142,6 +146,10 @@ from verification_command_guard import (
 from verification_phases import (  # noqa: E402 — 两阶段验证（2026-09-16）
     normalize_plan_phases,
     is_final_gate as _is_final_gate,
+    # 2026-11-09（判定/记账层）：关卡之间的先后（先 Nightly 后 E2E）从
+    # 阶段模块借 —— **同一份常量、不写第二遍**：关卡顺序漂一次，记账层
+    # 就会问错「谁挡着谁」。
+    infer_phase_order as _infer_phase_order,
 )
 # 2026-09-18（D5）：全量关卡完整性护栏。D2/D4 补回了 Phase 2 两种关卡的
 # 表达方式与提示词；这个护栏是"提示词说了但没人核对"的那层兜底 ——
@@ -1845,6 +1853,97 @@ def _load_service_manager(project_dir: Any = None) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# The plan's CI contract file — named by the tree under test (2026-11-06)
+# ---------------------------------------------------------------------------
+#
+# The contract belongs to the tree under test: it is the tree's feature
+# and the tree's file name.  A flat ``from ci_contract import
+# CONTRACT_FILENAME`` resolves through ``sys.path`` — where the *harness'*
+# copy sits — and in a harness that carries no ``ci_contract`` at all it
+# raises ``ModuleNotFoundError``.  That import sat on the way into
+# ``_run_full_ci_vp`` — one flat import away from taking the whole
+# full-CI verification point down with it.
+
+#: The contract file's name, as the framework names it.  It is the last
+#: resort of :func:`_contract_filename`: a name that is only ever used
+#: to *look for* a file, so a wrong guess costs a missing contract and
+#: nothing else.
+_DEFAULT_CONTRACT_FILENAME = "ci_contract.json"
+
+
+def _tree_ci_contract_module(project_dir: Any) -> Any:
+    """The tree under test's own ``ci_contract`` module — or ``None``.
+
+    Loaded **from its path**, so the harness' copy cannot shadow it —
+    the same convention as :func:`_load_service_manager`.
+    """
+    if not project_dir:
+        return None
+    try:
+        path = Path(project_dir) / "backend" / "ci_contract.py"
+    except TypeError:
+        return None
+    try:
+        if not path.is_file():
+            return None
+    except OSError:
+        return None
+    try:
+        import hashlib
+        import importlib.util
+
+        digest = hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:12]
+        module_name = f"pdt_project_ci_contract_{digest}"
+        spec = importlib.util.spec_from_file_location(module_name, str(path))
+        if spec is None or spec.loader is None:
+            raise ImportError(f"no loader for {path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.modules.pop(module_name, None)
+        return module
+    except Exception as exc:  # noqa: BLE001 — a fallback, never a failure
+        logger.warning(
+            "[ci_runner] could not load the tree under test's own "
+            "ci_contract (%s); falling back: %s", path, exc,
+        )
+        return None
+
+
+def _contract_filename(project_dir: Any = None, runner_module: Any = None) -> str:
+    """The name of the plan's CI contract file.
+
+    Resolution order:
+
+      1. the runner that will judge — the runner reads the contract, so
+         the runner names the file;
+      2. the tree under test's own ``ci_contract`` module — the tree
+         owns the contract, so the tree names the file;
+      3. a flat import — the harness' own copy, when it has one;
+      4. the framework's own name — a name that is only used to look for
+         a file, so the worst a wrong guess costs is a missing contract.
+
+    Never raises: the contract is optional, and a round must not die
+    because a name could not be resolved.
+    """
+    name = getattr(runner_module, "CONTRACT_FILENAME", "")
+    if name:
+        return str(name)
+    module = _tree_ci_contract_module(project_dir)
+    if module is not None:
+        name = getattr(module, "CONTRACT_FILENAME", "")
+        if name:
+            return str(name)
+    try:
+        from ci_contract import CONTRACT_FILENAME  # noqa: PLC0415
+
+        return str(CONTRACT_FILENAME)
+    except Exception:  # noqa: BLE001 — a name, never a verdict
+        return _DEFAULT_CONTRACT_FILENAME
+
+# ---------------------------------------------------------------------------
 # Which ``verification_ci_runner`` runs the gate? (2026-11-04, VP-012)
 # ---------------------------------------------------------------------------
 #
@@ -1992,6 +2091,8 @@ def _ci_runner_module_paths(project_dir: Any = None) -> List[str]:
     module = _load_ci_runner(project_dir)
     actual = getattr(module, "__file__", None)
     return [str(actual)] if actual else []
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -2897,6 +2998,14 @@ def _entry_is_infrastructure_unresolved(entry: Any) -> bool:
     return str(entry.get("reason_code") or "") == INFRA_UNRESOLVED_TERMINAL
 
 
+#: The verdict the CI gate writes when it ran out of budget and could
+#: not decide (``verification_ci_runner.STATUS_INCONCLUSIVE``).  Spelled
+#: here rather than imported so reading a report does not drag the CI
+#: runner — and the subprocess machinery behind it — into this module's
+#: import time (same reason as ``verification.orchestrator``).
+STATUS_INCONCLUSIVE = "INCONCLUSIVE"
+
+
 def _derive_overall_status(entries: Any) -> str:
     """The round's verdict, derived from the round's entries.
 
@@ -2914,7 +3023,8 @@ def _derive_overall_status(entries: Any) -> str:
       * a FAILED entry          -> ``FAILED``
       * a PARTIAL entry         -> ``PARTIAL``
       * a DEFERRED entry, an
-        environment-blocked one, or an infra-unresolved one
+        environment-blocked one, an infra-unresolved one, or an
+        INCONCLUSIVE one
                                  -> ``SKIPPED``
       * anything else           -> ``PASSED``
 
@@ -2930,6 +3040,11 @@ def _derive_overall_status(entries: Any) -> str:
     breaking, not that one outage took the round out — and the two are
     read from different fields, so neither can be mistaken for the
     other.
+
+    ``INCONCLUSIVE`` (2026-11-10) joins them too, for the same reason:
+    a gate that ran out of budget did not decide anything, so the
+    round did not judge that point.  A round that says ``PASSED``
+    about a gate that could not decide is a verdict nobody earned.
 
     A round with no entry at all stays ``PASSED``: a round with no
     verification point has no verdict to give, and that behaviour is
@@ -2949,6 +3064,7 @@ def _derive_overall_status(entries: Any) -> str:
         statuses.append(str(status))
         if (
             str(status) == "DEFERRED"
+            or str(status) == STATUS_INCONCLUSIVE
             or _entry_is_environment_blocked(entry)
             or _entry_is_infrastructure_unresolved(entry)
         ):
@@ -4054,6 +4170,29 @@ def _health_endpoint_answers(health_url: str, timeout: float = 3.0) -> bool:
         return False
 
 
+def _runner_accepts_kwarg(runner: Callable[..., Any], name: str) -> bool:
+    """Does ``runner`` take the keyword argument ``name``?
+
+    The runner that judges a round may be the tree under test's own copy
+    (see :mod:`verification_ci_runner_loader`), and a copy from before
+    the CI contract existed does not take ``plan_dir``.  Handing it a
+    keyword it does not know would raise a ``TypeError`` and turn a
+    gradeable round into a crash — so the keyword is only handed over to
+    a runner that can use it.  An unreadable signature counts as "yes":
+    the call itself is the only place the answer can be trusted.
+    """
+    try:
+        parameters = inspect.signature(runner).parameters
+    except (TypeError, ValueError):
+        return True
+    if name in parameters:
+        return True
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+
+
 def _closes_round_start_marker(method):
     """把"这一轮结束了"接在轮次方法上。
 
@@ -4102,6 +4241,372 @@ def _closes_round_start_marker(method):
             self._clear_round_started_at(round_number)
 
     return wrapper
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 全量关卡的本轮身份（2026-11-09，判定/记账层）
+# ---------------------------------------------------------------------------
+#
+# 「本轮没被问过」的判据 = 计划自己的相位契约（``backend/verification_phases.py``）：
+#
+# * Phase 2 的关卡只有在「它之前的一切都已终态成功」时才被派发 ——
+#   Phase 1 的验证点，以及 ``phase_order`` 更小的关卡；
+# * 所以前置不满足 ⇒ 这个关卡本轮**根本没被问过** ⇒ 它的身份是
+#   ``DEFERRED``（本轮延后，下轮重跑），不是 FAILED、不是 SKIPPED。
+#
+# 为什么不能只问「执行器的裁决表里有没有它」：那张表是**跨轮**的（每个
+# 验证点只留最新一条）。上一轮残留的裁决会让一个本轮根本没被派发的关卡
+# 看起来「被问过」—— 于是它以 FAILED 的身份留在账本里，判定层照抄，报告
+# 层再判一次 FAILED。「没跑过的门禁」于是被当成「跑挂了的门禁」，凭空
+# 买下一条去修它的任务（2026-11-09：本计划第 16 轮的 VP-016）。
+#
+# 两个还原层（投影层与报告层）共用这一份判据 —— 两处各写一份，早晚会漂成
+# 「一处判延后、一处判失败」，同一个验证点又有了两个身份。
+
+
+def _phase2_gates_never_asked(
+    verification_points: List[Mapping[str, Any]],
+    statuses: Mapping[str, Optional[str]],
+    *,
+    not_dispatched: Iterable[str] = (),
+    missing_blocks: bool = True,
+    asked_this_round: Iterable[str] = (),
+) -> Dict[str, str]:
+    """本轮**没被问过**的 Phase 2 全量关卡 → ``{vp_id: 理由}``。
+
+    Args:
+        verification_points: 计划自己的验证点列表（LLM schema）。
+        statuses: 本轮的裁决状态（``vp_id`` → status）。
+        not_dispatched: 执行器真不会派发的验证点 id（计划作废 /
+            主题外移除）—— 它们永远产生不了结论，不能拿来挡门禁。
+        missing_blocks: 「前置**没有**结论」算不算挡路。投影层知道执行器
+            真会派发哪些验证点，缺一条就是「没跑成」⇒ 挡路（``True``）；
+            报告层只有账本，「查无此条」分不清「没跑」与「根本不会被派
+            发」，所以只认**已知**的失败（``False``）—— 宁可少判一次延后，
+            也不能把真失败洗成延后。
+        asked_this_round: **本轮真被问过**的关卡 id（它自己有一条本轮的
+            真实裁决）。判据的第一位是「本轮有没有裁决」：有 ⇒ 它被问过
+            ⇒ 它真失败了就记 FAILED，绝不因为账本里别处不完整而把它说成
+            「本轮没被问过」。
+            **唯一的例外**：更早的关卡本轮已知是红的（相位契约：关卡按
+            ``phase_order`` 串行，前置红 ⇒ 后面的根本没被派发）—— 这时
+            它自己那条裁决只可能是上一轮的残留，它的身份仍是 DEFERRED。
+
+    Returns:
+        ``{vp_id: 理由}`` —— 只含 Phase 2 关卡。
+    """
+    skip = {str(vid) for vid in not_dispatched}
+    asked = {str(vid) for vid in asked_this_round}
+    core: List[Mapping[str, Any]] = []
+    gates: List[Mapping[str, Any]] = []
+    for vp in verification_points or []:
+        if not isinstance(vp, dict):
+            continue
+        if _is_final_gate(vp):
+            gates.append(vp)
+        else:
+            core.append(vp)
+
+    # 关卡按 ``phase_order`` 串行（先 Nightly 后 E2E）；缺 ``phase_order``
+    # 时按计划里的位置兜底 —— 与 ``verification_phases.split_by_phase``
+    # 同一口径。
+    gates = [
+        vp for _, vp in sorted(
+            enumerate(gates),
+            key=lambda pair: (_infer_phase_order(pair[1], pair[0]), pair[0]),
+        )
+    ]
+
+    deferred: Dict[str, str] = {}
+    effective: Dict[str, Optional[str]] = {}
+    earlier_gates: List[str] = []
+
+    for gate in gates:
+        gate_id = str(gate.get("id") or "")
+        if not gate_id or gate_id in skip:
+            continue
+        own = statuses.get(gate_id)
+        # 2026-11-09（VP-029）：**更早的关卡**本轮已知红了 ⇒ 这个关卡本轮
+        # 根本没被派发（相位契约：关卡按 ``phase_order`` 串行，前置红 ⇒
+        # 后面的不会被派发）—— 它自己那条裁决只可能是**上一轮**的残留。
+        #
+        # 所以这条检查必须排在「它被问过」之前：真失败绝不进延后，但**被
+        # 前置挡住的**关卡的「失败」不是本轮的（2026-11-09：本计划第 15
+        # 轮，Nightly 关卡真跑了并红了，E2E 关卡没轮到 —— E2E 在账本里那条
+        # FAILED 是上一轮的残留，它本轮的身份是 DEFERRED，不是 FAILED）。
+        blocked_by_earlier = any(
+            effective.get(earlier_id) is not None
+            and effective.get(earlier_id) not in _TERMINAL_SUCCESS_STATUSES
+            for earlier_id in earlier_gates
+        )
+        if gate_id in asked and not blocked_by_earlier:
+            # 它本轮有一条**真实裁决** ⇒ 它被问过 ⇒ 它的身份就是那条裁决
+            # （真失败就记 FAILED）。「本轮没被问过」对它不成立。
+            effective[gate_id] = own
+            earlier_gates.append(gate_id)
+            continue
+        reason = ""
+        for vp in core:
+            vp_id = str(vp.get("id") or "")
+            if not vp_id or vp_id in skip:
+                continue
+            status = statuses.get(vp_id)
+            if status is None:
+                if not missing_blocks:
+                    continue
+                reason = f"Phase 1 的 {vp_id} 尚未产生结论"
+                break
+            if status not in _TERMINAL_SUCCESS_STATUSES:
+                reason = f"Phase 1 的 {vp_id} 结论为 {status}"
+                break
+        if not reason:
+            for earlier_id in earlier_gates:
+                status = effective.get(earlier_id)
+                if status is None:
+                    if not missing_blocks:
+                        continue
+                    reason = f"更早的全量关卡 {earlier_id} 尚未执行"
+                    break
+                if status not in _TERMINAL_SUCCESS_STATUSES:
+                    reason = f"更早的全量关卡 {earlier_id} 结论为 {status}"
+                    break
+        if not reason and own is None:
+            reason = "本轮没有裁决：它根本没被派发"
+        if not reason and own == "DEFERRED":
+            reason = "本轮被前置关卡挡住，没被派发"
+        if reason:
+            deferred[gate_id] = reason
+            # 延后的关卡对更早的关卡来说也是「没通过」—— 后面那道关卡
+            # 同样不会被派发。
+            effective[gate_id] = "DEFERRED"
+        else:
+            effective[gate_id] = own
+        earlier_gates.append(gate_id)
+
+    return deferred
+
+
+def _not_dispatched_vp_ids(
+    executor: Any, plan_data: Mapping[str, Any],
+) -> Set[str]:
+    """执行器真不会派发的验证点 id（计划作废 / 主题外移除）。
+
+    判据从执行器借（``_vp_is_not_dispatched``）—— 门禁只能向执行器真会跑
+    的验证点要结论，这两处必须共用同一份判据（执行器侧的门禁与投影侧
+    的记账各写一份，早晚漂成「一处跳过、一处照问」，把门禁锁死）。
+    """
+    checker = getattr(executor, "_vp_is_not_dispatched", None)
+    if not callable(checker):
+        return set()
+    ids: Set[str] = set()
+    for vp in plan_data.get("verification_points", []) or []:
+        if not isinstance(vp, dict):
+            continue
+        try:
+            if checker(vp):
+                vp_id = str(vp.get("id") or "")
+                if vp_id:
+                    ids.add(vp_id)
+        except Exception:  # noqa: BLE001 — 判据读不出来就当「会派发」
+            continue
+    return ids
+
+
+def _deferred_gate_ids(
+    execution_results: Mapping[str, Any],
+    ledger: Mapping[str, Any],
+) -> Set[str]:
+    """本轮没被问过的 Phase 2 关卡 id 全集（报告层用）。
+
+    四条证据，任何一条成立就算「没被问过」：
+
+    1. 账本里它已经标成 ``DEFERRED``；
+    2. 账本里**查无此关卡**（计划里有、本轮没有裁决）；
+    3. 信封里记着 ``deferred_vp_ids``（投影层算出来的权威答案）；
+    4. 它的前置（Phase 1 + 更早的关卡）本轮**已知**是失败的 —— 按相位
+       契约，一个前置红了的关卡本轮不会被派发，它账本里那条结论只可能
+       是上一轮残留的。
+
+    第 4 条认的是「已知失败」而不是「没有结论」：账本里查无此条分不清
+    「没跑」与「根本不会被派发」（主题外移除的验证点属于后者），把「没
+    结论」当挡路条件会把真失败洗成延后 —— 那比少判一次延后贵得多。
+
+    判据还有第 5 条（``asked_this_round``）：关卡自己有一条**真裁决**
+    ⇒ 它本轮被问过 ⇒ 它的身份就是那条裁决（真失败就记 FAILED）。Phase 1
+    的前置红不改变它「被问过」的事实 —— 少了这道保护，第 4 条会把一条真
+    跑过并红了的关卡洗成延后，修复环于是永远不收敛（真失败没人修）。
+    唯一的例外是**更早的关卡**红了：那时的它本轮根本没被派发，账本里那
+    条裁决只可能是上一轮的残留（见 :func:`_phase2_gates_never_asked`）。
+    """
+    points = list(execution_results.get("verification_points") or [])
+    statuses = {str(vid): status for vid, status in (ledger or {}).items()}
+    deferred = {
+        vid for vid, status in statuses.items() if status == "DEFERRED"
+    }
+    gate_ids = {
+        str(vp.get("id")) for vp in points
+        if isinstance(vp, dict) and _is_final_gate(vp)
+    }
+    deferred |= {vid for vid in gate_ids if vid not in statuses}
+    deferred |= {
+        str(vid) for vid in (execution_results.get("deferred_vp_ids") or [])
+    }
+    deferred |= set(_phase2_gates_never_asked(
+        points, statuses, missing_blocks=False,
+        # 账本里有裁决 ⇒ 它被问过 ⇒ 它的身份就是那条裁决。DEFERRED 不算
+        # （那不是裁决，是「本轮没问过」的记账）。
+        asked_this_round={
+            vid for vid, status in statuses.items()
+            if status and str(status) != "DEFERRED"
+        },
+    ))
+    return deferred
+
+
+def _restore_ran_gate_failures(
+    report_data: Dict[str, Any],
+    execution_results: Mapping[str, Any],
+    deferred_ids: Iterable[str],
+) -> bool:
+    """判定层把「真跑了并红了的关卡」写成 DEFERRED 时，按账本还原成 FAILED。
+
+    账本是「它到底跑了没有」的证据：账本里 ``FAILED`` 意味着执行器真跑了
+    它、它真红了。判定层写 DEFERRED 是把「没被问过」套到了一个**被问过**
+    的关卡上 —— 报告必须按账本还原：状态回 FAILED，``actual_result`` 换成
+    账本里的原文（判定层那段「本轮没被问过」的散文描述的是一件没发生的事）。
+
+    「真失败被洗成延后」比「延后被记成真失败」更贵：前者让修复环永远不收
+    敛（真失败没人修），后者只是多买一条任务。
+
+    Returns:
+        是否改动了任何一条。
+    """
+    deferred = {str(vid) for vid in deferred_ids}
+    ledger = {
+        str(er.get("id")): er
+        for er in (execution_results.get("execution_results") or [])
+        if isinstance(er, dict)
+    }
+    restored = False
+    for vr in report_data.get("verification_results", []) or []:
+        if not isinstance(vr, dict):
+            continue
+        vid = str(vr.get("id") or "")
+        if not vid or vid in deferred:
+            continue
+        entry = ledger.get(vid) or {}
+        if str(entry.get("status")) != "FAILED":
+            continue
+        if str(vr.get("status")) != "DEFERRED":
+            continue
+        vr["status"] = "FAILED"
+        actual = str(entry.get("actual_result") or "").strip()
+        if actual:
+            vr["actual_result"] = actual
+        restored = True
+    return restored
+
+
+def _inconclusive_ledger_ids(
+    execution_results: Mapping[str, Any],
+) -> Set[str]:
+    """账本里 status == ``INCONCLUSIVE`` 的验证点 id 全集。
+
+    账本是「门禁到底判了没有」的证据：门禁预算用尽时它写下
+    ``INCONCLUSIVE``（``verification_ci_runner.STATUS_INCONCLUSIVE``），
+    意思是「**没能下结论**」—— 不是「交付物坏了」。
+
+    判定层（Phase 3 的 LLM）的词表里根本没有这个状态（只有 PASSED /
+    FAILED / SKIPPED / PARTIAL），所以它对一条 INCONCLUSIVE 只能猜一个
+    SKIPPED。报告层按账本还原它的身份，与 DEFERRED 的还原同形。
+    """
+    ids: Set[str] = set()
+    for result in (execution_results or {}).get("execution_results") or []:
+        if not isinstance(result, dict):
+            continue
+        if str(result.get("status") or "") != STATUS_INCONCLUSIVE:
+            continue
+        vp_id = str(result.get("id") or "").strip()
+        if vp_id:
+            ids.add(vp_id)
+    return ids
+
+
+def _restore_inconclusive_verdicts(
+    report_data: Dict[str, Any],
+    execution_results: Mapping[str, Any],
+) -> bool:
+    """把账本里的 INCONCLUSIVE 还原到报告条目上（与 DEFERRED 同形）。
+
+    判定层没有 INCONCLUSIVE 这个词，只能对预算用尽的门禁猜一个 SKIPPED。
+    报告必须按账本还原：
+
+      * 状态回 ``INCONCLUSIVE``；
+      * ``actual_result`` 换成账本原文（判定层那段「功能未验证」描述的是
+        一件没发生的事）；
+      * 证据换成账本的证据（门禁跑的是哪一段、超时多久，只有账本知道）；
+      * 报告里**根本没有这一条**时按账本补一条 —— 不许让它消失
+        （VP-016 那轮的教训：少一条，门禁的「没结论」就变成了「没跑过」）。
+
+    这些 id 同时从 ``requirement_deviations`` 里摘掉：一条「偏离」是对
+    交付物的判决，而「门禁预算用尽」说的不是交付物。
+
+    只还原**账本自己写下的**那条结论：真跑了并红了的点仍然是 FAILED，
+    空轮 / 全 PASSED 轮 / DEFERRED 轮的行为一个字都不变。
+
+    Returns:
+        是否改动了任何一条。
+    """
+    inconclusive_ids = _inconclusive_ledger_ids(execution_results)
+    if not inconclusive_ids:
+        return False
+
+    ledger = {
+        str(er.get("id") or "").strip(): er
+        for er in (execution_results or {}).get("execution_results") or []
+        if isinstance(er, dict)
+    }
+
+    report_results = report_data.get("verification_results")
+    if not isinstance(report_results, list):
+        report_results = []
+
+    restored = False
+    for vp_id in sorted(inconclusive_ids):
+        source = ledger.get(vp_id) or {}
+        entry = None
+        for candidate in report_results:
+            if not isinstance(candidate, dict):
+                continue
+            if str(candidate.get("id") or "").strip() == vp_id:
+                entry = candidate
+                break
+        if entry is None:
+            # 报告里没有这一条 —— 按账本补一条。少一条就等于把门禁的
+            # 「没结论」说成「没跑过」，而那正是这一层要挡住的事。
+            entry = {"id": vp_id}
+            report_results.append(entry)
+        entry["status"] = STATUS_INCONCLUSIVE
+        actual = str(source.get("actual_result") or "").strip()
+        if actual:
+            entry["actual_result"] = actual
+        evidence = source.get("evidence")
+        if evidence:
+            entry["evidence"] = evidence
+        restored = True
+
+    if not restored:
+        return False
+
+    report_data["verification_results"] = report_results
+    report_data["requirement_deviations"] = [
+        d for d in (report_data.get("requirement_deviations") or [])
+        if str(d.get("verification_point_id")) not in inconclusive_ids
+    ]
+    # 轮次的结论由**同一份**派生算出来（:func:`_derive_overall_status`），
+    # 不由判定层那句摘要算 —— 条目才是证据。
+    report_data["overall_status"] = _derive_overall_status(report_results)
+    return True
 
 
 def _runner_accepts_round(runner: Any) -> bool:
@@ -4185,6 +4690,7 @@ def _ci_runner_kwargs(
         return kwargs
     kwargs["round_no"] = round_no
     return kwargs
+
 
 
 class Orchestrator:
@@ -11346,13 +11852,20 @@ class Orchestrator:
         reading ``full_ci runner crashed``.  See
         :func:`_ci_runner_kwargs`.
         """
+        # The contract file is named by the tree under test (2026-11-06):
+        # a flat import of ``ci_contract`` resolved through ``sys.path``
+        # and raised ``ModuleNotFoundError`` in a harness that carries
+        # no such module — one import away from taking this whole
+        # verification point down.
         vp_id = str(vp.get("id", "unknown"))
         provenance: Dict[str, Any] = {}
+        runner_module: Any = None
         try:
             from verification_ci_runner_loader import load_ci_runner
 
             loaded = load_ci_runner(self.project_dir)
             run_ci_verification = loaded.run_ci_verification
+            runner_module = loaded.module
             provenance = dict(loaded.provenance)
         except Exception as exc:  # noqa: BLE001 - a fallback, not a failure
             logger.exception(
@@ -11360,6 +11873,7 @@ class Orchestrator:
             )
             from verification_ci_runner import run_ci_verification
 
+            runner_module = sys.modules.get("verification_ci_runner")
             provenance = {
                 "resolution": "harness",
                 "module_path": "",
@@ -11368,21 +11882,41 @@ class Orchestrator:
                 "fallback_reason": f"{type(exc).__name__}: {exc}",
             }
 
+        contract_filename = _contract_filename(
+            self.project_dir, runner_module=runner_module,
+        )
+
         # 2026-11-09: 这一轮跑出来的取证必须能说清自己属于哪一轮 ——
         # 产物目录是跨轮复用的，后一轮会把前一轮的 ``ci_output.json`` 覆盖掉，
         # 于是同一束证据自相矛盾（2026-11-08）。轮次由**这一轮**说出来（agent
         # 知道自己是第几轮），runner 据此按轮次另存一份副本；判定的语义一个字
         # 不改（``ci_output.json`` 仍然是 full_ci 的唯一判据）。
+        run_kwargs: Dict[str, Any] = _ci_runner_kwargs(
+            runner=run_ci_verification,
+            project_dir=self.project_dir,
+            artifact_dir=self.plan_dir / "vp_artifacts",
+            round_no=getattr(self, "_current_round", 0),
+        )
+        # The plan's own CI contract lives next to the plan: it declares
+        # which exit codes mean "the gate could not decide" (2026-11-02).
+        # The contract is optional, so the plan directory is handed over
+        # when there is a contract in it — a plan without one gets the
+        # framework's default, which is exactly what the runner reads out
+        # of a directory that holds no contract.
+        #
+        # The runner that is called may be the tree under test's own copy
+        # (see the loader above), and a copy from before the contract
+        # existed does not take ``plan_dir`` — handing it the keyword
+        # anyway would raise a ``TypeError`` and turn a gradeable round
+        # into a crash.  So the keyword goes to a runner that can use it.
+        if (
+            (self.plan_dir / contract_filename).exists()
+            and _runner_accepts_kwarg(run_ci_verification, "plan_dir")
+        ):
+            run_kwargs["plan_dir"] = self.plan_dir
         try:
-            result = run_ci_verification(
-                vp,
-                **_ci_runner_kwargs(
-                    runner=run_ci_verification,
-                    project_dir=self.project_dir,
-                    artifact_dir=self.plan_dir / "vp_artifacts",
-                    round_no=getattr(self, "_current_round", 0),
-                ),
-            )
+            result = run_ci_verification(vp, **run_kwargs)
+
         except Exception as exc:  # noqa: BLE001 - runner never raises
             logger.exception(
                 "[ci_runner] unexpected failure for %s", vp_id,
@@ -12840,22 +13374,37 @@ class Orchestrator:
                 # LLM 只能对着"没有结果"猜一个 FAILED/SKIPPED —— 猜成 FAILED
                 # 会污染失败统计并把修复任务引到错误靶子（去"修"一个没跑过的
                 # 全量门禁）。这里强制还原为 DEFERRED，并从需求偏离里摘掉。
-                deferred_ids = {
-                    vid for vid, st in execution_verdicts.items()
-                    if st == "DEFERRED"
-                }
+                # 2026-11-06（VP-016 根因）：计划里的 Phase 2 关卡若本轮
+                # **没有裁决**，它是「本轮没问过」，不是「跑挂了」——
+                # 无论判定 LLM 写的是 FAILED 还是 SKIPPED，一律还原成
+                # DEFERRED，并把它的需求偏离摘掉。
+                #
+                # 这一层是记账层的兜底（执行器侧 L1、投影侧 L2）：即使账本里
+                # 查无此关卡，报告层也不会把「没跑过的门禁」报成失败 ——
+                # 那条「失败」会按 ``deliverable_defect`` 买下一条去修一个
+                # 没跑过的门禁的任务，并在 legacy-v2 规则下把判定层的散文
+                # 哈希成指纹（措辞一变指纹就变 → 循环永远说「根因已演进」）。
+                #
+                # 2026-11-09（判定/记账层）：判据从「账本里已经标了 DEFERRED
+                # 的**残余**」改成「**本轮有没有裁决**」—— 全集是计划自己的
+                # Phase 2 列表（``verification_phases.is_final_gate`` over
+                # ``execution_results['verification_points']``），与投影层共用
+                # 同一份判据（见 :func:`_deferred_gate_ids`）。
+                deferred_ids = _deferred_gate_ids(
+                    execution_results, execution_verdicts,
+                )
                 if deferred_ids:
                     for vr in report_data.get("verification_results", []):
-                        if vr.get("id") in deferred_ids:
+                        if str(vr.get("id")) in deferred_ids:
                             vr["status"] = "DEFERRED"
                             if not (vr.get("actual_result") or "").strip():
                                 vr["actual_result"] = (
-                                    "Phase 2 全量关卡本轮延后："
-                                    "Phase 1 未全部通过"
+                                    "本轮没被问过：Phase 2 全量关卡本轮延后"
+                                    "（前置关卡未通过，它没有被派发）"
                                 )
                     report_data["requirement_deviations"] = [
                         d for d in (report_data.get("requirement_deviations") or [])
-                        if d.get("verification_point_id") not in deferred_ids
+                        if str(d.get("verification_point_id")) not in deferred_ids
                     ]
                     # The round's verdict comes from the one derivation
                     # (:func:`_derive_overall_status`, R4).  A deferred
@@ -12867,6 +13416,31 @@ class Orchestrator:
                     report_data["overall_status"] = _derive_overall_status(
                         report_data.get("verification_results", [])
                     )
+
+                # 2026-11-09（负控）：判定层把一个**真跑了并红了的**关卡写成
+                # DEFERRED 时，按账本还原成 FAILED ——「本轮没被问过」只对没被
+                # 问过的关卡成立。真失败被洗成延后，修复环就不收敛。
+                if _restore_ran_gate_failures(
+                    report_data, execution_results, deferred_ids,
+                ):
+                    report_data["overall_status"] = _derive_overall_status(
+                        report_data.get("verification_results", [])
+                    )
+
+                # 2026-11-10（VP-013）：门禁预算用尽时写下的是
+                # ``INCONCLUSIVE``（``verification_ci_runner.
+                # STATUS_INCONCLUSIVE``）——「**没能下结论**」，不是「交付物
+                # 坏了」。判定层的词表里没有这个词（只有 PASSED / FAILED /
+                # SKIPPED / PARTIAL），所以它对一条 INCONCLUSIVE 只能猜一个
+                # SKIPPED：这一轮看上去「没人判过」，操作员的问题没人问，
+                # 计划一路转到 max_rounds。
+                #
+                # 账本是权威（门禁自己写下的结论），报告层按账本还原它的身份
+                # —— 与上面 DEFERRED 的还原同形。还原跑在**环境阻塞排除之前**：
+                # 那一层只管 BLOCKED / invalid_env，两条链路互不干涉。
+                #
+                # 还原函数自己重推 overall_status（同一份派生：条目才是证据）。
+                _restore_inconclusive_verdicts(report_data, execution_results)
 
                 if not any(s == "FAILED" for s in execution_verdicts.values()):
                     for vr in report_data.get("verification_results", []):
@@ -17803,6 +18377,54 @@ class Orchestrator:
                 if VerificationExecutor._verdict_round_of(verdict) == current_round
             ]
 
+        # 2026-11-09（判定/记账层）：判据从「执行器的**跨轮**裁决表」改成
+        # 「**本轮有没有裁决**」。
+        #
+        # 全集 = 计划自己的 Phase 2 列表（``is_final_gate`` over
+        # ``plan_data['verification_points']``，减去已退役的 —— 见上面
+        # ``verification_points`` 的过滤）。一个关卡「本轮被问过」= 它本轮
+        # 有一条**非 DEFERRED** 的裁决，且它的前置（Phase 1 + 更早的关卡）
+        # 本轮都是终态成功 —— 这就是计划自己的相位契约。
+        #
+        # 为什么不能只看裁决表有没有它：那张表是**跨轮**的（每个验证点只留
+        # 最新一条），上一轮残留的裁决会让一个本轮根本没被派发的关卡看起来
+        # 「被问过」→ 它以 FAILED 的身份留在账本里 → 判定层照抄 → 报告层
+        # 再判一次 FAILED。「没跑过的门禁」于是被当成「跑挂了的门禁」。
+        deferred_gate_ids = _phase2_gates_never_asked(
+            verification_points,
+            {
+                str(v.get("vp_id")): str(v.get("status"))
+                for v in executor_verdicts
+            },
+            not_dispatched=_not_dispatched_vp_ids(executor, plan_data),
+            # 轮次已知 ⇒ 账本已经是**本轮**的：一条非 DEFERRED 的本轮裁决
+            # 就是「它被问过」的证据（它真跑过、真红了）。
+            # 轮次未知（账本是跨轮的）⇒ 这条证据只对**真失败**成立（见下）。
+            asked_this_round=(
+                {
+                    str(v.get("vp_id")) for v in executor_verdicts
+                    if str(v.get("status")) != "DEFERRED"
+                }
+                if current_round > 0 else {
+                    # 轮次未知（账本是**跨轮**的）：判据故意**不对称**——
+                    #
+                    # * FAILED 仍然算「被问过」：真失败绝不进延后（把它洗成
+                    #   延后，修复环就永远不收敛 —— 真失败没人修）。
+                    # * PASSED **不算**：跨轮的那条 PASSED 可能是上一轮的，
+                    #   拿它证明「本轮被问过」等于让上一轮的成功替这一轮
+                    #   说话 —— 那正是本层要治的病。
+                    str(v.get("vp_id")) for v in executor_verdicts
+                    if str(v.get("status")) == "FAILED"
+                }
+            ),
+        )
+        # 账本里已经标成 DEFERRED 的关卡保留执行器写的那条理由（更具体：
+        # 它知道是哪一条前置挡住了）；只有「残留的旧裁决」要换成 DEFERRED。
+        already_deferred = {
+            str(v.get("vp_id")) for v in executor_verdicts
+            if str(v.get("status")) == "DEFERRED"
+        }
+
         # 2026-10-25 (repair-r1-31): the plan's own VPs are the
         # fallback for a VP that never dispatched — the address it was
         # *going to* use is still worth recording.
@@ -17814,6 +18436,14 @@ class Orchestrator:
         results: List[Dict[str, Any]] = []
         for v in executor_verdicts:
             vp_id = v.get("vp_id", "unknown")
+            # 2026-11-09：本轮没被问过的关卡，上一轮残留的裁决**不算数**
+            # —— 它的身份是 DEFERRED，不是上一轮那条结论。账本里已经标成
+            # DEFERRED 的保留执行器写的那条（更具体）。
+            if (
+                str(vp_id) in deferred_gate_ids
+                and str(vp_id) not in already_deferred
+            ):
+                continue
             status = v.get("status", "FAILED")
             # Preserve explicit actual_result if the verdict carries one;
             # otherwise fall back to the legacy reasons-join behavior.
@@ -17878,6 +18508,49 @@ class Orchestrator:
                 ]
             results.append(result)
 
+        # 2026-11-06（VP-016 根因）：计划里有、本轮**没有裁决**的 Phase 2
+        # 关卡，必须以 ``DEFERRED`` 的身份留在账本里 —— 不是从账本里消失。
+        #
+        # 修复前它整个消失：执行器侧的延后记账是跨轮的（第二轮起不写本轮
+        # 裁决），轮次作用域过滤又把上一轮那条没有轮次戳的 DEFERRED 一并
+        # 筛掉，于是账本里查无此关卡。判定层（Phase 3 LLM）看到的是
+        # 「计划里有 VP-016、没有执行结果」——一张空白支票——它只能替它编
+        # 一个状态（「未执行即未通过」→ FAILED / type=missing / high），
+        # 报告层现成的 DEFERRED 还原因为输入是空集而**空转**。
+        #
+        # 「没跑过」不是「跑挂了」：被门禁延后的关卡本轮**根本没被问过**，
+        # 它的正确身份是 DEFERRED（本轮延后，下轮重跑）。这一层同时让
+        # ``deferred_ids`` 不再是空集，报告层现成的还原逻辑（见
+        # :meth:`generate_verification_report`）就能生效。
+        #
+        # 2026-11-09：判据换成「本轮有没有裁决」（见上面
+        # ``deferred_gate_ids`` 的推导），这一层只负责把**判定**落到账本里。
+        for vp in verification_points:
+            if not isinstance(vp, dict) or not _is_final_gate(vp):
+                continue
+            vp_id = str(vp.get("id") or "")
+            if not vp_id or vp_id not in deferred_gate_ids:
+                continue
+            if vp_id in already_deferred:
+                # 账本里已经是 DEFERRED（执行器写的那条更具体）—— 不重复。
+                continue
+            results.append({
+                "id": vp_id,
+                "status": "DEFERRED",
+                "actual_result": (
+                    "本轮没被问过：Phase 2 全量关卡本轮延后（"
+                    f"{deferred_gate_ids[vp_id]}），它没有被派发"
+                ),
+                "evidence": json.dumps(
+                    {
+                        "gate": "verification_phase_2",
+                        "deferred": True,
+                        "reason": deferred_gate_ids[vp_id],
+                    },
+                    ensure_ascii=False,
+                ),
+            })
+
         # 2026-10-25 (repair-r1-26): the environment verdict is a round
         # verdict.  If the round could not reach the service, none of
         # its results describes the product — they are all recorded
@@ -17907,6 +18580,9 @@ class Orchestrator:
             "verification_points": verification_points,
             "execution_results": results,
             "executed_at": datetime.now().isoformat(),
+            # 2026-11-09：本轮没被问过的 Phase 2 关卡 id —— 报告层的
+            # 还原判据与投影层共用同一份答案，不必从账本的残余里反推。
+            "deferred_vp_ids": sorted(deferred_gate_ids),
         }
 
         # Persist to SQLite (``plan_verification.execution_results``)

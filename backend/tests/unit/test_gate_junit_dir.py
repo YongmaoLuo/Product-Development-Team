@@ -18,6 +18,11 @@ What is pinned here
 2. **Without** it, no phase carries ``--junitxml`` at all — and the run
    writes no file, so a run that is not read as evidence stays exactly
    as it was.
+3. **Only this round's reports are read.**  The directory is named
+   after the verification point, so it is the *same* directory round
+   after round — and a report an earlier round wrote into it stays
+   there.  Reading it back would make this round look like it had
+   failed a case it never ran.
 
 The gate script resolves its virtualenv and its suite relative to its
 own location, so the script under test is a *copy* of the repository's
@@ -298,11 +303,153 @@ def _vp(entry: str) -> dict:
     """A ``full_ci`` verification point that runs *entry*."""
     return {
         "id": "VP-014",
+
         "verification_method": "full_ci",
         "verification_phase": 2,
         "phase_order": 1,
         "ci_entry": entry,
     }
+
+
+# The directory is reused across rounds — so only this round's reports
+# may be read back as this round's evidence.
+# ---------------------------------------------------------------------------
+#
+# The runner names the junit directory after the verification point, so
+# it is the *same* directory round after round.  What an earlier round
+# wrote into it stays there, and the reader took every ``phase-*.xml``
+# it found for the round being graded — so a failure that happened two
+# rounds ago was read back as this round's, and a round whose gate
+# never wrote a report inherited a verdict from a report it did not
+# produce.
+
+#: A report an earlier round left behind.  It names a case that failed
+#: *in that round*, so it is told apart from this round's by the case
+#: it names.
+_STALE_REPORT_XML = """<?xml version="1.0" encoding="utf-8"?>
+<testsuites name="pytest tests">
+  <testsuite name="pytest" errors="0" failures="1" skipped="0" tests="1" time="0.001">
+    <testcase classname="tests.unit.test_stale" name="test_failed_in_an_earlier_round">
+      <failure message="assert the earlier round failed">boom</failure>
+    </testcase>
+  </testsuite>
+</testsuites>
+"""
+
+#: The report this round writes.  A different case, so the two are
+#: never confused.
+_FRESH_REPORT_XML = """<?xml version="1.0" encoding="utf-8"?>
+<testsuites name="pytest tests">
+  <testsuite name="pytest" errors="0" failures="1" skipped="0" tests="1" time="0.001">
+    <testcase classname="tests.unit.test_fresh" name="test_failed_in_this_round">
+      <failure message="assert this round failed">boom</failure>
+    </testcase>
+  </testsuite>
+</testsuites>
+"""
+
+#: The fake gate the runner starts.  It publishes the report that sits
+#: next to it, into the directory the runner named — and publishes
+#: nothing when there is none, which is what a gate that writes no
+#: junit looks like.
+_FAKE_GATE_SOURCE = '''\
+import os
+import shutil
+import sys
+from pathlib import Path
+
+target = os.environ.get("PDT_GATE_JUNIT_DIR")
+source = Path(__file__).parent / "report.xml"
+if target and source.exists():
+    destination = Path(target)
+    destination.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, destination / "phase-1.xml")
+sys.exit(int(sys.argv[1]))
+'''
+
+
+def _runner_gate(tmp_path: Path, *, report: str = "", exit_code: int = 0) -> str:
+    """The ``ci_entry`` of a fake gate the runner starts.
+
+    *report* is the XML the gate publishes into the directory the runner
+    named; an empty string means the gate publishes nothing at all.
+    """
+    script = tmp_path / "fake_gate.py"
+    script.write_text(_FAKE_GATE_SOURCE, encoding="utf-8")
+    if report:
+        (tmp_path / "report.xml").write_text(report, encoding="utf-8")
+    return f'"{sys.executable}" "{script}" {exit_code}'
+
+
+def _vp_reused_dir(entry: str) -> dict:
+    """A ``full_ci`` verification point pointing at *entry*.
+
+    It has an id of its own, so the artifact directory that is
+    reused across rounds is the one this file writes into — and the
+    one this file's own test writes into — not the one the other
+    tests here use.
+    """
+    return {
+        "id": "VP-901",
+        "verification_method": "full_ci",
+        "verification_phase": 2,
+        "phase_order": 1,
+        "ci_entry": entry,
+    }
+
+
+class TestJunitDirectoryIsReusedAcrossRounds:
+    def test_only_this_round_s_reports_are_read_as_its_evidence(
+        self, tmp_path,
+    ):
+        """A report an earlier round left behind is not this round's failure.
+
+        The directory arrives with a report in it — the one the previous
+        round wrote.  The gate this round starts writes none, so the
+        evidence must not mention that case: this round did not run it
+        and it did not fail.  Then the gate writes a report of its own,
+        and *that* case must appear — otherwise the reader would have
+        been silenced altogether rather than narrowed to this round.
+        """
+        artifacts = tmp_path / "artifacts"
+        junit_dir = artifacts / "VP-901"
+        junit_dir.mkdir(parents=True)
+        (junit_dir / "phase-1.xml").write_text(
+            _STALE_REPORT_XML, encoding="utf-8",
+        )
+
+        silent = run_ci_verification(
+            _vp_reused_dir(_runner_gate(tmp_path, report="")),
+            project_dir=tmp_path,
+            artifact_dir=artifacts,
+        )
+
+        assert silent.evidence["junit_failures"] == [], (
+            "a report an earlier round left behind was read as this "
+            f"round's failure:\n{silent.evidence.get('junit_failures')}"
+        )
+        assert silent.evidence["junit_phases"] == [], (
+            "a report an earlier round left behind was read as this "
+            f"round's phase:\n{silent.evidence.get('junit_phases')}"
+        )
+        assert silent.evidence["failed_cases"] == [], (
+            "a report an earlier round left behind was read as this "
+            f"round's failing set:\n{silent.evidence.get('failed_cases')}"
+        )
+
+        fresh = run_ci_verification(
+            _vp_reused_dir(_runner_gate(tmp_path, report=_FRESH_REPORT_XML)),
+            project_dir=tmp_path,
+            artifact_dir=artifacts,
+        )
+
+        assert [
+            failure["node_id"]
+            for failure in fresh.evidence["junit_failures"]
+        ] == ["tests/unit/test_fresh.py::test_failed_in_this_round"], (
+            "the report this round wrote was not read back:\n"
+            f"{fresh.evidence.get('junit_failures')}"
+        )
 
 
 #: A report of an earlier round: it names a case this round never ran.
@@ -469,3 +616,4 @@ def test_junit_availability_follows_the_run_not_the_entry_name(tmp_path):
         "the report this run wrote was not read: "
         f"{written.evidence['junit_phases']!r}"
     )
+
