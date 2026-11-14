@@ -1459,7 +1459,7 @@ class VerificationSubAgent:
         # 可机械执行的，就**不要**起 LLM 会话 —— 判定住在 runner 里，
         # 跨轮可复跑；子会话的自报不可复跑。分派表说「判不了」时，才走
         # 下面的 LLM 子会话。
-        route, mode = resolve(vp_node)
+        route, mode = resolve(vp_node, project_dir)
         if mode == DETERMINISTIC_MODE:
             return await self._run_deterministic_vp(
                 vp_node, log_dir, project_dir,
@@ -4782,32 +4782,112 @@ def _vp_method(vp: Any) -> str:
     return str(vp.get("verification_method") or "").strip()
 
 
-def _runner_module(name: str) -> Any:
-    """导入分派表点名的 runner 模块。"""
-    import importlib
+def _project_runner_path(name: str, project_dir: Optional[Path]) -> Optional[Path]:
+    """被测树自己那份 runner（``<project_dir>/backend/<name>.py``）。
 
-    return importlib.import_module(name)
+    没有这一层，「跑的是谁的代码」就由 ``sys.path`` 决定 —— 而
+    ``backend/__init__.py`` 把**长驻进程自己那份** ``backend/`` 放在
+    ``sys.path[0]``，于是判的是别的树。
+    """
+    if not project_dir:
+        return None
+    try:
+        candidate = Path(project_dir) / "backend" / f"{name}.py"
+    except TypeError:
+        return None
+    return candidate if candidate.is_file() else None
 
 
-def _runner_issues(runner_name: str, vp: Any) -> List[Any]:
+def _runner_module(name: str, project_dir: Optional[Path] = None) -> Any:
+    """导入分派表点名的 runner 模块。
+
+    优先用**被测树自己那份**（按路径加载，绝不从 ``sys.path`` 解析）：
+    分派表点名的 runner 必须是被测的那个，否则这条验证点判的是另一棵树。
+    被测树没有这份模块、或者加载失败时，回落到 harness 那份。
+
+    模块名带路径摘要（``pdt_project_runner_<sha1[:12]>``），不占用
+    ``<name>`` 这个名字 —— 否则会把 harness 的模块换掉，正是这个 loader
+    要防的混淆。加载期间注册进 ``sys.modules``，加载完 ``pop`` 掉。
+    绝不抛异常：加载不了就回落，不能因此掀翻整轮。
+    """
+    path = _project_runner_path(name, project_dir)
+    if path is None:
+        import importlib
+
+        return importlib.import_module(name)
+
+    try:
+        import hashlib
+        import importlib.util
+
+        digest = hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:12]
+        module_name = f"pdt_project_runner_{digest}"
+        spec = importlib.util.spec_from_file_location(module_name, str(path))
+        if spec is None or spec.loader is None:
+            raise ImportError(f"no loader for {path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.modules.pop(module_name, None)
+        return module
+    except Exception:  # noqa: BLE001 — 回落，不是失败
+        import importlib
+
+        return importlib.import_module(name)
+
+
+def _runner_issues(
+    runner_name: str, vp: Any, project_dir: Optional[Path] = None,
+) -> List[Any]:
     """runner 的校验器给出的全部问题（空列表 = 判得了）。
 
     校验器问的是「这条验证点你能不能执行」，答案只有它能给：分派器不替
     runner 做这个判断。抄一份规则进分派器，抄出来的那份一定会和真规则
     漂移，而漂移的方向是「看起来能跑」。
 
+    2026-11-04：``project_dir`` 必须传进去。校验器里「入口引用的路径
+    存不存在」这一段的前提就是 ``project_dir`` —— 不传，整段检查被跳过，
+    一条写坏了的 ``ci_entry`` 在这条路径上被判成「可执行」。
+
     CI runner 的「入口必须是单条适配脚本调用」这条**形态契约**在执行期
     不启用（``require_single_entry=False``）—— 历史计划里的内联复合入口
     不重写，它仍然要能跑、仍然归确定性 runner 判。形态契约是**规划期**的
     规则（生成时就退回重写），不是执行期的准入条件。
     """
-    module = _runner_module(runner_name)
+    module = _runner_module(runner_name, project_dir)
     validator = getattr(module, "validate_vp", None)
     if validator is None:
         return [f"{runner_name} 没有提供校验器，无法判定这条验证点"]
-    if runner_name == "verification_ci_runner":
-        return list(validator(vp, require_single_entry=False) or [])
-    return list(validator(vp) or [])
+    kwargs: Dict[str, Any] = {}
+    if project_dir is not None and _accepts_kwarg(validator, "project_dir"):
+        kwargs["project_dir"] = Path(project_dir)
+    if runner_name == "verification_ci_runner" and _accepts_kwarg(
+        validator, "require_single_entry"
+    ):
+        kwargs["require_single_entry"] = False
+    return list(validator(vp, **kwargs) or [])
+
+
+def _accepts_kwarg(validator: Any, name: str) -> bool:
+    """这个校验器接不接受 ``name`` 这个关键字参数？
+
+    看签名，不靠试错：校验器自己抛 ``TypeError`` 时，签名检查不会把
+    那个错误当成「签名不匹配」再跑一遍。
+    """
+    import inspect
+
+    try:
+        signature = inspect.signature(validator)
+    except (TypeError, ValueError):
+        return False
+    for parameter in signature.parameters.values():
+        if parameter.name == name:
+            return True
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+    return False
 
 
 def _issue_evidence(issues: List[Any]) -> List[Any]:
@@ -4840,7 +4920,24 @@ def _evidence_text(evidence: Dict[str, Any], *keys: str) -> str:
     return ""
 
 
-def resolve(vp: Any) -> Tuple[str, str]:
+def _blocking_issues(issues: List[Any]) -> List[Any]:
+    """哪些问题让 runner **判不了**这条验证点（要落回 LLM 路径）。
+
+    「入口引用的路径不存在」**不算**：门禁判得了 —— 它会跑起来，会跑出一个
+    机器写的失败裁决（退出码、失败用例、artifact、失败身份）。落回 LLM 路径
+    反而把它变成一句散文：下一轮就认不出这是同一个缺陷，指纹只能去哈希那句
+    散文，于是同一个缺陷每轮都长得不一样（2026-11-04，VP-012）。
+
+    这里读的是 runner **自己**给问题的分类（``issue.kind``），不是分派器自己
+    抄一份规则 —— 抄出来的规则一定会和真规则漂移。
+    """
+    return [
+        issue for issue in issues
+        if getattr(issue, "kind", "") != "path_missing"
+    ]
+
+
+def resolve(vp: Any, project_dir: Optional[Path] = None) -> Tuple[str, str]:
     """决定一条验证点走哪条路：确定性 runner，还是 LLM 路径。
 
     Returns:
@@ -4853,12 +4950,15 @@ def resolve(vp: Any) -> Tuple[str, str]:
 
     「判得了」这件事**只**由那个将要执行它的 runner 的校验器回答。
     分派器自己不读验证点的字段：判定口径住在 runner 里，两边不会打架。
+
+    2026-11-04：``project_dir`` 传进去，判与被判的都是**被测树那份**
+    runner —— 校验用的代码必须和执行的代码来自同一棵树。
     """
     method = _vp_method(vp)
     runner_name = DETERMINISTIC_RUNNERS.get(method)
     if runner_name is None:
         return (LLM_ROUTE, ESCALATE_PATH_MODE)
-    if _runner_issues(runner_name, vp):
+    if _blocking_issues(_runner_issues(runner_name, vp, project_dir)):
         return (LLM_ROUTE, ESCALATE_PATH_MODE)
     return (runner_name, DETERMINISTIC_MODE)
 
@@ -4894,8 +4994,8 @@ def run_deterministic(
             evidence={"method": method},
         )
 
-    issues = _runner_issues(runner_name, vp)
-    if issues:
+    issues = _runner_issues(runner_name, vp, project_dir)
+    if _blocking_issues(issues):
         return DeterministicOutcome(
             status=OUTCOME_ESCALATE,
             route=LLM_ROUTE,
@@ -4910,7 +5010,7 @@ def run_deterministic(
             },
         )
 
-    module = _runner_module(runner_name)
+    module = _runner_module(runner_name, project_dir)
     executor_name = _RUNNER_EXECUTORS.get(runner_name)
     executor = getattr(module, executor_name, None) if executor_name else None
     if executor is None:

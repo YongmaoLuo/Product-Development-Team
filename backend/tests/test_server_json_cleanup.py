@@ -2399,6 +2399,19 @@ def exec_instance_lifecycle(tmp_path, monkeypatch):
         # required — without it the spawn dies at import time
         # (``from backend.framework...``) and the e2e layer SKIPs.
         "PYTHONPATH": str(_BACKEND_ROOT.parent),
+        # ``PDT_DISABLE_TEMP_SWEEP`` is the credential-sweep switch
+        # (``utils.secret_sweep`` reads it).  The startup sweep is a
+        # **machine-wide** rewrite -- it walks the real temp roots and
+        # overwrites credentials in the settings payloads it recognises.
+        # The pytest process carries the switch itself
+        # (``_pytest_hermetic_env`` does a ``setdefault``), but that is
+        # *process-local*: a whitelist environment does not inherit the
+        # parent's, so the spawned server ran the machine-wide sweep
+        # anyway and its lifespan took 18-21 s -- long enough that the
+        # 30 s health poll below was a coin flip.  A value the parent
+        # already holds is passed through unchanged -- whoever set it
+        # decides, and ``"0"`` (do sweep) is as legitimate as ``"1"``.
+        "PDT_DISABLE_TEMP_SWEEP": os.environ.get("PDT_DISABLE_TEMP_SWEEP", "1"),
     }
     def _server_log_tail() -> str:
         try:

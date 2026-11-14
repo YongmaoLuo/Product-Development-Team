@@ -213,6 +213,31 @@ except ImportError:  # pragma: no cover - Windows
 
 logger = logging.getLogger(__name__)
 
+#: The real ``subprocess.Popen``, captured at import time.
+#:
+#: A test replaces ``subprocess.Popen`` with a recorder to watch the
+#: product's own spawns — that is how the shape of a service start is
+#: asserted.  The reaper's **probes** must not be seen by such a
+#: recorder: a probe is the product asking the operating system a
+#: question, and a recorder that answers it would answer with the
+#: recorder's own answer rather than the operating system's.  Worse, the
+#: recorder overwrites the record it was installed to keep: the probe
+#: runs *after* the spawn, so the last thing recorded is the probe.
+#:
+#: The service manager already keeps the same rule for the same reason
+#: (see ``service_manager._REAL_POPEN``).
+_REAL_POPEN = subprocess.Popen
+
+#: The real ``subprocess.run``, captured at import time.
+#:
+#: A fake installed for ``subprocess.run`` is a legitimate seam: it
+#: answers the probe with a fixture instead of asking the operating
+#: system.  The reaper honours such a fake — and uses it *only* when
+#: one is installed, so that the probe is otherwise spawned through
+#: :data:`_REAL_POPEN` rather than through whatever ``subprocess.Popen``
+#: currently names.
+_REAL_RUN = subprocess.run
+
 __all__ = [
     "SPAWN_OWNER_PID",
     "SPAWN_OWNER_START",
@@ -520,6 +545,80 @@ def _ps_binary() -> str:
     return _PS_BINARY
 
 
+def _run_probe(
+    args: List[str],
+    timeout: float = 10.0,
+    env: Optional[Dict[str, str]] = None,
+) -> Optional[Tuple[int, str, str]]:
+    """Run a probe command and return ``(returncode, stdout, stderr)``.
+
+    ``None`` means the probe could not be run at all — it is missing, it
+    could not be spawned, it timed out.  A probe that ran and failed is
+    reported through its return code instead, because "the tool said no"
+    and "the tool never ran" mean different things to the caller.
+
+    The probe is spawned through :data:`_REAL_POPEN` rather than through
+    the module attribute ``subprocess.Popen``.  ``subprocess.run`` looks
+    that attribute up when it spawns, so a test that replaced it would
+    capture the reaper's probes as well as the product's spawns — and
+    the probe, running *after* the spawn, would overwrite the record
+    the test came to read.
+
+    A fake installed for ``subprocess.run`` is honoured instead: it is
+    the probe's *answer*, and an answer is a legitimate thing to fake
+    (``tests/unit/test_orphan_reaper_procs.py`` fakes it to pin the
+    parsers against a fixture).  The two seams cannot be confused: the
+    fake replaces the whole call, the recorder replaces only the spawn.
+    """
+    runner = subprocess.run
+    if runner is not _REAL_RUN:
+        try:
+            completed = runner(
+                list(args),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return (
+            int(getattr(completed, "returncode", 0) or 0),
+            _as_text(getattr(completed, "stdout", "")),
+            _as_text(getattr(completed, "stderr", "")),
+        )
+    try:
+        completed = _REAL_POPEN(
+            list(args),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            env=env,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    try:
+        out, err = completed.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            completed.kill()
+        except OSError:  # pragma: no cover - the child is already gone
+            pass
+        try:
+            completed.communicate(timeout=timeout)
+        except (OSError, subprocess.SubprocessError):  # pragma: no cover
+            pass
+        return None
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover
+        return None
+    return (
+        int(getattr(completed, "returncode", 0) or 0),
+        _as_text(out),
+        _as_text(err),
+    )
+
+
 def _ps_start_epoch(pid: int) -> Optional[str]:
     """Return the start time of ``pid`` via ``ps`` (macOS / BSD), or ``None``.
 
@@ -532,19 +631,17 @@ def _ps_start_epoch(pid: int) -> Optional[str]:
     env = dict(os.environ)
     env["LC_ALL"] = "C"
     env["LANG"] = "C"
-    try:
-        completed = subprocess.run(
-            [_ps_binary(), "-o", "lstart=", "-p", str(pid)],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            env=env,
-        )
-    except (OSError, subprocess.SubprocessError):
+    result = _run_probe(
+        [_ps_binary(), "-o", "lstart=", "-p", str(pid)],
+        timeout=5,
+        env=env,
+    )
+    if result is None:
         return None
-    if completed.returncode != 0:
+    returncode, stdout, _stderr = result
+    if returncode != 0:
         return None
-    return _parse_lstart(completed.stdout.strip())
+    return _parse_lstart(stdout.strip())
 
 
 #: How many pids one ``ps`` invocation is asked about.
@@ -1787,22 +1884,15 @@ def _run_tool(
     could not be spawned, it timed out.  A tool that ran and failed is
     reported through its return code instead, because "the tool said no"
     and "the tool never ran" mean different things to the caller.
+
+    The tool is spawned by :func:`_run_probe`, which keeps it out of
+    the sight of a test that replaced ``subprocess.Popen`` to watch the
+    product's own spawns.
     """
-    try:
-        completed = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=_tool_env(),
-        )
-    except (OSError, subprocess.SubprocessError):
+    result = _run_probe(list(args), timeout=timeout, env=_tool_env())
+    if result is None:
         return None
-    return (
-        getattr(completed, "returncode", 0),
-        _as_text(completed.stdout),
-        _as_text(completed.stderr),
-    )
+    return result
 
 
 def _run_ps(args: List[str], timeout: float = 10.0) -> Optional[str]:

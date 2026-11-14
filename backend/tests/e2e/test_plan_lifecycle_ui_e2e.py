@@ -1002,9 +1002,19 @@ with sync_playwright() as driver:
         page.screenshot(path=str(Path(artifacts_dir) / "stopped.png"), full_page=True)
 
     elif mode == "requeued":
-        wait_for_card(page, card)
+        # ``wait_for_card`` reloads while the served list is stale and
+        # answers whether the card ever showed up.  Its answer used to be
+        # thrown away, and the next line then asked Playwright for the
+        # text of an element that was not there -- a 30 s timeout that
+        # said nothing about the plan.  The answer is the report now,
+        # and a card that never showed up reads as an empty label rather
+        # than as a timeout.
+        card_found = wait_for_card(page, card)
+        report["requeued_card_found"] = card_found
         page.wait_for_timeout(300)
-        report["requeued_label"] = page.inner_text(card + " .plan-status")
+        report["requeued_label"] = (
+            page.inner_text(card + " .plan-status") if card_found else ""
+        )
         report["cards"] = card_labels(page)
         report["requeued_card_count"] = page.locator(card).count()
 
@@ -1255,6 +1265,15 @@ def lifecycle_ui_flow(tmp_path_factory) -> Dict[str, Any]:
             observations["state_db_path"], plan_id
         )
         observations["listed_after_requeue"] = _wait_for_plan_in_list(base_url, plan_id)
+        # The card can only be on the page if the plan is in the listing
+        # the page reads.  Asserting that here makes the failure say
+        # *the plan did not come back*; asserted only at the end, it
+        # said nothing, because the browser step below timed out first
+        # -- ninety seconds of Playwright waiting for a card that was
+        # never going to be there.
+        assert observations["listed_after_requeue"] is True, (
+            "the requeued plan did not come back to the listing"
+        )
 
         # --- step 8: the card is back ------------------------------------
         observations["browser_requeued"] = _run_driver(

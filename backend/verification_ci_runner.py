@@ -493,6 +493,28 @@ SIGNAL_GATE_INCONCLUSIVE = "gate_inconclusive"
 SIGNAL_TIMEOUT = "timeout"
 SIGNAL_GATE_NOT_EXECUTABLE = "gate_not_executable"
 
+#: The evidence key that carries the **machine-written** identity of a
+#: failure (2026-11-04, VP-012 round 4).
+#:
+#: The round's fingerprint falls back to the ``legacy-v2`` rule — which
+#: hashes the judgment LLM's *prose* — whenever it is given no
+#: machine-written ids.  Prose differs from round to round, so the same
+#: defect fingerprinted differently every round and the loop read it as
+#: "the root cause has evolved".  This key is the pipe that feeds the
+#: ``identity-v1`` rule instead: a set of ids that describe **what
+#: broke**, not how the run looked.
+#:
+#: 2026-11-14: the two places that **write** this key spell it out
+#: literally (``"failure_identity"``) instead of using this constant,
+#: because the CI artifact contract (:mod:`ci_artifact`) is **derived
+#: from this file's own source** and a key built from a constant is
+#: invisible to that derivation — an invisible key is a key the contract
+#: does not allow, and the runner would then reject its own artifact.
+#: The contract's own pinning test
+#: (``tests/unit/test_ci_artifact_schema.py``) fails the moment the
+#: runner and the contract drift apart.
+FAILURE_IDENTITY_FIELD = "failure_identity"
+
 #: The lines that carry a lane's conclusion. A gate run that is killed
 #: mid-way still has to answer "which lanes finished, and what did they
 #: say" — and the answer is in these lines, not in the tail of the
@@ -634,6 +656,12 @@ _COMMAND_SEPARATORS = ";&|"
 #: part of the path made the pre-flight look up a path that can never
 #: exist — and it hid the ``cd`` of ``(cd backend && …)``, so the paths
 #: after it were resolved against the wrong directory (2026-11-05).
+#:
+#: 2026-11-04 (this branch): the brackets were **reserved words** of
+#: their own — the reader tokenised them away instead of stripping them
+#: off the edge of a word.  2026-11-06 (main) keeps the edge rule (see
+#: :func:`_normalize_token`): it drops the same bracket without breaking
+#: the ``)`` that closes a command substitution in the middle of a word.
 _GROUPING_PREFIX = "("
 _GROUPING_SUFFIX = ")"
 
@@ -677,10 +705,26 @@ _COMPOUND_ENTRY_OPERATORS = ("&&", "||", ";", "(", ")", "|", ">", "<")
 
 @dataclass
 class SchemaIssue:
-    """One reason a ``full_ci`` VP cannot be executed as declared."""
+    """One reason a ``full_ci`` VP cannot be executed as declared.
+
+    ``kind`` says **which** reason it is, in machine-readable form.
+    The dispatcher asks the runner "can you take this point?" and
+    believes the answer — so it has to be able to tell the two kinds
+    apart without re-deriving the rule:
+
+    * ``"schema"`` — the point cannot be executed at all (no
+      ``ci_entry``, a narrowed entry, …).  Nothing can judge it, so it
+      belongs on the LLM path.
+    * ``"path_missing"`` — the entry names a path that is not in the
+      tree.  The gate **can** judge it: it runs, and it reports a
+      machine-written failure (exit code, failing cases, artifact).
+      That verdict is worth more than a model's opinion of it, so this
+      kind does not send the point to the LLM path.
+    """
 
     vp_id: str
     detail: str
+    kind: str = "schema"
     #: The machine-written **rule** that fired — the identity of the
     #: defect.  ``detail`` is the human-readable explanation; this is
     #: the part that stays the same when the explanation is reworded.
@@ -693,6 +737,7 @@ class SchemaIssue:
         return {
             "vp_id": self.vp_id,
             "detail": self.detail,
+            "kind": self.kind,
             "code": self.code,
             "subject": self.subject,
         }
@@ -863,9 +908,10 @@ def _referenced_paths(entry: str, project_dir: Optional[Path] = None) -> List[st
       a relative path named after it is relative to that directory, not
       to the repository root (``state_machine/tests`` after
       ``cd backend`` is ``backend/state_machine/tests``);
-    * the shell's grouping brackets are punctuation, not part of the
-      token they are glued to (``(test`` → ``test``,
-      ``backend/.venv)`` → ``backend/.venv``).
+    * the grouping parentheses of a compound command are reserved words
+      (punctuation), not part of the word they are glued to: ``(test`` is
+      the ``test`` builtin and ``backend/.venv)`` is the path
+      ``backend/.venv``.
 
     The flag / absolute-path / URL skip rules are unchanged, and the
     existence check in :func:`validate_vp` is not relaxed: a path that
@@ -892,7 +938,24 @@ def _created_paths(entry: str) -> Set[str]:
 
 
 def _split_command_text(text: str) -> List[str]:
-    """Split one command line into tokens, tolerating unbalanced quotes."""
+    """Split one command line into tokens, tolerating unbalanced quotes.
+
+    The split is plain ``shlex``: quoted text keeps its metacharacters
+    (``'a;b'`` is one word, the way the shell reads it) and a command
+    substitution stays readable — ``$(dirname "$0")/ci_gha.sh`` comes
+    out as ``['$(dirname', '$0)/ci_gha.sh']``, so the path it names is
+    ``$0)/ci_gha.sh`` and not a name the pre-flight could never look up.
+
+    2026-11-04 (this branch): the grouping parentheses were reserved
+    words of their own, so ``(test -e x || …) && cmd`` came out as
+    separate tokens.  2026-11-06 (main) fixed the same defect — the
+    closing bracket glued to a path — from the other end: the bracket is
+    stripped from the **edge** of a token (:func:`_normalize_token`)
+    instead of being tokenised away.  The edge rule keeps both readings:
+    ``backend/.venv)`` still reads as ``backend/.venv`` (the defect this
+    branch was fixing), and the ``)`` that closes a command substitution
+    in the middle of a word stays where the shell put it.
+    """
     try:
         return shlex.split(text)
     except ValueError:
@@ -1076,7 +1139,7 @@ def _collect_referenced_paths(
         token = _normalize_token(raw)
         if not token:
             # A separator (``&&`` / ``||`` / ``;`` …): the next token
-            # starts a new command. A lone ``)`` lands here too — it is
+            # starts a new command.  A lone ``)`` lands here too — it is
             # a grouping symbol, not a path.
             at_command_start = True
             index += 1
@@ -1101,7 +1164,9 @@ def _collect_referenced_paths(
 
         if at_command_start and token == "cd" and index + 1 < len(tokens):
             target_raw = tokens[index + 1]
-            base = _resolve_cd_target(base, _normalize_token(target_raw))
+            base = _resolve_cd_target(
+                base, _normalize_token(target_raw),
+            )
             index += 2
             # ``cd backend;`` — the command ends with its target, so the
             # next token starts a new command.
@@ -1259,6 +1324,7 @@ def _validate_command_e2e_vp(
             issues.append(SchemaIssue(
                 vp_id,
                 f"{ENTRY_COMMAND_FIELD} 引用的路径不存在：{rel}",
+                kind="path_missing",
                 code="e2e_command_path_missing",
                 subject=rel,
             ))
@@ -1350,6 +1416,7 @@ def validate_vp(
             issues.append(SchemaIssue(
                 vp_id,
                 f"{CI_ENTRY_FIELD} 引用的路径不存在：{rel}",
+                kind="path_missing",
                 code="ci_entry_path_missing",
                 subject=rel,
             ))
@@ -2114,6 +2181,55 @@ def _read_junit_evidence(
     return evidence
 
 
+def _failure_identity(evidence: Dict[str, Any], status: str) -> List[str]:
+    """The machine-written identity of this run's failure (2026-11-04).
+
+    What it is: the set of ids that say **what broke**, in words the
+    machine wrote.  What it is not: a description of how the run
+    looked — that is the judgment LLM's prose, and prose differs from
+    round to round even when nothing about the defect did.
+
+    Three sources, in order:
+
+    1. **the failing junit node ids** — the gate's own record of which
+       cases failed (the same ids :func:`_failed_case_ids_from_evidence`
+       lifts into the verdict);
+    2. **the machine's signal** — ``gate_failed`` / ``timeout`` /
+       ``gate_not_executable`` — for a run that failed without naming a
+       case;
+    3. **the exit code** — for a run that failed without a signal.
+
+    A run that passed has no failure, so it has no identity: the empty
+    list is the honest answer, and the fingerprint of a passed point is
+    never computed.
+    """
+    if status == STATUS_PASSED:
+        return []
+
+    failures = evidence.get("junit_failures")
+    ids: List[str] = []
+    if isinstance(failures, list):
+        for failure in failures:
+            if not isinstance(failure, dict):
+                continue
+            node_id = str(failure.get("node_id") or "").strip()
+            if node_id:
+                ids.append(node_id)
+    if ids:
+        return sorted(set(ids))
+
+    parts: List[str] = []
+    signal = str(evidence.get("signal") or "").strip()
+    if signal:
+        parts.append(f"signal:{signal}")
+    exit_code = evidence.get("exit_code")
+    if exit_code is not None:
+        parts.append(f"exit_code:{exit_code}")
+    if evidence.get("timed_out"):
+        parts.append("timed_out:true")
+    return parts
+
+
 # ---------------------------------------------------------------------------
 # The wall-clock shape of a failure
 # ---------------------------------------------------------------------------
@@ -2245,6 +2361,12 @@ def run_ci_verification(
     runs its ``ci_entry``; an ``e2e`` command point runs its
     ``entry_command`` — and neither of them opens an LLM session.
 
+    Whatever happens, the run leaves a **machine-written** identity
+    behind (:data:`FAILURE_IDENTITY_FIELD`) and — when an artifact
+    directory was given — an artifact that carries it.  A failure that
+    leaves nothing machine-written behind is a failure the next round
+    cannot recognise as the same failure.
+
     ``round_no`` names the round this run belongs to.  It is **evidence**,
     not a knob: the artifact directory of a VP is reused across rounds,
     so without it a later round silently replaces the forensic copy of an
@@ -2270,6 +2392,14 @@ def run_ci_verification(
         result.evidence = {
             "vp_id": vp_id,
             "schema_issues": [i.to_dict() for i in issues],
+            # 2026-11-04: the schema's own words ARE the machine-written
+            # identity — they are produced by the validator, not by a
+            # model, and they are the same in every round that hits the
+            # same defect.
+            # 2026-11-14: the key is spelled out **literally** so the
+            # artifact contract's derivation can see it (see
+            # :data:`FAILURE_IDENTITY_FIELD`).
+            "failure_identity": [i.detail for i in issues],
             # 2026-11-06: the machine-written identity of the defect.
             # This path never ran a single case, so there were no junit
             # node ids to name — and the failure identity fell back to
@@ -2288,6 +2418,13 @@ def run_ci_verification(
             # per-round copy (``ci_output.round-<n>.json``) that
             # :func:`_write_artifact` writes next to it.
         }
+        # 2026-11-04: the artifact is written **before** the return.  It
+        # used to be written at the very end of the function, so a gate
+        # that never started — rejected by the schema — left no artifact
+        # at all, and the round had nothing machine-written to compare.
+        # 2026-11-09: the write goes through :func:`_write_ci_artifacts`,
+        # so the payload is checked against the contract on this path
+        # too — and the round's own copy is written beside it.
         _write_ci_artifacts(
             artifact_dir, vp_id, result.evidence, round_no=round_no,
         )
@@ -2564,6 +2701,15 @@ def run_ci_verification(
         if tail:
             result.reasons.append(f"输出尾部：{tail[-600:]}")
 
+    # 2026-11-04: the machine-written identity of this run.  It is set
+    # after the verdict, because only the verdict knows whether there
+    # was a failure at all — a passed gate has none.
+    # 2026-11-14: the key is spelled out **literally** so the artifact
+    # contract's derivation can see it (see
+    # :data:`FAILURE_IDENTITY_FIELD`).
+    evidence["failure_identity"] = _failure_identity(
+        evidence, result.status,
+    )
     result.evidence = evidence
     _write_ci_artifacts(
         artifact_dir, vp_id, evidence, round_no=round_no,

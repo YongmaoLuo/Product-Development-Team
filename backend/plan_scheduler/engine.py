@@ -107,6 +107,14 @@ that was just taken over has not had its turn yet and is protected for
 a whole M.  A row for a plan that is not working is a reservation
 nobody holds, and it is deleted.
 
+A run that **outlived the backend** is adopted before that: the
+executor is still running, and the backend's startup reconcile may have
+parked the plan all the same — it reads the plan's execution row, and a
+row it cannot vouch for is a row it does not trust.  The scheduler
+asks the plan's own ledger and the kernel instead, and a pid whose
+start time is the recorded start time is the process the plan was
+running with, whatever its command line says.
+
 The recovery decides nothing and starts nothing: the first tick after
 it is an ordinary tick.
 
@@ -251,6 +259,19 @@ SCHEDULER_INTENT_FILE = "scheduler_intent.json"
 #: The name the worker thread carries.  It is the name the operator and
 #: the teardown look for, so it is one word and it is fixed.
 THREAD_NAME = "PlanSchedulerEngine"
+
+#: The phase a plan is in while it is working.
+EXECUTING_PHASE = "executing"
+
+#: The terminal phase the startup reconcile parks a plan in when it
+#: cannot vouch for the plan's run.
+STOPPED_PHASE = "stopped"
+
+#: The role the process ledger files a plan's own run under.  The
+#: re-adoption looks for this role and for no other: it is the run the
+#: plan was working with, and not one of the processes that ran inside
+#: it.
+EXECUTOR_ROLE = "executor"
 
 #: The actions a command may ask for.  The set is closed: an action
 #: that is not one of these four has no meaning, and a meaning that
@@ -526,6 +547,40 @@ def _stamp(epoch: float) -> str:
     )
 
 
+def _same_invocation(
+    live: Sequence[str], recorded: Sequence[str]
+) -> bool:
+    """True when two command lines are the same invocation.
+
+    The **first** entry is the program, and it is not compared: a
+    process may rewrite its own ``argv[0]`` shortly after it starts —
+    on macOS the launcher replaces it with the resolved path — so a
+    command line read a moment after the spawn may name the same
+    program under a different first entry.  The rest of the line is
+    compared: the arguments are what the program was started with, and
+    a program that was started with different arguments is not the run
+    the ledger recorded.
+
+    Args:
+        live: the command line the kernel reports now.
+        recorded: the command line the ledger wrote down.
+
+    Returns:
+        True when the two lines are the same invocation.
+    """
+    live_parts = [part for part in live if part]
+    recorded_parts = [part for part in recorded if part]
+    if len(recorded_parts) < 2:
+        # A line with nothing but the program carries no arguments to
+        # agree on, and a line with nothing at all is no evidence.
+        return False
+    tail = recorded_parts[1:]
+    # The live line may carry entries the recorded one did not — a
+    # wrapper may add arguments of its own — so the comparison is on
+    # the recorded entries, in order, and not on the length.
+    return [part for part in live_parts[1:] if part in tail] == tail
+
+
 # ---------------------------------------------------------------------------
 # The engine
 # ---------------------------------------------------------------------------
@@ -789,11 +844,20 @@ class PlanSchedulerEngine:
         plans that are working, and a half-applied recovery is a
         scheduler that counts a plan it has no record of.
 
+        The re-adoption stands outside that transaction, and it comes
+        first: it writes the plan's own rows, through the repositories
+        that own them, and those repositories open a transaction of
+        their own.  A plan that is given its row back is working as
+        far as the facts are concerned, so the reconciliation below
+        sees it and keeps its slot.
+
         Returns:
             A summary of what the recovery did: ``queued`` (the line
             as it stands now), ``backfilled`` (the plans that joined the
-            tail), ``adopted`` (the plans that were timed from now) and
-            ``removed_slots`` (the rows nobody held any more).
+            tail), ``adopted`` (the plans that were timed from now),
+            ``removed_slots`` (the rows nobody held any more) and
+            ``readopted`` (the plans whose run outlived the backend
+            and were given their row back).
         """
         stamp = _stamp(self._now())
         summary: Dict[str, Any] = {
@@ -801,7 +865,12 @@ class PlanSchedulerEngine:
             "backfilled": [],
             "adopted": [],
             "removed_slots": [],
+            "readopted": [],
         }
+        # The re-adoption comes first: a plan that is working again
+        # must be working again before the slots are reconciled, or the
+        # reconciliation would hand its slot to somebody else.
+        summary["readopted"] = self._readopt_surviving_runs()
         with self._store.transaction(self._conn):
             summary["backfilled"] = self._backfill_queue(stamp)
             adopted, removed = self._recover_slots(stamp)
@@ -909,6 +978,186 @@ class PlanSchedulerEngine:
             self._store.upsert_slot(self._conn, plan_id, stamp)
             adopted.append(plan_id)
         return adopted, removed
+
+    # ------------------------------------------------------------------
+    # The re-adoption
+    # ------------------------------------------------------------------
+
+    def _readopt_surviving_runs(self) -> List[str]:
+        """Give the plans whose run outlived the backend their row back.
+
+        A plan that was working when the backend was killed keeps its
+        executor: the process is still there, and it is the plan's own
+        process.  The startup reconcile may have parked the plan all
+        the same — it reads the plan's execution row, and a row it
+        cannot vouch for is a row it does not trust — and a parked plan
+        is a plan that is not working, so the scheduler would hand its
+        slot to somebody else while the work was still going.
+
+        So the scheduler asks the plan's own ledger and the kernel
+        instead.  The ledger says which pids the plan started with; the
+        kernel says whether a pid is still the same process.  A pid
+        whose start time is the recorded start time is the process the
+        plan was running with, whatever its command line says — the
+        launcher may have rewritten ``argv[0]`` after the spawn, and a
+        rewritten ``argv[0]`` is not a different process.
+
+        Only the plans the scheduler **holds** are asked: a slot is
+        what says the scheduler was running this plan, and a plan the
+        scheduler never held is not the scheduler's to re-adopt.
+
+        Returns:
+            The plans that were given their row back.
+        """
+        working = {
+            str(row.get("plan_id") or "")
+            for row in self._facts.active_plans()
+            if row.get("plan_id")
+        }
+
+        readopted: List[str] = []
+        for slot in self._store.list_slots(self._conn):
+            plan_id = str(slot.get("plan_id") or "")
+            if not plan_id or plan_id in working:
+                continue
+            pid = self._surviving_executor_pid(plan_id)
+            if pid is None:
+                continue
+            if self._readopt_run(plan_id, pid):
+                working.add(plan_id)
+                readopted.append(plan_id)
+        return readopted
+
+    def _surviving_executor_pid(self, plan_id: str) -> Optional[int]:
+        """The pid of the plan's executor, if it is still running.
+
+        Args:
+            plan_id: the plan whose ledger is asked.
+
+        Returns:
+            The pid of the plan's executor, or ``None`` when the plan
+            has no executor, when the executor is gone, or when the
+            pid no longer names the process the ledger recorded.
+        """
+        from process_ledger import live_records
+
+        for candidate in self._plan_dir_candidates(plan_id):
+            try:
+                records = live_records(candidate)
+            except Exception as exc:  # noqa: BLE001 — an unreadable ledger is no evidence
+                log.warning(
+                    "[scheduler] could not read the ledger of plan %s "
+                    "(%s: %s)",
+                    plan_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+            for pid in sorted(records):
+                record = records[pid]
+                if str(getattr(record, "role", "") or "") != EXECUTOR_ROLE:
+                    continue
+                if self._is_the_recorded_process(record):
+                    return int(pid)
+        return None
+
+    def _is_the_recorded_process(self, record: Any) -> bool:
+        """True when the recorded pid is still the process it was.
+
+        The start time is the identity: two processes that never shared
+        a life cannot share a start time, so a pid whose start time
+        is the recorded one is the process the ledger wrote down — even
+        when the command line reads differently, which is what a
+        rewritten ``argv[0]`` looks like.
+
+        Args:
+            record: the ledger's record of the process.
+
+        Returns:
+            True when the pid is still the recorded process.
+        """
+        from process_identity import CREATE_TIME_TOLERANCE, probe
+
+        try:
+            pid = int(record.pid)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        identity = probe(pid)
+        if identity is None:
+            return False
+        recorded_at = getattr(record, "create_time", None)
+        if identity.create_time is None or recorded_at is None:
+            return False
+        if abs(float(identity.create_time) - float(recorded_at)) > float(
+            CREATE_TIME_TOLERANCE
+        ):
+            return False
+        return _same_invocation(
+            identity.cmdline, getattr(record, "cmdline", ())
+        )
+
+    def _readopt_run(self, plan_id: str, pid: int) -> bool:
+        """Put the plan's row back: its run is going again.
+
+        The execution row says the run is running again and names the
+        pid it is running with; the routing row says the plan is
+        executing.  The two are written through the repositories that
+        own them, each in a transaction of its own — so this runs
+        outside the store's transaction, where a second ``BEGIN`` would
+        be refused.
+
+        Args:
+            plan_id: the plan to give its row back.
+            pid: the pid the plan's executor is running with.
+
+        Returns:
+            True when the execution row was written.
+        """
+        from state_machine.repositories.execution_repository import (
+            ExecutionRepository,
+        )
+        from state_machine.repositories.routing_repository import (
+            RoutingRepository,
+        )
+
+        try:
+            ExecutionRepository(self._conn).update_fields(
+                plan_id,
+                create_if_missing=True,
+                exec_status="running",
+                exec_pid=int(pid),
+                stop_reason=None,
+            )
+        except Exception as exc:  # noqa: BLE001 — a plan that cannot be re-adopted is left alone
+            log.warning(
+                "[scheduler] could not re-adopt the run of plan %s "
+                "(%s: %s)",
+                plan_id,
+                type(exc).__name__,
+                exc,
+            )
+            return False
+
+        # The phase is the plan's own, and it says the plan is working
+        # again.  A failure here is not fatal: the execution row is
+        # what the facts read, and the phase is what the plan's own
+        # lifecycle reads.
+        try:
+            RoutingRepository(self._conn).try_mark_phase(
+                plan_id,
+                (STOPPED_PHASE, EXECUTING_PHASE),
+                EXECUTING_PHASE,
+            )
+        except Exception as exc:  # noqa: BLE001 — the phase is not the facts
+            log.warning(
+                "[scheduler] could not move the re-adopted plan %s back to "
+                "%s (%s: %s)",
+                plan_id,
+                EXECUTING_PHASE,
+                type(exc).__name__,
+                exc,
+            )
+        return True
 
     # ------------------------------------------------------------------
     # The commands

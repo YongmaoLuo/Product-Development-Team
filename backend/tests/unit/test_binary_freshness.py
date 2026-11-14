@@ -199,6 +199,84 @@ def test_check_freshness_no_artefacts_is_skipped(tmp_path: Path) -> None:
     assert "no-op" in entry["title"].lower()
 
 
+# ---------------------------------------------------------------------------
+# Provenance — which tree is the code coming from? (2026-11-04, VP-012)
+# ---------------------------------------------------------------------------
+#
+# The mtime check can only see *inside* the tree it was handed: it
+# compares each ``.py`` with its sibling ``.pyc``.  That is the right
+# question for "is the bytecode in this tree older than its source", and
+# the wrong question for "is the code that is about to run in this tree
+# at all" — the round-4 failure ran a runner from a *different* checkout
+# and this gate reported ``PASSED`` for it.
+
+
+def test_module_from_another_tree_is_not_fresh(tmp_path: Path) -> None:
+    """A module that does not come from the tree under test is FAILED."""
+    from binary_freshness import check_binary_freshness
+
+    (tmp_path / "src").mkdir()
+    py = tmp_path / "src" / "main.py"
+    py.write_text("# x\n")
+    cache = tmp_path / "src" / "__pycache__"
+    cache.mkdir()
+    pyc = cache / "main.cpython-311.pyc"
+    pyc.write_text("# cached\n")
+    os.utime(py, (time.time() - 3600, time.time() - 3600))
+    os.utime(pyc, (time.time(), time.time()))
+
+    elsewhere = tmp_path.parent / "some-other-tree" / "backend" / "runner.py"
+    report = check_binary_freshness(
+        tmp_path, expected_module_paths=[str(elsewhere)],
+    )
+
+    assert report.status == "FAILED"
+    assert report.is_stale is True
+    assert str(elsewhere) in report.detail
+
+
+def test_module_from_the_tree_under_test_is_not_flagged(tmp_path: Path) -> None:
+    """The same tree's module does not make the gate fail."""
+    from binary_freshness import check_binary_freshness
+
+    (tmp_path / "src").mkdir()
+    py = tmp_path / "src" / "main.py"
+    py.write_text("# x\n")
+    cache = tmp_path / "src" / "__pycache__"
+    cache.mkdir()
+    pyc = cache / "main.cpython-311.pyc"
+    pyc.write_text("# cached\n")
+    os.utime(py, (time.time() - 3600, time.time() - 3600))
+    os.utime(pyc, (time.time(), time.time()))
+
+    report = check_binary_freshness(
+        tmp_path, expected_module_paths=[str(py)],
+    )
+
+    assert report.status == "PASSED"
+    assert report.is_stale is False
+
+
+def test_no_expected_paths_keeps_the_old_behaviour(tmp_path: Path) -> None:
+    """The provenance dimension is opt-in: nobody passes paths, nothing
+    changes."""
+    from binary_freshness import check_binary_freshness
+
+    (tmp_path / "src").mkdir()
+    py = tmp_path / "src" / "main.py"
+    py.write_text("# x\n")
+    cache = tmp_path / "src" / "__pycache__"
+    cache.mkdir()
+    pyc = cache / "main.cpython-311.pyc"
+    pyc.write_text("# cached\n")
+    os.utime(py, (time.time() - 3600, time.time() - 3600))
+    os.utime(pyc, (time.time(), time.time()))
+
+    report = check_binary_freshness(tmp_path)
+
+    assert report.status == "PASSED"
+
+
 def test_check_freshness_cache_is_write_only(tmp_path: Path) -> None:
     """The per-round cache records reports; it never reads them back.
 

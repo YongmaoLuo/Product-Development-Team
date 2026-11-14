@@ -93,10 +93,20 @@ pytestmark = pytest.mark.integration
 #: How many unmarked children the fixture spawns.
 CHILD_COUNT = 3
 
-#: The children's program.  ``time.sleep(30)`` is long enough to outlive
-#: every pass in this file and short enough that a leaked child cannot
-#: outlive the test run by much.
-CHILD_CODE = "import time; time.sleep(30)"
+#: The children's program.
+#:
+#: The sleep is the child's **budget to be read**, not its cleanup: the
+#: unscoped pass in this file reads *every* process on the machine, two
+#: ``ps`` calls per process, and on this host that pass takes 34-44 s on
+#: a quiet machine and 83-85 s with eight workers running beside it.
+#: A child has to outlive the pass to be judged at all — one that is
+#: already dead is read back as ``env_unreadable`` (nothing could be
+#: read) instead of ``unmarked`` (it was read and carries no marker),
+#: and the case would then prove nothing about the reaper's judgement.
+#: 600 s leaves more than seven times the measured worst case.  The
+#: fixture terminates the children in its ``finally``, so the sleep is
+#: only the backstop for a fixture that dies before its cleanup.
+CHILD_CODE = "import time; time.sleep(600)"
 
 #: The environment the children are *launched* with: ``PATH`` and
 #: nothing else.  It is built from scratch rather than inherited so

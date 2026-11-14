@@ -15,7 +15,11 @@ operator had to scroll past the answer to find the plans.
 The order was backwards as well.  The queue was drawn *above* the
 running plans, although the question an operator opens the panel with
 is "what is running right now, and what is it doing".  The panel now
-reads capacity → 在跑 → 队列.
+reads capacity → 在跑 → 队列, and — since 2026-10-31 — a third block,
+终态计划, below the queue.  That one is a *different* block: it holds
+the plans that failed, which are in neither the queue nor the running
+list, and whose two buttons (「启动」 / 「重跑验证」) have nowhere else
+to live.
 
 These are properties of the *markup*, invisible in a browser and loud
 in a source scan, so they are pinned here rather than at runtime.
@@ -28,6 +32,9 @@ The rule
   cards, so the cards are what the block is made of.
 * The 「可操作的计划」 block is gone — its heading and its three element
   ids.
+* The 「终态计划」 block, which came back on 2026-10-31, is present
+  and whole: its heading, its empty state and its table sit below the
+  queue block, and its rows are drawn into ``#scheduler-terminal-list``.
 * ``frontend/app.js``: no call to the deleted renderer or loader is
   left, and no selector points at a deleted element id.
 
@@ -328,4 +335,181 @@ def test_queue_cards_keep_the_promotion_fact() -> None:
         "renderSchedulerQueue() no longer falls back to 「—」 for a plan "
         "without a promotion. The dash says \"there is nothing here\"; an "
         "empty cell says \"not filled in yet\"."
+    )
+
+
+# ---------------------------------------------------------------------------
+# The terminal-plans block
+# ---------------------------------------------------------------------------
+
+#: The heading of the third block of the scheduler panel.
+_TERMINAL_SUBTITLE = "终态计划"
+
+#: The empty-state text of that block.
+_TERMINAL_EMPTY_TEXT = "没有终态计划"
+
+#: The extra class its heading carries.  It is what keeps the heading
+#: out of :data:`_SUBTITLE_RE`, which matches ``class="scheduler-subtitle"``
+#: exactly — so the two-section scan above keeps counting the blocks it
+#: knows about, and this one needs no exception there.
+_TERMINAL_SUBTITLE_CLASS = "scheduler-terminal-subtitle"
+
+#: The three pieces of that block.
+_TERMINAL_EMPTY_ID = "scheduler-terminal-empty"
+_TERMINAL_TABLE_ID = "scheduler-terminal-table"
+_TERMINAL_LIST_ID = "scheduler-terminal-list"
+
+#: Every ``<h3>`` in the view, with its attributes and its text.
+_HEADING_RE = re.compile(r"<h3([^>]*)>(.*?)</h3>", re.DOTALL)
+
+#: A ``class="..."`` attribute value.
+_CLASS_RE = re.compile(r"class=\"([^\"]*)\"")
+
+
+def _headings(view: str) -> list[tuple[list[str], str, int]]:
+    """Return ``(classes, text, offset)`` for every ``<h3>`` in ``view``.
+
+    Unlike :func:`_subtitles`, this accepts a heading whose ``class``
+    attribute carries more than one name, and it keeps the classes
+    themselves — the terminal block's heading is found by the extra
+    class it wears, not by the bare ``scheduler-subtitle``.
+    """
+    found: list[tuple[list[str], str, int]] = []
+    for match in _HEADING_RE.finditer(view):
+        class_match = _CLASS_RE.search(match.group(1))
+        classes = class_match.group(1).split() if class_match else []
+        found.append((classes, match.group(2).strip(), match.start()))
+    return found
+
+
+def _element_span(html: str, element_id: str) -> tuple[str, int, int]:
+    """Return ``(tag name, start, end)`` of the element ``element_id``.
+
+    The element ends at the first close of its *own* tag after its
+    opening tag: the scheduler panel nests no element of the same kind
+    inside the ones this gate looks at, so the first close is the right
+    one.  The tag is derived from the element rather than assumed, so
+    that a block whose piece changed its kind — a ``<tbody>`` that
+    became a ``<div>`` — is reported as what it is now, and the gate
+    that looks at it fails on that fact instead of on a missing close.
+
+    A missing id raises rather than returning the whole document, so a
+    gate that cannot find what it looks for fails loudly instead of
+    matching nothing and passing.
+    """
+    match = re.search(
+        r"<([a-z]+)[^>]*\bid=\"" + re.escape(element_id) + r"\"", html
+    )
+    assert match is not None, f'id="{element_id}" not found'
+    tag = match.group(1)
+    end = html.find(f"</{tag}>", match.end())
+    assert end != -1, f'id="{element_id}" is never closed'
+    return tag, match.start(), end + len(tag) + 3
+
+
+def test_terminal_block_is_whole_and_third() -> None:
+    """The 「终态计划」 block must be there, whole and below the queue.
+
+    It came back on 2026-10-31 (upstream commit 26e7c921 removed the
+    *other* third block, the 「可操作的计划」 one, and the same series
+    of changes put 终态计划 back on the panel).  A failed plan is in
+    neither the queue nor the running list, and its two buttons
+    (「启动」 / 「重跑验证」) are drawn into
+    ``#scheduler-terminal-list`` — so if the block loses its heading,
+    its empty state or its table, those buttons have nowhere to live
+    and the panel says nothing about a failed plan.
+
+    Nothing else pins this block down.  The two-section scan above
+    cannot see it — the heading wears an extra class, so
+    :data:`_SUBTITLE_RE` skips it — and the only other gate that
+    mentions it asserts that ``id="scheduler-terminal-list"`` occurs
+    somewhere in the markup, not that it is a ``<tbody>`` inside the
+    terminal table, nor that the block still has a heading and an empty
+    state.  The rest of the block would go missing without a single
+    test going red — and the browser is the only place that notices,
+    which is exactly what the end-to-end checkpoint is for.  So the
+    shape of the block is pinned here, in the source.
+
+    The heading must keep its extra class: it is what lets the
+    two-section scan keep counting exactly the two blocks it knows
+    about, without that scan having to be taught about a third one.
+    """
+    view = _section_html(_source(_INDEX_HTML), "scheduler-view")
+
+    terminal = [
+        (classes, offset)
+        for classes, text, offset in _headings(view)
+        if "scheduler-subtitle" in classes and text == _TERMINAL_SUBTITLE
+    ]
+    assert len(terminal) == 1, (
+        "the scheduler view must carry exactly one 「终态计划」 block "
+        f"heading, found {len(terminal)}. The failed plans' buttons are "
+        "drawn into that block; without it the panel says nothing about "
+        "a plan that failed."
+    )
+    classes, terminal_at = terminal[0]
+
+    assert _TERMINAL_SUBTITLE_CLASS in classes, (
+        f"the 「终态计划」 heading lost its {_TERMINAL_SUBTITLE_CLASS!r} "
+        "class. That class is what keeps the two-section scan from "
+        "counting this block — and the scan asserts that the panel "
+        "draws exactly 在跑 and 队列, so the class has to stay."
+    )
+
+    queue_at = _subtitle_offset(view, "队列")
+    assert queue_at < terminal_at, (
+        "the 「终态计划」 block is drawn above the 队列 block. The queue is "
+        "what the operator reads for the plans that are waiting; the "
+        "terminal block belongs below it."
+    )
+
+    empty_tag, empty_at, empty_end = _element_span(view, _TERMINAL_EMPTY_ID)
+    assert empty_tag == "div", (
+        f'#{_TERMINAL_EMPTY_ID} is a <{empty_tag}>, not a <div>. The '
+        "empty state is what the panel says when there is no failed "
+        "plan; it has to be the element the script toggles."
+    )
+    assert _TERMINAL_EMPTY_TEXT in view[empty_at:empty_end], (
+        f"#{_TERMINAL_EMPTY_ID} does not say {_TERMINAL_EMPTY_TEXT!r}. The "
+        "operator reads the panel to find out whether a failed plan is "
+        "waiting for a decision; an empty state that says nothing says "
+        "nothing."
+    )
+
+    table_tag, table_at, table_end = _element_span(view, _TERMINAL_TABLE_ID)
+    assert table_tag == "table", (
+        f'#{_TERMINAL_TABLE_ID} is a <{table_tag}>, not a <table>. The '
+        "rows of the failed plans are drawn into its body."
+    )
+
+    assert terminal_at < empty_at < table_at, (
+        "the 「终态计划」 block is not whole: its heading, its empty state "
+        "and its table have to sit together, in that order. A heading "
+        "above an empty state that lives further down is not a block, "
+        "it is a mismatched pair."
+    )
+
+    list_tag, list_at, list_end = _element_span(view, _TERMINAL_LIST_ID)
+    assert list_tag == "tbody", (
+        f"#{_TERMINAL_LIST_ID} is a <{list_tag}>, not a <tbody>. The rows "
+        "are appended to the body of the terminal table, not to the "
+        "table itself."
+    )
+    assert table_at < list_at < table_end, (
+        f"#{_TERMINAL_LIST_ID} is not inside #{_TERMINAL_TABLE_ID}. The "
+        "terminal table has no body to draw the failed plans into, so "
+        "the panel shows the heading and the empty state and nothing "
+        "else."
+    )
+    assert list_end <= table_end, (
+        f"#{_TERMINAL_LIST_ID} is not closed before "
+        f"#{_TERMINAL_TABLE_ID} ends; the table is malformed."
+    )
+
+    titles = [title for title, _ in _subtitles(view)]
+    assert _TERMINAL_SUBTITLE not in titles, (
+        "the 「终态计划」 heading is picked up by the two-section scan. "
+        "That scan asserts that the panel draws exactly the 在跑 block "
+        "and the 队列 block, so the terminal heading has to keep the "
+        "extra class that keeps it out of that count."
     )

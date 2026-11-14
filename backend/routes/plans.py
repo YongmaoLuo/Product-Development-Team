@@ -631,6 +631,38 @@ def _mark_listing_degraded(
 #: purpose.
 _INTERNAL_DIR_PREFIX = "."
 
+#: The files that make a directory under the plans root a PLAN.
+#:
+#: A directory that carries none of them is not a plan — it is somebody
+#: else's bookkeeping that happens to live under the plans root.  The
+#: verification round writes its own root-cause archives there
+#: (``<plan-dir>/reports/``), a reaped run leaves its directory behind,
+#: and a scratch directory can be created by anything.  None of them is
+#: a plan, and none of them says anything about the state database.
+#:
+#: The names are the ones the framework already uses for a plan's own
+#: artifacts — the import, the PRD and its review, and the two branch
+#: markers :func:`plan_artifacts.detect` reads (``tasks.json`` for the
+#: dev branch, ``verification-plan.md`` for the verification branch).
+#:
+#: Two kinds of file are deliberately NOT here.  The legacy state
+#: sidecars (``plan_state.json`` and ``execution.json``) are pinned as
+#: "do not read" by the VP-006 static gate — production code may not
+#: name them — and a plan directory that carries one of them carries a
+#: task list beside it anyway.  And the OUTPUTS of a verification run
+#: (``verification_plan.json``, ``verification_report.json``,
+#: ``preflight_report.json``) are the run's own bookkeeping: a round
+#: writes them into whatever directory it was pointed at, so they
+#: cannot be what says "this directory is a plan".
+PLAN_ARTIFACT_FILENAMES = (
+    TASKS_FILENAME,
+    PLAN_DOC_FILENAME,
+    "interview.json",
+    "prd.json",
+    "prd.md",
+    "review.json",
+)
+
 
 # ---------------------------------------------------------------------------
 # When the data plane does not describe the tree
@@ -672,15 +704,29 @@ class PlansDataPlaneMismatch(Exception):
         self.directory_plan_ids = list(directory_plan_ids)
 
 
-def _plan_dir_names(plans_dir: Path) -> List[str]:
-    """The names of the plan directories under the plans root.
+def _carries_plan_artifact(plan_dir: Path) -> bool:
+    """Does this directory hold an artifact that only a plan holds?
 
-    A directory that cannot be read contributes nothing: an unreadable
-    tree is not evidence of a mismatch, and treating it as one would
-    turn a permissions problem into a refusal.
+    The answer decides whether the directory counts as tree evidence for
+    the mismatch check.  A directory whose artifacts cannot be listed
+    (an unreadable directory) contributes nothing: an unreadable
+    directory is not evidence of a mismatch, and treating it as one
+    would turn a permissions problem into a refusal.
+    """
+    for filename in PLAN_ARTIFACT_FILENAMES:
+        try:
+            if (plan_dir / filename).exists():
+                return True
+        except OSError:  # pragma: no cover - unreadable directory
+            continue
+    return False
+
+
+def _tree_dir_names(plans_dir: Path) -> List[str]:
+    """The names of EVERY directory under the plans root.
 
     A directory whose name starts with a DOT is the framework's own
-    runtime state, not a plan.  A generated plan id is
+    runtime state, not plan content.  A generated plan id is
     ``<YYYYMMDD>-<slug>`` (``framework.ids.derive_plan_id``): the date
     stamp leads, and ``slugify_plan_id`` strips leading and trailing
     ``-`` and ``.`` from the slug, so a GENERATED plan directory never
@@ -697,20 +743,47 @@ def _plan_dir_names(plans_dir: Path) -> List[str]:
     still refuses a database that knows none of the REAL plans in the
     tree.
 
-    What the rule costs: a plan created under a caller-supplied id that
-    starts with a dot (``validate_plan_id`` allows dots) is not counted
-    as tree evidence either.  It is still LISTED — the listing is built
-    from the database's rows, not from this scan — so the only thing it
-    loses is its ability to prove the database describes the tree.
+    A directory that cannot be read contributes nothing: an unreadable
+    tree is not evidence of a mismatch, and treating it as one would
+    turn a permissions problem into a refusal.
     """
     try:
-        return sorted(
-            entry.name
+        entries = [
+            entry
             for entry in plans_dir.iterdir()
             if entry.is_dir() and not entry.name.startswith(_INTERNAL_DIR_PREFIX)
-        )
+        ]
     except OSError:
         return []
+    return sorted(entry.name for entry in entries)
+
+
+def _plan_dir_names(plans_dir: Path) -> List[str]:
+    """The names of the PLAN directories under the plans root.
+
+    "There is a directory here" is not "there is a plan here": the
+    verification round writes its root-cause archives under the plans
+    root (``<plan-dir>/reports/``), a reaped run leaves its directory
+    behind, and a scratch directory can be created by anything.  Such a
+    directory says nothing about the state database, so counting it as
+    tree evidence refused instances that really had no plans.  A
+    directory is tree evidence only when it carries a plan artifact —
+    the same rule the rest of the framework uses to tell a plan from a
+    non-plan.
+
+    What the rule costs: a plan whose artifacts have not been written
+    yet cannot PROVE that the tree holds a plan.  It can still prove
+    that the database describes this tree — the refusal asks that
+    question separately, against the tree's own directories (see
+    :func:`_refuse_when_data_source_does_not_describe_the_tree`) — and
+    such a plan is still LISTED, because the listing is built from the
+    database's rows and not from this scan.
+    """
+    return [
+        name
+        for name in _tree_dir_names(plans_dir)
+        if _carries_plan_artifact(plans_dir / name)
+    ]
 
 
 def _plan_ids_known_to_db(conn: Any) -> Set[str]:
@@ -760,11 +833,26 @@ def _refuse_when_data_source_does_not_describe_the_tree(
 ) -> None:
     """Refuse to answer when the data plane does not describe the tree.
 
-    The check is an INTERSECTION, not a count: as long as the database
-    knows ONE of the plans in the tree, the two halves belong together
-    and the listing answers normally.  Only when it knows NONE of them
-    is the database somebody else's — and only then does an empty
-    answer become a lie.
+    Two questions, two kinds of evidence:
+
+      * does the tree HOLD a plan?  A directory that carries a plan
+        artifact does; a directory that carries none is somebody else's
+        bookkeeping that happens to live under the plans root (the
+        verification round's ``reports/`` archive, a reaped run's
+        leftover).  A tree that holds no plan has nothing for the
+        database to describe, so there is nothing to refuse about.
+      * does the DATABASE describe this tree?  The check is an
+        INTERSECTION, not a count: as long as the database knows ONE
+        plan that lives in this tree, the two halves belong together and
+        the listing answers normally.  Only when it knows NONE of them
+        is the database somebody else's — and only then does an empty
+        answer become a lie.
+
+    The two questions are asked separately on purpose.  A plan whose
+    artifacts have not been written yet carries no artifact, so it
+    cannot answer the first question — but the database knows it and its
+    directory is in this tree, so it answers the second one, and the
+    listing answers.
 
     The archived plans count as known: they are read out of the tree
     itself, so a tree of archived plans is a tree this instance can
@@ -773,7 +861,7 @@ def _refuse_when_data_source_does_not_describe_the_tree(
     directory_plan_ids = _plan_dir_names(_server.PLANS_DIR)
     if not directory_plan_ids:
         return
-    if set(directory_plan_ids) & known_plan_ids:
+    if set(_tree_dir_names(_server.PLANS_DIR)) & known_plan_ids:
         return
     raise PlansDataPlaneMismatch(data_source, directory_plan_ids)
 
@@ -1818,6 +1906,28 @@ def get_plan_status(plan_id: str):
         )
 
 
+def _is_verification_not_started(error: HTTPException) -> bool:
+    """Is this 404 the handler saying "verification has not started"?
+
+    ``get_verification_progress`` answers ``HTTPException(404, {"error":
+    "verification not started"})`` when the executor has not written a
+    progress state yet — the normal state of every plan that is still
+    executing.  So it is an **answer**, not a fault, and the snapshot
+    has to treat it as one.
+
+    The check is exact on purpose.  A 404 whose detail says something
+    else (the plan is not in the tree, a plain string) is a different
+    answer, and it keeps being logged as the failure it is — the
+    blanket ``except`` below stays in charge of everything this does
+    not recognise.
+    """
+    return (
+        error.status_code == 404
+        and isinstance(error.detail, dict)
+        and error.detail.get("error") == "verification not started"
+    )
+
+
 def _plan_status_payload(plan_id: str) -> Dict[str, Any]:
     """``PlanStatus`` + the three detail sections, read once.
 
@@ -1855,7 +1965,27 @@ def _plan_status_payload(plan_id: str) -> Dict[str, Any]:
     ):
         try:
             payload[key] = handler(plan_id)
-        except Exception:
+        except Exception as error:
+            if (
+                key == "verification"
+                and isinstance(error, HTTPException)
+                and _is_verification_not_started(error)
+            ):
+                # 2026-11-04: "verification not started" is a normal
+                # answer — the plan is still executing and the
+                # verification round has not begun.  It used to fall
+                # into the blanket handler below and be reported as a
+                # broken section: a full traceback at ERROR level,
+                # 2393 times in two hours, for every plan still
+                # running.  The section stays ``None`` (there is
+                # nothing to show yet) and the reason is said once,
+                # quietly, so an operator can still tell "not started
+                # yet" from "the section broke".
+                payload[key] = None
+                _server.logger.debug(
+                    "[plan_status] verification not started plan=%s", plan_id,
+                )
+                continue
             _server.logger.exception(
                 "[plan_status] %s section failed plan=%s", key, plan_id,
             )

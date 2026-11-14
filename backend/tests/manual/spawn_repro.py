@@ -555,7 +555,14 @@ def _child_env(cfg: SpawnConfig) -> Dict[str, str]:
         env = dict(os.environ)
     env.update(cfg.env_extra or {})
     _apply_spawn_marker(env)
-    return env
+    # Production's own builder has the last word.  The environment a
+    # service child is started with is ``service_manager._child_env``,
+    # and the rules it applies -- the unbuffered output a child's log
+    # depends on, among them -- are production's, not this module's
+    # copy of them.  The argv already comes from production's builder
+    # for the same reason: a copy is a second shape, and the second
+    # shape drifts.
+    return sm._child_env(env)
 
 
 def _detached_argv(start_cmd: str, *, own_session: bool = True) -> List[str]:
@@ -1525,6 +1532,7 @@ def _run_single_mode(args: argparse.Namespace, port: int, tmpdir: Path) -> int:
         print(
             f"    ready={result.ready} pid={result.pid} "
             f"rc={result.rc} fds={result.fd_count} "
+            f"took={result.duration:.2f}s "
             f"tail={result.log_tail[:120]!r}"
         )
 
