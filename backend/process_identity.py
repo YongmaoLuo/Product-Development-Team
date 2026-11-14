@@ -48,6 +48,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional, Sequence, Tuple
@@ -76,6 +77,23 @@ CMDLINE_PREFIX_LEN = 2
 #: line; ``pgid`` is the process group, which is what a kill has to
 #: target when the process has children of its own.
 _PS_FORMAT = "pid=,pgid=,lstart=,command="
+
+
+#: How long one machine read may take before it is given up on, in
+#: seconds.
+#:
+#: The read has to be **bounded**, because the caller is on a clock: the
+#: reaper's escalation window is ten seconds, and a read that may take
+#: ten seconds on its own turns the whole sweep into a read that may
+#: take half a minute.  ``ps -p`` reads one ``/proc`` entry, so three
+#: seconds is generous; ten was not a bound, it was a hope.
+PS_READ_TIMEOUT_SEC = 3.0
+
+
+#: How long to wait before the second attempt at a read that did not
+#: come back, in seconds.  Long enough for the machine to finish what
+#: it was doing, short enough that the retry costs nothing.
+PS_READ_RETRY_DELAY_SEC = 0.05
 
 
 #: The ``lstart`` spellings ``ps`` emits. The day is space-padded
@@ -148,27 +166,115 @@ def probe(pid: int) -> Optional[ProcessIdentity]:
     Returns ``None`` when the pid names no process, or when no source
     could describe it. ``None`` is the answer that stops a kill: a pid
     with no readable identity cannot be shown to be the recorded one.
+
+    A caller that has to tell "there is no such process" apart from
+    "the machine could not be read" must use :func:`probe_result`:
+    this function answers ``None`` to both.
+
+    This is the reader :func:`probe_result` goes through, so a caller
+    that replaces it replaces the whole read — the identity and the
+    readability with it.  There is one place where the kernel is
+    asked, and a caller that watches that place sees everything.
+    """
+    number = _usable_pid(pid)
+    if number is None:
+        return None
+    identity, _readable = _read_identity_with_retry(number)
+    return identity
+
+
+def probe_result(pid: int) -> Tuple[Optional[ProcessIdentity], bool]:
+    """The kernel identity of ``pid``, and whether the kernel answered.
+
+    Two questions in one call, because a caller that has to choose
+    between "the process is gone" and "the machine could not be read"
+    needs both, and :func:`probe` throws the second one away.
+
+    * ``(identity, True)`` — the machine was read.  ``identity`` is
+      ``None`` when the pid names no process.
+    * ``(None, False)`` — the machine could not be read.  Nothing is
+      known about the pid, and in particular it is **not** known to be
+      gone.
+
+    2026-11-06: the reaper asked the kernel for an identity on a
+    machine whose load average was 39, the read did not come back, and
+    the process was recorded as "already gone at reap time".  A read
+    that failed is not a reading, and it must never be filed as one.
+
+    The identity comes from :func:`probe` and the readability from a
+    reading of its own.  ``probe`` answers ``None`` to two different
+    facts — "the pid names no process" and "the machine could not be
+    read" — and only the first of them may close a record, so when
+    ``probe`` says ``None`` the machine is asked once more, for the
+    second question alone.  Whatever that reading says about the
+    identity is discarded: the reader that answers for the identity
+    has already had its say, and a second opinion must not become a
+    licence to signal.
+    """
+    number = _usable_pid(pid)
+    if number is None:
+        return None, True
+
+    identity = probe(pid)
+    if identity is not None:
+        return identity, True
+
+    _identity, readable = _read_identity(number)
+    return None, readable
+
+
+def _usable_pid(pid: int) -> Optional[int]:
+    """The pid to ask about, or ``None`` when there is nothing to ask.
+
+    A pid that is not a positive number names no process, and asking
+    about it would be asking the kernel about pid 0 — which is not a
+    process at all.
     """
     try:
-        pid = int(pid)
+        number = int(pid)
     except (TypeError, ValueError):
         return None
-    if pid <= 0:
+    if number <= 0:
         return None
+    return number
 
+
+def _read_identity_with_retry(pid: int) -> Tuple[Optional[ProcessIdentity], bool]:
+    """One reading of the kernel's answer about ``pid``, and a second
+    one if the first did not come back.
+
+    A read that does not come back is tried **once** more: a machine
+    that is briefly too busy to answer is not a machine that cannot be
+    read at all, and the difference is the difference between "there is
+    nothing there" and "I could not look".
+    """
+    identity, readable = _read_identity(pid)
+    if readable:
+        return identity, True
+
+    time.sleep(PS_READ_RETRY_DELAY_SEC)
+    return _read_identity(pid)
+
+
+def _read_identity(pid: int) -> Tuple[Optional[ProcessIdentity], bool]:
+    """One reading of the kernel's answer about ``pid``.
+
+    ``psutil`` is asked first — it reads ``/proc`` directly and forks
+    nothing — and ``ps`` is the fallback for a machine without it.
+    """
     module = _resolve_psutil()
     if module is not None:
         try:
-            return _probe_with_psutil(module, pid)
+            return _probe_with_psutil(module, pid), True
         except _no_such_process(module):
             # The pid is gone. Asking ``ps`` would only repeat the
             # answer, and a recycled pid must not be reported as ours.
-            return None
+            return None, True
         except Exception as exc:  # noqa: BLE001 - a probe is best-effort
             logger.debug(
                 "[process_identity] psutil probe failed for pid=%s: %s", pid, exc
             )
-    return _probe_with_ps(pid)
+    return _probe_with_ps_result(pid)
 
 
 def alive(pid: int) -> bool:
@@ -179,7 +285,8 @@ def alive(pid: int) -> bool:
         return False
     if pid <= 0:
         return False
-    return probe(pid) is not None
+    identity, _readable = _read_identity(pid)
+    return identity is not None
 
 
 def parent_pid(pid: int) -> Optional[int]:
@@ -344,30 +451,52 @@ def _probe_with_psutil(module: Any, pid: int) -> ProcessIdentity:
 
 def _probe_with_ps(pid: int) -> Optional[ProcessIdentity]:
     """Read the identity of ``pid`` through ``ps``."""
-    raw = _run_ps(pid)
+    identity, _readable = _probe_with_ps_result(pid)
+    return identity
+
+
+def _probe_with_ps_result(pid: int) -> Tuple[Optional[ProcessIdentity], bool]:
+    """Read the identity of ``pid`` through ``ps``, and say whether it answered."""
+    raw, readable = _run_ps_result(pid)
+    if not readable:
+        return None, False
     if not raw:
-        return None
-    return _parse_ps_identity(raw, pid)
+        return None, True
+    return _parse_ps_identity(raw, pid), True
 
 
 def _run_ps(pid: int) -> Optional[str]:
     """Ask ``ps`` about one pid. Never raises."""
+    output, _readable = _run_ps_result(pid)
+    return output
+
+
+def _run_ps_result(pid: int) -> Tuple[Optional[str], bool]:
+    """Ask ``ps`` about one pid, and say whether the answer arrived.
+
+    ``ps`` answers a pid that names no process with an empty output and
+    an exit status of 1 — that is a **reading**: the pid is gone.  A
+    probe that times out, or that could not be run at all, has no
+    reading to offer, and the two must not be confused: one of them is
+    a fact about the process, the other is a fact about the machine
+    being busy.
+    """
     try:
         completed = subprocess.run(
             ["ps", "-o", _PS_FORMAT, "-p", str(pid)],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=PS_READ_TIMEOUT_SEC,
         )
     except Exception as exc:  # noqa: BLE001 - a probe is best-effort
         logger.debug("[process_identity] ps failed for pid=%s: %s", pid, exc)
-        return None
+        return None, False
 
     if isinstance(completed, str):
         output = completed
     else:
         output = getattr(completed, "stdout", "") or ""
-    return str(output).strip() or None
+    return str(output).strip() or None, True
 
 
 def _parse_ps_identity(raw: str, pid: int) -> Optional[ProcessIdentity]:

@@ -1,0 +1,10 @@
+{
+  "verification_points": [
+    {
+      "id": "VP-001",
+      "title": "契约计划种子验证点",
+      "verification_method": "code_review",
+      "verification_phase": 1
+    }
+  ]
+}

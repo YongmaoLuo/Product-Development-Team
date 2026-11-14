@@ -284,6 +284,601 @@ def test_schema_accepts_deferred(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 跨轮记账：被本轮延后的关卡，在本轮账本里必须看得见
+# ---------------------------------------------------------------------------
+#
+# 2026-11-06（VP-016 根因）：``_mark_layer_deferred`` 的跳过判据曾经是
+# **跨轮**的 ``item_id in self._verdicts`` ——「这个 VP 已经有裁决了（哪怕
+# 是上一轮的 DEFERRED）就不写新的」。于是从第二轮起，被门禁延后的关卡在
+# 本轮**一条裁决都没有**：执行器不写、轮次作用域过滤按轮次戳把它筛掉、
+# ``execution_results`` 里查无此 VP。
+#
+# 判定层（Phase 3 LLM）看到的是「计划里有 VP-016、没有执行结果」——一张
+# 空白支票——于是替它编了一个 FAILED（missing → high），框架再照着这条
+# 「失败」去买一条「去修一个没跑过的门禁」的任务。
+#
+# 不变量：**被本轮延后的关卡，在本轮账本里必须看得见。**
+
+
+def _make_round_executor(
+    plan: Dict[str, Any],
+    plan_dir: Path,
+    verdicts: Dict[str, str],
+    round_no: int,
+):
+    """一个绑定轮次的执行器 —— 每轮一个自己的 ``plan_dir``。
+
+    轮次必须显式绑定：跨轮记账的判据就是「**本轮**有没有裁决」，轮次
+    未知时执行器按旧口径退回去（那正是缺陷的藏身处）。
+    """
+    from verification_executor import VerificationExecutor
+
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    calls: List[str] = []
+
+    async def runner(vp: Dict[str, Any]) -> Dict[str, Any]:
+        vp_id = vp["id"]
+        calls.append(vp_id)
+        return {
+            "status": verdicts.get(vp_id, "PASSED"),
+            "reasons": [f"{vp_id} stub"],
+            "evidence": {},
+        }
+
+    executor = VerificationExecutor(
+        verification_plan=plan,
+        plan_id="plan-x",
+        plan_dir=plan_dir,
+        sub_agent_runner=runner,
+        verif_repo=None,
+        round_no=round_no,
+    )
+    return executor, calls
+
+
+def _two_deferred_rounds(
+    plan: Dict[str, Any],
+    tmp_path: Path,
+    verdicts: Dict[str, str],
+):
+    """连跑两轮，两轮都把同一个 Phase 2 关卡延后；返回第二个执行器。
+
+    第二轮把第一轮的结论**水合**回来 —— 那正是真实的跨轮继承（进程重启
+    后从状态库水合），也正是缺陷发作的条件：延后判据一旦跨轮，被延后的
+    关卡在第二轮就一条裁决都不写。
+    """
+    executor1, _ = _make_round_executor(
+        plan, tmp_path / "round1", verdicts, round_no=1,
+    )
+    asyncio.run(executor1.run(max_parallel=1))
+
+    executor2, calls2 = _make_round_executor(
+        plan, tmp_path / "round2", verdicts, round_no=2,
+    )
+    for vp_id, verdict in executor1._verdicts.items():
+        executor2._store_verdict(vp_id, dict(verdict))
+    executor2._backfill_index_lists_from_verdicts()
+    asyncio.run(executor2.run(max_parallel=1))
+    return executor1, executor2, calls2
+
+
+def test_deferred_gate_writes_a_verdict_in_every_round(tmp_path: Path) -> None:
+    """第二轮再次延后时，本轮账本里必须有一条**本轮盖戳**的 DEFERRED。
+
+    修复前：``_verdicts_by_round[2]`` 里没有它、``_deferred_vps`` 是空的
+    ——「本轮没问过」这件事从账本里彻底消失。
+    """
+    plan = _plan(
+        _vp("VP-001"),
+        _vp("VP-010", verification_phase=2, phase_order=1, title="全量 Nightly CI"),
+    )
+    _, executor2, _ = _two_deferred_rounds(
+        plan, tmp_path, {"VP-001": "FAILED"},
+    )
+
+    round2 = executor2._verdicts_by_round.get(2, {})
+    assert "VP-010" in round2, "第二轮的账本里必须有本轮盖戳的 DEFERRED"
+    assert round2["VP-010"]["status"] == "DEFERRED"
+    assert round2["VP-010"]["round"] == 2, "轮次戳必须是本轮，不是上一轮"
+    assert "VP-010" in executor2._deferred_vps
+
+
+def test_deferred_gate_stays_in_the_current_round_ledger(tmp_path: Path) -> None:
+    """本轮视图（``_current_round_verdicts``）在第二轮仍要读得到那条延后。
+
+    修复前：第二轮的账本里只有 Phase 1 的结论 —— 关卡整个消失，判定层
+    拿到的就是「有计划条目、无执行结果」。
+    """
+    plan = _plan(
+        _vp("VP-001"),
+        _vp("VP-010", verification_phase=2, phase_order=1, title="全量 Nightly CI"),
+    )
+    _, executor2, _ = _two_deferred_rounds(
+        plan, tmp_path, {"VP-001": "FAILED"},
+    )
+
+    ledger = executor2._current_round_verdicts()
+    assert "VP-010" in ledger, "被本轮延后的关卡必须留在本轮账本里"
+    assert ledger["VP-010"]["status"] == "DEFERRED"
+    assert ledger["VP-010"]["round"] == 2
+
+
+def test_report_projects_an_unjudged_gate_as_deferred(tmp_path: Path) -> None:
+    """计划里有、本轮没有裁决的 Phase 2 关卡，必须以 DEFERRED 进账本。
+
+    修复前它整个从账本里消失（``deferred_ids`` 是空集），判定层拿到的是
+    一张空白支票，只能替它编一个状态。
+    """
+    from verification_agent import VerificationAgent
+
+
+    plan = _plan(
+        _vp("VP-001"),
+        _vp("VP-010", verification_phase=2, phase_order=1, title="全量 Nightly CI"),
+    )
+    executor, _ = _make_round_executor(
+        plan, tmp_path / "round2", {"VP-001": "FAILED"}, round_no=2,
+    )
+    # 本轮没有裁决：只有**上一轮**的 DEFERRED 被水合回来。
+    executor._store_verdict("VP-010", {
+        "status": "DEFERRED",
+        "reasons": ["Phase 2 关卡延后：Phase 1 的 VP-001 结论为 FAILED"],
+        "evidence": {},
+        "round": 1,
+    })
+
+    agent = VerificationAgent.__new__(VerificationAgent)
+    agent.verif_repo = None
+    envelope = agent._build_execution_results_from_executor(
+        {"verification_points": plan["vps"]}, executor,
+    )
+
+    statuses = {er["id"]: er["status"] for er in envelope["execution_results"]}
+    assert statuses.get("VP-010") == "DEFERRED", (
+        "本轮没被问过的 Phase 2 关卡必须以 DEFERRED 的身份留在账本里"
+    )
+
+
+def test_report_restores_deferred_and_drops_the_deviation_of_an_unjudged_gate(
+    tmp_path: Path,
+) -> None:
+    """判定层把「本轮没问过」的关卡写成 FAILED + missing 偏离时，
+    报告层必须把它还原成 DEFERRED，并把那条需求偏离摘掉。
+
+    修复前：报告里留着 ``FAILED`` 与 ``type=missing / severity=high``
+    —— 失败统计被污染，修复任务被引到错误靶子（去「修」一个没跑过的
+    全量门禁）。
+    """
+    from unittest.mock import Mock
+
+    from verification_agent import VerificationAgent
+
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    coding_tool = Mock()
+    coding_tool.query_json.return_value = {
+        "overall_status": "FAILED",
+        "summary": "判定层自己编的状态",
+        "verification_results": [
+            {
+                "id": "VP-001", "status": "FAILED",
+                "actual_result": "boom", "evidence": "e",
+            },
+            {
+                "id": "VP-010", "status": "FAILED",
+                "actual_result": "端到端验收未执行，功能未验证", "evidence": "e",
+            },
+        ],
+        "requirement_deviations": [
+            {
+                "verification_point_id": "VP-010",
+                "type": "missing",
+                "severity": "high",
+                "description": "本轮没有任何产物",
+            },
+        ],
+    }
+    agent = VerificationAgent(
+        plan_dir=plan_dir, project_dir=project_dir, coding_tool=coding_tool,
+    )
+
+    execution_results = {
+        "verification_points": [
+            _vp("VP-001"),
+            _vp("VP-010", verification_phase=2, phase_order=1,
+                title="全量 Nightly CI"),
+        ],
+        "execution_results": [
+            {
+                "id": "VP-001", "status": "FAILED",
+                "actual_result": "boom", "evidence": "e",
+            },
+        ],
+    }
+    report = agent.generate_verification_report(execution_results, retry_llm=1)
+
+    entries = {
+        vr.get("id"): vr.get("status")
+        for vr in report.get("verification_results", [])
+    }
+    assert entries.get("VP-010") == "DEFERRED", (
+        "本轮没被问过的 Phase 2 关卡不得报成 FAILED"
+    )
+    deviations = [
+        d for d in (report.get("requirement_deviations") or [])
+        if d.get("verification_point_id") == "VP-010"
+    ]
+    assert deviations == [], "延后的关卡不得留下需求偏离"
+
+
+def test_deferred_gate_never_enters_the_failure_history(tmp_path: Path) -> None:
+    """被延后的关卡不进失败集合 → 不进失败历史 → 不买修复任务。
+
+    失败历史与指纹的入口只认 ``FAILED / timeout / SPLIT / hard_timeout``；
+    报告里那条 ``FAILED`` 一旦留下，这条「没跑过的门禁」就会按
+    ``deliverable_defect`` 买下一条修复任务，并在 legacy-v2 规则下把判定层
+    的散文哈希成指纹 —— 措辞一变指纹就变，循环于是永远说「根因已演进」。
+    """
+    from unittest.mock import Mock
+
+    from verification.orchestrator import VerificationOrchestrator
+    from verification_agent import VerificationAgent
+
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    coding_tool = Mock()
+    coding_tool.query_json.return_value = {
+        "overall_status": "FAILED",
+        "summary": "判定层自己编的状态",
+        "verification_results": [
+            {
+                "id": "VP-001", "status": "FAILED",
+                "actual_result": "boom", "evidence": "e",
+            },
+            {
+                "id": "VP-010", "status": "FAILED",
+                "actual_result": "端到端验收未执行，功能未验证", "evidence": "e",
+            },
+        ],
+        "requirement_deviations": [
+            {
+                "verification_point_id": "VP-010",
+                "type": "missing",
+                "severity": "high",
+                "description": "本轮没有任何产物",
+            },
+        ],
+    }
+    agent = VerificationAgent(
+        plan_dir=plan_dir, project_dir=project_dir, coding_tool=coding_tool,
+    )
+    execution_results = {
+        "verification_points": [
+            _vp("VP-001"),
+            _vp("VP-010", verification_phase=2, phase_order=1,
+                title="全量 Nightly CI"),
+        ],
+        "execution_results": [
+            {
+                "id": "VP-001", "status": "FAILED",
+                "actual_result": "boom", "evidence": "e",
+            },
+        ],
+    }
+    report = agent.generate_verification_report(execution_results, retry_llm=1)
+
+    orchestrator = VerificationOrchestrator.__new__(VerificationOrchestrator)
+    failed = orchestrator._extract_failed_vps_with_evidence(report)
+
+    assert "VP-010" not in failed, "被延后的关卡不得进失败集合"
+    assert "VP-001" in failed, "真失败仍然要留在失败集合里"
+
+
+# ---------------------------------------------------------------------------
+# VP-029：真失败不得被洗成延后
+# ---------------------------------------------------------------------------
+#
+# 「机器跑不动」不得被记成「代码坏了」；反过来同样成立：**真的跑过并红了
+# 的关卡也不得被记成「没跑过」**。真失败被洗成延后，修复环就永远不收敛
+# （没人去修它）。
+#
+# 判据的第一位是「**本轮有没有裁决**」：关卡自己有一条真实裁决，它的身份
+# 就是那条裁决 —— 前置红不改变它「被问过」的事实。
+
+
+def _report_layer_gate_ids(points: List[Dict[str, Any]], ledger: Dict[str, str]):
+    """报告层算出来的「本轮没被问过」的 Phase 2 关卡 id 集合。"""
+    from verification_agent import _deferred_gate_ids
+
+    return _deferred_gate_ids({"verification_points": points}, ledger)
+
+
+def test_deferred_gate_ids_keeps_a_gate_with_a_real_verdict_out_of_deferred() -> None:
+    """关卡自己有一条真裁决 ⇒ 它被问过 ⇒ 前置红也不许把它算成「没被问过」。"""
+    points = [
+        _vp("VP-001"),
+        _vp("VP-015", verification_phase=2, phase_order=1, title="全量 Nightly CI"),
+    ]
+    ledger = {"VP-001": "FAILED", "VP-015": "FAILED"}
+
+    assert _report_layer_gate_ids(points, ledger) == set(), (
+        "真跑过并红了的关卡不得被算成「本轮没被问过」"
+    )
+
+
+def test_deferred_gate_ids_marks_a_gate_without_any_verdict_as_deferred() -> None:
+    """负控：本轮一条裁决都没有的关卡仍然必须落 DEFERRED。"""
+    points = [
+        _vp("VP-001"),
+        _vp("VP-015", verification_phase=2, phase_order=1, title="全量 Nightly CI"),
+    ]
+
+    assert _report_layer_gate_ids(points, {}) == {"VP-015"}, (
+        "本轮没有裁决的关卡必须仍然是「没被问过」"
+    )
+
+
+def test_report_keeps_a_gate_failed_when_it_really_ran_and_failed(
+    tmp_path: Path,
+) -> None:
+    """账本里真跑过并红了的关卡，报告里必须仍是 FAILED。
+
+    修复前：报告层的「规则 4」只看前置红不红，前置红 ⇒ 判定成「本轮没被
+    问过」⇒ 无条件写成 DEFERRED ⇒ 真失败被洗成延后 ⇒ 修复环不收敛。
+    """
+    from unittest.mock import Mock
+
+    from verification_agent import VerificationAgent
+
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    points = [
+        _vp("VP-001"),
+        _vp("VP-015", verification_phase=2, phase_order=1, title="全量 Nightly CI"),
+    ]
+
+    coding_tool = Mock()
+    coding_tool.query_json.return_value = {
+        "overall_status": "FAILED",
+        "summary": "判定层自己编的状态",
+        "verification_results": [
+            {
+                "id": "VP-001", "status": "FAILED",
+                "actual_result": "phase 1 red", "evidence": "e",
+            },
+            {
+                "id": "VP-015", "status": "FAILED",
+                "actual_result": "full_ci exit_code=1", "evidence": "e",
+            },
+        ],
+        "requirement_deviations": [],
+    }
+    agent = VerificationAgent(
+        plan_dir=plan_dir, project_dir=project_dir, coding_tool=coding_tool,
+    )
+
+    execution_results = {
+        "verification_points": points,
+        "execution_results": [
+            {
+                "id": "VP-001", "status": "FAILED",
+                "actual_result": "phase 1 red", "evidence": "e",
+            },
+            {
+                "id": "VP-015", "status": "FAILED",
+                "actual_result": "full_ci exit_code=1", "evidence": "e",
+            },
+        ],
+    }
+    report = agent.generate_verification_report(execution_results, retry_llm=1)
+
+    statuses = {
+        vr.get("id"): vr.get("status")
+        for vr in report.get("verification_results", [])
+    }
+    assert statuses.get("VP-015") == "FAILED", (
+        "真跑过并红了的关卡不得被洗成 DEFERRED"
+    )
+
+
+def test_report_keeps_an_unjudged_gate_deferred(tmp_path: Path) -> None:
+    """负控：本轮没有裁决的关卡仍然必须落 DEFERRED。"""
+    from unittest.mock import Mock
+
+    from verification_agent import VerificationAgent
+
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    points = [
+        _vp("VP-001"),
+        _vp("VP-015", verification_phase=2, phase_order=1, title="全量 Nightly CI"),
+    ]
+
+    coding_tool = Mock()
+    coding_tool.query_json.return_value = {
+        "overall_status": "FAILED",
+        "summary": "判定层自己编的状态",
+        "verification_results": [
+            {
+                "id": p["id"], "status": "FAILED",
+                "actual_result": "judgment stub", "evidence": "e",
+            }
+            for p in points
+        ],
+        "requirement_deviations": [],
+    }
+    agent = VerificationAgent(
+        plan_dir=plan_dir, project_dir=project_dir, coding_tool=coding_tool,
+    )
+
+    report = agent.generate_verification_report(
+        {"verification_points": points, "execution_results": []}, retry_llm=1,
+    )
+
+    statuses = {
+        vr.get("id"): vr.get("status")
+        for vr in report.get("verification_results", [])
+    }
+    assert statuses.get("VP-015") == "DEFERRED", (
+        "本轮没有裁决的关卡必须仍然是 DEFERRED"
+    )
+
+
+def test_projection_keeps_a_failed_gate_failed_when_the_round_is_unknown(
+    tmp_path: Path,
+) -> None:
+    """轮次未知时，跨轮表里一条真 FAILED 仍然算「被问过」。
+
+    修复前：投影层在轮次未知时传 ``asked_this_round=set()``，把跨轮表里
+    一条真实的 FAILED 也写成 DEFERRED —— 真失败被洗成延后。
+    """
+    from verification_agent import VerificationAgent
+
+    plan = _plan(
+        _vp("VP-001"),
+        _vp("VP-015", verification_phase=2, phase_order=1, title="全量 Nightly CI"),
+    )
+    # 轮次未绑定 ⇒ 账本是跨轮的。
+    executor, _ = _make_round_executor(
+        plan, tmp_path / "unbound", {}, round_no=None,
+    )
+    executor._store_verdict("VP-001", {
+        "status": "FAILED", "reasons": ["phase 1 red"], "evidence": {}, "round": 1,
+    })
+    executor._store_verdict("VP-015", {
+        "status": "FAILED", "reasons": ["full_ci exit_code=1"],
+        "evidence": {}, "round": 1,
+    })
+
+    agent = VerificationAgent.__new__(VerificationAgent)
+    agent.verif_repo = None
+    envelope = agent._build_execution_results_from_executor(
+        {"verification_points": plan["vps"]}, executor,
+    )
+
+    statuses = {er["id"]: er["status"] for er in envelope["execution_results"]}
+    assert statuses.get("VP-015") == "FAILED", (
+        "轮次未知时，真跑过并红了的关卡也不得被写成 DEFERRED"
+    )
+    assert "VP-015" not in envelope["deferred_vp_ids"]
+
+
+def test_projection_does_not_treat_a_cross_round_passed_gate_as_asked(
+    tmp_path: Path,
+) -> None:
+    """负控：轮次未知时，跨轮的 PASSED 不算「本轮被问过」的证据。
+
+    跨轮表里那条 PASSED 可能是上一轮的 —— 拿它证明「本轮被问过」，就等于
+    让上一轮的成功替这一轮说话。
+    """
+    from verification_agent import VerificationAgent
+
+    plan = _plan(
+        _vp("VP-001"),
+        _vp("VP-015", verification_phase=2, phase_order=1, title="全量 Nightly CI"),
+    )
+    executor, _ = _make_round_executor(
+        plan, tmp_path / "unbound", {}, round_no=None,
+    )
+    executor._store_verdict("VP-001", {
+        "status": "FAILED", "reasons": ["phase 1 red"], "evidence": {}, "round": 1,
+    })
+    executor._store_verdict("VP-015", {
+        "status": "PASSED", "reasons": ["上一轮跑过"], "evidence": {}, "round": 1,
+    })
+
+    agent = VerificationAgent.__new__(VerificationAgent)
+    agent.verif_repo = None
+    envelope = agent._build_execution_results_from_executor(
+        {"verification_points": plan["vps"]}, executor,
+    )
+
+    statuses = {er["id"]: er["status"] for er in envelope["execution_results"]}
+    assert statuses.get("VP-015") == "DEFERRED", (
+        "跨轮的 PASSED 不得被当成本轮「被问过」的证据"
+    )
+    assert "VP-015" in envelope["deferred_vp_ids"]
+
+
+# ---------------------------------------------------------------------------
+# VP-029（补）：被前置关卡挡住的关卡，它的「失败」不是本轮的
+# ---------------------------------------------------------------------------
+#
+# 「真失败被洗成延后」和「没跑过的门禁被记成跑挂了」是同一个错误的两个
+# 方向。区分它们要问的是**相位契约**：关卡按 ``phase_order`` 串行，前置
+# 关卡红了 ⇒ 后面的关卡本轮**根本没被派发** ⇒ 它自己那条裁决只可能是上
+# 一轮的残留（plan 20261102-Plan 第 15 轮的真实形状：Nightly 真跑了并
+# 红了，E2E 没轮到，而 E2E 在账本里留着上一轮的 FAILED）。
+
+
+def test_deferred_gate_ids_defers_a_gate_blocked_by_an_earlier_red_gate() -> None:
+    """更早的关卡红了 ⇒ 这个关卡本轮没被派发 ⇒ 它那条 FAILED 是残留。"""
+    points = [
+        _vp("VP-001"),
+        _vp("VP-015", verification_phase=2, phase_order=1, title="全量 Nightly CI"),
+        _vp("VP-016", verification_phase=2, phase_order=2, title="全量 E2E 测试"),
+    ]
+    ledger = {
+        "VP-001": "PASSED",
+        "VP-015": "FAILED",
+        "VP-016": "FAILED",
+    }
+
+    assert _report_layer_gate_ids(points, ledger) == {"VP-016"}, (
+        "被前置关卡挡住的关卡不得被算成「本轮被问过」"
+    )
+
+
+def test_projection_defers_a_gate_blocked_by_an_earlier_red_gate(
+    tmp_path: Path,
+) -> None:
+    """负控（跨轮表）：前置红了 ⇒ 后面的关卡本轮没被派发 ⇒ DEFERRED。"""
+    from verification_agent import VerificationAgent
+
+    plan = _plan(
+        _vp("VP-001"),
+        _vp("VP-015", verification_phase=2, phase_order=1, title="全量 Nightly CI"),
+        _vp("VP-016", verification_phase=2, phase_order=2, title="全量 E2E 测试"),
+    )
+    executor, _ = _make_round_executor(
+        plan, tmp_path / "unbound", {}, round_no=None,
+    )
+    executor._store_verdict("VP-001", {
+        "status": "PASSED", "reasons": ["ok"], "evidence": {}, "round": 2,
+    })
+    executor._store_verdict("VP-015", {
+        "status": "FAILED", "reasons": ["nightly ci 红"], "evidence": {}, "round": 2,
+    })
+    executor._store_verdict("VP-016", {
+        "status": "FAILED", "reasons": ["上一轮残留"], "evidence": {}, "round": 1,
+    })
+
+    agent = VerificationAgent.__new__(VerificationAgent)
+    agent.verif_repo = None
+    envelope = agent._build_execution_results_from_executor(
+        {"verification_points": plan["vps"]}, executor,
+    )
+
+    statuses = {er["id"]: er["status"] for er in envelope["execution_results"]}
+    assert statuses.get("VP-015") == "FAILED", "真跑挂的关卡不能被洗成 DEFERRED"
+    assert statuses.get("VP-016") == "DEFERRED", (
+        "被前置关卡挡住的关卡本轮没被问过 —— 上一轮残留的裁决不算数"
+    )
+    assert "VP-016" in envelope["deferred_vp_ids"]
+
+
 # 门禁重算（2026-11-06）：延后不是终态，理由必须点名当前的阻塞者
 # ---------------------------------------------------------------------------
 #
@@ -386,6 +981,7 @@ def test_deferral_is_recorded_in_the_round_that_deferred_it(
     """本轮再次延后时，本轮账本里必须有一条**自己的**条目。"""
     from verification_executor import VERDICT_ROUND_FIELD
 
+
     plan = _plan(
         _vp("VP-001"),
         _vp("VP-010", verification_phase=2, phase_order=1, title="全量 Nightly CI"),
@@ -434,6 +1030,13 @@ def test_a_real_conclusion_is_not_overwritten_by_a_deferral(
     assert executor2._verdicts["VP-010"]["status"] == "PASSED", (
         "已有结论不得被一条延后记录覆盖"
     )
+
+
+    plan = _plan(
+        _vp("VP-001"),
+        _vp("VP-010", verification_phase=2, phase_order=1, title="全量 Nightly CI"),
+    )
+
 
 
 # ---------------------------------------------------------------------------

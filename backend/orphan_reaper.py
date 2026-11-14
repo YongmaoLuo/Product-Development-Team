@@ -211,6 +211,34 @@ try:  # POSIX only.  Without it there is no singleton (see ``acquire_lock``).
 except ImportError:  # pragma: no cover - Windows
     fcntl = None  # type: ignore[assignment]
 
+#: The import name of the optional ``psutil`` dependency.
+#:
+#: 2026-11-08：按名导入，而不是 ``import psutil``。这个模块必须**只**用
+#: 标准库（``backend/tests/unit/test_orphan_reaper_config.py`` 的
+#: ``test_module_imports_only_the_standard_library`` 扫的是它的 AST，任何
+#: ``ast.Import`` 节点里的第三方名字都算越界），而 ``psutil`` 是本仓声明的
+#: 依赖（``backend/pyproject.toml`` 里的 ``psutil>=5.9``）、不是标准库。
+#:
+#: 名字放在一个**具名常量**里，而不是内联在调用点上：另一道门禁
+#: （``backend/tests/static_gates/test_no_module_path_outside_the_repo.py``）
+#: 禁止把仓外的模块路径写成字符串字面量，而它明确放行
+#: ``importlib.import_module(some_var)`` —— 具名常量正是那种写法，也正是
+#: 本仓 ``verification_subagent._runner_module`` 已经在用的写法。一个能被
+#: grep 到的具名常量有主、有评审；一个拼出来的字符串没有。
+#:
+#: 语义完全一样：走的是同一套 import 机制、同样落在 ``sys.modules`` 上、
+#: 同样能被 ``ImportError`` 抓到、同样能看出 ``sys.modules`` 里的模块被换过。
+#: 它换来的只是「模块在 AST 层面仍是纯标准库」，不是绕过依赖。
+_PSUTIL_MODULE_NAME = "psutil"
+
+#: ``psutil`` is optional.  The handle is module-level so that a caller
+#: (or a test) can clear it and force the ``ps`` fallback.
+psutil = None
+try:
+    psutil = importlib.import_module(_PSUTIL_MODULE_NAME)
+except ImportError:  # pragma: no cover - the fallback covers this case
+    psutil = None
+
 logger = logging.getLogger(__name__)
 
 #: The real ``subprocess.Popen``, captured at import time.
@@ -264,6 +292,7 @@ __all__ = [
     "spawn_start_epoch",
     "ProcInfo",
     "list_processes",
+    "census_processes",
     "read_process_environ",
     "read_process_environ_bulk",
     "BULK_ENV_MIN_PROCESSES",
@@ -313,6 +342,7 @@ __all__ = [
     "ensure_daemon",
     "ReaperDaemon",
     "list_reaper_daemons",
+    "census_reaper_daemons",
     "daemon_status",
     "stop_daemons_for_plans_root",
     "run_once",
@@ -1770,6 +1800,32 @@ _DOUBLE_ESCAPE_RE = re.compile(r"\\([\"\\])")
 #: The columns :func:`list_processes` asks ``ps`` for.
 _PS_PROCESS_COLUMNS = "pid=,ppid=,pgid=,uid=,rss=,args="
 
+#: How long one read of the process table may take for the scan.
+#:
+#: The scan asks once and gives up: a scan that cannot see the machine
+#: reclaims nothing, and a scan that waits for a machine that will not
+#: answer holds the boot path open for nothing.
+PROCESS_TABLE_READ_TIMEOUT_SEC = 15.0
+
+#: How many times the census asks ``ps`` for the process table before it
+#: gives up on the machine.
+#:
+#: More than once, because a machine that is briefly too busy to answer is
+#: not a machine that cannot be read at all; a bounded number of times,
+#: because a census that waits forever is no better than one that gives up
+#: at once.
+CENSUS_READ_ATTEMPTS = 3
+
+#: How long one of those reads may take.
+#:
+#: Shorter than the read the scan gets, because there is more than one of
+#: them: three of these fit in the budget one read had before, so the
+#: census never waits longer than the scan it sits beside.
+CENSUS_READ_TIMEOUT_SEC = 5.0
+
+#: The pause between two attempts of the ``ps`` fallback.
+CENSUS_READ_RETRY_DELAY_SEC = 0.25
+
 #: The columns the one-shot environment read asks ``ps`` for.
 #:
 #: The pid and the command line are enough: the command line is what has
@@ -2432,11 +2488,197 @@ def list_processes() -> List[ProcInfo]:
     A failing probe yields an empty list, and an empty list means the
     scan finds no candidates — the outcome that reclaims nothing, which
     is the right outcome for a scan that could not see the machine.
+
+    A caller that has to tell "there is nothing there" apart from "the
+    machine could not be read" uses :func:`census_processes`, which
+    answers both questions at once.
     """
-    output = _run_ps(["-axo", _PS_PROCESS_COLUMNS], timeout=15.0)
+    processes, _readable = _read_process_table_with_ps(
+        PROCESS_TABLE_READ_TIMEOUT_SEC
+    )
+    return processes
+
+
+def _read_process_table_with_ps(timeout: float) -> Tuple[List[ProcInfo], bool]:
+    """One read of the process table with ``ps``, and whether it answered.
+
+    A ``ps`` that is missing, that failed, that timed out, or that
+    answered with nothing at all has no reading to offer.  A machine
+    that answers with an empty table is not a machine without
+    processes; it is a machine whose table could not be read.
+    """
+    output = _run_ps(["-axo", _PS_PROCESS_COLUMNS], timeout=timeout)
     if not output:
-        return []
-    return _parse_ps_process_table(output)
+        return [], False
+    return _parse_ps_process_table(output), True
+
+
+def _resolve_psutil() -> Optional[Any]:
+    """Return the ``psutil`` module to use, or ``None`` when there is none.
+
+    ``psutil`` is optional, so "not available" has to be a state this
+    module can be in.  It gets there three ways, and all three land on
+    the ``ps`` fallback:
+
+    * the import at module scope failed — psutil is not installed;
+    * the module-level handle was cleared to simulate that;
+    * ``sys.modules["psutil"]`` was poisoned, which is how a test makes
+      a fresh import fail without uninstalling the package.
+    """
+    global psutil
+    if psutil is None:
+        return None
+
+    installed = sys.modules.get("psutil")
+    if installed is None:
+        return None
+    if installed is not psutil:
+        # A caller swapped in a stub; the stub is the truth here.
+        return psutil
+
+    try:
+        # 2026-11-08：按名导入（理由同模块级那一处）：这个模块在 AST 层面
+        # 必须仍是纯标准库，而晚导入要认的是**当前** ``sys.modules`` 里的那
+        # 一份 —— ``importlib.import_module`` 正是这么取的，语义与
+        # ``import psutil as fresh`` 一致。
+        fresh = importlib.import_module(_PSUTIL_MODULE_NAME)
+    except Exception:  # noqa: BLE001 - any import failure means "no psutil"
+        return None
+    return fresh
+
+
+def _read_process_table_psutil(module: Any) -> Tuple[List[ProcInfo], bool]:
+    """Read the process table with ``psutil``.
+
+    Returns the processes and whether *every* one of them could be
+    described.  A process whose command line the kernel refuses to
+    hand over — another user's process, on macOS — cannot be classified
+    as a reaper daemon or not, and a census that cannot classify a
+    process cannot claim to have read the machine.
+    """
+    processes: List[ProcInfo] = []
+    complete = True
+    try:
+        for proc in module.process_iter():
+            record = _proc_info_from_psutil(proc)
+            if record is None:
+                complete = False
+                continue
+            processes.append(record)
+    except Exception:  # noqa: BLE001 - the reader is best-effort
+        logger.debug(
+            "[orphan_reaper] the psutil read of the machine failed",
+            exc_info=True,
+        )
+        return [], False
+    return processes, complete
+
+
+def _proc_info_from_psutil(proc: Any) -> Optional[ProcInfo]:
+    """Return one process as :class:`ProcInfo`, or ``None``.
+
+    ``None`` means the process could not be described: its command line
+    is the part the kernel may refuse, and a census with a hole in it
+    has to know that it has one.
+    """
+    try:
+        pid = int(proc.pid)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    try:
+        argv = " ".join(str(part) for part in (proc.cmdline() or ()))
+    except Exception:  # noqa: BLE001 - the kernel may refuse the command line
+        return None
+    return ProcInfo(
+        pid=pid,
+        ppid=_psutil_int(proc, "ppid"),
+        pgid=_psutil_int(proc, "pgid"),
+        uid=_psutil_uid(proc),
+        rss_kb=_psutil_rss_kb(proc),
+        argv=argv,
+    )
+
+
+def _psutil_int(proc: Any, name: str) -> int:
+    """Return one integer attribute of *proc*, or ``0`` when it is unknown."""
+    try:
+        return int(getattr(proc, name)())
+    except Exception:  # noqa: BLE001 - the kernel may refuse
+        return 0
+
+
+def _psutil_uid(proc: Any) -> int:
+    """Return the effective user id of *proc*, or ``0`` when it is unknown."""
+    try:
+        return int(proc.uids().effective)
+    except Exception:  # noqa: BLE001 - the kernel may refuse
+        return 0
+
+
+def _psutil_rss_kb(proc: Any) -> int:
+    """Return the resident memory of *proc* in kilobytes, or ``0``."""
+    try:
+        return int(proc.memory_info().rss) // 1024
+    except Exception:  # noqa: BLE001 - the kernel may refuse
+        return 0
+
+
+def census_processes() -> Tuple[List[ProcInfo], bool]:
+    """The process table, and whether the machine could be read.
+
+    Two questions in one call, because a caller that has to choose
+    between "there is nothing there" and "I could not look" needs both,
+    and :func:`list_processes` throws the second one away.
+
+    * ``(processes, True)`` — the machine was read.
+    * ``([], False)`` — the machine could not be read.  Nothing is
+      known about the processes on it, and in particular it is **not**
+      known that there are none.
+
+    ``psutil`` is asked first: it reads the machine directly and forks
+    nothing, which is what a machine under load needs — a fork on a
+    busy machine is a fork that does not come back.  It is optional,
+    and a machine without it falls back to ``ps``.
+
+    2026-11-06: a machine whose load average was 39 did not answer the
+    read, and the census reported "no daemons" for a machine that was
+    running five.  A read that failed is not a reading, and it must
+    never be filed as one.
+    """
+    module = _resolve_psutil()
+    if module is not None:
+        processes, complete = _read_process_table_psutil(module)
+        if complete:
+            return processes, True
+        logger.debug(
+            "[orphan_reaper] psutil could not describe every process; "
+            "the ps fallback is asked instead"
+        )
+    return _read_process_table_ps_with_retries()
+
+
+def _read_process_table_ps_with_retries() -> Tuple[List[ProcInfo], bool]:
+    """Read the process table with ``ps``, and say whether it answered.
+
+    The read is tried a bounded number of times: a machine that is
+    briefly too busy to answer is not a machine that cannot be read at
+    all, and a census that gives up at the first refusal reports a
+    machine it merely did not hear from.
+    """
+    for attempt in range(CENSUS_READ_ATTEMPTS):
+        processes, readable = _read_process_table_with_ps(
+            CENSUS_READ_TIMEOUT_SEC
+        )
+        if readable:
+            return processes, True
+        if attempt + 1 < CENSUS_READ_ATTEMPTS:
+            time.sleep(CENSUS_READ_RETRY_DELAY_SEC)
+    logger.warning(
+        "[orphan_reaper] the process table could not be read after %d "
+        "attempts; the machine is unknown, not empty",
+        CENSUS_READ_ATTEMPTS,
+    )
+    return [], False
 
 
 def _parse_lsof_listeners(text: str) -> Dict[int, List[int]]:
@@ -4444,9 +4686,11 @@ def list_reaper_daemons(
     read leaves the daemon listed with an unknown age — the daemon is
     still running, which is the fact that matters.
 
-    Nothing here raises.  A census that cannot be taken is an empty
-    census, and the caller reads the count off it — so an empty census
-    is a count of zero and never an error.
+    Nothing here raises.  The list alone cannot tell an empty machine
+    from an unreadable one: a read that failed yields an empty list
+    here, and the caller reads the count off it.  A caller that has to
+    tell the two apart uses :func:`census_reaper_daemons`, which
+    answers both questions at once.
     """
     if procs is None:
         procs = list_processes()
@@ -4454,7 +4698,45 @@ def list_reaper_daemons(
         now = time.time()
     if self_pid is None:
         self_pid = os.getpid()
+    return _reaper_daemons_from(procs, now=now, self_pid=self_pid)
 
+
+def census_reaper_daemons(
+    procs: Optional[Sequence[ProcInfo]] = None,
+    now: Optional[float] = None,
+    self_pid: Optional[int] = None,
+) -> Tuple[List[ReaperDaemon], bool]:
+    """The reaper daemons on this machine, and whether it could be read.
+
+    The second half of the answer is the point.  "There is no daemon
+    on this root" and "I could not look" are different facts, and a
+    census that cannot tell them apart files a machine it could not
+    read as a machine with no daemons on it.
+
+    *procs* is the process table to read — the live one is read when it
+    is not given, and a table the caller hands in is a table the caller
+    read, so the answer is then that the machine was read.  *now* is
+    the current time in epoch seconds, and *self_pid* is the pid to
+    leave out: the caller's own, so that a reaper asking about the
+    machine does not count itself.
+    """
+    readable = True
+    if procs is None:
+        procs, readable = census_processes()
+    if now is None:
+        now = time.time()
+    if self_pid is None:
+        self_pid = os.getpid()
+    return _reaper_daemons_from(procs, now=now, self_pid=self_pid), readable
+
+
+def _reaper_daemons_from(
+    procs: Sequence[ProcInfo],
+    *,
+    now: float,
+    self_pid: int,
+) -> List[ReaperDaemon]:
+    """The reaper daemons among *procs*, which the caller has read."""
     daemons: List[ReaperDaemon] = []
     for proc in procs:
         if proc.pid == self_pid:

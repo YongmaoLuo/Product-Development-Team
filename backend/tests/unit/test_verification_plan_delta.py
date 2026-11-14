@@ -372,6 +372,64 @@ def test_allocator_never_emits_definitionless_id() -> None:
         assert entry["gaps"], "a rejection must say what was missing"
 
 
+def test_an_api_test_with_a_bare_json_path_never_lands() -> None:
+    """裸 ``json_path`` 的新增**连号都拿不到**。
+
+    2026-11-06（VP-018）：``lookup_json_path`` 只认以 ``$`` 开头的路径，
+    而增量 LLM 写出来的 ``json_path`` 有时是裸成员名（``decision_id``）。
+    这种新增落进计划就是一条**永远跑不出结论**的判据 —— 它跑出来的失败是
+    「subject not found」，读起来像产品缺陷（VP-018 就是这么被修了一轮的）。
+    挡在发号之前，它连计划都进不去。
+    """
+    from verification_plan_delta import apply_delta, parse_delta_payload
+
+    plan = _plan(_vp("VP-001"))
+    delta = parse_delta_payload({
+        "add": [
+            {
+                "title": "裸路径的 api_test",
+                "reason": "依据",
+                "verification_method": "api_test",
+                "request": {"method": "GET", "url": "http://x/y"},
+                "assertions": [
+                    {"name": "返回 decision_id", "json_path": "decision_id",
+                     "exists": True},
+                ],
+            },
+        ],
+        "obsolete": [],
+    }, plan)
+
+    summary = apply_delta(plan, delta, round_number=4)
+
+    assert summary["added"] == [], (
+        "a bare json_path cannot be resolved by the runner, so it must not land"
+    )
+    assert [vp["id"] for vp in plan["verification_points"]] == ["VP-001"], (
+        "a definition-less addition must not consume a VP id"
+    )
+    assert summary["rejected_definitionless"], (
+        "the rejection must leave a trace: an unusable addition dropped "
+        "silently leaves no audit"
+    )
+    [entry] = summary["rejected_definitionless"]
+    assert any(
+        "json_path" in gap and "$" in gap for gap in entry["gaps"]
+    ), entry["gaps"]
+
+
+def test_the_delta_prompt_teaches_the_dollar_root() -> None:
+    """提示词必须教 ``$`` 根 —— 判据写错这件事要从源头少发生。
+
+    2026-11-06（VP-018）：提示词只说了 ``json_path`` 是合法主体，没说
+    路径长什么样，于是增量 LLM 写出了裸成员名。
+    """
+    from verification_plan_delta import DELTA_SYSTEM_PROMPT
+
+    assert "json_path" in DELTA_SYSTEM_PROMPT
+    assert "$.decision_id" in DELTA_SYSTEM_PROMPT
+
+
 def test_added_vp_has_no_test_command_field() -> None:
     """VP 早已没有 ``test_command``（C8），增量路径不许把它塞回来。"""
     from verification_plan_delta import apply_delta, parse_delta_payload

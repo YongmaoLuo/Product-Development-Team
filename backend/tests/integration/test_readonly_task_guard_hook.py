@@ -47,6 +47,20 @@ from file_lock_broker import FileLockBroker  # noqa: E402
 from file_lock_protocol import socket_path  # noqa: E402
 
 
+#: How long the caller waits for one guard-hook spawn.
+#:
+#: The guard is a separate process, and on a loaded host the interpreter
+#: alone can take the better part of a minute to come up.  The broker path
+#: starts a SECOND interpreter (the lock CLI) on top of that, so the whole
+#: path costs roughly two spawns.  A ceiling below that makes the CALLER
+#: die before the guard has rendered its verdict -- the case then reports
+#: a broken contract for what is really a slow machine.
+#:
+#: This is the test's own waiting ceiling and nothing else: no exit code,
+#: no stderr match, no assertion and no loop count moves with it.
+_HOOK_SPAWN_TIMEOUT_S = 150
+
+
 @pytest.fixture
 def workspace(tmp_path):
     """A project dir, a plans dir, and the guard script, ready to invoke."""
@@ -101,7 +115,7 @@ def _run_hook(workspace, target, *, broker_on, task_id="t1",
         capture_output=True,
         text=True,
         env=env,
-        timeout=60,
+        timeout=_HOOK_SPAWN_TIMEOUT_S,
     )
     return proc.returncode, proc.stderr
 
@@ -526,7 +540,8 @@ def _stamp_readonly_task_src():
     return coding_tool._stamp_readonly_task
 
 
-def test_a_concurrent_rematerialisation_never_disarms_the_hook(workspace):
+@pytest.mark.timeout(600)
+def test_a_concurrent_rematerialisation_never_disarms_the_hook(workspace, monkeypatch):
     """The guard script is never visible half-written.
 
     Every ``import coding_tool`` re-materialises the shared tmpfile, and
@@ -534,11 +549,6 @@ def test_a_concurrent_rematerialisation_never_disarms_the_hook(workspace):
     so a hook starting inside that window runs a 0-byte script and exits
     0 -- the read-only refusal silently disappears. CI hit exactly that
     (root-4, run 39014769298): exit 0 with empty stderr.
-
-    Falsifier: a writer thread re-materialises the script while the
-    reader below inspects the same path. With an in-place write the
-    reader observes a short body; with an atomic replace it never sees
-    anything but a complete script.
 
     The writer is bounded on purpose. A timed tight loop is a CPU and
     filesystem stressor, and this shard's sibling tests drive a real
@@ -549,18 +559,44 @@ def test_a_concurrent_rematerialisation_never_disarms_the_hook(workspace):
     rewrites at 1 ms still expose a non-atomic write without starving a
     neighbour.
 
+    The falsifier is DETERMINISTIC, not a race that is usually empty.
+    The writers below are threads in THIS process, so the pid cannot
+    tell them apart: a scratch name derived from the pid alone is shared
+    by every writer in the process. Sharing one scratch path is not
+    untidy, it is the defect -- writer B truncates the file writer A is
+    about to publish (A then publishes a half-written guard, so a reader
+    sees a 0-byte script), and B afterwards finds its scratch file
+    already renamed away (``FileNotFoundError``). Both symptoms land on
+    a timing window, which is exactly why this test used to be an empty
+    falsifier four times out of five: three reads against one writer
+    almost never met the window, so it shipped a regression detector
+    that did not detect.
+
+    So the judgement does not wait for the race: the scratch path each
+    write actually publishes from is captured (the source handed to
+    ``os.replace`` IS the scratch path that write used) and asserted to
+    be pairwise distinct. With one scratch path for the whole process
+    the paths are equal and the assertion fails EVERY time -- no luck
+    involved. The captured names are also checked for the shape the
+    contract asks for: this process's pid (which separates writers of
+    different processes) followed by a per-write unique id (which
+    separates two writers inside this one). The reader stays as the
+    black-box confirmation: it samples the published path while the
+    writers rewrite it and must never see anything but a complete
+    script -- and never an EMPTY one, which is the exact shape of the
+    CI failure (a hook running a 0-byte script prints nothing and exits
+    0, so the refusal silently disappears).
+
     The reader is dense on purpose, for the opposite reason: the window
     is a small slice of each 1 ms sleep, so how many times the reader
-    looks decides whether this test can fail at all. With one read per
-    hook call -- 3 reads per run -- the in-place write was caught in 1
-    of 5 runs, so the falsifier was empty four times out of five and
-    this test would have shipped a regression detector that does not
-    detect. Measured against the in-place write, the first short body
-    showed up at read 1 twice, 256, 475, 1073 and worst 1431 of 20
-    trials (a read costs ~11 us). 20000 samples is ~14x the worst case
-    observed and still bounded: it ends in ~0.2 s and stops the moment
-    the writer's 500 rewrites are done.
+    looks decides whether it can catch anything at all. Measured
+    against the in-place write, the first short body showed up at read
+    1 twice, 256, 475, 1073 and worst 1431 of 20 trials (a read costs
+    ~11 us). 20000 samples is ~14x the worst case observed and still
+    bounded: it ends in ~0.2 s and stops the moment the writers' 500
+    rewrites are done.
     """
+    import os
     import threading
     import time
 
@@ -570,21 +606,52 @@ def test_a_concurrent_rematerialisation_never_disarms_the_hook(workspace):
     src = coding_tool._EDIT_WRITE_FORMAL_REPO_GUARD_SRC
     stop = threading.Event()
 
-    def _rewrite():
-        for _ in range(500):
-            if stop.is_set():
-                return
-            coding_tool._materialise_guard_script(path)
-            time.sleep(0.001)
+    WRITERS = 3
+    WRITES_PER_WRITER = 500
 
-    writer = threading.Thread(target=_rewrite, daemon=True)
-    writer.start()
+    # The evidence, collected from the publish step itself: ``os.replace``
+    # is how a write becomes visible, so the source it is handed is the
+    # scratch path THAT write used.
+    real_os = coding_tool.os
+    scratch_paths = []
+    scratch_lock = threading.Lock()
+
+    class _RecordingOs:
+        """Delegates to the real ``os`` and records each publish source."""
+
+        def __getattr__(self, name):
+            return getattr(real_os, name)
+
+        def replace(self, src_path, dst_path):
+            with scratch_lock:
+                scratch_paths.append(Path(src_path))
+            return real_os.replace(src_path, dst_path)
+
+    monkeypatch.setattr(coding_tool, "os", _RecordingOs())
+
+    writer_errors = []
+
+    def _rewrite():
+        try:
+            for _ in range(WRITES_PER_WRITER):
+                if stop.is_set():
+                    return
+                coding_tool._materialise_guard_script(path)
+                time.sleep(0.001)
+        except Exception as exc:  # noqa: BLE001 -- recorded, asserted below
+            writer_errors.append(repr(exc))
+
+    writers = [threading.Thread(target=_rewrite, daemon=True)
+               for _ in range(WRITERS)]
+    for writer in writers:
+        writer.start()
     try:
-        # The falsifier, inside the rewrite window: every read here races
-        # the writer, and an atomic replace makes a short body
-        # unreachable. Bounded so a healthy writer cannot spin forever --
-        # 500 rewrites at 1 ms finish in ~0.66 s, long before 20000 reads
-        # are spent, so this loop cannot outlive the race it is sampling.
+        # The black-box half of the falsifier, inside the rewrite window:
+        # every read here races the writers, and an atomic replace makes
+        # a short body unreachable. Bounded so a healthy writer cannot
+        # spin forever -- 500 rewrites at 1 ms finish in ~0.66 s, long
+        # before 20000 reads are spent, so this loop cannot outlive the
+        # race it is sampling.
         short = None
         for _ in range(20000):
             body = path.read_text(encoding="utf-8")
@@ -592,8 +659,9 @@ def test_a_concurrent_rematerialisation_never_disarms_the_hook(workspace):
                 short = len(body)
                 break
         assert short is None, (
-            "a reader saw the guard script truncated to %d byte(s); a hook "
-            "starting then would exit 0 and allow the edit" % (short,)
+            "a reader saw the guard script truncated to %d byte(s)%s; a hook "
+            "starting then would exit 0 and allow the edit"
+            % (short, " (it was EMPTY)" if short == 0 else "")
         )
 
         # The black-box symptom, still inside the same window: the guard
@@ -606,6 +674,86 @@ def test_a_concurrent_rematerialisation_never_disarms_the_hook(workspace):
                 broker_on=True, read_only=True,
             )
             assert code == 2, stderr
+
+        # The deterministic half: every writer must have finished its
+        # quota before the scratch paths are judged, otherwise the sample
+        # is partial and the comparison below proves nothing.
+        for writer in writers:
+            writer.join(timeout=30)
+        assert not writer_errors, (
+            "a writer failed while re-materialising the guard script: %r"
+            % (writer_errors[:3],)
+        )
+        assert len(scratch_paths) == WRITERS * WRITES_PER_WRITER, (
+            "expected %d scratch paths (one per write), recorded %d"
+            % (WRITERS * WRITES_PER_WRITER, len(scratch_paths))
+        )
+        distinct = len(set(scratch_paths))
+        assert distinct == len(scratch_paths), (
+            "two writers shared one scratch path: %d writes produced only "
+            "%d distinct scratch path(s), so one writer can publish "
+            "another writer's half-written script"
+            % (len(scratch_paths), distinct)
+        )
+        # The other half of the contract: the scratch name carries this
+        # process's pid (that is what separates writers of DIFFERENT
+        # processes) plus a per-write unique component (that is what
+        # separates two writers inside THIS process). Pairwise distinct
+        # names that all carry the pid can only come from a per-write
+        # unique id -- a pid-only name would be one name for all of them.
+        pid = str(os.getpid())
+        prefix = path.name + "." + pid + "."
+        for scratch in scratch_paths:
+            assert scratch.name.startswith(prefix), (
+                "the scratch path %r does not carry this process's pid (%s) "
+                "followed by a per-write unique id" % (scratch.name, pid)
+            )
     finally:
         stop.set()
-        writer.join(timeout=5)
+        for writer in writers:
+            writer.join(timeout=5)
+
+
+def test_a_failed_rewrite_leaves_no_scratch_file_behind(tmp_path, monkeypatch):
+    """A failed write must not strand its scratch file.
+
+    Every write now has a name of its own (the pid plus a per-write
+    unique id), so a write that FAILS would leave a new orphan in the
+    guard's directory every time -- the old pid-only name could strand
+    at most one, and nothing would ever collect the rest. So a failed
+    write removes its own scratch file and re-raises; the published path
+    keeps the previous complete script, so a reader still never sees a
+    half-written guard.
+    """
+    import pathlib
+
+    import coding_tool
+
+    target = tmp_path / "guard.py"
+    coding_tool._materialise_guard_script(target)
+    published = target.read_bytes()
+
+    real_write_text = pathlib.Path.write_text
+
+    def _explode(self, *args, **kwargs):
+        if self.name.endswith(".tmp"):
+            # A truncated write that then fails, the worst case: the
+            # scratch file exists and holds half a script.
+            real_write_text(self, "half written", encoding="utf-8")
+            raise RuntimeError("disk full")
+        return real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "write_text", _explode)
+    try:
+        with pytest.raises(RuntimeError):
+            coding_tool._materialise_guard_script(target)
+    finally:
+        monkeypatch.undo()
+
+    left = sorted(p.name for p in tmp_path.iterdir())
+    assert left == [target.name], (
+        "a failed rewrite stranded %r next to the guard script" % (left,)
+    )
+    assert target.read_bytes() == published, (
+        "a failed rewrite damaged the published guard script"
+    )

@@ -142,9 +142,28 @@ def test_probe_listening_process(monkeypatch) -> None:
     assert probe.error == ""
 
 
+def _stub_no_listener(monkeypatch) -> None:
+    """把佐证探测固定成「没人听」。
+
+    2026-11-08：``probe_port`` 在 ``lsof`` 说没人持有时会再用
+    ``_port_is_listening`` 佐证一次（main 的 ``ce21cfd6`` 引入的 TCP 探测）。
+    那条佐证读的是**宿主真实的端口表** —— 而 8080 会被无关进程占用
+    （2026-11-08 实测：另一个 worktree 的 ``python -m backend.server``
+    正监听 127.0.0.1:8080）。于是「lsof 说没人听」这条被真实端口状态翻成了
+    ``listening=True``。
+
+    被测对象是 **lsof 分支**，不是佐证探测，所以这里把它固定住：用例不密封
+    不是产品缺陷。断言与端口号一字不改。
+    """
+    monkeypatch.setattr(
+        "service_freshness._port_is_listening", lambda *a, **k: False,
+    )
+
+
 def test_probe_no_listener(monkeypatch) -> None:
     from service_freshness import probe_port
     _stub_run(monkeypatch, "", None, None)
+    _stub_no_listener(monkeypatch)
     probe = probe_port(8080)
     assert probe.listening is False
     assert probe.pids == []
@@ -154,6 +173,7 @@ def test_probe_no_listener(monkeypatch) -> None:
 def test_probe_lsof_failure_sets_error(monkeypatch) -> None:
     from service_freshness import probe_port
     monkeypatch.setattr("service_freshness._run_probe_cmd", lambda *a, **k: None)
+    _stub_no_listener(monkeypatch)
     probe = probe_port(8080)
     assert probe.listening is False
     assert "lsof" in probe.error

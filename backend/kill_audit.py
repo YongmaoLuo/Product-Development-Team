@@ -44,6 +44,18 @@ The rules the records follow
   the records written next to it.  A reader that has to guess a field
   name cannot query the ledger -- and a query that cannot match
   answers nothing while looking rigorous.
+* **A liveness probe is recorded too.**  A kill with signal ``0`` asks
+  the kernel whether the pid exists and sends nothing at all — but it is
+  still a call that reached the kernel, and this file is the account of
+  what this process asked the kernel to do.  It is the most frequent
+  call in the system and every record costs a stack extraction and a
+  file write, so the records are **capped**
+  (:data:`KILL_AUDIT_MAX_RECORDS`) rather than filtered.  A cap keeps
+  the newest evidence; a filter would delete a whole class of calls
+  from the account, and "signal 0 was never recorded" is exactly the
+  blind spot an audit cannot afford (2026-11-08: an early return for
+  ``sig == 0`` removed the most common kind of call from the records,
+  and the cases that pin "every kill is written down" went red).
 
 The sending side and the receiving side
 ---------------------------------------
@@ -897,6 +909,18 @@ def install_kill_audit() -> None:
             return
         if isinstance(sig, bool) or not isinstance(sig, int):
             sig = -1
+        # Signal 0 is recorded like any other signal.  It asks the
+        # kernel whether the pid exists and sends nothing at all, but it
+        # is still a call that reached the kernel, and the account of
+        # what this process asked the kernel to do does not get to omit
+        # a class of calls (2026-11-08: the early return that skipped
+        # ``sig == 0`` removed the most common kind of call from the
+        # records, and the cases that pin "every kill is written down"
+        # went red against it).
+        #
+        # The cost of writing them is bounded by KILL_AUDIT_MAX_RECORDS,
+        # which is a cap rather than a filter: a cap keeps the newest
+        # evidence, a filter would delete the evidence entirely.
         try:
             write_kill_audit(kind, target, sig)
         except Exception:  # noqa: BLE001 - the audit never blocks a signal
