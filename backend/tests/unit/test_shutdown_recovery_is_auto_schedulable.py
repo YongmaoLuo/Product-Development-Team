@@ -57,10 +57,20 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import NamedTuple
 
+import pytest
 from pause_state import PAUSE_CHECKPOINT_FILENAME, write_pause_checkpoint
 from plan_scheduler.facts import PlanFactsReader
+from plan_state import PlanState
 from server import _execution_state, _recover_execution_states
+
+# ``server`` must be imported first: it seeds ``sys.modules['server']``
+# and then wires the ``routes`` package, and ``routes.execution``
+# late-binds back into it.  So the import below comes *after* the one
+# above on purpose -- do not sort these two.
+from routes import execution as routes_execution
 from shutdown_checkpoint import SHUTDOWN_STOP_REASON
 from state_machine.db.connection import open as open_db
 from state_machine.db.schema import migrate
@@ -336,4 +346,220 @@ def test_a_user_stopped_plan_is_not_in_the_queue(
     )
     assert "p-stopped" not in _queued_plan_ids(db_path, plans_root), (
         "a cancelled run must not be queued for another attempt"
+    )
+
+
+# ----------------------------------------------------------------------
+# The boot repair: the phase is moved, the verdict is not judged again
+# ----------------------------------------------------------------------
+
+
+class _PhaseSpy(NamedTuple):
+    """What the boot repair did to a plan's phase.
+
+    * ``opened`` -- the plans whose state was opened at all.  A repair
+      that has nothing to repair opens nothing;
+    * ``reads`` -- the phases the repair read, and in what order;
+    * ``writes`` -- the phases the repair wrote.
+    """
+
+    opened: list
+    reads: list
+    writes: list
+
+
+def _phase_writer_spy(monkeypatch):
+    """Record what the boot repair opens, reads and writes.
+
+    ``routes.execution._restore_parked_phase`` repairs a parked plan's
+    phase through ``PlanState.force_set_phase`` -- the one writer of a
+    plan's phase.  The spy stands in front of that writer, in front of
+    the read that precedes it, and in front of the state holder's own
+    constructor, so a test can say **when** the repair writes and what
+    it writes, and not merely that the phase ended up somewhere.  Every
+    call goes through: the repair's own write still lands, and the row
+    it writes is the row the test reads back.
+    """
+    opened = []
+    reads = []
+    writes = []
+
+    original_open = PlanState.__init__
+    original_read = PlanState.get_current_phase
+    original_write = PlanState.force_set_phase
+
+    def _open_spy(self, plan_dir):
+        opened.append(Path(plan_dir).name)
+        return original_open(self, plan_dir)
+
+    def _read_spy(self):
+        phase = original_read(self)
+        reads.append((self.plan_dir.name, phase))
+        return phase
+
+    def _write_spy(self, phase):
+        writes.append((self.plan_dir.name, phase))
+        return original_write(self, phase)
+
+    monkeypatch.setattr(PlanState, "__init__", _open_spy)
+    monkeypatch.setattr(PlanState, "get_current_phase", _read_spy)
+    monkeypatch.setattr(PlanState, "force_set_phase", _write_spy)
+    return _PhaseSpy(opened, reads, writes)
+
+
+def _execution_row(db_path, plan_id):
+    """The run state row, as the recovery path reads it."""
+    conn = open_db(db_path)
+    try:
+        return ExecutionRepository(conn).summary(plan_id)
+    finally:
+        conn.close()
+
+
+def test_shutdown_restore_pins_phase_repair_for_a_parked_plan(
+    tmp_path, monkeypatch, sample_plan_factory
+):
+    """The phase a dying server failed to write is written by the repair.
+
+    The repair is ``backend/routes/execution.py:2511``'s
+    ``_restore_parked_phase`` (the ``startup_reconcile`` path).  A plan
+    whose run the server parked under a shutdown but whose phase was
+    never moved still wears the phase of a live run -- and the
+    scheduler never picks a plan up from there.  So the repair moves the
+    phase, and it moves it through the phase writer: the read and the
+    write are both pinned here, so a repair that guessed the phase, or
+    wrote it by hand, would not pass.
+    """
+    db_path = _state_db(tmp_path, monkeypatch)
+    plan_dir = _seed_plan(
+        sample_plan_factory, db_path, "p-parked", "executing"
+    )
+    spy = _phase_writer_spy(monkeypatch)
+
+    routes_execution._restore_parked_phase("p-parked", plan_dir)
+
+    assert spy.opened == ["p-parked"], "the repair opened the plan"
+    assert spy.reads == [("p-parked", "executing")], (
+        "the repair decides on the phase the plan actually stands in"
+    )
+    assert spy.writes == [("p-parked", "queued")], (
+        "the repair moves the phase to the one the scheduler reads"
+    )
+    assert _phase_of(db_path, "p-parked") == "queued", (
+        "the parked plan is back in the waiting set"
+    )
+
+
+def test_shutdown_restore_pins_phase_repair_for_a_queued_plan(
+    tmp_path, monkeypatch, sample_plan_factory
+):
+    """A plan that is already queued is not written again.
+
+    The repair writes the phase the plan already stands in.  Writing it
+    a second time is not free -- the write moves the plan's completed
+    phases along with it -- and it is not needed: the plan is already
+    where the scheduler will find it.
+    """
+    db_path = _state_db(tmp_path, monkeypatch)
+    plan_dir = _seed_plan(sample_plan_factory, db_path, "p-queued", "queued")
+    spy = _phase_writer_spy(monkeypatch)
+
+    routes_execution._restore_parked_phase("p-queued", plan_dir)
+
+    assert spy.reads == [("p-queued", "queued")], (
+        "the repair looked at the phase before deciding to leave it"
+    )
+    assert spy.writes == [], "a plan that is already queued is not written again"
+    assert _phase_of(db_path, "p-queued") == "queued"
+
+
+@pytest.mark.parametrize(
+    "terminal", ["completed", "failed", "stopped", "archived"]
+)
+def test_shutdown_restore_pins_phase_repair_for_a_terminal_plan(
+    tmp_path, monkeypatch, sample_plan_factory, terminal
+):
+    """A plan that has moved on is not put back in line.
+
+    The terminal phases are the four the repair knows about
+    (``server._TERMINAL_PHASES``).  A plan that reached one of them
+    after the shutdown was parked has moved on since -- its row is an
+    old verdict rather than the current state -- so re-queueing it
+    would resurrect work that is already done.
+    """
+    db_path = _state_db(tmp_path, monkeypatch)
+    plan_dir = _seed_plan(sample_plan_factory, db_path, "p-done", terminal)
+    spy = _phase_writer_spy(monkeypatch)
+
+    routes_execution._restore_parked_phase("p-done", plan_dir)
+
+    assert spy.reads == [("p-done", terminal)], (
+        "the repair looked at the phase before deciding to leave it"
+    )
+    assert spy.writes == [], (
+        f"a plan in {terminal} is not work that is waiting any more"
+    )
+    assert _phase_of(db_path, "p-done") == terminal
+
+
+def test_shutdown_restore_pins_phase_repair_without_a_plan_directory(
+    tmp_path, monkeypatch, sample_plan_factory
+):
+    """No plan directory means no phase to repair.
+
+    The repair writes a phase, not a state of its own: with no
+    directory there is nothing to read the phase from, and inventing
+    one would put a plan in the queue that nobody has ever run.
+    """
+    db_path = _state_db(tmp_path, monkeypatch)
+    _seed_plan(sample_plan_factory, db_path, "p-elsewhere", "executing")
+    missing = tmp_path / "plans" / "p-missing"
+    spy = _phase_writer_spy(monkeypatch)
+
+    routes_execution._restore_parked_phase("p-missing", missing)
+
+    assert spy.opened == [], (
+        "there was no plan to open: the repair did not even look"
+    )
+    assert spy.reads == [], "there was no phase to read"
+    assert spy.writes == [], "there was no phase to write"
+    assert _phase_of(db_path, "p-missing") is None, (
+        "the repair invented a phase for a plan that has no directory"
+    )
+
+
+def test_shutdown_restore_pins_phase_repair_does_not_judge_the_row(
+    tmp_path, monkeypatch, sample_plan_factory
+):
+    """The repair moves the phase; the row's verdict stands as it is.
+
+    The row says the server went down under the run, and that verdict
+    was written once.  The repair is not a second judgement -- it takes
+    the verdict as it is and moves the phase to agree with it.  So the
+    row must come out of the repair exactly as it went in.
+    """
+    db_path = _state_db(tmp_path, monkeypatch)
+    plan_dir = _seed_plan(
+        sample_plan_factory, db_path, "p-parked", "executing"
+    )
+    _seed_execution(
+        db_path,
+        "p-parked",
+        exec_status="stopped",
+        stop_reason=SHUTDOWN_STOP_REASON,
+        exec_pid=_DEAD_PID,
+        started_at=_naive_local(datetime.now(timezone.utc)),
+    )
+    spy = _phase_writer_spy(monkeypatch)
+
+    routes_execution._restore_parked_phase("p-parked", plan_dir)
+
+    assert spy.writes == [("p-parked", "queued")], "the phase is moved"
+    row = _execution_row(db_path, "p-parked")
+    assert row is not None, "the row is gone"
+    assert row["exec_status"] == "stopped", (
+        "the repair re-judged the run: a verdict is judged once, not twice"
+    )
+    assert row["stop_reason"] == SHUTDOWN_STOP_REASON, (
+        "the repair re-judged the run: a verdict is judged once, not twice"
     )

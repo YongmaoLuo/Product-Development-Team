@@ -1,33 +1,33 @@
-"""Unit tests: the victim is the **youngest plan**, not the newest slot.
+"""Unit tests: ``created_at`` no longer has a say in the victim's identity.
 
 What this file holds down
 -------------------------
-The scheduler interrupts a running plan when a slot has to be freed,
-and it has to pick the right one.  The old rule — "the plan that took
-its slot most recently" — reads the wrong column: the slot timestamp
-is rewritten whenever the ledger is reconciled, so after a reconcile
-every plan looks as if it had just started and the rule stops meaning
-anything.
+The scheduler interrupts a running plan when a slot has to be freed, and
+it has to pick the right one.  The rule it used to follow — "the plan
+that was created most recently" — read a column that says nothing about
+how much work a plan has done, and the column it fell back to — the
+moment the slot was taken — is rewritten whenever the ledger is
+reconciled, so after a reconcile every plan looks as if it had just
+started and the rule stops meaning anything.
 
-The rule that survives the rewrite is the one about the **plan** rather
-than about the slot: the youngest plan is the one that was created
-most recently, because it is the one least likely to be wrapping up.
-Interrupting the plan that is closest to finishing is what the operator
-would not forgive.
+Both columns are gone from the order.  What decides now is the
+**priority** and the **runtime**, and neither of them is a timestamp of
+the plan's birth.  The order itself is pinned in
+``test_victim_priority_order.py``; what this file holds down is that
+the creation time is out of it altogether.
 
 The contracts this file pins:
 
-1. **The creation time decides.**  A plan that took its slot early but
-   was created late is the victim; a plan that took its slot late but
-   was created early is not.
-2. **An unreadable creation time falls back to the slot time.**  A
-   missing, ``NULL``, zero or non-numeric ``created_at`` is not a
-   creation time — the policy falls back to the moment the slot was
-   taken, which is the behaviour it always had.
-3. **A tie is broken by name.**  Two plans created at the same moment
-   are told apart by ``plan_id`` in dictionary order, so the answer
-   never depends on the order the entries happened to arrive in.
-4. **No candidate is an answer, not a crash.**  An empty candidate set
+1. **The creation time is not read.**  Two plans that differ only in
+   ``created_at`` are told apart by their runtime, and a ``created_at``
+   built to point the wrong way does not move the victim.
+2. **The order does not depend on the order the entries came in.**
+3. **A creation time the policy cannot read is no creation time at
+   all** — and since the column is not read, an unusable one changes
+   nothing.
+4. **A tie is broken by name.**  Two plans of the same priority and the
+   same runtime are told apart by ``plan_id`` in dictionary order.
+5. **No candidate is an answer, not a crash.**  An empty candidate set
    gives ``None``.
 
 The tests assert **the decision the operator sees** — the plan id — and
@@ -58,61 +58,90 @@ def _running(plan_id: str, elapsed: float, acquired_at: float, **extra) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 1. The creation time decides
+# 1. The creation time is not read
 # ---------------------------------------------------------------------------
 
 
-def test_select_victim_orders_by_creation_age_not_slot_time() -> None:
-    """The plan created last is the victim — not the one that took its slot last.
+def test_created_at_is_not_read() -> None:
+    """The creation time has no say: the runtime decides.
 
-    ``A`` took its slot most recently and ``B`` was created most
-    recently.  Under the old rule (``acquired_at``) the victim would be
-    ``A``; the rule this file pins picks ``B``.
+    ``late`` was created most recently and has run the longest; ``early``
+    was created first and has run the shortest.  The victim is ``early``
+    — the creation time is not read, and the answer is the runtime's.
+    ``M`` is 60 seconds, so that both plans are eligible and the runtime
+    alone is what is left to decide.
     """
     snapshot = {
         "running": [
-            _running("A", 3600, 2000, created_at=1000),
-            _running("B", 3600, 1000, created_at=2000),
+            _running("late", 900, 100, created_at=2000),
+            _running("early", 100, 200, created_at=1000),
         ]
     }
 
-    assert select_victim(snapshot, 600) == "B"
+    assert select_victim(snapshot, 60) == "early"
 
 
-def test_select_victim_orders_by_creation_age_whatever_order_the_entries_came_in() -> None:
+def test_created_at_does_not_move_the_victim() -> None:
+    """Two snapshots that differ only in ``created_at`` give the same answer.
+
+    The creation times are swapped between the two runs of the same two
+    plans — and the victim is the shorter run both times.
+    """
+    creation_times_swapped = {
+        "running": [
+            _running("a", 900, 100, created_at=2000),
+            _running("b", 100, 200, created_at=1000),
+        ]
+    }
+    creation_times_the_other_way_round = {
+        "running": [
+            _running("a", 900, 100, created_at=1000),
+            _running("b", 100, 200, created_at=2000),
+        ]
+    }
+
+    assert select_victim(creation_times_swapped, 60) == "b"
+    assert select_victim(creation_times_the_other_way_round, 60) == "b"
+
+
+def test_created_at_does_not_depend_on_the_order_the_entries_came_in() -> None:
     """The victim's identity does not depend on the order of the running set."""
-    youngest_first = {
+    shortest_first = {
         "running": [
-            _running("A", 3600, 2000, created_at=1000),
-            _running("B", 3600, 1000, created_at=2000),
+            _running("early", 100, 200, created_at=1000),
+            _running("late", 900, 100, created_at=2000),
         ]
     }
-    oldest_first = {
+    longest_first = {
         "running": [
-            _running("B", 3600, 1000, created_at=2000),
-            _running("A", 3600, 2000, created_at=1000),
+            _running("late", 900, 100, created_at=2000),
+            _running("early", 100, 200, created_at=1000),
         ]
     }
 
-    assert select_victim(youngest_first, 600) == "B"
-    assert select_victim(oldest_first, 600) == "B"
+    assert select_victim(shortest_first, 60) == "early"
+    assert select_victim(longest_first, 60) == "early"
 
 
-# ---------------------------------------------------------------------------
-# 2. An unreadable creation time falls back to the slot time
-# ---------------------------------------------------------------------------
+def test_select_victim_without_created_at_judges_by_the_runtime() -> None:
+    """A running entry that carries no creation time is judged like any other.
 
-
-def test_select_victim_falls_back_to_acquired_at_without_created_at() -> None:
-    """A running entry without a creation time is judged by its slot time."""
+    The slot times point the other way round — ``long`` took its slot
+    most recently — so the answer is the runtime's and not the slot's.
+    """
     snapshot = {
         "running": [
-            _running("older", 3600, 1000),
-            _running("younger", 3600, 2000),
+            _running("long", 900, 200),
+            _running("short", 100, 100),
         ]
     }
 
-    assert select_victim(snapshot, 600) == "younger"
+    assert select_victim(snapshot, 60) == "short"
+
+
+# ---------------------------------------------------------------------------
+# 2. An unreadable creation time changes nothing
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -125,22 +154,23 @@ def test_select_victim_falls_back_to_acquired_at_without_created_at() -> None:
     ],
     ids=["null", "zero", "not-a-number", "a-flag"],
 )
-def test_select_victim_treats_an_unusable_created_at_as_missing(
+def test_select_victim_treats_an_unusable_created_at_as_no_creation_time(
     label: str, created_at
 ) -> None:
-    """A creation time the policy cannot read is no creation time at all.
+    """A creation time the policy cannot read changes nothing.
 
-    ``None``, ``0``, a string and a boolean all fall back to the moment
-    the slot was taken — the behaviour the policy always had.
+    ``None``, ``0``, a string and a boolean all read as no creation time
+    at all — and since the column is not read, the answer is the
+    runtime's in every one of the four cases.
     """
     snapshot = {
         "running": [
-            _running("older", 3600, 1000, created_at=created_at),
-            _running("younger", 3600, 2000, created_at=created_at),
+            _running("late", 900, 100, created_at=created_at),
+            _running("early", 100, 200, created_at=created_at),
         ]
     }
 
-    assert select_victim(snapshot, 600) == "younger"
+    assert select_victim(snapshot, 60) == "early"
 
 
 # ---------------------------------------------------------------------------
@@ -149,19 +179,20 @@ def test_select_victim_treats_an_unusable_created_at_as_missing(
 
 
 def test_select_victim_ties_break_on_plan_id() -> None:
-    """Two plans created at the same moment are told apart by name.
+    """Two plans of the same priority and the same runtime are told apart by name.
 
-    The slot times point the other way round, so the answer is the
-    name's and not the slot's.
+    The creation times point the other way round — ``beta`` was created
+    most recently — so the answer is the name's and not the creation
+    time's.
     """
     snapshot = {
         "running": [
-            _running("beta", 3600, 2000, created_at=5000),
-            _running("alpha", 3600, 1000, created_at=5000),
+            _running("beta", 300, 200, created_at=5000),
+            _running("alpha", 300, 100, created_at=1000),
         ]
     }
 
-    assert select_victim(snapshot, 600) == "alpha"
+    assert select_victim(snapshot, 60) == "alpha"
 
 
 # ---------------------------------------------------------------------------

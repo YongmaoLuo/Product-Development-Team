@@ -214,8 +214,38 @@ class _Spawn:
     def __init__(self) -> None:
         self.calls: List[Tuple[List[str], Dict[str, Any]]] = []
         self.posix_spawn_calls: List[Tuple[Any, ...]] = []
+        #: The command the service was declared with, when the caller knows it.
+        self.declared = ""
         #: Every service spawn the capture took, in order.
         self.wrapper_spawns: List[List[str]] = []
+
+    def service_call(self, declared: str = "") -> Optional[Tuple[List[str], Dict[str, Any]]]:
+        """The call that started the **declared** service.
+
+        The spawn path is allowed to start more than one process -- a
+        helper of its own, a probe, anything -- and a recorder that
+        takes "the last one" is a recorder that will one day watch a
+        helper and call it the service.  That is not a hypothetical:
+        the census ``ps`` the registry used to run was exactly such a
+        helper, and every assertion about the service's argv was
+        really an assertion about the census.
+
+        The service is the spawn that carries the declared command, so
+        that is what is selected.  When the declared command is not
+        known, the shape is the other way of telling -- the spawn that
+        is the service's own and not one of the path's probes.  A
+        third way, "the last call", is not used: it is the one that
+        watches a helper and calls it the service.
+        """
+        wanted = declared or self.declared
+        if wanted:
+            for argv, kwargs in self.calls:
+                if argv and argv[-1] == wanted:
+                    return argv, kwargs
+        spawns = self.spawns
+        if spawns:
+            return spawns[-1]
+        return None
 
     @property
     def spawns(self) -> List[Tuple[List[str], Dict[str, Any]]]:
@@ -232,9 +262,9 @@ class _Spawn:
     @property
     def spawned_argv(self) -> List[str]:
         """The argv, whichever way the process was created."""
-        spawns = self.spawns
-        if spawns:
-            return list(spawns[-1][0])
+        call = self.service_call()
+        if call is not None:
+            return list(call[0])
         if self.posix_spawn_calls:
             return list(self.posix_spawn_calls[-1][1])
         return []
@@ -242,17 +272,8 @@ class _Spawn:
     @property
     def spawned_kwargs(self) -> Dict[str, Any]:
         """The keyword arguments the service's own spawn was given."""
-        spawns = self.spawns
-        return dict(spawns[-1][1]) if spawns else {}
-
-    @property
-    def argv(self) -> List[str]:
-        """The argv of the service's own spawn, read the flat way.
-
-        The same answer as :attr:`spawned_argv`, under the name the
-        pins that watch one spawn read.
-        """
-        return self.spawned_argv
+        call = self.service_call()
+        return dict(call[1]) if call is not None else {}
 
     @property
     def kwargs(self) -> Dict[str, Any]:
@@ -264,9 +285,10 @@ class _Spawn:
         return self.spawned_kwargs
 
 
-def _install_recorders(monkeypatch) -> _Spawn:
+def _install_recorders(monkeypatch, declared: str = "") -> _Spawn:
     """Record what the spawn path asks for, without starting anything."""
     record = _Spawn()
+    record.declared = declared
     real_popen = sm.subprocess.Popen
 
     def _fake_popen(argv, **kwargs):
@@ -315,12 +337,14 @@ def _start_recording(
     decide the outcome, and ``_await_exit`` is stubbed because it waits
     two seconds for a process that -- being a recording -- never exits.
     """
-    record = _install_recorders(monkeypatch)
+    decl = _decl(**overrides)
+    # The recorder is told the declared command, so that it can pick the
+    # service's own spawn out of everything the spawn path started.
+    record = _install_recorders(monkeypatch, decl.start_cmd)
     monkeypatch.setattr(sm, "wait_until_ready", lambda decl, t=None: True)
     monkeypatch.setattr(
         sm, "_await_exit", lambda proc, timeout: (False, None)
     )
-    decl = _decl(**overrides)
     runtime = sm.start_service(decl, tmp_path)
     # Exactly one spawn is the service's own.  A start that spawned the
     # service twice, or none at all, would leave the assertions below
@@ -509,6 +533,18 @@ def test_argv_preserves_start_cmd_verbatim(tmp_path, monkeypatch):
     )
     assert all(start_cmd not in part for part in argv[:-1]), (
         f"the declared command appears more than once in the argv: {argv!r}"
+    )
+    # Exactly one spawn carried the declared command.  The recorder
+    # picks the service out of everything the spawn path started, so
+    # this is what says the service was spawned once -- and that the
+    # argv above is the service's and not a helper's.
+    carrying = [
+        call for call in record.calls
+        if call[0] and call[0][-1] == start_cmd
+    ]
+    assert len(carrying) == 1, (
+        f"the declared command was handed to {len(carrying)} spawns, not "
+        f"one: {[c[0][-1] for c in record.calls]!r}"
     )
 
 

@@ -138,10 +138,14 @@ class FakeStore:
         self.writes.append("remove:{0}".format(plan_id))
         self.queue = [row for row in self.queue if row["plan_id"] != plan_id]
 
-    def upsert_slot(self, conn: Any, plan_id: str, stamp: str) -> None:
+    def upsert_slot(
+        self, conn: Any, plan_id: str, stamp: str, priority: int = 0
+    ) -> None:
         """Give a plan its slot."""
         self.writes.append("slot:{0}".format(plan_id))
-        self.slots.append({"plan_id": plan_id, "acquired_at": stamp})
+        self.slots.append(
+            {"plan_id": plan_id, "acquired_at": stamp, "priority": priority}
+        )
 
     def transaction(self, conn: Any) -> Any:
         """A transaction that commits nothing: the case's writes are the record."""

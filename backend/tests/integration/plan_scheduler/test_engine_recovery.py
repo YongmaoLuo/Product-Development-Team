@@ -21,6 +21,13 @@ This file holds down the three rules the recovery follows:
    The order is the plan's own (``updated_at`` and then the plan id),
    and the number it is given is ``MAX(seq) + 1``.
 
+And one rule about the **priority** of a plan that is already working:
+the number the caller gave it is the number it runs at, and the restart
+does not change it.  The number lives in the slot row, the row is
+rewritten by the takeover, and the number has to survive the rewrite —
+otherwise a bug plan at ``-10`` would come back from the restart as an
+ordinary plan at ``0`` and could be interrupted for a feature.
+
 The recovery decides nothing and starts nothing: the first tick after it
 is an ordinary tick, and a plan that is already working is not in
 ``queued``, so it cannot be admitted a second time.
@@ -34,6 +41,7 @@ the lifecycle (which records instead of stopping anything).
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import sys
@@ -63,6 +71,10 @@ MIN_RUNTIME = 600.0
 #: How long the case's child process — the plan that is really
 #: working — stays alive.
 CHILD_LIFETIME = 30
+
+#: The priority a bug plan is given: a negative number, so it stands
+#: ahead of the plans nobody gave a number to.
+BUG_PRIORITY = -10
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +341,10 @@ def _world(
         commands=commands,
         sink=sink,
         clock=clock,
+        # The plans root the engine reads a plan's own intent artifact
+        # from: the recovery has to be able to find the number the
+        # caller gave a plan.
+        plans_dir=_plans_root(),
     )
     return World(engine, store, sink, lifecycle, ledger, clock, _open_db(database.path))
 
@@ -391,6 +407,46 @@ def _slot(conn: sqlite3.Connection, plan_id: str, acquired_at: str) -> None:
         "INSERT OR REPLACE INTO scheduler_slot (plan_id, acquired_at, updated_at) "
         "VALUES (?, ?, ?)",
         (plan_id, acquired_at, acquired_at),
+    )
+
+
+def _slot_with_priority(
+    store: Any, conn: sqlite3.Connection, plan_id: str, acquired_at: str, priority: int
+) -> None:
+    """Write the slot row the admission writes.
+
+    The plan holds compute, and the weight the caller gave it is
+    written down with it — the store's own writer, so the row is the
+    one the scheduler would have written itself.
+    """
+    store.upsert_slot(conn, plan_id, acquired_at, priority=int(priority))
+
+
+def _slot_priority(conn: sqlite3.Connection, plan_id: str) -> Optional[int]:
+    """The priority the slot row of the plan holds.
+
+    ``None`` means there is no slot row at all — a plan that holds no
+    slot has no priority to read.
+    """
+    row = conn.execute(
+        "SELECT priority FROM scheduler_slot WHERE plan_id = ?", (plan_id,)
+    ).fetchone()
+    return None if row is None else int(row[0])
+
+
+def _intent(plan_id: str, priority: int) -> None:
+    """Write the plan's own intent artifact: the number the caller gave.
+
+    The artifact lives in the plan's own directory, and it is the
+    caller's number — the scheduler's copy of it lives in the queue row
+    and in the slot row.
+    """
+    from plan_scheduler.engine import SCHEDULER_INTENT_FILE
+
+    path = _plans_root() / plan_id / SCHEDULER_INTENT_FILE
+    path.write_text(
+        json.dumps({"priority": int(priority)}),
+        encoding="utf-8",
     )
 
 
@@ -697,3 +753,157 @@ def test_empty_database_recovers_to_nothing(
 
     assert _queue_rows(world.read_conn) == [], "the recovery invented a queue"
     assert _slots(world.read_conn) == {}, "the recovery invented a slot"
+
+
+def test_adopted_plan_keeps_its_priority_after_restart(
+    db_factory: Any, plan_factory: Any, case_registry: Any
+) -> None:
+    """The number a running plan runs at survives the restart.
+
+    The plan holds a slot, and the slot carries the weight the caller
+    gave it — that is the number the eviction rule compares the running
+    plans by.  The restart takes the slot over: the old row goes and a
+    new one is written, because the clock is the thing being reset.
+
+    The number has to survive that rewrite.  A takeover that wrote the
+    row without the number would bring a bug plan back from the
+    restart as an ordinary plan at ``0``, and the bug plan would then
+    be interruptible for a feature — the very thing the priority is
+    there to prevent.
+    """
+    world = _world(db_factory, plan_factory, plan_ids=("p1",))
+    conn = world.read_conn
+    live = _live_pid(case_registry)
+
+    _routing(conn, "p1", "executing")
+    _execution(conn, "p1", exec_pid=live, exec_status="running")
+    _slot_with_priority(world.store, conn, "p1", _iso(BASE_EPOCH - 3600), BUG_PRIORITY)
+
+    assert _slot_priority(conn, "p1") == BUG_PRIORITY, (
+        "the case did not start with the priority the plan runs at"
+    )
+
+    world.engine._recover()
+
+    assert _slot_priority(conn, "p1") == BUG_PRIORITY, (
+        "the restart raised the priority of the running plan: {0!r}".format(
+            _slot_priority(conn, "p1")
+        )
+    )
+    # The rest of the takeover is unchanged: the clock is reset, so the
+    # plan is protected for a whole M after the restart.
+    assert _slots(conn)["p1"]["acquired_at"] == _iso(BASE_EPOCH), (
+        "the adopted plan kept its old clock: {0!r}".format(_slots(conn)["p1"])
+    )
+
+
+def test_adopted_plan_without_a_slot_priority_is_rebuilt_from_the_intent(
+    db_factory: Any, plan_factory: Any, case_registry: Any
+) -> None:
+    """A plan adopted without a row is given the number the caller gave.
+
+    The plan was started outside the scheduler — through the lifecycle
+    API, or by the run that was interrupted — so there is no slot row
+    to carry the number over.  The caller's number is in the plan's own
+    artifact, and the recovery reads it out of there: the number the
+    plan runs at after the restart is the number the caller gave.
+    """
+    world = _world(db_factory, plan_factory, plan_ids=("p1",))
+    conn = world.read_conn
+    live = _live_pid(case_registry)
+
+    _intent("p1", BUG_PRIORITY)
+    _routing(conn, "p1", "executing")
+    _execution(conn, "p1", exec_pid=live, exec_status="running")
+
+    assert _slot_priority(conn, "p1") is None, "the case started with a slot row"
+
+    world.engine._recover()
+
+    assert _slot_priority(conn, "p1") == BUG_PRIORITY, (
+        "the adopted plan does not run at the priority the caller gave: "
+        "{0!r}".format(_slot_priority(conn, "p1"))
+    )
+
+
+def test_recovery_leaves_the_default_priority_at_zero(
+    db_factory: Any, plan_factory: Any, case_registry: Any
+) -> None:
+    """A plan nobody gave a number to still runs at zero.
+
+    The default is ``0``, and the recovery never invents a number: a
+    plan that expresses no intent and holds no row runs at ``0``, as
+    it did before the restart.
+    """
+    world = _world(db_factory, plan_factory, plan_ids=("p1",))
+    conn = world.read_conn
+    live = _live_pid(case_registry)
+
+    _routing(conn, "p1", "executing")
+    _execution(conn, "p1", exec_pid=live, exec_status="running")
+
+    world.engine._recover()
+
+    assert _slot_priority(conn, "p1") == 0, (
+        "a plan nobody gave a priority to does not run at 0; it runs at "
+        "{0!r}".format(_slot_priority(conn, "p1"))
+    )
+
+
+def test_plan_at_minus_ten_is_still_not_the_victim_after_restart(
+    db_factory: Any, plan_factory: Any, case_registry: Any
+) -> None:
+    """After a restart the bug plan is still the one that is not interrupted.
+
+    This is the whole criterion in one case.  Two plans are working: the
+    bug plan at ``-10`` and the feature plan at ``0``.  The plan the
+    scheduler may interrupt is the one that stands last in the line —
+    the feature plan — and it stays that one across the restart.
+
+    The restart is what makes the case worth having: the takeover
+    rewrites the slot rows, and a takeover that wrote them without the
+    number would make the two plans equals.  The rule would then fall
+    back to the age, and the bug plan would be the one interrupted for a
+    feature.
+    """
+    from plan_scheduler.policy import select_victim
+
+    world = _world(db_factory, plan_factory, plan_ids=("bug", "feat"))
+    conn = world.read_conn
+    live = _live_pid(case_registry)
+
+    _routing(conn, "bug", "executing")
+    _execution(conn, "bug", exec_pid=live, exec_status="running")
+    _slot_with_priority(world.store, conn, "bug", _iso(BASE_EPOCH - 3600), BUG_PRIORITY)
+    _routing(conn, "feat", "executing")
+    _execution(conn, "feat", exec_pid=live, exec_status="running")
+    _slot_with_priority(world.store, conn, "feat", _iso(BASE_EPOCH - 3600), 0)
+
+    world.engine._recover()
+
+    # The clock is reset by the takeover, so the plans are young; the
+    # clock is moved past the protection window to make them eligible.
+    world.clock.advance(MIN_RUNTIME + 1)
+
+    running = {
+        str(row["plan_id"]): row for row in world.engine.snapshot()["running"]
+    }
+
+    # The candidate set and the choice among them are the ones the
+    # command executor uses when it interrupts somebody.
+    candidates = world.ledger.evictable(world.clock(), MIN_RUNTIME)
+    assert {str(entry["plan_id"]) for entry in candidates} == {"bug", "feat"}, (
+        "the two working plans are not both candidates: {0!r}".format(candidates)
+    )
+
+    victim = select_victim({"running": candidates}, MIN_RUNTIME)
+    assert victim == "feat", (
+        "the plan that may be interrupted after the restart is {0!r}; the "
+        "bug plan at -10 may not give way to a feature plan at 0".format(
+            victim
+        )
+    )
+    assert running["bug"]["priority"] == BUG_PRIORITY, (
+        "the panel does not report the bug plan at the priority it runs "
+        "at: {0!r}".format(running["bug"])
+    )

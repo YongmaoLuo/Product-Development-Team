@@ -1,28 +1,31 @@
-"""Unit tests: the executor picks the victim by the plan's creation time.
+"""Unit tests: the executor picks the victim by the plan's place in the line.
 
 Background
 ----------
 An explicit ``start`` may interrupt a running plan — but only when the
 capacity is full and only when the rules allow it.  A plan that has been
-working for at least ``M`` seconds may be interrupted, and among those the
-**youngest** one is chosen: the plan that was created most recently, and
-therefore the one least likely to be wrapping up.
+working for at least ``M`` seconds may be interrupted, and among those
+the choice is made in **two stages**: the plan that stands **last in the
+line** — the largest priority number — is interrupted first, and among
+the plans of one priority the one that has run the **shortest** goes
+first.
 
 The executor used to answer that question itself.  It asked the ledger
 who may be interrupted, and then read the **slots** again to put the
-running set back together.  The set it rebuilt carried no creation time,
-so the policy could only fall back to the slot's timestamp — and the
+running set back together.  The set it rebuilt carried no priority, so
+the policy could only fall back to the slot's timestamp — and the
 slot's timestamp is rewritten by every reconciliation.  The victim was
 therefore decided by the bookkeeping rather than by the rule.
 
-The ledger's candidates carry the creation time now, so the executor
-hands them to the policy as they are: one candidate set, read once, and
-the policy's own rule decides which of them is the victim.
+The ledger's candidates carry the priority now, so the executor hands
+them to the policy as they are: one candidate set, read once, and the
+policy's own rule decides which of them is the victim.
 
 What this file holds down
 -------------------------
-1. **The creation time decides.**  The plan that was created last is the
-   victim — even when the other plan took its slot more recently.
+1. **The priority decides.**  The plan that stands last in the line is
+   the victim — even when the other plan took its slot more recently,
+   and even when the other plan's name sorts first.
 2. **Nobody eligible means no victim.**  A plan inside its protected
    window is not interrupted.
 3. **The slots are read once.**  The candidate set comes from the
@@ -44,6 +47,7 @@ import pytest
 
 from plan_scheduler.capacity import CapacityLedger
 from plan_scheduler.commands import CommandExecutor
+from plan_scheduler.config import DEFAULT_MIN_RUNTIME_SECONDS
 from plan_scheduler.facts import PlanFactsReader
 from plan_scheduler.store import SqliteSchedulerStore
 
@@ -133,15 +137,39 @@ class _World:
         self,
         conn: sqlite3.Connection,
         ledger: CapacityLedger,
-        executor: CommandExecutor,
         store: _CountingStore,
         clock: _Clock,
+        facts: PlanFactsReader,
+        min_runtime_seconds: float = MIN_RUNTIME,
     ) -> None:
         self.conn = conn
         self.ledger = ledger
-        self.executor = executor
         self.store = store
         self.clock = clock
+        self.facts = facts
+        self.min_runtime_seconds = min_runtime_seconds
+        self.executor = self.executor_factory(min_runtime_seconds)
+
+    def executor_factory(
+        self, min_runtime_seconds: float = DEFAULT_MIN_RUNTIME_SECONDS
+    ) -> CommandExecutor:
+        """Return an executor over this world, running with this threshold.
+
+        ``M`` — the runtime a plan is protected for — is a knob, and a
+        case that wants another one asks for it here instead of building
+        a second world.  The default is the threshold the scheduler runs
+        with when nobody says otherwise.
+        """
+        return CommandExecutor(
+            self.store,
+            self.ledger,
+            _Lifecycle(),
+            facts=self.facts,
+            conn=self.conn,
+            capacity=1,
+            min_runtime_seconds=min_runtime_seconds,
+            clock=self.clock,
+        )
 
     def working(self, plan_id: str, started_at: Optional[float] = None) -> None:
         """Make the plan hold compute, and say when its work began.
@@ -174,9 +202,17 @@ class _World:
         )
         self.conn.commit()
 
-    def slot(self, plan_id: str, acquired_at: float) -> None:
-        """Give the plan a slot, taken at ``acquired_at``."""
-        self.store.upsert_slot(self.conn, plan_id, now=_utc_iso(acquired_at))
+    def slot(self, plan_id: str, acquired_at: float, priority: int = 0) -> None:
+        """Give the plan a slot, taken at ``acquired_at``, at ``priority``.
+
+        The priority is the plan's place in the line: the larger the
+        number, the later the plan stands, and the later it stands the
+        more the scheduler can afford to interrupt it.  A plan whose
+        priority nobody mentions runs at the ordinary weight, ``0``.
+        """
+        self.store.upsert_slot(
+            self.conn, plan_id, now=_utc_iso(acquired_at), priority=priority
+        )
 
 
 @pytest.fixture()
@@ -190,65 +226,69 @@ def world(tmp_path: Path):
     store = _CountingStore()
     facts = PlanFactsReader(conn, tmp_path / "plans", clock=clock)
     ledger = CapacityLedger(store, facts, clock)
-    executor = CommandExecutor(
-        store,
-        ledger,
-        _Lifecycle(),
-        facts=facts,
-        conn=conn,
-        capacity=1,
-        min_runtime_seconds=MIN_RUNTIME,
-        clock=clock,
-    )
     try:
-        yield _World(conn, ledger, executor, store, clock)
+        yield _World(
+            conn, ledger, store, clock, facts, min_runtime_seconds=MIN_RUNTIME
+        )
     finally:
         conn.close()
 
 
 # ---------------------------------------------------------------------------
-# 1. The creation time decides
+# 1. The priority decides
 # ---------------------------------------------------------------------------
 
 
-def test_select_victim_passes_created_at_through_from_ledger(world: _World) -> None:
-    """The victim is the plan that was created last.
+def test_select_victim_passes_priority_through_from_ledger(world: _World) -> None:
+    """The victim is the plan that stands last in the line.
 
-    Two plans are working and both are old enough to be interrupted, but
-    they were created on different days: ``alpha`` was made in January,
-    ``beta`` was made today.  The slot timestamps point the other way —
-    ``alpha`` took its slot more recently than ``beta`` — because a slot
-    is taken when a plan is adopted, and the bookkeeping says nothing
-    about how long the work has been going on.
+    Two plans are working and both are old enough to be interrupted,
+    and they have been running for exactly as long as each other — so
+    the runtime cannot tell them apart.  What tells them apart is their
+    place in the line: ``beta`` was pushed back by the caller
+    (``priority = -10``) and keeps its slot, while ``alpha`` stands
+    last (``priority = 0``) and is the plan the scheduler can most
+    afford to interrupt.
 
-    The **youngest** plan is the one that may be interrupted: the plan
-    that was made last is the one least likely to be wrapping up.  The
-    creation time has to reach the policy for that to be true, and it
+    Two other answers are ruled out by the data, so that the priority
+    is the only thing left that can decide.  The **slot timestamps**
+    point the other way — ``beta`` took its slot more recently than
+    ``alpha``, so a runtime measured from the slots would squeeze
+    ``beta`` — and so do the **plan ids**: ``20260101-beta`` sorts
+    before ``20261029-alpha``, so a tie broken by name would pick
+    ``beta`` as well.  Only the priority makes ``alpha`` the victim.
+
+    The priority has to reach the policy for that to be true, and it
     reaches it through the ledger's candidates — the executor does not
-    rebuild the candidate set out of the slot rows, because those rows
-    carry no creation time at all.
+    rebuild the candidate set out of the slot rows.
     """
-    world.working("20260101-alpha", started_at=BASE_EPOCH - 3600)
-    world.slot("20260101-alpha", BASE_EPOCH - 700)
-    world.working("20261029-beta", started_at=BASE_EPOCH - 3600)
-    world.slot("20261029-beta", BASE_EPOCH - 3000)
+    world.working("20261029-alpha", started_at=BASE_EPOCH - 3600)
+    world.slot("20261029-alpha", BASE_EPOCH - 3000, priority=0)
+    world.working("20260101-beta", started_at=BASE_EPOCH - 3600)
+    world.slot("20260101-beta", BASE_EPOCH - 700, priority=-10)
 
     candidates = world.ledger.evictable(world.clock(), MIN_RUNTIME)
     assert {entry["plan_id"] for entry in candidates} == {
-        "20260101-alpha",
-        "20261029-beta",
+        "20261029-alpha",
+        "20260101-beta",
     }, "both plans are old enough to be interrupted: {0!r}".format(candidates)
-    created = {entry["plan_id"]: entry["created_at"] for entry in candidates}
-    assert created["20261029-beta"] > created["20260101-alpha"], (
-        "the two plans were not created in the order the case needs: "
-        "{0!r}".format(created)
+    priorities = {entry["plan_id"]: entry["priority"] for entry in candidates}
+    assert priorities == {"20261029-alpha": 0, "20260101-beta": -10}, (
+        "the candidates do not carry the priority of their slots: "
+        "{0!r}".format(priorities)
+    )
+    elapsed = {entry["plan_id"]: entry["elapsed"] for entry in candidates}
+    assert elapsed["20261029-alpha"] == elapsed["20260101-beta"], (
+        "the two plans have to have run for as long as each other, or the "
+        "runtime decides instead of the priority: {0!r}".format(elapsed)
     )
 
     world.store.list_slots_calls = 0
     victim = world.executor._select_victim(MIN_RUNTIME)
 
-    assert victim == "20261029-beta", (
-        "the victim was not the plan that was created last: {0!r}".format(victim)
+    assert victim == "20261029-alpha", (
+        "the victim was not the plan that stands last in the line: "
+        "{0!r}".format(victim)
     )
     assert world.store.list_slots_calls == 1, (
         "the slots were read {0} times: the candidate set comes from the "

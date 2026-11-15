@@ -96,6 +96,17 @@ shape, no existing row is touched, and no schema version is bumped —
 the presence guard below is what creates it on a database that already
 reached v7.
 
+The ``scheduler_slot`` table gained a ``priority`` column (2026-11-01):
+the queue's priority row is deleted the moment a plan is admitted, so
+without it a *running* plan cannot be read for its priority at all.
+This is the one scheduler change that changes the shape of an existing
+table rather than adding one — ``CREATE TABLE IF NOT EXISTS`` cannot
+give a table that is already there another column — so the column is
+added in place with ``ALTER TABLE``, guarded by the presence of the
+column itself rather than by a version number.  The schema version
+therefore stays at 7: an existing database is upgraded by the same
+presence-guarded step that runs on every ``migrate``.
+
 The three tables live in this database, not in a side-car file or a
 second SQLite file: scheduling facts and plan facts must be readable
 in one transaction, otherwise "is this plan running?" and "is this
@@ -467,15 +478,28 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduler_queue_seq
 """
 
 #: The concurrency slots.  The row records *when* the slot was taken
-#: and nothing else: which plan is running is a plan fact, derived
-#: from ``plan_routing`` / ``plan_execution``.  ``acquired_at`` is the
-#: only time source the eviction rule (a plan that has been running
-#: long enough may be evicted) is allowed to use.
+#: and how urgent the plan was: which plan is running is a plan fact,
+#: derived from ``plan_routing`` / ``plan_execution``.  ``acquired_at``
+#: is the only time source the eviction rule (a plan that has been
+#: running long enough may be evicted) is allowed to use.
+#:
+#: ``priority`` is the plan's priority *at the moment it took the
+#: slot*.  The queue's own priority row is deleted the moment the plan
+#: is admitted, so without this column a running plan cannot be read
+#: for its priority at all — and the eviction rule, which compares
+#: running plans against each other, would have nothing to compare.
+#: The column is ``NOT NULL DEFAULT 0`` so a slot written before the
+#: column existed reads back as 0 rather than NULL.
+#:
+#: It is declared *last* on purpose: ``ALTER TABLE ... ADD COLUMN``
+#: appends, so a table upgraded in place ends up with the same column
+#: order as one created by this DDL.
 _DDL_SCHEDULER_SLOT = """
 CREATE TABLE IF NOT EXISTS scheduler_slot (
   plan_id     TEXT PRIMARY KEY,
   acquired_at TEXT NOT NULL,
-  updated_at  TEXT NOT NULL
+  updated_at  TEXT NOT NULL,
+  priority    INTEGER NOT NULL DEFAULT 0
 )
 """
 
@@ -925,6 +949,46 @@ def _add_missing_plan_decision_columns(conn: sqlite3.Connection) -> None:
             pass
 
 
+def _ensure_slot_priority_column(conn: sqlite3.Connection) -> None:
+    """Add the ``priority`` column to a slot table that lacks it.
+
+    ``CREATE TABLE IF NOT EXISTS`` cannot change a table that already
+    exists, so a database written by a backend that predates the
+    priority column keeps the three columns it was created with — and
+    every read that asks a running plan for its priority fails against
+    it with *"no such column: priority"*.  The upgrade is therefore
+    *additive*: read the live column set with ``PRAGMA table_info``
+    and ``ALTER TABLE`` the missing column in.
+
+    ``ALTER TABLE ... ADD COLUMN`` appends, so an upgraded table ends
+    up with the same column order as one created by the DDL.  The
+    column carries ``NOT NULL DEFAULT 0``, so the rows that were
+    already there read back as priority 0 instead of NULL — the
+    eviction rule compares numbers, and NULL does not compare.
+
+    The read is what makes it safe to run on every ``migrate``: a
+    current table has the column, so the step costs one ``PRAGMA`` and
+    no write lock — the hot path a per-request connection open depends
+    on is untouched.
+    """
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(scheduler_slot)")
+    }
+    if "priority" in existing:
+        return
+    try:
+        conn.execute(
+            "ALTER TABLE scheduler_slot "
+            "ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError:
+        # Another process added the column between the PRAGMA and the
+        # ALTER (SQLite's write lock serialises the two, so this is
+        # the only way to lose the race).  The column is there, which
+        # is all this step wanted.
+        pass
+
+
 #: The deliverable-channel columns ``plan_tasks`` gained on 2026-11-03.
 #:
 #: ``deliverable`` says WHAT a task hands back — ``"code"`` (a diff in
@@ -999,6 +1063,15 @@ def _ensure_scheduler_tables(conn: sqlite3.Connection) -> None:
     request) free of write locks.  When something *is* missing the
     whole DDL set is replayed: every statement is ``IF NOT EXISTS``, so
     the objects that were already there are left exactly as they are.
+
+    A table that *is* there is not necessarily the current shape: the
+    ``scheduler_slot`` table gained a ``priority`` column after it was
+    first shipped, and ``CREATE TABLE IF NOT EXISTS`` cannot change a
+    table that already exists.  The column is therefore added in place
+    by :func:`_ensure_slot_priority_column` — and the check runs
+    *before* the "everything is present" early return, because the
+    presence of the objects says nothing about the shape of the table
+    they are.
     """
     present = {
         row[0]
@@ -1006,6 +1079,23 @@ def _ensure_scheduler_tables(conn: sqlite3.Connection) -> None:
             "SELECT name FROM sqlite_master WHERE type IN ('table', 'index')"
         )
     }
+    if "scheduler_slot" not in present:
+        # The slot table is not there yet: create the whole set *first*.
+        # ``PRAGMA table_info`` on a table that does not exist answers
+        # "no columns", which the shape check below would misread as
+        # "the priority column is missing" — so the column question is
+        # not asked until the table is known to exist.
+        for _name, ddl in _SCHEDULER_OBJECTS:
+            conn.execute(ddl)
+        present = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'index')"
+            )
+        }
+
+    _ensure_slot_priority_column(conn)
+
     if all(name in present for name, _ddl in _SCHEDULER_OBJECTS):
         return
     for _name, ddl in _SCHEDULER_OBJECTS:

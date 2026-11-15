@@ -73,7 +73,7 @@ def test_defaults_when_section_missing(tmp_path: Path) -> None:
     assert config.enabled is False
     assert config.dry_run is False
     assert config.capacity == 4
-    assert config.min_runtime_seconds == 600.0
+    assert config.min_runtime_seconds == 0.0
     assert config.tick_seconds == 5.0
     assert config.command_timeout_seconds == 30.0
     assert config == SchedulerConfig()
@@ -89,7 +89,7 @@ def test_missing_key_falls_back_to_its_default(tmp_path: Path) -> None:
     assert config.capacity == 3
     assert config.enabled is False
     assert config.dry_run is False
-    assert config.min_runtime_seconds == 600.0
+    assert config.min_runtime_seconds == 0.0
     assert config.tick_seconds == 5.0
     assert config.command_timeout_seconds == 30.0
 
@@ -99,6 +99,21 @@ def test_missing_file_yields_defaults(tmp_path: Path) -> None:
     config = SchedulerConfigLoader(tmp_path / "absent.yaml").current()
 
     assert config == SchedulerConfig()
+
+
+def test_min_runtime_seconds_default_is_zero() -> None:
+    """The default minimum runtime is zero — no run is protected on age alone.
+
+    ``min_runtime_seconds`` is the threshold ``M``: a running plan may
+    only be interrupted once it has been running for at least ``M``
+    seconds.  The default is **zero**, so the plan that has run the
+    shortest is the one the scheduler interrupts first.
+
+    A default above zero would keep the shortest runs out of the
+    candidate set altogether, and the rule that interrupts the shortest
+    run would never reach the plan it is about.
+    """
+    assert SchedulerConfig().min_runtime_seconds == 0.0
 
 
 def test_unknown_keys_are_ignored(tmp_path: Path) -> None:
@@ -153,7 +168,7 @@ def test_reload_does_not_mix_old_and_new_values(tmp_path: Path) -> None:
 
     after = loader.current()
     assert after.capacity == 9
-    assert after.min_runtime_seconds == 600.0
+    assert after.min_runtime_seconds == 0.0
 
 
 def test_unchanged_file_is_not_reloaded(tmp_path: Path) -> None:

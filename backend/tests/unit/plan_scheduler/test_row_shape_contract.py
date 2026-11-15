@@ -75,6 +75,10 @@ QUEUE_ROW_KEYS = {
 #: plan has been running and what the plan is running *for*, and a
 #: panel that shows the first without the second draws the same word
 #: for a plan that is executing and for one that is repairing.
+#:
+#: The priority sits next to the phase: it is the weight the caller
+#: gave the plan, and the eviction rule compares the running plans by
+#: it — a row without one cannot be compared at all.
 RUNNING_ROW_KEYS = {
     "plan_id",
     "acquired_at",
@@ -84,6 +88,7 @@ RUNNING_ROW_KEYS = {
     "evictable",
     "workspace",
     "phase",
+    "priority",
 }
 
 #: The keys the **document** carries — and no others.
@@ -177,11 +182,12 @@ def test_queue_row_keys_include_phase() -> None:
 
 
 def test_running_row_keys_include_phase() -> None:
-    """A running row carries exactly the eight keys the contract declares.
+    """A running row carries exactly the nine keys the contract declares.
 
     The running line is where the phase matters most: "running" is a
     fact about the slot, and the phase is a fact about the plan, and
-    the two are not the same fact.
+    the two are not the same fact.  The priority is there too — it is
+    the weight the eviction rule compares the running plans by.
     """
     state = _state([], [_running_row("r1", 400.0, phase="executing")])
 

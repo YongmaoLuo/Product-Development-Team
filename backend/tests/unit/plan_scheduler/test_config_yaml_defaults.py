@@ -56,7 +56,7 @@ DEFAULT_VALUES: Dict[str, Any] = {
     "enabled": False,
     "dry_run": False,
     "capacity": 4,
-    "min_runtime_seconds": 600,
+    "min_runtime_seconds": 0,
     "tick_seconds": 5,
     "command_timeout_seconds": 30,
 }
@@ -83,6 +83,28 @@ def test_config_yaml_has_scheduler_section() -> None:
     assert set(section) == set(SCHEDULER_KEYS)
     for key, value in DEFAULT_VALUES.items():
         assert section[key] == value, key
+
+
+def test_defaults_match_the_config_file() -> None:
+    """The default table is the file — same keys, same values, and ``M`` is 0.
+
+    The table in this file is a description of ``backend/config.yaml``,
+    not a second copy of it: it names exactly the keys the section
+    carries, and each of them holds the value the section holds.
+
+    And the minimum runtime is zero in both.  ``min_runtime_seconds`` is
+    the threshold ``M`` — how long a young run is left alone before it
+    may be interrupted.  A default above zero would keep the shortest
+    runs out of the candidate set altogether, and the rule that
+    interrupts the shortest run would never reach the plan it is about.
+    """
+    section = _read_section()
+
+    assert set(DEFAULT_VALUES) == set(section)
+    for key, value in DEFAULT_VALUES.items():
+        assert value == section[key], key
+
+    assert DEFAULT_VALUES["min_runtime_seconds"] == 0
 
 
 def test_loader_reads_written_section() -> None:

@@ -115,8 +115,11 @@ _QUEUE_COLUMNS = (
     "updated_at",
 )
 
-#: The columns of ``scheduler_slot``, in the order they are read.
-_SLOT_COLUMNS = ("plan_id", "acquired_at", "updated_at")
+#: The columns of ``scheduler_slot``, in the order they are read.  The
+#: priority is last, because it was added to the table last: the column
+#: is declared last on purpose, so a table upgraded in place ends up
+#: with the same column order as one created by the schema.
+_SLOT_COLUMNS = ("plan_id", "acquired_at", "updated_at", "priority")
 
 #: The columns of ``scheduler_command``, in the order they are read.
 _COMMAND_COLUMNS = (
@@ -145,6 +148,24 @@ def _as_dict(columns: tuple, row: Optional[sqlite3.Row]) -> Optional[Dict[str, A
     if row is None:
         return None
     return dict(zip(columns, tuple(row)))
+
+
+def _is_missing_priority_column(error: sqlite3.OperationalError) -> bool:
+    """Whether the error says the slot table has no priority column.
+
+    The ``priority`` column was added after the slot table was first
+    shipped, so a database that has not been migrated yet does not have
+    it — and SQLite names the column in the error.  A read says
+    *"no such column: priority"* and a write says *"table scheduler_slot
+    has no column named priority"*, so both forms are recognised here.
+    That is the one error the slot writes and reads may answer with the
+    three-column form of the statement; every other error belongs to the
+    caller.
+    """
+    message = str(error)
+    if "priority" not in message:
+        return False
+    return "no such column" in message or "has no column named" in message
 
 
 class SqliteSchedulerStore:
@@ -406,33 +427,61 @@ class SqliteSchedulerStore:
         conn: sqlite3.Connection,
         plan_id: str,
         now: Optional[str] = None,
+        priority: int = 0,
     ) -> bool:
         """Record that a plan holds a concurrency slot.
 
-        The slot says *when* the plan took it, and that is all it says
-        — which plan is running is a plan fact, read from the plan
-        tables.  Writing the slot a second time does not reset the
-        clock: the eviction rule reads ``acquired_at``, and a plan that
-        has been running for an hour must not get an hour more because
-        its slot was written down twice.
+        The slot says *when* the plan took it and *at what priority* it
+        runs — and that is all it says; which plan is running is a plan
+        fact, read from the plan tables.  Writing the slot a second
+        time does not reset the clock: the eviction rule reads
+        ``acquired_at``, and a plan that has been running for an hour
+        must not get an hour more because its slot was written down
+        twice.  The priority *is* replaced, though — the slot holds one
+        row per plan, so the priority a plan runs at is the one that
+        was written last.
+
+        The priority is the last parameter, so the calls written before
+        the column existed — ``upsert_slot(conn, plan_id, stamp)`` —
+        keep their meaning, and a plan whose priority nobody mentions
+        runs at 0.
 
         Args:
             conn: the connection to write on.
             plan_id: the plan that holds the slot.
             now: the timestamp to record; the current UTC time when
                 omitted.
+            priority: the priority the plan runs at; 0 when it is not
+                given.
 
         Returns:
             ``True`` — the slot is held by the plan afterwards.
         """
         stamp = now or _utcnow_iso()
         with self.transaction(conn):
-            conn.execute(
-                "INSERT INTO scheduler_slot (plan_id, acquired_at, updated_at) "
-                "VALUES (?, ?, ?) "
-                "ON CONFLICT(plan_id) DO UPDATE SET updated_at = excluded.updated_at",
-                (plan_id, stamp, stamp),
-            )
+            try:
+                conn.execute(
+                    "INSERT INTO scheduler_slot "
+                    "(plan_id, acquired_at, updated_at, priority) "
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(plan_id) DO UPDATE SET "
+                    "updated_at = excluded.updated_at, "
+                    "priority = excluded.priority",
+                    (plan_id, stamp, stamp, int(priority)),
+                )
+            except sqlite3.OperationalError as exc:
+                if not _is_missing_priority_column(exc):
+                    raise
+                # A slot table from before the column existed: the
+                # priority cannot be written down, but the slot still
+                # can — and the reader answers 0 for it.
+                conn.execute(
+                    "INSERT INTO scheduler_slot (plan_id, acquired_at, updated_at) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT(plan_id) DO UPDATE SET "
+                    "updated_at = excluded.updated_at",
+                    (plan_id, stamp, stamp),
+                )
             return True
 
     def delete_slot(self, conn: sqlite3.Connection, plan_id: str) -> bool:
@@ -460,16 +509,36 @@ class SqliteSchedulerStore:
         depended on the order SQLite happened to return would evict a
         different plan on every run.
 
+        Every row carries the priority the plan runs at.  A row that
+        has no priority of its own — written before the column existed,
+        or holding NULL — reads as 0: the eviction rule compares
+        numbers, and NULL does not compare.
+
         Args:
             conn: the connection to read on.
 
         Returns:
             The held slots, each a dict of the row's columns.
         """
-        rows = conn.execute(
-            "SELECT plan_id, acquired_at, updated_at FROM scheduler_slot "
-            "ORDER BY acquired_at, plan_id"
-        ).fetchall()
+        try:
+            rows = conn.execute(
+                "SELECT plan_id, acquired_at, updated_at, "
+                "COALESCE(priority, 0) AS priority FROM scheduler_slot "
+                "ORDER BY acquired_at, plan_id"
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if not _is_missing_priority_column(exc):
+                raise
+            # A slot table from before the column existed: read the
+            # three columns it has, and answer 0 for the priority of
+            # every row.
+            rows = conn.execute(
+                "SELECT plan_id, acquired_at, updated_at FROM scheduler_slot "
+                "ORDER BY acquired_at, plan_id"
+            ).fetchall()
+            return [
+                dict(zip(_SLOT_COLUMNS, tuple(row) + (0,))) for row in rows
+            ]
         return [dict(zip(_SLOT_COLUMNS, tuple(row))) for row in rows]
 
     # ------------------------------------------------------------------
