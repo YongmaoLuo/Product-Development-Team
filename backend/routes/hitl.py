@@ -83,6 +83,7 @@ What this file deliberately does not do
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -103,6 +104,9 @@ import server as _server
 
 
 router = APIRouter()
+
+
+logger = logging.getLogger(__name__)
 
 
 #: The ``source`` recorded for a decision nobody else claimed: this
@@ -234,42 +238,73 @@ def create_hitl_decision(
     an empty option set — is refused with a 400 and leaves no row
     behind.
     """
-    plan_dir = _server._plan_dir(plan_id)
-
+    # A failure that is **not** the request's fault — the store cannot
+    # be opened, the database is gone — is a 500 the caller can read,
+    # and it never leaves the handler.
+    #
+    # That last part is the point.  An exception that escapes a handler
+    # is answered and *then* the connection is closed, without saying
+    # so, so the next request on that connection is answered by a reset
+    # instead of by the product (2026-11-06: the browser replay of the
+    # HITL delivery died on ``read ECONNRESET``).  Answering here
+    # keeps the failure on this request.
+    #
+    # 2026-11-08：这两段原本写在上面的 docstring 里。FastAPI 把 docstring
+    # 采成 OpenAPI 的 description，于是它成了契约的一部分 ——
+    # ``backend/tests/api/test_openapi_unchanged.py`` 的指纹就跟着漂了。
+    # 说明信息一行不丢，只是不再进入 schema：契约没有变，位置放错了。
     try:
-        request = DecisionRequest(
-            plan_id=plan_id,
-            source=payload.source,
-            task_id=payload.task_id,
-            vp_id=payload.vp_id,
-            failure_class=payload.failure_class,
-            round=payload.round,
-            question=payload.question,
-            options=list(payload.options),
-            default_option=payload.default_option,
-            answer_note=payload.answer_note,
-            mode=(
-                payload.mode
-                if payload.mode is not None
-                else DecisionMode.AUTO.value
-            ),
-            timeout_sec=payload.timeout_sec,
+        plan_dir = _server._plan_dir(plan_id)
+
+        try:
+            request = DecisionRequest(
+                plan_id=plan_id,
+                source=payload.source,
+                task_id=payload.task_id,
+                vp_id=payload.vp_id,
+                failure_class=payload.failure_class,
+                round=payload.round,
+                question=payload.question,
+                options=list(payload.options),
+                default_option=payload.default_option,
+                answer_note=payload.answer_note,
+                mode=(
+                    payload.mode
+                    if payload.mode is not None
+                    else DecisionMode.AUTO.value
+                ),
+                timeout_sec=payload.timeout_sec,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                400,
+                {"error": "invalid_request", "detail": str(exc)},
+            ) from exc
+
+        try:
+            decision = create_decision(request, plan_dir)
+        except DecisionRejected as exc:
+            raise HTTPException(
+                400,
+                {
+                    "error": exc.reason,
+                    "detail": str(exc),
+                    "decision_id": exc.decision_id,
+                },
+            ) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 - the answer must stay here
+        logger.exception(
+            "[hitl] the decision for plan %s could not be created: %s",
+            plan_id,
+            exc,
         )
-    except ValueError as exc:
         raise HTTPException(
-            400,
-            {"error": "invalid_request", "detail": str(exc)},
-        ) from exc
-
-    try:
-        decision = create_decision(request, plan_dir)
-    except DecisionRejected as exc:
-        raise HTTPException(
-            400,
+            500,
             {
-                "error": exc.reason,
+                "error": "decision_unavailable",
                 "detail": str(exc),
-                "decision_id": exc.decision_id,
             },
         ) from exc
 

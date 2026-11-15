@@ -240,6 +240,7 @@ def test_returned_buckets_do_not_alias_the_input() -> None:
         ("SKIPPED", BUCKET_SKIPPED),
         ("SPLIT", BUCKET_SKIPPED),
         ("DEFERRED", BUCKET_DEFERRED),
+        ("INCONCLUSIVE", BUCKET_DEFERRED),
         ("UNKNOWN", None),
         ("", None),
         (None, None),
@@ -248,6 +249,24 @@ def test_returned_buckets_do_not_alias_the_input() -> None:
 def test_bucket_for_status_matrix(status, expected) -> None:
     """status → 桶 的完整映射（未知 status 不进任何桶）。"""
     assert bucket_for_status(status) == expected
+
+
+def test_an_inconclusive_verdict_never_lands_in_the_failed_bucket() -> None:
+    """「机器答不了」不是「交付物坏了」—— 它绝不进失败桶。
+
+    失败桶是修复任务的输入：一个预算用尽的门禁落进失败桶，就会凭空
+    造出一条「去修机器没答出来的那件事」的任务。它与 DEFERRED 同理 ——
+    既不是成功也不是失败，下一轮重跑。
+    """
+    buckets = derive_index_buckets({
+        "VP-I": {"status": "INCONCLUSIVE"},
+    })
+
+    assert buckets[BUCKET_FAILED] == [], buckets
+    assert buckets[BUCKET_DEFERRED] == ["VP-I"], buckets
+    assert buckets[BUCKET_COMPLETED] == [], buckets
+    assert buckets[BUCKET_SKIPPED] == [], buckets
+    assert _buckets_of(buckets, "VP-I") == [BUCKET_DEFERRED]
 
 
 def test_bucket_for_status_applies_the_retired_rule() -> None:

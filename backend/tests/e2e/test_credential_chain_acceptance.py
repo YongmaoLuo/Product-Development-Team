@@ -1173,6 +1173,15 @@ def child_env(fd: Optional[int] = None, extra: Optional[dict] = None) -> dict:
     behind it, and a check that reports those has to be turned off before
     it can be believed on the entries that do matter.
 
+    ``PYTHONPATH`` is in the child's environment because the child has to
+    be able to import this package, and it is deliberately *not* among
+    the names searched for fragments. The value it carries is the checkout
+    path — where the suite happens to live, on a machine that has no say
+    in what the secret is — and a canary's readable label shares six
+    characters with any directory on that machine whose name contains
+    ``test``. A sweep that calls the checkout path a leak is a sweep that
+    cannot be believed on the entries that do matter.
+
     ``extra`` is how the positive control puts the value where a real leak
     would have put it: the child's own initial environment, under the very
     variable this project is removing. A control that put it anywhere else
@@ -1184,7 +1193,7 @@ def child_env(fd: Optional[int] = None, extra: Optional[dict] = None) -> dict:
         "PDT_TEST_FD_VAR": FD_ENV_VAR,
         "PDT_TEST_SECRET_NAME": LOGICAL_NAME,
     }
-    chosen = {"PYTHONPATH", "PDT_TEST_FD_VAR", "PDT_TEST_SECRET_NAME"}
+    chosen = {"PDT_TEST_FD_VAR", "PDT_TEST_SECRET_NAME"}
     if fd is not None:
         env[FD_ENV_VAR] = str(fd)
         chosen.add(FD_ENV_VAR)

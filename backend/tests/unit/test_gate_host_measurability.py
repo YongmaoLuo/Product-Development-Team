@@ -22,14 +22,28 @@ What is pinned here
 2. A phase that failed on an unmeasurable host is **INCONCLUSIVE** and
    the gate exits 3 — but only when every one of that phase's failures
    is a wall-clock shape.
-3. **The negative control**: a phase with a deterministic failure (an
+3. A phase whose failures are all **transport** shapes (a connection
+   that broke) is INCONCLUSIVE too, and for the same reason: the
+   window between "the server dropped the connection" and "the client
+   noticed" is a fact about the host, not about the program.
+4. That shape is read out of the **whole** failure message, not only
+   its first line: a driver that died prints its traceback inside the
+   assertion that wrapped its exit code, so the error that matters can
+   sit thousands of characters into the message.
+5. **The negative control**: a phase with a deterministic failure (an
    assertion about behaviour) stays **FAILED** and the gate exits 1,
    even on an unmeasurable host.  "Unmeasurable host ⇒ everything is
    inconclusive" is not a fix; it hides real regressions.
-4. A measurable host keeps today's verdict, unchanged.
-5. The **test layer's own load gate** stands down on the measurement,
+6. A measurable host keeps today's verdict, unchanged — the new shape
+   is only consulted where the host has declared itself unmeasurable.
+7. The **test layer's own load gate** stands down on the measurement,
    not on the ``CI`` guess: a probe that measured the host beats an
    environment variable that guessed it.
+6. The **shape of a failure the gate has actually seen** decides who
+   owns it: a case that waited and gave up on the clock is the
+   machine's, an assertion about the result is the code's.  The four
+   failures a real run recorded are pinned here, so the attribution
+   cannot drift away from the evidence it was made for.
 
 The gate is driven for real: the script under test is the repository's
 own ``scripts/run_tests.sh``, and the pytest it runs is a stub that
@@ -38,11 +52,13 @@ writes a junit report with the failure message the test wants.
 
 from __future__ import annotations
 
+import ast
 import os
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import pytest
 
@@ -53,6 +69,13 @@ if str(BACKEND_DIR) not in sys.path:
 
 from tests import _host_load  # noqa: E402
 from tests import _readiness  # noqa: E402
+from verification_ci_runner import (  # noqa: E402
+    is_wall_clock_shaped,
+    phase_report_evidence,
+)
+
+import verification_ci_runner as ci_runner  # noqa: E402
+from verification_ci_runner import MAX_JUNIT_MESSAGE_CHARS  # noqa: E402
 
 #: The repository root — this file lives at ``backend/tests/unit/``.
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -79,6 +102,32 @@ WALL_CLOCK_MESSAGE = (
 #: A failure that says something about the code, not about the clock.
 DETERMINISTIC_MESSAGE = "AssertionError: 1 + 1 == 3"
 
+#: A failure that says the connection broke, not that the clock ran out.
+TRANSPORT_MESSAGE = "Error: APIRequestContext.post: read ECONNRESET"
+
+#: The failure message the CI's own phase-2 report carried for the
+#: browser-replay case.
+#:
+#: The transport error is **not** the first line of this message.  The
+#: first line is the assertion that wraps the driver's exit code, and
+#: the error itself sits at the bottom of the traceback that assertion
+#: quotes — far past the ``MAX_JUNIT_MESSAGE_CHARS`` the evidence keeps
+#: of a message's first line.  A classifier that reads only the first
+#: line does not see the broken connection at all.
+CI_TRANSPORT_MESSAGE = (
+    "AssertionError: the browser driver failed (exit 1); stdout='' "
+    "stderr='Traceback (most recent call last):\\n"
+    "  File \"/tmp/pytest-of-ci/pytest-1/test_browser_replays_the_missi0"
+    "/drive_negative_replay.py\", line 82, in <module>\\n"
+    "    create_status = post(\"/api/interview/start\", payload)[0]\\n"
+    "  File \"/usr/lib/python3.11/site-packages/playwright/_impl/"
+    "_api_request_context.py\", line 172, in post\\n"
+    "    return mapping.rewrite_error(error, f\"{mapping.api_name}: {error}\")"
+    " from None\\n"
+    "playwright._impl._errors.Error: APIRequestContext.post: read ECONNRESET"
+    "\\nCall log:\\n  - → POST http://127.0.0.1:64737/api/interview/start"
+)
+
 #: The stub pytest: it records the ``PDT_HOST_MEASURABLE`` it was
 #: given, writes the junit report the gate asked for, and exits with
 #: the code the test wants.
@@ -86,6 +135,7 @@ _STUB_SOURCE = '''#!/usr/bin/env python3
 import os
 import pathlib
 import sys
+import xml.sax.saxutils as sax
 
 report = ""
 for arg in sys.argv[1:]:
@@ -98,10 +148,17 @@ with open(os.environ["PDT_STUB_ENV_LOG"], "a", encoding="utf-8") as handle:
 if report:
     path = pathlib.Path(report)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # The message is escaped the way pytest escapes it: a failure
+    # message that carries a traceback carries quotes and angle
+    # brackets, and a report that does not escape them is not a report
+    # the evidence can be read out of.
+    message = sax.escape(
+        os.environ["PDT_STUB_MESSAGE"], {'"': "&quot;"}
+    )
     path.write_text(
         '<testsuites><testsuite name="pytest" tests="1" failures="1" '
         'errors="0" skipped="0"><testcase classname="t" name="n">'
-        '<failure message="' + os.environ["PDT_STUB_MESSAGE"] + '">trace'
+        '<failure message="' + message + '">trace'
         "</failure></testcase></testsuite></testsuites>",
         encoding="utf-8",
     )
@@ -261,6 +318,150 @@ def test_the_negative_control_keeps_a_deterministic_failure_red(
     assert "FAILED" in _verdict(verdicts, "phase 1/3"), (
         f"phase 1 is reported as {verdicts['phase 1/3']!r} although its "
         f"failure is not a wall-clock shape:\n{completed.stdout}"
+    )
+
+
+def test_a_transport_failure_on_an_unmeasurable_host_is_inconclusive(
+    tmp_path: Path,
+) -> None:
+    """A connection that broke is the machine's, not the code's.
+
+    The shape is not a wall-clock one — nothing timed out — but it is
+    not the code's either.  A server that answers a request with an
+    unhandled exception drops the connection, and the client only
+    finds out when it hands the pooled socket to the next request.  How
+    long that window is depends on how busy the machine is, so on a
+    host that cannot even time a sleep the interruption says nothing
+    about the code.
+
+    Recording it as a code failure turns the machine's noise into a
+    repair task against a delivery nobody has proven defective — the
+    same mistake the wall-clock shape used to cause.
+    """
+    completed, _ = _run_gate(
+        tmp_path, message=TRANSPORT_MESSAGE, probe="fail",
+    )
+
+    assert completed.returncode == 3, (
+        f"a transport failure on an unmeasurable host produced exit code "
+        f"{completed.returncode}, not 3:\n{completed.stdout}\n{completed.stderr}"
+    )
+    verdicts = _summary(completed.stdout)
+    for phase in ("phase 1/3", "phase 2/3", "phase 3/3"):
+        verdict = _verdict(verdicts, phase)
+        assert "INCONCLUSIVE" in verdict, (
+            f"{phase} is reported as {verdict!r} although its only failure "
+            f"is a broken connection:\n{completed.stdout}"
+        )
+        assert "FAILED" not in verdict, (
+            f"{phase} is reported as {verdict!r} although its only failure "
+            f"is a broken connection:\n{completed.stdout}"
+        )
+
+
+def test_a_transport_failure_on_a_measurable_host_is_still_a_failure(
+    tmp_path: Path,
+) -> None:
+    """The new shape is only consulted where the host is unmeasurable.
+
+    On a host that can keep time the gate judges the code as it always
+    did: a broken connection is a failure, and the gate says so.
+    """
+    completed, _ = _run_gate(
+        tmp_path, message=TRANSPORT_MESSAGE, probe="pass",
+    )
+
+    assert completed.returncode == 1, (
+        f"a transport failure on a measurable host produced exit code "
+        f"{completed.returncode}, not 1:\n{completed.stdout}\n{completed.stderr}"
+    )
+    verdicts = _summary(completed.stdout)
+    assert "FAILED" in _verdict(verdicts, "phase 1/3"), (
+        f"phase 1 is reported as {verdicts['phase 1/3']!r} although the "
+        f"host could measure wall-clock time:\n{completed.stdout}"
+    )
+
+
+def test_a_transport_failure_hidden_in_a_traceback_is_still_the_machines(
+    tmp_path: Path,
+) -> None:
+    """The broken connection is not always the first line of the failure.
+
+    The CI's own phase-2 report carried the browser-replay failure as
+    "the browser driver failed (exit 1)" — an assertion that wraps the
+    driver's exit code — with the transport error quoted at the bottom
+    of the traceback it printed, 2378 characters into the message.
+
+    A classifier that reads only the first line of a failure message
+    never sees that error, and records the failure as the code's.  So
+    the shape has to be looked for in the whole message, not only in
+    the part the evidence keeps.
+
+    The message this test uses is the CI's own shape, so the test
+    fails if the shape stops being the CI's.
+    """
+    marker = CI_TRANSPORT_MESSAGE.find("ECONNRESET")
+    assert marker > MAX_JUNIT_MESSAGE_CHARS, (
+        f"the transport error sits at offset {marker} of the message, "
+        f"which is inside the {MAX_JUNIT_MESSAGE_CHARS} characters the "
+        f"evidence keeps of a message's first line — the test no longer "
+        f"exercises the shape it was written for."
+    )
+
+    completed, _ = _run_gate(
+        tmp_path, message=CI_TRANSPORT_MESSAGE, probe="fail",
+    )
+
+    assert completed.returncode == 3, (
+        f"a transport failure buried in a traceback produced exit code "
+        f"{completed.returncode}, not 3:\n{completed.stdout}\n{completed.stderr}"
+    )
+    verdicts = _summary(completed.stdout)
+    for phase in ("phase 1/3", "phase 2/3", "phase 3/3"):
+        verdict = _verdict(verdicts, phase)
+        assert "INCONCLUSIVE" in verdict, (
+            f"{phase} is reported as {verdict!r} although its only failure "
+            f"is a broken connection:\n{completed.stdout}"
+        )
+        assert "FAILED" not in verdict, (
+            f"{phase} is reported as {verdict!r} although its only failure "
+            f"is a broken connection:\n{completed.stdout}"
+        )
+
+
+def test_the_runner_reads_a_transport_failure_out_of_a_traceback(
+    tmp_path: Path,
+) -> None:
+    """The runner's own evidence must say what the gate says.
+
+    The gate is one reader of the report; the runner is another, and
+    it decides whether the gate's "the machine could not be measured"
+    is believed.  If the runner reads only the first line of a
+    failure, it sees a failure that is neither a wall-clock shape nor
+    a transport shape, and it records the gate's verdict as the
+    code's — the same misreading, one layer up.
+    """
+    report = tmp_path / "phase-2.xml"
+    report.write_text(
+        '<testsuites><testsuite name="pytest" tests="1" failures="1" '
+        'errors="0" skipped="0"><testcase classname="t" name="n">'
+        '<failure message="'
+        + CI_TRANSPORT_MESSAGE.replace("&", "&amp;").replace("<", "&lt;")
+        .replace(">", "&gt;").replace('"', "&quot;")
+        + '">trace</failure></testcase></testsuite></testsuites>',
+        encoding="utf-8",
+    )
+
+    assert ci_runner.phase_report_evidence(str(report)) == "environment|0", (
+        "the runner does not read the broken connection out of the "
+        "failure's traceback"
+    )
+
+    evidence = ci_runner._read_junit_evidence(tmp_path)
+    assert ci_runner._blocking_failures(evidence) == [], (
+        "the runner records the broken connection as a failure of the "
+        "code, so the gate's 'the machine could not be measured' is "
+        "overridden with the code's verdict"
     )
 
 
@@ -477,3 +678,268 @@ def test_the_suites_that_wait_for_a_service_use_the_shared_decision() -> None:
         f"shared decision what to do on a host that cannot keep time: "
         f"{missing}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 5. The attribution of the failures a real run recorded
+# ---------------------------------------------------------------------------
+#
+# The gate does not decide "the host was busy" on its own: it reads the
+# shape of each failure out of the phase's own junit report.  So the
+# question "does this failure belong to the machine or to the code?" has
+# exactly one answer — the shape of the message the case wrote.
+#
+# The four failures below are the ones the real run behind VP-015
+# recorded (``vp_artifacts/VP-015/phase-1.xml`` and ``phase-2.xml``,
+# 2026-11-06 12:07 and 12:30), first line, as the report has it.
+#
+# Two of them are the machine's: a case that waited for a child to
+# disappear, and a case that waited for a daemon count to settle.  What
+# the run recorded was only the answer ("the executor left its children
+# running", "the root carries 0 daemons after 5 launches: []"), which is
+# why the gate could not tell them from a code failure; the lines below
+# are those recorded lines with the wait they gave up on named — the
+# wording the two cases write today, and which is pinned to their
+# source further down.
+#
+# The other two are the code's: an assertion about the verdict the gate
+# produced, and a browser that could not reach the server.  The
+# browser's line names the run's own temporary directory; that part is
+# elided here, because it says where the run happened rather than what
+# broke, and a path from another machine has no place in this tree.  The
+# ECONNRESET at the end of it — the part that identifies the failure —
+# is the recorded text.
+
+#: The recorded first lines, by the failure they name.
+RECORDED_FAILURES: Dict[str, str] = {
+    "the unit assertion": (
+        "AssertionError: assert 'signal' not in {'vp_id': 'VP-901', "
+        "'ci_entry': 'bash scripts/run_tests.sh', 'exit_code': 7, "
+        "'timed_out': False, ...}"
+    ),
+    "the browser driver": (
+        "AssertionError: the browser driver failed (exit 1); stdout='' "
+        "stderr='Traceback (most recent call last):\\n  File "
+        "\"<the run's temporary directory>/drive_replay.py\", line 82, in "
+        "<module>\\n    create_status, create_body = post(\\n"
+        "playwright._impl._errors.Error: APIRequestContext.post: read "
+        "ECONNRESET"
+    ),
+    "the executor's children": (
+        "AssertionError: the executor left its children running: the "
+        "children did not settle within 30s of the SIGTERM"
+    ),
+    "the daemon count": (
+        "AssertionError: the daemon count did not settle within 30s: the "
+        "root carries 0 daemons after 5 launches: []"
+    ),
+}
+
+#: The two recorded failures the machine owns.
+HOST_SHAPED_FAILURES = ("the executor's children", "the daemon count")
+
+#: The two recorded failures the code owns.
+CODE_SHAPED_FAILURES = ("the unit assertion", "the browser driver")
+
+
+def _junit_report(path: Path, messages: List[str]) -> Path:
+    """A junit report that fails the way the recorded run failed.
+
+    The report is written the way pytest writes one — a ``message``
+    attribute on the failure — because that attribute is the first line
+    the gate reads.
+    """
+    root = ET.Element("testsuites")
+    suite = ET.SubElement(
+        root, "testsuite",
+        name="pytest", tests=str(len(messages)),
+        failures=str(len(messages)), errors="0", skipped="0",
+    )
+    for index, message in enumerate(messages):
+        case = ET.SubElement(suite, "testcase", classname="t", name=f"n{index}")
+        failure = ET.SubElement(case, "failure", message=message)
+        failure.text = "trace"
+    ET.ElementTree(root).write(str(path), encoding="utf-8", xml_declaration=True)
+    return path
+
+
+def _string_constants(path: Path) -> Set[str]:
+    """Every string literal in a source file.
+
+    The parser folds adjacent literals into one constant, so the message
+    a case writes is found whole however it happens to be wrapped.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+
+
+def test_the_recorded_process_control_failures_are_the_hosts_shape() -> None:
+    """Two of the recorded failures were the machine's, not the code's.
+
+    Both are "it waited, and the wait ran out": a child that did not
+    disappear, a daemon count that did not settle.  On a host that
+    cannot measure wall-clock time these are the machine's verdict, and
+    the gate has to say so instead of blaming a delivery that did not
+    fail.
+    """
+    for name in HOST_SHAPED_FAILURES:
+        message = RECORDED_FAILURES[name]
+        assert is_wall_clock_shaped(message), (
+            f"{name} is not a wall-clock shape, so the gate would blame "
+            f"the code for the machine's answer: {message!r}"
+        )
+
+
+def test_the_recorded_code_failures_keep_their_own_shape() -> None:
+    """The other two recorded failures are the code's, whatever the host did.
+
+    An assertion about the verdict the gate produced, and a browser that
+    could not reach the server, are not the clock's fault.  Excusing
+    them would hide a real regression behind the machine's noise.
+    """
+    for name in CODE_SHAPED_FAILURES:
+        message = RECORDED_FAILURES[name]
+        assert not is_wall_clock_shaped(message), (
+            f"{name} is a wall-clock shape, so the gate would excuse a "
+            f"failure that is the code's: {message!r}"
+        )
+
+
+def test_the_phase_evidence_reads_the_recorded_process_control_failures(
+    tmp_path: Path,
+) -> None:
+    """A phase whose failures are all the machine's is the machine's.
+
+    This is the shape the gate asks the report for, and the answer it
+    acts on: ``wall-clock`` means the phase's failures are the host's.
+    """
+    report = _junit_report(
+        tmp_path / "phase-1.xml",
+        [RECORDED_FAILURES[name] for name in HOST_SHAPED_FAILURES],
+    )
+
+    assert phase_report_evidence(str(report)) == "wall-clock|0", (
+        "the phase's failures are the machine's, and the evidence does "
+        "not say so"
+    )
+
+
+def test_the_phase_evidence_reads_the_recorded_code_failure_as_the_codes(
+    tmp_path: Path,
+) -> None:
+    """A phase with one failure about the result is the code's."""
+    report = _junit_report(
+        tmp_path / "phase-1.xml",
+        [RECORDED_FAILURES[name] for name in CODE_SHAPED_FAILURES],
+    )
+
+    assert phase_report_evidence(str(report)) == "code|0", (
+        "the phase names a failure that is not the clock's, and the "
+        "evidence does not say so"
+    )
+
+
+def test_a_phase_that_mixes_the_two_shapes_is_the_codes_shape(
+    tmp_path: Path,
+) -> None:
+    """The machine's failures do not excuse the code's.
+
+    The recorded phase-2 held all three: the executor's children, the
+    daemon count, and the browser.  Two of them were the host's, one was
+    the code's — and the phase was the code's, because one failure that
+    is not the clock's is enough.
+    """
+    report = _junit_report(
+        tmp_path / "phase-2.xml",
+        [
+            RECORDED_FAILURES["the executor's children"],
+            RECORDED_FAILURES["the daemon count"],
+            RECORDED_FAILURES["the browser driver"],
+        ],
+    )
+
+    assert phase_report_evidence(str(report)) == "code|0", (
+        "the phase holds a failure that is the code's, and the evidence "
+        "let the machine's two failures excuse it"
+    )
+
+
+def test_a_census_the_machine_could_not_read_is_the_hosts_shape() -> None:
+    """A machine that could not be read is the machine's failure, too.
+
+    "Unreadable" is not "empty": a census the host could not answer is
+    the host's verdict, not a statement about the code.  The wording is
+    the one the census case already uses.
+    """
+    message = (
+        "AssertionError: the machine could not be read for this census: "
+        "the daemons on the root could not be counted, so the answer is "
+        "unknown rather than zero"
+    )
+
+    assert is_wall_clock_shaped(message), (
+        "a census the machine could not answer is recorded as a code "
+        f"failure: {message!r}"
+    )
+
+
+def test_the_process_control_cases_still_say_how_long_they_waited() -> None:
+    """The two cases name the wait they gave up on.
+
+    The attribution is read off the message the case writes, so a case
+    that stops naming its wait stops being excusable — silently, and
+    with nothing to say so.  The two strings below are the ones the
+    recorded run's classification depends on, and they are pinned to
+    the source that writes them.
+    """
+    expected = (
+        (
+            "tests/integration/test_process_ownership_negative_controls.py",
+            "the executor left its children running: the children did not "
+            "settle within 30s of the SIGTERM",
+        ),
+        (
+            "tests/integration/test_reaper_daemon_leak_acceptance.py",
+            "the daemon count did not settle within 30s: the root carries "
+            "%d daemons after %d launches: %r",
+        ),
+    )
+
+    for relative, message in expected:
+        constants = _string_constants(REPO_ROOT / "backend" / relative)
+        assert message in constants, (
+            f"{relative} no longer writes the message the attribution "
+            f"depends on: {message!r}"
+        )
+
+
+def test_a_process_control_failure_is_inconclusive_on_an_unmeasurable_host(
+    tmp_path: Path,
+) -> None:
+    """The whole chain: the real message, the real gate, exit 3.
+
+    The failure the recorded run produced — a case that waited for a
+    child to disappear — has to come out of the gate as "could not
+    decide" on a host that cannot measure wall-clock time.
+    """
+    completed, _ = _run_gate(
+        tmp_path,
+        message=RECORDED_FAILURES["the executor's children"],
+        probe="fail",
+    )
+
+    assert completed.returncode == 3, (
+        f"a process-control failure on an unmeasurable host produced exit "
+        f"code {completed.returncode}, not 3:\n"
+        f"{completed.stdout}\n{completed.stderr}"
+    )
+    verdicts = _summary(completed.stdout)
+    for phase in ("phase 1/3", "phase 2/3", "phase 3/3"):
+        assert "INCONCLUSIVE" in _verdict(verdicts, phase), (
+            f"{phase} is reported as {verdicts[phase]!r} on a host that "
+            f"cannot measure wall-clock time:\n{completed.stdout}"
+        )

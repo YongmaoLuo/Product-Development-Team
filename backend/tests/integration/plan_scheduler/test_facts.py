@@ -237,6 +237,7 @@ def test_queued_plans_derived_from_routing(
             "priority": 0,
             "seq": 1,
             "due": True,
+            "phase": "queued",
         }
     finally:
         conn.close()
@@ -263,7 +264,8 @@ def test_queued_plan_is_held_back_by_next_run_at(
         queued = _reader(conn, plans_root).queued_plans()
 
         assert queued == [
-            {"plan_id": "p1", "priority": 0, "seq": 1, "due": False}
+            {"plan_id": "p1", "priority": 0, "seq": 1, "due": False,
+             "phase": "queued"}
         ]
     finally:
         conn.close()

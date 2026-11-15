@@ -1431,7 +1431,7 @@ def _build_scheduler_engine() -> _SchedulerRuntime:
             migrate(conn)
             current = config_loader.current()
             store = SqliteSchedulerStore()
-            facts = PlanFactsReader(conn, PLANS_DIR)
+            facts = PlanFactsReader(conn, PLANS_DIR, live_plan_ids=_live_plan_ids)
             ledger = CapacityLedger(store, facts, conn=conn)
             lifecycle = PlanLifecycleService()
             commands = CommandExecutor(
@@ -4334,6 +4334,54 @@ def _is_verification_in_flight(state: Optional[dict]) -> bool:
     if not state:
         return False
     return state.get("verification_status") in _VERIFICATION_IN_FLIGHT_STATUSES
+
+
+def _live_plan_ids() -> set[str]:
+    """The plan ids that are alive right now — one answer for the process.
+
+    Two readers wanted this answer and each computed it for itself: the
+    scheduler's facts reader, which asks the database's rows, and the
+    active endpoint, which asks the two in-memory tables.  The rules
+    drifted apart — the rows go quiet when a verification round stops
+    refreshing them while the round is very much still running, and the
+    tables keep resting records forever — so the capacity panel could
+    say a slot was free while the workflow was working on it.  "used"
+    and "active" did not agree, and neither was wrong on its own terms.
+
+    This helper is the single answer, and it is what the scheduler's
+    facts reader is now handed (see ``_build_scheduler_engine``).  It is
+    the union of the two sides, each read through the predicate that
+    already knows what "working" means: an execution whose subprocess is
+    alive (:func:`_is_execution_in_flight`) and a verification whose
+    round is cycling (:func:`_is_verification_in_flight`).  A resting
+    record — a finished execution keeps its entry forever, a failed
+    verification keeps its verdict — is not alive, and a terminal status
+    is not a running one.
+
+    The active endpoint (:func:`routes.plans.get_active_tasks`) derives
+    its set from those same two predicates, so the two answers are the
+    same answer and cannot disagree; it does not call this function yet,
+    because that endpoint lives in ``backend/routes/plans.py`` rather
+    than in this module.
+
+    The answer is a **set**: a plan that is executing *and* verifying at
+    the same time holds one slot, not two, so it is named once.
+
+    The two tables are written by the background threads while this is
+    read, so they are snapshotted before they are walked: a dict that
+    changes size mid-iteration raises, and a tick-stale snapshot cannot
+    raise.
+    """
+    if not _execution_state and not _verification_state:
+        return set()
+    live: set[str] = set()
+    for plan_id, state in list(_execution_state.items()):
+        if _is_execution_in_flight(state):
+            live.add(plan_id)
+    for plan_id, state in list(_verification_state.items()):
+        if _is_verification_in_flight(state):
+            live.add(plan_id)
+    return live
 
 
 # 2026-09-06:

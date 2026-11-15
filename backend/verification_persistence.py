@@ -40,12 +40,14 @@ Implements multi-file persistence strategy for verification reports:
 import json
 import gzip
 import os
+import re
 import shutil
 import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Sequence
 
+from bounded_log import append_bounded_line, rotated_log_paths
 from plan_artifacts import TASKS_FILENAME
 from verification_report_md import render as render_markdown
 
@@ -82,6 +84,31 @@ _PLAN_TASK_VP_KEYS = ("vp_id", "failed_vp_id")
 
 #: The report fields that are lists, and default to an empty list.
 _REPORT_LIST_FIELDS = ("skipped_items", "confirmed_defects", "unresolved", "human_decisions")
+
+#: The suffix a rotated copy of a log carries: ``<name>.1`` … ``<name>.N``.
+#: The highest number holds the oldest lines.
+_ROTATED_COPY_SUFFIX = re.compile(r"\.(\d+)$")
+
+
+def _log_candidates(live: Path) -> List[Path]:
+    """The files one log's entries live in, oldest first.
+
+    A log's rotated copies come first, oldest copy first — the highest
+    copy number holds the oldest lines — and the live file comes last,
+    because it holds the newest.  That order is the order the lines
+    were written in, so a reader that walks the candidates in order
+    walks the entries in that order too.
+
+    A candidate that is not there is left out: most plans never rotate
+    their log, so most of the copies a reader looks for do not exist.
+    One that disappears between this check and the read is still
+    handled by the reader itself.
+    """
+    return [
+        candidate
+        for candidate in (*rotated_log_paths(live), live)
+        if candidate.exists()
+    ]
 
 
 def _discard(path: Optional[Path]) -> None:
@@ -165,6 +192,11 @@ def write_audit_event(
         ``True`` when the event reached the disk, ``False`` when it
         could not be written. The caller decides what an unwritable
         audit trail means; the event itself is never raised.
+
+    The file is written through :func:`bounded_log.append_bounded_line`,
+    so it is bounded: an audit trail that records every event of every
+    round would otherwise grow without a ceiling, and a reader that has
+    to find one line in it has to read all of it.
     """
     try:
         logs_dir = Path(plan_dir) / "logs"
@@ -175,8 +207,10 @@ def write_audit_event(
             "timestamp": datetime.now().isoformat(),
             "data": data,
         }
-        with open(logs_dir / AUDIT_LOG_FILENAME, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+        append_bounded_line(
+            logs_dir / AUDIT_LOG_FILENAME,
+            json.dumps(entry, ensure_ascii=False, default=str) + "\n",
+        )
         return True
     except OSError:
         return False
@@ -737,9 +771,67 @@ class VerificationPersistenceManager:
         with open(self.report_file, "r", encoding="utf-8") as f:
             return json.load(f)
 
+    def _log_bases(self, pattern: str) -> List[Path]:
+        """The live log files matching ``pattern``, in file-name order.
+
+        A log file's rotated copies are found next to it, and the live
+        file is the one the glob matches.  A copy whose live file is
+        gone — archived by the round cleanup, or deleted — still holds
+        entries, so the copies are looked for as well and the live file
+        they belong to is rebuilt from the copy's name.
+
+        The order is the file-name order, because the file name carries
+        the round and the timestamp: two log files of the same round are
+        two moments of that round, and the earlier one holds the earlier
+        entries.
+        """
+        bases = {path for path in self.logs_dir.glob(pattern) if path.is_file()}
+
+        for copy_path in self.logs_dir.glob(f"{pattern}.*"):
+            match = _ROTATED_COPY_SUFFIX.search(copy_path.name)
+            if match is None:
+                continue
+            suffix_length = match.end() - match.start()
+            base = copy_path.with_name(copy_path.name[:-suffix_length])
+            if not base.exists():
+                bases.add(base)
+
+        return sorted(bases)
+
+    def _read_log_entries(self, path: Path) -> List[Dict[str, Any]]:
+        """The entries of one JSON-lines log file, the bad lines skipped.
+
+        A file that cannot be read costs that file and nothing else: the
+        round log is written while the plan runs, and a copy that was
+        torn by a kill holds half a line.  Neither may end the read —
+        the entries the other files hold are still the answer.
+        """
+        entries: List[Dict[str, Any]] = []
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(entry, dict):
+                        entries.append(entry)
+        except Exception:
+            pass
+
+        return entries
+
     def get_round_logs(self, round_number: int) -> List[Dict[str, Any]]:
         """
         Load all log entries for a specific round.
+
+        The rotated copies of each log file are read too, oldest copy
+        first: a rotation moves the *old* entries out of the live file,
+        and the entries a reader is looking for are often exactly the
+        ones that were rotated out.
 
         Args:
             round_number: Round number to load
@@ -747,22 +839,10 @@ class VerificationPersistenceManager:
         Returns:
             List of log entries
         """
-        log_files = sorted(self.logs_dir.glob(f"verification_{round_number}_*.log"))
-
-        entries = []
-        for log_file in log_files:
-            try:
-                with open(log_file, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line:
-                            try:
-                                entry = json.loads(line)
-                                entries.append(entry)
-                            except json.JSONDecodeError:
-                                pass
-            except Exception:
-                pass
+        entries: List[Dict[str, Any]] = []
+        for log_file in self._log_bases(f"verification_{round_number}_*.log"):
+            for candidate in _log_candidates(log_file):
+                entries.extend(self._read_log_entries(candidate))
 
         return entries
 
@@ -770,62 +850,70 @@ class VerificationPersistenceManager:
         """
         Load all log entries for a specific verification point across all rounds.
 
+        The rotated copies of each log file are read too, oldest copy
+        first — see :meth:`get_round_logs`.
+
         Args:
             vp_id: Verification point ID
 
         Returns:
             List of log entries for this verification point
         """
-        all_entries = []
-        log_files = sorted(self.logs_dir.glob("verification_*.log"))
-
-        for log_file in log_files:
-            try:
-                with open(log_file, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line:
-                            try:
-                                entry = json.loads(line)
-                                if entry.get("verification_point_id") == vp_id:
-                                    all_entries.append(entry)
-                            except json.JSONDecodeError:
-                                pass
-            except Exception:
-                pass
+        all_entries: List[Dict[str, Any]] = []
+        for log_file in self._log_bases("verification_*.log"):
+            for candidate in _log_candidates(log_file):
+                for entry in self._read_log_entries(candidate):
+                    if entry.get("verification_point_id") == vp_id:
+                        all_entries.append(entry)
 
         return all_entries
 
     def _write_log_entry(self, entry: Dict[str, Any]) -> None:
-        """Write a JSON-lines log entry."""
+        """Write a JSON-lines log entry.
+
+        The write goes through :func:`bounded_log.append_bounded_line`,
+        so the round log is bounded: a round that logs every sub-agent
+        line would otherwise grow a single file past any ceiling, and
+        the reader of that file has to read all of it to find the one
+        line it wanted.
+
+        A log that cannot be written costs that line and nothing else.
+        The round has to finish whatever happens to its log, so the
+        write failure is swallowed here rather than ending the
+        verification.
+        """
         if not self._log_file:
             return
 
-        with open(self._log_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        try:
+            append_bounded_line(
+                self._log_file,
+                json.dumps(entry, ensure_ascii=False) + "\n",
+            )
+        except OSError:
+            pass
 
     def _collect_screenshot_references(self) -> List[str]:
-        """Collect all screenshot references from current round."""
-        screenshots = []
+        """Collect all screenshot references from current round.
+
+        The rotated copies of the round log are read too, oldest copy
+        first — a rotation moves the *old* screenshots out of the live
+        file, and a screenshot the report does not reference is a
+        screenshot nobody can look at.
+        """
+        screenshots: List[str] = []
 
         if not self._log_file:
             return screenshots
 
-        try:
-            with open(self._log_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            entry = json.loads(line)
-                            if entry.get("event_type") == "screenshot_saved":
-                                rel_path = entry.get("data", {}).get("relative_path")
-                                if rel_path:
-                                    screenshots.append(rel_path)
-                        except json.JSONDecodeError:
-                            pass
-        except Exception:
-            pass
+        for candidate in _log_candidates(self._log_file):
+            for entry in self._read_log_entries(candidate):
+                if entry.get("event_type") != "screenshot_saved":
+                    continue
+                data = entry.get("data")
+                rel_path = data.get("relative_path") if isinstance(data, dict) else None
+                if rel_path:
+                    screenshots.append(rel_path)
 
         return screenshots
 

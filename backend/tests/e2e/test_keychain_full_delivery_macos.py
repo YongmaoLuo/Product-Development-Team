@@ -2099,10 +2099,89 @@ _HARNESS_SOURCE_RE = re.compile(
 )
 
 
-def sweepable_text(sample: str) -> str:
-    """The reading with this file's own two strings removed.
+#: The machine's own text, and the places a reading carries it.
+#:
+#: A reading is a picture of a process image, and a process image holds
+#: whatever the machine put in it: the checkout this suite runs in, the
+#: interpreter it runs under, the directories the machine's ``PATH`` names.
+#: None of that is evidence of anything.
+#:
+#: It has to be taken out before the fragment search rather than after,
+#: because a canary's *readable* label is ordinary text, and ordinary text
+#: turns up in ordinary paths. Six characters of ``pdt-test-feishu-secret-``
+#: appear in a directory called ``load-test-rig`` as readily as they appear
+#: in a leak, and a sweep that cannot tell the two apart reports the
+#: machine's own path as a leak of the secret. A check that fires on correct
+#: code gets switched off, and then it says nothing at all.
+#:
+#: Taken out of the fragment search only. The whole-value assertion runs
+#: against the reading as it was taken, because what must never appear is
+#: the *value*, and a value hidden inside a path is still a value.
 
-    Two exclusions, both load-bearing, and the second one is specific to this
+
+def _machine_text() -> tuple:
+    """The paths a reading of this machine's child carries, and why.
+
+    Four groups, each here because a reading shows it:
+
+    * the checkout and the ``backend`` directory inside it. The import
+      path this file hands the child is the second of those, and one
+      string for the checkout root covers the virtualenv under it, the
+      interpreter inside that, and every ``PATH`` entry pointing into it.
+    * the interpreter, as this suite started it and as the kernel
+      recorded it. The first is the child's ``argv[0]`` and the
+      ``__PYVENV_LAUNCHER__`` a virtualenv puts in a child's environment;
+      the second is the executable underneath the virtualenv, which on a
+      macOS framework build is the framework's own binary rather than the
+      symlink that was run — a path no attribute of this process holds,
+      and the one the kernel puts in the reading.
+    * the machine's own ``PATH``, entry by entry. The environment this
+      file builds hands the child the very same value.
+    * the launcher variable, when this process carries one.
+    """
+    paths = [
+        str(_BACKEND_DIR),
+        str(_BACKEND_DIR.parent),
+        sys.executable,
+        os.path.realpath(sys.executable),
+    ]
+    base = getattr(sys, "_base_executable", None)
+    if base:
+        paths.append(base)
+        paths.append(os.path.realpath(base))
+        framework = (
+            Path(base).parent.parent / "Resources/Python.app/Contents/MacOS/Python"
+        )
+        if framework.exists():
+            paths.append(str(framework))
+    paths.extend(
+        part for part in os.environ.get("PATH", "").split(os.pathsep) if part
+    )
+    launcher = os.environ.get("__PYVENV_LAUNCHER__")
+    if launcher:
+        paths.append(launcher)
+    return tuple(paths)
+
+
+def _strip_machine_text(text: str) -> str:
+    """The text with the machine's own paths taken out of it.
+
+    Whole strings rather than a shape, so that what goes is exactly the
+    machine's own text and nothing that merely resembles it: a path that
+    carries a secret is a leak, and a sweep that removed paths by shape
+    would take that leak out with them. The paths removed here are the
+    ones this process can name, so it knows what it is removing.
+    """
+    for piece in _machine_text():
+        if piece:
+            text = text.replace(piece, "")
+    return text
+
+
+def sweepable_text(sample: str) -> str:
+    """The reading with this file's own two strings and the machine's own text removed.
+
+    Three exclusions, all load-bearing, and the second one is specific to this
     platform: ``ps eew`` prints the child's *arguments* as well as its
     environment, and those arguments are this file's source, which names
     ``read_secret_fd``. A canary reads ``pdt-test-feishu-secret-<hex>``, and
@@ -2115,12 +2194,19 @@ def sweepable_text(sample: str) -> str:
     and a literal only ever reaches one of them. See that constant for the
     escaping it has to tolerate.
 
-    Neither exclusion touches the whole-value assertion, which runs against
-    the reading as it was taken: what must never appear is the *value*, and a
-    value smuggled inside this file's own source or its two entries would
-    still be caught there.
+    The third exclusion is the machine's own text — the checkout, the
+    interpreter, the machine's ``PATH`` — which a reading carries whether or
+    not this file put it there. It is removed for the same reason the other
+    two are: a canary's readable label is ordinary text, and ordinary text
+    turns up in ordinary paths. See :func:`_machine_text`.
+
+    None of the three exclusions touches the whole-value assertion, which
+    runs against the reading as it was taken: what must never appear is the
+    *value*, and a value smuggled inside this file's own source or its two
+    entries would still be caught there.
     """
-    return _HARNESS_ENTRY_RE.sub("", _HARNESS_SOURCE_RE.sub("", sample))
+    text = _HARNESS_ENTRY_RE.sub("", _HARNESS_SOURCE_RE.sub("", sample))
+    return _strip_machine_text(text)
 
 
 def leaked_fragments(text: str, value: str) -> list:
@@ -2146,8 +2232,11 @@ def assert_no_sentinel_in(sample: str, sentinel: str, probe: str) -> None:
     because this text is destined for a CI log and a diagnostic that printed
     the secret it found would publish it at the moment somebody is reading
     about it. The full reading is included: it is the evidence for the count,
-    and the sweep has already removed the two strings that are legitimately
-    there.
+    and it is the reading as it was taken — this file's own two strings and
+    the machine's own paths have been swept out of the text that was
+    searched, so what is printed is where a fragment actually came from.
+    The value itself is not in it: the whole-value assertion above ran
+    first, and it would have failed on a reading that carried it.
     """
     assert sentinel not in sample, (
         "the running child's {} carries the secret itself.\n"
@@ -2166,7 +2255,7 @@ def assert_no_sentinel_in(sample: str, sentinel: str, probe: str) -> None:
             len(leaked),
             max((len(fragment) for fragment in leaked), default=0),
             hashlib.sha256(sentinel.encode("utf-8", "surrogateescape")).hexdigest(),
-            swept,
+            sample,
         )
     )
 

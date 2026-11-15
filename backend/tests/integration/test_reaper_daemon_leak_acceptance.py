@@ -16,8 +16,8 @@ replaced, and the guard the suite installs to take its own daemons
 back.  What was missing was the *evidence*: controls that fail when one
 of those mechanisms stops working, and that can be re-run to show it.
 
-The three controls
-------------------
+The four controls
+-----------------
 ``test_five_launches_leave_one_daemon``
     The leak itself.  The same root is asked for a daemon five times and
     one daemon is left.
@@ -38,6 +38,17 @@ The three controls
 ``test_suite_guard_is_installed``
     The suite's own guard: an autouse fixture that takes back the
     daemons the run started, and only those.
+
+``test_the_census_says_when_the_machine_could_not_be_read``
+    The census the leak was closed by, and the fact it has to report
+    besides the daemons: whether the machine could be read at all.  A
+    machine that cannot be read is not a machine with no daemons on it,
+    and the control that counts the daemons must not turn the first
+    into the second.
+
+    On 2026-11-06 a machine with a load average of 39 did not answer
+    the read, and the census reported "no daemons" for a machine that
+    was running five of them.  The count was never made.
 
 The rules
 ---------
@@ -61,6 +72,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import pytest
@@ -155,25 +167,32 @@ def _resolved(path: object) -> Optional[str]:
         return None
 
 
-def _daemons_for_root(root: Path) -> List[Any]:
-    """Return the live reaper daemons serving *root*.
+def _daemons_for_root(root: Path) -> Tuple[List[Any], bool]:
+    """Return the live reaper daemons serving *root*, and whether the
+    machine could be read.
 
     The machine's own daemons are not this file's business, so the
     answer is filtered by the root: a developer with a reaper of their
     own gets the same answer as a runner with none.
+
+    The second half of the answer is the census's own: "there is no
+    daemon on this root" and "I could not look" are different facts.
+    A machine too busy to answer gives the second one, and it says
+    nothing about the daemons on it.
     """
     target = _resolved(root)
     if target is None:
-        return []
+        return [], True
 
+    daemons, readable = reaper.census_reaper_daemons()
     found: List[Any] = []
-    for daemon in reaper.list_reaper_daemons():
+    for daemon in daemons:
         served = getattr(daemon, "plans_root", None)
         if not served:
             continue
         if _resolved(served) == target:
             found.append(daemon)
-    return found
+    return found, readable
 
 
 def _entry_for(status: Dict[str, Any], pid: int) -> Optional[Dict[str, Any]]:
@@ -205,15 +224,23 @@ def _entries_for_root(status: Dict[str, Any], root: Path) -> List[Dict[str, Any]
     return found
 
 
-def _wait_for_a_daemon(root: Path, timeout: float = DAEMON_TIMEOUT) -> Optional[Any]:
-    """Wait until the census reports a daemon serving *root*."""
+def _wait_for_a_daemon(
+    root: Path, timeout: float = DAEMON_TIMEOUT
+) -> Tuple[Optional[Any], bool]:
+    """Wait until the census reports a daemon serving *root*.
+
+    The daemon is ``None`` when the census never reported one, and the
+    second half of the answer says whether the census could read the
+    machine at all: a machine that could not be read reports no daemon
+    and does not know that there is none.
+    """
     deadline = time.monotonic() + timeout
     while True:
-        live = _daemons_for_root(root)
+        live, readable = _daemons_for_root(root)
         if live:
-            return live[0]
+            return live[0], True
         if time.monotonic() >= deadline:
-            return None
+            return None, readable
         time.sleep(POLL_INTERVAL)
 
 
@@ -236,22 +263,28 @@ def _wait_for_the_lock(root: Path, timeout: float = LOCK_TIMEOUT) -> bool:
     return False
 
 
-def _settle(farm: "_DaemonFarm", timeout: float) -> Tuple[List[Any], int]:
+def _settle(farm: "_DaemonFarm", timeout: float) -> Tuple[List[Any], int, bool]:
     """Wait for the launched daemons to stop standing down.
 
-    Returns the daemons still serving the root and the number of the
-    launched processes that have left.  A daemon that stands down has
-    to *leave*: a process that is still there is a daemon that did not
-    stand down, however polite its log line was.
+    Returns the daemons still serving the root, the number of the
+    launched processes that have left, and whether the census could read
+    the machine.  A daemon that stands down has to *leave*: a process
+    that is still there is a daemon that did not stand down, however
+    polite its log line was.
+
+    A census that could not read the machine is retried until the
+    deadline: a machine that is briefly too busy to answer is not a
+    machine that cannot be read at all.  What it must never become is
+    an answer of zero.
     """
     deadline = time.monotonic() + timeout
     while True:
         exited = sum(1 for process in farm.processes if process.poll() is not None)
-        live = _daemons_for_root(farm.root)
-        if exited >= len(farm.processes) - 1 and len(live) == 1:
-            return live, exited
+        live, readable = _daemons_for_root(farm.root)
+        if readable and exited >= len(farm.processes) - 1 and len(live) == 1:
+            return live, exited, True
         if time.monotonic() >= deadline:
-            return live, exited
+            return live, exited, readable
         time.sleep(POLL_INTERVAL)
 
 
@@ -368,6 +401,46 @@ def farm(tmp_path: Path) -> Iterator[_DaemonFarm]:
 # ---------------------------------------------------------------------------
 
 
+def _assert_the_leak_is_closed(
+    live: List[Any], exited: int, readable: bool
+) -> None:
+    """The control's own verdict on the census it read.
+
+    The count of daemons is only an answer when the machine could be
+    read to count them.  An unreadable machine is reported as
+    unreadable -- the answer is unknown, not zero -- and the case
+    still fails: a control that cannot measure the leak must not pass
+    it either.
+
+    Whether the *gate* books that failure against the code is a
+    separate question, and it is answered by the shape of the message:
+    a machine that could not be read is the machine's shape, so the
+    failure is not turned into a repair task against a delivery that
+    did not fail.
+    """
+    assert readable, (
+        "the machine could not be read for this census: the daemons on "
+        "the root could not be counted, so the answer is unknown rather "
+        "than zero"
+    )
+    # The wording names the wait that ran out, and not only the answer:
+    # the gate reads the *shape* of a failure to decide whether the
+    # machine or the code owns it, and "it waited and the wait ran out"
+    # is the machine's shape.  A message that said only "the root
+    # carries N daemons" would be indistinguishable from a code
+    # failure, and a busy host would turn this control into a repair
+    # task against a delivery that did not fail.
+    assert len(live) == 1, (
+        "the daemon count did not settle within 30s: the root carries %d "
+        "daemons after %d launches: %r"
+        % (len(live), LAUNCHES, [(d.pid, d.plans_root) for d in live])
+    )
+    assert exited >= LAUNCHES - 1, (
+        "%d of the %d launched daemons are still running"
+        % (LAUNCHES - exited, LAUNCHES)
+    )
+
+
 def test_five_launches_leave_one_daemon(farm: _DaemonFarm) -> None:
     """Five launches on one root leave one daemon.
 
@@ -393,16 +466,9 @@ def test_five_launches_leave_one_daemon(farm: _DaemonFarm) -> None:
             # measuring which daemon won the race for it.
             _wait_for_the_lock(farm.root)
 
-    live, exited = _settle(farm, STAND_DOWN_TIMEOUT)
+    live, exited, readable = _settle(farm, STAND_DOWN_TIMEOUT)
 
-    assert len(live) == 1, (
-        "the root carries %d daemons after %d launches: %r"
-        % (len(live), LAUNCHES, [(d.pid, d.plans_root) for d in live])
-    )
-    assert exited >= LAUNCHES - 1, (
-        "%d of the %d launched daemons are still running"
-        % (LAUNCHES - exited, LAUNCHES)
-    )
+    _assert_the_leak_is_closed(live, exited, readable)
 
 
 def test_status_lists_running_daemon(farm: _DaemonFarm) -> None:
@@ -415,7 +481,12 @@ def test_status_lists_running_daemon(farm: _DaemonFarm) -> None:
     or a script actually reads.
     """
     farm.spawn()
-    daemon = _wait_for_a_daemon(farm.root)
+    daemon, readable = _wait_for_a_daemon(farm.root)
+    assert readable, (
+        "the machine could not be read for this census: the daemon on %s "
+        "could not be found, so the answer is unknown rather than absent"
+        % (farm.root,)
+    )
     assert daemon is not None, "the daemon never showed up in the census"
 
     status = reaper.daemon_status()
@@ -526,6 +597,185 @@ def test_suite_guard_is_installed(request: pytest.FixtureRequest) -> None:
         "%r does not take a census of the machine first, so it cannot "
         "tell its own daemons from somebody else's" % (GUARD_FIXTURE,)
     )
+
+
+# ---------------------------------------------------------------------------
+# The census the controls read
+# ---------------------------------------------------------------------------
+
+
+class _FakeProcess:
+    """One process, as ``psutil`` would describe it.
+
+    A command line of ``None`` is the case that matters: the kernel
+    refused to hand it over, which is what happens to another user's
+    process on macOS.
+    """
+
+    def __init__(self, pid: int, argv: Optional[List[str]]) -> None:
+        self.pid = pid
+        self._argv = argv
+
+    def cmdline(self) -> List[str]:
+        if self._argv is None:
+            raise PermissionError(13, "the command line was refused")
+        return list(self._argv)
+
+    def ppid(self) -> int:
+        return 1
+
+    def pgid(self) -> int:
+        return self.pid
+
+    def uids(self) -> Any:
+        return SimpleNamespace(effective=501, real=501)
+
+    def memory_info(self) -> Any:
+        return SimpleNamespace(rss=1024 * 64)
+
+
+class _FakePsutil:
+    """The ``psutil`` module, as the census uses it."""
+
+    def __init__(self, processes: List[_FakeProcess]) -> None:
+        self._processes = processes
+
+    def process_iter(self) -> Iterator[_FakeProcess]:
+        return iter(self._processes)
+
+
+def test_the_census_says_when_the_machine_could_not_be_read(monkeypatch) -> None:
+    """A machine that cannot be read is not a machine with no daemons.
+
+    The census answers two questions at once: which daemons are
+    running, and whether the machine could be read to find out.  The
+    second one is what a busy machine gives.
+
+    On 2026-11-06 a machine with a load average of 39 did not answer
+    the read, and the census reported "no daemons" for a machine that
+    was running five of them.  The count was never made, and a count
+    that was never made is not a count of zero.
+    """
+    monkeypatch.setattr(reaper, "_resolve_psutil", lambda: None)
+    monkeypatch.setattr(reaper, "_run_ps", lambda *args, **kwargs: None)
+
+    processes, readable = reaper.census_processes()
+
+    assert readable is False, (
+        "the census reported a machine it could not read as a machine it "
+        "had read"
+    )
+    assert processes == [], (
+        "the census invented processes on a machine it could not read: %r"
+        % (processes,)
+    )
+
+
+def test_the_census_asks_psutil_before_it_forks_ps(monkeypatch) -> None:
+    """The census reads the machine without forking when it can.
+
+    ``ps`` is a fork, and a fork on a machine that is already busy is a
+    fork that does not come back.  ``psutil`` reads the machine
+    directly, so it is asked first; ``ps`` is the fallback for a
+    machine without it.
+    """
+    forked: List[Any] = []
+
+    def fake_run(args, **kwargs):
+        forked.append(list(args))
+        raise OSError("ps must not be run while psutil can read the machine")
+
+    monkeypatch.setattr(
+        reaper,
+        "_resolve_psutil",
+        lambda: _FakePsutil(
+            [_FakeProcess(4242, ["python", "-m", "backend.orphan_reaper"])]
+        ),
+    )
+    monkeypatch.setattr(reaper, "_run_ps", fake_run)
+
+    processes, readable = reaper.census_processes()
+
+    assert readable is True
+    assert [proc.pid for proc in processes] == [4242]
+    assert forked == [], (
+        "the census forked ps while psutil could read the machine: %r"
+        % (forked,)
+    )
+
+
+def test_the_census_falls_back_to_ps_when_psutil_cannot_describe_a_process(
+    monkeypatch,
+) -> None:
+    """A process the kernel refuses to describe makes the census fall back.
+
+    ``psutil`` cannot read the command line of another user's process
+    on macOS, and a census that cannot classify a process cannot claim
+    to have read the machine -- a daemon it could not describe is a
+    daemon it could not count.  The ``ps`` fallback is the complete
+    read.
+    """
+    ps_table = (
+        "  11  1  11  501  1024 /usr/bin/python3 -m backend.orphan_reaper"
+        " --daemon\n"
+    )
+    monkeypatch.setattr(
+        reaper,
+        "_resolve_psutil",
+        lambda: _FakePsutil([_FakeProcess(4242, None)]),
+    )
+    monkeypatch.setattr(reaper, "_run_ps", lambda *args, **kwargs: ps_table)
+
+    processes, readable = reaper.census_processes()
+
+    assert readable is True
+    assert [proc.pid for proc in processes] == [11]
+    assert processes[0].argv.endswith("--daemon")
+
+
+def test_the_census_retries_the_ps_fallback(monkeypatch) -> None:
+    """The ``ps`` fallback is tried more than once, and a bounded number
+    of times.
+
+    A machine that is briefly too busy to answer is not a machine that
+    cannot be read at all -- but a census that waits forever is no
+    better than one that gives up at once.
+    """
+    attempts: List[Any] = []
+
+    def fake_run(args, **kwargs):
+        attempts.append(list(args))
+        return None
+
+    monkeypatch.setattr(reaper, "_resolve_psutil", lambda: None)
+    monkeypatch.setattr(reaper, "_run_ps", fake_run)
+    monkeypatch.setattr(reaper, "CENSUS_READ_RETRY_DELAY_SEC", 0.0)
+
+    processes, readable = reaper.census_processes()
+
+    assert readable is False
+    assert len(attempts) == reaper.CENSUS_READ_ATTEMPTS, (
+        "the census asked ps %d times; it is supposed to try more than "
+        "once and no more than %d times"
+        % (len(attempts), reaper.CENSUS_READ_ATTEMPTS)
+    )
+
+
+def test_the_control_reports_an_unreadable_machine_as_unreadable() -> None:
+    """An unreadable machine is reported as unreadable, not as zero daemons.
+
+    The control reads the machine and counts the daemons it finds.  A
+    machine too busy to answer gives no count at all, and the control
+    has to say so: "the root carries 0 daemons" would be a statement
+    about the machine that was never made.  The case still fails -- a
+    control that cannot measure the leak must not pass it either.
+    """
+    with pytest.raises(AssertionError) as failure:
+        _assert_the_leak_is_closed([], 0, False)
+
+    message = str(failure.value)
+    assert "could not be read" in message, message
+    assert "0 daemons" not in message, message
 
 
 # ---------------------------------------------------------------------------

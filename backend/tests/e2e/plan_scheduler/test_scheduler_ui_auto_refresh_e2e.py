@@ -152,6 +152,11 @@ GUARD_VALUE = "1"
 #: The panel's own capacity widget, as the operator reads it.
 QUEUE_SELECTOR = "#scheduler-view-capacity-queue"
 
+#: The panel's line, as the panel draws it: one card per waiting plan.
+#: The driver waits for a card before it reads the panel, so that what
+#: is read is a panel that has drawn its line.
+QUEUE_CARD_SELECTOR = "#scheduler-queue-cards .scheduler-plan-card"
+
 #: The moment the snapshot on the panel was made.
 STAMP_SELECTOR = "#scheduler-view-generated-at"
 
@@ -227,6 +232,10 @@ with sync_playwright() as driver:
     # The one click: the operator opens the panel.
     page.click("#btn-open-scheduler")
     page.wait_for_selector("#scheduler-view:not(.hidden)", timeout=30000)
+    # The panel draws its waiting plans as cards; the driver waits for
+    # one of them, so that the panel is read after it has drawn its
+    # line and not before.
+    page.wait_for_selector(QUEUE_CARD_SELECTOR, timeout=30000)
 
     # What the server serves right now.  The panel is watched against
     # this, so the panel is never compared with a number made up here.

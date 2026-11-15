@@ -12,8 +12,8 @@ The chain
 ---------
 1. the server is a child process, with its own database and its own plans;
 2. the operator opens the scheduling view (``#btn-open-scheduler``);
-3. the line the panel draws has rows, and every row names the plan it
-   is about — a plan id, not a dash;
+3. the line the panel draws has a card per waiting plan, and every one
+   of them names the plan it is about — a plan id, not a dash;
 4. the running plans carry a duration an operator can read: how long
    the plan has been running, in hours and minutes or minutes and seconds;
 5. the operator picks a capacity (five) and presses "apply"
@@ -202,19 +202,85 @@ def browser_executable():
     return None
 
 
-def read_rows(page, selector):
-    """The cells of every row of a table, read in one go.
+#: The two blocks of the panel, as the panel draws them: one card per
+#: waiting plan, and one card per plan that holds a slot.  A card
+#: carries the plan it is about in ``data-plan-id`` and the facts the
+#: panel draws in ``data-fact`` attributes.
+QUEUE_CARD_SELECTOR = "#scheduler-queue-cards .scheduler-plan-card"
+RUNNING_CARD_SELECTOR = "#scheduler-running-cards .scheduler-plan-card"
 
-    The panel redraws its tables whenever it reads the model again, so
-    a row that was located a moment ago may be gone by the time it is
-    read.  Reading the whole table in one evaluation avoids that race:
-    what is read is what is on the page at that moment.
+
+def read_cards(page, selector):
+    """The cards the panel draws, read in one go.
+
+    The panel redraws its cards whenever it reads the model again, so a
+    card that was located a moment ago may be gone by the time it is
+    read.  Reading them all in one evaluation avoids that race: what is
+    read is what is on the page at that moment.
+
+    A card is read as the plan it is about and the facts it carries:
+    the plan comes from the card's own ``data-plan-id``, and every fact
+    from the ``data-fact`` attribute the renderer gave it.
     """
     return page.eval_on_selector_all(
         selector,
-        """rows => rows.map(row => Array.from(row.querySelectorAll('td'))
-                                 .map(cell => cell.innerText.trim()))""",
+        """cards => cards.map(card => {
+               const facts = {};
+               card.querySelectorAll('[data-fact]').forEach(node => {
+                   facts[node.dataset.fact] = (node.dataset.value || '').trim();
+               });
+               return {
+                   plan_id: (card.dataset.planId || '').trim(),
+                   facts: facts,
+               };
+           })""",
     )
+
+
+def read_queue(page):
+    """The line, as the panel draws it.
+
+    The panel draws the waiting plans as **cards**, one per plan, and
+    the cards are what is read here.  A card is read as the columns
+    the queue's table used to draw — the position, the plan, the
+    number, the priority, the promotion and the reason — so that what
+    the panel says about a plan is read the way it always was.  The
+    table the panel used to draw the rows into
+    (``#scheduler-queue-list``) is still in the markup and carries no
+    rows any more.
+    """
+    return [
+        [
+            row["facts"].get("position", ""),
+            row["plan_id"],
+            row["facts"].get("seq", ""),
+            row["facts"].get("priority", ""),
+            row["facts"].get("promote_order", ""),
+            row["facts"].get("reason", ""),
+        ]
+        for row in read_cards(page, QUEUE_CARD_SELECTOR)
+    ]
+
+
+def read_running(page):
+    """The running plans, as the panel draws them.
+
+    The panel draws them as cards too, and a card is read as the
+    columns the running table used to draw — the plan, the time it has
+    been running, whether it may be interrupted and its workspace.  The
+    table the panel used to draw the rows into
+    (``#scheduler-running-list``) is still in the markup and carries no
+    rows any more.
+    """
+    return [
+        [
+            row["plan_id"],
+            row["facts"].get("running_sec", ""),
+            row["facts"].get("evictable", ""),
+            row["facts"].get("workspace", ""),
+        ]
+        for row in read_cards(page, RUNNING_CARD_SELECTOR)
+    ]
 
 
 def read_text(page, selector):
@@ -294,10 +360,10 @@ with sync_playwright() as driver:
     page.wait_for_selector("#scheduler-view:not(.hidden)", timeout=30000)
     page.wait_for_timeout(500)
 
-    # The line: wait until the panel draws rows in it.
+    # The line: wait until the panel draws its cards.
     deadline = time.time() + 60
     while time.time() < deadline:
-        if read_rows(page, "#scheduler-queue-list tr"):
+        if read_queue(page):
             break
         refresh(page)
     else:
@@ -313,10 +379,10 @@ with sync_playwright() as driver:
     # read that was judged readable is the read that is kept, so
     # nothing can change in between the two.
     deadline = time.time() + duration_timeout
-    running = read_rows(page, "#scheduler-running-list tr")
+    running = read_running(page)
     while not readable(running) and time.time() < deadline:
         refresh(page)
-        running = read_rows(page, "#scheduler-running-list tr")
+        running = read_running(page)
     if not readable(running):
         raise AssertionError(
             "the panel drew no readable duration within {0}s; it drew "
@@ -334,11 +400,9 @@ with sync_playwright() as driver:
     page.wait_for_timeout(2000)
 
     report = {
-        "queue_cells": read_rows(page, "#scheduler-queue-list tr"),
+        "queue_cells": read_queue(page),
         "running_cells": running,
-        "running_cells_after_capacity": read_rows(
-            page, "#scheduler-running-list tr"
-        ),
+        "running_cells_after_capacity": read_running(page),
         "agent_count": read_text(page, "#scheduler-view-agent-count"),
         "panel_capacity_total": read_text(page, "#scheduler-view-capacity-total"),
         "panel_capacity_source": read_text(page, "#scheduler-capacity-source"),

@@ -26,11 +26,17 @@
   * ``completed_vps`` = PASSED（终态成功）
   * ``failed_vps``    = FAILED / BLOCKED（要重跑）
   * ``skipped_vps``   = SKIPPED / SPLIT（终态成功，重跑也只会再跳一次）
-  * ``deferred_vps``  = DEFERRED（**刻意不进任何终态桶**）
+  * ``deferred_vps``  = DEFERRED / INCONCLUSIVE（**刻意不进任何终态桶**）
 
 ``BaseExecutor.run`` 的 ``completed_set`` 是 completed ∪ skipped，两者都不在
 里面才会在下一轮重跑 —— 这正是 DEFERRED 的语义：Phase 1 修好之后要把全量
 关卡真正跑一遍。
+
+INCONCLUSIVE（2026-11-10）是门禁自己的第三个结论：预算用尽，**没能下结论**
+（``verification_ci_runner.STATUS_INCONCLUSIVE``）。它与 DEFERRED 同桶 ——
+既不是成功也不是失败，下一轮重跑 —— 而且它**绝不进失败桶**：失败桶是修复
+任务的输入，「机器答不了」落进去会凭空造出一条「去修机器没答出来的那件事」
+的任务。
 
 计划作废（retired）的两条规则：
 
@@ -112,7 +118,8 @@ def bucket_for_status(
     """一条裁决属于哪个桶；不属于任何桶时返回 ``None``。
 
     :param status: 裁决的 ``status`` 字段（``"PASSED"`` / ``"FAILED"`` /
-        ``"BLOCKED"`` / ``"SKIPPED"`` / ``"SPLIT"`` / ``"DEFERRED"``）。
+        ``"BLOCKED"`` / ``"SKIPPED"`` / ``"SPLIT"`` / ``"DEFERRED"`` /
+        ``"INCONCLUSIVE"``）。
     :param vp_id: 该裁决所属的 VP id —— 只有它能去 ``retired`` 里查作废标记。
     :param retired: ``{vp_id: "obsolete" | "superseded_by"}``，即「计划自己
         作废了哪些 VP」。``None`` 表示没有 VP 被作废。
@@ -154,6 +161,15 @@ def bucket_for_status(
 
     if status == "DEFERRED":
         # Phase 2 关卡被门禁延后。**刻意不进任何终态成功桶**。
+        return BUCKET_DEFERRED
+
+    if status == "INCONCLUSIVE":
+        # 门禁预算用尽、没能下结论（``verification_ci_runner.
+        # STATUS_INCONCLUSIVE``）。它与 DEFERRED 同形：既不是成功也不是
+        # 失败，下一轮重跑。
+        #
+        # 它**绝不进失败桶**：失败桶是修复任务的输入，一条「机器答不了」
+        # 落进去就会凭空造出「去修机器没答出来的那件事」的任务。
         return BUCKET_DEFERRED
 
     # 未知 / None status：不进任何桶。

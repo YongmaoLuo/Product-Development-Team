@@ -435,6 +435,21 @@ fi
 # other 27 (perf) are inside it but have to run alone. Dropping phase 3
 # would trade coverage for a green exit code.
 #
+# Phase 3 is also the only phase a CPU load case belongs to.  A case that
+# needs the host to be busy uses the one sanctioned rig --
+# ``backend/tests/_load_rig.py::cpu_load`` -- which starts real child
+# processes and reclaims every one of them when the block ends, and which
+# asks the host whether it is idle before it starts anything
+# (``backend/tests/_host_load.py``): a host already carrying someone
+# else's work is skipped with the reason in the message, not measured.
+#
+# The rig belongs here and nowhere else.  Phase 3 is serial, it runs on
+# the nightly schedule, and it is the one phase where a loaded host
+# cannot invalidate the rest of the suite.  A load case in the parallel
+# phase would have the load and the workers competing for the same
+# cores, so the number that came out would describe the machine rather
+# than the code under test.
+#
 # The caller keeps the historical one-shot invocation whenever it has
 # already expressed the shape it wants: an explicit target, an explicit
 # ``-n`` (xdist workers), an explicit ``-p xdist`` / ``-p no:xdist``, or

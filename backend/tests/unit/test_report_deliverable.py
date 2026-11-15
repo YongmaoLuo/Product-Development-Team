@@ -55,6 +55,20 @@ if str(_BACKEND_DIR) not in sys.path:
 from task import SubTask  # noqa: E402
 
 
+#: How long the caller waits for one guard-hook spawn.
+#:
+#: The guard is a separate process, and on a loaded host the interpreter
+#: alone can take the better part of a minute to come up.  The broker path
+#: starts a SECOND interpreter (the lock CLI) on top of that, so the whole
+#: path costs roughly two spawns.  A ceiling below that makes the CALLER
+#: die before the guard has rendered its verdict -- the case then reports
+#: a broken contract for what is really a slow machine.
+#:
+#: This is the test's own waiting ceiling and nothing else: no exit code,
+#: no stderr match, no assertion and no loop count moves with it.
+_HOOK_SPAWN_TIMEOUT_S = 150
+
+
 # ---------------------------------------------------------------------------
 # 1 — the model
 # ---------------------------------------------------------------------------
@@ -538,7 +552,8 @@ def _run_hook(workspace, target, *, read_only=True, report_path=None):
     proc = subprocess.run(
         [sys.executable, str(workspace["script"])],
         input=json.dumps({"tool_input": {"file_path": str(target)}}),
-        capture_output=True, text=True, env=env, timeout=60,
+        capture_output=True, text=True, env=env,
+        timeout=_HOOK_SPAWN_TIMEOUT_S,
     )
     return proc.returncode, proc.stderr
 
@@ -608,6 +623,7 @@ def test_an_ordinary_in_project_file_is_still_refused(workspace):
     assert "files_to_modify" in stderr
 
 
+@pytest.mark.timeout(600)
 def test_a_readonly_task_without_a_report_still_refuses_everything(workspace):
     """No carve-out issued ⇒ the pre-existing invariant is untouched."""
     scratch = workspace["scratch"] / "pdt-report-absent.md"
@@ -621,6 +637,7 @@ def test_a_readonly_task_without_a_report_still_refuses_everything(workspace):
     assert code == 2, stderr
 
 
+@pytest.mark.timeout(600)
 def test_a_report_task_with_no_stamp_is_still_refused(workspace):
     """``PDT_REPORT_PATH`` absent must not fall open.
 

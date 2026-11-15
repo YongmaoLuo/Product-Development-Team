@@ -1,0 +1,30 @@
+@@ -654,11 +654,16 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
+     # 重新钉住该文件的哈希。
++    # 2026-11-01：因「调度卡片按卡片渲染、默认收起、展开才请求详情」（task-12）改动了
++    # `frontend/app.js`，按本 gate 的既定流程把哈希前移到本分支的批准态。表内条目集合
++    # 与断言强度均不变：被钉文件的范围不变、sha256 仍逐字节比对。
+     "frontend/app.js": (
+-        "d6cd5c015d0e3d4ac1f963e6275b29350c256ff1b6ad8335aef56cd37f1595e0"
++        "b4344606ca1d3c3dac23c8891500ef1fffb3c9a74d4fc95882d89b1654fe343c"
+     ),
++    # 2026-11-01：因「调度卡片容器与收起态样式」（task-11）改动了 `frontend/style.css`，
++    # 按本 gate 的既定流程把哈希前移到本分支的批准态；表内条目集合不变。
+     "frontend/style.css": (
+-        "0cab7b66dae8b5b693a9e8e4b5c4cda4f8651ae649512e81d8aa8c18a24f836b"
++        "2f1a86a32af180e47915a8d9ad3af479e500f5a401ce45b4edc4f302bec14202"
+     ),
+@@ -668,6 +673,7 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
+     # sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
++    # 2026-11-01：本轮未改动该文件，其哈希原样保留 —— 本次前移只涉及三个前端文件。
+     "backend/verification_loop.py": (
+         "cb585e3776f47a15b7fa2493d039353a957e80c941f51fc7f51a79dba4449a30"
+     ),
+@@ -699,8 +705,10 @@ FROZEN_SCHEDULER_SURFACE_SHA256: dict[str, str] = {
+     # 这个区块里；同样按本 gate 的既定流程重新钉住哈希。
++    # 2026-11-01：因「调度卡片容器与收起态样式」（task-11）改动了 `frontend/index.html`，
++    # 按本 gate 的既定流程把哈希前移到本分支的批准态；表内条目集合不变。
+     "frontend/index.html": (
+-        "02e443000dfd112b687d909d56a4444a4ed58bed9b07d3caeb07433f16fbc0f7"
++        "48c1a3d022fab8f0a696ebfe7613d7ab5e4e46101331118270992e00074cd5ba"
+     ),
+ }

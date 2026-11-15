@@ -2339,3 +2339,215 @@ def build_verification_card(
         execution_progress={"tasks": task_progress or []},
         verification_progress=progress,
     )
+
+
+# ---------------------------------------------------------------------------
+# Shared progress lines (card / web parity)
+# ---------------------------------------------------------------------------
+#
+# The Feishu progress card and the scheduler page's plan-detail panel
+# answer the same three questions — where the plan is right now, how
+# many tasks are done, what is running at this moment. The wording for
+# all three lives in the section builders above, and this function
+# REUSES them instead of writing a second phrasing: a view that says
+# the same fact in its own words is a second source of truth, and the
+# two then drift apart.
+
+
+def _section_text_lines(elements: Any) -> List[str]:
+    """The text lines a card section rendered — one entry per line.
+
+    A section element carries its wording in ``text.content``; a
+    section that renders a block (the running-tasks list) puts one
+    newline-separated line per item into it. Splitting them here is
+    what makes such a section usable by a consumer that renders line
+    by line.
+
+    Elements that carry no text (the ``<hr>`` separators) contribute
+    nothing.
+    """
+    if isinstance(elements, str):
+        elements = [{"text": {"content": elements}}]
+    lines: List[str] = []
+    for element in elements or []:
+        if not isinstance(element, dict):
+            continue
+        text = element.get("text")
+        if isinstance(text, dict):
+            content = text.get("content")
+        elif isinstance(text, str):
+            content = text
+        else:
+            content = element.get("content")
+        if not isinstance(content, str):
+            continue
+        for raw in content.splitlines():
+            line = raw.strip()
+            if line:
+                lines.append(line)
+    return lines
+
+
+def _int_or(value: Any, default: int) -> int:
+    """``value`` as an int, or ``default`` when it is not one."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _task_counts(
+    summary: Dict[str, Any],
+    status: "PlanStatus",
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """The task-count mapping the card's progress bar renders from.
+
+    ``summary`` is the ``/api/plan/{id}/summary`` body, whose counts
+    live under ``tasks``; a payload that carries the counts directly
+    (a bare ``{"total": …, "completed": …}``) is accepted too, so the
+    same function serves both shapes. The order is the card's own:
+    the summary's counts first, the snapshot's counts second.
+    """
+    candidates = (
+        summary.get("tasks"),
+        summary if "total" in summary else None,
+        status.tasks,
+        payload.get("tasks"),
+    )
+    for candidate in candidates:
+        if isinstance(candidate, dict) and candidate:
+            return candidate
+    return {}
+
+
+def build_progress_lines(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Render the progress area as text lines, from the card's builders.
+
+    The Feishu progress card renders its "where am I" area in three
+    sections — the unified phase banner, the task-count bar and the
+    running-tasks block. A second surface (the scheduler page's
+    plan-detail panel) has to show the same three things, and it must
+    not grow its own sentences for them: this function renders the
+    SAME sections and hands back their wording, so the card and the
+    page cannot disagree about what the plan is doing.
+
+    ``payload`` is a plan status snapshot (the body of
+    ``GET /api/plan/{id}/status``): ``plan_id``, the phase under
+    ``current_phase`` / ``phase``, the ``summary`` section, the
+    ``execution`` progress section and the ``verification`` progress
+    section. Every one of them is optional — a payload carrying only
+    a phase answers with the phase line alone, and a payload with no
+    phase at all answers with no lines.
+
+    Returns ``{"title": str, "lines": [{"kind": str, "text": str}]}``.
+    The kinds are ``phase`` (where the plan is), ``summary`` (the task
+    counts) and ``task`` (what is running right now). The text of a
+    line is the card's own wording, verbatim.
+    """
+    data = payload if isinstance(payload, dict) else {}
+    plan_id = str(data.get("plan_id") or "")
+    summary = data.get("summary")
+    summary = summary if isinstance(summary, dict) else {}
+    execution = data.get("execution")
+    execution = execution if isinstance(execution, dict) else {}
+    verification = data.get("verification")
+    verification = verification if isinstance(verification, dict) else {}
+
+    # The card reads the phase and the verification sub-state off a
+    # snapshot. ``_status_from_summary`` is how a caller that holds
+    # only a summary gets one; the payload's own top-level fields win
+    # over it, because those ARE the snapshot the server assembled.
+    state = summary.get("state")
+    state = state if isinstance(state, dict) else {}
+    verification_state = state.get("verification")
+    verification_state = (
+        verification_state if isinstance(verification_state, dict) else {}
+    )
+    status = _status_from_summary(plan_id, {
+        "state": {
+            "current_phase": state.get("current_phase") or "",
+            "verification": verification_state,
+        },
+        "tasks": (
+            summary.get("tasks")
+            if isinstance(summary.get("tasks"), dict) else {}
+        ),
+    })
+
+    phase = str(
+        data.get("current_phase") or data.get("phase") or status.phase or ""
+    )
+    verification_status = str(
+        data.get("verification_status") or status.verification_status or ""
+    )
+    verification_round = _int_or(
+        data.get("verification_round"), status.verification_round,
+    )
+    verification_max_rounds = _int_or(
+        data.get("verification_max_rounds"), status.verification_max_rounds,
+    )
+    verification_stop_reason = (
+        data.get("verification_stop_reason") or status.verification_stop_reason
+    )
+
+    task_progress = execution.get("tasks")
+    task_progress = task_progress if isinstance(task_progress, list) else []
+
+    # The running task is the first in_progress row — the same row the
+    # card names in its phase line.
+    current_task: Optional[Tuple[str, str]] = None
+    for row in task_progress:
+        if (
+            isinstance(row, dict)
+            and row.get("status") == "in_progress"
+            and row.get("id")
+        ):
+            current_task = (str(row["id"]), str(row.get("title") or "").strip())
+            break
+
+    # What the executor is doing when no task row says. The snapshot
+    # is authoritative; the progress payload is the path a caller that
+    # built its own snapshot takes.
+    activity = data.get("current_activity")
+    if not isinstance(activity, dict):
+        candidate = execution.get("current_activity")
+        activity = candidate if isinstance(candidate, dict) else None
+
+    # The VP being verified, and the round's sub-step when no VP is in
+    # flight — the two facts the card's phase line names.
+    current_vp = verification.get("current_vp")
+    current_vp = current_vp if isinstance(current_vp, dict) else None
+    verification_activity = (
+        _activity_label_text(verification.get("activity")) or None
+    )
+
+    lines: List[Dict[str, str]] = []
+    lines.extend(
+        {"kind": "phase", "text": text}
+        for text in _section_text_lines(_unified_phase_section(
+            phase,
+            verification_status=verification_status,
+            verification_round=verification_round,
+            verification_max_rounds=verification_max_rounds,
+            verification_stop_reason=verification_stop_reason,
+            current_task=current_task,
+            current_vp=current_vp,
+            current_activity=activity,
+            verification_activity=verification_activity,
+        ))
+    )
+    lines.extend(
+        {"kind": "summary", "text": text}
+        for text in _section_text_lines(
+            _task_summary_section(_task_counts(summary, status, data))
+        )
+    )
+    lines.extend(
+        {"kind": "task", "text": text}
+        for text in _section_text_lines(
+            _in_progress_tasks_section(task_progress)
+        )
+    )
+
+    return {"title": plan_id or str(data.get("title") or ""), "lines": lines}

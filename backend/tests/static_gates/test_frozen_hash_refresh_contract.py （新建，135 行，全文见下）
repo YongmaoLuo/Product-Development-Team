@@ -1,0 +1,135 @@
+"""The frozen-hash refresh contract for the three changed frontend files.
+
+Why this gate exists
+--------------------
+The change-surface gate holds the files the verification mode is not
+allowed to touch by pinning their sha256 in two tables:
+``FROZEN_R10_SURFACE_SHA256`` and ``FROZEN_SCHEDULER_SURFACE_SHA256``.
+A file that changes *by design* — approved in the plan, reviewed, merged
+— has to move its pin forward, and moving a pin is exactly the kind of
+edit that can fail in two directions at once:
+
+* **It can be done too well.** An entry deleted, an exemption added, or
+  the equality assertion loosened into a containment check all turn the
+  gate green while the file it was written to protect is no longer held
+  at all. The refresh is supposed to *move* a pin, never to remove one.
+* **It can be done by hand.** A hash copied out of a message is a claim
+  about a file rather than a measurement of one, and the first later
+  edit of that file slips through a gate that never sees a byte.
+
+So this file pins the refresh itself:
+
+* the three frontend files this round changed carry the hash of their
+  bytes on disk in the table that owns them — computed here, compared
+  for equality, never typed in;
+* both tables carry exactly the entries they carried before the
+  refresh — the same keys, the same count, no entry added and none
+  dropped.
+
+What it deliberately does not do
+--------------------------------
+It says nothing about the rest of the frozen surface. The pins on
+``backend/verification_loop.py`` and
+``backend/state_machine/db/schema.py`` are not this file's business:
+they did not move this round, and the sibling gate
+``test_verification_mode_scope_gates.py`` keeps holding them byte for
+byte. This contract covers the three frontend files and the shape of
+the two tables — nothing else.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import sys
+from pathlib import Path
+
+#: The gate module that owns the two tables lives in this directory,
+#: so the directory goes on ``sys.path`` first. This is the same two
+#: lines the sibling gate uses for the same reason.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from test_verification_mode_scope_gates import (  # noqa: E402
+    FROZEN_R10_SURFACE_SHA256,
+    FROZEN_SCHEDULER_SURFACE_SHA256,
+    REPO_ROOT,
+)
+
+#: The two tables, by name, so a failure message can name the table
+#: rather than the module attribute it lives in.
+TABLES: dict[str, dict[str, str]] = {
+    "FROZEN_R10_SURFACE_SHA256": FROZEN_R10_SURFACE_SHA256,
+    "FROZEN_SCHEDULER_SURFACE_SHA256": FROZEN_SCHEDULER_SURFACE_SHA256,
+}
+
+#: The three frontend files this round changed, and the table that
+#: owns each one. A file that is not named here is not covered by this
+#: contract — the refresh is a move of three pins, not of the whole
+#: frozen surface.
+REFRESHED_FRONTEND_FILES: dict[str, str] = {
+    "frontend/app.js": "FROZEN_R10_SURFACE_SHA256",
+    "frontend/style.css": "FROZEN_R10_SURFACE_SHA256",
+    "frontend/index.html": "FROZEN_SCHEDULER_SURFACE_SHA256",
+}
+
+#: The entry sets the two tables carried before the refresh. These are
+#: written down rather than derived, because "the table still says what
+#: it said" is only checkable against a recorded baseline — deriving it
+#: from the table would compare the table with itself and pass.
+EXPECTED_TABLE_KEYS: dict[str, frozenset[str]] = {
+    "FROZEN_R10_SURFACE_SHA256": frozenset({
+        "frontend/app.js",
+        "frontend/style.css",
+        "backend/verification_loop.py",
+    }),
+    "FROZEN_SCHEDULER_SURFACE_SHA256": frozenset({
+        "backend/state_machine/db/schema.py",
+        "frontend/index.html",
+    }),
+}
+
+
+def test_three_frontend_hashes_match_disk() -> None:
+    """The refreshed pins are measurements of the files, not claims about them.
+
+    Each of the three frontend files this round changed has to carry the
+    sha256 of its own bytes in the table that owns it. The expected
+    value is computed from the file on disk here, so a pin that was
+    typed by hand — or left at the pre-refresh value — fails.
+    """
+    mismatched: list[str] = []
+    for rel, table_name in sorted(REFRESHED_FRONTEND_FILES.items()):
+        table = TABLES[table_name]
+        assert rel in table, (
+            f"{rel} is no longer pinned by {table_name}: the refresh moved a "
+            "pin, it did not drop one"
+        )
+        frozen = table[rel]
+        actual = hashlib.sha256((REPO_ROOT / rel).read_bytes()).hexdigest()
+        if frozen != actual:
+            mismatched.append(
+                f"{rel} ({table_name}): frozen {frozen}, actual {actual}"
+            )
+    assert mismatched == [], (
+        "a refreshed frozen hash does not match the file on disk:\n  "
+        + "\n  ".join(mismatched)
+    )
+
+
+def test_table_entry_counts_unchanged() -> None:
+    """Both tables still carry exactly the entries they carried before.
+
+    The refresh is allowed to move a pin forward. It is not allowed to
+    add a file to a table, drop one from it, or swap one for another —
+    every one of those changes what the gate holds, and each of them
+    would leave the gate green.
+    """
+    for table_name, expected_keys in sorted(EXPECTED_TABLE_KEYS.items()):
+        table = TABLES[table_name]
+        assert set(table) == set(expected_keys), (
+            f"{table_name} changed its entry set: expected "
+            f"{sorted(expected_keys)}, got {sorted(table)}"
+        )
+        assert len(table) == len(expected_keys), (
+            f"{table_name} changed its entry count: expected "
+            f"{len(expected_keys)}, got {len(table)}"
+        )

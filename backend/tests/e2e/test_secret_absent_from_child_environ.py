@@ -628,6 +628,75 @@ def leaked_fragments(text: str, value: str) -> list:
     ]
 
 
+#: The machine's own text, and the places a child's environment carries it.
+#:
+#: A child's environment holds whatever the machine put in it: the checkout
+#: this suite runs in, the interpreter it runs under, the directories the
+#: machine's ``PATH`` names. None of that is evidence of anything.
+#:
+#: It has to be taken out before the fragment search rather than after,
+#: because a canary's *readable* label is ordinary text, and ordinary text
+#: turns up in ordinary paths. Six characters of ``pdt-test-feishu-secret-``
+#: appear in a directory called ``load-test-rig`` as readily as they appear
+#: in a leak, and a sweep that cannot tell the two apart reports the
+#: machine's own path as a leak of the secret. A check that fires on correct
+#: code gets switched off, and then it says nothing at all.
+#:
+#: Taken out of the fragment search only. The whole-value assertion runs
+#: against the sample as it was read, because what must never appear is the
+#: *value*, and a value hidden inside a path is still a value.
+
+
+def _machine_text() -> tuple:
+    """The paths a child's environment carries because of the machine.
+
+    Three groups, each here because a child's environment shows it:
+
+    * the checkout and the ``backend`` directory inside it. The import
+      path this file hands the child is the second of those, and one
+      string for the checkout root covers the virtualenv under it, the
+      interpreter inside that, and every ``PATH`` entry pointing into it.
+    * the interpreter, as this suite started it and the one underneath the
+      virtualenv. A child's arguments are not in an environment block, but
+      the ``__PYVENV_LAUNCHER__`` a virtualenv puts in a child's
+      environment names it.
+    * the machine's own ``PATH``, entry by entry. The environment this
+      file builds hands the child the very same value.
+    """
+    paths = [
+        str(_BACKEND_DIR),
+        str(_BACKEND_DIR.parent),
+        sys.executable,
+        os.path.realpath(sys.executable),
+    ]
+    base = getattr(sys, "_base_executable", None)
+    if base:
+        paths.append(base)
+        paths.append(os.path.realpath(base))
+    paths.extend(
+        part for part in os.environ.get("PATH", "").split(os.pathsep) if part
+    )
+    launcher = os.environ.get("__PYVENV_LAUNCHER__")
+    if launcher:
+        paths.append(launcher)
+    return tuple(paths)
+
+
+def _strip_machine_text(text: str) -> str:
+    """The text with the machine's own paths taken out of it.
+
+    Whole strings rather than a shape, so that what goes is exactly the
+    machine's own text and nothing that merely resembles it: a path that
+    carries a secret is a leak, and a sweep that removed paths by shape
+    would take that leak out with them. The paths removed here are the
+    ones this process can name, so it knows what it is removing.
+    """
+    for piece in _machine_text():
+        if piece:
+            text = text.replace(piece, "")
+    return text
+
+
 def sweepable_text(captured: EnvironSample) -> str:
     """The sample with this file's own two bookkeeping entries removed.
 
@@ -644,6 +713,14 @@ def sweepable_text(captured: EnvironSample) -> str:
     which runs against the sample as it was read: what must never appear
     is the *value*, and a value smuggled inside one of the two stripped
     entries would be a defect the primary assertion still catches.
+
+    The machine's own text goes the same way and for the same reason. A
+    child's environment carries the checkout path, the interpreter and the
+    machine's ``PATH`` whether or not this file put them there, and a
+    canary's readable label shares six characters with an ordinary path
+    often enough to matter — a sweep that calls the checkout path a leak
+    is a sweep that cannot be believed on the entries that do. See
+    :func:`_machine_text`.
     """
     entries = [entry for entry in captured.raw.split(b"\0") if entry]
     kept = [
@@ -651,7 +728,7 @@ def sweepable_text(captured: EnvironSample) -> str:
         for entry in entries
         if not entry.startswith(_HARNESS_ENTRY_PREFIXES)
     ]
-    return b"\0".join(kept).decode("utf-8", "replace")
+    return _strip_machine_text(b"\0".join(kept).decode("utf-8", "replace"))
 
 
 # ---------------------------------------------------------------------------

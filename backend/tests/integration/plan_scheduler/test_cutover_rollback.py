@@ -160,6 +160,21 @@ GLOBAL_SCHEDULER_PATHS = (
     "/api/scheduler/capacity",
 )
 
+#: The scheduler's routes that answer about ONE plan, under the
+#: scheduler's own prefix.  2026-11-02：分支新增了
+#: GET /api/scheduler/plan/{plan_id}/detail（按计划的只读详情路由）。
+#: 它不是全局路由（不是白名单里的读模型/容量旋钮），也不是
+#: /api/plan/ 前缀 —— 闸门因此打红。把它认成「按计划」，而不是塞进
+#: GLOBAL_SCHEDULER_PATHS：后者会把一条关于单个计划的路由伪装成全局
+#: 路由，闸门从此再也拦不住真正的新全局路由。
+PER_PLAN_SCHEDULER_PREFIX = "/api/scheduler/plan/"
+
+
+def _is_per_plan_scheduler_path(path: str) -> bool:
+    """Whether a scheduler route answers about one particular plan."""
+    return str(path).startswith(PER_PLAN_SCHEDULER_PREFIX)
+
+
 #: A switch word as a whole word.  ``schedulerToggle`` is a helper that
 #: shows and hides a table, not a switch: the word is part of a longer
 #: name, and a name is not a control.
@@ -490,6 +505,36 @@ def _strip_comments(text: str) -> str:
     return "".join(out)
 
 
+#: A literal that names ONE plan: a control about that plan and not
+#: about the scheduler at large.  ``data-plan-id`` is the marker the
+#: panel itself uses on a plan card.
+PLAN_MARKER = re.compile(r"data-plan-id|\bplan[_-]?id\b", re.IGNORECASE)
+
+#: A switch word inside a ``data-`` attribute: a dataset hook, not a
+#: control name and not a request path.
+DATA_ATTRIBUTE_SWITCH = re.compile(
+    r"data-[\w-]*\b(?:%s)\b" % "|".join(SWITCH_WORDS), re.IGNORECASE
+)
+
+
+def _is_per_plan_hook(literal: str, start: int, end: int) -> bool:
+    """Whether the switch word at ``start`` is a hook about one plan.
+
+    The gate forbids a control for the scheduler's **global** switch:
+    a control that stops the world.  The plan card's fold — a
+    ``data-scheduler-toggle`` that carries one plan's id — acts on
+    that plan alone, so it is not that control.  Anything else that
+    carries a switch word is still flagged: the exemption is a named
+    plan and a dataset hook, nothing wider.
+    """
+    if not PLAN_MARKER.search(literal):
+        return False
+    for match in DATA_ATTRIBUTE_SWITCH.finditer(literal):
+        if match.start() <= start and end <= match.end():
+            return True
+    return False
+
+
 def _frontend_switch_lines(text: str) -> List[str]:
     """The places in a frontend file that could switch the scheduler.
 
@@ -505,6 +550,10 @@ def _frontend_switch_lines(text: str) -> List[str]:
     and hides a table (``schedulerToggle(el, visible)``) is a rendering
     detail, not a switch.  So the scan reads the file's *literals* —
     the names and the paths — and leaves the comments out.
+
+    A control about ONE plan is not a violation either: it cannot stop
+    the world.  A switch word in a dataset hook that names a plan is
+    that control, and the scan leaves it alone.
     """
     findings: List[str] = []
     source = _strip_comments(text)
@@ -514,9 +563,12 @@ def _frontend_switch_lines(text: str) -> List[str]:
         low = literal.lower()
         if "scheduler" not in low:
             continue
-        if SWITCH_WORD.search(low):
+        for word in SWITCH_WORD.finditer(literal):
+            if _is_per_plan_hook(literal, word.start(), word.end()):
+                continue
             line = source.count("\n", 0, match.start()) + 1
             findings.append(f"{line}: control {literal.strip()!r}")
+            break
 
     for match in SETTING_WRITE.finditer(source):
         line = source.count("\n", 0, match.start()) + 1
@@ -1037,6 +1089,8 @@ def test_no_global_toggle_in_ui_or_api(server_module) -> None:
     for path in scheduler_paths:
         if path in GLOBAL_SCHEDULER_PATHS:
             continue
+        if _is_per_plan_scheduler_path(path):
+            continue
         assert path.startswith("/api/plan/"), (
             f"a scheduler route that is not about one plan: {path!r}. The "
             "read model, the capacity knob and the per-plan actions are "
@@ -1049,6 +1103,15 @@ def test_no_global_toggle_in_ui_or_api(server_module) -> None:
     )
     assert not _is_global_switch_path("/api/scheduler/state"), (
         "the route predicate mistakes the read model for a switch"
+    )
+    assert not _is_per_plan_scheduler_path("/api/scheduler/state"), (
+        "the per-plan predicate mistakes the read model for a per-plan route"
+    )
+    assert not _is_per_plan_scheduler_path("/api/scheduler/capacity"), (
+        "the per-plan predicate mistakes the capacity knob for a per-plan route"
+    )
+    assert not _is_per_plan_scheduler_path("/api/scheduler/enabled"), (
+        "the per-plan predicate mistakes a global switch for a per-plan route"
     )
 
     # -- the frontend -----------------------------------------------------
@@ -1085,6 +1148,28 @@ def test_no_global_toggle_in_ui_or_api(server_module) -> None:
     ), (
         "the frontend scanner mistakes the read model — or the panel's own "
         "show/hide helper — for a control for the switch"
+    )
+
+    # The per-plan exemption has to be able to fail.
+    assert not _frontend_switch_lines(
+        "const card = '<button class=\"scheduler-plan-header\" "
+        "data-plan-id=\"p1\" data-scheduler-toggle=\"p1\">p1</button>';\n"
+    ), (
+        "the frontend scanner mistakes a per-plan fold for a control for "
+        "the switch"
+    )
+    assert _frontend_switch_lines(
+        "const button = '<button id=\"btn-scheduler-toggle\" "
+        "data-plan-id=\"p1\">p1</button>';\n"
+    ), (
+        "the per-plan exemption swallows a control for the switch that "
+        "names a plan"
+    )
+    assert _frontend_switch_lines(
+        "const flag = '<div data-scheduler-disable=\"true\"></div>';\n"
+    ), (
+        "the per-plan exemption swallows a control for the switch that "
+        "lives in a data attribute"
     )
 
     # -- the route modules ------------------------------------------------

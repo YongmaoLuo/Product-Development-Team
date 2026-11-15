@@ -39,6 +39,20 @@ from file_lock_broker import FileLockBroker  # noqa: E402
 from file_lock_protocol import socket_path  # noqa: E402
 
 
+#: How long the caller waits for one guard-hook spawn.
+#:
+#: The guard is a separate process, and on a loaded host the interpreter
+#: alone can take the better part of a minute to come up.  The broker path
+#: starts a SECOND interpreter (the lock CLI) on top of that, so the whole
+#: path costs roughly two spawns.  A ceiling below that makes the CALLER
+#: die before the guard has rendered its verdict -- the case then reports
+#: a broken contract for what is really a slow machine.
+#:
+#: This is the test's own waiting ceiling and nothing else: no exit code,
+#: no stderr match, no assertion and no loop count moves with it.
+_HOOK_SPAWN_TIMEOUT_S = 150
+
+
 @pytest.fixture
 def workspace(tmp_path):
     """A project dir, a plans dir and the guard script, ready to invoke."""
@@ -116,7 +130,7 @@ def _run_hook(workspace, target, *, broker_on=True, task_id="t1",
         capture_output=True,
         text=True,
         env=env,
-        timeout=60,
+        timeout=_HOOK_SPAWN_TIMEOUT_S,
     )
     return proc.returncode, proc.stderr
 
@@ -192,6 +206,7 @@ def test_the_refusal_happens_before_the_broker_acquire(workspace, broker):
     )
 
 
+@pytest.mark.timeout(600)
 def test_a_declaration_matches_exactly_and_never_by_prefix(workspace, broker):
     """A sibling path is not a declared path.
 
@@ -224,6 +239,7 @@ def test_a_directory_declaration_matches_nothing(workspace, broker):
     assert "did not declare" in stderr
 
 
+@pytest.mark.timeout(600)
 def test_an_absolute_declaration_matches_the_same_file(workspace, broker):
     """Both spellings of one path are one permission.
 
@@ -237,6 +253,7 @@ def test_an_absolute_declaration_matches_the_same_file(workspace, broker):
     assert code == 0, stderr
 
 
+@pytest.mark.timeout(600)
 def test_a_leading_dot_slash_declaration_still_matches(workspace, broker):
     """``./backend/a.py`` and ``backend/a.py`` are one path."""
     code, stderr = _run_hook(

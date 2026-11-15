@@ -104,8 +104,11 @@ is a test that makes the next one fail for the wrong reason.
 
 from __future__ import annotations
 
+import http.server
 import json
+import http.client
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -284,6 +287,38 @@ def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind((LOOPBACK_HOST, 0))
         return sock.getsockname()[1]
+
+
+def _host_and_port(base_url: str) -> Tuple[str, int]:
+    """The host and the port a ``base_url`` names."""
+    without_scheme = base_url.split("://", 1)[-1]
+    host, _, port = without_scheme.partition(":")
+    return host, int(port)
+
+
+#: One line of uvicorn's access log: the client's address, the request
+#: line, and the status.  The client's **port** is the connection — two
+#: requests from one port came in on one socket, and that is what tells
+#: a replay that shared its connections from one that did not.
+_ACCESS_LINE = re.compile(
+    r"INFO:\s+(?P<addr>\S+):(?P<port>\d+)\s+-\s+"
+    r"\"(?P<method>[A-Z]+)\s+(?P<path>\S+)\s+HTTP"
+)
+
+
+def _client_ports(log_path: Path, path: str) -> List[str]:
+    """The client ports the server saw for the requests to ``path``."""
+    ports: List[str] = []
+    if not log_path.exists():
+        return ports
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    for line in text.splitlines():
+        match = _ACCESS_LINE.search(line)
+        if match is None:
+            continue
+        if match.group("path") == path:
+            ports.append(match.group("port"))
+    return ports
 
 
 def _wait_for_server(base_url: str, timeout: float = SERVER_BOOT_TIMEOUT_SEC) -> None:
@@ -853,6 +888,163 @@ def test_session_receives_decision_message(booted):
 
 
 # ---------------------------------------------------------------------------
+# The connection a failed request leaves behind
+# ---------------------------------------------------------------------------
+#
+# 2026-11-06: the browser replay of the sequence above died on
+# ``read ECONNRESET`` when it asked for the decision.  Nothing was
+# wrong with the decision — the request that failed was the *interview*
+# before it, and the server answered that one with an unhandled
+# exception (the coding tool this suite pins is not installed, so the
+# model call has nothing behind it).
+#
+# An exception that escapes a handler is answered, and then the
+# connection is closed: Starlette's server-error middleware sends the
+# answer and re-raises, and uvicorn closes the transport as soon as it
+# sees the exception.  The client was never told — the answer carried
+# no ``Connection: close`` — so it kept the socket in its pool, and the
+# next request on that socket was answered by a reset instead of by the
+# product.
+#
+# Two halves answer that, and both of them are pinned here:
+#
+# * the **endpoint** answers with JSON even when it cannot do what it
+#   was asked, so the failure never leaves the handler (the case
+#   below);
+# * the **client** asks for a connection of its own on every call, so
+#   a connection the server closed without saying so is never the one
+#   the next call goes out on (the browser replay, below).
+#
+# The third half — a 500 that announces the close — belongs to the
+# server's catch-all handler in ``backend/server.py``, which is not in
+# this task's declaration; the attempt report carries it.
+
+
+@pytest.fixture
+def booted_without_a_store(tmp_path):
+    """A running backend whose store cannot be opened.
+
+    Its own server, because an unusable state database is a property of
+    the server: the path the store would have to create sits inside a
+    **file**, so the store cannot create the database it wants and
+    every write against it fails.
+
+    The database is reached **through a symlink**, and that is the whole
+    point of the fixture.  The path the server is handed has to have a
+    directory for a parent, because the instance lock the server takes
+    before it binds its socket is written next to the database
+    (``<database>.instance.lock``, in ``backend/instance_lock.py``) and
+    that lock's ``mkdir`` has to succeed.  A database whose **parent**
+    is a file therefore refuses the *boot* — the lock's ``mkdir`` raises
+    ``FileExistsError`` out of the lifespan, uvicorn exits, and the port
+    is never opened — which is a different failure from the one this
+    case is about: this case is about a server that runs and answers,
+    not about a server that never starts.  The symlink keeps the
+    parent a directory (the lock is taken) and puts the *database*
+    where it cannot be created.
+
+    A directory in the database's place would not do either: the server
+    heals that one (it moves the unreadable file aside and starts a
+    fresh database), and a healed store answers the request normally.
+    """
+    workdir = tmp_path
+    blocker = workdir / "blocked"
+    blocker.write_text("not a directory\n", encoding="utf-8")
+    # The symlink is dangling on purpose: it resolves into the blocker,
+    # so the database can neither be found nor created, and the startup
+    # guard leaves it alone (it only touches a database that exists).
+    database = workdir / "state.db"
+    database.symlink_to(blocker / "state.db")
+    base_url, proc = boot_server(
+        workdir, {"PDT_STATE_DB_PATH": str(database)}
+    )
+    try:
+        yield base_url, workdir
+    finally:
+        shutdown_server(proc)
+
+
+def test_a_decision_that_cannot_be_created_still_answers(
+    booted_without_a_store,
+):
+    """A decision that cannot be stored is answered, not a reset.
+
+    The plan's store cannot be opened — the state database cannot be
+    created — so the decision cannot be created.  The endpoint has to
+    answer anyway — with JSON, on the connection the caller already
+    has.
+
+    The same connection, on purpose: a client that opens a fresh
+    connection for every request cannot see this at all, and it is
+    exactly the client that pools connections — browsers, agents,
+    every long-lived client — that breaks.
+
+    2026-11-06: an exception that escapes a handler is answered and
+    then the connection is closed without saying so, so the *next*
+    request on that connection is answered by a reset instead of by
+    the product.  That is what killed the browser replay.
+    """
+    base_url, workdir = booted_without_a_store
+    host, port = _host_and_port(base_url)
+
+    broken_plan = "e2e-broken-plan"
+
+    connection = http.client.HTTPConnection(host, port, timeout=30)
+    try:
+        connection.request(
+            "POST",
+            f"/api/hitl/{broken_plan}/decisions",
+            body=json.dumps(
+                {
+                    "question": QUESTION,
+                    "options": OPTIONS,
+                    "default_option": DEFAULT_OPTION,
+                }
+            ),
+            headers={
+                REQUEST_HEADER: REQUEST_HEADER_VALUE,
+                "Content-Type": "application/json",
+                "Host": LOOPBACK_HOST,
+            },
+        )
+        response = connection.getresponse()
+        body = response.read()
+        assert response.status >= 400, (
+            f"the decision could not be created; the endpoint answered "
+            f"{response.status}: {body!r}"
+        )
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except ValueError:
+            raise AssertionError(
+                f"the endpoint answered with something that is not JSON: "
+                f"{body!r}"
+            )
+        assert "error" in payload, (
+            f"the endpoint's answer names no error: {payload!r}"
+        )
+
+        # And the connection is still the caller's to use — the answer
+        # above did not take it down with it.
+        connection.request(
+            "GET",
+            "/health",
+            headers={
+                REQUEST_HEADER: REQUEST_HEADER_VALUE,
+                "Host": LOOPBACK_HOST,
+            },
+        )
+        follow_up = connection.getresponse()
+        follow_up_body = follow_up.read()
+        assert follow_up.status == 200, (
+            f"the request that followed the failure was answered with "
+            f"{follow_up.status}: {follow_up_body!r}"
+        )
+    finally:
+        connection.close()
+
+
+# ---------------------------------------------------------------------------
 # The negative control
 # ---------------------------------------------------------------------------
 #
@@ -1215,6 +1407,16 @@ launch_kwargs = {"executable_path": executable} if executable else {}
 headers = {
     "X-PDT-Request": "1",
     "Content-Type": "application/json",
+    # One call, one connection.  A fresh context per call is *not* a
+    # fresh connection: the request context pools its sockets for the
+    # whole driver process, so the socket a failed request left behind
+    # is the socket the next request goes out on -- and a server that
+    # closes the connection after an unhandled exception closes it
+    # without saying so (2026-11-06: the browser replay died on
+    # ``read ECONNRESET``).  Asking for the close makes the pool hand
+    # out a new connection for the next call, which is what this
+    # driver always meant to do.
+    #
     # One connection per call, exactly like the browserless path above
     # (urllib opens one connection per request).  The server answers
     # the creation request with an unhandled exception (the
@@ -1225,6 +1427,64 @@ headers = {
     # the same socket.
     "Connection": "close",
 }
+
+#: Every call asks for the connection to be closed when it is done.
+#:
+#: The server answers the creation request with an unhandled exception
+#: — the interview's model call has no provider behind it — and a
+#: server that closes the connection after an unhandled exception
+#: leaves the client holding a socket that is no longer there.  A
+#: request that asks for the connection to be closed is answered with a
+#: request to close it, so the client drops the socket instead of
+#: pooling it.
+CONNECTION_CLOSE = {"Connection": "close"}
+
+#: The transport errors that mean "the connection broke under us".
+TRANSPORT_ERRORS = (
+    "ECONNRESET",
+    "ECONNABORTED",
+    "EPIPE",
+    "socket hang up",
+    "socket hangup",
+    "connection reset",
+)
+
+
+def is_transport_error(error):
+    """Is this error the connection breaking, rather than the server answering?
+
+    The client raises no exception kind of its own for this, so the
+    message is what there is to read — and the message is the one the
+    operating system wrote about the socket.
+    """
+    text = str(error).lower()
+    return any(marker.lower() in text for marker in TRANSPORT_ERRORS)
+
+
+def post_once(api_context, url, payload):
+    """Send one request, on a connection that is closed afterwards."""
+    return api_context.request.post(
+        url, headers={**headers, **CONNECTION_CLOSE}, data=payload
+    )
+
+
+def post_with_retry(api_context, url, payload):
+    """Send the request, and send it again if the connection broke.
+
+    The second layer under the ``Connection: close`` header: a socket
+    that was already dead when the call was made is replaced by a
+    fresh one instead of taking the call down with it.
+    """
+    try:
+        return post_once(api_context, url, payload)
+    except Exception as error:
+        if not is_transport_error(error):
+            raise
+        # The connection broke under the client.  The request may never
+        # have reached the server, so it is sent again — on a
+        # connection of its own, because the old one is gone.
+        return post_once(api_context, url, payload)
+
 
 with sync_playwright() as driver:
     browser = driver.chromium.launch(**launch_kwargs)
@@ -1241,13 +1501,28 @@ with sync_playwright() as driver:
         server to close the connection is never handed that socket
         again.
 
+        The connection pool lives in the Playwright **driver process**,
+        not in the context: a fresh context isolates the cookie jar,
+        and closing it does not guarantee that the socket it used is
+        gone.  So a fresh context per call is not the isolation it
+        looks like, and a server that drops the connection after an
+        unhandled exception takes the *next* call down with it when
+        the next call is handed the pooled socket.
+
+        Two things stop that, and they are independent of each other:
+
+        * the request asks for the connection to be closed, so the
+          server says so in its answer and the client drops the
+          socket instead of pooling it;
+        * a transport error is retried once, on a fresh connection.
+
         The body is read here, while the context is still open — a
         response is disposed with the context that fetched it.
         """
         api_context = browser.new_context()
         try:
-            response = api_context.request.post(
-                base_url + path, headers=headers, data=payload
+            response = post_with_retry(
+                api_context, base_url + path, payload
             )
             return response.status, response.text()
         finally:
@@ -1297,6 +1572,112 @@ with sync_playwright() as driver:
     }))
     browser.close()
 '''
+
+
+# ---------------------------------------------------------------------------
+# A server that drops the connection
+# ---------------------------------------------------------------------------
+#
+# The product answers the interview's first call with an unhandled
+# exception — the model call has no provider behind it — and a server
+# that closes the connection after an unhandled exception leaves the
+# client holding a socket that is no longer there.  The next call is
+# handed that socket, and the request never reaches the server at all.
+#
+# The server below does exactly what the product's does in that
+# situation: it answers the first call with a 500, closes the
+# connection straight after the answer, and puts a ``Connection``
+# header on that answer **only when the request asked for one** — the
+# same rule uvicorn follows.  It records what it was asked, so the
+# case can say what the client did with the connection it was given.
+
+
+class _DroppingHandler(http.server.BaseHTTPRequestHandler):
+    """Answers like a server that raised, and records what it was asked."""
+
+    # HTTP/1.1: the connection is kept alive unless the answer says
+    # otherwise, which is the whole of the problem this device exists
+    # to reproduce.
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self) -> None:  # noqa: N802 - the name is http.server's
+        """Answer the first call with a 500, and drop the connection."""
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        self.server.posts.append({
+            "path": self.path,
+            "connection": self.headers.get("Connection", ""),
+        })
+        first = len(self.server.posts) == 1
+        # The server drops the connection either way: this is what a
+        # server does after an unhandled exception.
+        self.close_connection = True
+        if first:
+            self._answer(500, {"detail": "the model call has no provider behind it"})
+            return
+        self._answer(200, {"decision_id": "decision-1", "status": "pending"})
+
+    def do_GET(self) -> None:  # noqa: N802 - the name is http.server's
+        """Serve the page the driver takes its screenshot of."""
+        self.server.gets.append({"path": self.path})
+        # The driver waits for ``#app`` to be *visible*, so the element
+        # has to carry something to draw.
+        body = b'<html><body><div id="app">PDT</div></body></html>'
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+
+    def _answer(self, status: int, payload: Dict[str, Any]) -> None:
+        """Send a JSON answer, and close the connection after it."""
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        # A server that is told to close the connection says so in the
+        # answer; a server that is not told anything says nothing, and
+        # the client is left holding a socket the server has dropped.
+        if self.headers.get("Connection", "").lower() == "close":
+            self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+
+    def log_message(self, *args: Any) -> None:
+        """Keep the device's own output out of the test's."""
+
+
+class _DroppingServer:
+    """The server above, running on a port of its own."""
+
+    def __init__(self) -> None:
+        self.posts: List[Dict[str, str]] = []
+        self.gets: List[Dict[str, str]] = []
+        self._server = http.server.ThreadingHTTPServer(
+            (LOOPBACK_HOST, 0), _DroppingHandler,
+        )
+        self._server.daemon_threads = True
+        self._server.posts = self.posts  # type: ignore[attr-defined]
+        self._server.gets = self.gets  # type: ignore[attr-defined]
+        self.port = int(self._server.server_address[1])
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, daemon=True,
+        )
+        self._thread.start()
+
+    @property
+    def base_url(self) -> str:
+        """The URL the device answers on."""
+        return f"http://{LOOPBACK_HOST}:{self.port}"
+
+    def close(self) -> None:
+        """Stop the device and let its thread out."""
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
 
 
 def test_browser_replays_the_same_delivery(booted):
@@ -1349,6 +1730,30 @@ def test_browser_replays_the_same_delivery(booted):
     )
     assert Path(screenshot).exists(), (
         f"the browser replay left no screenshot at {screenshot}"
+    )
+
+    # The two calls went out on two connections.  This is the whole of
+    # the 2026-11-06 failure: the interview failed, the server closed
+    # the connection without saying so, and the request context — which
+    # pools its sockets for the whole driver process, whatever context
+    # it fetches them in — sent the decision on the socket that was
+    # already dead.  The driver asks for a connection of its own on
+    # every call, and the server's access log is where that shows.
+    log_path = workdir / "logs" / LOG_FILENAME
+    interview_ports = _client_ports(log_path, "/api/interview/start")
+    decision_ports = _client_ports(log_path, f"/api/hitl/{PLAN_ID}/decisions")
+    assert interview_ports, (
+        f"the server's log names no request to /api/interview/start; it "
+        f"is at {log_path}"
+    )
+    assert decision_ports, (
+        f"the server's log names no request to /api/hitl/{PLAN_ID}/decisions; "
+        f"it is at {log_path}"
+    )
+    assert interview_ports[-1] != decision_ports[-1], (
+        "the browser replay sent both calls on one connection (client "
+        f"port {decision_ports[-1]}); a request that failed takes the "
+        "next request down with it"
     )
 
 
@@ -1411,6 +1816,94 @@ def test_browser_replays_the_missing_binary_delivery(booted_without_transport):
     assert Path(screenshot).exists(), (
         f"the browser replay left no screenshot at {screenshot}"
     )
+
+
+def test_the_browser_replay_survives_a_connection_the_server_dropped(
+    tmp_path: Path,
+) -> None:
+    """The replay must not die on a connection the server dropped.
+
+    The server answers the first call with an unhandled exception and
+    drops the connection; the answer carries no ``Connection`` header
+    unless the request asked for one.  A client that hands the pooled
+    socket to the second call therefore hands it a socket the server
+    has already dropped — the second request never reaches the server
+    at all, and the driver dies with a transport error that has
+    nothing to do with the delivery.
+
+    Two things have to hold, and they are two different things:
+
+    1. **the request asks for the connection to be closed.**  The
+       server then says so in its answer, and the client drops the
+       socket instead of pooling it.  This is the half that is
+       deterministic — a client that says nothing is never told
+       anything;
+    2. **the second call reaches the server.**  A transport error is
+       retried, so a socket that was already dead is replaced by a
+       fresh one instead of taking the call down with it.
+
+    The device is a server of its own rather than the product's: the
+    behaviour under test is the *client's* handling of a dropped
+    connection, and the product's server is free to change its own.
+    """
+    interpreter = _playwright_interpreter()
+    if interpreter is None:
+        pytest.skip(
+            "no Playwright driver is installed in this environment; "
+            "the default (browserless) path carries the assertions"
+        )
+
+    server = _DroppingServer()
+    try:
+        driver_script = tmp_path / "drive_dropped.py"
+        driver_script.write_text(_BROWSER_REPLAY, encoding="utf-8")
+        screenshot = str(tmp_path / "dropped.png")
+        result = subprocess.run(
+            [
+                interpreter,
+                str(driver_script),
+                server.base_url,
+                MISSING_PLAN_ID,
+                MISSING_DESTINATION,
+                MISSING_SESSION_ID,
+                QUESTION,
+                screenshot,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+            env=_driver_env(),
+        )
+    finally:
+        server.close()
+
+    assert result.returncode == 0, (
+        f"the browser driver failed (exit {result.returncode}) against a "
+        f"server that dropped the connection; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload["create_status"] == 200, (
+        f"the replayed creation call failed against a server that "
+        f"dropped the connection: {payload!r}"
+    )
+
+    assert len(server.posts) == 2, (
+        f"the server saw {len(server.posts)} of the 2 calls the driver "
+        f"makes: {server.posts!r}. A call that never reached the server "
+        f"was made on a connection the server had already dropped."
+    )
+
+    for entry in server.posts:
+        assert entry["connection"].lower() == "close", (
+            f"the driver sent {entry['path']!r} without asking for the "
+            f"connection to be closed (the request carried "
+            f"Connection: {entry['connection']!r}). A server that drops "
+            f"the connection after an unhandled exception then leaves "
+            f"the client holding a socket that is no longer there."
+        )
 
 
 # ---------------------------------------------------------------------------

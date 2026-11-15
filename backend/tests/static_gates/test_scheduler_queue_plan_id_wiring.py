@@ -2,19 +2,25 @@
 
 Why this gate exists
 --------------------
-The queue is the list of plans waiting for a slot.  Each row names the
-plan it is about — in the plan column — and carries the two buttons
-that act on that plan: 提升 (push it up the queue) and 启动 (start it
-now).  The id the buttons act on travels in the ``data-plan``
-attribute, so a row names one plan twice over, and both names have to
-be the same one.
+The queue is the list of plans waiting for a slot.  Each plan is drawn
+as a **card**: a header the operator reads at a glance, and the two
+buttons that act on that plan — 提升 (push it up the queue) and 启动
+(start it now).  The id the buttons act on travels in the
+``data-plan`` attribute, so a card names one plan twice over, and both
+names have to be the same one.
 
 The id has to come from the snapshot field the backend fills in.  The
-row reads it off the queue item, shows it, and hands the same one to
-the buttons.  A row that shows an id the buttons do not act on names a
-plan nobody can act on; a row that reads an id and shows nothing names
-no plan at all.  Both are invisible in a browser and loud in a source
-scan, so the contract is pinned here rather than at runtime.
+queue reads it off the queue item, the card shows it, and the buttons
+act on that same one.  A card that shows an id the buttons do not act
+on names a plan nobody can act on; a card that reads an id and shows
+nothing names no plan at all.  Both are invisible in a browser and
+loud in a source scan, so the contract is pinned here rather than at
+runtime.
+
+The queue used to be drawn as table rows, and this gate used to look
+for a ``<tr>`` with a ``<td>`` in it.  The panel draws cards now, so
+the gate looks at the card: the row is gone, and a gate that still
+looked for it would fail on a panel that is right.
 
 Scan target
 -----------
@@ -38,18 +44,15 @@ _APP_JS = _REPO_ROOT / "frontend" / "app.js"
 #: The renderer that draws the queue.
 _RENDERER = "renderSchedulerQueue"
 
-#: The snapshot field the queue row reads its plan id from.
+#: The function that draws one plan's card, from the row it is handed.
+_CARD_FUNCTION = "schedulerCard"
+
+#: The snapshot field the queue card reads its plan id from.
 _PLAN_ID_FIELD = "item.plan_id"
 
-#: The actions the queue row's buttons offer, in the words the source
+#: The actions the queue card's buttons offer, in the words the source
 #: spells them: 提升 is ``promote`` and 启动 is ``start``.
 _QUEUE_ACTIONS = ("promote", "start")
-
-#: A template literal, from its opening backtick to the next one.
-_TEMPLATE_RE = re.compile(r"`[^`]*`", re.DOTALL)
-
-#: One cell of a rendered row.
-_CELL_RE = re.compile(r"<td[^>]*>(.*?)</td>", re.DOTALL)
 
 #: A call to the button renderer, with its arguments.
 _ACTION_CALL_RE = re.compile(r"schedulerActionButtons\s*\(([^)]*)\)")
@@ -103,26 +106,13 @@ def _function_body(source: str, name: str) -> str:
     raise AssertionError(f"unterminated function {name}()")
 
 
-def _row_template(body: str) -> str | None:
-    """Return the template literal that builds a queue row.
-
-    A template literal ends at the next backtick, so a nested template
-    inside the row would split the span.  The row carries none, and the
-    caller fails loudly when this helper finds no row at all.
-    """
-    for match in _TEMPLATE_RE.finditer(body):
-        if "<tr" in match.group(0):
-            return match.group(0)
-    return None
-
-
-def _action_call(row: str, variable: str) -> str | None:
+def _action_call(body: str, variable: str) -> str | None:
     """Return the arguments of the button call that acts on *variable*.
 
-    The row may carry more than one set of buttons, so the call is
+    A card may carry more than one set of buttons, so the call is
     looked up by the id it acts on rather than by position.
     """
-    for match in _ACTION_CALL_RE.finditer(row):
+    for match in _ACTION_CALL_RE.finditer(body):
         arguments = match.group(1)
         if _first_argument(arguments) == variable:
             return arguments
@@ -137,10 +127,24 @@ def _first_argument(arguments: str) -> str | None:
     return None
 
 
-def _renders(variable: str, text: str) -> bool:
-    """Whether *text* renders *variable* through ``escapeHtml``."""
-    pattern = r"escapeHtml\(\s*" + re.escape(variable) + r"\b"
-    return bool(re.search(pattern, text))
+def _plan_id_variable(body: str, where: str) -> str:
+    """Return the name the plan id is bound to in *body*.
+
+    Raises :class:`AssertionError` when the body does not read the
+    plan id off the queue item, or reads it without binding it to a
+    name — a name is what the card and the buttons can both point at.
+    """
+    assert _PLAN_ID_FIELD in body, (
+        f"{where} never reads `{_PLAN_ID_FIELD}`, so the queue card has "
+        "no plan id to show and no id for its buttons to act on."
+    )
+
+    binding = _PLAN_ID_BINDING_RE.search(body)
+    assert binding is not None, (
+        f"{where} reads `{_PLAN_ID_FIELD}` but binds it to no variable, "
+        "so the id never reaches the card or the buttons."
+    )
+    return binding.group("var")
 
 
 # ---------------------------------------------------------------------------
@@ -148,67 +152,29 @@ def _renders(variable: str, text: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _plan_id_variable(source: str) -> str:
-    """Return the name the queue row binds its plan id to.
-
-    Raises :class:`AssertionError` when the renderer does not read the
-    plan id off the queue item, or reads it without binding it to a
-    name — a name is what the row and the buttons can both point at.
-    """
-    body = _function_body(source, _RENDERER)
-
-    assert _PLAN_ID_FIELD in body, (
-        f"{_RENDERER}() never reads `{_PLAN_ID_FIELD}`, so the queue row "
-        "has no plan id to show and no id for its buttons to act on."
-    )
-
-    binding = _PLAN_ID_BINDING_RE.search(body)
-    assert binding is not None, (
-        f"{_RENDERER}() reads `{_PLAN_ID_FIELD}` but binds it to no "
-        "variable, so the id never reaches the row."
-    )
-    return binding.group("var")
-
-
-def check_queue_row_reads_plan_id(source: str) -> None:
-    """The queue row must read the plan id off the queue item.
+def check_queue_card_reads_plan_id(source: str) -> None:
+    """The queue must read the plan id off the queue item.
 
     The snapshot the backend hands the panel carries the plan's id in
-    ``plan_id``, and the queue row is where that id belongs.  A row
-    that reads some other field names the wrong thing; a row that
-    reads nothing names nothing.
+    ``plan_id``, and the queue is where that id belongs.  A queue that
+    reads some other field names the wrong thing; a queue that reads
+    nothing names nothing.
     """
-    _plan_id_variable(source)
+    _plan_id_variable(_function_body(source, _RENDERER), f"{_RENDERER}()")
 
 
-def check_plan_id_reaches_the_row(source: str) -> None:
-    """The plan id must be shown in the row, and acted on by the buttons.
+def check_plan_id_reaches_the_card(source: str) -> None:
+    """The plan id must be shown on the card, and acted on by the buttons.
 
-    One id, three jobs: read off the queue item, shown in the plan
-    column, handed to the buttons that promote and start it.  Showing
-    one id and acting on another names a plan the reader cannot act on,
-    and reading an id into a variable no cell uses names no plan at
-    all.
+    One id, three jobs: read off the queue item, shown on the card,
+    handed to the buttons that promote and start it.  Showing one id
+    and acting on another names a plan the reader cannot act on, and
+    reading an id into a name nothing renders names no plan at all.
     """
-    variable = _plan_id_variable(source)
-    body = _function_body(source, _RENDERER)
+    queue = _function_body(source, _RENDERER)
+    variable = _plan_id_variable(queue, f"{_RENDERER}()")
 
-    row = _row_template(body)
-    assert row is not None, (
-        f"{_RENDERER}() builds no row template, so there is nowhere for "
-        "the plan id to be shown."
-    )
-
-    cells = [
-        cell for cell in _CELL_RE.findall(row) if _renders(variable, cell)
-    ]
-    assert cells, (
-        f"{_RENDERER}() reads the plan id into `{variable}` but no cell of "
-        "the row shows it. An id nobody can read is an id the row does "
-        "not name."
-    )
-
-    arguments = _action_call(row, variable)
+    arguments = _action_call(queue, variable)
     assert arguments is not None, (
         f"{_RENDERER}() shows `{variable}` but does not hand that same id "
         "to the action buttons, so the buttons act on something else."
@@ -220,11 +186,28 @@ def check_plan_id_reaches_the_row(source: str) -> None:
             "plan id it shows."
         )
 
+    # The card names the same plan: it reads the same field of the row
+    # the queue hands it, and shows the id it found there.
+    card = _function_body(source, _CARD_FUNCTION)
+    shown = _plan_id_variable(card, f"{_CARD_FUNCTION}()")
+
+    assert re.search(r"escapeHtml\(\s*" + re.escape(shown) + r"\b", card), (
+        f"{_CARD_FUNCTION}() reads the plan id but shows it without "
+        "escaping it, so a plan whose id carries a quote breaks the "
+        "card's markup."
+    )
+
+    assert "data-plan-id=" in card, (
+        f"{_CARD_FUNCTION}() does not write the plan's id into the card's "
+        "markup, so a card on the page cannot be traced back to the plan "
+        "it is about."
+    )
+
 
 def check_queue_plan_id_wiring(source: str) -> None:
     """Both rules at once — what the gate as a whole asserts."""
-    check_queue_row_reads_plan_id(source)
-    check_plan_id_reaches_the_row(source)
+    check_queue_card_reads_plan_id(source)
+    check_plan_id_reaches_the_card(source)
 
 
 # ---------------------------------------------------------------------------
@@ -232,29 +215,29 @@ def check_queue_plan_id_wiring(source: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_queue_row_reads_plan_id() -> None:
-    """The queue row must read the plan id off the queue item."""
-    check_queue_row_reads_plan_id(_source(_APP_JS))
+def test_queue_card_reads_plan_id() -> None:
+    """The queue must read the plan id off the queue item."""
+    check_queue_card_reads_plan_id(_source(_APP_JS))
 
 
-def test_plan_id_reaches_the_row() -> None:
-    """The plan id must be shown in the row, and acted on by the buttons.
+def test_plan_id_reaches_the_card() -> None:
+    """The plan id must be shown on the card, and acted on by the buttons.
 
-    The id the row shows and the id the buttons act on have to be one
-    id.  Two ids mean the row names a plan the buttons do not touch;
-    an id in a variable no cell renders means the row names no plan at
+    The id the card shows and the id the buttons act on have to be one
+    id.  Two ids mean the card names a plan the buttons do not touch;
+    an id in a name nothing renders means the card names no plan at
     all.
     """
-    check_plan_id_reaches_the_row(_source(_APP_JS))
+    check_plan_id_reaches_the_card(_source(_APP_JS))
 
 
 def test_the_gate_has_teeth() -> None:
-    """Negative control: a row that does not read the plan id must fail.
+    """Negative control: a queue that does not read the plan id must fail.
 
     The fixture is the panel with the queue's plan-id read replaced by
-    a different field.  Everything else — the row, the plan column, the
-    buttons — stays as it is, so a gate that only looked at the wiring
-    would accept it.  The gate has to notice the missing read.
+    a different field.  Everything else — the card, the plan id on it,
+    the buttons — stays as it is, so a gate that only looked at the
+    wiring would accept it.  The gate has to notice the missing read.
     """
     source = _source(_APP_JS)
     body = _function_body(source, _RENDERER)
@@ -273,37 +256,32 @@ def test_the_gate_has_teeth() -> None:
     )
 
 
-def test_the_gate_rejects_a_plan_id_that_no_cell_shows() -> None:
-    """Negative control: an id read into a name nobody uses must fail.
+def test_the_gate_rejects_a_plan_id_no_card_shows() -> None:
+    """Negative control: an id the card does not show must fail.
 
-    The fixture is the panel with the plan column and the buttons
-    pointed at a different field.  The read is still there — a gate
-    that only looked for the read would pass it — but the row names no
-    plan, so the gate has to notice that the id it reads never reaches
-    the reader.
+    The fixture is the panel with the card reading a different field.
+    The queue still reads the plan id and still hands it to the buttons
+    — a gate that only looked for the read would pass it — but the card
+    names no plan, so the gate has to notice that the id it reads never
+    reaches the reader.
     """
     source = _source(_APP_JS)
-    body = _function_body(source, _RENDERER)
-    binding = _PLAN_ID_BINDING_RE.search(body)
+    card = _function_body(source, _CARD_FUNCTION)
+    binding = _PLAN_ID_BINDING_RE.search(card)
     assert binding is not None, (
         "the panel no longer binds the plan id, so the negative control "
         "would prove nothing."
     )
-    variable = binding.group("var")
-
-    mutated = body.replace(f"escapeHtml({variable}", "escapeHtml(item.seq")
-    mutated = mutated.replace(
-        f"schedulerActionButtons({variable}", "schedulerActionButtons(item.seq"
-    )
-    assert mutated != body, (
+    mutated = card.replace(_PLAN_ID_FIELD, "item.seq")
+    assert mutated != card, (
         "the fixture no longer reads the plan id, so the negative "
         "control would prove nothing."
     )
 
     with pytest.raises(AssertionError) as failure:
-        check_queue_plan_id_wiring(source.replace(body, mutated))
+        check_queue_plan_id_wiring(source.replace(card, mutated))
 
-    assert variable in str(failure.value), (
+    assert _PLAN_ID_FIELD in str(failure.value), (
         "the gate rejected the fixture for a reason other than the "
         f"unshown plan id: {failure.value}"
     )

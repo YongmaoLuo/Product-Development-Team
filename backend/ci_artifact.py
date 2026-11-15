@@ -127,6 +127,12 @@ CI_ARTIFACT_FIELDS: FrozenSet[str] = frozenset({
     "junit_stale_reports_removed",
     "failed_cases",
     "schema_issues",
+    # The declaration this verdict was based on: which exit codes mean
+    # "the gate could not decide", where its budget came from and
+    # whether its output was parsed as the framework's summary format.
+    # A plan that writes no CI contract gets the framework's default,
+    # and this key says so rather than being absent.
+    "ci_contract",
     # 2026-11-14: the **machine-written** identity of the failure — the
     # ids of what broke, spelled out by the validator rather than by a
     # model.  The runner writes it on both paths (the schema-failure

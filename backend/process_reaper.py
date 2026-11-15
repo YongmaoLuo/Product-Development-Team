@@ -745,7 +745,7 @@ def _signal_if_vouched(
     nothing was sent: the reason has already been written to the ledger
     and to the outcome.
     """
-    identity = process_identity.probe(record.pid)
+    identity, readable = process_identity.probe_result(record.pid)
     if identity is None:
         # The pid no longer names the process we recorded, so nothing
         # may be signalled on its word: a pid we cannot vouch for is
@@ -753,6 +753,22 @@ def _signal_if_vouched(
         # separate question, and the liveness check answers it —
         # something may still be running under that number, and then the
         # sweep has to report it rather than pretend the tree is dead.
+        #
+        # And whether the machine could be **read** is a third
+        # question.  A read that did not come back says nothing about
+        # the pid — not that it is gone.  2026-11-06: the read failed
+        # on a machine whose load average was 39, the record was filed
+        # as "already gone at reap time", it left the live set, and
+        # nothing ever swept it up again.
+        if not readable:
+            _fail(
+                plan_dir,
+                record,
+                outcome,
+                "the machine could not be read; the pid was neither "
+                "confirmed gone nor identified",
+            )
+            return None
         if _alive(record.pid):
             _fail(
                 plan_dir,

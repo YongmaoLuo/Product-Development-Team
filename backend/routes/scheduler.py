@@ -7,6 +7,12 @@ What this file is
 document.  The operator panel, the LUI and anything else that wantsto know "what is running, what is waiting, and why is it waiting" read
 this one endpoint, so that they cannot disagree with each other.
 
+``GET /api/scheduler/plan/{plan_id}/detail`` — one plan's own progress:
+where it is, how many tasks are done, and what is running this moment.
+The wording is the Feishu card's own — the panel and the card cannot
+disagree about what a plan is doing — and asking for it is a **read**:
+it writes nothing.
+
 ``POST /api/scheduler/capacity`` — the operator's capacity knob: how
 many plans may run at the same time, written while the scheduler runs.
 
@@ -190,6 +196,22 @@ from plan_scheduler.snapshot import build
 # ``server.<name>``.  See ``routes/plan_lifecycle.py`` for the rule.
 import server as _server
 
+# Late binding into the plans module: the phase **labels** live in one
+# place — ``plan_state.PHASE_LABELS`` — and ``routes.plans._phase_label``
+# is the one function that reads it, so the same phase cannot be
+# labelled two ways in two endpoints.  The **module** is imported rather
+# than the function: the attribute is looked up when the label is
+# computed, so a helper that is replaced is seen here.
+from routes import plans as _routes_plans
+
+# Late binding into the notifications package: the **progress wording**
+# lives in the card's own builder (``notifications.cards``), and the
+# plan-detail endpoint hands that wording on rather than growing a
+# second phrasing of it.  The **module** is imported rather than the
+# function: the attribute is looked up when the lines are built, so a
+# builder that is replaced is seen here.
+from notifications import cards as _cards
+
 # The state machine's own exceptions.  They are imported here rather than
 # from the lifecycle facade because the facade re-exports only one of
 # them, and this module needs to tell "there is no such plan" from "the
@@ -241,6 +263,65 @@ def _empty_snapshot() -> Dict[str, Any]:
     return build({})
 
 
+#: The two lists of the read model whose rows carry a phase.
+_ROW_LISTS = ("queue", "running")
+
+
+def _phase_label_for(phase: Any) -> str:
+    """Return the label of ``phase`` — the empty string when it has none.
+
+    The label is worked out by ``routes.plans._phase_label``: the one
+    function that reads the one table (``plan_state.PHASE_LABELS``), so
+    the same phase cannot be labelled two ways in two endpoints.  The
+    **module** is what is imported — the function is looked up when the
+    label is computed, not bound when this module is imported.
+
+    A row that carries no phase has no label: the answer is the empty
+    string, not a missing key and not an exception — a state written
+    before the phase existed is a normal thing to read.
+    """
+    if not phase:
+        return ""
+    return str(_routes_plans._phase_label(phase))
+
+
+def _labeled_row(row: Any) -> Any:
+    """Return ``row`` with the label of its phase beside the phase.
+
+    A row that is not a document is handed back as it was: the read
+    model's rows are documents, and a row that is not one is the
+    engine's business, not this module's.
+    """
+    if not isinstance(row, Mapping):
+        return row
+
+    labeled = dict(row)
+    labeled["phase_label"] = _phase_label_for(row.get("phase"))
+    return labeled
+
+
+def _with_phase_labels(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the read model with a ``phase_label`` on every row.
+
+    The phase itself is passed on exactly as it was read — the label is
+    a **supplement** to the phase name, never a replacement for it (see
+    ``routes.plans._phase_label``).
+
+    Only the two lists change.  The capacity, the queue length, the
+    over-capacity flag and the generation stamp are the read model's
+    own, and they are handed back untouched.
+    """
+    labeled = dict(payload)
+
+    for name in _ROW_LISTS:
+        rows = payload.get(name)
+        if not isinstance(rows, (list, tuple)):
+            continue
+        labeled[name] = [_labeled_row(row) for row in rows]
+
+    return labeled
+
+
 @router.get("/api/scheduler/state")
 def get_scheduler_state(request: Request) -> Dict[str, Any]:
     """Answer with the scheduler's read model.
@@ -258,7 +339,7 @@ def get_scheduler_state(request: Request) -> Dict[str, Any]:
     engine = getattr(request.app.state, "scheduler_engine", None)
 
     if engine is None:
-        return _empty_snapshot()
+        return _with_phase_labels(_empty_snapshot())
 
     try:
         snapshot = engine.snapshot()
@@ -267,7 +348,7 @@ def get_scheduler_state(request: Request) -> Dict[str, Any]:
         # as far as the panel is concerned — and the panel must keep
         # answering.  The failure is logged rather than swallowed.
         logger.exception("the scheduler's snapshot could not be read")
-        return _empty_snapshot()
+        return _with_phase_labels(_empty_snapshot())
 
     if not isinstance(snapshot, Mapping):
         # An answer that is not a document is not the read model: the
@@ -280,9 +361,83 @@ def get_scheduler_state(request: Request) -> Dict[str, Any]:
             "answering the idle read model",
             type(snapshot).__name__,
         )
-        return _empty_snapshot()
+        return _with_phase_labels(_empty_snapshot())
 
-    return dict(snapshot)
+    return _with_phase_labels(dict(snapshot))
+
+
+# ---------------------------------------------------------------------------
+# The plan detail
+# ---------------------------------------------------------------------------
+
+
+#: The answer a plan that is not there is given.
+#:
+#: The detail endpoint has one refusal of its own, and it says what it
+#: is about in the panel's own words: the plan is not there.  The
+#: wording is this route's — the plans route's own 404 body carries
+#: diagnostics about the instance that answered, and those are about
+#: **its** question, not about this one.
+_PLAN_NOT_FOUND_DETAIL = "plan not found"
+
+
+@router.get("/api/scheduler/plan/{plan_id}/detail")
+def get_scheduler_plan_detail(plan_id: str) -> Any:
+    """Answer with one plan's progress — the card's own wording.
+
+    The scheduler's read model says **which** plans are queued and
+    which are running.  When the operator opens one of them, the panel
+    asks a second question — "what is this plan doing right now?" — and
+    that answer already exists: it is the Feishu progress card's body,
+    the same three sections (where the plan is, how the tasks are
+    counted, what is running this moment), worded by the same builders.
+
+    So this endpoint grows no second phrasing of it.  It asks the plan's
+    status for where the plan is, asks the card's builder
+    (``cards.build_progress_lines``) for the wording, and hands both on.
+    A panel and a card that read the same lines cannot disagree about
+    what a plan is doing.
+
+    It is a **read**, and it reads one thing only: the routing row's
+    phase is the same before the call and after it.  A detail endpoint
+    that stamped a phase would be a second writer of the plan's state.
+
+    Two refusals, and they are told apart:
+
+    * a **malformed** id is a bad request — the shared guard's own 400,
+      left alone;
+    * a plan that is **not there** is a 404 that says so.
+
+    A refusal of the third kind — this instance may not say whether the
+    plan exists — travels on unchanged: it is the plans route's answer
+    about **its** data plane, and re-wording it here would replace a
+    true statement with a vaguer one.
+    """
+    # The id is admitted through the shared guard: ``_plan_dir`` is the
+    # one place a request-supplied id may become a path, and it refuses
+    # a traversal with 400.  That answer is the guard's own and it is
+    # left alone — a malformed id is a bad request, not a missing plan.
+    _server._plan_dir(plan_id)
+
+    status = _routes_plans.get_plan_status(plan_id)
+
+    if isinstance(status, JSONResponse):
+        # The plans route refused.  A 404 becomes this route's own
+        # answer; anything else travels on as it came.
+        if status.status_code == 404:
+            raise HTTPException(404, _PLAN_NOT_FOUND_DETAIL)
+        return status
+
+    payload = dict(status) if isinstance(status, Mapping) else {}
+
+    phase = str(payload.get("current_phase") or payload.get("phase") or "")
+
+    return {
+        "plan_id": plan_id,
+        "phase": phase,
+        "phase_label": _phase_label_for(phase),
+        "lines": _cards.build_progress_lines(payload)["lines"],
+    }
 
 
 # ---------------------------------------------------------------------------

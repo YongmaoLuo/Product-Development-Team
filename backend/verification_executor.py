@@ -152,7 +152,20 @@ logger = logging.getLogger(__name__)
 #: lives in :mod:`verification_subagent` for the LLM-output path; this
 #: class is the post-LLM collector and the contract is symmetric with
 #: what the orchestrator reports to the judgment phase).
-ALLOWED_STATUSES = ("PASSED", "FAILED", "SKIPPED", "BLOCKED", "DEFERRED")
+#:
+#: ``INCONCLUSIVE`` (2026-11-10) is the sixth word, and it is the CI
+#: gate's own: a gate that ran out of its budget did not decide, so it
+#: did not prove the deliverable defective
+#: (``verification_ci_runner.STATUS_INCONCLUSIVE``).  The schema used to
+#: reject it, and ``_run_single_vp`` turns a rejected verdict into
+#: ``FAILED`` with an **empty** evidence dict — so the gate's "I could
+#: not decide" was recorded as "the deliverable failed", which is
+#: exactly the failure that buys a repair task for a defect nobody
+#: found.  The word belongs in the ledger; what the round does with it
+#: is the report layer's and the orchestrator's business.
+ALLOWED_STATUSES = (
+    "PASSED", "FAILED", "SKIPPED", "BLOCKED", "DEFERRED", "INCONCLUSIVE",
+)
 
 #: Required keys for a valid verdict payload. The contract is
 #: position-free: any extra keys are ignored.
@@ -1604,6 +1617,7 @@ class VerificationExecutor(BaseExecutor):
 
             {
                 "status":   one of "PASSED", "FAILED", "SKIPPED", "BLOCKED",
+                            "DEFERRED", "INCONCLUSIVE",
                 "reasons":  List[str],
                 "evidence": dict,
                 ...        # any extra keys are ignored
@@ -4011,6 +4025,33 @@ class VerificationExecutor(BaseExecutor):
             return
         self._mark_layer_skipped(layer, reason)
 
+    def _has_verdict_in_current_round(self, vp_id: str) -> bool:
+        """这个验证点**本轮**有没有结论。
+
+        2026-11-06（VP-016 根因）：这条判据曾经是**跨轮**的
+        ``vp_id in self._verdicts`` ——「这个 VP 已经有裁决了（哪怕是上一轮
+        的 DEFERRED）就不写新的」。于是从第二轮起，被门禁延后的关卡在
+        本轮**一条裁决都没有**：它「本轮没被问过」这个事实只存在于上一轮
+        的账本里，而本轮的账本里它整个消失。
+
+        后果不是少一行日志，是一条凭空造出来的失败：判定层（Phase 3 LLM）
+        只看到「计划里有这个点、没有执行结果」——一张空白支票——于是替它
+        编了一个 ``FAILED``（``type=missing`` / ``severity=high``），框架
+        再照着这条「失败」买下一条「去修一个没跑过的门禁」的任务。
+
+        轮次已知时走 :meth:`_verdict_exists_in_round` —— 两张表都查（轮次
+        作用域表 ``_verdicts_by_round`` 是本轮账本的真相，``_verdicts`` 里
+        那一条带着它自己的轮次戳），装载路径两张表一起写，两边不会差。
+
+        轮次未知（0）时退回旧口径（跨轮表）：不知道轮次就不能凭轮次拒掉
+        任何一条，也不要凭空造一个轮次 —— 轮次都分不出来，就分不出「上一
+        轮」和「这一轮」，于是沿用旧口径：**有结论就不重写**。
+        """
+        current = self._verdict_round_no()
+        if current <= 0:
+            return vp_id in self._verdicts
+        return self._verdict_exists_in_round(vp_id, current)
+
     def _mark_layer_deferred(
         self,
         layer: List[Dict[str, Any]],
@@ -4019,6 +4060,12 @@ class VerificationExecutor(BaseExecutor):
         refresh: bool = False,
     ) -> None:
         """把整层 Phase 2 VP 标为 ``DEFERRED``（本轮延后，下轮重跑）。
+
+        2026-11-06（VP-016 根因）：跳过判据是「**本轮**已经有裁决就不写
+        新的」（:meth:`_has_verdict_in_current_round`），不是跨轮的「这个
+        VP 已经有裁决」。于是被本轮延后的关卡，每一轮都留下一条**本轮
+        盖戳**的 ``DEFERRED`` —— 「本轮没问过」这件事必须看得见，否则它
+        会被判定层读成「跑挂了」。
 
         2026-11-09（轮次作用域 · DEFERRED）：判据是「**本轮**已有裁决」，
         不是「这条验证点有裁决」。
@@ -4058,6 +4105,11 @@ class VerificationExecutor(BaseExecutor):
         条目，判定环节只能自己编一条 FAILED。
 
         所以判据 1 只看**本轮**那一份（``_current_round_bucket``）。
+
+        同一轮内不覆盖既有结论；跨轮必须重新落一条带本轮轮次戳的
+        DEFERRED —— 与 :meth:`_mark_layer_skipped` 的轮次语义一致（整层
+        跳过每一轮都走 ``_stamp_round`` 落一条本轮结论）。
+
         """
         current_round = self._verdict_round_no()
         for item in layer:
@@ -4073,6 +4125,7 @@ class VerificationExecutor(BaseExecutor):
                 item_id, current_round
             ):
                 # 本轮已经落过账 —— 同一轮内不覆盖既有结论。
+
                 continue
             verdict = {
                 "status": "DEFERRED",

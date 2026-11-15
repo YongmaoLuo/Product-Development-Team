@@ -607,6 +607,15 @@ VERIFICATION_JUDGMENT_SYSTEM_PROMPT = """你是一位资深 QA 工程师。你�
 - 偏离类型：功能缺失、功能变更、性能不达标、兼容性问题
 - 验证点因命令格式错误而未运行 = 也是一种"功能未验证"的偏离，应记录在 requirement_deviations 中
 
+**执行器没能判定的验证点（2026-11-10，必须遵守）**：
+- 执行结果里被标成 `INCONCLUSIVE`（门禁预算用尽，**没能下结论**）或被环境阻塞
+  （服务没起来 / 数据面对不上）的验证点，**不得写成交付物缺陷**：它们说的不是
+  交付物，是这一轮没问成。
+- 这些验证点**也不得**为它们登记 requirement_deviations —— 一条「偏离」是对
+  交付物的判决，而「机器没答出来」不是判决。
+- 你只能写上面那四个状态（PASSED / FAILED / SKIPPED / PARTIAL）。`INCONCLUSIVE`
+  由框架按执行器的账本还原，不需要（也不允许）你猜。
+
 输出格式（纯 JSON）：
 {
   "overall_status": "PASSED|FAILED|PARTIAL",

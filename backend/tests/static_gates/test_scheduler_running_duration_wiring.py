@@ -2,7 +2,7 @@
 
 Why this gate exists
 --------------------
-The running table has two clocks to choose from, and they answer
+The running card has two clocks to choose from, and they answer
 different questions:
 
 * ``elapsed_sec`` is the **slot** clock — the time since the slot was
@@ -21,19 +21,20 @@ it was wrong about the thing it named.
 
 The rule
 --------
-* ``frontend/app.js``: the running row reads ``running_sec`` and falls
-  back to ``elapsed_sec`` when it is missing.  The fallback must be a
-  nullish coalescing (``??``), not ``||`` — a plan that started a
-  moment ago has ``running_sec`` of ``0``, and ``||`` would throw that
-  number away and show the slot clock instead.
+* ``frontend/app.js``: the running card's duration fact reads
+  ``running_sec`` and falls back to ``elapsed_sec`` when it is
+  missing.  The fallback must be a nullish coalescing (``??``), not
+  ``||`` — a plan that started a moment ago has ``running_sec`` of
+  ``0``, and ``||`` would throw that number away and show the slot
+  clock instead.
 * The duration is written by a **named** function
   (``schedulerDurationText``) so the format lives in one place and can
   be pinned here.  It must carry the three units — hours, minutes and
   seconds — and the two thresholds that separate them, and it must
   draw a dash for a missing number.
-* ``frontend/index.html``: the column is headed 「已运行」.  The old
-  「已运行(秒)」 wording is gone: the column no longer shows seconds,
-  it shows a duration.
+* ``frontend/app.js``: the duration fact is labelled 「已运行」.  The old
+  「已运行(秒)」 wording is gone from the script and from the markup:
+  the fact no longer shows seconds, it shows a duration.
 
 Scan target
 -----------
@@ -118,10 +119,10 @@ def _function_body(source: str, name: str) -> str:
 
 
 def test_running_uses_running_sec() -> None:
-    """The running row must show the plan clock, and fall back to the slot clock.
+    """The running card must show the plan clock, and fall back to the slot clock.
 
     ``running_sec`` is the time since the plan started — the number the
-    「已运行」 column promises.  ``elapsed_sec`` is the time since the
+    「已运行」 fact promises.  ``elapsed_sec`` is the time since the
     slot was acquired, which restarts at zero with the scheduler; it is
     the right answer only when the plan clock is missing.
 
@@ -132,28 +133,28 @@ def test_running_uses_running_sec() -> None:
     body = _function_body(_source(_APP_JS), "renderSchedulerRunning")
 
     assert "running_sec" in body, (
-        "the running row never reads `running_sec`, so the 「已运行」 "
-        "column shows the slot clock — a number that restarts at zero "
+        "the running card never reads `running_sec`, so the 「已运行」 "
+        "fact shows the slot clock — a number that restarts at zero "
         "when the scheduler restarts."
     )
 
     assert "elapsed_sec" in body, (
-        "the running row never reads `elapsed_sec`, so a listing that "
+        "the running card never reads `elapsed_sec`, so a listing that "
         "carries no `running_sec` has nothing to fall back to and the "
-        "column goes blank."
+        "fact goes blank."
     )
 
     match = re.search(r"running_sec\s*\?\?\s*(?P<fallback>[^;\n]+)", body)
     assert match is not None, (
-        "the running row does not fall back from `running_sec` to "
+        "the running card does not fall back from `running_sec` to "
         "`elapsed_sec` with `??`. Without the coalescing operator the "
-        "column cannot show the plan clock and still survive a listing "
+        "fact cannot show the plan clock and still survive a listing "
         "that carries only the slot clock."
     )
 
     assert "elapsed_sec" in match.group("fallback"), (
         "the fallback of `running_sec` does not name `elapsed_sec`; the "
-        "row would read the plan clock and then fall back to nothing."
+        "card would read the plan clock and then fall back to nothing."
     )
 
 
@@ -204,29 +205,39 @@ def test_duration_formatter_is_named() -> None:
     )
 
 
-def test_header_no_longer_says_seconds() -> None:
-    """The column must be headed 「已运行」, not 「已运行(秒)」.
+def test_the_duration_fact_is_not_headed_in_seconds() -> None:
+    """The duration fact must be labelled 「已运行」, not 「已运行(秒)」.
 
-    The column shows a duration now — 「1h 23m」 — so a header that
-    promises seconds is wrong twice over: it names a unit the cell does
-    not use, and it promises the operator a number they cannot read at a
-    glance.
+    The fact shows a duration now — 「1h 23m」 — so a label that
+    promises seconds is wrong twice over: it names a unit the fact
+    does not use, and it promises the operator a number they cannot
+    read at a glance.
+
+    The label lives in the script now: the card's duration fact carries
+    it, so the old wording is looked for in the script as well as in
+    the markup.
     """
-    html = _source(_INDEX_HTML)
+    body = _function_body(_source(_APP_JS), "renderSchedulerRunning")
 
-    assert re.search(r"<th[^>]*>\s*已运行\s*</th>", html), (
-        "the running table has no 「已运行」 column header; the column "
-        "the operator reads is not labelled."
+    assert re.search(r'name:\s*"running_sec"', body), (
+        "the running card has no `running_sec` fact; the duration the "
+        "operator reads is not written with the field it comes from."
     )
 
-    assert _OLD_HEADER_RE.search(html) is None, (
-        "the running table still heads its column 「已运行(秒)」. The "
-        "column shows a duration now, not a number of seconds."
+    assert re.search(r'label:\s*"已运行"', body), (
+        "the running card's duration fact is not labelled 「已运行」; the "
+        "operator is left with a number nobody can read."
     )
 
+    for path in (_APP_JS, _INDEX_HTML):
+        assert _OLD_HEADER_RE.search(_source(path)) is None, (
+            f"{path.name} still says 「已运行(秒)」. The duration fact "
+            "shows a duration now, not a number of seconds."
+        )
 
-def test_evictable_column_still_reads_evictable() -> None:
-    """The 「可驱逐」 column must keep reading ``item.evictable``.
+
+def test_the_evictable_fact_still_reads_evictable() -> None:
+    """The 「可驱逐」 fact must keep reading ``item.evictable``.
 
     The eviction rule is applied to the **slot** clock, not to the plan
     clock: a plan is protected for a minimum runtime measured from the
@@ -238,7 +249,7 @@ def test_evictable_column_still_reads_evictable() -> None:
     body = _function_body(_source(_APP_JS), "renderSchedulerRunning")
 
     assert re.search(r"item\.evictable", body), (
-        "the 「可驱逐」 column no longer reads `item.evictable`. The "
+        "the 「可驱逐」 fact no longer reads `item.evictable`. The "
         "eviction rule is the backend's — measured against the slot "
         "clock — and the panel must not recompute it from the duration "
         "it draws."

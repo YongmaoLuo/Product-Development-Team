@@ -184,6 +184,36 @@ def test_assertion_without_a_comparator_is_a_schema_error():
     assert "would always pass" in issues[0].detail
 
 
+def test_a_rooted_json_path_is_still_accepted():
+    assert validate_vp(_vp("http://x", [
+        {"name": "返回 decision_id", "json_path": "$.decision_id", "exists": True},
+    ])) == []
+
+
+def test_the_json_path_root_error_names_the_writing_style():
+    """要求写成一句话：路径必须以 ``$`` 开头，收到的那个是什么。
+
+    2026-11-08：这条检查原本住在 ``verification_api_runner`` 里。那个模块是
+    本仓的**冻结面**（``backend/tests/static_gates/
+    test_verification_mode_scope_gates.py`` 把它整份钉在基线上），改动它会
+    让整仓门禁失败。判据因此搬到 ``verification_plan_delta`` —— 它不在冻结面
+    里，而且它才是真正下发判据的地方：写不进来的判据**到不了**执行器。
+
+    断言一字未改，跟着实现一起搬；``test_verification_plan_delta.py`` 里的
+    ``test_an_api_test_with_a_bare_json_path_never_lands`` 钉着它的端到端后果
+    —— 裸路径的新增连号都拿不到，落不进计划。
+    """
+    from verification_plan_delta import json_path_root_error
+
+    assert json_path_root_error("$.decision_id") is None
+
+    reason = json_path_root_error("decision_id")
+
+    assert reason is not None
+    assert "必须以 `$` 开头" in reason
+    assert "'decision_id'" in reason
+
+
 def test_status_list_means_any_of(server_url: str):
     result = run_api_verification(
         _vp(f"{server_url}/created", [{"name": "created", "status": [200, 201]}])
