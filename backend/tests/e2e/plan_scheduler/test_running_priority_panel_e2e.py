@@ -46,7 +46,8 @@ the server's memory:
 2. the plan whose artifact says ``{"priority": -10}`` has a running
    entry whose priority **is** ``-10``;
 3. the other plans of the batch read **0** — the ordinary weight;
-4. the panel **drew** the running plans (``#scheduler-running-list``);
+4. the panel **drew** the running plans (as cards, in
+   ``#scheduler-running-cards``);
 5. the screenshot the panel left behind **exists and is not empty**.
 
 What is real here
@@ -217,17 +218,24 @@ def browser_executable():
 
 
 def read_rows(page, selector):
-    """The cells of every row of a table, read in one go.
+    """The plan id and the header of every card, read in one go.
 
-    The panel redraws its tables whenever it reads the model again, so
-    a row that was located a moment ago may be gone by the time it is
-    read.  Reading the whole table in one evaluation avoids that race:
-    what is read is what is on the page at that moment.
+    The running list is drawn as **cards** — one card per plan, folded
+    — and a card carries its plan id in ``data-plan-id``.  The panel
+    redraws its cards whenever it reads the model again, so a card
+    that was located a moment ago may be gone by the time it is read.
+    Reading every card in one evaluation avoids that race: what is
+    read is what is on the page at that moment.
+
+    The first item of every pair is the plan id, which is what the
+    assertions read.
     """
     return page.eval_on_selector_all(
         selector,
-        """rows => rows.map(row => Array.from(row.querySelectorAll('td'))
-                                 .map(cell => cell.innerText.trim()))""",
+        """cards => cards.map(card => [
+                card.dataset.planId || '',
+                (card.querySelector('.scheduler-plan-header')?.innerText || '').trim(),
+            ])""",
     )
 
 
@@ -265,12 +273,12 @@ with sync_playwright() as driver:
     while True:
         page.click("#btn-refresh-scheduler", timeout=30000)
         page.wait_for_timeout(500)
-        running = read_rows(page, "#scheduler-running-list tr")
+        running = read_rows(page, "#scheduler-running-cards .scheduler-plan-card")
         if running or time.time() > deadline:
             break
 
     # 4. the running plans, as the panel draws them.
-    running = read_rows(page, "#scheduler-running-list tr")
+    running = read_rows(page, "#scheduler-running-cards .scheduler-plan-card")
 
     # The read model, read through the same session at the same moment:
     # the panel and this answer are two readings of one server.
