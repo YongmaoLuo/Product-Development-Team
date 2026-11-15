@@ -93,6 +93,7 @@ from .plan_dir_resolver import (
 from .state_events import (
     KIND_PLAN_CLOSED,
     KIND_PLAN_PHASE_CHANGED,
+    KIND_PLAN_RESTARTED,
     KIND_STALE_REFRESH,
     KIND_TASK_STATE_CHANGED,
     KIND_VP_STATE_CHANGED,
@@ -172,6 +173,18 @@ class PlanCardState:
             "skip forever" and never re-tries — operators can
             clear the flag by editing the JSON file or by
             restarting after fixing the env.
+        last_execution_started_at: ``started_at`` of the execution
+            the current card belongs to. A plan that is started again
+            gets a NEW ``started_at`` (``POST
+            /api/execution/{plan_id}/start`` writes a fresh one every
+            time), so a change here means "this plan is running
+            again" — the old card describes a run that is over, and the
+            notifier rotates it: the message ids are cleared and the
+            next push sends a FRESH card instead of editing the stale
+            one in place. ``None`` means "not seen yet" (a card-state
+            JSON written before this field existed, or a plan the
+            watch has not looked at yet) → the first sighting only
+            records the baseline, it never rotates.
     """
 
     plan_id: str
@@ -181,6 +194,7 @@ class PlanCardState:
     last_fingerprint: Optional[str] = None
     last_push_ts: Optional[float] = None
     permanently_disabled: bool = False
+    last_execution_started_at: Optional[str] = None
 
 
 def _load_card_state(plan_id: str) -> PlanCardState:
@@ -197,6 +211,9 @@ def _load_card_state(plan_id: str) -> PlanCardState:
                 last_fingerprint=data.get("last_fingerprint"),
                 last_push_ts=data.get("last_push_ts"),
                 permanently_disabled=bool(data.get("permanently_disabled", False)),
+                # Absent in card-state JSONs written before this field
+                # existed → None → "first sighting", no rotation.
+                last_execution_started_at=data.get("last_execution_started_at"),
             )
     except (OSError, ValueError) as exc:
         logger.warning(
@@ -224,6 +241,10 @@ def _save_card_state(state: PlanCardState) -> None:
                     "last_fingerprint": state.last_fingerprint,
                     "last_push_ts": state.last_push_ts,
                     "permanently_disabled": state.permanently_disabled,
+                    # The execution the current card belongs to. A
+                    # change here means the plan was started again →
+                    # the card is rotated (see PlanCardState).
+                    "last_execution_started_at": state.last_execution_started_at,
                 },
                 ensure_ascii=False,
             ),
@@ -818,6 +839,12 @@ class FeishuNotifier:
                 progress = fetch_execution_progress(
                     plan_id, base_url=self._backend_base,
                 )
+                # 2026-11-14: a plan that is started AGAIN must get a
+                # NEW card, not an in-place edit of the card that
+                # describes the finished run. The rotation check runs
+                # BEFORE the fingerprint baseline so it is independent
+                # of whether the task list happens to look the same.
+                self._maybe_rotate_card_for_restart(plan_id, progress)
                 sig = self._execution_state_fingerprint(progress)
                 if sig is None:
                     # No readable state yet — retry next tick.
@@ -840,6 +867,92 @@ class FeishuNotifier:
                 plan_id=plan_id,
                 payload={"sub_kind": "exec_progress_watch"},
             ))
+
+    def _maybe_rotate_card_for_restart(
+        self, plan_id: str, progress: Any,
+    ) -> bool:
+        """Rotate the card when the plan has been started AGAIN.
+
+        ``POST /api/execution/{plan_id}/start`` writes a fresh
+        ``started_at`` on every call, so a changed ``started_at`` in
+        the progress payload means "this plan is running again". The
+        card that is live in the chat describes the PREVIOUS run —
+        its phase, its task list, its verdict are all stale — so
+        editing it in place would tell the operator that the old run
+        is still going. Instead the persisted message ids are
+        cleared, which makes the next push take the "no message id
+        yet" branch and send a FRESH card for the new run.
+
+        The rotation is what makes the card correct; the fresh card
+        itself comes from the existing push path (see
+        ``_push_to_feishu`` / ``_push_to_telegram``) — no special
+        case is added there.
+
+        Returns True when a rotation happened (and the caller gets a
+        ``plan_restarted`` event queued).
+        """
+        if not isinstance(progress, dict):
+            return False
+        raw = progress.get("started_at")
+        if raw is None:
+            # No execution stamp in this payload — nothing to compare
+            # against. Keep the pre-existing behaviour.
+            return False
+        started_at = str(raw).strip()
+        if not started_at:
+            return False
+
+        try:
+            with self._states_lock:
+                state = self._states.get(plan_id)
+                if state is None:
+                    state = _load_card_state(plan_id)
+                    if state.chat_id is None:
+                        # Same resolution ``_handle_plan`` does for a
+                        # plan it has never seen: without it the plan
+                        # would be treated as "no chat id" and be
+                        # disabled permanently.
+                        state.chat_id = _resolve_chat_id(plan_id)
+                    self._states[plan_id] = state
+
+                prev = state.last_execution_started_at
+                if prev is None:
+                    # First sighting of this plan — record the baseline
+                    # only. The startup sweep already pushed a card;
+                    # rotating here would throw that card away.
+                    state.last_execution_started_at = started_at
+                    _save_card_state(state)
+                    return False
+                if prev == started_at:
+                    # Same execution — the card is still the right one.
+                    return False
+
+                # A new execution: the live card belongs to the old run.
+                state.message_id = None
+                state.telegram_message_id = None
+                state.last_fingerprint = None
+                state.last_execution_started_at = started_at
+                _save_card_state(state)
+        except Exception:
+            # Persistence failure must not break the watch — the next
+            # tick retries. Never let this kill the tick.
+            logger.exception(
+                "[feishu_notifier] exec watch: card rotation failed for "
+                "plan=%s", plan_id,
+            )
+            return False
+
+        logger.warning(
+            "[feishu_notifier] exec watch: plan=%s was started again "
+            "(started_at %s -> %s) — rotating the card", plan_id, prev,
+            started_at,
+        )
+        self._enqueue_event(StateEvent(
+            kind=KIND_PLAN_RESTARTED,
+            plan_id=plan_id,
+            payload={"sub_kind": "execution_restarted"},
+        ))
+        return True
 
     def _watch_stale_cards(self) -> None:
         """Force a refresh for any plan whose card has gone quiet while
@@ -1005,9 +1118,14 @@ class FeishuNotifier:
             # the stale-refresh watchdog. The watchdog is a third bypass
             # because the thing it exists to catch is precisely a long
             # silence: gating it on "enough time passed" would defeat it.
+            # A restart is a fourth bypass: the plan was started again,
+            # so the card for the previous run must not keep being
+            # edited — the new run needs its own card, and it must go
+            # out now rather than after the min-interval.
             bypass = (
                 KIND_PLAN_CLOSED in kinds
                 or KIND_STALE_REFRESH in kinds
+                or KIND_PLAN_RESTARTED in kinds
                 or final_flush
             )
             if (
