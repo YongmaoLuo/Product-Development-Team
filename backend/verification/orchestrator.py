@@ -520,14 +520,22 @@ TERMINAL_OPTIONS = (
 
 #: The answer a terminal question falls back to when nobody replies.
 #:
-#: The conservative reading of a stopped chain: the fallback must not
-#: change what the plan *is*.  *Revise the criterion* obsoletes
-#: acceptance criteria — the plan would carry on with fewer of them,
-#: and could then pass where it had failed — so it is not a fallback
-#: for a question nobody was there to answer.  *Rerun this round*
-#: changes nothing about the plan: the round runs again, and if it
-#: fails the same way the plan is asked again (once per round
-#: attempt).
+#: The default **follows the agent's advice**.  The judge read the
+#: failure scene and said what it means, and a round nobody answered
+#: should follow the judgement it was given rather than a constant
+#: that ignores it.  So this constant is the fallback for the one case
+#: where there is no advice to follow: a round whose analysis could
+#: not be produced at all — the **fallback card** — which carries no
+#: recommendation, because there was nothing to recommend.
+#:
+#: The conservative reading still holds for that case.  The fallback
+#: must not change what the plan *is*.  *Revise the criterion*
+#: obsoletes acceptance criteria — the plan would carry on with fewer
+#: of them, and could then pass where it had failed — so it is not a
+#: fallback for a question nobody was there to answer **and** nobody
+#: analysed.  *Rerun this round* changes nothing about the plan: the
+#: round runs again, and if it fails the same way the plan is asked
+#: again (once per round attempt).
 TERMINAL_DEFAULT_OPTION = "rerun_this_round"
 
 #: The statuses that are **not** a failure.
@@ -3005,8 +3013,11 @@ class VerificationOrchestrator:
         lines: a person **answers** the question, and nobody answers a
         document.  The facts say what happened; the card says what to
         decide about it.  The recommendation is written **in the
-        question only** — the three options and the answer the question
-        falls back to when nobody replies are not the judge's to move.
+        question** — and it is also the answer the question falls back
+        to when nobody replies: a round nobody answered follows the
+        judgement the agent was given.  The **options** stay the
+        orchestrator's: the judge recommends one of them, it does not
+        get to invent a third.
 
         The analysis is optional, and its absence is **not** invisible.
         The judge is a model call, and a model call that fails must not
@@ -3160,6 +3171,24 @@ class VerificationOrchestrator:
             analysis_error = (
                 self._terminal_last_analysis_error or ANALYSIS_ERROR_EMPTY
             )
+        # The answer the question falls back to when nobody replies is
+        # the judge's own recommendation whenever the round has one:
+        # the agent read the failure scene and said what it means, and
+        # an unattended round follows the judgement it was given rather
+        # than a constant that ignores it.
+        #
+        # The condition is "there is an analysis **and** it rendered":
+        # ``card`` is still the **analysis** card at this point — it is
+        # replaced by the fallback card further down — so a truthy
+        # ``card`` means the judge produced a reading that held the
+        # contract.  A round with no analysis at all (the fallback
+        # card) carries no recommendation to follow, so it falls back
+        # to the conservative constant.
+        default_option = TERMINAL_DEFAULT_OPTION
+        if isinstance(analysis, Mapping) and card:
+            recommendation = analysis.get("recommendation")
+            if recommendation in TERMINAL_OPTIONS:
+                default_option = recommendation
         if not card:
             card = render_fallback_brief(
                 plan_id=self.plan_dir.name,
@@ -3174,7 +3203,7 @@ class VerificationOrchestrator:
         return {
             "question": question,
             "options": list(TERMINAL_OPTIONS),
-            "default_option": TERMINAL_DEFAULT_OPTION,
+            "default_option": default_option,
             "report_path": str(report_path),
             "analysis_error": analysis_error,
         }
