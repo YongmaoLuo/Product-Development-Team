@@ -2,9 +2,10 @@
 
 Background
 ----------
-The scheduler answers five questions over and over: which plans are
-waiting, which plans are working, which plan is waiting for a human,
-which directory a plan works in, and what starting a plan needs.
+The scheduler answers six questions over and over: which plans are
+waiting, which plans are working, which plans are parked, which plan is
+waiting for a human, which directory a plan works in, and what starting
+a plan needs.
 
 None of those answers is the scheduler's to keep.  They are already
 written down — the phase in ``plan_routing``, the subprocess and the
@@ -26,7 +27,7 @@ missing is reported once rather than on every tick, and a plan's
 creation time, which comes from the filesystem and cannot change under
 it.
 
-The five questions
+The six questions
 ------------------
 ``queued_plans()``
     Which plans are waiting to run.  The *set* comes from
@@ -36,6 +37,13 @@ The five questions
     admission check and the restart recovery cannot disagree about who
     runs next.  Each row carries the ``phase`` the plan is in, as the
     routing row wrote it.
+``parked_plans()``
+    Which plans are parked — stopped for want of provider capacity,
+    waiting for the window to open again.  The criterion is not decided
+    here: the rows are handed to the one selector
+    (:func:`quota_resume.select_parked_plans`) the resumer uses as
+    well, so the read model and the resumer cannot disagree about who
+    is parked.
 ``active_plans()``
     Which plans are holding compute.  Two kinds of work hold compute:
     an execution subprocess, and a verification round.  The two sets are
@@ -178,6 +186,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from quota_resume import select_parked_plans
+
 from .queue import queue_key
 
 log = logging.getLogger(__name__)
@@ -271,6 +281,23 @@ _EXECUTION_COLUMNS = (
 
 #: The columns of ``plan_verification`` this module reads.
 _VERIFICATION_COLUMNS = ("plan_id", "verification_status", "updated_at")
+
+#: The columns of ``plan_execution`` this module reads to find the
+#: parked plans.  The status and the reason are both read: the status
+#: says the run stopped, the reason says it stopped for want of
+#: capacity — and the criterion that joins them is the selector's
+#: business, not this module's.
+_PARKED_EXECUTION_COLUMNS = ("plan_id", "exec_status", "stop_reason")
+
+#: The columns of ``plan_verification`` this module reads to find the
+#: parked plans.  The round is read with them: a parked verification
+#: round stopped *in a round*, and the round is what says which one.
+_PARKED_VERIFICATION_COLUMNS = (
+    "plan_id",
+    "verification_status",
+    "verification_stop_reason",
+    "round",
+)
 
 
 def _as_dict(columns: Tuple[str, ...], row: Any) -> Dict[str, Any]:
@@ -750,6 +777,83 @@ class PlanFactsReader:
         if stamp is None:
             return True
         return (self._now_epoch() - stamp) > VERIFICATION_STALE_SECONDS
+
+    # ------------------------------------------------------------------
+    # The parked plans
+    # ------------------------------------------------------------------
+
+    def parked_plans(self) -> List[Dict[str, Any]]:
+        """Return the plans that are parked, one row per plan.
+
+        A plan parked for quota is neither working nor waiting: it holds
+        no slot, so :meth:`active_plans` does not name it, and it is in
+        no line, so :meth:`queued_plans` does not name it either.  It
+        has stopped for want of provider capacity and it will start
+        again by itself once the window opens — which is exactly the
+        plan an operator has to be able to see.
+
+        What "parked" means is **not** decided here.  The rows are
+        handed to :func:`quota_resume.select_parked_plans`, which is the
+        one place the criterion lives, because a second criterion here
+        would be a second answer to the same question — and two answers
+        drift: the read model would name a plan the resumer does not
+        revive, or the other way round.
+
+        A plan parked on both sides is **one** plan and appears once:
+        the execution side wins the tie, the way it does in
+        :meth:`active_plans`.
+
+        A parked plan is reported even when its directory is gone.  The
+        park is a fact of the database, and a plan whose directory has
+        moved is exactly the plan an operator has to know about — the
+        queue may drop such a plan (a ghost at the head of the queue
+        would block every plan behind it), but the parked set may not.
+
+        Each row also carries the ``phase`` the plan is in — the routing
+        row's own value, passed on as it is.
+
+        Returns:
+            The parked plans, each a dict of ``plan_id``, ``kind``,
+            ``round``, ``reason`` and ``phase``, ordered by plan id.
+            Empty when nothing is parked.
+        """
+        try:
+            execution_rows = [
+                _as_dict(_PARKED_EXECUTION_COLUMNS, raw)
+                for raw in self._conn.execute(
+                    "SELECT plan_id, exec_status, stop_reason FROM plan_execution"
+                ).fetchall()
+            ]
+            verification_rows = [
+                _as_dict(_PARKED_VERIFICATION_COLUMNS, raw)
+                for raw in self._conn.execute(
+                    "SELECT plan_id, verification_status, "
+                    "verification_stop_reason, round FROM plan_verification"
+                ).fetchall()
+            ]
+            selected = select_parked_plans(execution_rows, verification_rows)
+            return [
+                {
+                    "plan_id": entry.plan_id,
+                    "kind": entry.kind,
+                    "round": entry.round,
+                    "reason": entry.reason,
+                    # The phase the plan is in, read from the routing
+                    # row and passed on as it is.
+                    "phase": self._phase(entry.plan_id),
+                }
+                for entry in selected
+            ]
+        except sqlite3.Error as exc:
+            # The rows could not be read.  The answer degrades to "no
+            # plan is parked", which is the safe direction: the parked
+            # plans wait one tick longer, and the tick itself — which
+            # admits every other plan — keeps running.
+            log.warning(
+                "the parked plans could not be read (%s); reporting none",
+                exc,
+            )
+            return []
 
     # ------------------------------------------------------------------
     # The pending decision

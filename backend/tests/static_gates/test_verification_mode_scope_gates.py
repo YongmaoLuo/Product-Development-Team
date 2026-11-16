@@ -936,7 +936,23 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 2026-11-14：本分支（base drift 轮次复用与审计、服务放置复用自家实例）的
     # 已批准改动同样落在 `verification_loop.py`；与上面「轮次实例身份」的改动
     # 合并后，冻结基线前移到**合并态**哈希。判定强度不变：仍是逐字节 sha256 比对。
-        "1275d125e7ced4fc39c21c664916b6ef60fc61034deb82a29386a0dbff1f208d"
+    # 2026-11-15：因本分支已批准的「停放不等于失败」（PRD R1）改动落在
+    # `verification_loop.py` 上，按本 gate 的既定流程把冻结基线前移到本分支的
+    # 批准态哈希：
+    #   * task-4（a9bd275e「死亡闩锁不把配额停放判成线程死亡」）：新增
+    #     `_plan_parked_for_quota`，在 `verification_thread_died_unexpectedly`
+    #     判死**之前**先问一句「这个计划是不是停在配额上」；命中即不是死亡 ——
+    #     不写终态、不动相位，计划停在 waiting_for_quota，等配额窗口重开后续跑；
+    #   * task-5（566ec593「验证轮停放写入行与运行时旁路文件」）：新增
+    #     `_park_verification_round_for_quota`，让验证侧的停放有地方落行。
+    # 前移之前已核对：自上一版基线（dbf9a037，2026-11-14 钉住的合并态）以来，
+    # 该文件只有上述两处已批准改动（+294/-0，分别来自 task-4 与 task-5），
+    # 没有夹带别的改动。
+    # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的
+    # 范围（仍是 `frontend/app.js` / `frontend/style.css` / `backend/verification_loop.py`
+    # 这三个，一个不多一个不少）与 sha256 逐字节比对的强度都不变，该文件此后仍被
+    # 逐字节钉住，任何再编辑照样红。
+        "bda62e8b19b35c4205decade53c65e1cdfdb1a990bf63e4bb0b592a76dcc0b2f"
     ),
 }
 

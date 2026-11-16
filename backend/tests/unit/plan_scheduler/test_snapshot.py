@@ -17,7 +17,8 @@ down the four things that make it trustworthy:
 3. **The capacity flag is the count.**  ``over_capacity`` is true
    exactly when more plans hold a slot than the scheduler has slots.
 4. **The shape is closed.**  The keys are fixed, the lists are lists and
-   never ``null``, and every reason is one of the policy's own words.
+   never ``null``, and every queue reason is one of the policy's own
+   words.
 
 The tests assert **the fields the panel reads**, not the whole
 document.  A whole-document golden file would break every time the
@@ -246,7 +247,10 @@ def test_key_set_is_closed() -> None:
 
     The phase is one of the row's keys now — what the plan is doing,
     in the routing layer's own words — and it is a key of **both** rows
-    and of neither of the document's six keys.
+    and of neither of the document's seven keys.  The seventh key is
+    ``parked``: the plans stopped for want of provider capacity, which
+    hold no slot and are in no line, so the two lists above could
+    never name them.
     """
     result = build(_state())
 
@@ -256,6 +260,7 @@ def test_key_set_is_closed() -> None:
         "over_capacity",
         "queue",
         "running",
+        "parked",
         "generated_at",
     }
     assert set(result["capacity"]) == {"total", "used", "source"}
@@ -325,11 +330,14 @@ def test_a_state_with_nothing_in_it_still_builds() -> None:
     assert result["running"] == []
     assert result["queue_length"] == 0
     assert result["over_capacity"] is False
+    # Nothing is parked either, and that too is an empty list.
+    assert result["parked"] == []
     assert set(result) == {
         "capacity",
         "queue_length",
         "over_capacity",
         "queue",
         "running",
+        "parked",
         "generated_at",
     }

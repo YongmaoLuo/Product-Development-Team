@@ -8,11 +8,13 @@
 已就绪」这个事实必须由 :func:`verification_gate.verification_branch_ready` 回答，
 而它的答案只以「多一个源阶段」的形式进入 CAS。
 
-本文件钉住五件事：
+本文件钉住六件事：
 
 * **验证分支六维全真** → 200，阶段推进到 ``verification_running``；
 * **开发分支的源阶段元组逐项不变**（冻结值断言）——验证分支的放行不得收窄
   开发分支的既有可达性；
+* **停放的计划够得着**（``waiting_for_quota`` 条件追加进源阶段集合），
+  **没停放的计划够不着**（同一项不进冻结的基准元组）；
 * **审核不完备 / 基线漂移** → 既有 409，**不新增错误码**；
 * **既有的 409 用例**（阶段不匹配）保持绿；
 * ``verification_plan_review`` **不在** ``begin_verification`` 的「已是验证态」
@@ -588,6 +590,70 @@ def test_dev_source_tuple_byte_identical(
         assert got == want, (
             f"开发分支的源阶段元组第 {index} 项变了：{got!r} != {want!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 2b. 停放的计划：条件追加的那一项
+# ---------------------------------------------------------------------------
+#
+# ``waiting_for_quota`` 不是基准元组里的一项——基准元组是冻结值，逐项不变。
+# 它是**条件追加**的一项：只有当计划自己停在 ``waiting_for_quota`` 上时，
+# 它才进源阶段集合。
+#
+# 两个方向都要钉住：
+#
+# * 停放的计划要**够得着**——CAS 在轮次解析**之前**按源阶段集合放行，集合
+#   里没有这一项，停放的计划永远拿不到 ``409 stage_mismatch`` 之外的东西，
+#   也就永远续不上它停下的那一轮；
+# * 非停放的计划要**够不着**——把这一项无条件塞进基准元组，看着一样能跑，
+#   实际是把开发分支的既有可达性悄悄改掉了（这正是冻结值要拦的形状）。
+
+
+def test_parked_plan_gains_the_quota_source_phase(
+    make_dev_plan,
+    no_worker_thread,
+    cas_spy,
+) -> None:
+    """停在 ``waiting_for_quota`` 的计划：源阶段集合多出这一项，且放行。"""
+    plan = make_dev_plan()
+    _record_routing_row(
+        plan.plan_id,
+        phase="waiting_for_quota",
+        verification={
+            "status": "pending",
+            "round": 0,
+            "max_rounds": 3,
+            "stop_reason": None,
+        },
+    )
+
+    resp = client.post(f"/api/verification/{plan.plan_id}/start")
+
+    assert resp.status_code == 200, resp.text
+    assert cas_spy, "try_mark_phase was never called"
+    _plan_id, sources, new_phase = cas_spy[-1]
+    assert new_phase == "verification_running"
+    assert "waiting_for_quota" in sources, (
+        f"停放的计划不在源阶段集合里，它永远续不上：{sources}"
+    )
+
+
+def test_non_parked_plan_does_not_gain_the_quota_source_phase(
+    make_dev_plan,
+    no_worker_thread,
+    cas_spy,
+) -> None:
+    """没停放的计划：源阶段集合里没有这一项（基准元组逐项不变）。"""
+    plan = make_dev_plan()
+
+    resp = client.post(f"/api/verification/{plan.plan_id}/start")
+
+    assert resp.status_code == 200, resp.text
+    assert cas_spy, "try_mark_phase was never called"
+    _plan_id, sources, _new_phase = cas_spy[-1]
+    assert "waiting_for_quota" not in sources, (
+        f"停放的源阶段被无条件塞进了基准元组：{sources}"
+    )
 
 
 # ---------------------------------------------------------------------------

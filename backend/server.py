@@ -1037,8 +1037,9 @@ class HeartbeatMonitor:
     def _tick(self) -> None:
         """One tick of the monitor.
 
-        Two sweeps, in this order: the liveness sweep (``_check_once``)
-        and the human-in-the-loop expiry sweep.
+        Three sweeps, in this order: the liveness sweep
+        (``_check_once``), the quota resume sweep, and the
+        human-in-the-loop expiry sweep.
 
         The expiry sweep runs **after** the liveness sweep, not inside
         it.  ``_check_once`` returns immediately when no plan is in
@@ -1048,13 +1049,33 @@ class HeartbeatMonitor:
         overdue decisions only while some other plan happened to be
         running.
 
-        Neither sweep can take the monitor down: a failure is logged
-        and the next tick runs.
+        The quota resume sweep is mounted here for the same reason, and
+        for one more: a server whose only outstanding work is a
+        *parked* plan has empty registries — nothing executing, nothing
+        verifying — so a sweep inside ``_check_once`` would never run
+        on the machine that needs it most.  This monitor is the thing
+        that runs every 30 seconds, so it is the thing that has to ask
+        "is the quota back yet?".
+
+        None of the three sweeps can take the monitor down: a failure
+        is logged and the next tick runs.
         """
         try:
             self._check_once()
         except Exception:
             pass
+        try:
+            # Imported here rather than at module level: quota_resume
+            # reads the state database through ``server``, so a
+            # module-level import would close a cycle between the two
+            # modules — and an import cycle is a failure at *import*
+            # time, which is the one moment the server cannot afford
+            # to fail.
+            import quota_resume
+
+            quota_resume.run_resume_sweep()
+        except Exception:
+            logger.exception("quota resume sweep failed")
         self._expire_hitl_decisions()
 
     def _expire_hitl_decisions(self) -> None:

@@ -50,13 +50,33 @@ model down over a field that is allowed to be absent.
 
 The shape is closed
 -------------------
-The document has exactly six keys: ``capacity``, ``queue_length``,
-``over_capacity``, ``queue``, ``running`` and ``generated_at``.  A
-field that appears without being declared is a field the panel cannot
-render and the LUI cannot rely on, so adding one is a decision and not
-an accident.  The two lists are always lists — an empty scheduler
-produces two empty lists, never two ``null``s, because ``null`` would
-be a second answer to "how many are waiting".
+The document has exactly seven keys: ``capacity``, ``queue_length``,
+``over_capacity``, ``queue``, ``running``, ``parked`` and
+``generated_at``.  A field that appears without being declared is a
+field the panel cannot render and the LUI cannot rely on, so adding one
+is a decision and not an accident.  The three lists are always lists —
+an empty scheduler produces three empty lists, never three ``null``s,
+because ``null`` would be a second answer to "how many are waiting".
+
+The seventh key was added; the six did not move
+----------------------------------------------
+The document used to carry six keys, and the six were a closed
+contract pinned by three tests.  ``parked`` was added beside them and
+not instead of one of them: the names, the types and the meanings of
+the other six are unchanged, and the rows of the queue and of the
+running line keep their key sets.  A reader written against the six
+keys is still reading a document it was written for — it finds one
+more key, which is what a backward-compatible addition looks like.
+
+The parked row is not a queued row
+----------------------------------
+A parked plan is neither running nor waiting: it holds no slot and it
+is in no line, so it is in neither of the two lists above.  Its row
+therefore has its own shape — the plan, the side that stopped, the
+round, the reason and the phase — and the reason it carries is the
+quota layer's own word rather than the queue policy's, because a
+parked plan stopped for want of provider capacity and not for want of
+a slot.
 
 The queue row names its plan
 ----------------------------
@@ -127,6 +147,8 @@ from __future__ import annotations
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+
+from quota_resume import KIND_EXECUTION, QUOTA_PARK_REASON
 
 from .config import DEFAULT_CAPACITY, DEFAULT_MIN_RUNTIME_SECONDS
 from .policy import REASONS
@@ -474,6 +496,53 @@ def _running_view(state: Any, now: float, min_runtime: float) -> List[Dict[str, 
     return view
 
 
+def _parked_view(state: Any) -> List[Dict[str, Any]]:
+    """Return the parked plans as the panel reads them.
+
+    A parked plan is neither running nor waiting: it holds no slot, so
+    the running line does not name it, and it is in no line, so the
+    queue does not name it either.  It stopped for want of provider
+    capacity, and it is the one plan an operator has to be able to see
+    — it will start again by itself once the window opens.
+
+    The row says which plan it is (``plan_id``), which side of it
+    stopped (``kind`` — execution or verification), which verification
+    round it stopped in (``round``), why it stopped (``reason``) and
+    what it is doing (``phase``).
+
+    The **reason** is passed on as it is, and it is deliberately not
+    read through the queue's own fallback: ``waiting_for_quota`` is
+    not in the queue policy's closed vocabulary, and mapping it there
+    would tell the operator that a plan parked for quota is waiting for
+    a *slot* — a different fact, and a wrong one.  The phase travels
+    as it is too, for the same reason the other rows' phases do: a
+    label is the routing layer's business.
+
+    A field the row does not carry answers its default.  The defaults
+    come from the quota layer, which owns that vocabulary: a park has
+    exactly one reason — the plan is waiting for quota — so a row that
+    names none is read as that one, and the word is the quota layer's
+    own constant rather than a second spelling of it here.  A row
+    that names no kind is read as the execution side, which is the side
+    the facts report first when a plan is parked on both.  The round
+    is zero and the phase is ``None``.
+
+    The order is the one the state carries: the facts hand the parked
+    plans over in plan-id order, and the snapshot owns no second
+    ordering of its own for plans that are not competing for a slot.
+    """
+    return [
+        {
+            "plan_id": str(_field(row, "plan_id", "")),
+            "kind": str(_field(row, "kind", KIND_EXECUTION)),
+            "round": int(_number(_field(row, "round", 0), 0.0)),
+            "reason": str(_field(row, "reason", QUOTA_PARK_REASON)),
+            "phase": _phase(row),
+        }
+        for row in _entries(state, "parked")
+    ]
+
+
 # ---------------------------------------------------------------------------
 # The snapshot
 # ---------------------------------------------------------------------------
@@ -492,8 +561,8 @@ def build(state: Any) -> Dict[str, Any]:
     Returns:
         The document the panel renders and the LUI reports.  Its keys
         are exactly ``capacity``, ``queue_length``, ``over_capacity``,
-        ``queue``, ``running`` and ``generated_at``.  The capacity
-        block carries the number and its source — ``total``,
+        ``queue``, ``running``, ``parked`` and ``generated_at``.  The
+        capacity block carries the number and its source — ``total``,
         ``used`` and ``source``.
     """
     running_rows = _entries(state, "running")
@@ -524,5 +593,9 @@ def build(state: Any) -> Dict[str, Any]:
         "over_capacity": used > total,
         "queue": queue,
         "running": _running_view(state, now, min_runtime),
+        # The plans parked for quota — the facts' answer.  A state that
+        # names none is an empty list: nothing parked is a normal thing
+        # to look at, and a list is an answer a caller can walk.
+        "parked": _parked_view(state),
         "generated_at": _now_iso(),
     }

@@ -43,13 +43,25 @@ command's own vocabulary of outcomes becomes an HTTP status code and a
 document, and the rules of that translation are the same for all four
 actions.
 
-The six keys
-------------
+The seven keys
+--------------
 ``capacity``, ``queue_length``, ``over_capacity``, ``queue``,
-``running`` and ``generated_at`` — the document the panel renders andthe LUI reports.  The list lives in
+``running``, ``parked`` and ``generated_at`` — the document the panel
+renders andthe LUI reports.  The list lives in
 :func:`plan_scheduler.snapshot.build`, which is the only place it is
 written down; this module does not repeat it, because a second copy of
 the key set is a second thing to keep in step with the first.
+
+The ``parked`` list is the plans that stopped for want of provider
+capacity.  It holds no slot and is in no line, so the panel would not
+see those plans at all unless the read model named them — and its rows
+carry a phase, so they carry the label of that phase like every other
+row does.
+
+The route's own published description still says "the six keys": it is
+the endpoint's OpenAPI description, and that description is frozen by
+the approved baseline (``tests/api/openapi_snapshot.json``).  It is
+refreshed when that baseline is re-taken, not here.
 
 What an idle scheduler answers
 ------------------------------
@@ -257,15 +269,20 @@ def _empty_snapshot() -> Dict[str, Any]:
     """The idle scheduler's read model.
 
     Assembled by the production builder out of an empty state, so the
-    idle document has the very same six keys as a busy one — a caller
+    idle document has the very same seven keys as a busy one — a caller
     does not have to branch on "is there anything to show" before it
     can read the answer.
     """
     return build({})
 
 
-#: The two lists of the read model whose rows carry a phase.
-_ROW_LISTS = ("queue", "running")
+#: The three lists of the read model whose rows carry a phase.
+#:
+#: The parked plans are in it too: a plan parked for quota holds no
+#: slot and is in no line, so the panel would not see it at all unless
+#: the read model named it.  Its row carries a phase, so it carries
+#: the label of that phase like every other row does.
+_ROW_LISTS = ("queue", "running", "parked")
 
 
 def _phase_label_for(phase: Any) -> str:
@@ -308,7 +325,7 @@ def _with_phase_labels(payload: Dict[str, Any]) -> Dict[str, Any]:
     a **supplement** to the phase name, never a replacement for it (see
     ``routes.plans._phase_label``).
 
-    Only the two lists change.  The capacity, the queue length, the
+    Only the three lists change.  The capacity, the queue length, the
     over-capacity flag and the generation stamp are the read model's
     own, and they are handed back untouched.
     """
