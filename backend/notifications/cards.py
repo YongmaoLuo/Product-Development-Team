@@ -44,6 +44,19 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 #: (``tasks.json``) has no such task.
 DB_ORPHAN_TERMINAL_ORIGIN = "db_orphan_terminal"
 
+#: Heading of the task-progress section. The card's wording, kept as a
+#: constant so a surface that shows the same facts (the scheduler
+#: page's plan-detail panel) reuses the card's title instead of
+#: writing a second one.
+TASK_SUMMARY_TITLE = "**📋 任务执行状态：**"
+
+#: Heading of the running-tasks section, when one task is running.
+IN_PROGRESS_TITLE = "🔄 **正在执行：**"
+
+#: Heading of the running-tasks section, when several tasks run in
+#: parallel. ``{n}`` is the number of running tasks.
+IN_PROGRESS_PARALLEL_TITLE = "🔄 **正在执行（{n} 个并行）：**"
+
 
 def drop_terminal_db_orphans(
     summary: Optional[Dict[str, Any]],
@@ -510,6 +523,39 @@ def _unified_phase_section(
     return [{"tag": "div", "text": {"tag": "lark_md", "content": line}}]
 
 
+def _in_progress_task_rows(
+    task_progress: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, str]]:
+    """The running tasks, as ``{"id": …, "title": …}`` rows.
+
+    2026-11-14: which rows are running, and what each of them is
+    called, used to be decided inside the renderer and folded straight
+    into a sentence. A surface that shows the same facts (the
+    scheduler page's plan-detail panel) therefore had to re-derive
+    them — and re-derive them differently. This is the one place that
+    decides both, and the renderer below renders what it says.
+
+    A row without an ``id`` is skipped: it cannot be named. A row
+    without a ``title`` keeps its place with an empty title, because
+    the renderer falls back to the id alone and the section must never
+    be silently dropped (2026-09-11).
+    """
+    rows: List[Dict[str, str]] = []
+    for task in task_progress or []:
+        if not isinstance(task, dict):
+            continue
+        if task.get("status") != "in_progress":
+            continue
+        task_id = task.get("id")
+        if not task_id:
+            continue
+        rows.append({
+            "id": str(task_id),
+            "title": str(task.get("title") or "").strip(),
+        })
+    return rows
+
+
 def _in_progress_tasks_section(
     task_progress: Optional[List[Dict[str, Any]]],
     current_activity: Optional[Dict[str, Any]] = None,
@@ -534,21 +580,17 @@ def _in_progress_tasks_section(
 
     Returns ``[]`` only when there is genuinely nothing to report.
     """
-    in_progress = [
-        t for t in (task_progress or [])
-        if isinstance(t, dict) and t.get("status") == "in_progress"
-        and t.get("id")
-    ]
+    in_progress = _in_progress_task_rows(task_progress)
     if in_progress:
         n = len(in_progress)
         if n > 1:
-            heading = f"🔄 **正在执行（{n} 个并行）：**"
+            heading = IN_PROGRESS_PARALLEL_TITLE.format(n=n)
         else:
-            heading = "🔄 **正在执行：**"
+            heading = IN_PROGRESS_TITLE
         lines = [heading]
-        for t in in_progress:
-            tid = t.get("id", "")
-            title = (t.get("title") or "").strip()
+        for row in in_progress:
+            tid = row["id"]
+            title = row["title"]
             # Truncate very long titles so the card stays compact
             # (Feishu has a 4 KB element cap and a 30-line/element limit).
             if len(title) > 80:
@@ -569,7 +611,7 @@ def _in_progress_tasks_section(
         return []
     return [
         {"tag": "div", "text": {"tag": "lark_md",
-                                "content": f"🔄 **正在执行：**\n- {activity_line}"}},
+                                "content": f"{IN_PROGRESS_TITLE}\n- {activity_line}"}},
         {"tag": "hr"},
     ]
 
@@ -598,6 +640,50 @@ def _format_now() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _task_summary_data(
+    tasks_info: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """The structured form of the task-progress bar.
+
+    2026-11-14: the counts, the percentage and the bar used to be
+    computed inside the renderer and folded straight into a sentence.
+    A surface that shows the same facts (the scheduler page's
+    plan-detail panel) therefore had to recompute them — and recompute
+    them differently. This returns them; the renderer below renders
+    them; the two can no longer disagree.
+
+    Returns ``None`` when the plan has no tasks at all (no counts, or
+    a total of zero) — there is no progress to report, and the section
+    must not render an empty bar.
+
+    Counts are read as non-negative integers: a negative count is a
+    counter that ran backwards, and zero is the only reading of it
+    that cannot make the bar wrong. The percentage is clamped into
+    0..100 for the same reason, so the bar is always ten cells wide.
+    """
+    if not tasks_info:
+        return None
+
+    def count(key: str) -> int:
+        return max(0, _int_or(tasks_info.get(key), 0))
+
+    counts = {
+        "total": count("total"),
+        "completed": count("completed"),
+        "in_progress": count("in_progress"),
+        "pending": count("pending"),
+        "failed": count("failed"),
+        "skipped": count("skipped"),
+    }
+    total = counts["total"]
+    if total <= 0:
+        return None
+    percent = max(0, min(100, round(counts["completed"] * 100 / total)))
+    filled = percent // 10
+    bar = "█" * filled + "░" * (10 - filled)
+    return {"counts": counts, "percent": percent, "bar": bar}
+
+
 def _task_summary_section(tasks_info: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Render task progress bar + non-zero counts as a list of card elements.
 
@@ -605,24 +691,25 @@ def _task_summary_section(tasks_info: Optional[Dict[str, Any]]) -> List[Dict[str
     Pure function — same input always produces the same output, so
     the notifier's fingerprint dedup can compare cards safely.
     """
-    if not tasks_info:
+    data = _task_summary_data(tasks_info)
+    if data is None:
         return []
-    total = tasks_info.get("total", 0) or 0
-    if total <= 0:
-        return []
-    completed = tasks_info.get("completed", 0) or 0
-    failed = tasks_info.get("failed", 0) or 0
-    skipped = tasks_info.get("skipped", 0) or 0
-    in_progress = tasks_info.get("in_progress", 0) or 0
-    pending = tasks_info.get("pending", 0) or 0
-    pct = round(completed * 100 / total)
-    bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
-    line = f"**📋 任务执行状态：**{bar} {pct}% ({completed}/{total})"
-    counts = [
-        f"✅{completed}", f"⏳{in_progress}", f"📋{pending}",
-        f"❌{failed}", f"⏭{skipped}",
+    counts = data["counts"]
+    line = (
+        f"{TASK_SUMMARY_TITLE}{data['bar']} {data['percent']}%"
+        f" ({counts['completed']}/{counts['total']})"
+    )
+    chips = [
+        f"✅{counts['completed']}", f"⏳{counts['in_progress']}",
+        f"📋{counts['pending']}", f"❌{counts['failed']}",
+        f"⏭{counts['skipped']}",
     ]
-    non_zero = [c for c in counts if not c.endswith("0")]
+    # The chip of a zero count is dropped. The test is on the rendered
+    # chip's last character, as it always was — which also drops a
+    # count that ends in "0" (10, 20, …). That quirk predates this
+    # refactor and the card's wording is frozen: changing it is a card
+    # change, not a refactor.
+    non_zero = [c for c in chips if not c.endswith("0")]
     if non_zero:
         line += "　" + "　".join(non_zero)
     return [
@@ -670,33 +757,32 @@ def _extract_failure_context(description: Optional[str], max_chars: int = 120) -
     return snippet
 
 
-def _blocked_tasks_section(progress: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Render pending tasks that are blocked by upstream failures.
+def _blocked_task_rows(progress: Optional[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """The tasks an upstream failure holds up, as structured rows.
 
-    2026-09-10: the card title shows
-    ``⏸ 暂停（上游阻塞）`` but the body never tells the operator
-    *which* tasks are blocked and *why*. Without this section the
-    operator has to ask "what's actually stuck?" — exactly the
-    ambiguity the card was supposed to remove.
+    2026-11-14: which pending tasks are blocked, by which dependency,
+    and whether they wait on a *failure* or on a task that is still
+    running used to be decided inside the renderer and folded straight
+    into a sentence. A surface that shows the same facts (the scheduler
+    page's plan-detail panel) therefore had to re-derive them — and
+    re-derive them differently. This is the one place that decides
+    both, and the renderer below renders what it says.
 
-    Algorithm:
-      1. Collect pending tasks from ``progress.tasks``.
-      2. For each pending task, inspect its ``depends_on`` list:
-         - if any dep has status ``failed`` → "被 [id] 阻塞(失败)"
-         - else if any dep has status ``pending`` or
-           ``in_progress`` → "等待 [id, ...]" (transitive cascade
-           is NOT expanded — single-level is enough to surface the
-           cascade to the operator)
-         - else (all deps completed/skipped/superseded) → skip
-      3. Render as ``🚧 被阻塞的待执行任务`` + bullet list.
+    A row's ``state`` is ``failed`` when one of the task's dependencies
+    failed and ``waiting`` when the dependency is still pending or
+    running; ``dep`` names the dependencies that decide the state,
+    joined by ``", "``.
 
-    Returns ``[]`` when there are no blocked tasks — pure function.
+    A task whose dependencies are all done is not blocked and gets no
+    row — neither does a task without dependencies (it is schedulable,
+    not blocked).
     """
-    if not progress:
-        return []
-    prog_tasks = progress.get("tasks") or []
-    if not prog_tasks:
-        return []
+    rows: List[Dict[str, str]] = []
+    if not isinstance(progress, dict):
+        return rows
+    prog_tasks = progress.get("tasks")
+    if not isinstance(prog_tasks, list):
+        return rows
     # Build a status lookup so we can resolve dependency IDs to
     # statuses without re-scanning the list for each pending task.
     status_by_id: Dict[str, str] = {}
@@ -706,7 +792,6 @@ def _blocked_tasks_section(progress: Optional[Dict[str, Any]]) -> List[Dict[str,
         tid = t.get("id")
         if tid:
             status_by_id[str(tid)] = (t.get("status") or "").lower()
-    blocked_lines: List[str] = []
     for t in prog_tasks:
         if not isinstance(t, dict):
             continue
@@ -727,15 +812,61 @@ def _blocked_tasks_section(progress: Optional[Dict[str, Any]]) -> List[Dict[str,
         if not failed_deps and not waiting_deps:
             # All deps are completed / skipped / superseded — not blocked.
             continue
-        tid = t.get("id", "?")
-        title = t.get("title", "未知任务")
         if failed_deps:
-            block_reason = f"被 [{', '.join(f'`{d}`' for d in failed_deps)}] 阻塞（失败）"
+            state = "failed"
+            dep = ", ".join(failed_deps)
         else:
-            block_reason = f"等待 [{', '.join(f'`{d}`' for d in waiting_deps)}]"
-        blocked_lines.append(f"• `{tid}` {title}　↳ {block_reason}")
-    if not blocked_lines:
+            state = "waiting"
+            dep = ", ".join(waiting_deps)
+        rows.append({
+            "id": str(t.get("id", "?")),
+            "title": str(t.get("title", "未知任务")),
+            "dep": dep,
+            "state": state,
+        })
+    return rows
+
+
+def _blocked_tasks_section(progress: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Render pending tasks that are blocked by upstream failures.
+
+    2026-09-10: the card title shows
+    ``⏸ 暂停（上游阻塞）`` but the body never tells the operator
+    *which* tasks are blocked and *why*. Without this section the
+    operator has to ask "what's actually stuck?" — exactly the
+    ambiguity the card was supposed to remove.
+
+    Algorithm:
+      1. Collect pending tasks from ``progress.tasks``.
+      2. For each pending task, inspect its ``depends_on`` list:
+         - if any dep has status ``failed`` → "被 [id] 阻塞(失败)"
+         - else if any dep has status ``pending`` or
+           ``in_progress`` → "等待 [id, ...]" (transitive cascade
+           is NOT expanded — single-level is enough to surface the
+           cascade to the operator)
+         - else (all deps completed/skipped/superseded) → skip
+      3. Render as ``🚧 被阻塞的待执行任务`` + bullet list.
+
+    2026-11-14: steps 1 and 2 now live in ``_blocked_task_rows``, so a
+    surface that shows the same facts (the scheduler page's plan-detail
+    panel) reuses them instead of re-deriving them. The wording below
+    is unchanged.
+
+    Returns ``[]`` when there are no blocked tasks — pure function.
+    """
+    rows = _blocked_task_rows(progress)
+    if not rows:
         return []
+    blocked_lines: List[str] = []
+    for row in rows:
+        dep_tag = ", ".join(
+            f"`{d}`" for d in (dep.strip() for dep in row["dep"].split(",")) if d
+        )
+        if row["state"] == "failed":
+            block_reason = f"被 [{dep_tag}] 阻塞（失败）"
+        else:
+            block_reason = f"等待 [{dep_tag}]"
+        blocked_lines.append(f"• `{row['id']}` {row['title']}　↳ {block_reason}")
     return [
         {"tag": "hr"},
         {"tag": "div", "text": {"tag": "lark_md", "content": "**🚧 被阻塞的待执行任务：**"}},
@@ -1128,6 +1259,49 @@ def _resolve_header(
     return {"title": f"{base} · {plan_id}", "color": color}
 
 
+def _failed_vp_rows(verification: Optional[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """The VPs that failed the verification round, as structured rows.
+
+    2026-11-14: which VPs failed, and what each of them was testing,
+    used to be decided inside the renderer and folded straight into a
+    sentence. A surface that shows the same facts (the scheduler page's
+    plan-detail panel) therefore had to re-derive them — and re-derive
+    them differently. This is the one place that decides both, and the
+    renderer below renders what it says.
+
+    2026-09-12: the ``failed_vps`` list emitted by
+    ``/api/verification/{id}/progress`` contains bare id strings (e.g.
+    ``"VP-006"``), not dicts. A bare id is resolved through the round's
+    ``vps`` index, so the row carries the title the operator
+    recognises; an id the index does not know keeps an empty title
+    rather than being dropped.
+    """
+    rows: List[Dict[str, str]] = []
+    if not isinstance(verification, dict):
+        return rows
+    failed_vps = verification.get("failed_vps") or []
+    vps_index = {
+        v.get("id"): v
+        for v in (verification.get("vps") or [])
+        if isinstance(v, dict) and v.get("id")
+    }
+    for entry in failed_vps:
+        if isinstance(entry, dict):
+            rows.append({
+                "id": str(entry.get("id", "")),
+                "title": str(entry.get("title", "")),
+            })
+        elif isinstance(entry, str):
+            meta = vps_index.get(entry, {})
+            rows.append({
+                "id": entry,
+                "title": str(meta.get("title", "")),
+            })
+        else:
+            rows.append({"id": "", "title": ""})
+    return rows
+
+
 def _verification_sections(
     progress: Optional[Dict[str, Any]],
     is_terminal: bool,
@@ -1420,6 +1594,11 @@ def _verification_sections(
         for v in vps_list
         if isinstance(v, dict) and v.get("id")
     }
+    # 2026-11-14: the identity of each failed VP (its id and title) comes
+    # from the shared rows, so a surface that shows the same facts (the
+    # scheduler page's plan-detail panel) names them the same way. The
+    # wording below is unchanged.
+    failed_vp_rows = _failed_vp_rows(progress)
     if failed_vps:
         n = len(failed_vps)
         heading = (
@@ -1429,12 +1608,16 @@ def _verification_sections(
         elements.append(
             {"tag": "div", "text": {"tag": "lark_md", "content": heading}}
         )
-        for entry in failed_vps:
+        for entry, row in zip(failed_vps, failed_vp_rows):
+            fid = row["id"]
+            ftitle = row["title"]
+            # The method / layer / reason still come from the entry
+            # itself (a dict carries them) or from the canonical
+            # ``vps_index_fail`` dict built above (a bare id does not).
             if isinstance(entry, dict):
-                fid = entry.get("id", "")
-                ftitle = entry.get("title", "")
                 fmethod = entry.get("method", "")
                 flayer = entry.get("layer", "")
+                reason = (entry.get("actual_result") or "").strip()
             else:
                 # 2026-09-12: the failed_vps list emitted by
                 # /api/verification/{id}/progress contains bare id strings
@@ -1446,13 +1629,10 @@ def _verification_sections(
                 # the metadata from the canonical ``vps_index_fail`` dict
                 # built above so the rendered line includes the title and
                 # (when present) the actual_result reason.
-                fid = entry if isinstance(entry, str) else ""
                 fmeta = vps_index_fail.get(fid, {})
-                ftitle = fmeta.get("title", "")
                 fmethod = fmeta.get("method", "")
                 flayer = fmeta.get("layer", "")
-            reason = (fmeta.get("actual_result") or "").strip() \
-                if isinstance(entry, str) else (entry.get("actual_result") or "").strip()
+                reason = (fmeta.get("actual_result") or "").strip()
             method_tag = f" `{fmethod}`" if fmethod else ""
             layer_tag = f" · {flayer}" if flayer else ""
             elements.append(
@@ -1687,6 +1867,145 @@ def _verification_sections(
     return elements
 
 
+def _failed_task_rows(
+    execution_progress: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """The failed tasks, as structured rows.
+
+    2026-11-14: which tasks failed, why, and how many attempts they
+    took used to be decided inside the renderer and folded straight into
+    a sentence. A surface that shows the same facts (the scheduler
+    page's plan-detail panel) therefore had to re-derive them — and
+    re-derive them differently. This is the one place that decides
+    both, and the renderer below renders what it says.
+
+    The reason is the task's ``failure_reason``; when there is none the
+    task's ``description`` is mined for a context snippet, and when that
+    yields nothing the reason is ``未知原因`` — the card's own wording.
+    A reason longer than 200 chars is cut here too, so the row and the
+    card cannot disagree about how much of it is shown.
+
+    ``attempt`` is how many attempts the task took, ``max_attempts`` the
+    executor's retry bound — the two numbers of ``尝试 N/M``.
+
+    A task whose attempt count is not a number is read as a single
+    attempt: the count is decoration on the card, and a broken count
+    must not cost the operator the failure itself.
+    """
+    rows: List[Dict[str, Any]] = []
+    if not isinstance(execution_progress, dict):
+        return rows
+    tasks_list = execution_progress.get("tasks")
+    if not isinstance(tasks_list, list):
+        return rows
+    # ``max_retries`` is the executor's stop bound (see
+    # ``retry_manager.MAX_RETRIES`` and ``config.max_retries``); if the
+    # runtime overlay doesn't carry it we still show the count alone.
+    # ``retry_manager`` is imported lazily and defensively — ``cards``
+    # deliberately keeps the backend import graph out.
+    max_attempts = 5
+    try:
+        from retry_manager import RetryManager as _RM  # type: ignore
+        max_attempts = int(getattr(_RM, "MAX_RETRIES", 5))
+    except Exception:
+        pass
+    for t in tasks_list:
+        if not isinstance(t, dict):
+            continue
+        if t.get("status") != "failed":
+            continue
+        tid = t.get("id", "?")
+        # 2026-09-11 plan v9 (Bug 1 fix): for ``db_orphan_terminal``
+        # placeholders there is no static ``title`` field on disk —
+        # the orphan row in ``plan_tasks`` only carries status +
+        # failure_reason. Show the id + reason text instead of a
+        # generic "未知任务" so the operator can correlate with
+        # ``plan_tasks`` rows directly.
+        # 2026-09-14: the endpoint hydrate resolves the REAL title
+        # from the plan_tasks row when available — prefer it and only
+        # fall back to the DB-only marker when the row genuinely has
+        # no title (the previous code unconditionally overwrote the
+        # resolved title, which is why operators saw "Task RP-1
+        # (DB-only)" even for rows with real titles).
+        if t.get("_origin") == DB_ORPHAN_TERMINAL_ORIGIN:
+            title = t.get("title") or f"Task {tid} (DB-only)"
+        else:
+            title = t.get("title") or "未知任务"
+        reason = (
+            t.get("failure_reason")
+            or _extract_failure_context(t.get("description"))
+            or "未知原因"
+        )
+        reason = str(reason)
+        if len(reason) > 200:
+            reason = reason[:200] + "..."
+        # 2026-09-11: surface
+        # the per-task attempt count from the runtime overlay
+        # so the operator can see "tried N times before giving
+        # up" at a glance. ``attempt`` is in
+        # ``_RUNTIME_OVERLAY_FIELDS`` (``server.py``) so the
+        # progress endpoint already inherits it onto the task
+        # dict. ``attempts`` is an alias some callers use — we
+        # accept either.
+        attempts_used = t.get("attempts") or t.get("attempt") or 1
+        try:
+            attempt = int(attempts_used)
+        except (TypeError, ValueError):
+            attempt = 1
+        rows.append({
+            "id": str(tid),
+            "title": str(title),
+            "reason": reason,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+        })
+    return rows
+
+
+def _failed_tasks_section(
+    execution_progress: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Render the failed-task detail block — the card's own wording.
+
+    2026-11-14: the block used to live inside
+    :func:`_execution_sections`. A surface that shows the same facts
+    (the scheduler page's plan-detail panel) has to say the same words
+    about them, so the wording moved here and the card renders it
+    through this helper: one wording, two surfaces, no second phrasing.
+
+    The rows carry the identity, the reason and the attempt count; the
+    wording below is unchanged.
+    """
+    rows = _failed_task_rows(execution_progress)
+    if not rows:
+        return []
+    elements: List[Dict[str, Any]] = [
+        {"tag": "hr"},
+        {
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": "**❌ 失败任务详情：**"},
+        },
+    ]
+    for row in rows:
+        # Only render the ``尝试 N/M`` suffix when the count is
+        # > 1 (a single-attempt failure is the common case and
+        # doesn't need the suffix noise); when ``attempt`` is
+        # missing entirely we still show the failure reason
+        # without the suffix.
+        if row["attempt"] and row["attempt"] > 1:
+            attempt_suffix = (
+                f"  (尝试 {row['attempt']}/{row['max_attempts']})"
+            )
+        else:
+            attempt_suffix = ""
+        content = f"• `[{row['id']}]` {row['title']}{attempt_suffix}"
+        content += f"\n  └─ {row['reason']}"
+        elements.append(
+            {"tag": "div", "text": {"tag": "lark_md", "content": content}}
+        )
+    return elements
+
+
 def _execution_sections(
     tasks_info: Dict[str, Any],
     execution_progress: Optional[Dict[str, Any]],
@@ -1841,73 +2160,9 @@ def _execution_sections(
 
     failed_n = tasks_info.get("failed", 0) or 0
     if failed_n > 0:
-        failed_tasks = [
-            t for t in tasks_list
-            if isinstance(t, dict) and t.get("status") == "failed"
-        ]
-        if failed_tasks:
-            elements.append({"tag": "hr"})
-            elements.append(
-                {"tag": "div", "text": {"tag": "lark_md", "content": "**❌ 失败任务详情：**"}}
-            )
-            for t in failed_tasks:
-                tid = t.get("id", "?")
-                # 2026-09-11 plan v9 (Bug 1 fix): for ``db_orphan_terminal``
-                # placeholders there is no static ``title`` field on disk —
-                # the orphan row in ``plan_tasks`` only carries status +
-                # failure_reason. Show the id + reason text instead of a
-                # generic "未知任务" so the operator can correlate with
-                # ``plan_tasks`` rows directly.
-                # 2026-09-14: the endpoint hydrate resolves the REAL
-                # title from the plan_tasks row when available —
-                # prefer it and only fall back to the DB-only marker
-                # when the row genuinely has no title (the previous
-                # code unconditionally overwrote the resolved title,
-                # which is why operators saw "Task RP-1 (DB-only)"
-                # even for rows with real titles).
-                if t.get("_origin") == "db_orphan_terminal":
-                    title = t.get("title") or f"Task {tid} (DB-only)"
-                else:
-                    title = t.get("title") or "未知任务"
-                reason = t.get("failure_reason") or _extract_failure_context(t.get("description")) or "未知原因"
-                if len(reason) > 200:
-                    reason = reason[:200] + "..."
-                # 2026-09-11: surface
-                # the per-task attempt count from the runtime overlay
-                # so the operator can see "tried N times before giving
-                # up" at a glance. ``attempt`` is in
-                # ``_RUNTIME_OVERLAY_FIELDS`` (``server.py``) so the
-                # progress endpoint already inherits it onto the task
-                # dict. ``attempts`` is an alias some callers use — we
-                # accept either. ``max_retries`` is the executor's stop
-                # bound (see ``retry_manager.MAX_RETRIES`` and
-                # ``config.max_retries``); if the overlay doesn't carry
-                # it we still show the count alone.
-                attempts_used = t.get("attempts") or t.get("attempt") or 1
-                # ``max_retries`` defaults to 5 (config.py + retry_manager
-                # align after 2026-09-11 plan), but the runtime overlay
-                # doesn't always carry it; fall back to retry_manager's
-                # current class attr so the rendered text stays truthful.
-                max_retries_default = 5
-                try:
-                    from retry_manager import RetryManager as _RM  # type: ignore
-                    max_retries_default = getattr(_RM, "MAX_RETRIES", 5)
-                except Exception:
-                    pass
-                # Only render the ``尝试 N/M`` suffix when the count is
-                # > 1 (a single-attempt failure is the common case and
-                # doesn't need the suffix noise); when ``attempt`` is
-                # missing entirely we still show the failure reason
-                # without the suffix.
-                if attempts_used and int(attempts_used) > 1:
-                    attempt_suffix = f"  (尝试 {int(attempts_used)}/{max_retries_default})"
-                else:
-                    attempt_suffix = ""
-                content = f"• `[{tid}]` {title}{attempt_suffix}"
-                content += f"\n  └─ {reason}"
-                elements.append(
-                    {"tag": "div", "text": {"tag": "lark_md", "content": content}}
-                )
+        # 2026-11-14: the wording lives in one builder now — the one
+        # the plan-detail panel renders too.
+        elements.extend(_failed_tasks_section(execution_progress))
         elements.extend(_blocked_tasks_section(execution_progress))
 
     skipped = tasks_info.get("skipped", 0) or 0
@@ -2421,29 +2676,33 @@ def _task_counts(
     return {}
 
 
-def build_progress_lines(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Render the progress area as text lines, from the card's builders.
+def _progress_context(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Everything the progress area reads off one payload — read once.
 
-    The Feishu progress card renders its "where am I" area in three
-    sections — the unified phase banner, the task-count bar and the
-    running-tasks block. A second surface (the scheduler page's
-    plan-detail panel) has to show the same three things, and it must
-    not grow its own sentences for them: this function renders the
-    SAME sections and hands back their wording, so the card and the
-    page cannot disagree about what the plan is doing.
+    2026-11-14: the progress area has two shapes. The Feishu card wants
+    flattened text lines; the scheduler page's plan-detail panel wants
+    structured sections. They are the same facts, and reading them
+    twice is two chances to disagree about the same plan. This reads
+    them once and hands the one reading to both.
 
-    ``payload`` is a plan status snapshot (the body of
-    ``GET /api/plan/{id}/status``): ``plan_id``, the phase under
-    ``current_phase`` / ``phase``, the ``summary`` section, the
-    ``execution`` progress section and the ``verification`` progress
-    section. Every one of them is optional — a payload carrying only
-    a phase answers with the phase line alone, and a payload with no
-    phase at all answers with no lines.
+    Every part of the payload is optional. A payload carrying only a
+    phase answers with the phase alone; a payload with no phase at all
+    answers with nothing.
 
-    Returns ``{"title": str, "lines": [{"kind": str, "text": str}]}``.
-    The kinds are ``phase`` (where the plan is), ``summary`` (the task
-    counts) and ``task`` (what is running right now). The text of a
-    line is the card's own wording, verbatim.
+    The returned mapping carries:
+
+    * ``plan_id`` / ``summary`` / ``execution`` / ``verification`` —
+      the payload's own parts, normalised to dictionaries;
+    * ``status`` — the snapshot the card's header is decided from
+      (:func:`_status_from_summary`);
+    * ``phase`` — where the plan is, and the verification sub-state
+      around it (``verification_status`` / ``verification_round`` /
+      ``verification_max_rounds`` / ``verification_stop_reason``);
+    * ``task_progress`` — the execution's task rows, ``current_task`` —
+      the row that is running right now, ``activity`` — what the
+      executor does when no task row says, ``current_vp`` and
+      ``verification_activity`` — the verification window's two facts;
+    * ``tasks_info`` — the task counts the progress bar renders from.
     """
     data = payload if isinstance(payload, dict) else {}
     plan_id = str(data.get("plan_id") or "")
@@ -2522,31 +2781,386 @@ def build_progress_lines(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         _activity_label_text(verification.get("activity")) or None
     )
 
+    return {
+        "plan_id": plan_id,
+        "summary": summary,
+        "execution": execution,
+        "verification": verification,
+        "status": status,
+        "phase": phase,
+        "verification_status": verification_status,
+        "verification_round": verification_round,
+        "verification_max_rounds": verification_max_rounds,
+        "verification_stop_reason": verification_stop_reason,
+        "task_progress": task_progress,
+        "current_task": current_task,
+        "activity": activity,
+        "current_vp": current_vp,
+        "verification_activity": verification_activity,
+        "tasks_info": _task_counts(summary, status, data),
+    }
+
+
+def _positive_int_or_none(value: Any) -> Optional[int]:
+    """``value`` when it is a positive integer, ``None`` otherwise.
+
+    A runtime that is zero, negative, a float or a string is not a
+    runtime the reader can trust, and a runtime the reader cannot trust
+    is better reported as unknown than as a number that looks right.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value > 0 else None
+
+
+def _verification_facts(context: Dict[str, Any]) -> Dict[str, Any]:
+    """The verification facts the panel shows — read the card's way.
+
+    2026-11-14: the snapshot's own ``verification_status`` is the
+    source :func:`build_card` decides the terminal state from, so it
+    is the source here too; the progress payload's own copy is the
+    fallback for a caller that carries only the payload. The plan's
+    *phase* is never a source: a plan parked in ``verification_failed``
+    is not the same fact as a round whose status is ``failed``.
+    """
+    verification = context["verification"]
+    status = str(
+        context["verification_status"]
+        or verification.get("verification_status")
+        or verification.get("status")
+        or ""
+    ).lower()
+    round_n = (
+        context["verification_round"]
+        or _int_or(verification.get("verification_round"), 0)
+        or _int_or(verification.get("current_round"), 0)
+    )
+    max_rounds = (
+        context["verification_max_rounds"]
+        or _int_or(verification.get("max_rounds"), 0)
+    )
+    stop_reason = str(
+        context["verification_stop_reason"]
+        or verification.get("stop_reason")
+        or ""
+    )
+    return {
+        "status": status,
+        "round": round_n,
+        "max_rounds": max_rounds,
+        "stop_reason": stop_reason,
+    }
+
+
+def _in_progress_context_section(
+    context: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """The running-tasks section — the card's own running-tasks block.
+
+    2026-11-14: which tasks are running is decided once (by
+    ``_in_progress_task_rows``) and worded once (by
+    ``_in_progress_tasks_section``); the card renders the wording and
+    this section renders the same wording plus the rows behind it.
+
+    The section is the execution part's own section: a plan that has an
+    execution has one, and its items are the tasks that are running —
+    none, when nothing is. The blocked and the failure sections are
+    different in that: each of them is there only when it has
+    something to say.
+    """
+    if not context["execution"]:
+        return None
+    elements = _in_progress_tasks_section(
+        context["task_progress"], context["activity"],
+    )
+    return {
+        "kind": "in_progress",
+        "items": _in_progress_task_rows(context["task_progress"]),
+        "text": "\n".join(_section_text_lines(elements)),
+    }
+
+
+def _blocked_context_section(
+    context: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """The blocked-tasks section — the card's own blocked block.
+
+    The rows come from ``_blocked_task_rows`` and the wording from
+    ``_blocked_tasks_section`` — the one decision about which tasks an
+    upstream failure holds up, and the one wording about it. A plan with
+    no blocked task has no such section.
+    """
+    execution = context["execution"]
+    rows = _blocked_task_rows(execution)
+    if not rows:
+        return None
+    return {
+        "kind": "blocked",
+        "items": rows,
+        "text": "\n".join(_section_text_lines(
+            _blocked_tasks_section(execution)
+        )),
+    }
+
+
+def _failure_context_section(
+    context: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """The failed-task section — the card's own failure detail.
+
+    The rows come from ``_failed_task_rows`` and the wording from
+    ``_failed_tasks_section`` — the block the card renders under
+    "❌ 失败任务详情". A plan with no failed task has no such section.
+    """
+    execution = context["execution"]
+    rows = _failed_task_rows(execution)
+    if not rows:
+        return None
+    return {
+        "kind": "failure",
+        "items": rows,
+        "text": "\n".join(_section_text_lines(
+            _failed_tasks_section(execution)
+        )),
+    }
+
+
+def _verification_context_section(
+    context: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """The verification section — the card's own verification body.
+
+    The wording is ``_verification_sections``'s, and the terminal
+    judgement is the one :func:`build_card` makes: the round's
+    ``verification_status`` in ``_VERIFICATION_TERMINAL_STATUSES``. The
+    plan's phase is never consulted — a phase says where the plan is,
+    a status says what the round concluded.
+
+    The section is absent when the payload carries no verification at
+    all: a plan that never ran verification has nothing to say about
+    it.
+    """
+    verification = context["verification"]
+    if not verification:
+        return None
+    facts = _verification_facts(context)
+    is_terminal = facts["status"] in _VERIFICATION_TERMINAL_STATUSES
+    elements = _verification_sections(
+        verification, is_terminal, context["status"],
+    )
+    return {
+        "kind": "verification",
+        "status": facts["status"],
+        "round": facts["round"],
+        "max_rounds": facts["max_rounds"],
+        "stop_reason": facts["stop_reason"],
+        "failed_vps": _failed_vp_rows(verification),
+        "text": "\n".join(_section_text_lines(elements)),
+    }
+
+
+def build_progress_sections(
+    payload: Optional[Dict[str, Any]],
+    running_sec: Optional[int] = None,
+    phase_label: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """The progress area as structured sections — the card's own facts.
+
+    2026-11-14: :func:`build_progress_lines` answers with flattened
+    text lines, which is all a renderer that prints paragraphs can
+    use. A panel that draws the plan's state — a status header with a
+    colour and an elapsed time, a phase banner, a progress bar — needs
+    the same facts as structure. This is that structure, and every
+    word in it is the card's own wording: the phase banner is
+    ``_unified_phase_section``'s, the progress bar is
+    ``_task_summary_section``'s, the status header is
+    ``_resolve_header``'s.
+
+    The sections come out in the card's order — status, phase, task
+    progress, in progress, blocked, verification, failure — and the
+    status section is always first: it is the one that says which plan
+    this is. The last four are the plan's context: what is running
+    right now, what an upstream failure holds up, what the verification
+    round said, and what failed. Their wording is the card's too — the
+    running-tasks block is ``_in_progress_tasks_section``'s, the
+    blocked block is ``_blocked_tasks_section``'s, the verification
+    body is ``_verification_sections``'s and the failure detail is
+    ``_failed_tasks_section``'s — so the panel and the card cannot
+    disagree about the same state.
+
+    A section whose data is absent is absent: a plan with no execution
+    has no running-tasks, blocked or failure section, and a plan that
+    never ran verification has no verification section.
+
+    Args:
+        payload: a plan status snapshot (the body of
+            ``GET /api/plan/{id}/status``).
+        running_sec: how long the run has been going, in seconds. A
+            value that is not a positive integer is reported as
+            ``None`` — the reader is told nothing rather than told
+            something wrong.
+        phase_label: the phase's label, when the caller has one of its
+            own. It wins over the card's own table, so a caller that
+            knows the phase better than the table does can say so.
+
+    Returns:
+        The sections, each a mapping whose ``kind`` says what it is.
+        A payload that carries nothing at all produces no sections.
+    """
+    if not isinstance(payload, dict):
+        return []
+
+    context = _progress_context(payload)
+    plan_id = context["plan_id"]
+    phase = context["phase"]
+    summary = context["summary"]
+    execution = context["execution"]
+    verification = context["verification"]
+
+    # A payload with nothing in it has nothing to show. A plan that has
+    # not started yet (no phase anywhere) is shown by its status line
+    # alone — there is no phase banner and no progress to report.
+    if not (
+        plan_id or phase or summary or execution or verification
+    ):
+        return []
+
+    header = _resolve_header(context["status"], context["tasks_info"])
+    title = header["title"]
+    if not phase:
+        # Without a phase the header has no base label to show, so the
+        # plan's own id is the title.
+        title = plan_id or title
+    elif not plan_id:
+        # The card's header ends with the plan id; with no plan id that
+        # separator is not something to show either.
+        title = title.removesuffix(" · ")
+
+    if phase_label is not None:
+        label = str(phase_label)
+    else:
+        label = _PHASE_LABEL.get(phase, "")
+
+    started_at = execution.get("started_at")
+    if not isinstance(started_at, str):
+        started_at = ""
+
+    sections: List[Dict[str, Any]] = [{
+        "kind": "status",
+        "plan_id": plan_id,
+        "title": title,
+        "color": header["color"],
+        "phase": phase,
+        "phase_label": label,
+        "running_sec": _positive_int_or_none(running_sec),
+        "started_at": started_at,
+    }]
+
+    if phase:
+        phase_text = "\n".join(_section_text_lines(_unified_phase_section(
+            phase,
+            verification_status=context["verification_status"],
+            verification_round=context["verification_round"],
+            verification_max_rounds=context["verification_max_rounds"],
+            verification_stop_reason=context["verification_stop_reason"],
+            current_task=context["current_task"],
+            current_vp=context["current_vp"],
+            current_activity=context["activity"],
+            verification_activity=context["verification_activity"],
+        )))
+        if phase_text:
+            sections.append({"kind": "phase", "text": phase_text})
+
+        # The progress bar: the card's own counts, percentage and bar.
+        summary_data = _task_summary_data(context["tasks_info"])
+        if summary_data is not None:
+            sections.append({
+                "kind": "task_progress",
+                "counts": summary_data["counts"],
+                "percent": summary_data["percent"],
+                "bar": summary_data["bar"],
+                "text": "\n".join(_section_text_lines(
+                    _task_summary_section(context["tasks_info"])
+                )),
+            })
+
+    # The four context sections — what is running, what is blocked, what
+    # the verification round said, what failed. Each one is the card's
+    # own wording, and each one is absent when its data is.
+    in_progress = _in_progress_context_section(context)
+    if in_progress is not None:
+        sections.append(in_progress)
+    blocked = _blocked_context_section(context)
+    if blocked is not None:
+        sections.append(blocked)
+    verification_section = _verification_context_section(context)
+    if verification_section is not None:
+        sections.append(verification_section)
+    failure = _failure_context_section(context)
+    if failure is not None:
+        sections.append(failure)
+
+    return sections
+
+
+def build_progress_lines(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Render the progress area as text lines, from the card's builders.
+
+    The Feishu progress card renders its "where am I" area in three
+    sections — the unified phase banner, the task-count bar and the
+    running-tasks block. A second surface (the scheduler page's
+    plan-detail panel) has to show the same three things, and it must
+    not grow its own sentences for them: this function renders the
+    SAME sections and hands back their wording, so the card and the
+    page cannot disagree about what the plan is doing.
+
+    ``payload`` is a plan status snapshot (the body of
+    ``GET /api/plan/{id}/status``): ``plan_id``, the phase under
+    ``current_phase`` / ``phase``, the ``summary`` section, the
+    ``execution`` progress section and the ``verification`` progress
+    section. Every one of them is optional — a payload carrying only
+    a phase answers with the phase line alone, and a payload with no
+    phase at all answers with no lines.
+
+    Returns ``{"title": str, "lines": [{"kind": str, "text": str}]}``.
+    The kinds are ``phase`` (where the plan is), ``summary`` (the task
+    counts) and ``task`` (what is running right now). The text of a
+    line is the card's own wording, verbatim.
+
+    2026-11-14: the payload is read once, by
+    :func:`_progress_context`, and the structured form of the same
+    facts (:func:`build_progress_sections`) is read from that same
+    reading — so the lines and the sections cannot disagree.
+    """
+    data = payload if isinstance(payload, dict) else {}
+    context = _progress_context(payload)
+    plan_id = context["plan_id"]
+
     lines: List[Dict[str, str]] = []
     lines.extend(
         {"kind": "phase", "text": text}
         for text in _section_text_lines(_unified_phase_section(
-            phase,
-            verification_status=verification_status,
-            verification_round=verification_round,
-            verification_max_rounds=verification_max_rounds,
-            verification_stop_reason=verification_stop_reason,
-            current_task=current_task,
-            current_vp=current_vp,
-            current_activity=activity,
-            verification_activity=verification_activity,
+            context["phase"],
+            verification_status=context["verification_status"],
+            verification_round=context["verification_round"],
+            verification_max_rounds=context["verification_max_rounds"],
+            verification_stop_reason=context["verification_stop_reason"],
+            current_task=context["current_task"],
+            current_vp=context["current_vp"],
+            current_activity=context["activity"],
+            verification_activity=context["verification_activity"],
         ))
     )
     lines.extend(
         {"kind": "summary", "text": text}
         for text in _section_text_lines(
-            _task_summary_section(_task_counts(summary, status, data))
+            _task_summary_section(context["tasks_info"])
         )
     )
     lines.extend(
         {"kind": "task", "text": text}
         for text in _section_text_lines(
-            _in_progress_tasks_section(task_progress)
+            _in_progress_tasks_section(context["task_progress"])
         )
     )
 

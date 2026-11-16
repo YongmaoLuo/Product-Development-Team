@@ -60,6 +60,9 @@ _TOGGLE_FUNCTION = "toggleSchedulerCard"
 #: way they left them.
 _RESTORE_FUNCTION = "schedulerRestoreOpenCards"
 
+#: The function that refreshes one card's detail in the background.
+_REFRESH_FUNCTION = "schedulerRefreshCardDetail"
+
 #: The function that decides whether a card's detail has gone stale.
 _STALE_FUNCTION = "schedulerCardDetailStale"
 
@@ -83,6 +86,11 @@ _RUNNING_RENDERER = "renderSchedulerRunning"
 _QUEUE_RENDERER = "renderSchedulerQueue"
 _RUNNING_CONTAINER = "#scheduler-running-cards"
 _QUEUE_CONTAINER = "#scheduler-queue-cards"
+
+#: The function that brings a container's cards in line with its rows.
+#: The renderers hand their rows to it — the container is synced, not
+#: filled — so a card that is still on the page keeps its node.
+_SYNC_FUNCTION = "schedulerSyncCards"
 
 #: The list containers the two tables are drawn into.  The cards
 #: replaced them as the rendering surface, so a renderer that still
@@ -193,22 +201,39 @@ def test_card_defaults_to_collapsed() -> None:
 
 
 def test_detail_request_only_on_expand() -> None:
-    """The detail must be asked for in the toggle, and nowhere else.
+    """The detail must be asked for only for a card that is open.
 
     The request is what an open card costs.  A request made by a
     renderer would be made on **every poll** — one per plan, every
     five seconds, for a detail the operator may never look at — and a
     folded card would no longer be free.
 
-    So the request lives in the toggle: the one function that opens a
-    card.  No renderer may ask for it.
+    So the request lives in the two functions that serve an **open**
+    card: the toggle (the operator's own click) and the refresh (the
+    background refresh that keeps an open card current).  The refresh
+    asks only for a card that is open — a folded card is fetched when
+    the operator opens it, not behind their back — and no renderer may
+    ask for it.
     """
     source = _source(_APP_JS)
     toggle = _function_body(source, _TOGGLE_FUNCTION)
+    refresh = _function_body(source, _REFRESH_FUNCTION)
 
     assert _DETAIL_PATH.search(toggle), (
         f"{_TOGGLE_FUNCTION}() never asks for the plan's detail, so "
         "opening a card opens an empty one."
+    )
+
+    assert _DETAIL_PATH.search(refresh), (
+        f"{_REFRESH_FUNCTION}() never asks for the plan's detail, so a "
+        "card whose answer has grown old never catches up with the plan "
+        "it is about."
+    )
+
+    assert re.search(r"""dataset\.expanded\s*!==\s*["']true["']""", refresh), (
+        f"{_REFRESH_FUNCTION}() does not ask whether the card is open. A "
+        "folded card must not be fetched behind the operator's back — the "
+        "fold is what keeps a folded card free."
     )
 
     for renderer in (_CARD_FUNCTION, _RUNNING_RENDERER, _QUEUE_RENDERER):
@@ -247,6 +272,13 @@ def test_renders_into_cards_container() -> None:
     either there or it is not.  So the renderers write into
     ``#scheduler-running-cards`` and ``#scheduler-queue-cards``, and
     they no longer write into the tables' list containers.
+
+    The containers are **synced**, not filled: the renderer hands its
+    rows to the sync, and the sync is what puts the cards on the page.
+    A renderer that wrote the container's whole markup would draw every
+    card again on every poll — and a card that is drawn again is a new
+    node, so the fold the operator opened and the answer they are
+    reading would be lost with the old one.
     """
     source = _source(_APP_JS)
 
@@ -275,6 +307,24 @@ def test_renders_into_cards_container() -> None:
         "would be drawn twice — once as a card and once as a row that "
         "cannot be folded."
     )
+
+    for renderer, body in (
+        (_RUNNING_RENDERER, running),
+        (_QUEUE_RENDERER, queue),
+    ):
+        assert _SYNC_FUNCTION + "(" in body, (
+            f"{renderer}() does not sync the cards through "
+            f"{_SYNC_FUNCTION}(). The container is synced — a plan that is "
+            "still there keeps the card it has, so the fold the operator "
+            "opened survives the poll."
+        )
+
+        assert "innerHTML" not in body, (
+            f"{renderer}() writes the container's whole innerHTML. The "
+            "cards are synced, not rebuilt: a card that is drawn again is "
+            "a new node, and the operator's fold and the answer they are "
+            "reading are lost with the old one."
+        )
 
 
 def test_expand_reuses_the_cached_detail() -> None:
@@ -322,26 +372,38 @@ def test_detail_failure_stays_in_the_card() -> None:
     in that card: a list that went blank because one plan could not be
     read is a worse answer than a card that says what went wrong — and
     a card whose detail was cleared is a card that says nothing at all.
+
+    The card is never emptied to say it, and a card that still holds
+    an answer keeps it: a failed refresh learned nothing, so what the
+    card shows is still the best answer there is.
     """
     source = _source(_APP_JS)
-    toggle = _function_body(source, _TOGGLE_FUNCTION)
 
-    assert "catch" in toggle, (
-        f"{_TOGGLE_FUNCTION}() does not catch a failed detail request. An "
-        "uncaught failure empties the card and leaves the operator with "
-        "a card that says nothing."
-    )
+    for name in (_TOGGLE_FUNCTION, _REFRESH_FUNCTION):
+        body = _function_body(source, name)
 
-    assert "innerHTML" in toggle, (
-        f"{_TOGGLE_FUNCTION}() never writes into the card. A failed "
-        "request has to leave a word in the card it failed for."
-    )
+        assert "catch" in body, (
+            f"{name}() does not catch a failed detail request. An "
+            "uncaught failure empties the card and leaves the operator "
+            "with a card that says nothing."
+        )
 
-    assert 'innerHTML = ""' not in toggle, (
-        f"{_TOGGLE_FUNCTION}() empties the card when the detail cannot be "
-        "read. The other plans in the list are fine, and they must stay "
-        "on screen."
-    )
+        assert "innerHTML" in body, (
+            f"{name}() never writes into the card. A failed request has "
+            "to leave a word in the card it failed for."
+        )
+
+        assert 'innerHTML = ""' not in body, (
+            f"{name}() empties the card when the detail cannot be read. "
+            "The other plans in the list are fine, and they must stay "
+            "on screen."
+        )
+
+        assert "schedulerCardErrorHtml" in body, (
+            f"{name}() does not say what went wrong in the card it failed "
+            "for. A failed detail has to leave a word where the operator "
+            "is looking."
+        )
 
 
 def test_detail_request_goes_through_the_api_wrapper() -> None:
@@ -349,22 +411,25 @@ def test_detail_request_goes_through_the_api_wrapper() -> None:
 
     Every request the page makes carries the guard header
     ``X-PDT-Request: 1``, and exactly two functions attach it.  A bare
-    ``fetch(`` in the toggle would answer 403 at runtime — the request
-    would go out and come back refused, which reads on screen as a
-    plan whose detail cannot be read.
+    ``fetch(`` in the toggle — or in the refresh that keeps an open
+    card current — would answer 403 at runtime: the request would go
+    out and come back refused, which reads on screen as a plan whose
+    detail cannot be read.
     """
     source = _source(_APP_JS)
-    toggle = _function_body(source, _TOGGLE_FUNCTION)
 
-    assert "api(" in toggle, (
-        f"{_TOGGLE_FUNCTION}() does not ask through the api() wrapper, so "
-        "the request carries no guard header and is refused."
-    )
+    for name in (_TOGGLE_FUNCTION, _REFRESH_FUNCTION):
+        body = _function_body(source, name)
 
-    assert "fetch(" not in toggle, (
-        f"{_TOGGLE_FUNCTION}() calls fetch() directly. Every request must "
-        "go through api(), which attaches the guard header."
-    )
+        assert "api(" in body, (
+            f"{name}() does not ask through the api() wrapper, so the "
+            "request carries no guard header and is refused."
+        )
+
+        assert "fetch(" not in body, (
+            f"{name}() calls fetch() directly. Every request must go "
+            "through api(), which attaches the guard header."
+        )
 
 
 def test_the_card_takes_the_row_and_nothing_else() -> None:
@@ -435,7 +500,10 @@ def test_the_detail_cache_expires() -> None:
     opposite of what an open card is for.
 
     So the cache records when the detail was fetched, and the panel
-    asks again once the answer is older than the poll interval.
+    asks again once the answer is older than the poll interval.  What
+    it must **not** do is throw the answer away to ask again: the
+    answer stays on the screen until the new one replaces it, and the
+    card is not folded and opened again on the way.
     """
     source = _source(_APP_JS)
 
@@ -468,9 +536,15 @@ def test_the_detail_cache_expires() -> None:
         "whether what they show has gone stale, so an open card never "
         "catches up with the plan it is about."
     )
-    assert _TOGGLE_FUNCTION in restore, (
+    assert _REFRESH_FUNCTION in restore, (
         f"{_RESTORE_FUNCTION}() never asks again. A card that was opened "
         "shows what it showed when it was opened, for ever."
+    )
+    assert _TOGGLE_FUNCTION not in restore, (
+        f"{_RESTORE_FUNCTION}() goes through {_TOGGLE_FUNCTION}() to ask "
+        "again. The toggle folds the card and opens it again — the "
+        "operator watches their card twitch every five seconds, and the "
+        "card goes blank while the new answer is on its way."
     )
 
 
@@ -484,32 +558,36 @@ def test_the_answer_goes_to_the_card_that_is_on_the_page() -> None:
     looking at stays empty, and nothing says why.
 
     So the card is looked up **again** after the request, and the answer
-    is written into the card that is there now.
+    is written into the card that is there now.  That goes for the
+    background refresh too: its answer belongs to the card that is on
+    the page when the answer arrives.
     """
     source = _source(_APP_JS)
-    toggle = _function_body(source, _TOGGLE_FUNCTION)
 
-    request = _DETAIL_PATH.search(toggle)
-    assert request is not None, (
-        f"{_TOGGLE_FUNCTION}() never asks for the plan's detail."
-    )
+    for name in (_TOGGLE_FUNCTION, _REFRESH_FUNCTION):
+        body = _function_body(source, name)
 
-    lookups = [
-        match.start()
-        for match in re.finditer(re.escape(_CARD_ELEMENT_FUNCTION) + r"\(", toggle)
-    ]
-    assert lookups, (
-        f"{_TOGGLE_FUNCTION}() never looks the card up, so it has nowhere "
-        "to put the answer."
-    )
+        request = _DETAIL_PATH.search(body)
+        assert request is not None, (
+            f"{name}() never asks for the plan's detail."
+        )
 
-    assert any(position > request.start() for position in lookups), (
-        f"{_TOGGLE_FUNCTION}() looks the card up only before the request. "
-        "The panel redraws its cards every five seconds, and the card the "
-        "request was made from may be gone by the time the answer "
-        "arrives — the answer has to go to the card that is on the page "
-        "now."
-    )
+        lookups = [
+            match.start()
+            for match in re.finditer(re.escape(_CARD_ELEMENT_FUNCTION) + r"\(", body)
+        ]
+        assert lookups, (
+            f"{name}() never looks the card up, so it has nowhere to put "
+            "the answer."
+        )
+
+        assert any(position > request.start() for position in lookups), (
+            f"{name}() looks the card up only before the request. The "
+            "panel redraws its cards every five seconds, and the card the "
+            "request was made from may be gone by the time the answer "
+            "arrives — the answer has to go to the card that is on the "
+            "page now."
+        )
 
 
 def test_every_class_the_card_uses_has_a_rule() -> None:

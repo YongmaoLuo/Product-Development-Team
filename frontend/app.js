@@ -2441,13 +2441,391 @@ function schedulerCardElement(planId) {
     return null;
 }
 
-/** The lines a card shows when it is open.
+/** One card's markup, turned into a node.
+
+    A plan that is new to the page arrives as **markup** — the card
+    renderer draws it — and the parser is what turns that markup into a
+    node the page can hold.
+
+    The markup is parsed in a ``template`` element: a template parses
+    without putting anything on the page, so nothing in the markup can
+    fire an event or fetch a resource by accident.  The card goes on
+    the page only when the panel has decided to show it.
+
+    What comes back is **one** card — the one the markup is about —
+    and markup that carries no card gives back nothing. */
+function schedulerCardFromHtml(html) {
+    const markup = String(html == null ? "" : html).trim();
+    if (!markup) return null;
+    const template = document.createElement("template");
+    template.innerHTML = markup;
+    return template.content.querySelector(".scheduler-plan-card") || null;
+}
+
+/** Write a plan's new facts into the card the page already has.
+
+    The card the operator is looking at must stay **the same card**:
+    the fold they opened, the answer they are reading and everything
+    the page knows about that card live on that node.  A card that was
+    drawn again would lose all three.
+
+    So the update writes **into** the card — the header's contents and
+    the actions' contents — and leaves the card itself alone.  The
+    header node stays the node it was, so a click on it is still a
+    click on the same button.
+
+    What the update does **not** touch is the card's state: the fold
+    and the detail area belong to the operator and to the plan, not to
+    the poll.  A card that is open keeps what it shows, and a card that
+    is folded keeps its detail empty. */
+function schedulerUpdateCard(card, row) {
+    if (!card) return;
+    const next = schedulerCardFromHtml(schedulerCard(row || {}));
+    if (!next) return;
+
+    // The header's words are what changed; the header itself is the
+    // button the operator clicks, and it stays the node it was.
+    const header = card.querySelector(".scheduler-plan-header");
+    const nextHeader = next.querySelector(".scheduler-plan-header");
+    if (header && nextHeader && header.innerHTML !== nextHeader.innerHTML) {
+        header.innerHTML = nextHeader.innerHTML;
+    }
+
+    // The actions are the plan's, and they are written into the
+    // actions the card already has.
+    const actions = card.querySelector(".scheduler-row-actions");
+    const nextActions = next.querySelector(".scheduler-row-actions");
+    if (actions && nextActions && actions.innerHTML !== nextActions.innerHTML) {
+        actions.innerHTML = nextActions.innerHTML;
+    }
+}
+
+/** Bring one container's cards in line with the rows it is given.
+
+    The cards are **keyed by the plan they are about**: a plan that is
+    still on the page keeps the card it already has, and only the parts
+    that changed are written into it.  A plan that is new is parsed out
+    of its markup and put on the page; a plan that has gone takes its
+    own card off the page — and only its own card.
+
+    The order is the server's.  A card that has moved is **moved**
+    (``insertBefore``) rather than drawn again, so the card the
+    operator is looking at keeps its identity — and its fold, and its
+    answer — while the list changes shape around it.
+
+    A row that names no plan is not a card: there is nothing to key it
+    by, and a card that names no plan cannot be acted on. */
+function schedulerSyncCards(containerId, rows) {
+    const container = document.querySelector(containerId);
+    if (!container) return;
+
+    const list = Array.isArray(rows) ? rows : [];
+
+    // The cards that are on the page, keyed by the plan they are about.
+    const cards = new Map();
+    for (const card of Array.from(container.querySelectorAll(".scheduler-plan-card"))) {
+        const id = card.dataset.planId ? String(card.dataset.planId) : "";
+        if (!id) continue;
+        cards.set(id, card);
+    }
+
+    // The plans the server has just named: the ones whose cards stay.
+    const wanted = new Set();
+    for (const row of list) {
+        const item = row || {};
+        const id = item.plan_id ? String(item.plan_id) : "";
+        if (!id) continue;
+        wanted.add(id);
+    }
+
+    // A plan that has gone takes its card off the page — and only its
+    // own card goes with it.  The card is taken off as a node: a
+    // container that was emptied would draw every card again.
+    for (const [id, card] of Array.from(cards.entries())) {
+        if (wanted.has(id)) continue;
+        cards.delete(id);
+        container.removeChild(card);
+    }
+
+    // The cards, in the order the server gave them.  The list is walked
+    // from the end, so that each card can be put in front of the one
+    // that follows it: a card that is already where it belongs is left
+    // exactly where it is.
+    let anchor = null;
+    for (let index = list.length - 1; index >= 0; index -= 1) {
+        const row = list[index] || {};
+        const id = row.plan_id ? String(row.plan_id) : "";
+        if (!id) continue;
+        let card = cards.get(id);
+        if (!card) {
+            // A plan that is new: its card is parsed out of its markup.
+            card = schedulerCardFromHtml(schedulerCard(row));
+            if (!card) continue;
+            cards.set(id, card);
+        } else {
+            // A plan that is still here: only what changed is written
+            // into the card it already has.
+            schedulerUpdateCard(card, row);
+        }
+        const inPlace = card.parentNode === container
+            && (anchor === null
+                ? card.nextElementSibling === null
+                : card.nextElementSibling === anchor);
+        if (!inPlace) container.insertBefore(card, anchor);
+        anchor = card;
+    }
+}
+
+/** How long a plan's run has been going, as the panel says it.
+
+    The runtime sits next to the plan's status, and a runtime the
+    panel does not know is said as 「—」: "the run has been going for
+    no time at all" and "the panel does not know how long the run has
+    been going" are different statements, and only the first one is
+    true of a plan that never started.
+
+    Under a minute is counted in seconds, a longer run in minutes and
+    seconds — the same shape the card's own runtime uses, so the panel
+    and the card say the same thing about the same run. */
+function schedulerFormatDuration(sec) {
+    if (sec === null || sec === undefined) return "—";
+    const total = Number(sec);
+    if (!Number.isFinite(total) || total < 0) return "—";
+    const seconds = Math.floor(total);
+    if (seconds < 60) return String(seconds) + "s";
+    const minutes = Math.floor(seconds / 60);
+    return String(minutes) + "m " + String(seconds % 60) + "s";
+}
+
+/** One plan's progress, drawn as the card's own sections.
+
+    The detail endpoint answers with the plan's facts in **two**
+    shapes: the ``lines`` a renderer prints one by one, and the
+    ``sections`` a panel draws — a status header with a colour and an
+    elapsed time, a phase banner, a progress bar, the running tasks,
+    the blocked tasks, the verification round, the failed tasks.
+
+    The sections are what the panel draws, and every word in them is
+    the backend's own: the panel never writes a second wording about a
+    plan's state, it draws the facts the card's builders produced.
+
+    Every value that comes from the server is escaped on the way in.
+    The markup is **concatenated** rather than interpolated, so every
+    ``${…}`` in this function carries a value that has already been
+    through ``escapeHtml()`` — a reader (and the gate that reads
+    this file) can tell at a glance that nothing reaches the DOM
+    unescaped. */
+function schedulerSectionHtml(section) {
+    const data = section && typeof section === "object" ? section : {};
+    const kind = data.kind ? String(data.kind) : "";
+
+    // The section's own wording, one line per entry.  The wording is
+    // the card's own and it comes from the server, so it is escaped
+    // here — the same way every other renderer escapes what it is
+    // handed.
+    const escapeHtmlTextLines = (value) => String(value == null ? "" : value)
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line !== "")
+        .map((line) => `<span class="scheduler-detail-text">${escapeHtml(line)}</span>`)
+        .join("");
+
+    // The status header: the plan's own title, its id, the phase it
+    // is in, and how long the run has been going.  The colour is the
+    // backend's — the panel does not decide what a plan's colour is.
+    if (kind === "status") {
+        const color = data.color ? String(data.color) : "grey";
+        const title = data.title ? String(data.title) : "";
+        const planId = data.plan_id ? String(data.plan_id) : "";
+        const badge = data.phase_label
+            ? String(data.phase_label)
+            : (data.phase ? String(data.phase) : "");
+        return `<div class="scheduler-detail-section scheduler-detail-status" data-section="status" data-status-color="${escapeHtml(color)}">
+            <span class="scheduler-detail-status-dot"></span>
+            <span class="scheduler-detail-section-title">${escapeHtml(title)}</span>
+            <span class="scheduler-detail-plan-id">${escapeHtml(planId)}</span>
+            <span class="scheduler-detail-phase-badge">${escapeHtml(badge)}</span>
+            <span class="scheduler-detail-duration">${escapeHtml(schedulerFormatDuration(data.running_sec))}</span>
+        </div>`;
+    }
+
+    // The phase banner: the backend's own sentence.  There is no
+    // structure to draw for it — the sentence IS the section.
+    if (kind === "phase") {
+        return '<div class="scheduler-detail-section" data-section="phase">' +
+            '<span class="scheduler-detail-section-title">当前状态</span>' +
+            escapeHtmlTextLines(data.text) +
+            '</div>';
+    }
+
+    // The progress bar: the card's own counts, percentage and bar.
+    // The section's wording is exactly these three pieces put
+    // together, so it is not repeated — the pieces are drawn instead.
+    if (kind === "task_progress") {
+        const counts = data.counts && typeof data.counts === "object" ? data.counts : {};
+        const total = Number(counts.total) || 0;
+        const completed = Number(counts.completed) || 0;
+        const percent = Math.round(Number(data.percent) || 0);
+        const bar = data.bar ? String(data.bar) : "";
+        // The counts are the card's own chips, and a count of zero is
+        // dropped — the card drops it too, so the two show the same
+        // chips.
+        const chips = [
+            ["✅", counts.completed],
+            ["⏳", counts.in_progress],
+            ["📋", counts.pending],
+            ["❌", counts.failed],
+            ["⏭", counts.skipped],
+        ]
+            .filter((chip) => Number(chip[1]) > 0)
+            .map((chip) => chip[0] + Number(chip[1]))
+            .join(" ");
+        const percentText = String(percent) + "% (" + String(completed) + "/" + String(total) + ")";
+        return `<div class="scheduler-detail-section" data-section="task_progress">
+            <span class="scheduler-detail-section-title">任务执行状态</span>
+            <code class="scheduler-detail-bar">${escapeHtml(bar)}</code>
+            <span class="scheduler-detail-pct">${escapeHtml(percentText)}</span>
+            <span class="scheduler-detail-counts scheduler-detail-muted">${escapeHtml(chips)}</span>
+        </div>`;
+    }
+
+    // The running tasks.  When nothing is running the card says what
+    // the executor is doing instead ("the executor is idle"), and
+    // that sentence is the section's own wording — so it is drawn when
+    // there are no rows to draw.
+    if (kind === "in_progress") {
+        const items = Array.isArray(data.items) ? data.items : [];
+        const rows = items.map((item) => {
+            const entry = item && typeof item === "object" ? item : {};
+            return `<div class="scheduler-task-row" data-task-status="in_progress">
+                <span class="scheduler-task-icon">🔄</span>
+                <span class="scheduler-task-id">${escapeHtml(entry.id || "")}</span>
+                <span class="scheduler-task-title">${escapeHtml(entry.title || "")}</span>
+            </div>`;
+        }).join("");
+        return '<div class="scheduler-detail-section" data-section="in_progress">' +
+            '<span class="scheduler-detail-section-title">正在执行</span>' +
+            (rows || escapeHtmlTextLines(data.text)) +
+            '</div>';
+    }
+
+    // The blocked tasks: the ones an upstream dependency holds up.
+    // The reason is the card's own wording — a task waiting on a
+    // dependency that failed is blocked by it, a task waiting on one
+    // that is still running is waiting for it.
+    if (kind === "blocked") {
+        const items = Array.isArray(data.items) ? data.items : [];
+        const rows = items.map((item) => {
+            const entry = item && typeof item === "object" ? item : {};
+            const dep = entry.dep ? String(entry.dep) : "";
+            const reason = dep
+                ? (entry.state === "failed"
+                    ? "被 " + dep + " 阻塞（失败）"
+                    : "等待 " + dep)
+                : "";
+            return `<div class="scheduler-task-row" data-task-status="blocked">
+                <span class="scheduler-task-icon">🚧</span>
+                <span class="scheduler-task-id">${escapeHtml(entry.id || "")}</span>
+                <span class="scheduler-task-title">${escapeHtml(entry.title || "")}</span>
+                <span class="scheduler-detail-muted">${escapeHtml(reason)}</span>
+            </div>`;
+        }).join("");
+        return '<div class="scheduler-detail-section" data-section="blocked">' +
+            '<span class="scheduler-detail-section-title">被阻塞的待执行任务</span>' +
+            rows +
+            '</div>';
+    }
+
+    // The verification round: its status, the round it is on, why it
+    // stopped, and the VPs this round failed.  The wording is drawn
+    // as well — it carries what the round is doing right now (the VP
+    // in flight, the activity), which the fields do not.
+    if (kind === "verification") {
+        const status = data.status ? String(data.status) : "";
+        const round = Number(data.round) || 0;
+        const maxRounds = Number(data.max_rounds) || 0;
+        const stopReason = data.stop_reason ? String(data.stop_reason) : "";
+        const failedVps = Array.isArray(data.failed_vps) ? data.failed_vps : [];
+        const rows = failedVps.map((item) => {
+            const entry = item && typeof item === "object" ? item : {};
+            return `<div class="scheduler-task-row" data-task-status="failed">
+                <span class="scheduler-task-icon">❌</span>
+                <span class="scheduler-task-id">${escapeHtml(entry.id || "")}</span>
+                <span class="scheduler-task-title">${escapeHtml(entry.title || "")}</span>
+            </div>`;
+        }).join("");
+        const roundText = maxRounds > 0
+            ? "round " + String(round) + "/" + String(maxRounds)
+            : "round " + String(round);
+        return '<div class="scheduler-detail-section" data-section="verification">' +
+            '<span class="scheduler-detail-section-title">验证状态</span>' +
+            `<span class="scheduler-detail-phase-badge">${escapeHtml(status)}</span>` +
+            `<span class="scheduler-detail-muted">${escapeHtml(roundText)}</span>` +
+            (stopReason ? `<span class="scheduler-detail-text">${escapeHtml(stopReason)}</span>` : "") +
+            rows +
+            escapeHtmlTextLines(data.text) +
+            '</div>';
+    }
+
+    // The failed tasks: what failed, why, and how many attempts it
+    // took.  The attempt count is drawn only when the task was tried
+    // more than once — a single attempt is the common case and needs
+    // no count.
+    if (kind === "failure") {
+        const items = Array.isArray(data.items) ? data.items : [];
+        const rows = items.map((item) => {
+            const entry = item && typeof item === "object" ? item : {};
+            const attempt = Number(entry.attempt) || 0;
+            const maxAttempts = Number(entry.max_attempts) || 0;
+            const attemptText = attempt > 1
+                ? "（尝试 " + String(attempt) + "/" + String(maxAttempts) + "）"
+                : "";
+            return `<div class="scheduler-task-row" data-task-status="failed">
+                <span class="scheduler-task-icon">❌</span>
+                <span class="scheduler-task-id">${escapeHtml(entry.id || "")}</span>
+                <span class="scheduler-task-title">${escapeHtml(entry.title || "")}</span>
+                <span class="scheduler-detail-text">${escapeHtml(entry.reason || "")}</span>
+                <span class="scheduler-detail-muted">${escapeHtml(attemptText)}</span>
+            </div>`;
+        }).join("");
+        return '<div class="scheduler-detail-section" data-section="failure">' +
+            '<span class="scheduler-detail-section-title">失败任务详情</span>' +
+            rows +
+            '</div>';
+    }
+
+    // A kind the panel does not know is still a section: it is drawn
+    // as a generic block carrying its own wording, and it never stops
+    // the panel from drawing the rest of the answer.
+    return '<div class="scheduler-detail-section" data-section="' + escapeHtml(kind) + '">' +
+        '<span class="scheduler-detail-section-title">' + escapeHtml(kind) + '</span>' +
+        escapeHtmlTextLines(data.text) +
+        '</div>';
+}
+
+/** The plan's progress a card shows when it is open.
+
+    The detail endpoint answers with the plan's facts in two shapes:
+    the ``sections`` a panel draws, and the ``lines`` a renderer prints
+    one by one.  The sections are drawn when the answer carries them —
+    they are the plan's structure, and printing the lines instead
+    throws that structure away.
+
+    The lines are the fallback: an answer that carries no sections is
+    shown as the paragraphs it has always been, so a backend that has
+    not learned to answer with sections yet does not blank the card.
 
     The wording is the backend's — the same builders the progress card
     uses — so the panel and the card cannot disagree about what a plan
     is doing. */
 function schedulerCardDetailHtml(payload) {
     const data = payload && typeof payload === "object" ? payload : {};
+    const sections = Array.isArray(data.sections) ? data.sections : [];
+    if (sections.length) {
+        return sections
+            .map((section) => schedulerSectionHtml(section))
+            .join("");
+    }
     const lines = Array.isArray(data.lines) ? data.lines : [];
     if (!lines.length) {
         return "<p>这个计划还没有进度信息</p>";
@@ -2505,6 +2883,10 @@ function schedulerCardDetailStale(planId) {
     asked again: the lines are kept, keyed by the plan's id, so
     opening and folding and opening again is one request, not two.
 
+    An answer that has **grown old** is refreshed in the background:
+    the card shows what it has until the new answer is here, and the
+    card is never blank while it waits.
+
     A plan whose detail cannot be read says so **in its own card**:
     the failure is that card's business, and a list that went blank
     because one plan could not be read is a worse answer than a card
@@ -2530,11 +2912,20 @@ async function toggleSchedulerCard(planId) {
     const cached = _schedulerCardDetails.get(id);
     if (cached) {
         if (detail) detail.innerHTML = schedulerCardDetailHtml(cached.payload);
+        // The answer has grown old: the new one is asked for in the
+        // background, and the card keeps what it has until it is here.
+        if (schedulerCardDetailStale(id)) {
+            loadInBackground(() => schedulerRefreshCardDetail(id), "card detail refresh");
+        }
         return;
     }
     const failed = _schedulerCardErrors.get(id);
     if (failed) {
         if (detail) detail.innerHTML = schedulerCardErrorHtml(failed.message);
+        // A failure that has grown old is worth asking about again.
+        if (schedulerCardDetailStale(id)) {
+            loadInBackground(() => schedulerRefreshCardDetail(id), "card detail refresh");
+        }
         return;
     }
 
@@ -2559,7 +2950,68 @@ async function toggleSchedulerCard(planId) {
         // rather than leaving the list blank.
         const message = err && err.message ? err.message : String(err || "");
         _schedulerCardErrors.set(id, {message: message, at: Date.now()});
-        _schedulerCardDetails.delete(id);
+        // A card that still holds an answer keeps it: a failure is no
+        // reason to empty a card that has something to say.
+        if (_schedulerCardDetails.has(id)) return;
+        const current = schedulerCardElement(id);
+        const currentDetail = current ? current.querySelector(".scheduler-plan-detail") : null;
+        if (currentDetail) currentDetail.innerHTML = schedulerCardErrorHtml(message);
+    } finally {
+        _schedulerCardPending.delete(id);
+    }
+}
+
+/** Ask for one card's detail again, without taking the card's content
+    away.
+
+    A card's detail goes stale while the operator is looking at it: the
+    panel polls every five seconds, and the cached answer is worth
+    reading for exactly as long as that.  When it grows old the card
+    has to catch up — but catching up is a **background** job.  The
+    answer the card already has stays on the screen until the new one
+    arrives, and the new one replaces it in place.
+
+    So this never empties a card.  It asks once (a card that is
+    already being fetched is not asked again), it asks only for a card
+    that is **open** — a folded card is fetched when the operator opens
+    it, not behind their back — and it asks through ``api()`` like
+    every other request the page makes.
+
+    A failure is not the end of the card either: a card that still has
+    an answer keeps it, and only a card with nothing to show says what
+    went wrong. */
+async function schedulerRefreshCardDetail(planId) {
+    const id = planId ? String(planId) : "";
+    if (!id) return;
+    const card = schedulerCardElement(id);
+    if (!card) return;
+    // Only a card the operator has open is worth keeping fresh.
+    if (card.dataset.expanded !== "true") return;
+    // Already on its way: one card, one request.
+    if (_schedulerCardPending.has(id)) return;
+
+    _schedulerCardPending.add(id);
+    try {
+        const payload = await api(`/scheduler/plan/${encodeURIComponent(id)}/detail`);
+        _schedulerCardDetails.set(id, {payload: payload, at: Date.now()});
+        _schedulerCardErrors.delete(id);
+        // The panel redraws its cards between the question and the
+        // answer, so the card is looked up **again**: the answer goes
+        // to the card that is on the page now.
+        const current = schedulerCardElement(id);
+        const currentDetail = current ? current.querySelector(".scheduler-plan-detail") : null;
+        if (!currentDetail) return;
+        const html = schedulerCardDetailHtml(payload);
+        // Nothing changed: the card is left exactly as it is.
+        if (currentDetail.innerHTML === html) return;
+        currentDetail.innerHTML = html;
+    } catch (err) {
+        const message = err && err.message ? err.message : String(err || "");
+        _schedulerCardErrors.set(id, {message: message, at: Date.now()});
+        // A card that still holds an answer keeps it: a refresh that
+        // failed learned nothing, and what the card shows is still the
+        // best answer there is.
+        if (_schedulerCardDetails.has(id)) return;
         const current = schedulerCardElement(id);
         const currentDetail = current ? current.querySelector(".scheduler-plan-detail") : null;
         if (currentDetail) currentDetail.innerHTML = schedulerCardErrorHtml(message);
@@ -2576,11 +3028,17 @@ async function toggleSchedulerCard(planId) {
     open cards are re-opened after the repaint, and the detail they
     already have is put back **without asking for it again**.
 
+    The repaint does not go through the toggle: the toggle is the
+    operator's, and going through it would fold the card and open it
+    again every five seconds.  Here the card is simply put back the
+    way the operator left it.
+
     What they have may be stale, though: an open card is a window on
     what the plan is doing now, and a window that shows the past is a
-    picture.  So a card whose detail has grown old is asked again —
-    the entry is dropped first, and the toggle does what it does for a
-    card that was never opened. */
+    picture.  So a card whose detail has grown old is **refreshed** —
+    in the background, with the answer the card already has left on
+    the screen until the new one arrives.  The cached answer is not
+    dropped: dropping it is what made the card go blank. */
 function schedulerRestoreOpenCards() {
     for (const planId of Array.from(_schedulerOpenCards)) {
         const card = schedulerCardElement(planId);
@@ -2591,27 +3049,24 @@ function schedulerRestoreOpenCards() {
             _schedulerOpenCards.delete(planId);
             continue;
         }
-        // The answer is on its way: the card is opened, and what it
-        // shows is written into it when the answer arrives.
-        if (_schedulerCardPending.has(planId)) {
-            card.dataset.expanded = "true";
-            continue;
-        }
-        if (schedulerCardDetailStale(planId)) {
-            _schedulerCardDetails.delete(planId);
-            _schedulerCardErrors.delete(planId);
-            toggleSchedulerCard(planId);
-            continue;
-        }
+        // The card stays open.  The repaint must not close it under
+        // the operator's eyes.
         card.dataset.expanded = "true";
         const detail = card.querySelector(".scheduler-plan-detail");
-        if (!detail) continue;
-        const cached = _schedulerCardDetails.get(planId);
-        if (cached) {
-            detail.innerHTML = schedulerCardDetailHtml(cached.payload);
-        } else {
-            const failed = _schedulerCardErrors.get(planId);
-            if (failed) detail.innerHTML = schedulerCardErrorHtml(failed.message);
+        if (detail) {
+            const cached = _schedulerCardDetails.get(planId);
+            if (cached) {
+                detail.innerHTML = schedulerCardDetailHtml(cached.payload);
+            } else {
+                const failed = _schedulerCardErrors.get(planId);
+                if (failed) detail.innerHTML = schedulerCardErrorHtml(failed.message);
+            }
+        }
+        // What the card shows has grown old: the new answer is asked
+        // for in the background.  The card keeps what it has until the
+        // new answer is here — it never goes blank.
+        if (schedulerCardDetailStale(planId)) {
+            loadInBackground(() => schedulerRefreshCardDetail(planId), "card detail refresh");
         }
     }
 }
@@ -2622,51 +3077,52 @@ function schedulerRestoreOpenCards() {
 
     The queue is drawn as **cards**, one per waiting plan, and every
     card starts folded: a plan's progress lines are asked for when the
-    operator opens its card, not on every poll. */
+    operator opens its card, not on every poll.
+
+    The cards are **synced**, not drawn again: a plan that is still
+    waiting keeps the card it has, so the fold the operator opened and
+    the answer they are reading survive the poll. */
 function renderSchedulerQueue(snapshot) {
     const rows = snapshot && Array.isArray(snapshot.queue) ? snapshot.queue : [];
     const body = $("#scheduler-queue-cards");
     if (!body) return;
 
-    if (!rows.length) {
-        body.innerHTML = "";
-        schedulerToggle($("#scheduler-queue-empty"), true);
-        return;
-    }
+    const cards = rows.map((row) => {
+        const item = row || {};
+        const planId = item.plan_id ? String(item.plan_id) : "";
+        return {
+            ...item,
+            facts: [
+                {name: "position", label: "位置", value: item.position},
+                {name: "seq", label: "序号", value: item.seq},
+                {name: "priority", label: "优先级", value: item.priority},
+                // A plan that was never promoted reads as 「—」:
+                // there is nothing here, not "not filled in yet".
+                {
+                    name: "promote_order",
+                    label: "提升",
+                    value:
+                        item.promote_order === null ||
+                        item.promote_order === undefined
+                            ? "—"
+                            : item.promote_order,
+                },
+                {
+                    name: "reason",
+                    label: "原因",
+                    value: schedulerReasonText(item.reason),
+                },
+            ],
+            actions_html: schedulerActionButtons(planId, ["promote", "start"]),
+        };
+    });
 
-    body.innerHTML = rows
-        .map((row) => {
-            const item = row || {};
-            const planId = item.plan_id ? String(item.plan_id) : "";
-            return schedulerCard({
-                ...item,
-                facts: [
-                    {name: "position", label: "位置", value: item.position},
-                    {name: "seq", label: "序号", value: item.seq},
-                    {name: "priority", label: "优先级", value: item.priority},
-                    // A plan that was never promoted reads as 「—」:
-                    // there is nothing here, not "not filled in yet".
-                    {
-                        name: "promote_order",
-                        label: "提升",
-                        value:
-                            item.promote_order === null ||
-                            item.promote_order === undefined
-                                ? "—"
-                                : item.promote_order,
-                    },
-                    {
-                        name: "reason",
-                        label: "原因",
-                        value: schedulerReasonText(item.reason),
-                    },
-                ],
-                actions_html: schedulerActionButtons(planId, ["promote", "start"]),
-            });
-        })
-        .join("");
+    // The cards are **synced**, not drawn again: a plan that is still
+    // waiting keeps the card it has, and only what changed is written
+    // into it.
+    schedulerSyncCards("#scheduler-queue-cards", cards);
 
-    schedulerToggle($("#scheduler-queue-empty"), false);
+    schedulerToggle($("#scheduler-queue-empty"), rows.length === 0);
 }
 
 /** How long a plan has been running, in the words an operator reads.
@@ -2704,57 +3160,58 @@ function schedulerDurationText(seconds) {
 
     The running plans are drawn as **cards**, one per plan, and every
     card starts folded: a plan's progress lines are asked for when the
-    operator opens its card, not on every poll. */
+    operator opens its card, not on every poll.
+
+    The cards are **synced**, not drawn again: a plan that is still
+    running keeps the card it has, so the fold the operator opened and
+    the answer they are reading survive the poll. */
 function renderSchedulerRunning(snapshot) {
     const rows = snapshot && Array.isArray(snapshot.running) ? snapshot.running : [];
     const body = $("#scheduler-running-cards");
     if (!body) return;
 
-    if (!rows.length) {
-        body.innerHTML = "";
-        schedulerToggle($("#scheduler-running-empty"), true);
-        return;
-    }
+    const cards = rows.map((row) => {
+        const item = row || {};
+        const planId = item.plan_id ? String(item.plan_id) : "";
+        return {
+            ...item,
+            facts: [
+                // The plan's own clock, and the slot clock it falls
+                // back to for a listing that carries no plan clock.
+                {
+                    name: "running_sec",
+                    label: "已运行",
+                    value: schedulerDurationText(
+                        item.running_sec ?? item.elapsed_sec
+                    ),
+                },
+                // The backend's own flag: the eviction rule is
+                // measured against the slot clock, and the panel does
+                // not recompute it.
+                {
+                    name: "evictable",
+                    label: "可驱逐",
+                    value: item.evictable ? "是" : "否",
+                },
+                {
+                    name: "workspace",
+                    label: "工作区",
+                    value:
+                        item.workspace === null || item.workspace === undefined
+                            ? "—"
+                            : item.workspace,
+                },
+            ],
+            actions_html: schedulerActionButtons(planId, ["pause"]),
+        };
+    });
 
-    body.innerHTML = rows
-        .map((row) => {
-            const item = row || {};
-            const planId = item.plan_id ? String(item.plan_id) : "";
-            return schedulerCard({
-                ...item,
-                facts: [
-                    // The plan's own clock, and the slot clock it falls
-                    // back to for a listing that carries no plan clock.
-                    {
-                        name: "running_sec",
-                        label: "已运行",
-                        value: schedulerDurationText(
-                            item.running_sec ?? item.elapsed_sec
-                        ),
-                    },
-                    // The backend's own flag: the eviction rule is
-                    // measured against the slot clock, and the panel does
-                    // not recompute it.
-                    {
-                        name: "evictable",
-                        label: "可驱逐",
-                        value: item.evictable ? "是" : "否",
-                    },
-                    {
-                        name: "workspace",
-                        label: "工作区",
-                        value:
-                            item.workspace === null || item.workspace === undefined
-                                ? "—"
-                                : item.workspace,
-                    },
-                ],
-                actions_html: schedulerActionButtons(planId, ["pause"]),
-            });
-        })
-        .join("");
+    // The cards are **synced**, not drawn again: a plan that is still
+    // running keeps the card it has, and only what changed is written
+    // into it.
+    schedulerSyncCards("#scheduler-running-cards", cards);
 
-    schedulerToggle($("#scheduler-running-empty"), false);
+    schedulerToggle($("#scheduler-running-empty"), rows.length === 0);
 }
 
 /** The phase a plan is in: the routing phase when the listing carries
