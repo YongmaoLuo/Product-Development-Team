@@ -16,9 +16,9 @@ parameterises across.  Concretely:
 
   2.  Every public write method on :class:`VerificationRepository``
       (``init_round``, ``complete_round``, ``append_verdict``,
-      ``mark_stopped``) is invoked once here and we assert each call
-      mutates the ``plan_verification`` row AND leaves the
-      ``plan_execution`` row byte-for-byte unchanged.
+      ``mark_stopped``, ``mark_parked``) is invoked once here and we
+      assert each call mutates the ``plan_verification`` row AND leaves
+      the ``plan_execution`` row byte-for-byte unchanged.
 """
 
 from __future__ import annotations
@@ -73,6 +73,7 @@ VERIFICATION_WRITE_METHODS = [
     ("complete_round", lambda repo: repo.complete_round("p1", {"passed": 2})),
     ("append_verdict", lambda repo: repo.append_verdict("p1", {"seq": 1})),
     ("mark_stopped", lambda repo: repo.mark_stopped("p1", "user_stopped")),
+    ("mark_parked", lambda repo: repo.mark_parked("p1")),
 ]
 
 

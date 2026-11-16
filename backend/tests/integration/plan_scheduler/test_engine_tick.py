@@ -542,8 +542,16 @@ def test_snapshot_is_the_read_model(db_factory, plan_factory) -> None:
         "over_capacity",
         "queue",
         "running",
+        "parked",
         "generated_at",
     }, "the snapshot has another shape: {0!r}".format(sorted(snapshot))
+
+    # 2026-11-15：读模型多了 parked 列表（停放等配额的计划，R4 要求面板能看出来）。
+    # 按本 gate 的既定流程把它纳入断言集合；形状仍按全等比较，多一个键或少一个键
+    # 都打红。
+    assert snapshot["parked"] == [], (
+        "nothing is parked, but the panel says {0!r}".format(snapshot["parked"])
+    )
 
     # 2026-10-30：快照的 capacity 增加了 source 字段（容量来自配置文件还是运行期
     # 覆盖），按本 gate 的既定流程把该字段纳入断言；形状仍按全等比较，多一个键或

@@ -115,6 +115,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
+#: The real ``getpgid``, bound once, at import time.
+#:
+#: The census reads the **host's** process table — it is evidence about
+#: processes that have nothing to do with the process running the test
+#: suite.  A test double that patches ``os.getpgid`` (anywhere in the
+#: process: ``os`` is one module, so patching it through one importer
+#: patches it through all of them) is rewriting the census's answer
+#: instead of the caller's.  The census therefore keeps its own
+#: reference to the system call, and a test double inside the process
+#: cannot reach it.  This is the same standing the module has always
+#: had: the audit records what really happened, never what a
+#: substitute said.
+_getpgid = os.getpgid
+
 #: The environment variable that says where the audit records go.
 KILL_AUDIT_DIR_ENV = "PDT_KILL_AUDIT_DIR"
 
@@ -501,7 +515,11 @@ def _census_psutil(pgid: int) -> Optional[List[dict]]:
             # invents a member.
             continue
         try:
-            row_pgid = os.getpgid(pid)
+            # ``_getpgid`` is the system call bound at import time, not
+            # ``os.getpgid`` read through the module: the census reads
+            # the host's process table, and a test double inside this
+            # process must not be able to rewrite that answer.
+            row_pgid = _getpgid(pid)
         except OSError:
             # The process is gone between the two reads; it is not a
             # member of anything any more.

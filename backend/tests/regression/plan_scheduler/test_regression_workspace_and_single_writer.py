@@ -933,8 +933,13 @@ def test_regression_workspace_block_is_reported(tmp_path, monkeypatch):
         "over_capacity",
         "queue",
         "running",
+        "parked",
         "generated_at",
     }, body
+    # 2026-11-15: 读模型多了 parked 列表（停放等配额的计划，R4 要求面板能看
+    # 出来）。按本 gate 的既定流程把它纳入断言集合；形状仍按全等比较，多一个
+    # 键或少一个键都打红。
+    assert body["parked"] == [], body
     assert body["queue_length"] == 1, body
     assert [str(row["reason"]) for row in body["queue"]] == [
         "workspace_busy"

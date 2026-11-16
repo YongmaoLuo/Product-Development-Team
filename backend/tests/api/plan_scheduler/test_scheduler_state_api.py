@@ -12,7 +12,7 @@ with a 404 (``{"detail": "Not found"}``) instead of the snapshot.
    the guard header is refused by the middleware before it reaches a
    handler, so a 403 here would mean the route sits outside the
    guarded surface; a 404 would mean the catch-all swallowed it.
-2. **The key set is closed.**  The document has exactly six keys.  A
+2. **The key set is closed.**  The document has exactly seven keys.  A
    field that appears without being declared is a field the panel
    cannot render and the LUI cannot rely on.
 3. **The queue is in the production order.**  The rows come back
@@ -112,13 +112,14 @@ STATE_PATH = "/api/scheduler/state"
 #: is a route that was registered too late.
 CATCH_ALL_PATH = "/{path:path}"
 
-#: The six keys the read model carries — and no others.
+#: The seven keys the read model carries — and no others.
 EXPECTED_KEYS = {
     "capacity",
     "queue_length",
     "over_capacity",
     "queue",
     "running",
+    "parked",
     "generated_at",
 }
 
@@ -231,7 +232,7 @@ def test_state_returns_200_not_catchall(install_engine):
 
 
 def test_state_key_set_closed(install_engine):
-    """The document has exactly six keys.
+    """The document has exactly seven keys.
 
     A field that appears without being declared is a field the panel
     cannot render and the LUI cannot rely on, so the set is asserted
@@ -394,7 +395,7 @@ def test_state_broken_engine_answers_empty_not_500(monkeypatch):
 def test_state_non_document_snapshot_answers_empty_not_500(monkeypatch):
     """An engine that answers with something that is not a document.
 
-    The read model is a document with six keys, and the panel reads
+    The read model is a document with seven keys, and the panel reads
     those keys by name.  An engine that hands back something else —
     ``None`` today, a list tomorrow — has not answered the question,
     and a document that is not the read model would leave the panel

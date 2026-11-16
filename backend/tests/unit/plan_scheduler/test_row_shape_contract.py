@@ -38,9 +38,15 @@ The assertions are exact equality, never ``issubset``: a subset
 assertion would still pass when a field was added, and adding a field
 is precisely the thing that has to be a decision.
 
-The document's own six keys are asserted too, and they are asserted as
-**six** — a sub-phase is a field on a *row*, and it did not turn the
-document into a seventh-key document.
+The document's own keys are asserted too, and they are asserted as
+**seven** — a sub-phase is a field on a *row*, and it did not turn the
+document into a seventh-key document.  The seventh key is ``parked``:
+the plans stopped for want of provider capacity, which hold no slot
+and are in no line, so neither the queue nor the running line can
+ever name them.  It was added beside the other six and not instead of
+one of them — the six keep their names, their types and their
+meanings, so a reader written against them is still reading a
+document it was written for.
 """
 
 from __future__ import annotations
@@ -93,14 +99,20 @@ RUNNING_ROW_KEYS = {
 
 #: The keys the **document** carries — and no others.
 #:
-#: Six, and still six: the phase is a field on a row, and it did not
-#: turn the document into a seventh-key document.
+#: Seven.  The phase was a field on a *row* and did not turn the
+#: document into a seventh-key document; the seventh key is
+#: ``parked`` — the plans stopped for want of provider capacity, which
+#: hold no slot and are in no line, so neither of the two lists above
+#: can ever name them.  It was added beside the other six and not
+#: instead of one of them: the six keep their names, their types and
+#: their meanings.
 TOP_LEVEL_KEYS = {
     "capacity",
     "queue_length",
     "over_capacity",
     "queue",
     "running",
+    "parked",
     "generated_at",
 }
 
@@ -197,13 +209,14 @@ def test_running_row_keys_include_phase() -> None:
 
 
 def test_top_level_keys_unchanged() -> None:
-    """The document still carries exactly its six keys.
+    """The document carries exactly its seven keys.
 
     The phase was added to the **rows**, and the document is not a row:
-    a reader that finds a seventh key at the top level is reading a
+    a reader that finds an eighth key at the top level is reading a
     document whose shape has moved, and every reader that was written
-    against the six keys is now reading a document it was not written
-    for.
+    against these keys is now reading a document it was not written
+    for.  The seventh key, ``parked``, was written down here so that
+    the next person to touch the whitelist knows it is deliberate.
     """
     result = build(_state([_queue_row("p1", 1)], [_running_row("r1", 400.0)]))
 

@@ -157,12 +157,22 @@ def _resolve_start_round(
     * a ``kind="verification"`` checkpoint — the operator pressed stop,
       and the stop wrote the round, the verdicts and the VPs it cut
       short (``_write_verification_checkpoint``);
-    * a ``plan_verification`` row whose status is still ``running`` or
-      ``loop_stopped`` with a round > 0 — the process was killed before
-      it could write anything, so the row is all that is left.
+    * a ``plan_verification`` row whose status is still ``running``,
+      ``loop_stopped`` or ``waiting_for_quota`` with a round > 0 — the
+      process was killed before it could write anything, or the round
+      was parked because every provider ran out of capacity, so the row
+      is all that is left.
 
     Either one is enough. When neither is there the plan's last round
     really did finish, and the next round is the next one.
+
+    2026-11-15: ``waiting_for_quota`` joined the interrupted states. A
+    round parked for capacity is not a finished round: it keeps its
+    number and the verdicts it had already collected, and the start
+    that follows the park has to pick THAT round back up. Answering
+    ``round + 1`` for it would relabel half-done work under a round
+    that never ran — the same mislabelling the other two interrupted
+    states are protected from.
 
     Returns ``(next_round, resumed)``.
     """
@@ -172,7 +182,8 @@ def _resolve_start_round(
     checkpoint_round = int((checkpoint or {}).get("verification_round") or 0)
 
     interrupted = checkpoint is not None or (
-        status in ("running", "loop_stopped") and current_round > 0
+        status in ("running", "loop_stopped", "waiting_for_quota")
+        and current_round > 0
     )
     if not interrupted:
         return current_round + 1, False
@@ -1273,6 +1284,16 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
 
     try:
         current = verification.current(plan_id)
+        # 2026-11-15: the plan's own routing phase decides whether the
+        # parked source phase joins the CAS's source set below.  The CAS
+        # compares the **routing** phase, so this read is the very fact
+        # the CAS will compare against — and ``ensure_row()`` above has
+        # already made sure the row exists, so the read answers a
+        # phase or answers nothing at all.
+        _routing_row = routing.current(plan_id) or {}
+        _quota_parked = (
+            _routing_row.get("current_phase") == "waiting_for_quota"
+        )
         # 2026-10-20: an interrupted round is RESUMED, not replaced.
         # ``_resolve_start_round`` answers "is there a round to pick up?"
         # from the two traces that survive an interruption — the
@@ -1367,6 +1388,23 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
                 # instead of being refused with 409 stage_mismatch.
                 "verification_repairing",
             )
+            # 2026-11-15: a plan parked for quota — every provider ran
+            # out of capacity — is waiting for the window to reopen, and
+            # the round it parked on is still the round it is on (the
+            # row keeps its number and its verdicts).  Without this
+            # entry the start was refused with ``409 stage_mismatch``
+            # before the round resolution was ever reached, so the
+            # parked round could never be resumed no matter what
+            # ``_resolve_start_round`` answered.
+            #
+            # The entry is **conditional**, and the shape is deliberately
+            # the same as the ``_recovered`` / ``_review_ready`` entries
+            # below: the source phase joins the set only when the plan
+            # is actually parked on it.  The development branch's source
+            # set therefore stays item-for-item identical for every
+            # plan that is not parked — the frozen tuple is not
+            # widened, only a plan that needs it gets one more item.
+            + (("waiting_for_quota",) if _quota_parked else ())
             # 2026-10-20: a recovered plan is still parked at
             # ``verification_running`` — the process died before it
             # could move the routing row. Its own recovered in-memory

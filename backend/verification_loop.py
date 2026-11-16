@@ -71,6 +71,13 @@ import server as _server
 # ``plan_state`` imports nothing from ``server`` / this module, so a
 # top-level import carries no cycle risk.
 import plan_state
+# 2026-11-15: the reader that knows which plans are parked for quota.
+# The DECISION ("does this row say the plan is parked?") lives in
+# ``quota_resume`` so that the heartbeat's sweep, the scheduler's facts
+# and this module's death latch cannot drift apart on what "parked"
+# means.  The module is stdlib-only with no import-time side effects,
+# so a top-level import carries no cycle risk.
+import quota_resume
 # 2026-10-22: the type a cancelled round raises. Dependency-free (stdlib
 # only), so a top-level import carries no cycle risk — and the auto-loop
 # has to be able to name it in an ``except`` clause, which a lazy
@@ -3278,6 +3285,63 @@ def _execution_log_evidence_ts(
     return evidence
 
 
+def _plan_parked_for_quota(plan_id: str) -> bool:
+    """Is this plan parked because of quota?
+
+    A parked plan is WAITING, not dead.  On 2026-11-15 a repair
+    execution that ran out of capacity was parked under
+    ``waiting_for_quota``, and twenty-one seconds later the verification
+    watchdog wrote ``verification_thread_died_unexpectedly`` onto the
+    plan.  The reason was structural: the death latch asked whether an
+    execution was IN FLIGHT for this plan, and a parked execution is not
+    in flight — its status is not ``running`` and it has no process — so
+    the hand-off branch was skipped and the ended thread was read as a
+    death.  A park is not a failure (arch decision R1), and the latch
+    has to be able to tell the two apart.
+
+    So the latch asks THIS question, and it asks it of the two places
+    the park is written down:
+
+    * the executor's own in-memory record (``_execution_state``), which
+      says ``waiting_for_quota`` from the moment the park happens;
+    * the durable ``plan_execution`` row, which says the same thing
+      after a restart, read through the shared reader
+      (:func:`quota_resume.plan_parked`) that owns the decision of what
+      a parked row is.
+
+    Either answer is enough.  The in-memory one is asked first because
+    it is free, and the durable one is asked second because it is the
+    truth — a plan parked before the process restarted has no in-memory
+    record at all, and a plan parked in this process may not have
+    reached the database yet.
+
+    Args:
+        plan_id: the plan to ask about.
+
+    Returns:
+        Whether the plan is parked because of quota.
+
+    Raises:
+        Whatever the durable read raises.  That decision is the
+        caller's: the death latch treats an unreadable park as "not
+        parked", because a doubt must never become a licence to leave a
+        dead round running.
+    """
+    record = _server._execution_state.get(plan_id)
+    if isinstance(record, dict):
+        status = str(record.get("status") or "").strip().lower()
+        if status == QUOTA_WAIT_PHASE:
+            return True
+
+    from state_machine.db.connection import open as open_db
+
+    conn = open_db(_server._state_db_path())
+    try:
+        return bool(quota_resume.plan_parked(conn, plan_id))
+    finally:
+        conn.close()
+
+
 def _lazy_check_verification(plan_id: str) -> None:
     """Probe a single running verification by inspecting its background thread
     AND the freshness of its log / results files.
@@ -3358,6 +3422,16 @@ def _lazy_check_verification(plan_id: str) -> None:
     terminal write names no round: the watchdog is the thing that
     DECLARES the death, so the mark it has just written must not
     refuse its own verdict.
+
+    2026-11-15: and a park is not a death either.  The thread-death
+    branch asks two questions before it declares a round dead — "is a
+    repair execution still in flight?" (the hand-off) and "is this plan
+    parked for quota?" — and a plan that is WAITING for capacity answers
+    the second one.  It has to: a parked execution is not in flight, so
+    without the second question a parked plan fell through the hand-off
+    branch and was written off (2026-11-15 09:12, a plan parked at
+    09:12 and dead 21 seconds later).  The staleness rungs and the
+    death sequence are unchanged.
     """
     now = _hitl_now()
     _expire_hitl_decisions(now)
@@ -3468,6 +3542,40 @@ def _lazy_check_verification(plan_id: str) -> None:
                 # Not a death: no stop_reason, no death sequence, no
                 # lease release, no phase change.  The plan stays as it
                 # is and the repair round keeps running.
+                return
+            # 2026-11-15: a quota park is not a death either.  The
+            # hand-off above asks whether an execution is IN FLIGHT, and
+            # a parked execution is not in flight — its status is not
+            # ``running`` and it has no process.  So a plan parked for
+            # capacity fell through that branch and was written off
+            # (2026-11-15 09:12: a plan parked at 09:12 was written off
+            # 21 seconds later).  The latch asks the park question here
+            # instead, where a park is a park.
+            #
+            # A park that cannot be read is treated as "not a park" —
+            # the conservative direction, the same one the hand-off
+            # takes above: a real park we failed to see is judged dead
+            # (the plan stops, loudly), and a real death is never
+            # mistaken for a park (which would leave a dead round
+            # holding the plan for ever, silently).
+            try:
+                _parked = _plan_parked_for_quota(plan_id)
+            except Exception:
+                _parked = False
+                _server.logger.exception(
+                    "[verification_watchdog] the quota park could not be "
+                    "read — treating the thread end as a death plan=%s",
+                    plan_id,
+                )
+            if _parked:
+                _server.logger.info(
+                    "[verification_watchdog] thread ended onto a quota park "
+                    "- not a death plan=%s", plan_id,
+                )
+                # Not a death either: the plan is waiting for capacity,
+                # and the round resumes when the window reopens.  No
+                # stop_reason, no death sequence, no lease release, no
+                # phase change.
                 return
             stop_reason = "verification_thread_died_unexpectedly"
             _server.logger.warning(
@@ -4852,6 +4960,16 @@ def _run_repair_execution_async(
                         state["status"] = QUOTA_WAIT_PHASE
                         state["stop_reason"] = QUOTA_WAIT_PHASE
                         state["repair_unfinished_tasks"] = _left
+                        # 2026-11-15 (arch decision R1 — 停放态原样保留):
+                        # the EXECUTION side is parked above; the
+                        # VERIFICATION side is parked here.  Without it
+                        # the ``plan_verification`` row keeps saying
+                        # ``running`` and no snapshot is written, so the
+                        # round this plan stopped at is unknowable and
+                        # the resume has no round to pick up.
+                        _park_verification_round_for_quota(
+                            plan_id, int(state.get("round") or 0),
+                        )
                         _server.logger.warning(
                             "[repair_async] executor exited 0 with %d repair "
                             "task(s) still pending because every provider ran out "
@@ -5924,6 +6042,182 @@ def _repair_parked_for_quota(tasks_file: Path) -> bool:
         return _quota_wait_detail(tasks_file) is not None
     except Exception:  # noqa: BLE001 — an unreadable plan is not a marker
         return False
+
+
+def _park_verification_round_for_quota(plan_id: str, round_n: int) -> None:
+    """Park the verification round that ran out of provider quota.
+
+    2026-11-15 (arch decision R1 — 停放态原样保留): the repair path
+    parks the EXECUTION side of a quota-starved round — the repair
+    async exit writes ``state["status"] = QUOTA_WAIT_PHASE`` and the
+    plan's phase moves to ``waiting_for_quota``.  The VERIFICATION side
+    was left saying nothing: the ``plan_verification`` row kept
+    ``running`` and the side-channel snapshot was never written, so two
+    things were unknowable — *which* round the plan stopped at, and
+    *that* it had stopped at all.  The resume had no round to pick up
+    and the operator had no status to read.
+
+    This writes that side:
+
+      * ``plan_verification.verification_status`` becomes
+        ``waiting_for_quota`` and ``verification_stop_reason`` records
+        why the round parked (via the repository's non-terminal
+        ``mark_parked`` — parking is not a verdict, so no ``plan_closed``
+        is published);
+      * the round number is left AS IT IS — the round resumes in place
+        under the same number, and its verdicts and results are not
+        touched;
+      * the side-channel snapshot ``plans/{id}/.verification_runtime.json``
+        carries the same status, in the SAME file and under the SAME
+        field names the death mark already writes (:func:
+        `_mark_verification_failed_dead`) — the park does not invent a
+        second format;
+      * the in-memory verification state is parked too, so ``/status``
+        stops reporting a live round that is not running.
+
+    The round number: the plan's own row is the authority on which
+    round the plan is on, so the snapshot mirrors the row.  The caller
+    (``round_n``) is the fallback for a row that could not be read, and
+    ``0`` means "nobody said" — a round is never invented out of a
+    number nobody handed over.
+
+    Idempotent: a round that is already parked is not written a second
+    time.  The park can be reached from more than one place (the repair
+    exit and the auto-loop's own park), and the second arrival has to
+    change nothing.
+
+    Best-effort throughout: this runs on the repair path's exit, in the
+    middle of the repair bookkeeping.  A database that cannot be written
+    is logged and stepped over — never raised into the exit, which would
+    turn "the providers ran dry" into "the repair crashed".
+    """
+    try:
+        caller_round = int(round_n)
+    except (TypeError, ValueError):
+        caller_round = 0
+    if caller_round < 0:
+        caller_round = 0
+
+    # --- 1. the plan's own row -------------------------------------------
+    # The row is read as well as written: it says which round the plan
+    # is on (the snapshot has to mirror it), and it says whether the
+    # round is ALREADY parked (in which case it is not written again).
+    row_round: Optional[int] = None
+    row_parked = False
+    try:
+        from state_machine.db.connection import open as open_db
+        from state_machine.db.schema import migrate
+        from state_machine.repositories.verification_repository import (
+            VerificationRepository,
+        )
+
+        conn = open_db(_server._state_db_path())
+        try:
+            migrate(conn)
+            repo = VerificationRepository(conn)
+            row = repo.current(plan_id)
+            if row is not None:
+                row_parked = row.get("verification_status") == QUOTA_WAIT_PHASE
+                if isinstance(row.get("round"), int):
+                    row_round = row["round"]
+            if not row_parked:
+                repo.mark_parked(plan_id, reason=QUOTA_WAIT_PHASE)
+        finally:
+            conn.close()
+    except Exception:
+        _server.logger.exception(
+            "[verification_park] the verification row could not be parked "
+            "plan=%s round=%s",
+            plan_id, caller_round,
+        )
+
+    # The round the plan is on: the row first (it is the authority and
+    # it is left untouched by the park), the caller second, and 0 for
+    # "nobody said" — never a number invented out of thin air.
+    effective_round = row_round if row_round is not None else caller_round
+
+    # --- 2. the in-memory state and the side-channel snapshot -------------
+    now = datetime.now().isoformat()
+    lock = _server._verification_locks.setdefault(plan_id, threading.Lock())
+    with lock:
+        state = _server._verification_state.get(plan_id)
+        if isinstance(state, dict):
+            state["verification_status"] = QUOTA_WAIT_PHASE
+            state["stop_reason"] = QUOTA_WAIT_PHASE
+            # A parked round is NOT over: it has work left and it resumes
+            # under the same number.  No end time, no verdict.
+            state["ended_at"] = None
+            state["updated_at"] = now
+            if effective_round > 0:
+                state["verification_round"] = effective_round
+        # The snapshot is taken here so the parked values below cannot be
+        # lost if the write below raises.
+        snapshot = dict(state) if isinstance(state, dict) else {}
+
+    snapshot["verification_status"] = QUOTA_WAIT_PHASE
+    snapshot["stop_reason"] = QUOTA_WAIT_PHASE
+    snapshot["ended_at"] = None
+    snapshot["updated_at"] = now
+    if effective_round > 0:
+        snapshot["verification_round"] = effective_round
+    else:
+        snapshot.setdefault("verification_round", 0)
+
+    # The side-channel snapshot is the death mark's file, under the same
+    # field names — a restarted server reads it to learn what the round
+    # did, and a park that leaves no snapshot behind is a park nobody
+    # can see.
+    try:
+        plan_dir = _server._plan_dir(plan_id)
+    except Exception:
+        plan_dir = None
+    if plan_dir is not None and plan_dir.exists():
+        runtime_path = plan_dir / ".verification_runtime.json"
+        if not _runtime_snapshot_already_parked(runtime_path, effective_round):
+            try:
+                runtime_path.write_text(
+                    json.dumps(snapshot, default=str),
+                    encoding="utf-8",
+                )
+            except Exception:
+                _server.logger.exception(
+                    "[verification_park] the runtime snapshot could not be "
+                    "written plan=%s round=%s",
+                    plan_id, caller_round,
+                )
+
+    _server.logger.info(
+        "[verification_park] the verification round is parked plan=%s "
+        "round=%s status=%s",
+        plan_id, caller_round, QUOTA_WAIT_PHASE,
+    )
+
+
+def _runtime_snapshot_already_parked(
+    runtime_path: Path, round_n: int,
+) -> bool:
+    """Does the side-channel snapshot already carry this park?
+
+    The park can be reached twice (the repair exit and the auto-loop's
+    own park), and the second arrival has to write nothing again.  A
+    snapshot that already says "parked" for the same round is left
+    exactly as it is; one that says something else — an older round, or
+    a verdict — is stale and gets rewritten.
+    """
+    try:
+        if not runtime_path.exists():
+            return False
+        existing = json.loads(runtime_path.read_text(encoding="utf-8"))
+    except Exception:
+        # An unreadable snapshot is not "already parked" — the park
+        # writes what it has to write.
+        return False
+    if not isinstance(existing, dict):
+        return False
+    return (
+        existing.get("verification_status") == QUOTA_WAIT_PHASE
+        and existing.get("verification_round") == round_n
+    )
 
 
 def _bump_repair_not_drained_guard(plan_id: str) -> int:

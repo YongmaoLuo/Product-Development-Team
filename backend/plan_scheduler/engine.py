@@ -2226,6 +2226,10 @@ class PlanSchedulerEngine:
         The capacity comes with the word that says where it came from,
         so the read model may show the operator that the number in
         force is an override and not the configured capacity.
+
+        The parked plans are in the state too: a plan parked for quota
+        holds no slot and is in no line, so the read model would not
+        see it at all without them.
         """
         now = self._now()
         waiting = [
@@ -2264,9 +2268,48 @@ class PlanSchedulerEngine:
             "running": self._running_view(
                 self._store.list_slots(self._conn), now
             ),
+            # The plans parked for quota — the facts' answer.  A parked
+            # plan holds no slot and is in no line, so without this the
+            # read model could not see the one plan that stopped for
+            # want of provider capacity.
+            "parked": self._parked_plans(),
         }
         self._rebuild_line(state)
         return state
+
+    def _parked_plans(self) -> List[Dict[str, Any]]:
+        """Return the plans parked for quota, or none when the facts cannot say.
+
+        The parked set is a fact the tick does not need to admit
+        anybody: a parked plan holds no slot and is in no line.  So a
+        facts reader that cannot answer the question — one that does
+        not know how to read the parked set at all, or one whose read
+        failed — costs the tick nothing.  The answer degrades to
+        "nothing is parked", which is the safe direction: the parked
+        plans wait one tick longer and every other plan is admitted
+        as usual.
+
+        The reader is duck-typed on purpose: the engine asks the
+        facts what they know, and a fact the reader does not carry is
+        not a fact the engine may insist on.
+        """
+        reader = getattr(self._facts, "parked_plans", None)
+        if not callable(reader):
+            return []
+        try:
+            rows = reader()
+        except Exception as exc:  # noqa: BLE001 — the tick must survive
+            log.warning(
+                "[scheduler] the parked plans could not be read (%s: %s); "
+                "reporting none",
+                type(exc).__name__,
+                exc,
+            )
+            return []
+        try:
+            return list(rows or [])
+        except TypeError:
+            return []
 
     def _rebuild_line(self, state: Dict[str, Any]) -> None:
         """Rebuild the line from the queue table and the plan facts.

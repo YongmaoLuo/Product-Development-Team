@@ -17,6 +17,13 @@ logger = logging.getLogger(__name__)
 # end — no further transition is expected.
 _TERMINAL_VERIFICATION_STATUSES = frozenset({"passed", "failed", "loop_stopped"})
 
+# 2026-11-15: the status a PARKED verification round carries — the round
+# stopped because the providers ran out of quota, but it still has work
+# left and it resumes under the same round number.  It is deliberately
+# NOT one of ``_TERMINAL_VERIFICATION_STATUSES``: parking is not a
+# verdict (arch decision R1 — 停放不等于失败).
+_PARKED_VERIFICATION_STATUS = "waiting_for_quota"
+
 _COLUMNS = (
     "plan_id",
     "verification_status",
@@ -473,6 +480,66 @@ class VerificationRepository:
         # the row matches the expected end-state; if it doesn't, raise
         # loudly instead of letting the silent drift reach the dashboard.
         self._assert_terminal_state_consistent(plan_id, expected_status=status)
+
+    def mark_parked(
+        self, plan_id: str, reason: str = _PARKED_VERIFICATION_STATUS,
+    ) -> None:
+        """Park the verification cycle — the round is NOT over.
+
+        2026-11-15 (arch decision R1 — 停放不等于失败): a verification
+        round that has to stop because every provider ran out of quota
+        must not be written as ``failed``.  ``failed`` says the round
+        ended for good, and the plan's verification lifecycle with it.
+        The round in fact still has work left, and it resumes under the
+        SAME round number once capacity comes back.
+
+        :meth:`mark_stopped` cannot express that pause: its status
+        vocabulary is closed over the terminal/running statuses
+        (``waiting_for_quota`` is a ``ValueError``) and it publishes
+        ``plan_closed`` — i.e. it treats a parked round as a closed
+        plan.  This method is the non-terminal write entry point:
+
+          * ``verification_status`` becomes ``waiting_for_quota``;
+          * ``verification_stop_reason`` records why the round parked;
+          * ``round`` / ``max_rounds`` / ``verdicts`` / ``results`` are
+            left untouched — the round resumes where it stopped;
+          * NO ``plan_closed`` is published — a parked plan is not a
+            closed one;
+          * a row that already reached a terminal status
+            (``passed`` / ``failed`` / ``loop_stopped``) is NOT
+            overwritten: the first ending wins, the attempt is only
+            logged.
+
+        Parking twice is idempotent — the second call writes the same
+        values.
+
+        Args:
+            plan_id: The plan whose verification round is parked.
+            reason: Why the round parked; defaults to
+                ``"waiting_for_quota"``.
+
+        Raises:
+            KeyError: when the plan has no verification row — the same
+                behaviour as :meth:`mark_stopped`.
+        """
+        row = self.current(plan_id)
+        if (
+            row is not None
+            and row.get("verification_status") in _TERMINAL_VERIFICATION_STATUSES
+        ):
+            logger.info(
+                "verification_park_refused plan=%s status=%s attempted_reason=%s",
+                plan_id,
+                row.get("verification_status"),
+                reason,
+            )
+            return
+
+        self._update(
+            plan_id,
+            verification_status=_PARKED_VERIFICATION_STATUS,
+            verification_stop_reason=reason,
+        )
 
     def _stop_reason_is_write_once(self, plan_id: str, reason: str) -> bool:
         """Is the stop reason of this round already fixed?
