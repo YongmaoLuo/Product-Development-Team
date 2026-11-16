@@ -172,7 +172,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from typing import Any, Dict, FrozenSet, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, FrozenSet, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -381,6 +382,100 @@ def get_scheduler_state(request: Request) -> Dict[str, Any]:
 _PLAN_NOT_FOUND_DETAIL = "plan not found"
 
 
+def _stamp_text(value: Any) -> str:
+    """The stamp ``value`` carries, as text — ``""`` when it carries none.
+
+    Only a string is a stamp: a number, a ``None`` and a boolean are
+    not times, and reading one as a time would produce a duration
+    nobody can explain.
+    """
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+
+def _parse_stamp(value: str) -> Optional[datetime]:
+    """The moment ``value`` names, in UTC — ``None`` when it names none.
+
+    A **naive** stamp is read as UTC, because that is what the producer
+    writes (``datetime.utcnow().isoformat()``): mixing it with a local
+    clock does not fail, it silently answers a wrong number — a run of
+    ten minutes reads as two hours on a UTC+8 machine, and an operator
+    reading that has every reason to conclude the plan is stuck.
+
+    A trailing ``Z`` is spelled out as an offset, so the answer is the
+    same on every interpreter this code runs on.
+    """
+    text = (value or "").strip()
+    if not text:
+        return None
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        moment = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment
+
+
+def _detail_running_sec(payload: Any) -> Optional[int]:
+    """How long the plan's run has been going, in seconds.
+
+    ``None`` when the run's age is unknown: "the run's age is unknown"
+    and "the run's age is zero" are different statements, and only the
+    first one is true when the run never started.
+
+    The stamps are read off the plan status' **execution** block, and
+    off the summary's own execution block when the first one carries
+    none — the status carries the run's stamps in two places, and the
+    one that has them wins.
+
+    A run that has not ended yet is measured against the current time.
+    A duration that comes out negative (a stamp from the future, or a
+    clock that moved backwards) is clamped to zero: a negative number
+    of seconds is not a fact about a run.
+    """
+    if not isinstance(payload, Mapping):
+        return None
+
+    blocks: List[Mapping] = []
+    execution = payload.get("execution")
+    if isinstance(execution, Mapping):
+        blocks.append(execution)
+    summary = payload.get("summary")
+    if isinstance(summary, Mapping):
+        nested = summary.get("execution")
+        if isinstance(nested, Mapping):
+            blocks.append(nested)
+
+    started_at = ""
+    ended_at = ""
+    for block in blocks:
+        if not started_at:
+            started_at = _stamp_text(block.get("started_at"))
+        if not ended_at:
+            ended_at = _stamp_text(block.get("ended_at"))
+
+    if not started_at:
+        return None
+
+    start = _parse_stamp(started_at)
+    if start is None:
+        return None
+
+    if ended_at:
+        end = _parse_stamp(ended_at)
+        if end is None:
+            return None
+    else:
+        end = datetime.now(timezone.utc)
+
+    seconds = int((end - start).total_seconds())
+    return seconds if seconds > 0 else 0
+
+
 @router.get("/api/scheduler/plan/{plan_id}/detail")
 def get_scheduler_plan_detail(plan_id: str) -> Any:
     """Answer with one plan's progress — the card's own wording.
@@ -431,11 +526,32 @@ def get_scheduler_plan_detail(plan_id: str) -> Any:
     payload = dict(status) if isinstance(status, Mapping) else {}
 
     phase = str(payload.get("current_phase") or payload.get("phase") or "")
+    phase_label = _phase_label_for(phase)
+    running_sec = _detail_running_sec(payload)
 
+    # The answer carries the card's facts in **both** shapes: the
+    # ``lines`` a renderer prints, and the ``sections`` a panel draws
+    # (a status header with a colour and an elapsed time, a phase
+    # banner, a progress bar, the running tasks).  Both are the card's
+    # own builders' output, so the panel and the card cannot disagree
+    # about the same plan.
+    #
+    # The phase's label is passed to the sections' builder **explicitly**
+    # (:func:`_phase_label_for`, the shared table's): the builder's own
+    # table spells some phases differently, and a response that carried
+    # one spelling at the top level and another in the status section
+    # would make the panel guess which one to draw.
+    #
+    # The route's docstring is the published HTTP contract's (the
+    # OpenAPI baseline freezes it), so the new keys are described here.
     return {
         "plan_id": plan_id,
         "phase": phase,
-        "phase_label": _phase_label_for(phase),
+        "phase_label": phase_label,
+        "running_sec": running_sec,
+        "sections": _cards.build_progress_sections(
+            payload, running_sec, phase_label,
+        ),
         "lines": _cards.build_progress_lines(payload)["lines"],
     }
 
