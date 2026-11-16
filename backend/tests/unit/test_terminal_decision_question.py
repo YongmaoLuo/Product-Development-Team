@@ -32,9 +32,11 @@ by the judge and rendered as a decision card:
   asked something, and what they are asked is the **same decision
   shape** — the failed points written out by hand instead of by a
   model — with the reason there is no analysis said on the card.
-* **The analysis never moves the default.**  The judge recommends; the
-  human decides.  The answer the question falls back to when nobody
-  replies does not change because a model had an opinion.
+* **The analysis moves the default.**  The judge recommends; the human
+  decides — and a round nobody answered follows the judgement the
+  agent was given, so the answer the question falls back to is the
+  judge's own recommendation.  A round with **no** analysis has no
+  recommendation to follow, and keeps the conservative constant.
 * **The question stays inside its cap.**  Twenty failed points with
   eight-hundred-character verdicts still render a question a person can
   read.
@@ -168,6 +170,8 @@ def test_question_carries_round_stop_reason_verdicts_and_count(orchestrator):
         "revise_criterion",
     ]
     assert payload["options"] == list(TERMINAL_OPTIONS)
+    # This round has **no** analysis, so there is no recommendation to
+    # follow and the default stays the conservative constant.
     assert payload["default_option"] == "rerun_this_round"
     assert payload["default_option"] == TERMINAL_DEFAULT_OPTION
 
@@ -292,8 +296,43 @@ def test_question_capped_at_600_with_twenty_points(analysis_orchestrator):
     assert len(payload["question"]) <= 600
 
 
-def test_recommendation_never_changes_default_option(analysis_orchestrator):
-    """The recommendation is written in the body; the default does not move."""
+def test_recommendation_decides_the_default_option(analysis_orchestrator):
+    """The judge's recommendation is the answer nobody gave.
+
+    The default is **not** a constant that ignores the analysis: the
+    judge read the failure scene and said what it means, so a round
+    nobody answered follows that judgement.  ``revise_criterion`` is
+    the recommendation that tells the two rules apart — the constant
+    it would otherwise fall back to is ``rerun_this_round``.
+    """
+    analysis_orchestrator._terminal_judge.result = {
+        **_ANALYSIS,
+        "recommendation": "revise_criterion",
+    }
+
+    payload = analysis_orchestrator._terminal_decision_question(
+        _report("VP-3"), 2, ["VP-3"], 0,
+    )
+
+    assert "revise_criterion" in payload["question"], (
+        "the recommendation is not on the card at all"
+    )
+    assert payload["default_option"] == "revise_criterion", (
+        "the default does not follow the recommendation: "
+        f"{payload['default_option']!r}"
+    )
+    assert payload["options"] == list(TERMINAL_OPTIONS)
+
+
+def test_recommendation_of_rerun_also_decides_the_default_option(
+    analysis_orchestrator,
+):
+    """The other recommendation is followed too.
+
+    The default is the recommendation, not "always the other one" — a
+    judge that recommends ``rerun_this_round`` gets that as the
+    fallback answer too.
+    """
     analysis_orchestrator._terminal_judge.result = {
         **_ANALYSIS,
         "recommendation": "rerun_this_round",
@@ -303,7 +342,86 @@ def test_recommendation_never_changes_default_option(analysis_orchestrator):
         _report("VP-3"), 2, ["VP-3"], 0,
     )
 
-    assert "rerun_this_round" in payload["question"]
-    assert payload["default_option"] == "rerun_this_round"
-    assert payload["default_option"] == TERMINAL_DEFAULT_OPTION
+    assert payload["default_option"] == "rerun_this_round", (
+        "the default does not follow the recommendation: "
+        f"{payload['default_option']!r}"
+    )
     assert payload["options"] == list(TERMINAL_OPTIONS)
+
+
+def test_the_constant_is_the_fallback_for_a_round_with_no_recommendation(
+    analysis_orchestrator,
+):
+    """The constant is a **fallback**, not the rule.
+
+    The same orchestrator, asked twice: the round the judge analysed
+    follows the recommendation; the round whose answer carried no
+    usable recommendation keeps the conservative constant.  Without
+    this contrast the two could not be told apart — a payload that
+    always carried the constant would pass a guard test on its own.
+    """
+    analysed = analysis_orchestrator._terminal_decision_question(
+        _report("VP-3"), 2, ["VP-3"], 0,
+    )
+    assert analysed["default_option"] == "revise_criterion", (
+        "the analysed round does not follow the recommendation: "
+        f"{analysed['default_option']!r}"
+    )
+
+    analysis_orchestrator._terminal_judge.result = {
+        "recommendation": "not_an_option",
+    }
+    refused = analysis_orchestrator._terminal_decision_question(
+        _report("VP-3"), 2, ["VP-3"], 0,
+    )
+    assert refused["default_option"] == TERMINAL_DEFAULT_OPTION, (
+        "the round with no recommendation did not keep the constant: "
+        f"{refused['default_option']!r}"
+    )
+
+
+def test_analysis_without_a_recommendation_leaves_the_default_alone(
+    analysis_orchestrator,
+):
+    """An analysis that carries no recommendation has none to follow.
+
+    An answer missing the field does not hold the contract, so the
+    round is the fallback card — and the default stays the
+    conservative constant.
+    """
+    without = dict(_ANALYSIS)
+    without.pop("recommendation")
+    analysis_orchestrator._terminal_judge.result = without
+
+    payload = analysis_orchestrator._terminal_decision_question(
+        _report("VP-3"), 2, ["VP-3"], 0,
+    )
+
+    assert payload["default_option"] == TERMINAL_DEFAULT_OPTION, (
+        "the default moved without a recommendation to move it: "
+        f"{payload['default_option']!r}"
+    )
+
+
+def test_recommendation_outside_the_options_leaves_the_default_alone(
+    analysis_orchestrator,
+):
+    """A recommendation outside the options is not a recommendation.
+
+    The options are the orchestrator's, and the judge recommends one
+    of them; an answer naming a third is refused, so the round has no
+    recommendation to follow and the default stays the constant.
+    """
+    analysis_orchestrator._terminal_judge.result = {
+        **_ANALYSIS,
+        "recommendation": "not_an_option",
+    }
+
+    payload = analysis_orchestrator._terminal_decision_question(
+        _report("VP-3"), 2, ["VP-3"], 0,
+    )
+
+    assert payload["default_option"] == TERMINAL_DEFAULT_OPTION, (
+        "a recommendation outside the options moved the default: "
+        f"{payload['default_option']!r}"
+    )
