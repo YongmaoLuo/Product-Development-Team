@@ -62,6 +62,13 @@
     内存里那份（写文件时**同一个**值）拿到，否则这个修复在生产路径上
     永远拿不到起点、永远保守阻断 —— 等于没修。
 
+「没人回答时」用哪个答案
+----------------------
+11. ``test_the_recommendation_is_the_answer_nobody_gave`` —— 判官**读出了**
+    失败场景并建议 ``revise_criterion`` 时，没人回答用的答案就是
+    ``revise_criterion``：兜底答案**跟着 agent 的建议走**，不是恒等于那个
+    写死的常量。判官什么都没读出来时（兜底卡）没有建议可跟，答案才是常量。
+
 轮次序列
 --------
 ::
@@ -238,6 +245,34 @@ class _FakeTerminalJudge:
     def analyze(self, **kwargs):
         self.kwargs = kwargs
         return None
+
+
+class _AnalysisTerminalJudge:
+    """A terminal analysis judge that reads the scene and recommends.
+
+    ``_FakeTerminalJudge`` finds **no** analysis, so the round is the
+    fallback card and the fallback answer is the constant.  This judge
+    does the opposite: it reads the failure scene and recommends one of
+    the two options, which is what makes the card the **analysis** card
+    — and what makes the recommendation the answer a round nobody
+    answered falls back to.
+    """
+
+    def __init__(self, recommendation: str = "revise_criterion") -> None:
+        self.last_session_id = "sess-analysis"
+        self.recommendation = recommendation
+        self.kwargs = None
+
+    def analyze(self, **kwargs):
+        self.kwargs = kwargs
+        return {
+            "context": "第 3 轮终局停止",
+            "problem": "登录接口连续三轮返回 500",
+            "evidence": ["VP-3 连续三轮返回 500"],
+            "recommendation": self.recommendation,
+            "recommendation_reason": "重跑不会改变同一个失败",
+            "uncertainty": "无法判断是不是环境问题",
+        }
 
 
 @pytest.fixture
@@ -963,3 +998,56 @@ def test_round_start_from_the_agent_memory_is_used_when_the_marker_is_gone(
     from hitl.service import list_decisions
 
     assert len(list_decisions(plan_dir.name)) == 2
+
+
+# ---------------------------------------------------------------------------
+# 11. 没人回答时，兜底答案就是 agent 的建议
+# ---------------------------------------------------------------------------
+
+
+def test_the_recommendation_is_the_answer_nobody_gave(
+    plan_dir, project_dir, repair_mocks, decision_calls,
+):
+    """判官的建议 → 就是没人回答时落地的那个答案。
+
+    这一条走的是**生产入口**：真的编排器真的跑完三轮，真的问人，真的把
+    决策写进表里。判官读出了失败场景并建议 ``revise_criterion`` ——
+    于是没人回答时用的答案必须是 ``revise_criterion``，而不是那个写死的
+    常量 ``rerun_this_round``。
+
+    没有分析时（``_FakeTerminalJudge``）没有建议可跟，答案才是常量；那一
+    条由 ``test_terminal_round_creates_one_decidable_operator_question``
+    钉着（它钉的是「默认项在选项之内」，不是「默认项是常量」）。
+    """
+    _write_plan_state(plan_dir)
+    _write_plan(plan_dir)
+
+    results = run_orchestrator_rounds(
+        ["fail", "fail", "fail"], plan_dir, project_dir,
+        terminal_judge=_AnalysisTerminalJudge(),
+    )
+    _, r3 = results[2]
+
+    assert r3["should_stop"] is True, (
+        f"the third same-cause failure is the terminal one: {r3!r}"
+    )
+    assert len(decision_calls) == 1, (
+        f"the terminal round asks exactly one question: {decision_calls!r}"
+    )
+
+    request = decision_calls[0]
+    assert request.default_option == "revise_criterion", (
+        "the answer nobody gave is not the agent's recommendation: "
+        f"{request.default_option!r}"
+    )
+
+    from hitl.service import list_decisions
+
+    stored = list_decisions(plan_dir.name)
+    assert len(stored) == 1, (
+        f"exactly one decision is waiting for an answer: {stored!r}"
+    )
+    assert stored[0].default_option == "revise_criterion", (
+        "the decision on disk does not carry the recommendation: "
+        f"{stored[0].default_option!r}"
+    )
