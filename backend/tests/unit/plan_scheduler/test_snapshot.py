@@ -28,7 +28,9 @@ clock moved, and the clock moves all the time — the contract is the
 
 from __future__ import annotations
 
+import ast
 from datetime import datetime
+from pathlib import Path
 
 from plan_scheduler.policy import REASONS
 from plan_scheduler.queue import queue_key
@@ -80,6 +82,22 @@ def _state(**overrides) -> dict:
     }
     state.update(overrides)
     return state
+
+
+#: The route module that hands the panel the document the builder writes.
+_ROUTE_MODULE = Path(__file__).resolve().parents[3] / "routes" / "scheduler.py"
+
+
+def _route_module_docstring() -> str:
+    """The route module's own docstring, read from its source.
+
+    Read from the source rather than imported, so the test asks a
+    question about the **words** the module says and not about the
+    module's behaviour — importing it would drag the whole routing
+    layer into a unit test about the read model's shape.
+    """
+    tree = ast.parse(_ROUTE_MODULE.read_text(encoding="utf-8"))
+    return ast.get_docstring(tree) or ""
 
 
 # ---------------------------------------------------------------------------
@@ -245,12 +263,21 @@ def test_key_set_is_closed() -> None:
     cannot render and the LUI cannot rely on; the key set is closed so
     that adding one is a decision rather than an accident.
 
+    The seventh key — ``waiting`` — was added on purpose: the panel
+    could not show what the operator was waiting for, so the read model
+    grew a list of waiting rows.  The set is compared **exactly** and
+    not as a subset: a subset assertion would let the next key in
+    without anybody deciding to add it.
+
     The phase is one of the row's keys now — what the plan is doing,
     in the routing layer's own words — and it is a key of **both** rows
-    and of neither of the document's seven keys.  The seventh key is
-    ``parked``: the plans stopped for want of provider capacity, which
-    hold no slot and are in no line, so the two lists above could
-    never name them.
+    and of neither of the document's eight keys.
+
+    The eighth key — ``parked`` — was added on purpose too: a plan
+    parked for quota holds no slot and is in no line, so the two lists
+    above could never name it.  The set is compared **exactly** and
+    not as a subset: a subset assertion would let the next key in
+    without anybody deciding to add it.
     """
     result = build(_state())
 
@@ -260,6 +287,7 @@ def test_key_set_is_closed() -> None:
         "over_capacity",
         "queue",
         "running",
+        "waiting",
         "parked",
         "generated_at",
     }
@@ -285,6 +313,29 @@ def test_key_set_is_closed() -> None:
         "priority",
         "phase",
     }
+
+
+def test_route_module_names_the_keys_the_read_model_carries() -> None:
+    """The route module's own key list is the read model's key list.
+
+    The route hands the panel the document the builder assembles, so
+    the two have to agree on what that document carries: a key the
+    builder emits and the module does not name is a key the module
+    cannot be read to have promised, and a key the module names and
+    the builder does not emit is a promise the panel would keep and
+    the document would break.
+
+    The list is read out of the module's own source, because a copy
+    kept here is exactly the second thing that has to be kept in step.
+    """
+    document = _route_module_docstring()
+
+    missing = [key for key in build(_state()) if f"``{key}``" not in document]
+
+    assert missing == [], (
+        "the scheduler route module does not name these read-model keys: "
+        + ", ".join(missing)
+    )
 
 
 def test_reason_comes_from_the_closed_vocabulary() -> None:
@@ -328,6 +379,7 @@ def test_a_state_with_nothing_in_it_still_builds() -> None:
 
     assert result["queue"] == []
     assert result["running"] == []
+    assert result["waiting"] == []
     assert result["queue_length"] == 0
     assert result["over_capacity"] is False
     # Nothing is parked either, and that too is an empty list.
@@ -338,6 +390,7 @@ def test_a_state_with_nothing_in_it_still_builds() -> None:
         "over_capacity",
         "queue",
         "running",
+        "waiting",
         "parked",
         "generated_at",
     }

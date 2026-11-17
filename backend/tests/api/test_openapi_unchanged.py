@@ -73,6 +73,14 @@ SNAPSHOT_PATH = _TESTS_DIR / "openapi_snapshot.json"
 #: that has never seen the snapshot file.  Change it **only** together with
 #: a deliberate, reviewed change to the public HTTP contract.
 #:
+#: The value is **computed**, never copied: it is the canonical fingerprint
+#: of the committed ``openapi_snapshot.json`` — the file parsed, re-serialised
+#: with sorted keys and no whitespace, SHA-256'd, which is exactly what
+#: ``_fingerprint`` does — and it is worth cross-checking against the schema
+#: the service actually publishes (``openapi_snapshot()``) before it is
+#: written down.  A hex string lifted out of a report or a log is not a
+#: derivation, and nothing here is allowed to be one.
+#:
 #: 2026-11-01（合入 base / PR #75）：本分支与 base 两侧都动过 HTTP 契约基线，
 #: 合并后的对外形状既包含本分支新增的调度计划详情端点，也包含 base 侧对既有
 #: 端点的 schema 改动，故指纹按**合并后的 app 实际发布的 schema** 重新取，
@@ -81,11 +89,20 @@ SNAPSHOT_PATH = _TESTS_DIR / "openapi_snapshot.json"
 #:
 #: 2026-11-07（合入 origin/main / 2fe98191）：再次合并后对外形状又变了
 #: ——main 侧新增了端点/改了既有端点的 schema，本分支的调度计划详情端点
-#: 仍在里面。指纹按**合并后的树实际发布的 schema** 重新取（跑
-#: `pytest tests/api/test_openapi_unchanged.py` 拿实际值回填），并与
+#: 仍在里面。指纹按**合并后的树实际发布的 schema** 重新取，并与
 #: `openapi_snapshot.json` 在同一次合并里一起更新：快照文件是这次 Git
 #: 合并的结果，它与合并后的树逐项相等，指纹与它一致。
-BASELINE_FINGERPRINT = "be49f1b2e917d905e81d890ab16e92e705c0d2eaefb7fe434bf79f40f8438cb0"
+#:
+#: 2026-11-16（postprocess 收尾阶段 / 本分支）：本阶段给调度器状态文档加了
+#: `waiting[]` 读模型，并新增 waits / postprocess-spec 收尾路由；
+#: `openapi_snapshot.json` 随之**只增不删**地补上这些路由（相对 base 为
+#: 271 行新增、0 行删除；`waiting[]` 是运行时读模型，不进 OpenAPI 快照）。
+#: 快照与指纹在**同一次变更**里更新：先由已提交快照的规范形式现算
+#: （`_fingerprint(json.loads(SNAPSHOT_PATH.read_text()))`），再与线上 app
+#: 实际发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零差异、
+#: 指纹相同——才把该值写进本常量。此前本分支沿用的是 base 合并时的旧指纹
+#: （`be49f1b2…`），它描述的是收尾路由加入之前的形状，已经过期。
+BASELINE_FINGERPRINT = "65d40bf4ca0f3b6e9701d2cafba3317941859fd9488d733fbbe9bc75ee51ec8b"
 
 #: The capture runs in its own process so the schema is the one a clean
 #: start produces: debug routes off, no schema cache carried over from
@@ -294,6 +311,42 @@ def test_openapi_matches_committed_fingerprint() -> None:
         "that was intended, update BASELINE_FINGERPRINT in the same "
         "commit that changes the contract; if it was not, the change does "
         "not belong on this branch."
+    )
+
+
+def test_baseline_fingerprint_matches_committed_snapshot() -> None:
+    """The committed constant is the fingerprint of the committed snapshot.
+
+    The other two corners of the triangle are transitive — "the published
+    schema equals the snapshot" plus "the published schema equals the
+    constant" only says the constant matches *something*.  This is the
+    direct corner: the constant is computed from the **committed**
+    snapshot, which is the artefact that actually travels in the
+    repository.
+
+    Reading the file directly (rather than through ``baseline_snapshot()``)
+    is what makes this check mean anything: that helper *generates* the
+    snapshot when it is missing, so a checkout without the file would
+    compare the constant against a freshly-minted copy of the live schema
+    and pass.  A missing committed snapshot is a failure here, not an
+    excuse to produce one.
+    """
+    assert SNAPSHOT_PATH.exists(), (
+        f"the committed OpenAPI baseline is missing ({SNAPSHOT_PATH.name}). "
+        "This check asserts about what the repository carries, so there is "
+        "nothing to compute the committed fingerprint against."
+    )
+
+    committed = json.loads(SNAPSHOT_PATH.read_text(encoding="utf-8"))
+    fingerprint = _fingerprint(committed)
+
+    assert fingerprint == BASELINE_FINGERPRINT, (
+        "BASELINE_FINGERPRINT does not describe the committed OpenAPI "
+        f"baseline (the committed snapshot fingerprints as {fingerprint}, "
+        f"the constant says {BASELINE_FINGERPRINT}). The two artefacts "
+        "that pin the HTTP contract disagree about what the contract is. "
+        "The fingerprint must be computed from the snapshot's canonical "
+        "JSON, not written by hand."
     )
 
 

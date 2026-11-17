@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "description": "零侵入基线快照：没有要求书时，plan 目录顶层应有的文件集合与大小量级（只记文件名与量级，不锁修改时间）",
+  "provenance": "取自 plans 根下真实 plan 目录顶层文件名的出现频次统计中的核心文件",
+  "size_buckets": {
+    "tiny": "< 1 KiB",
+    "small": "1 KiB - 64 KiB",
+    "medium": "64 KiB - 1 MiB",
+    "large": ">= 1 MiB"
+  },
+  "files": {
+    "execution.log": "medium",
+    "tasks.json": "small",
+    "verification_plan.json": "small",
+    "verification_report.json": "small",
+    "llm_sessions.jsonl": "small"
+  }
+}

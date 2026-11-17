@@ -50,23 +50,66 @@ model down over a field that is allowed to be absent.
 
 The shape is closed
 -------------------
-The document has exactly seven keys: ``capacity``, ``queue_length``,
-``over_capacity``, ``queue``, ``running``, ``parked`` and
+The document has exactly eight keys: ``capacity``, ``queue_length``,
+``over_capacity``, ``queue``, ``running``, ``waiting``, ``parked`` and
 ``generated_at``.  A field that appears without being declared is a
 field the panel cannot render and the LUI cannot rely on, so adding one
-is a decision and not an accident.  The three lists are always lists —
-an empty scheduler produces three empty lists, never three ``null``s,
-because ``null`` would be a second answer to "how many are waiting".
+is a decision and not an accident.  The four lists are always lists —
+an empty scheduler
+produces four empty lists, never four ``null``s, because ``null``
+would be a second answer to "how many are waiting".
 
-The seventh key was added; the six did not move
-----------------------------------------------
+The seventh key was added on purpose
+------------------------------------
+The document had six keys until the panel could not show what the
+operator was waiting for: the queue's reason column said 「等待人工回
+答」 and stopped there — no question, no time left, no way of telling
+one waiting plan from another.  The waiting list is that answer
+spelled out, and the key set was widened **explicitly** rather than
+loosened into a subset: a subset assertion would let the next key in
+without anybody deciding to add it.
+
+The waiting row is a closed shape too
+-------------------------------------
+A waiting row carries exactly eight keys — the plan, the item, the kind
+of wait, the question, the deadline, the time left, whether the wait
+can still be pushed out and how many times it has been.  A ninth key
+would be a field the panel cannot draw, so the row is pinned the same
+way the document is.
+
+The time left is counted, not guessed
+------------------------------------
+``remaining_seconds`` is measured against the **tick's own clock** —
+the moment the state carries — and not against the wall clock, so two
+reads of the same state say the same thing and the countdown on the
+panel does not jump between two reads nobody asked for.  A deadline
+that has passed answers zero: the panel counts down, and a countdown
+below zero would be showing a time that does not exist.
+
+The terminal summary comes from the report
+------------------------------------------
+The finishing stage's report — ``postprocess_report.json`` — is the
+terminal truth: the panel's terminal area, the failure notification and
+the resume entry point all read it.  The summary is that same truth
+with three of its fields, so the panel and the report cannot tell the
+operator two different stories.
+
+It is a **read**, like the rest of this module: it starts no
+subprocess, opens no database and writes nothing.  It is also not a
+key of the document above — the summary belongs to the plan entry the
+terminal area shows, not to the scheduler's own facts — so it is built
+by its own function, :func:`postprocess_summary`, and attached to a
+plan entry by :func:`with_postprocess`.
+
+The eighth key was added; the others did not move
+-------------------------------------------------
 The document used to carry six keys, and the six were a closed
 contract pinned by three tests.  ``parked`` was added beside them and
 not instead of one of them: the names, the types and the meanings of
-the other six are unchanged, and the rows of the queue and of the
+the other keys are unchanged, and the rows of the queue and of the
 running line keep their key sets.  A reader written against the six
-keys is still reading a document it was written for — it finds one
-more key, which is what a backward-compatible addition looks like.
+keys is still reading a document it was written for — it finds more
+keys, which is what a backward-compatible addition looks like.
 
 The parked row is not a queued row
 ----------------------------------
@@ -77,6 +120,7 @@ round, the reason and the phase — and the reason it carries is the
 quota layer's own word rather than the queue policy's, because a
 parked plan stopped for want of provider capacity and not for want of
 a slot.
+
 
 The queue row names its plan
 ----------------------------
@@ -146,7 +190,10 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional
+
+from postprocess.report import read_report
 
 from quota_resume import KIND_EXECUTION, QUOTA_PARK_REASON
 
@@ -156,9 +203,13 @@ from .queue import queue_key
 
 __all__ = [
     "build",
+    "postprocess_summary",
+    "with_postprocess",
     "CAPACITY_SOURCE_CONFIG",
     "CAPACITY_SOURCE_OVERRIDE",
     "DEFAULT_CAPACITY_SOURCE",
+    "POSTPROCESS_KEYS",
+    "WAITING_KEYS",
 ]
 
 
@@ -181,6 +232,36 @@ CAPACITY_SOURCE_OVERRIDE = "override"
 #: capacity is the ordinary case; the override is the one that has to
 #: be announced.
 DEFAULT_CAPACITY_SOURCE = CAPACITY_SOURCE_CONFIG
+
+#: The waiting row's eight keys — the shape the panel draws.  A row
+#: that carried a ninth key would be a field the panel cannot render,
+#: so the shape is closed here as firmly as the document's own.
+WAITING_KEYS = frozenset(
+    {
+        "plan_id",
+        "item_id",
+        "wait_type",
+        "question",
+        "deadline",
+        "remaining_seconds",
+        "extendable",
+        "extensions_count",
+    }
+)
+
+#: The terminal summary's three keys — the report's own fields, under
+#: the names the panel reads them by.
+POSTPROCESS_KEYS = frozenset({"spec_sha256", "terminal_status", "item_verdicts"})
+
+#: The wait statuses that are **settled**.  A wait that is not pending
+#: any more cannot be extended: its deadline is a deadline nobody is
+#: watching any more.
+SETTLED_WAIT_STATUSES = frozenset({"answered", "terminated", "failed"})
+
+#: The fields that mark a row as a wait record rather than a queued
+#: plan.  The engine's own ``waiting`` key means "plans waiting for a
+#: slot", and those rows must not be shown as waits.
+_WAIT_MARKERS = ("item_id", "wait_type", "question", "deadline", "extensions")
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +625,134 @@ def _parked_view(state: Any) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# The waiting list
+# ---------------------------------------------------------------------------
+
+
+def _is_wait_record(row: Any) -> bool:
+    """Whether a row is a wait record rather than a queued plan.
+
+    The engine's own ``waiting`` key means "the plans that are waiting
+    for a slot", and those rows carry a plan, a priority and a
+    sequence — none of the fields a wait carries.  A row that names an
+    item, a kind of wait, a question, a deadline or a set of
+    extensions is a wait, whatever list it was found in.
+    """
+    return any(_field(row, marker, None) is not None for marker in _WAIT_MARKERS)
+
+
+def _wait_rows(state: Any) -> List[Any]:
+    """The finishing stage's waits, as the state carries them.
+
+    The waits are read from ``waits`` — the key that says what they
+    are.  A state that lists them under ``waiting`` is read as well,
+    but only the rows that are wait records: the engine's ``waiting``
+    key means something else entirely, and showing its queued plans in
+    the panel's waiting block would be a second answer to "what is
+    waiting".
+    """
+    rows = list(_entries(state, "waits"))
+
+    for row in _entries(state, "waiting"):
+        if _is_wait_record(row) and row not in rows:
+            rows.append(row)
+
+    return rows
+
+
+def _deadline_text(value: Any) -> Optional[str]:
+    """The wait's deadline as the text the panel shows.
+
+    The stamp is passed on as it was written — the registry writes it
+    in ISO-8601 — and a stamp that is not text at all is read as
+    "unknown" rather than guessed at.
+    """
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return None
+
+
+def _remaining_seconds(deadline: Optional[str], now: float) -> int:
+    """How much time is left on a wait, in whole seconds.
+
+    The countdown is measured against the tick's own clock, so two
+    reads of the same state say the same thing.  A deadline that has
+    passed answers **zero** and never a negative number: the panel
+    counts down, and a countdown below zero would be showing a time
+    that does not exist.
+
+    A deadline that cannot be read answers zero as well.  The wait is
+    then not known to have time left, and the number the panel shows
+    is the one the wait's own record can support.
+    """
+    moment = _epoch(deadline)
+    if moment is None:
+        return 0
+    return int(max(0.0, moment - now))
+
+
+def _extendable(row: Any) -> bool:
+    """Whether the wait's deadline can still be pushed out.
+
+    A wait is extendable exactly while it is **pending** — the same
+    rule the extend action itself applies.  A record that carries no
+    status is read as a live wait: the registry always writes one, and
+    a record without one is not a settled wait.
+    """
+    status = _field(row, "status", None)
+    if not isinstance(status, str) or not status.strip():
+        return True
+    return status.strip().lower() not in SETTLED_WAIT_STATUSES
+
+
+def _extensions_count(row: Any) -> int:
+    """How many times the wait's deadline has been pushed out."""
+    value = _field(row, "extensions", [])
+    try:
+        return len(list(value))
+    except TypeError:
+        return 0
+
+
+def _waiting_view(state: Any, now: float) -> List[Dict[str, Any]]:
+    """The finishing stage's waits, as the panel reads them.
+
+    One row per wait, in the order the state listed them.  The row
+    names the plan and the item, passes on the kind of wait and the
+    question as they were written, and answers the two things the
+    operator asks of a countdown: how long is left, and can it still be
+    pushed out.
+
+    The kind of wait is passed on as the record wrote it.  The registry
+    refuses to create a wait with a kind outside its two-word
+    vocabulary, so the record the panel is handed is already a word it
+    knows — and a hand-made record that names something else is shown
+    as it is, because the read model does not rewrite a word it cannot
+    vouch for.
+    """
+    view: List[Dict[str, Any]] = []
+
+    for row in _wait_rows(state):
+        deadline = _deadline_text(_field(row, "deadline", None))
+        view.append(
+            {
+                "plan_id": str(_field(row, "plan_id", "")),
+                "item_id": str(_field(row, "item_id", "")),
+                "wait_type": str(_field(row, "wait_type", "")),
+                "question": str(_field(row, "question", "")),
+                "deadline": deadline,
+                "remaining_seconds": _remaining_seconds(deadline, now),
+                "extendable": _extendable(row),
+                "extensions_count": _extensions_count(row),
+            }
+        )
+
+    return view
+
+
+# ---------------------------------------------------------------------------
 # The snapshot
 # ---------------------------------------------------------------------------
 
@@ -561,9 +770,12 @@ def build(state: Any) -> Dict[str, Any]:
     Returns:
         The document the panel renders and the LUI reports.  Its keys
         are exactly ``capacity``, ``queue_length``, ``over_capacity``,
-        ``queue``, ``running``, ``parked`` and ``generated_at``.  The
-        capacity block carries the number and its source — ``total``,
-        ``used`` and ``source``.
+        ``queue``, ``running``, ``waiting``, ``parked`` and
+        ``generated_at``.  The capacity block carries the number and
+        its source — ``total``, ``used`` and ``source`` — the waiting
+        list carries one row per wait, with the question and the time
+        left on it, and the parked list carries the plans stopped for
+        want of provider capacity.
     """
     running_rows = _entries(state, "running")
 
@@ -593,9 +805,89 @@ def build(state: Any) -> Dict[str, Any]:
         "over_capacity": used > total,
         "queue": queue,
         "running": _running_view(state, now, min_runtime),
+        "waiting": _waiting_view(state, now),
         # The plans parked for quota — the facts' answer.  A state that
         # names none is an empty list: nothing parked is a normal thing
         # to look at, and a list is an answer a caller can walk.
         "parked": _parked_view(state),
         "generated_at": _now_iso(),
     }
+
+
+# ---------------------------------------------------------------------------
+# The terminal summary
+# ---------------------------------------------------------------------------
+
+
+def postprocess_summary(
+    plan_id: str,
+    *,
+    plans_dir: Optional[Path] = None,
+) -> Optional[Dict[str, Any]]:
+    """The terminal summary of a plan: what the finishing stage decided.
+
+    The summary is three of the terminal report's own fields — the
+    fingerprint of the requirement book the verdicts were judged
+    against, the stage's terminal status and the items' verdicts.  It
+    is read straight out of ``postprocess_report.json``, so the panel's
+    terminal area and the report cannot tell the operator two different
+    stories.
+
+    Args:
+        plan_id: The plan the summary belongs to.
+        plans_dir: The plans root.  Defaults to the report module's own
+            default, which honours the ``PDT_PLANS_DIR`` escape hatch.
+
+    Returns:
+        The summary — ``spec_sha256``, ``terminal_status`` and
+        ``item_verdicts`` — or ``None`` when the plan has no report,
+        which means it never reached the finishing stage.  "No report"
+        is an ordinary state, not an error.
+
+    This is a **read**: it starts no subprocess, opens no database and
+    writes nothing.
+    """
+    report = read_report(plan_id, plans_dir)
+    if report is None:
+        return None
+
+    return {
+        "spec_sha256": report["spec_sha256"],
+        "terminal_status": report["terminal_status"],
+        "item_verdicts": list(report["items"]),
+    }
+
+
+def with_postprocess(
+    entry: Mapping[str, Any],
+    *,
+    plans_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """The plan entry, carrying the terminal summary when the plan has one.
+
+    The terminal plan area shows plan entries that already exist, and
+    the summary is added to the entry rather than kept beside it: the
+    panel reads one entry per plan, and a summary that lived somewhere
+    else would be a second place to look for the same answer.
+
+    Args:
+        entry: The plan entry as the caller already has it.
+        plans_dir: The plans root — see :func:`postprocess_summary`.
+
+    Returns:
+        A copy of the entry.  When the plan has a terminal report, the
+        copy carries a ``postprocess`` key with the summary; when it has
+        none, the entry is handed back unchanged — a plan that never
+        reached the finishing stage has no terminal result to show.
+    """
+    plan_id = str(_field(entry, "plan_id", "") or _field(entry, "id", "") or "")
+    result = dict(entry)
+
+    if not plan_id:
+        return result
+
+    summary = postprocess_summary(plan_id, plans_dir=plans_dir)
+    if summary is not None:
+        result["postprocess"] = summary
+
+    return result

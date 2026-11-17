@@ -78,6 +78,11 @@ import pytest
 # truth, and this file is the witness that it did not move.  Every entry is
 # spelled out so that a change shows up as a *diff* in the review, not as a
 # test that quietly stopped asserting anything.
+#
+# 2026-11-17: 收尾阶段（``post_processing`` / ``postprocess_failed``）进了
+# 词表与边表，快照随之按真实值逐项涨（涨在哪些行、为什么涨，写在每一处
+# 旁边）。快照的**用途**没变：它仍然是「词表和边表只能按这一条路变」的
+# 见证 —— 涨过的地方再动一次，还是会打成红。
 # ---------------------------------------------------------------------------
 
 _PHASES_BEFORE = [
@@ -121,6 +126,11 @@ _PHASES_BEFORE = [
     # 「我们把它收起来了」。归档的对象常常是**从没跑过**的计划，所以它与
     # ``completed`` 的语义不能合并。
     "archived",
+    # 2026-11-17: 新增——可选收尾阶段的两个相位。快照跟着涨，是因为收尾
+    # 阶段进了相位词表：没有收尾要求书的计划走原来的 ``completed`` 路径
+    # （行为不变），有要求书的计划才进 ``post_processing``。
+    "post_processing",
+    "postprocess_failed",
 ]
 
 _MAIN_EDGES_BEFORE = {
@@ -187,8 +197,19 @@ _MAIN_EDGES_BEFORE = {
     # 恢复）。**进** ``archived`` 的那条边不在表里 —— 归档是通用目标，由
     # ``PlanState._transition_to`` 的判定接住，所以任何相位都能归档。
     "archived": ["queued"],
+    # 2026-11-17: 新增——收尾阶段的三条边。``verification_passed →
+    # post_processing`` 让验证通过的计划能进收尾；``post_processing`` 的
+    # 三个目标是「收完了」「有条目没过」「先回队列等一次调度」；
+    # ``postprocess_failed → post_processing`` 是续跑。收尾阶段是**工作流
+    # 层**的相位，所以这些边落在主表里，验证子表一个字节都没动。
+    "verification_passed": ["post_processing"],
+    "post_processing": ["completed", "postprocess_failed", "queued"],
+    "postprocess_failed": ["post_processing"],
 }
 
+# 2026-11-17: 这张表**没有**跟着涨 —— 收尾阶段是工作流层的相位，它的边
+# 落在主表里，验证子表一个字节都没动（``verification_passed`` 仍然是空的
+# 安全边界：验证通过不得被顺手洗成终态）。
 _VERIFICATION_EDGES_BEFORE = {
     "ready": ["verification", "verification_running"],
     "executing": [
@@ -250,6 +271,9 @@ _DEDICATED_EDGES_BEFORE = {
     "prd_review": ["tasks_generation"],
 }
 
+# 2026-11-17: 终态集合**没有**跟着涨。``post_processing`` 还在干活，
+# ``postprocess_failed`` 还要等人决定是否续跑 —— 两者都不是终态；终态是
+# 「再也不会动了」，把「等人」算成终态就是把人正在看的计划从列表里滤掉。
 _TERMINAL_PHASES_BEFORE = ["archived", "completed", "failed", "stopped"]
 
 

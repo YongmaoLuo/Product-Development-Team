@@ -96,6 +96,14 @@ from project_dir_guard import ProjectDirInvalidError, validate_project_dir
 # stdlib-only with no import-time side effects, so a top-level import
 # carries no cycle risk.
 from plan_status import QUOTA_WAIT_PHASE
+# 2026-11-14: the optional finishing stage (收尾阶段).  The gate that
+# decides whether a passed plan enters it is ONE predicate
+# (``has_postprocess_spec``), and the phase it writes is owned by the
+# package that owns the stage (``postprocess.state``).  Both modules
+# import nothing from ``server`` / this module, so a top-level import
+# carries no cycle risk.
+from postprocess.spec import has_postprocess_spec
+from postprocess.state import POSTPROCESS_FAILED, POST_PROCESSING
 
 # The human-in-the-loop side of a verification round.  Imported by value
 # — ``expire_due`` in particular — so that the deadline sweep this
@@ -5236,6 +5244,8 @@ def _persist_verification_terminal(
     *,
     chain_ending: Optional[bool] = None,
     round_token: Optional[str] = None,
+    phase_target: Optional[str] = None,
+    publish_closed: bool = True,
 ) -> None:
     """Top-level helper: persist a terminal verification outcome
     to both ``plan_verification.verification_status`` (SQLite) AND
@@ -5389,6 +5399,7 @@ def _persist_verification_terminal(
                 },
                 status=sqlite_status,
                 stop_reason=stop_reason,
+                publish_closed=publish_closed,
             )
             # Read the round back so step 4's mirror writes the real one
             # rather than whatever ``plan_routing.verification`` held
@@ -5473,6 +5484,16 @@ def _persist_verification_terminal(
         status, stop_reason, chain_ending,
     )
 
+    # The phase this terminal write moves the plan to.  It is
+    # derived from the verdict by default (``passed`` →
+    # ``completed``, anything else → ``failed``) and can be named
+    # explicitly by a caller that owns a different exit — the
+    # finishing stage, whose failed branch parks the plan at
+    # ``postprocess_failed`` instead of closing it.
+    _routing_target = phase_target or (
+        "completed" if status == "passed" else "failed"
+    )
+
     # ----- 2) Transition ``plan_routing.stage`` out of "verification_*" -----
     try:
         from state_machine.repositories.routing_repository import (
@@ -5494,10 +5515,6 @@ def _persist_verification_terminal(
                 # spellings of one decision, in one function, ~50 lines
                 # apart. There is one column now, so both steps name the
                 # same phase.
-                if status == "passed":
-                    _routing_target = "completed"
-                else:
-                    _routing_target = "failed"
                 try:
                     _RoutingRepo(_rconn).try_mark_phase(
                         plan_id,
@@ -6751,6 +6768,159 @@ def _get_pending_repair_tasks(
     return pending
 
 
+def _start_postprocess(plan_id: str) -> None:
+    """Hand the plan over to the finishing stage (收尾阶段).
+
+    2026-11-14: the ONE entry point the gate branch calls (architecture
+    decision point 1).  It is **module level** because it is the seam of
+    this subsystem: a test injects it, production runs the default.
+
+    The default imports the finishing subsystem **lazily** — the
+    verification loop is the verification sub-machine and must not drag
+    the finishing subsystem into import time; the finishing subsystem
+    reaches back into ``server``, so an import-time edge would close a
+    cycle.
+
+    The stage runs on a **background thread**: it performs outward
+    actions (open a PR, push) and may have to wait for a human, and the
+    caller is the verification chain's own thread — blocking it there
+    would stall the chain.  The thread has the shape the other
+    background threads here have (daemon + plan context binding), and
+    the stage's own progress file is what a later run resumes from.
+
+    Args:
+        plan_id: The plan the stage runs for.
+    """
+    def _run() -> None:
+        try:
+            # The imports live here, not in the function body: a broken
+            # finishing subsystem must not rewrite the verification
+            # round's verdict — the round PASSED, and the finishing stage
+            # is a stage of its own.
+            from postprocess.executor import CommandRunner
+            from postprocess.orchestrator import PostProcessOrchestrator
+            from postprocess.spec import freeze, load_spec
+
+            plan_dir = _server._plan_dir(plan_id)
+            frozen = freeze(load_spec(plan_dir))
+            # The commands of the book run in the plan's project — the
+            # repository the plan was executed in.  A plan that has no
+            # project has no repository to act on; the plan directory is
+            # then the workspace, and the command says so itself.
+            workspace = _server._get_project_dir(plan_id) or plan_dir
+            orchestrator = PostProcessOrchestrator(
+                plan_id,
+                plan_dir=plan_dir,
+                executor=CommandRunner(frozen, workspace=workspace),
+                sink=_postprocess_notification_sink(plan_dir),
+            )
+            try:
+                orchestrator.start()
+            finally:
+                # The stage owns the terminal exit: whatever it
+                # decided, the plan's phase follows the report
+                # it wrote — even when its failure notification
+                # could not be delivered, which is a failure of
+                # the delivery and not of the stage's verdict.
+                _settle_postprocess_phase(plan_id, plan_dir)
+        except Exception:  # noqa: BLE001 — the stage's own failure
+            _server.logger.exception(
+                "[postprocess] the finishing stage crashed plan=%s", plan_id
+            )
+
+    threading.Thread(
+        target=_server._run_in_plan_ctx, args=(plan_id, _run), daemon=True
+    ).start()
+
+
+def _postprocess_notification_sink(plan_dir: Any) -> Any:
+    """The channel a finishing-stage failure travels — the plan's own route.
+
+    The finishing stage grows no channel of its own: the failure
+    notification goes the way the plan already wired — the destinations
+    ``hitl_config.json`` names, delivered by the existing hook
+    dispatcher.  One route, one delivery, and the audit line the
+    notifier writes means exactly what it says: "this was delivered".
+
+    A plan with no deliverable destination is a plan nobody can be told
+    about, so the delivery fails loudly instead of dropping the failure
+    on the floor — and the notifier writes no audit line, because a
+    line means "delivered".
+
+    Args:
+        plan_dir: The plan's directory — the file that names the route.
+
+    Returns:
+        A sink the notifier can deliver through: a callable taking the
+        three-part payload.
+    """
+
+    def _sink(payload: Dict[str, Any]) -> None:
+        from hooks.dispatcher import dispatch
+        from postprocess.notify import NOTIFICATION_KIND
+
+        report = dispatch(NOTIFICATION_KIND, payload, plan_dir)
+        if report.delivered == 0:
+            raise RuntimeError(
+                f"the plan in {plan_dir} has no deliverable notification "
+                "channel: the failure notification was delivered to nobody"
+            )
+
+    return _sink
+
+
+def _settle_postprocess_phase(plan_id: str, plan_dir: Any) -> None:
+    """The finishing stage's terminal exit — the plan's phase follows the report.
+
+    The gate hands the plan to the finishing stage and writes nothing
+    else: the stage owns the terminal exit, so the phase that says
+    "this plan is done" (or "this plan is parked, waiting for a human")
+    is written **here**, from the report the stage wrote.
+
+    * every required item passed → ``completed``: the plan really is
+      finished, so the terminal record is written exactly as the
+      no-requirement-book path writes it — the verdict ``passed`` and
+      the plan's closing announcement;
+    * a required item failed → ``postprocess_failed``: the plan is
+      **parked**, not closed — a human decides whether to resume it —
+      so the verdict is recorded (``failed``) without announcing the
+      plan closed;
+    * the stage is suspended (an item waits for a human) → nothing is
+      written at all: the phase stays ``post_processing``, which is
+      where a stage that has not finished belongs.
+
+    Args:
+        plan_id: The plan the stage ran for.
+        plan_dir: The plan's directory — where the report lives.
+    """
+    from postprocess.report import (
+        TERMINAL_STATUS_COMPLETED,
+        TERMINAL_STATUS_FAILED,
+        read_report,
+    )
+
+    try:
+        report = read_report(plan_id, plans_dir=Path(plan_dir).parent)
+    except Exception:  # noqa: BLE001 — a damaged report is not a verdict
+        _server.logger.exception(
+            "[postprocess] cannot read the report of plan=%s", plan_id,
+        )
+        return
+    terminal = (report or {}).get("terminal_status")
+    if terminal == TERMINAL_STATUS_COMPLETED:
+        _server._record_verification_terminal(plan_id, "passed", None)
+        return
+    if terminal != TERMINAL_STATUS_FAILED:
+        return
+    _server._record_verification_terminal(
+        plan_id,
+        "failed",
+        TERMINAL_STATUS_FAILED,
+        phase_target=POSTPROCESS_FAILED,
+        publish_closed=False,
+    )
+
+
 def _handle_passed_round(
     plan_id: str,
     round_num: int,
@@ -6785,6 +6955,14 @@ def _handle_passed_round(
     write in, so the refusal sits at the TOP of this function, before
     the routing CAS and before the PlanState write, not only inside
     the terminal write at the bottom.
+
+    2026-11-14 (architecture decision point 1): the finishing gate.
+    Between the routing CAS and the phase write there is now ONE
+    decision point — ``has_postprocess_spec(plan_dir)``.  A plan that
+    declares a requirement book enters ``post_processing`` and the
+    finishing stage owns its terminal exit (it is what closes the
+    plan, and only when it is really done); a plan that declares
+    nothing walks steps 1 and 2 exactly as before, line for line.
     """
     if _round_is_invalidated(plan_id, round_token):
         _server.logger.warning(
@@ -6810,6 +6988,28 @@ def _handle_passed_round(
             pass
     except Exception:
         pass
+    # 2026-11-14 (architecture decision point 1): the finishing gate —
+    # the ONE decision point of the whole flow.  A plan that declares a
+    # requirement book does NOT get ``completed`` here: it enters
+    # ``post_processing`` and the finishing stage owns its terminal exit
+    # (the stage is what closes the plan, and it closes it only when it
+    # is really done).  A plan that declares nothing walks the old path,
+    # line for line.
+    try:
+        plan_dir = _server._plan_dir(plan_id)
+    except Exception:  # noqa: BLE001 — a bad id names no requirement book
+        plan_dir = None
+    if has_postprocess_spec(plan_dir):
+        try:
+            ps.transition_to(POST_PROCESSING)
+        except ValueError:
+            ps.force_set_phase(POST_PROCESSING)
+        _server.logger.info(
+            "[postprocess] plan=%s enters the finishing stage (phase=%s)",
+            plan_id, POST_PROCESSING,
+        )
+        _start_postprocess(plan_id)
+        return
     try:
         ps.transition_to("completed")
     except ValueError:
@@ -6824,6 +7024,8 @@ def _record_verification_terminal(
     plan_id: str, status: str, stop_reason: Optional[str],
     *, chain_ending: Optional[bool] = None,
     round_token: Optional[str] = None,
+    phase_target: Optional[str] = None,
+    publish_closed: bool = True,
 ) -> None:
     """2026-09-11 plan v14: module-level wrapper that updates the
     in-memory ``_verification_state[plan_id]`` AND delegates to
@@ -6874,6 +7076,8 @@ def _record_verification_terminal(
     _server._persist_verification_terminal(
         plan_id, status, stop_reason or "", chain_ending=chain_ending,
         round_token=round_token,
+        phase_target=phase_target,
+        publish_closed=publish_closed,
     )
 
 

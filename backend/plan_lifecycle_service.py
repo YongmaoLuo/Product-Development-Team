@@ -126,8 +126,8 @@ start
 
 pause 与 requeue
 ----------------
-调度器要的两件事也收在这个门面上，而它们走的都是**既有**的合法边 ——
-不新增相位、不新增边、不改 CAS 语义：
+调度器要的两件事也收在这个门面上，而它们走的都是**合法**的边 ——
+不新增相位、不改 CAS 语义：
 
 * ``pause_plan`` —— **在跑** → 既有 ``stop_plan(requeue=False)``；
   **排队中** → 既有合法边 ``queued → stopped``（``plan_state`` 的边表
@@ -137,6 +137,24 @@ pause 与 requeue
 
 两条边都由状态机承担，门面只发起迁移：合法性查的是状态机那两张边表，
 门面不自己判断「这条边存不存在」——自己判断就是一份会漂移的边表副本。
+
+**一处例外（2026-11-17）：``post_processing``。**
+``requeue_plan`` 的入口相位集合额外接受 ``post_processing``，状态机那边
+同步加了 ``post_processing → queued`` 那条边 —— 这是本模块**唯一**一处
+「新增边」。
+
+为什么它是例外而不是「又一条既有边」：收尾阶段是**后来新增**的相位，
+而 ``stopped → queued`` / ``failed → queued`` 那两条边与门面的入口集合
+都是在它之前写好的 —— 于是「收尾中的计划被人回答之后回到队列」这条出路
+压根不存在。PRD A9 要求「等待期间不占执行槽位；**唤醒后重新排队**」：
+等待中的计划不占槽位成立，但收尾中的计划被人工回答之后若回不到队列，
+就永远拿不到槽位 —— 唤醒后重新排队就没有实现。回答走的正是这条既有唤醒
+路径（普通回答 → ``submit_command("resume")`` → ``requeue_plan``），所以
+入口相位集合必须认它。
+
+集合只多这一个名字：``executing`` / ``completed`` /
+``verification_running`` 等等仍然是冲突 —— 入口集合没有被放宽成「任何
+相位都能 requeue」。
 
 冲突
 ----
@@ -711,13 +729,24 @@ class PlanLifecycleService:
         )
 
     def requeue_plan(self, plan_id: str) -> LifecycleResult:
-        """把一个停住或失败的计划放回等待相位 —— 既有合法边
-        ``stopped → queued`` 与 ``failed → queued``。
+        """把一个停住、失败或收尾中的计划放回等待相位 —— 合法边
+        ``stopped → queued``、``failed → queued`` 与
+        ``post_processing → queued``。
 
         **接受 ``stopped`` 与 ``failed``**：这两个相位都放回等待相位
         ``queued``。状态机的边表里那两条边（``stopped → queued`` 与
         ``failed → queued``）本来就存在 —— 收窄只发生在门面：入口相位
         集合少写了一个名字，于是那条本来合法的边永远走不到。
+
+        **接受 ``post_processing``**（2026-11-17 新增）：收尾阶段是**后来
+        新增**的相位，而 ``stopped → queued`` / ``failed → queued`` 那两条
+        边与门面的入口集合都是在它之前写好的。PRD A9 要求「等待期间不占
+        执行槽位；**唤醒后重新排队**」：等待中的计划不占槽位成立，但收尾中
+        的计划被人工回答之后若回不到队列，就永远拿不到槽位 —— 唤醒后重新
+        排队就没有实现。回答走的正是这条既有唤醒路径（普通回答 →
+        ``submit_command("resume")`` → ``requeue_plan``），所以入口相位
+        集合必须认 ``post_processing``，状态机那边同步加上
+        ``post_processing → queued`` 那条边。
 
         别的相位一律冲突（相位原样不动）。**``executing`` 仍然是冲突**：
         在跑的计划没有「放回等待相位」这回事 —— 那是一次停止加一次入队，
@@ -735,17 +764,23 @@ class PlanLifecycleService:
             raise PlanNotFoundError(plan_id)
 
         phase = self._current_phase(plan_dir)
-        # 入口相位集合：``stopped`` 与 ``failed``。其余相位 —— 包括
-        # ``executing`` —— 一律冲突。
-        if phase not in ("stopped", "failed"):
+        # 入口相位集合：``stopped``、``failed`` 与 ``post_processing``。
+        # 其余相位 —— 包括 ``executing`` —— 一律冲突。
+        #
+        # 2026-11-17: ``post_processing`` 是这次**唯一**的例外（见上面
+        # docstring）：收尾中的计划被人工回答后必须回到队列，否则 PRD A9
+        # 的「唤醒后重新排队」没有实现。集合只多这一个名字 —— 其余相位
+        # （含 ``executing`` / ``completed`` / ``verification_running``）
+        # 仍然是冲突。
+        if phase not in ("stopped", "failed", "post_processing"):
             logger.info(
                 "plan_lifecycle_requeue_conflict: plan=%s cannot be requeued "
                 "from the phase %r", plan_id, phase,
             )
             return self._conflict(plan_id, phase)
 
-        # ``stopped → queued`` / ``failed → queued`` 那两条边由状态机承担，
-        # 门面只发起迁移。
+        # ``stopped → queued`` / ``failed → queued`` / ``post_processing →
+        # queued`` 那三条边由状态机承担，门面只发起迁移。
         # CAS 冲突（``ConflictError``）照既有语义往外抛，不重试。
         if not self._requeue_to_queued(plan_dir):
             # 迁移被拒（相位在读与写之间变了，或那条边不合法）：冲突。
