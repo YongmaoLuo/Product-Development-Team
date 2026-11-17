@@ -130,6 +130,32 @@ if os.environ.get("FEISHU_NOTIFY_DEBUG_LOG"):
 
 
 # ---------------------------------------------------------------------------
+# Terminal phases
+# ---------------------------------------------------------------------------
+
+#: The workflow phases that END a plan.
+#:
+#: 2026-11-16: this is a COPY of ``routes.plans.TERMINAL_PHASES`` and
+#: the two must stay equal — a card that rotates on one set of phases
+#: and a listing that filters on another would disagree about which
+#: plans are over, and the disagreement would show up as a plan that
+#: is "finished" to the listing and "still running" to the chat.
+#:
+#: The copy exists because the notifications layer cannot import
+#: ``routes``: ``routes.plans`` imports ``server`` at module level and
+#: ``server`` imports the notifier back, so the import would close a
+#: cycle. The equality is pinned by a test — see
+#: ``backend/tests/unit/notifications/
+#: test_card_new_message_on_terminal.py``.
+TERMINAL_PHASES = frozenset({
+    "completed", "failed", "stopped",
+    "verification_passed",
+    "verification_failed",
+    "archived",
+})
+
+
+# ---------------------------------------------------------------------------
 # Card-state persistence
 # ---------------------------------------------------------------------------
 
@@ -185,6 +211,29 @@ class PlanCardState:
             JSON written before this field existed, or a plan the
             watch has not looked at yet) → the first sighting only
             records the baseline, it never rotates.
+        last_observed_phase: The workflow phase
+            (``plan_routing.current_phase``) the notifier last
+            observed for this plan. ``None`` means "never seen" — a
+            card-state JSON written before this field existed, or a
+            plan the notifier has not looked at yet.
+
+            This is what tells "this plan was running and I watched
+            it" from "this plan was already over when I first looked
+            at it". A plan that is ALREADY terminal the first time it
+            is seen only records a baseline: a notifier that has just
+            started must not post a fresh card for every finished
+            plan in the tree.
+        last_terminal_phase: The terminal phase the current card was
+            rotated for. A plan that reaches a terminal phase gets a
+            FRESH card instead of an in-place edit of the card that
+            has been scrolling past for hours, so the operator sees
+            the outcome at the bottom of the chat where the chat is.
+
+            ``None`` means "no terminal phase seen yet". The same
+            terminal phase seen again rotates nothing (the rotation
+            is idempotent); a non-terminal phase clears it, so
+            "finished → started again → finished" gets its own card
+            for the second ending too.
     """
 
     plan_id: str
@@ -195,6 +244,8 @@ class PlanCardState:
     last_push_ts: Optional[float] = None
     permanently_disabled: bool = False
     last_execution_started_at: Optional[str] = None
+    last_observed_phase: Optional[str] = None
+    last_terminal_phase: Optional[str] = None
 
 
 def _load_card_state(plan_id: str) -> PlanCardState:
@@ -214,6 +265,12 @@ def _load_card_state(plan_id: str) -> PlanCardState:
                 # Absent in card-state JSONs written before this field
                 # existed → None → "first sighting", no rotation.
                 last_execution_started_at=data.get("last_execution_started_at"),
+                # Same: absent → None. ``last_observed_phase`` is None
+                # for "never seen", which is what keeps a notifier
+                # that just started from posting a fresh card for
+                # every finished plan it finds.
+                last_observed_phase=data.get("last_observed_phase"),
+                last_terminal_phase=data.get("last_terminal_phase"),
             )
     except (OSError, ValueError) as exc:
         logger.warning(
@@ -245,6 +302,12 @@ def _save_card_state(state: PlanCardState) -> None:
                     # change here means the plan was started again →
                     # the card is rotated (see PlanCardState).
                     "last_execution_started_at": state.last_execution_started_at,
+                    # The workflow phase the notifier last saw, and the
+                    # terminal phase the card was rotated for. Absent in
+                    # card-state JSONs written before these fields
+                    # existed → loaded as None.
+                    "last_observed_phase": state.last_observed_phase,
+                    "last_terminal_phase": state.last_terminal_phase,
                 },
                 ensure_ascii=False,
             ),
@@ -932,6 +995,12 @@ class FeishuNotifier:
                 state.telegram_message_id = None
                 state.last_fingerprint = None
                 state.last_execution_started_at = started_at
+                # The run that is starting now is not the run that
+                # ended, so the terminal phase recorded for the old run
+                # must not block the NEW run's ending from getting its
+                # own card. Cleared here, and the terminal rotation
+                # clears it again for the non-terminal phases it sees.
+                state.last_terminal_phase = None
                 _save_card_state(state)
         except Exception:
             # Persistence failure must not break the watch — the next
@@ -952,6 +1021,130 @@ class FeishuNotifier:
             plan_id=plan_id,
             payload={"sub_kind": "execution_restarted"},
         ))
+        return True
+
+    def _maybe_rotate_card_for_terminal(
+        self, plan_id: str, phase: Any,
+    ) -> bool:
+        """Rotate the card when the plan has reached a TERMINAL phase.
+
+        The problem
+        -----------
+        A plan that runs for hours owns ONE card, and that card is
+        edited in place for the whole run. Meanwhile other plans are
+        started, restarted and finished, and each of those pushes its
+        own card — so the long-running plan's card drifts UP the chat
+        and out of sight. When it finally finishes, the result is
+        written into that same old message, which is nowhere near the
+        bottom of the chat any more: the operator never sees "it
+        finished".
+
+        The fix
+        -------
+        A plan that reaches a terminal phase (``completed`` /
+        ``failed`` / ``stopped`` / ``verification_passed`` /
+        ``verification_failed`` / ``archived``) gets a FRESH card
+        instead: the persisted message ids are cleared, so the next
+        push takes the "no message id yet" branch of the existing push
+        path and sends a NEW message — at the bottom of the chat,
+        where it is visible. No special case is added to
+        ``_push_to_feishu`` / ``_push_to_telegram``; the rotation is
+        what makes the existing path send a new card.
+
+        The rules
+        ---------
+        * **A terminal phase that differs from the one already
+          recorded** rotates. ``last_terminal_phase`` is what says
+          "this card already IS the card for that ending".
+        * **The same terminal phase seen again** rotates nothing — the
+          rotation is idempotent, and the watch and the push path both
+          look at the same plan repeatedly.
+        * **A non-terminal phase clears** ``last_terminal_phase``, so
+          "finished → started again → finished" gets a card for the
+          second ending too.
+        * **The first sighting of a plan that is ALREADY terminal**
+          only records the baseline and never rotates: a notifier
+          that has just started must not post a fresh card for every
+          finished plan in the tree. This is the same rule the
+          restart rotation follows, for the same reason.
+        * **The restart rotation clears** ``last_terminal_phase``: a
+          plan that was started again is running a NEW run, and that
+          run's ending is not the ending the old card was rotated for.
+
+        Returns True when a rotation happened.
+        """
+        key = str(phase or "").strip()
+        if not key:
+            # Nothing was observed — keep the pre-existing behaviour.
+            return False
+
+        try:
+            with self._states_lock:
+                state = self._states.get(plan_id)
+                if state is None:
+                    state = _load_card_state(plan_id)
+                    if state.chat_id is None:
+                        # Same resolution ``_handle_plan`` does for a
+                        # plan it has never seen: without it the plan
+                        # would be treated as "no chat id" and be
+                        # disabled permanently.
+                        state.chat_id = _resolve_chat_id(plan_id)
+                    self._states[plan_id] = state
+
+                first_sighting = state.last_observed_phase is None
+                prev_terminal = state.last_terminal_phase
+
+                changed = False
+                if state.last_observed_phase != key:
+                    state.last_observed_phase = key
+                    changed = True
+
+                if key not in TERMINAL_PHASES:
+                    # Not terminal: the plan is alive (or running
+                    # again), so a terminal phase seen earlier must not
+                    # block the NEXT ending from getting its own card.
+                    if state.last_terminal_phase is not None:
+                        state.last_terminal_phase = None
+                        changed = True
+                    if changed:
+                        _save_card_state(state)
+                    return False
+
+                if first_sighting:
+                    # First time this plan is seen AND it is already
+                    # over — record the baseline only.
+                    state.last_terminal_phase = key
+                    _save_card_state(state)
+                    return False
+
+                if prev_terminal == key:
+                    # The same ending seen again — idempotent.
+                    if changed:
+                        _save_card_state(state)
+                    return False
+
+                # A NEW ending. The card in the chat belongs to the
+                # run that just finished and has been scrolling past
+                # for hours: retire it, so the next push sends a fresh
+                # one at the bottom.
+                state.message_id = None
+                state.telegram_message_id = None
+                state.last_fingerprint = None
+                state.last_terminal_phase = key
+                _save_card_state(state)
+        except Exception:
+            # Persistence failure must not break the push path — the
+            # next tick retries. Never let this kill the tick.
+            logger.exception(
+                "[feishu_notifier] terminal card rotation failed for "
+                "plan=%s", plan_id,
+            )
+            return False
+
+        logger.warning(
+            "[feishu_notifier] plan=%s reached the terminal phase %s — "
+            "rotating the card", plan_id, key,
+        )
         return True
 
     def _watch_stale_cards(self) -> None:
@@ -1084,6 +1277,7 @@ class FeishuNotifier:
 
     def _drain_and_push(self, final_flush: bool = False) -> None:
         dirty: Dict[str, Set[str]] = {}
+        phases: Dict[str, str] = {}
         while True:
             try:
                 ev = self._queue.get_nowait()
@@ -1091,10 +1285,24 @@ class FeishuNotifier:
                 break
             kinds = dirty.setdefault(ev.plan_id, set())
             kinds.add(ev.kind)
+            # The phase the bus reported, when it reported one. The
+            # routing CAS publishes the new ``current_phase`` with the
+            # event, so the phase that ENDS the plan arrives together
+            # with the event that says so — the notifier does not have
+            # to go and read it back to know that the plan is over.
+            phase = (
+                ev.payload.get("phase")
+                if isinstance(ev.payload, dict) else None
+            )
+            if phase:
+                phases[ev.plan_id] = str(phase)
 
         for plan_id, kinds in dirty.items():
             try:
-                self._handle_plan(plan_id, kinds, final_flush=final_flush)
+                self._handle_plan(
+                    plan_id, kinds, final_flush=final_flush,
+                    phase_hint=phases.get(plan_id),
+                )
             except Exception:
                 logger.exception(
                     "[feishu_notifier] handle_plan %s failed", plan_id,
@@ -1102,6 +1310,7 @@ class FeishuNotifier:
 
     def _handle_plan(
         self, plan_id: str, kinds: Set[str], final_flush: bool,
+        phase_hint: Optional[str] = None,
     ) -> None:
         with self._states_lock:
             state = self._states.get(plan_id)
@@ -1128,6 +1337,21 @@ class FeishuNotifier:
                 or KIND_PLAN_RESTARTED in kinds
                 or final_flush
             )
+
+            # 2026-11-16 (the completion card has to land NOW): the
+            # phase the bus reported is read BEFORE the gate, because
+            # the gate would otherwise hold the terminal card back for
+            # up to a minute — and a plan that has just finished gets
+            # no further events, so a held card is a card that never
+            # arrives at all. The rotation that a terminal phase
+            # triggers also clears the message ids, so the push that
+            # follows it is a NEW card at the bottom of the chat
+            # instead of an edit of the one that has been scrolling
+            # past for hours.
+            if phase_hint:
+                if self._maybe_rotate_card_for_terminal(plan_id, phase_hint):
+                    bypass = True
+
             if (
                 not bypass
                 and state.last_push_ts is not None
@@ -1144,6 +1368,12 @@ class FeishuNotifier:
         )
         if card is None:
             return
+
+        # The phase the card was built from is the authority on where
+        # the plan is — the hint above is what the bus reported, this
+        # is what the plan says now. The rotation is idempotent, so
+        # running it for both sources is safe.
+        self._maybe_rotate_card_for_terminal(plan_id, phase)
 
         fp = card_fingerprint(card)
 

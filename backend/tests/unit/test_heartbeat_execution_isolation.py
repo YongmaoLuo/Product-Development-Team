@@ -98,10 +98,14 @@ def test_first_execution_plan_exception_does_not_skip_second(monkeypatch, caplog
     )
 
     # The failure is named: an unnamed failure would be a silent gap.
+    # ``server.logger.name`` rather than the literal "server": another
+    # case can load server.py under an alias, and server.py's
+    # ``sys.modules.setdefault("server", ...)`` then makes that alias
+    # module the canonical one — its logger keeps the alias name.
     error_messages = [
         r.getMessage()
         for r in caplog.records
-        if r.name == "server" and r.levelno >= logging.ERROR
+        if r.name == server.logger.name and r.levelno >= logging.ERROR
     ]
     assert any("e1" in m for m in error_messages), (
         "the log record must name the execution plan that failed; got "
@@ -181,7 +185,7 @@ def test_sub_agent_failure_does_not_escape_the_tick(monkeypatch, caplog):
     error_messages = [
         r.getMessage()
         for r in caplog.records
-        if r.name == "server" and r.levelno >= logging.ERROR
+        if r.name == server.logger.name and r.levelno >= logging.ERROR
     ]
     assert error_messages, (
         "the sub-agent sweep failure must be logged; caplog captured "
