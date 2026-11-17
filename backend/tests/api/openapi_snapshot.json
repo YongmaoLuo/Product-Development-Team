@@ -219,6 +219,19 @@
         "title": "CreateDecisionRequest",
         "type": "object"
       },
+      "ExtendWaitRequest": {
+        "description": "The body of ``POST /api/scheduler/{plan_id}/waits/{item_id}/extend``.\n\nThe number of seconds is declared ``Any`` on purpose.  A typed\n``int`` would let pydantic *coerce* ``\"3600\"`` into ``3600``, and a\nrequest that says ``\"3600\"`` is not a request that says a number of\nseconds \u2014 it is a request that says a string, and the answer to it\nis a refusal, not a guess.  The capacity knob above declares its\nnumber the same way, for the same reason.",
+        "properties": {
+          "seconds": {
+            "title": "Seconds"
+          }
+        },
+        "required": [
+          "seconds"
+        ],
+        "title": "ExtendWaitRequest",
+        "type": "object"
+      },
       "GeneratePRDRequest": {
         "properties": {
           "project_dir": {
@@ -504,6 +517,19 @@
           }
         },
         "title": "RevisePlanRequest",
+        "type": "object"
+      },
+      "SetDeadlineRequest": {
+        "description": "The body of ``PATCH /api/scheduler/{plan_id}/waits/{item_id}/deadline``.\n\nThe number of seconds is declared ``Any`` on purpose, for the same\nreason the extension's is: a typed ``int`` would let pydantic\n*coerce* ``\"3600\"`` into ``3600``, and a request that says\n``\"3600\"`` is not a request that says a number of seconds \u2014 it is a\nrequest that says a string, and the answer to it is a refusal, not\na guess.",
+        "properties": {
+          "remaining_seconds": {
+            "title": "Remaining Seconds"
+          }
+        },
+        "required": [
+          "remaining_seconds"
+        ],
+        "title": "SetDeadlineRequest",
         "type": "object"
       },
       "StartExecutionRequest": {
@@ -3350,6 +3376,251 @@
           }
         },
         "summary": "Get Scheduler State"
+      }
+    },
+    "/api/scheduler/{plan_id}/postprocess-spec": {
+      "get": {
+        "description": "Show one plan's requirement book.\n\nThe book is shown **as it is**: the editor is how an illegal book\ngets fixed, so the answer is the file's own content \u2014 not a\nprettified copy of it, and not the criteria the loader happens to\nunderstand.  A plan with no book answers 404: there is nothing to\nshow, and that is not a failure of the server.",
+        "operationId": "get_postprocess_spec_api_scheduler__plan_id__postprocess_spec_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Postprocess Spec"
+      },
+      "put": {
+        "description": "Write one plan's requirement book back.\n\nThe book is judged by the loader the finishing stage itself uses, so\nan edit the stage would refuse is refused here \u2014 and a refused edit\nwrites nothing, which leaves the book on disk exactly as the\nrunning round froze it.\n\nThe write is limited to **one file**: ``postprocess.json``.  The\nprogress file of a running round, the free-form companion and the\nplan's own tasks are none of this endpoint's business, and the\nwrite-back does not touch them.\n\nThe answer carries the fingerprint of the book that was written \u2014\nthe version the **next** round will freeze.  It says nothing about\nthe round that is running: that one kept the criteria it started\nwith.",
+        "operationId": "put_postprocess_spec_api_scheduler__plan_id__postprocess_spec_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "title": "Body"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Postprocess Spec"
+      }
+    },
+    "/api/scheduler/{plan_id}/waits/{item_id}/deadline": {
+      "patch": {
+        "description": "Put one waiting item's deadline where the operator says.\n\nThe extension pushes the deadline **out**; this puts it where the\noperator says it should be \u2014 a wait that is due in a week may be cut\nto two days, or pushed out to a month.  Both are the same field of\nthe same durable record, so the second one starts from what the\nfirst one wrote.\n\nThe answer says the deadline that was written down and how much\ntime is left on it, measured from the moment the deadline was set.\n\nA wait that is over cannot have its deadline moved.  That is a 409\nand not a 404: the item is known, and the wait is simply not\npending any more.",
+        "operationId": "set_wait_deadline_api_scheduler__plan_id__waits__item_id__deadline_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "title": "Item Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetDeadlineRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Wait Deadline"
+      }
+    },
+    "/api/scheduler/{plan_id}/waits/{item_id}/extend": {
+      "post": {
+        "description": "Push one waiting item's deadline out.\n\nThe extension is the operator saying \"this may take longer\", and the\nanswer says how much longer: the seconds that are left, and how many\ntimes the deadline has been pushed out.  Both are read out of the\npanel's own row, so the answer and the panel cannot disagree.\n\nA wait that is over cannot be extended.  That is a 409 and not a\n404: the item is known, and the wait is simply not pending any\nmore.",
+        "operationId": "extend_wait_api_scheduler__plan_id__waits__item_id__extend_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "title": "Item Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExtendWaitRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Extend Wait"
+      }
+    },
+    "/api/scheduler/{plan_id}/waits/{item_id}/terminate": {
+      "post": {
+        "description": "Give up on one waiting item.\n\nThe wait is over: it leaves the panel's waiting list, the question\nit asked is settled, and an answer that arrives afterwards is\nrefused rather than accepted.\n\nA wait that is over cannot be given up on twice.  That is a 409: the\noperator changed their mind, and the endpoint does not \u2014 a second\ntermination would leave two of them in the audit for one wait.",
+        "operationId": "terminate_wait_api_scheduler__plan_id__waits__item_id__terminate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "title": "Item Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Terminate Wait"
       }
     },
     "/api/system/active": {

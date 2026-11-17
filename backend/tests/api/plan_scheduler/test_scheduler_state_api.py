@@ -12,9 +12,17 @@ with a 404 (``{"detail": "Not found"}``) instead of the snapshot.
    the guard header is refused by the middleware before it reaches a
    handler, so a 403 here would mean the route sits outside the
    guarded surface; a 404 would mean the catch-all swallowed it.
-2. **The key set is closed.**  The document has exactly seven keys.  A
+2. **The key set is closed.**  The document has exactly eight keys.  A
    field that appears without being declared is a field the panel
-   cannot render and the LUI cannot rely on.
+   cannot render and the LUI cannot rely on.  The seventh key is
+   ``waiting`` — the finishing stage's waits, which
+   ``routes.scheduler._state_with_waiting`` merges into the very
+   document ``plan_scheduler.snapshot.build`` assembled.  The panel's
+   waiting block and its terminal block therefore read **one** read
+   model, and the two can be checked against each other here.  The
+   eighth key is ``parked`` — the plans stopped for want of provider
+   capacity, which hold no slot and are in no line, so neither the
+   queue nor the running line can ever name them.
 3. **The queue is in the production order.**  The rows come back
    sorted by ``plan_scheduler.queue.queue_key`` — the comparator the
    admission check uses — and the position of each row counts from
@@ -34,6 +42,32 @@ Two further pins ride along: the route is registered **ahead of** the
 catch-all (the registration order is what the 404 above is made of),
 and the route module does not open a database of its own — it reads
 the engine's snapshot and nothing else.
+
+The read model and the report
+-----------------------------
+Four places carry the shape this file pins, and they are named here so
+that a reader of a failure knows where the truth lives:
+
+* ``plan_scheduler.snapshot.build`` — the **eight-key** document:
+  ``capacity``, ``queue_length``, ``over_capacity``, ``queue``,
+  ``running``, ``waiting``, ``parked`` and ``generated_at``.
+* ``plan_scheduler.snapshot.WAITING_KEYS`` — the **eight-key** waiting
+  row: ``plan_id``, ``item_id``, ``wait_type``, ``question``,
+  ``deadline``, ``remaining_seconds``, ``extendable`` and
+  ``extensions_count``.
+* ``plan_scheduler.snapshot.postprocess_summary`` — the terminal
+  summary, read **straight** out of ``postprocess_report.json`` and
+  carrying three of its fields: ``spec_sha256``, ``terminal_status``
+  and ``item_verdicts``.
+* ``routes.scheduler._state_with_waiting`` — the route's handover of
+  that same read model to the panel: the waiting list the panel's
+  waiting block draws, and the terminal summary its terminal block
+  draws, come out of one model.
+
+Every key set asserted below is an **exact** one — equality, never
+``issubset``.  A subset assertion would still pass when a field was
+added, and adding a field is precisely the thing that has to be a
+decision somebody made on purpose.
 
 The guard header
 ----------------
@@ -112,13 +146,24 @@ STATE_PATH = "/api/scheduler/state"
 #: is a route that was registered too late.
 CATCH_ALL_PATH = "/{path:path}"
 
-#: The seven keys the read model carries — and no others.
+#: The eight keys the read model carries — and no others.
+#:
+#: The seventh is ``waiting``: the finishing stage's waits, merged into
+#: the document by ``routes.scheduler._state_with_waiting``.  It is a
+#: list, and it is always there — the panel reads it by name whether
+#: anything is waiting or not.
+#:
+#: The eighth is ``parked``: the plans stopped for want of provider
+#: capacity.  It is a list too, and it is always there — a plan parked
+#: for quota holds no slot and is in no line, so the read model is the
+#: only place that can name it.
 EXPECTED_KEYS = {
     "capacity",
     "queue_length",
     "over_capacity",
     "queue",
     "running",
+    "waiting",
     "parked",
     "generated_at",
 }
@@ -232,11 +277,21 @@ def test_state_returns_200_not_catchall(install_engine):
 
 
 def test_state_key_set_closed(install_engine):
-    """The document has exactly seven keys.
+    """The document has exactly eight keys.
 
     A field that appears without being declared is a field the panel
     cannot render and the LUI cannot rely on, so the set is asserted
     exactly — in both directions.
+
+    The seventh key is ``waiting`` — the finishing stage's waits, which
+    ``routes.scheduler._state_with_waiting`` merges into the document
+    that ``plan_scheduler.snapshot.build`` assembled.  The panel's
+    waiting block and its terminal block read one read model, and this
+    is where the two are checked against each other.
+
+    The eighth key is ``parked`` — the plans stopped for want of
+    provider capacity, which hold no slot and are in no line, so the
+    read model is the only place that can name them.
 
     The rows carry two more fields than the document does: the
     ``phase`` — the routing layer's own word for what the plan is
@@ -290,6 +345,49 @@ def test_state_key_set_closed(install_engine):
         "phase",
         "phase_label",
     }, sorted(body["running"][0])
+
+
+def test_state_key_set_is_the_eight_key_contract(install_engine):
+    """The live document carries the eight names — written out here.
+
+    ``EXPECTED_KEYS`` is the constant the other cases compare against,
+    and a constant can be edited in the same commit as the code that
+    produced it: when the two drift together, the comparison still
+    passes and the contract has quietly changed.  So this case writes
+    the eight names out **literally** and does not read
+    ``EXPECTED_KEYS`` at all — the contract itself is pinned here, and
+    a change to any of the eight names has to be a decision somebody
+    made on purpose.
+
+    The seventh name is ``waiting``: the finishing stage's waits, which
+    ``routes.scheduler._state_with_waiting`` merges into the document
+    ``plan_scheduler.snapshot.build`` assembled.  It is a list, and it
+    is a list whether anything is waiting or not — the panel's waiting
+    block and its terminal block read one read model, and this is where
+    the two are checked against each other.
+
+    The eighth name is ``parked``: the plans stopped for want of
+    provider capacity.  It is a list as well, and it is a list whether
+    anything is parked or not.
+    """
+    install_engine({"capacity": 4, "used": 0, "queue": [], "running": []})
+
+    response = client.get(STATE_PATH)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert set(body) == {
+        "capacity",
+        "queue_length",
+        "over_capacity",
+        "queue",
+        "running",
+        "waiting",
+        "parked",
+        "generated_at",
+    }, sorted(body)
+    assert isinstance(body["waiting"], list), body["waiting"]
+    assert isinstance(body["parked"], list), body["parked"]
 
 
 # ---------------------------------------------------------------------------
@@ -395,7 +493,7 @@ def test_state_broken_engine_answers_empty_not_500(monkeypatch):
 def test_state_non_document_snapshot_answers_empty_not_500(monkeypatch):
     """An engine that answers with something that is not a document.
 
-    The read model is a document with seven keys, and the panel reads
+    The read model is a document with eight keys, and the panel reads
     those keys by name.  An engine that hands back something else —
     ``None`` today, a list tomorrow — has not answered the question,
     and a document that is not the read model would leave the panel

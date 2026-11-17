@@ -8,7 +8,7 @@
     <meta http-equiv="Expires" content="0">
     <title>Spec-Driven Dev System</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%234f46e5'/%3E%3Ctext x='8' y='12' font-size='10' text-anchor='middle' fill='white' font-family='sans-serif'%3ES%3C/text%3E%3C/svg%3E">
-    <link rel="stylesheet" href="style.css?v=15">
+    <link rel="stylesheet" href="style.css?v=16">
 </head>
 <body>
     <div id="app-layout">
@@ -158,6 +158,29 @@
                     <tbody id="scheduler-queue-list"></tbody>
                 </table>
 
+                <!-- The waiting list: what the operator is waiting for.
+                     The row carries the question itself, the time left
+                     on it, and the three operations — 延长 / 终止 / 回答.
+                     The three are commands against three server paths;
+                     the answer one reuses the existing HITL path. -->
+                <h3 class="scheduler-subtitle scheduler-waiting-subtitle">等待中</h3>
+                <div id="scheduler-waiting-empty" class="empty-state">
+                    <p>没有等待中的条目</p>
+                </div>
+                <table id="scheduler-waiting-table" class="scheduler-table scheduler-waiting-table hidden">
+                    <thead>
+                        <tr>
+                            <th>计划</th>
+                            <th>条目</th>
+                            <th>类型</th>
+                            <th>剩余</th>
+                            <th>问题</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="scheduler-waiting-body"></tbody>
+                </table>
+
                 <h3 class="scheduler-subtitle scheduler-terminal-subtitle">终态计划</h3>
                 <div id="scheduler-terminal-empty" class="empty-state">
                     <p>没有终态计划</p>
@@ -172,6 +195,23 @@
                     </thead>
                     <tbody id="scheduler-terminal-list"></tbody>
                 </table>
+
+                <!-- The requirement sheet (要求书): read it, edit it,
+                     write it back.  The write only lands on
+                     plans/{id}/postprocess.json — and a plan that is
+                     already being finished keeps this round's frozen
+                     sheet, so an edit here changes the *next* round. -->
+                <h3 class="scheduler-subtitle scheduler-spec-subtitle">要求书</h3>
+                <div id="scheduler-spec-editor" class="scheduler-spec-editor">
+                    <div class="scheduler-spec-head">
+                        <label class="scheduler-spec-label" for="scheduler-spec-plan">计划</label>
+                        <input id="scheduler-spec-plan" class="scheduler-spec-plan" type="text" autocomplete="off" placeholder="计划 ID" />
+                        <button id="btn-scheduler-spec-load" class="btn btn-outline">查看</button>
+                        <button id="btn-scheduler-spec-save" class="btn">保存</button>
+                        <span id="scheduler-spec-message" class="scheduler-spec-message"></span>
+                    </div>
+                    <textarea id="scheduler-spec-text" class="scheduler-spec-text" rows="10" spellcheck="false" placeholder="要求书（postprocess.json）"></textarea>
+                </div>
             </section>
 
             <!-- Interview view -->
@@ -414,6 +454,6 @@
         </main>
     </div>
 
-    <script src="app.js?v=18"></script>
+    <script src="app.js?v=19"></script>
 </body>
 </html>

@@ -3214,6 +3214,159 @@ function renderSchedulerRunning(snapshot) {
     schedulerToggle($("#scheduler-running-empty"), rows.length === 0);
 }
 
+// --- The waiting list ---
+//
+// The read model carries a third list beside the queue and the
+// running plans: the **waits** — the finishing stage's own waiting
+// rows.  Until this block existed, the whole of that story on this
+// page was four characters in the queue's reason column
+// (「等待人工回答」): the question was nowhere, the time left on it
+// was nowhere, and there was no way to act on it from here.
+//
+// A wait is not a queued plan.  A queued plan waits for a slot; a
+// wait waits for a person, and only a person can settle it.  So the
+// waiting list is drawn as its own table, with the question in it —
+// the operator must be able to read *what* they are being asked
+// without leaving the page.
+//
+// The three operations are the three the architecture decided on
+// (architecture decision point 6): 延长 and 终止 are the scheduler's
+// own wait endpoints, and 回答 reuses the existing HITL answer path
+// rather than growing a second approval channel.  A second channel
+// would be a second answer to the same question, and the operator
+// would have no way of telling which one the server is using.
+
+/** The kind of wait, in the words an operator reads.  The vocabulary
+    is the server's (``postprocess.waits.WAIT_TYPES``) — a human wait
+    and an external one.  A word outside the map is drawn as the word
+    itself: never as an empty cell, and never as a guess. */
+const SCHEDULER_WAIT_TYPE_TEXT = {
+    human: "人工",
+    external: "外部",
+};
+
+/** How much time 延长 pushes a wait's deadline out by.
+
+    One hour is enough to finish the thing the question is about, and
+    short enough that a wait nobody comes back to still expires on its
+    own. */
+const SCHEDULER_WAIT_EXTEND_SECONDS = 3600;
+
+/** How much of the question the cell shows.
+
+    This shortens what the **eye** reads in a narrow column and
+    nothing else: the whole question stays in the row's ``title``,
+    because a question the operator cannot read in full is a question
+    nobody can answer. */
+const SCHEDULER_QUESTION_MAX = 80;
+
+/** The kind of wait, as the panel draws it. */
+function schedulerWaitingTypeText(waitType) {
+    if (waitType === null || waitType === undefined) return "—";
+    const word = String(waitType);
+    return SCHEDULER_WAIT_TYPE_TEXT[word] || word;
+}
+
+/** How long a wait has left, in the words an operator reads.
+
+    The countdown is the wait's own clock.  Zero is zero seconds — not
+    a dash and not "unknown": the read model answers zero for a
+    deadline that has passed and for one it could not read, and the
+    panel draws the number it was given rather than a second opinion
+    of its own. */
+function schedulerRemainingText(seconds) {
+    if (seconds === null || seconds === undefined) return "—";
+    const total = Number(seconds);
+    if (!Number.isFinite(total)) return "—";
+    const value = Math.max(0, Math.floor(total));
+    if (value >= 86400) {
+        const days = Math.floor(value / 86400);
+        const hours = Math.floor((value % 86400) / 3600);
+        return hours ? `${days}天${hours}小时` : `${days}天`;
+    }
+    if (value >= 3600) {
+        const hours = Math.floor(value / 3600);
+        const minutes = Math.floor((value % 3600) / 60);
+        return minutes ? `${hours}小时${minutes}分` : `${hours}小时`;
+    }
+    if (value >= 60) {
+        const minutes = Math.floor(value / 60);
+        const rest = value % 60;
+        return rest ? `${minutes}分${rest}秒` : `${minutes}分`;
+    }
+    return `${value}秒`;
+}
+
+/** The question as the cell shows it — shortened for the eye only.
+    The whole question stays in the row's ``title``. */
+function schedulerQuestionText(question) {
+    const text = question === null || question === undefined ? "" : String(question);
+    if (text.length <= SCHEDULER_QUESTION_MAX) return text;
+    return text.slice(0, SCHEDULER_QUESTION_MAX) + "…";
+}
+
+/** The waiting list — what the operator is actually waiting for.
+
+    The row carries the plan, the item, the kind of wait, the time
+    left and the question itself, plus the three operations.  The
+    order is the read model's own; the panel does not sort the waits
+    either.
+
+    An empty list is an empty state, not an error: "nothing is
+    waiting" is a normal thing to look at. */
+function renderSchedulerWaiting(snapshot) {
+    const rows = snapshot && Array.isArray(snapshot.waiting) ? snapshot.waiting : [];
+    const body = $("#scheduler-waiting-body");
+    if (!body) return;
+
+    if (!rows.length) {
+        body.innerHTML = "";
+        schedulerToggle($("#scheduler-waiting-table"), false);
+        schedulerToggle($("#scheduler-waiting-empty"), true);
+        return;
+    }
+
+    body.innerHTML = rows
+        .map((row) => {
+            const item = row || {};
+            const planId = item.plan_id ? String(item.plan_id) : "";
+            const itemId = item.item_id ? String(item.item_id) : "";
+            const question =
+                item.question === null || item.question === undefined ? "" : String(item.question);
+            // A wait that is no longer pending cannot be pushed out.
+            // The server refuses such an extension with a conflict,
+            // so the button says so before the operator presses it.
+            const extendable = item.extendable !== false;
+            // Only a **human** wait has somebody to answer it: an
+            // external wait is rechecked by the system, and offering
+            // an answer for it would be an answer to nobody.
+            const answerable = item.wait_type === "human";
+            const extendTitle = `延长 ${SCHEDULER_WAIT_EXTEND_SECONDS / 3600} 小时`;
+
+            const buttons = [
+                `<button class="btn btn-outline scheduler-action scheduler-waiting-action" data-action="extend" data-plan="${escapeHtml(planId)}" data-item="${escapeHtml(itemId)}" title="${escapeHtml(extendTitle)}"${extendable ? "" : " disabled"}>延长</button>`,
+                `<button class="btn btn-outline scheduler-action scheduler-waiting-action" data-action="terminate" data-plan="${escapeHtml(planId)}" data-item="${escapeHtml(itemId)}">终止</button>`,
+            ];
+            if (answerable) {
+                buttons.push(`<input class="scheduler-waiting-answer" type="text" placeholder="回答" data-plan="${escapeHtml(planId)}" data-item="${escapeHtml(itemId)}" />`);
+                buttons.push(`<button class="btn btn-outline scheduler-action scheduler-waiting-action" data-action="answer" data-plan="${escapeHtml(planId)}" data-item="${escapeHtml(itemId)}">回答</button>`);
+            }
+
+            return `<tr data-plan-id="${escapeHtml(planId)}" data-item-id="${escapeHtml(itemId)}">
+                <td>${escapeHtml(planId || "—")}</td>
+                <td>${escapeHtml(itemId || "—")}</td>
+                <td>${escapeHtml(schedulerWaitingTypeText(item.wait_type))}</td>
+                <td>${escapeHtml(schedulerRemainingText(item.remaining_seconds))}</td>
+                <td class="scheduler-waiting-question" title="${escapeHtml(question)}">${escapeHtml(schedulerQuestionText(question))}</td>
+                <td class="scheduler-row-actions">${buttons.join(" ")}</td>
+            </tr>`;
+        })
+        .join("");
+
+    schedulerToggle($("#scheduler-waiting-table"), true);
+    schedulerToggle($("#scheduler-waiting-empty"), false);
+}
+
 /** The phase a plan is in: the routing phase when the listing carries
     one, and the listing's own bucket otherwise. */
 function schedulerPlanPhase(plan) {
@@ -3269,6 +3422,7 @@ function renderScheduler(snapshot) {
     renderSchedulerCapacity(data);
     renderSchedulerQueue(data);
     renderSchedulerRunning(data);
+    renderSchedulerWaiting(data);
     // The cards are written folded; the ones the operator opened are
     // re-opened here, so a repaint does not close them under the
     // operator's eyes.
@@ -3625,8 +3779,107 @@ async function schedulerRerunVerification(planId) {
     }
 }
 
+/** Push a wait's deadline out.
+
+    The command is the scheduler's own wait endpoint — the panel does
+    not write a deadline itself, and it does not read one back: the
+    read model is the only source of "how much time is left". */
+async function schedulerExtendWait(planId, itemId) {
+    try {
+        const result = await api(
+            `/scheduler/${encodeURIComponent(planId)}/waits/${encodeURIComponent(itemId)}/extend`,
+            {
+                method: "POST",
+                body: JSON.stringify({ seconds: SCHEDULER_WAIT_EXTEND_SECONDS }),
+            },
+        );
+        await schedulerActionDone({ outcome: "applied", detail: result });
+        return result;
+    } catch (err) {
+        renderSchedulerError(err);
+        throw err;
+    }
+}
+
+/** Terminate a wait.
+
+    A terminated wait is final: it is never expired, and a late
+    answer to it is refused.  So the command is a command, and its
+    answer says what it did — not that it was accepted. */
+async function schedulerTerminateWait(planId, itemId) {
+    try {
+        const result = await api(
+            `/scheduler/${encodeURIComponent(planId)}/waits/${encodeURIComponent(itemId)}/terminate`,
+            {
+                method: "POST",
+                body: JSON.stringify({}),
+            },
+        );
+        await schedulerActionDone({ outcome: "applied", detail: result });
+        return result;
+    } catch (err) {
+        renderSchedulerError(err);
+        throw err;
+    }
+}
+
+/** The HITL decision a wait is answered through.
+
+    The waiting row carries the wait's ``item_id``; the HITL decision
+    row carries that very id in its ``task_id`` — the finishing stage
+    writes its question into the **existing** HITL table rather than
+    growing a second one.  So the panel finds the decision by that id
+    and answers it: it never guesses a decision id, and the plan in
+    the path keeps the answer inside the plan it belongs to. */
+async function schedulerWaitDecisionId(planId, itemId) {
+    const decisions = await api(
+        `/hitl/${encodeURIComponent(planId)}/decisions?status=pending`,
+    );
+    const rows = Array.isArray(decisions) ? decisions : [];
+    const match = rows.find(
+        (decision) => decision && String(decision.task_id || "") === String(itemId),
+    );
+    return match ? String(match.decision_id || "") : "";
+}
+
+/** Answer a human wait through the existing HITL path.
+
+    The answer is the operator's own text.  The HITL route stores the
+    option as it was given — which of the offered options it is is
+    not the route's business to decide — so what is typed here is
+    what is written down. */
+async function schedulerAnswerWait(planId, itemId, option) {
+    try {
+        const decisionId = await schedulerWaitDecisionId(planId, itemId);
+        if (!decisionId) {
+            throw new Error("该等待没有可回答的人工决策");
+        }
+        const result = await api(
+            `/hitl/${encodeURIComponent(planId)}/decisions/${encodeURIComponent(decisionId)}/answer`,
+            {
+                method: "POST",
+                body: JSON.stringify({ option: option }),
+            },
+        );
+        await schedulerActionDone({ outcome: "applied", detail: result });
+        return result;
+    } catch (err) {
+        renderSchedulerError(err);
+        throw err;
+    }
+}
+
+/** The answer the operator typed into one waiting row. */
+function schedulerWaitingAnswerText(planId, itemId) {
+    const inputs = Array.from($$(".scheduler-waiting-answer"));
+    const match = inputs.find(
+        (input) => input.dataset.plan === planId && input.dataset.item === itemId,
+    );
+    return match ? String(match.value || "").trim() : "";
+}
+
 /** Carry out the action a button asks for. */
-async function schedulerRunAction(action, planId) {
+async function schedulerRunAction(action, planId, itemId) {
     try {
         if (action === "promote") {
             await schedulerPromote(planId);
@@ -3638,6 +3891,17 @@ async function schedulerRunAction(action, planId) {
             await schedulerStart(planId);
         } else if (action === "rerun-verification") {
             await schedulerRerunVerification(planId);
+        } else if (action === "extend") {
+            await schedulerExtendWait(planId, itemId);
+        } else if (action === "terminate") {
+            await schedulerTerminateWait(planId, itemId);
+        } else if (action === "answer") {
+            const option = schedulerWaitingAnswerText(planId, itemId);
+            if (!option) {
+                renderSchedulerError(new Error("请先填写回答内容"));
+                return;
+            }
+            await schedulerAnswerWait(planId, itemId, option);
         }
     } catch {
         // The failure is already on screen in the action-result box.
@@ -3654,8 +3918,101 @@ function bindSchedulerActions() {
         const button = target && target.closest ? target.closest(".scheduler-action") : null;
         if (!button) return;
         event.preventDefault();
-        schedulerRunAction(button.dataset.action, button.dataset.plan);
+        schedulerRunAction(button.dataset.action, button.dataset.plan, button.dataset.item);
     });
+}
+
+// --- The requirement sheet (要求书) ---
+//
+// The finishing stage runs against a frozen **requirement sheet**:
+// the plan's own `postprocess.json`.  The panel is where an operator
+// reads it and corrects it — and the correction has to be written
+// back to the plan's file, because the file is what the next freezing
+// round reads.
+//
+// Two rules, and both of them come from the server:
+//
+//   * the write lands on `plans/{id}/postprocess.json` and on nothing
+//     else — so the panel sends one document, and the server decides
+//     where it goes;
+//   * a plan that is already being finished keeps **this** round's
+//     frozen sheet.  An edit made now is the *next* round's sheet, and
+//     the panel says so rather than pretending the round changed.
+//
+// A failed save is never silent: a save that failed quietly leaves
+// the operator believing a sheet was written that was not.
+
+/** Say something in the requirement sheet's own message line. */
+function schedulerSpecMessage(text, isError) {
+    const box = $("#scheduler-spec-message");
+    if (!box) return;
+    box.textContent = text;
+    box.classList.toggle("error", Boolean(isError));
+}
+
+/** The plan the requirement sheet belongs to. */
+function schedulerSpecPlanId() {
+    const input = $("#scheduler-spec-plan");
+    return input ? String(input.value || "").trim() : "";
+}
+
+/** Read a plan's requirement sheet into the editor.
+
+    The sheet is shown as it is — the operator edits what the next
+    freezing round will read, so nothing is prettified away. */
+async function loadPostprocessSpec(planId) {
+    const editor = $("#scheduler-spec-text");
+    const target = String(planId || "").trim();
+    if (!target) {
+        schedulerSpecMessage("请先填写计划 ID", true);
+        return null;
+    }
+    try {
+        const spec = await api(`/scheduler/${encodeURIComponent(target)}/postprocess-spec`);
+        if (editor) editor.value = JSON.stringify(spec, null, 2);
+        schedulerSpecMessage("要求书已载入", false);
+        return spec;
+    } catch (err) {
+        schedulerSpecMessage(
+            `读取失败：${err && err.message ? err.message : "未知错误"}`,
+            true,
+        );
+        throw err;
+    }
+}
+
+/** Write the requirement sheet back to the plan.
+
+    The editor holds JSON, so a text that is not JSON is refused here
+    — before the server ever sees it — and a refused write says so. */
+async function savePostprocessSpec(planId) {
+    const editor = $("#scheduler-spec-text");
+    const target = String(planId || "").trim();
+    if (!target) {
+        schedulerSpecMessage("请先填写计划 ID", true);
+        return null;
+    }
+    let spec;
+    try {
+        spec = JSON.parse(editor ? editor.value : "");
+    } catch {
+        schedulerSpecMessage("要求书不是合法的 JSON，未保存", true);
+        return null;
+    }
+    try {
+        const result = await api(`/scheduler/${encodeURIComponent(target)}/postprocess-spec`, {
+            method: "PUT",
+            body: JSON.stringify(spec),
+        });
+        schedulerSpecMessage("要求书已保存（收尾中的计划从下一轮起采用）", false);
+        return result;
+    } catch (err) {
+        schedulerSpecMessage(
+            `保存失败：${err && err.message ? err.message : "未知错误"}`,
+            true,
+        );
+        throw err;
+    }
 }
 
 /** One listener for every card header: the cards are drawn by the
@@ -3997,6 +4354,23 @@ function init() {
         }
     });
     bindSchedulerActions();
+    // The requirement sheet: 查看 reads it, 保存 writes it back.  Both
+    // failures are already on screen in the editor's own message line,
+    // so neither is swallowed here.
+    safeBind("#btn-scheduler-spec-load", "click", async () => {
+        try {
+            await loadPostprocessSpec(schedulerSpecPlanId());
+        } catch {
+            // The failure is already on screen in the spec editor's message line.
+        }
+    });
+    safeBind("#btn-scheduler-spec-save", "click", async () => {
+        try {
+            await savePostprocessSpec(schedulerSpecPlanId());
+        } catch {
+            // The failure is already on screen in the spec editor's message line.
+        }
+    });
     bindSchedulerCards();
 
     // Initial load.  None of these is waited for — they are fired and

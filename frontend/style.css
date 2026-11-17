@@ -1554,6 +1554,104 @@ main#app > .loading {
 
 .scheduler-action-none { color: var(--text-dim); }
 
+/* The waiting list: the question, the time left, and the three
+   operations.  The question column is capped so one long question
+   cannot push the operations off the screen — the whole question is
+   still in the cell's title. */
+.scheduler-waiting-table {
+    width: 100%;
+}
+
+.scheduler-waiting-question {
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.scheduler-waiting-answer {
+    padding: 4px 8px;
+    font-size: 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--text);
+    min-width: 140px;
+}
+
+.scheduler-waiting-answer:focus {
+    outline: none;
+    border-color: var(--primary);
+}
+
+.scheduler-waiting-action[disabled] {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* The requirement sheet (要求书): the plan it belongs to, the sheet
+   itself, and the line that says what the last read or write did. */
+.scheduler-spec-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 16px;
+}
+
+.scheduler-spec-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.scheduler-spec-label {
+    font-size: 12px;
+    color: var(--text-dim);
+}
+
+.scheduler-spec-plan {
+    padding: 4px 8px;
+    font-size: 13px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--text);
+    min-width: 200px;
+}
+
+.scheduler-spec-plan:focus {
+    outline: none;
+    border-color: var(--primary);
+}
+
+.scheduler-spec-text {
+    width: 100%;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 10px 12px;
+    color: var(--text);
+    font-size: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    resize: vertical;
+    min-height: 120px;
+}
+
+.scheduler-spec-text:focus {
+    outline: none;
+    border-color: var(--primary);
+}
+
+.scheduler-spec-message {
+    font-size: 12px;
+    color: var(--text-dim);
+}
+
+.scheduler-spec-message.error {
+    color: var(--danger);
+}
+
 /* What the last command did, in the command's own words. */
 .scheduler-action-result {
     display: flex;

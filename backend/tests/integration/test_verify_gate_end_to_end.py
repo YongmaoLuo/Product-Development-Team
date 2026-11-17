@@ -484,8 +484,12 @@ def test_end_to_end_ui_and_gates(tmp_path, acceptance_summary):
                     page.click("#btn-new-plan")
 
                     try:
+                        # 点名新建计划流程真正的那个输入框：页面别处也有
+                        # 文本输入（调度面板的计划 ID，默认隐藏），通用的
+                        # "textarea, input[type=text]" 会解析到那个隐藏元素
+                        # 上、永远等不到它可见。
                         handle = page.wait_for_selector(
-                            "textarea, input[type=text]",
+                            "#interview-input",
                             timeout=INPUT_TIMEOUT_MS,
                         )
                     except PlaywrightTimeoutError:

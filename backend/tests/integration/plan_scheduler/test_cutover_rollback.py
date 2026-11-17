@@ -169,10 +169,27 @@ GLOBAL_SCHEDULER_PATHS = (
 #: 路由，闸门从此再也拦不住真正的新全局路由。
 PER_PLAN_SCHEDULER_PREFIX = "/api/scheduler/plan/"
 
+#: 2026-11-17：收尾阶段的分支新增了按计划的路由前缀
+#: ``/api/scheduler/{plan_id}...``（``postprocess-spec`` 的读/写，以及等待
+#: 条目的 extend / terminate / deadline）。它们回答的是**一个计划**的事 ——
+#: 路径里就带着 ``{plan_id}`` —— 但前缀不是 ``/api/scheduler/plan/``，闸门
+#: 因此打红。
+#:
+#: 与 2026-11-02 那次一样：认成「按计划」，而不是塞进
+#: ``GLOBAL_SCHEDULER_PATHS``。后者会把一条关于单个计划的路由伪装成全局
+#: 路由，闸门从此再也拦不住真正的新全局路由。
+#:
+#: 放宽的**只有**这个前缀：``/api/scheduler/`` 下不带 ``{plan_id}`` 的新
+#: 路由仍然打红，开关判定（``SWITCH_WORDS``）也一个字没动。
+PER_PLAN_SCHEDULER_PREFIXES = (
+    PER_PLAN_SCHEDULER_PREFIX,
+    "/api/scheduler/{plan_id",
+)
+
 
 def _is_per_plan_scheduler_path(path: str) -> bool:
     """Whether a scheduler route answers about one particular plan."""
-    return str(path).startswith(PER_PLAN_SCHEDULER_PREFIX)
+    return any(str(path).startswith(prefix) for prefix in PER_PLAN_SCHEDULER_PREFIXES)
 
 
 #: A switch word as a whole word.  ``schedulerToggle`` is a helper that
@@ -1112,6 +1129,18 @@ def test_no_global_toggle_in_ui_or_api(server_module) -> None:
     )
     assert not _is_per_plan_scheduler_path("/api/scheduler/enabled"), (
         "the per-plan predicate mistakes a global switch for a per-plan route"
+    )
+    # 2026-11-17: 放宽的只是 ``/api/scheduler/{plan_id...}`` 这一个前缀 ——
+    # 带计划 id 的按计划路由要认出来，而不带计划 id 的新全局路由仍然要打红。
+    assert _is_per_plan_scheduler_path(
+        "/api/scheduler/{plan_id:path}/postprocess-spec"
+    ), (
+        "the per-plan predicate does not recognise the finishing stage's "
+        "per-plan route as a per-plan route"
+    )
+    assert not _is_per_plan_scheduler_path("/api/scheduler/global-thing"), (
+        "the per-plan predicate mistakes a global scheduler route for a "
+        "per-plan route"
     )
 
     # -- the frontend -----------------------------------------------------

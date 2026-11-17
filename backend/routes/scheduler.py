@@ -24,6 +24,13 @@ not "accepted", and not a promise.  The response body says what happened
 (``outcome``), which command did it (``command_id``), and the detail that
 says how (``detail``).
 
+``POST /api/scheduler/{plan_id}/waits/{item_id}/{extend|terminate}`` —
+the two actions the operator panel offers on a **waiting row**: push the
+deadline out, or give up on the wait.  Both change the plan's own
+finishing state, and both are carried out through the one lifecycle that
+owns a wait — the answer says what the change did to the wait, not that
+the change was accepted.
+
 The document is not assembled here
 ----------------------------------
 :func:`plan_scheduler.snapshot.build` assembles the read model, from the
@@ -43,11 +50,11 @@ command's own vocabulary of outcomes becomes an HTTP status code and a
 document, and the rules of that translation are the same for all four
 actions.
 
-The seven keys
+The eight keys
 --------------
 ``capacity``, ``queue_length``, ``over_capacity``, ``queue``,
-``running``, ``parked`` and ``generated_at`` — the document the panel
-renders andthe LUI reports.  The list lives in
+``running``, ``waiting``, ``parked`` and ``generated_at`` — the document
+the panel renders andthe LUI reports.  The list lives in
 :func:`plan_scheduler.snapshot.build`, which is the only place it is
 written down; this module does not repeat it, because a second copy of
 the key set is a second thing to keep in step with the first.
@@ -182,15 +189,24 @@ reserved for a fault of the scheduler's own.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import tempfile
 from collections.abc import Mapping
-from datetime import datetime, timezone
-from typing import Any, Dict, FrozenSet, List, Optional
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, FrozenSet, Iterator, List, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import JSONResponse
+from filelock import FileLock, Timeout
 from pydantic import BaseModel, Field
 
+from config_paths import resolve_plans_dir, resolve_state_db_path
+from file_lock_protocol import locks_dir_for_plan
+from hitl.store import HitlStore
 from plan_scheduler.commands import (
     APPLIED,
     BLOCKED_BY_CAPACITY,
@@ -202,6 +218,32 @@ from plan_scheduler.commands import (
 from plan_scheduler.capacity import CAPACITY_OVERRIDE_KEY
 from plan_scheduler.engine import FAILED, PENDING_ANSWER
 from plan_scheduler.snapshot import build
+
+# The finishing stage's waiting lifecycle.  The registry is the one
+# thing that may move a deadline, append an audit entry or give up on
+# a wait, and the progress module is the one thing that may write the
+# record it keeps.  Both are imported here rather than reached
+# through the orchestrator, because an endpoint that changes a wait
+# must not go through the stage that *asks* the question.
+from postprocess.progress import (
+    PROGRESS_FILENAME,
+    ProgressError,
+    load_progress,
+    progress_path,
+)
+from postprocess.waits import (
+    PENDING,
+    WAIT_TYPES,
+    WaitConflict,
+    WaitError,
+    WaitRegistry,
+)
+
+# The requirement book — the only input the finishing stage judges
+# against.  The loader is imported here so that an edit made through
+# the panel is judged by the very rules the stage itself applies: a
+# book the stage would refuse must not be written back.
+from postprocess.spec import SPEC_FILENAME, Spec, SpecError, freeze, load_spec
 
 # Late binding into the application module: ``server`` owns the shared
 # helpers (notably ``_plan_dir``, the one place a request-supplied plan id
@@ -269,7 +311,7 @@ def _empty_snapshot() -> Dict[str, Any]:
     """The idle scheduler's read model.
 
     Assembled by the production builder out of an empty state, so the
-    idle document has the very same seven keys as a busy one — a caller
+    idle document has the very same eight keys as a busy one — a caller
     does not have to branch on "is there anything to show" before it
     can read the answer.
     """
@@ -357,7 +399,7 @@ def get_scheduler_state(request: Request) -> Dict[str, Any]:
     engine = getattr(request.app.state, "scheduler_engine", None)
 
     if engine is None:
-        return _with_phase_labels(_empty_snapshot())
+        return _state_with_waiting(_with_phase_labels(_empty_snapshot()))
 
     try:
         snapshot = engine.snapshot()
@@ -366,11 +408,11 @@ def get_scheduler_state(request: Request) -> Dict[str, Any]:
         # as far as the panel is concerned — and the panel must keep
         # answering.  The failure is logged rather than swallowed.
         logger.exception("the scheduler's snapshot could not be read")
-        return _with_phase_labels(_empty_snapshot())
+        return _state_with_waiting(_with_phase_labels(_empty_snapshot()))
 
     if not isinstance(snapshot, Mapping):
         # An answer that is not a document is not the read model: the
-        # panel reads the six keys by name, and a document without them
+        # panel reads the eight keys by name, and a document without them
         # leaves it reading keys that are not there.  The idle document
         # is the one answer this route is allowed to give on its own,
         # so the panel keeps polling and keeps getting the read model.
@@ -379,9 +421,9 @@ def get_scheduler_state(request: Request) -> Dict[str, Any]:
             "answering the idle read model",
             type(snapshot).__name__,
         )
-        return _with_phase_labels(_empty_snapshot())
+        return _state_with_waiting(_with_phase_labels(_empty_snapshot()))
 
-    return _with_phase_labels(dict(snapshot))
+    return _state_with_waiting(_with_phase_labels(dict(snapshot)))
 
 
 # ---------------------------------------------------------------------------
@@ -1028,5 +1070,1001 @@ def scheduler_action_outside_the_vocabulary(
         content={
             "error": "no_such_action",
             "detail": "the scheduler knows four actions, and this is not one of them",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# The wait actions
+# ---------------------------------------------------------------------------
+#
+# The finishing stage's waits are the panel's "waiting" rows, and every
+# row carries two actions: **extend** the deadline, or **terminate** the
+# wait.  Both are changes to a plan's own state, and both are made
+# through the one lifecycle that owns a wait
+# (:class:`postprocess.waits.WaitRegistry`) — this module does not move
+# a deadline by itself, and it keeps no second copy of a wait anywhere.
+#
+# Where a wait lives
+# ------------------
+# In the plan's own progress file, under the waiting item's ``wait``
+# field (architecture decision point 5).  A week-long wait outlives the
+# process that created it, so the endpoint reads the durable record and
+# puts it back into a registry before it may change one of them.
+#
+# The answers
+# ----------
+# * **200** — the change was carried out;
+# * **400** — the item id is not a name: it carries a path separator, or
+#   it is a traversal;
+# * **404** — there is no such waiting item;
+# * **409** — the wait is not pending any more, or the change is being
+#   made right now by somebody else;
+# * **422** — the number of seconds asked for is not a number of
+#   seconds.
+#
+# The 403 is not on that list on purpose: the request guard is
+# middleware over every ``/api/`` path, so a request without the
+# header, a request from a foreign origin and a request with a forged
+# host are refused before this code runs at all.
+
+
+#: The longest extension one request may ask for, in seconds.
+#:
+#: Thirty days.  A wait is due in a week, so an extension is normally an
+#: hour or a day; thirty days is the point where "push the deadline out"
+#: stops being an extension and becomes a new wait — and a request that
+#: asks for a year is a request that does not know what it is asking
+#: for.
+_MAX_EXTEND_SECONDS: int = 30 * 24 * 60 * 60
+
+#: Who the audit entry names.
+#:
+#: There is no identity to read: the API is loopback-only and every
+#: request carries the guard header, so the operator at the keyboard is
+#: the operator.  The audit entry says so, because an audit row that
+#: says nobody did it is worse than no audit row.
+_WAIT_OPERATOR: str = "operator"
+
+#: How long a request waits for the lock that serialises the changes to
+#: one plan's waits.
+_WAIT_LOCK_TIMEOUT: float = 10.0
+
+
+class ExtendWaitRequest(BaseModel):
+    """The body of ``POST /api/scheduler/{plan_id}/waits/{item_id}/extend``.
+
+    The number of seconds is declared ``Any`` on purpose.  A typed
+    ``int`` would let pydantic *coerce* ``"3600"`` into ``3600``, and a
+    request that says ``"3600"`` is not a request that says a number of
+    seconds — it is a request that says a string, and the answer to it
+    is a refusal, not a guess.  The capacity knob above declares its
+    number the same way, for the same reason.
+    """
+
+    seconds: Any
+
+
+class _RebuiltRegistry(WaitRegistry):
+    """A registry put back together from the records on disk.
+
+    The registry owns the wait lifecycle: it is the only thing that may
+    move a deadline, append an audit entry or give up on a wait.  It
+    keeps its waits in memory, though, and a wait outlives the process
+    that created it — a week-long wait does.  So the endpoint has to put
+    the durable records back into a registry before it may change one of
+    them.
+
+    ``_persist`` is overridden so the rebuild itself writes nothing: the
+    records are already on disk, and writing them again would be a
+    second history of the same wait.  Once the rebuild is over the
+    registry writes as it always does — that is the whole point of it.
+    """
+
+    def __init__(self, plan_id: str, **kwargs: Any) -> None:
+        super().__init__(plan_id, **kwargs)
+        self.rebuilt: Dict[str, Any] = {}
+        self._rebuilding = True
+
+    def _persist(self, wait: Any) -> None:
+        """Keep the wait while rebuilding, write it afterwards."""
+        if self._rebuilding:
+            self.rebuilt[wait.item_id] = wait
+            return
+        super()._persist(wait)
+
+    def finish_rebuild(self) -> None:
+        """The records are back in place: from here on, changes are written."""
+        self._rebuilding = False
+
+    def set_deadline(
+        self,
+        item_id: str,
+        deadline: datetime,
+        *,
+        operator: str,
+    ) -> Dict[str, Any]:
+        """Put one wait's deadline where the adjustment puts it.
+
+        The registry's own verb for a deadline is ``extend_deadline``,
+        which **adds** to it — and adding is not what a dynamic
+        adjustment is.  The panel states how much time is left, and
+        the deadline becomes that: a wait that is due in a week may be
+        cut to two days, or pushed out to a month.  So the deadline is
+        **set** here, and the change is written down in the same audit
+        shape an extension leaves behind — who changed it, when, and
+        what it was before and after.  An audit row that said nothing
+        about a deadline that moved would be worse than no audit row.
+
+        Args:
+            item_id: The item the wait belongs to.
+            deadline: The moment the wait is now due.
+            operator: Who asked for the change — the audit entry names
+                them.
+
+        Returns:
+            The wait record, carrying the new deadline.
+
+        Raises:
+            WaitError: When the wait is unknown, or the operator is not
+                named.
+            WaitConflict: When the wait is not pending any more.
+        """
+        wait = self._require(item_id)
+        if wait.status != PENDING:
+            raise WaitConflict(
+                f"等待条目 {item_id} 当前状态为 {wait.status}，"
+                "只有 pending 可以调整截止时间"
+            )
+
+        who = self._checked_operator(operator, item_id)
+        previous = wait.deadline
+        wait.deadline = deadline
+        wait.extensions.append(
+            {
+                "operator": who,
+                "when": self._now().isoformat(),
+                "from": previous.isoformat(),
+                "to": deadline.isoformat(),
+            }
+        )
+        self._persist(wait)
+        return wait.to_record()
+
+
+def _checked_item_id(item_id: str) -> str:
+    """The item id as a name, or a refusal.
+
+    An item id names a row of the plan's own progress file, so it is a
+    **name** and not a path: a separator or a ``..`` in it is refused
+    with a 400 rather than answered with whatever it points at.  The
+    rule is the one the requirement book itself applies to an item id
+    (:mod:`postprocess.spec`).
+    """
+    if not isinstance(item_id, str) or not item_id.strip():
+        raise HTTPException(
+            400, {"error": "invalid_item_id", "detail": "the item id is empty"}
+        )
+    if "/" in item_id or "\\" in item_id or ".." in item_id:
+        raise HTTPException(
+            400,
+            {
+                "error": "invalid_item_id",
+                "detail": (
+                    "the item id names a row of the plan's progress file; "
+                    "it may not carry a path separator or '..'"
+                ),
+            },
+        )
+    return item_id
+
+
+def _checked_seconds(seconds: Any) -> int:
+    """The number of seconds one extension may ask for.
+
+    A refusal (422) rather than a guess.  A negative number, a
+    fraction, a string, a boolean and a number too large to be an
+    extension are five different mistakes, and none of them may be
+    rounded into an answer: an extension that was not asked for is a
+    wait that is longer than the operator agreed to.
+    """
+    if isinstance(seconds, bool) or not isinstance(seconds, int):
+        raise HTTPException(
+            422,
+            {
+                "error": "invalid_seconds",
+                "detail": (
+                    f"the number of seconds must be a whole number, got "
+                    f"{seconds!r}"
+                ),
+            },
+        )
+    if seconds <= 0:
+        raise HTTPException(
+            422,
+            {
+                "error": "invalid_seconds",
+                "detail": (
+                    f"the number of seconds must be positive, got {seconds}"
+                ),
+            },
+        )
+    if seconds > _MAX_EXTEND_SECONDS:
+        raise HTTPException(
+            422,
+            {
+                "error": "invalid_seconds",
+                "detail": (
+                    f"the number of seconds must not be more than "
+                    f"{_MAX_EXTEND_SECONDS}, got {seconds}"
+                ),
+            },
+        )
+    return seconds
+
+
+def _wait_records(plan_id: str) -> Dict[str, Dict[str, Any]]:
+    """Every wait record of one plan, as the progress file holds them.
+
+    The records live in the plan's own progress file, under each item's
+    ``wait`` field — the durable place the finishing stage keeps them.
+
+    Raises:
+        HTTPException: 500 when the file cannot be read as a progress
+            file.  A damaged file is reported, never read as an empty
+            plan: an empty plan means "nothing is waiting", and the
+            panel would then show a plan with nothing wrong with it.
+    """
+    try:
+        progress = load_progress(plan_id)
+    except ProgressError as exc:
+        raise HTTPException(
+            500,
+            {"error": "progress_unreadable", "detail": str(exc)},
+        ) from exc
+
+    records: Dict[str, Dict[str, Any]] = {}
+    items = progress.get("items")
+    if not isinstance(items, Mapping):
+        return records
+    for item_id, item in items.items():
+        if not isinstance(item, Mapping):
+            continue
+        record = item.get("wait")
+        if isinstance(record, Mapping):
+            records[str(item_id)] = dict(record)
+    return records
+
+
+def _status_of(record: Mapping[str, Any]) -> str:
+    """The status a wait record carries.
+
+    A record without a status is read as a live wait: the registry
+    always writes one, and a record without one is not a settled wait.
+    """
+    status = record.get("status")
+    if not isinstance(status, str) or not status.strip():
+        return PENDING
+    return status.strip()
+
+
+def _registry_of(
+    plan_id: str,
+    records: Mapping[str, Mapping[str, Any]],
+    *,
+    store: Any = None,
+) -> _RebuiltRegistry:
+    """The registry of one plan, rebuilt from its durable records.
+
+    A record the lifecycle cannot speak about — a kind of wait outside
+    its two-word vocabulary, a deadline that is not a moment — is left
+    out: the endpoint then answers "there is no such waiting item",
+    which is true of a record the lifecycle does not know.
+    """
+    registry = _RebuiltRegistry(plan_id, store=store)
+
+    for item_id, record in records.items():
+        wait_type = record.get("wait_type")
+        if wait_type not in WAIT_TYPES:
+            continue
+        deadline = record.get("deadline")
+        if not isinstance(deadline, str):
+            continue
+        try:
+            moment = datetime.fromisoformat(deadline)
+        except ValueError:
+            continue
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+
+        registry.create_wait(
+            {"id": item_id, "wait": {"type": wait_type}},
+            question=str(record.get("question") or ""),
+        )
+        wait = registry.rebuilt.get(item_id)
+        if wait is None:
+            continue
+        wait.deadline = moment
+        wait.extensions = [
+            dict(entry)
+            for entry in (record.get("extensions") or [])
+            if isinstance(entry, Mapping)
+        ]
+        wait.status = _status_of(record)
+
+    registry.finish_rebuild()
+    return registry
+
+
+@contextmanager
+def _wait_lock(plan_id: str) -> Iterator[None]:
+    """The lock that serialises the changes to one plan's waits.
+
+    The read-modify-write of a deadline is not atomic: the deadline is
+    read, moved and written back, and two requests doing that at the
+    same time would both read the same deadline — one of the two
+    extensions would be lost, and the audit would name an extension the
+    deadline does not carry.
+
+    The lock lives in the plan's own ``locks/`` directory, which is
+    where the repository's lock protocol puts a plan's runtime state.
+    """
+    plan_dir = progress_path(plan_id).parent
+    locks_dir = locks_dir_for_plan(plan_dir)
+    try:
+        locks_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(
+            500,
+            {"error": "lock_unavailable", "detail": str(exc)},
+        ) from exc
+
+    lock = FileLock(
+        str(locks_dir / "postprocess_waits.lock"), timeout=_WAIT_LOCK_TIMEOUT
+    )
+    try:
+        lock.acquire()
+    except Timeout as exc:
+        raise HTTPException(
+            409,
+            {
+                "error": "wait_busy",
+                "detail": (
+                    "another change to this plan's waits is being made right "
+                    "now; try again once it is done"
+                ),
+            },
+        ) from exc
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+@contextmanager
+def _hitl_store() -> Iterator[Any]:
+    """The HITL store, opened for this call and closed after it.
+
+    A terminated wait settles its question: a question that stayed open
+    after the operator gave up on it would still accept an answer, and
+    that answer would land as if it were asked for.
+
+    A store that cannot be opened is a warning and not a refusal: the
+    operator asked to give up on a wait, and that must happen even if
+    the question it asked cannot be settled right now.
+    """
+    try:
+        store = HitlStore(resolve_state_db_path())
+    except Exception:  # noqa: BLE001 — the wait is terminated either way
+        logger.warning(
+            "the HITL store could not be opened; the wait's question is "
+            "left open",
+            exc_info=True,
+        )
+        yield None
+        return
+    try:
+        yield store
+    finally:
+        store.close()
+
+
+def plan_waiting_rows(plan_id: str) -> List[Dict[str, Any]]:
+    """The panel's waiting rows for one plan.
+
+    The rows are built by the production read model
+    (:func:`plan_scheduler.snapshot.build`) out of the plan's own
+    durable wait records — the records the panel's ``waiting[]`` list is
+    built from — so the row and the record cannot tell two different
+    stories.
+
+    Only the waits that are still **pending** are listed.  A wait that
+    was answered or given up on is not waiting any more, and a row for
+    it would say "this is waiting" about something that is over.
+    """
+    rows = [
+        {**record, "plan_id": plan_id}
+        for record in _wait_records(plan_id).values()
+        if _status_of(record) == PENDING
+    ]
+    snapshot = build({"waits": rows})
+    return list(snapshot["waiting"])
+
+
+# ---------------------------------------------------------------------------
+# The waiting rows in the read model
+# ---------------------------------------------------------------------------
+#
+# The engine's snapshot answers "which plans are queued for a slot".
+# The panel's waiting block answers a different question — "what is the
+# finishing stage waiting for" — and the answer lives in the durable
+# wait records of the plans themselves.  These three helpers put that
+# answer into the read model the panel polls, so the panel reads one
+# document and does not go looking for a second one.
+
+
+def _plans_with_progress() -> List[str]:
+    """The plans that carry a finishing-stage progress file.
+
+    The plans root is read the way every other reader of it reads it —
+    through :func:`config_paths.resolve_plans_dir` — so the panel and
+    the stage always look at the same tree.
+
+    A directory that does not hold a progress file is not a plan the
+    finishing stage knows about: it is left out rather than read and
+    found empty.
+
+    A plans root that is not there at all is not a failure either.  The
+    panel polls this endpoint every few seconds, so a warning (and the
+    traceback that comes with it) per poll would fill the log with a
+    fact nobody asked for -- and would keep the process's captured log
+    records growing for as long as the panel is open.
+    """
+    root = resolve_plans_dir()
+    if not root.is_dir():
+        return []
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        logger.warning("the plans root could not be read", exc_info=True)
+        return []
+
+    plan_ids: List[str] = []
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        if not (entry / PROGRESS_FILENAME).is_file():
+            continue
+        plan_ids.append(entry.name)
+    return plan_ids
+
+
+def _pending_waiting_rows() -> List[Dict[str, Any]]:
+    """Every plan's pending waiting rows, as the panel reads them.
+
+    The rows come from :func:`plan_waiting_rows` — the production read
+    model over the durable wait records — so the row and the record
+    cannot tell two different stories.
+
+    A plan whose progress file cannot be read is left out and reported:
+    the panel must keep answering, and a plan it cannot read is not a
+    plan it may claim is waiting.
+    """
+    rows: List[Dict[str, Any]] = []
+    for plan_id in _plans_with_progress():
+        try:
+            rows.extend(plan_waiting_rows(plan_id))
+        except (HTTPException, ValueError):
+            logger.warning(
+                "the waiting rows of plan %s could not be read",
+                plan_id,
+                exc_info=True,
+            )
+            continue
+    return rows
+
+
+def _state_with_waiting(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
+    """The read model with the finishing stage's waits in it.
+
+    The rows the engine already carries are kept: they are the same
+    rows, read from the engine's own state, and a row that is in both
+    places is one row.  A row is identified by its plan and its item —
+    the pair the panel draws the row under and the pair the three
+    actions address.
+    """
+    document = dict(snapshot)
+    rows: List[Dict[str, Any]] = [
+        dict(row)
+        for row in (document.get("waiting") or [])
+        if isinstance(row, Mapping)
+    ]
+    known = {(str(row.get("plan_id")), str(row.get("item_id"))) for row in rows}
+
+    for row in _pending_waiting_rows():
+        key = (str(row.get("plan_id")), str(row.get("item_id")))
+        if key in known:
+            continue
+        known.add(key)
+        rows.append(row)
+
+    document["waiting"] = rows
+    return document
+
+
+def _row_of(plan_id: str, item_id: str) -> Optional[Dict[str, Any]]:
+    """The panel's row for one waiting item, or ``None``."""
+    for row in plan_waiting_rows(plan_id):
+        if row.get("item_id") == item_id:
+            return row
+    return None
+
+
+@router.post("/api/scheduler/{plan_id}/waits/{item_id:path}/extend")
+def extend_wait(plan_id: str, item_id: str, body: ExtendWaitRequest) -> JSONResponse:
+    """Push one waiting item's deadline out.
+
+    The extension is the operator saying "this may take longer", and the
+    answer says how much longer: the seconds that are left, and how many
+    times the deadline has been pushed out.  Both are read out of the
+    panel's own row, so the answer and the panel cannot disagree.
+
+    A wait that is over cannot be extended.  That is a 409 and not a
+    404: the item is known, and the wait is simply not pending any
+    more.
+    """
+    # The id is admitted through the shared guard: ``_plan_dir`` is the
+    # one place a request-supplied id may become a path, and it refuses
+    # a traversal with 400.  That answer is the guard's own and it is
+    # left alone — a malformed id is a bad request, not a missing plan.
+    _server._plan_dir(plan_id)
+
+    seconds = _checked_seconds(body.seconds)
+    item = _checked_item_id(item_id)
+
+    with _wait_lock(plan_id):
+        records = _wait_records(plan_id)
+        record = records.get(item)
+        if record is None:
+            raise HTTPException(
+                404,
+                {
+                    "error": "no_such_wait",
+                    "detail": f"there is no waiting item {item!r} in this plan",
+                },
+            )
+        if _status_of(record) != PENDING:
+            raise HTTPException(
+                409,
+                {
+                    "error": "wait_not_pending",
+                    "detail": (
+                        f"the wait {item!r} is {record.get('status')!r}, and "
+                        "only a pending wait can be extended"
+                    ),
+                },
+            )
+
+        registry = _registry_of(plan_id, records)
+        registry.extend_deadline(item, seconds, operator=_WAIT_OPERATOR)
+
+    row = _row_of(plan_id, item)
+    if row is None:
+        # Unreachable in practice: the wait was pending a moment ago and
+        # an extension does not settle it.  It is answered rather than
+        # left open, so that a future change cannot turn this into a
+        # route that answers 200 without an answer in it.
+        raise HTTPException(
+            500,
+            {
+                "error": "wait_row_missing",
+                "detail": f"the wait {item!r} has no row in the read model",
+            },
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "plan_id": row["plan_id"],
+            "item_id": row["item_id"],
+            "remaining_seconds": row["remaining_seconds"],
+            "extensions_count": row["extensions_count"],
+        },
+    )
+
+
+@router.post("/api/scheduler/{plan_id}/waits/{item_id:path}/terminate")
+def terminate_wait(plan_id: str, item_id: str) -> JSONResponse:
+    """Give up on one waiting item.
+
+    The wait is over: it leaves the panel's waiting list, the question
+    it asked is settled, and an answer that arrives afterwards is
+    refused rather than accepted.
+
+    A wait that is over cannot be given up on twice.  That is a 409: the
+    operator changed their mind, and the endpoint does not — a second
+    termination would leave two of them in the audit for one wait.
+    """
+    # The id is admitted through the shared guard: ``_plan_dir`` is the
+    # one place a request-supplied id may become a path, and it refuses
+    # a traversal with 400.  That answer is the guard's own and it is
+    # left alone — a malformed id is a bad request, not a missing plan.
+    _server._plan_dir(plan_id)
+
+    item = _checked_item_id(item_id)
+
+    with _wait_lock(plan_id):
+        records = _wait_records(plan_id)
+        record = records.get(item)
+        if record is None:
+            raise HTTPException(
+                404,
+                {
+                    "error": "no_such_wait",
+                    "detail": f"there is no waiting item {item!r} in this plan",
+                },
+            )
+        if _status_of(record) != PENDING:
+            raise HTTPException(
+                409,
+                {
+                    "error": "wait_not_pending",
+                    "detail": (
+                        f"the wait {item!r} is {record.get('status')!r}, and "
+                        "only a pending wait can be terminated"
+                    ),
+                },
+            )
+
+        with _hitl_store() as store:
+            registry = _registry_of(plan_id, records, store=store)
+            registry.terminate(item, operator=_WAIT_OPERATOR)
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "plan_id": plan_id,
+            "item_id": item,
+            "status": "terminated",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# The requirement book, and the deadline the panel adjusts
+# ---------------------------------------------------------------------------
+#
+# The finishing stage judges a plan against a **requirement book** —
+# ``plans/{id}/postprocess.json`` — and the operator panel needs two
+# ways into it: read the book and write it back, and put a waiting
+# item's deadline where the operator says it should be.
+#
+# The book is written by one file and one file only
+# -------------------------------------------------
+# The plan's own directory holds more than the book: the progress file
+# of a round that is running, the free-form companion, the plan's own
+# tasks.  Every one of them belongs to somebody else, and the
+# architecture gives the book exactly one file (decision point 3).  A
+# write that reached past that file would change the criteria of a
+# round that is already running — so the write-back is limited to
+# ``postprocess.json``, and a book the loader would refuse is not
+# written at all.
+#
+# An edit during a round belongs to the next round
+# -------------------------------------------------
+# The stage freezes the book when it starts: this round's criteria are
+# the book as it stood at that moment, and the fingerprint the progress
+# file carries does not move because a file next to it changed.  The
+# next freeze reads the new content.
+#
+# The deadline
+# ------------
+# The deadline is **one field**, and the panel has two verbs for it:
+# ``extend`` pushes it out, and the adjustment below puts it where the
+# operator says it should be.  Both write the same field of the same
+# durable record, both are refused for a wait that is not pending any
+# more (409), and both refuse a number of seconds that is not a number
+# of seconds (422).
+#
+# Why the plan id is carried whole
+# --------------------------------
+# The routes below take the plan id as a **path** segment, so that a
+# malformed id reaches the handler and is refused by the shared guard
+# with its own 400 — a bad request, not a missing endpoint.  A route
+# that could not carry the id would answer 404, and "there is no such
+# endpoint" is the wrong sentence for "that is not a plan id".
+
+
+#: The longest remaining time one adjustment may ask for, in seconds.
+#:
+#: The same thirty days an extension is capped at.  A wait is due in a
+#: week, so an adjustment is normally an hour or a day; thirty days is
+#: the point where "give this wait more time" stops being an adjustment
+#: and becomes a new wait.
+_MAX_REMAINING_SECONDS: int = _MAX_EXTEND_SECONDS
+
+
+class SetDeadlineRequest(BaseModel):
+    """The body of ``PATCH /api/scheduler/{plan_id}/waits/{item_id}/deadline``.
+
+    The number of seconds is declared ``Any`` on purpose, for the same
+    reason the extension's is: a typed ``int`` would let pydantic
+    *coerce* ``"3600"`` into ``3600``, and a request that says
+    ``"3600"`` is not a request that says a number of seconds — it is a
+    request that says a string, and the answer to it is a refusal, not
+    a guess.
+    """
+
+    remaining_seconds: Any
+
+
+def _checked_remaining_seconds(value: Any) -> int:
+    """The number of seconds one adjustment may ask for.
+
+    A refusal (422) rather than a guess.  A negative number, a
+    fraction, a string, a boolean and a number too large to be a wait
+    are five different mistakes, and none of them may be rounded into
+    an answer: a deadline that was not asked for is a wait that lasts
+    longer than the operator agreed to.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise HTTPException(
+            422,
+            {
+                "error": "invalid_remaining_seconds",
+                "detail": (
+                    f"the number of seconds must be a whole number, got "
+                    f"{value!r}"
+                ),
+            },
+        )
+    if value <= 0:
+        raise HTTPException(
+            422,
+            {
+                "error": "invalid_remaining_seconds",
+                "detail": (
+                    f"the number of seconds must be positive, got {value}"
+                ),
+            },
+        )
+    if value > _MAX_REMAINING_SECONDS:
+        raise HTTPException(
+            422,
+            {
+                "error": "invalid_remaining_seconds",
+                "detail": (
+                    f"the number of seconds must not be more than "
+                    f"{_MAX_REMAINING_SECONDS}, got {value}"
+                ),
+            },
+        )
+    return value
+
+
+def _checked_spec(document: Any) -> Spec:
+    """The requirement book as it stands, or a refusal.
+
+    The book is judged by the loader the finishing stage itself reads
+    (:func:`postprocess.spec.load_spec`), so an edit the stage would
+    refuse is refused here too — and the refusal is the loader's own
+    message, which names the entry that is wrong.  A book has many
+    entries and the loader rejects exactly one of them at a time, so
+    "the book is illegal" would tell the author nothing.
+
+    The candidate is loaded from a **temporary directory**, so a book
+    that is refused never reaches the plan's own file: the file on
+    disk is still the book the running round froze.
+
+    Args:
+        document: The book as the request carried it.
+
+    Returns:
+        The loaded book — its entries, validated.
+
+    Raises:
+        HTTPException: 422 when the document is not a legal
+            requirement book.
+    """
+    with tempfile.TemporaryDirectory(prefix="pdt-spec-check-") as scratch:
+        candidate = Path(scratch) / SPEC_FILENAME
+        candidate.write_text(
+            json.dumps(document, ensure_ascii=False), encoding="utf-8"
+        )
+        try:
+            return load_spec(scratch)
+        except SpecError as exc:
+            raise HTTPException(
+                422,
+                {"error": "invalid_spec", "detail": str(exc)},
+            ) from exc
+
+
+def _write_spec(path: Path, document: Any) -> None:
+    """Write the requirement book, atomically.
+
+    The book goes to a temporary file **in the plan's own directory**
+    and is then renamed over the target with ``os.replace``.  Two
+    things follow from that, and both are the point: a reader sees
+    either the previous book or the new one — never half of one — and
+    a write that fails leaves the previous book in place, complete and
+    parseable.
+
+    Args:
+        path: The book's own path.
+        document: The book, as it is to be written.
+    """
+    payload = json.dumps(document, ensure_ascii=False, indent=2) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    handle_fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f"{path.name}.", suffix=".tmp"
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        # The rename never happened: the previous book is untouched.
+        # The temporary file is best-effort cleanup — its absence must
+        # not mask the failure that got us here.
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+@router.get("/api/scheduler/{plan_id:path}/postprocess-spec")
+def get_postprocess_spec(plan_id: str) -> JSONResponse:
+    """Show one plan's requirement book.
+
+    The book is shown **as it is**: the editor is how an illegal book
+    gets fixed, so the answer is the file's own content — not a
+    prettified copy of it, and not the criteria the loader happens to
+    understand.  A plan with no book answers 404: there is nothing to
+    show, and that is not a failure of the server.
+    """
+    path = _server._plan_dir(plan_id) / SPEC_FILENAME
+
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise HTTPException(
+            404,
+            {
+                "error": "no_such_spec",
+                "detail": f"the plan {plan_id!r} has no requirement book",
+            },
+        ) from None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise HTTPException(
+            500,
+            {"error": "spec_unreadable", "detail": str(exc)},
+        ) from exc
+
+    try:
+        document = json.loads(raw)
+    except ValueError as exc:
+        raise HTTPException(
+            500,
+            {
+                "error": "spec_unreadable",
+                "detail": f"the requirement book is not valid JSON: {exc}",
+            },
+        ) from exc
+
+    return JSONResponse(status_code=200, content=document)
+
+
+@router.put("/api/scheduler/{plan_id:path}/postprocess-spec")
+def put_postprocess_spec(plan_id: str, body: Any = Body(...)) -> JSONResponse:
+    """Write one plan's requirement book back.
+
+    The book is judged by the loader the finishing stage itself uses, so
+    an edit the stage would refuse is refused here — and a refused edit
+    writes nothing, which leaves the book on disk exactly as the
+    running round froze it.
+
+    The write is limited to **one file**: ``postprocess.json``.  The
+    progress file of a running round, the free-form companion and the
+    plan's own tasks are none of this endpoint's business, and the
+    write-back does not touch them.
+
+    The answer carries the fingerprint of the book that was written —
+    the version the **next** round will freeze.  It says nothing about
+    the round that is running: that one kept the criteria it started
+    with.
+    """
+    plan_path = _server._plan_dir(plan_id)
+
+    spec = _checked_spec(body)
+    _write_spec(plan_path / SPEC_FILENAME, body)
+
+    frozen = freeze(spec)
+    return JSONResponse(
+        status_code=200,
+        content={
+            "plan_id": plan_id,
+            "spec_sha256": frozen.spec_sha256,
+            "items": len(frozen.spec.items),
+        },
+    )
+
+
+@router.patch("/api/scheduler/{plan_id:path}/waits/{item_id:path}/deadline")
+def set_wait_deadline(
+    plan_id: str, item_id: str, body: SetDeadlineRequest
+) -> JSONResponse:
+    """Put one waiting item's deadline where the operator says.
+
+    The extension pushes the deadline **out**; this puts it where the
+    operator says it should be — a wait that is due in a week may be cut
+    to two days, or pushed out to a month.  Both are the same field of
+    the same durable record, so the second one starts from what the
+    first one wrote.
+
+    The answer says the deadline that was written down and how much
+    time is left on it, measured from the moment the deadline was set.
+
+    A wait that is over cannot have its deadline moved.  That is a 409
+    and not a 404: the item is known, and the wait is simply not
+    pending any more.
+    """
+    # The id is admitted through the shared guard: ``_plan_dir`` is the
+    # one place a request-supplied id may become a path, and it refuses
+    # a traversal with 400.  That answer is the guard's own and it is
+    # left alone — a malformed id is a bad request, not a missing plan.
+    _server._plan_dir(plan_id)
+
+    seconds = _checked_remaining_seconds(body.remaining_seconds)
+    item = _checked_item_id(item_id)
+
+    with _wait_lock(plan_id):
+        records = _wait_records(plan_id)
+        registry = _registry_of(plan_id, records)
+        # The registry is the lifecycle's own view of the plan, and it
+        # leaves out a record it cannot speak about — a kind of wait
+        # outside its vocabulary, a deadline that is not a moment.  Such
+        # a record is not a waiting item, so it is answered the way an
+        # item that was never created is answered.
+        try:
+            record = registry.get(item)
+        except WaitError:
+            raise HTTPException(
+                404,
+                {
+                    "error": "no_such_wait",
+                    "detail": f"there is no waiting item {item!r} in this plan",
+                },
+            ) from None
+        if record["status"] != PENDING:
+            raise HTTPException(
+                409,
+                {
+                    "error": "wait_not_pending",
+                    "detail": (
+                        f"the wait {item!r} is {record['status']!r}, and "
+                        "only a pending wait can have its deadline moved"
+                    ),
+                },
+            )
+
+        # One moment, one deadline: the time left on the answer is the
+        # number of seconds that were asked for, not a second reading
+        # of a clock that has moved on since.
+        now = datetime.now(timezone.utc)
+        deadline = now + timedelta(seconds=seconds)
+        registry.set_deadline(item, deadline, operator=_WAIT_OPERATOR)
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "item_id": item,
+            "deadline": deadline.isoformat(),
+            "remaining_seconds": seconds,
         },
     )

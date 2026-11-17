@@ -19,9 +19,14 @@
    ``ok=False`` / ``detail='conflict'``，两个相位都还是 ``executing``，
    相位一个字节都不动。
 3. **``stopped`` 行为不变** —— 仍然是 ``stopped → queued``。
+4. **``post_processing`` → ``queued``** —— 收尾中的计划被人回答之后必须
+   回到队列：否则 PRD A9 的「唤醒后重新排队」没有实现（等待中的计划不占
+   执行槽位，但回答之后计划永远回不到队列里，就再也拿不到槽位）。
+5. **``completed`` 与 ``verification_running`` 仍然是冲突** —— 入口相位
+   集合只多了一个名字，没有被放宽成「任何非终态都能 requeue」。
 
-被测的是**入口相位集合**这一个东西：状态机的边表没动，执行行上的终态
-裁决也没动（那是另一条路径的事）。
+被测的是**入口相位集合**这一个东西：状态机的边表（``post_processing →
+queued`` 那条边）同步加了，执行行上的终态裁决没动（那是另一条路径的事）。
 """
 
 from __future__ import annotations
@@ -150,3 +155,67 @@ def test_requeue_stopped_unchanged(plans_dir, clean_state):
     assert result.berth_phase == "queued"
     assert result.detail == "requeue"
     assert _persisted_phase(plan_dir) == "queued"
+
+
+def test_requeue_post_processing_lands_queued(plans_dir, clean_state):
+    """``post_processing`` → 放回等待相位：``ok=True``，相位落库 ``queued``。
+
+    收尾中的计划被人回答（HITL 普通回答 → ``resume`` → ``requeue_plan``）
+    之后必须回到队列 —— 否则它永远拿不到执行槽位，PRD A9 的「唤醒后
+    重新排队」就没有实现。
+    """
+    from plan_lifecycle_service import PlanLifecycleService
+
+    plan_id = "requeue-post-processing-p1"
+    plan_dir = _write_plan(plans_dir, plan_id, "post_processing")
+    assert _persisted_phase(plan_dir) == "post_processing"
+
+    result = PlanLifecycleService().requeue_plan(plan_id)
+
+    assert result.ok is True
+    assert result.final_phase == "queued"
+    assert result.berth_phase == "queued"
+    assert result.detail == "requeue"
+    # 相位真的动了（落库的那份，不是只在返回值里说说）。
+    assert _persisted_phase(plan_dir) == "queued"
+
+
+def test_requeue_completed_still_conflicts(plans_dir, clean_state):
+    """负控：``completed`` → 冲突，相位一个字节都不动。
+
+    入口相位集合只多了一个名字（``post_processing``），没有被放宽成
+    「任何相位都能 requeue」。
+    """
+    from plan_lifecycle_service import PlanLifecycleService
+
+    plan_id = "requeue-completed-p1"
+    plan_dir = _write_plan(plans_dir, plan_id, "completed")
+    assert _persisted_phase(plan_dir) == "completed"
+
+    result = PlanLifecycleService().requeue_plan(plan_id)
+
+    assert result.ok is False
+    assert result.detail == "conflict"
+    assert result.final_phase == "completed"
+    assert result.berth_phase == "completed"
+    assert _persisted_phase(plan_dir) == "completed"
+
+
+def test_requeue_verification_running_still_conflicts(plans_dir, clean_state):
+    """负控：``verification_running`` → 冲突，相位一个字节都不动。
+
+    验证正在跑的计划没有「放回等待相位」这回事。
+    """
+    from plan_lifecycle_service import PlanLifecycleService
+
+    plan_id = "requeue-verification-running-p1"
+    plan_dir = _write_plan(plans_dir, plan_id, "verification_running")
+    assert _persisted_phase(plan_dir) == "verification_running"
+
+    result = PlanLifecycleService().requeue_plan(plan_id)
+
+    assert result.ok is False
+    assert result.detail == "conflict"
+    assert result.final_phase == "verification_running"
+    assert result.berth_phase == "verification_running"
+    assert _persisted_phase(plan_dir) == "verification_running"

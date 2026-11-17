@@ -934,12 +934,16 @@ def test_regression_workspace_block_is_reported(tmp_path, monkeypatch):
         "queue",
         "running",
         "parked",
+        "waiting",
         "generated_at",
     }, body
     # 2026-11-15: 读模型多了 parked 列表（停放等配额的计划，R4 要求面板能看
     # 出来）。按本 gate 的既定流程把它纳入断言集合；形状仍按全等比较，多一个
     # 键或少一个键都打红。
     assert body["parked"] == [], body
+    # 2026-11-17: 读模型多了 waiting 列表（收尾阶段里等人回答的条目）。本场景
+    # 里没有收尾等待条目，所以它是空的 —— 但键必须在，因为面板按名字读它。
+    assert body["waiting"] == [], body
     assert body["queue_length"] == 1, body
     assert [str(row["reason"]) for row in body["queue"]] == [
         "workspace_busy"

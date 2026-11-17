@@ -83,6 +83,31 @@ CORE_PHASES: Tuple[str, ...] = (
 #: The moment every case starts at.
 BASE_EPOCH = 1_700_000_000.0
 
+#: The keys the snapshot — the engine's read model — carries, and no
+#: others.  Written out **here** rather than read out of the code it
+#: checks, for the same reason the phase list above is: a test whose
+#: expectation comes from the implementation proves nothing.
+#:
+#: The seventh key is ``waiting`` — the finishing stage's waits, which
+#: ``plan_scheduler.snapshot.build`` puts in the document and
+#: ``routes.scheduler._state_with_waiting`` merges the live ones into.
+#: The panel's waiting block and its terminal block read one read
+#: model, and the engine hands that model to the panel.
+#:
+#: The eighth key is ``parked`` — the plans stopped for want of
+#: provider capacity, which hold no slot and are in no line, so the
+#: queue and the running line could never name them.
+SNAPSHOT_KEYS = {
+    "capacity",
+    "queue_length",
+    "over_capacity",
+    "queue",
+    "running",
+    "waiting",
+    "parked",
+    "generated_at",
+}
+
 
 # ---------------------------------------------------------------------------
 # The doubles
@@ -536,15 +561,14 @@ def test_snapshot_is_the_read_model(db_factory, plan_factory) -> None:
 
     snapshot = engine.snapshot()
     assert isinstance(snapshot, dict), "the snapshot is not a document"
-    assert set(snapshot) == {
-        "capacity",
-        "queue_length",
-        "over_capacity",
-        "queue",
-        "running",
-        "parked",
-        "generated_at",
-    }, "the snapshot has another shape: {0!r}".format(sorted(snapshot))
+    assert set(snapshot) == SNAPSHOT_KEYS, (
+        "the snapshot has another shape: {0!r}".format(sorted(snapshot))
+    )
+    # The waiting list is always a list — the panel's waiting block
+    # reads it by name whether anything is waiting or not.
+    assert isinstance(snapshot["waiting"], list), (
+        "the waiting list is {0!r}".format(snapshot["waiting"])
+    )
 
     # 2026-11-15：读模型多了 parked 列表（停放等配额的计划，R4 要求面板能看出来）。
     # 按本 gate 的既定流程把它纳入断言集合；形状仍按全等比较，多一个键或少一个键

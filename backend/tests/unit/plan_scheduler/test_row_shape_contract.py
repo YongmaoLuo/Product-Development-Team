@@ -39,14 +39,22 @@ assertion would still pass when a field was added, and adding a field
 is precisely the thing that has to be a decision.
 
 The document's own keys are asserted too, and they are asserted as
-**seven** — a sub-phase is a field on a *row*, and it did not turn the
-document into a seventh-key document.  The seventh key is ``parked``:
-the plans stopped for want of provider capacity, which hold no slot
-and are in no line, so neither the queue nor the running line can
-ever name them.  It was added beside the other six and not instead of
-one of them — the six keep their names, their types and their
-meanings, so a reader written against them is still reading a
-document it was written for.
+**eight** — a sub-phase is a field on a *row*, and it did not turn the
+document into a ninth-key document.  Two keys were added beside the
+original six, and neither took the place of one of them.
+
+The seventh key is ``waiting``: the finishing stage's waits, which
+``plan_scheduler.snapshot.build`` puts in the document and
+``routes.scheduler._state_with_waiting`` merges the live ones into, so
+that the panel's waiting block and its terminal block read one read
+model.
+
+The eighth key is ``parked``: the plans stopped for want of provider
+capacity, which hold no slot and are in no line, so neither the queue
+nor the running line can ever name them.  It was added beside the
+others and not instead of one of them — the keys keep their names,
+their types and their meanings, so a reader written against them is
+still reading a document it was written for.
 """
 
 from __future__ import annotations
@@ -99,19 +107,23 @@ RUNNING_ROW_KEYS = {
 
 #: The keys the **document** carries — and no others.
 #:
-#: Seven.  The phase was a field on a *row* and did not turn the
+#: Eight.  The phase was a field on a *row* and did not turn the
 #: document into a seventh-key document; the seventh key is
-#: ``parked`` — the plans stopped for want of provider capacity, which
-#: hold no slot and are in no line, so neither of the two lists above
-#: can ever name them.  It was added beside the other six and not
-#: instead of one of them: the six keep their names, their types and
-#: their meanings.
+#: ``waiting`` — the finishing stage's waits, a list of the panel's
+#: waiting block, put there by ``plan_scheduler.snapshot.build`` and
+#: merged with the live ones by ``routes.scheduler._state_with_waiting``.
+#: The eighth key is ``parked`` — the plans stopped for want of
+#: provider capacity, which hold no slot and are in no line, so neither
+#: of the two lists above can ever name them.  Both were added beside
+#: the original six and not instead of one of them: the keys keep their
+#: names, their types and their meanings.
 TOP_LEVEL_KEYS = {
     "capacity",
     "queue_length",
     "over_capacity",
     "queue",
     "running",
+    "waiting",
     "parked",
     "generated_at",
 }
@@ -209,14 +221,22 @@ def test_running_row_keys_include_phase() -> None:
 
 
 def test_top_level_keys_unchanged() -> None:
-    """The document carries exactly its seven keys.
+    """The document still carries exactly its eight keys.
 
     The phase was added to the **rows**, and the document is not a row:
-    a reader that finds an eighth key at the top level is reading a
+    a reader that finds a ninth key at the top level is reading a
     document whose shape has moved, and every reader that was written
     against these keys is now reading a document it was not written
-    for.  The seventh key, ``parked``, was written down here so that
-    the next person to touch the whitelist knows it is deliberate.
+    for.
+
+    The seventh key is ``waiting`` — the finishing stage's waits.  It
+    is there on purpose: the panel's waiting block and its terminal
+    block read **one** read model, and a document that dropped the
+    waiting list would leave the waiting block without anything to
+    read.
+
+    The eighth key, ``parked``, was written down here too, so that the
+    next person to touch the whitelist knows it is deliberate.
     """
     result = build(_state([_queue_row("p1", 1)], [_running_row("r1", 400.0)]))
 

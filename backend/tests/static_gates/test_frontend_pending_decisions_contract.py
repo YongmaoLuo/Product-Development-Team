@@ -1,5 +1,5 @@
 """The plan page must show the human decisions that are waiting for an
-answer, and must not become a place where they get answered.
+answer; the scheduler panel is the one place that may answer them.
 
 Why this gate exists
 --------------------
@@ -34,12 +34,22 @@ The rule
   plan page renderer (the summary projection) and the verification
   progress renderer (the progress projection) both hand the
   projection to it.
-* The page never calls the decision endpoints. Answering a decision is
-  an HTTP exchange performed outside the UI — the PRD keeps the
-  interactive card and the buttons out of the page — so the frontend
-  reads the projection and nothing else: no bare ``fetch(`` anywhere
-  (the canonical scanner from ``test_frontend_uses_api_wrapper``) and
-  no request to the decision service at all.
+* **The decision service is called from the scheduler panel, and only
+  from there.** The scheduler panel gives the operator three actions on
+  a waiting row — extend, terminate and answer — and the answer reuses
+  the decision service's own answer route
+  (``/api/hitl/{plan}/decisions/{id}/answer``; 收尾 PRD 决策点 8 / A6).
+  A request path naming the decision service (``/hitl``) may therefore
+  appear in ``frontend/app.js`` only inside a **top-level function whose
+  name starts with ``scheduler``** — the answer is a scheduler action,
+  not a plan-page concern. Such a path anywhere else in
+  ``frontend/app.js``, or in any other ``frontend/*.js`` file, is a
+  violation: the plan page still reads the projection and nothing else.
+* The page still goes through the ``api()`` / ``apiRequest()``
+  wrappers: no bare ``fetch(`` anywhere (the canonical scanner from
+  ``test_frontend_uses_api_wrapper``). The answer is a request like any
+  other, and a bare ``fetch(`` answers 403 at runtime while breaking
+  nothing at build time.
 
 Scan target
 -----------
@@ -113,6 +123,39 @@ def _function_body(source: str, name: str) -> str:
     raise AssertionError(f"unbalanced braces in function {name}()")
 
 
+def _top_level_function_ranges(source: str) -> list[tuple[str, int, int]]:
+    """Return ``(name, body_start, body_end)`` for every top-level function.
+
+    Only the outermost ``function foo(...)`` declarations are returned;
+    a nested function inside one of them belongs to that body, not to
+    this list.  ``body_start`` is the offset just after the opening
+    brace and ``body_end`` the offset of the matching closing brace, so
+    the body itself is ``source[body_start:body_end]``.
+
+    The offsets are what lets a caller say *where* a request path sits:
+    inside this function, or outside every function.
+    """
+    pattern = re.compile(
+        r"^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{",
+        re.MULTILINE,
+    )
+    ranges: list[tuple[str, int, int]] = []
+    for match in pattern.finditer(source):
+        name = match.group(1)
+        brace = match.end() - 1
+        depth = 0
+        for index in range(brace, len(source)):
+            char = source[index]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    ranges.append((name, brace + 1, index))
+                    break
+    return ranges
+
+
 def _top_level_functions(source: str) -> dict[str, str]:
     """Return ``{name: body}`` for every top-level function in ``source``.
 
@@ -120,25 +163,10 @@ def _top_level_functions(source: str) -> dict[str, str]:
     a nested function inside one of them belongs to that body, not to
     this map.
     """
-    pattern = re.compile(
-        r"^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{",
-        re.MULTILINE,
-    )
-    functions: dict[str, str] = {}
-    for match in pattern.finditer(source):
-        name = match.group(1)
-        body_start = match.end() - 1
-        depth = 0
-        for index in range(body_start, len(source)):
-            char = source[index]
-            if char == "{":
-                depth += 1
-            elif char == "}":
-                depth -= 1
-                if depth == 0:
-                    functions[name] = source[body_start + 1 : index]
-                    break
-    return functions
+    return {
+        name: source[start:end]
+        for name, start, end in _top_level_function_ranges(source)
+    }
 
 
 #: A call to ``renderPendingDecisions(...)`` and its argument list. The
@@ -212,14 +240,16 @@ def _pending_decision_violations(source: str) -> list[str]:
     return violations
 
 
-def _code_string_literals(source: str) -> list[str]:
-    """Return the string literals that appear in code position.
+def _code_string_literals_with_spans(source: str) -> list[tuple[str, int, int]]:
+    """Return the code-position string literals with their offsets.
 
     Comments are skipped, and the contents of a literal are not
     re-scanned, so a path mentioned in a comment never reaches the
-    caller and a literal is reported once.
+    caller and a literal is reported once.  The offsets are the
+    literal's start and end in ``source`` — they are what lets a caller
+    say *where* a literal sits rather than only *what* it says.
     """
-    literals: list[str] = []
+    literals: list[tuple[str, int, int]] = []
     index = 0
     length = len(source)
     while index < length:
@@ -234,6 +264,7 @@ def _code_string_literals(source: str) -> list[str]:
             continue
         if char in ('"', "'", "`"):
             quote = char
+            start = index
             index += 1
             buffer: list[str] = []
             while index < length:
@@ -247,16 +278,106 @@ def _code_string_literals(source: str) -> list[str]:
                     break
                 buffer.append(current)
                 index += 1
-            literals.append("".join(buffer))
+            literals.append(("".join(buffer), start, index))
             continue
         index += 1
     return literals
 
 
-#: The path fragment of the decision service. The frontend reads the
-#: projection the summary and the progress endpoints carry; it never
-#: asks the decision service itself.
+def _code_string_literals(source: str) -> list[str]:
+    """Return the string literals that appear in code position.
+
+    Comments are skipped, and the contents of a literal are not
+    re-scanned, so a path mentioned in a comment never reaches the
+    caller and a literal is reported once.
+    """
+    return [literal for literal, _, _ in _code_string_literals_with_spans(source)]
+
+
+#: The path fragment of the decision service. The plan page reads the
+#: projection the summary and the progress endpoints carry; the
+#: scheduler panel answers a decision through the decision service's
+#: own answer route (``/api/hitl/{plan}/decisions/{id}/answer``).
 _DECISION_SERVICE_PATH = "/hitl"
+
+#: The prefix a top-level function must carry to call the decision
+#: service. The answer is a scheduler action, so it lives in a
+#: scheduler function — a plan-page renderer that grew one would be
+#: the page answering a decision, which is not what the page is for.
+_SCHEDULER_FUNCTION_PREFIX = "scheduler"
+
+
+def _owning_function(
+    ranges: list[tuple[str, int, int]],
+    start: int,
+    end: int,
+) -> str | None:
+    """Return the top-level function whose body holds ``start``..``end``.
+
+    ``None`` means the literal sits outside every top-level function.
+    The innermost owner wins, so a literal in a nested function is
+    attributed to the top-level function that contains it — that is the
+    function the rule names.
+    """
+    owner: str | None = None
+    owner_span = 0
+    for name, body_start, body_end in ranges:
+        if body_start <= start and end <= body_end:
+            span = body_end - body_start
+            if owner is None or span < owner_span:
+                owner = name
+                owner_span = span
+    return owner
+
+
+def _decision_service_violations(source: str, label: str) -> list[str]:
+    """Return every way ``source`` breaks the decision-service contract.
+
+    The contract is about *where* a decision-service call may live: the
+    scheduler panel gives the operator three actions on a waiting row —
+    extend, terminate and answer — and the answer reuses the decision
+    service's own answer route (``/api/hitl/{plan}/decisions/{id}/answer``;
+    收尾 PRD 决策点 8 / A6).  A request path naming the decision service
+    is therefore allowed inside a top-level function whose name starts
+    with ``scheduler``, and nowhere else.
+
+    A path built outside every top-level function is a violation too:
+    the rule says where a decision-service call may live, and module
+    level is not one of those places.  Only code-position literals
+    count — a comment that names the decision service is not a request.
+    """
+    violations: list[str] = []
+    ranges = _top_level_function_ranges(source)
+
+    for literal, start, end in _code_string_literals_with_spans(source):
+        if _DECISION_SERVICE_PATH not in literal:
+            continue
+        owner = _owning_function(ranges, start, end)
+        if owner is not None and owner.startswith(_SCHEDULER_FUNCTION_PREFIX):
+            continue
+        if owner is None:
+            violations.append(
+                f"{label}: the request path {literal!r} is built outside any "
+                "top-level function; only a top-level function whose name "
+                f"starts with {_SCHEDULER_FUNCTION_PREFIX!r} may call the "
+                "decision service."
+            )
+            continue
+        violations.append(
+            f"{label}: the function {owner}() builds the request path "
+            f"{literal!r}; only a top-level function whose name starts with "
+            f"{_SCHEDULER_FUNCTION_PREFIX!r} may call the decision service."
+        )
+    return violations
+
+
+def _decision_service_literals(source: str) -> list[str]:
+    """Return the code-position literals that name the decision service."""
+    return [
+        literal
+        for literal in _code_string_literals(source)
+        if _DECISION_SERVICE_PATH in literal
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -300,20 +421,28 @@ def test_app_reads_pending_decisions() -> None:
 
 
 def test_no_bare_fetch() -> None:
-    """No bare ``fetch(`` in ``frontend/``, and no request to the
-    decision service at all.
+    """No bare ``fetch(`` in ``frontend/``, and the decision service is
+    called from the scheduler panel only.
 
     The first half is the canonical rule: every request must go through
     the ``api()`` / ``apiRequest()`` wrappers so the guard header is
     sent — a bare ``fetch(`` answers 403 at runtime and breaks nothing
-    at build time.
+    at build time.  The scheduler panel's answer action gets no
+    exception: it is a request like any other, so it goes through
+    ``api()`` too.
 
-    The second half is the HITL half of it. The page reads the
-    projection the summary and the progress endpoints carry; it must
-    not ask the decision service for the decisions itself, because
-    answering a decision is an HTTP exchange performed outside the UI
-    and the PRD keeps the interactive card and the buttons out of the
-    page.
+    The second half is the HITL half of it, and it is about *where* the
+    decision service may be called from.  The scheduler panel gives the
+    operator three actions on a waiting row — extend, terminate and
+    answer — and the answer reuses the decision service's own answer
+    route (``/api/hitl/{plan}/decisions/{id}/answer``; 收尾 PRD 决策点 8 /
+    A6).  A request path naming the decision service (``/hitl``) is
+    therefore allowed in ``frontend/app.js`` only inside a top-level
+    function whose name starts with ``scheduler`` — the answer is a
+    scheduler action, not a plan-page concern.  Everywhere else (another
+    top-level function, a module-level constant, or any other
+    ``frontend/*.js`` file) the decision service is still out of bounds:
+    the plan page reads the projection and nothing else.
     """
     findings = find_bare_fetches(_FRONTEND_DIR)
     assert not findings, (
@@ -325,14 +454,27 @@ def test_no_bare_fetch() -> None:
         + "\n  ".join(f"{p.as_posix()}:{ln}: {s}" for p, ln, s in findings)
     )
 
+    violations = _decision_service_violations(_source(_APP_JS), _APP_JS.name)
+    assert not violations, (
+        "frontend/app.js calls the decision service from outside a "
+        "scheduler function. The scheduler panel is where an operator "
+        "answers a decision (收尾 PRD 决策点 8 / A6), so the answer route "
+        "may only be called from a top-level function whose name starts "
+        f"with {_SCHEDULER_FUNCTION_PREFIX!r}.\n  "
+        + "\n  ".join(violations)
+    )
+
     for path in sorted(_FRONTEND_DIR.glob("*.js")):
-        for literal in _code_string_literals(_source(path)):
-            assert _DECISION_SERVICE_PATH not in literal, (
-                f"{path.name} builds the request path {literal!r}. The "
-                "page reads the pending_decisions projection the summary "
-                "and the progress endpoints carry; it must not call the "
-                "decision service."
-            )
+        if path == _APP_JS:
+            continue
+        literals = _decision_service_literals(_source(path))
+        assert not literals, (
+            f"{path.name} builds the request path {literals[0]!r}. The "
+            "decision service is called from the scheduler panel in "
+            "frontend/app.js and from nowhere else; the plan page reads the "
+            "pending_decisions projection the summary and the progress "
+            "endpoints carry."
+        )
 
 
 def test_gate_flags_an_unsafe_render() -> None:
@@ -402,27 +544,52 @@ function renderVerificationPanel(data) {
 
 
 def test_decision_service_request_is_detected() -> None:
-    """A request path into the decision service must be detected.
+    """A request path into the decision service must be detected where
+    the contract forbids it, and allowed where it permits it.
 
-    The literal scan is what keeps the page read-only: a path built in
-    code position is a request the page is about to make, whether it is
-    handed to ``api()`` or to anything else.
+    The rule is no longer "the frontend never names the decision
+    service": the scheduler panel answers a decision through it (收尾
+    PRD 决策点 8 / A6).  So the scanner has to bite on the same path
+    outside a scheduler function and stay quiet on it inside one — both
+    halves are pinned here, because a gate that only knows one half is
+    a gate that passes for the wrong reason.
     """
-    source = 'const decisions = await api("/hitl/plan-1/decisions");\n'
+    conforming = """
+async function schedulerAnswerWait(planId, itemId, option) {
+    const result = await api(
+        `/hitl/${planId}/decisions/${decisionId}/answer`,
+        { method: "POST", body: JSON.stringify({ option: option }) },
+    );
+    return result;
+}
+"""
+    assert _decision_service_violations(conforming, "app.js") == []
 
-    assert any("/hitl" in literal for literal in _code_string_literals(source))
+    offending = """
+function renderTasks(data) {
+    const decisions = await api(`/hitl/${data.planId}/decisions`);
+    return decisions;
+}
+"""
+    violations = _decision_service_violations(offending, "app.js")
+    assert violations, (
+        "the scanner did not catch a decision-service path in renderTasks()"
+    )
+    assert any("renderTasks" in violation for violation in violations), violations
+    assert any("/hitl" in violation for violation in violations), violations
 
 
 def test_decision_service_mention_in_a_comment_is_not_a_request() -> None:
     """A comment that names the decision service is not a request.
 
-    The scan reads code position only. A comment that says the page
-    never calls the decision service must not make the gate red, or the
-    rule could only be satisfied by deleting the explanation.
+    The scan reads code position only. A comment that says the plan
+    page never calls the decision service must not make the gate red, or
+    the rule could only be satisfied by deleting the explanation.
     """
     source = (
-        "// The page never calls /hitl — the operator answers over HTTP.\n"
+        "// The plan page never calls /hitl — the scheduler panel answers.\n"
         'const summary = await api("/plan/plan-1/summary");\n'
     )
 
     assert not any("/hitl" in literal for literal in _code_string_literals(source))
+    assert _decision_service_violations(source, "app.js") == []

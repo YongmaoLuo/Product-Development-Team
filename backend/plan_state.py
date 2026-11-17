@@ -191,6 +191,21 @@ VALID_PHASES = [
     # 完了」，``archived`` 表示「我们把它收起来了，别再跑它」。两者都留在词表
     # 里，不合并 —— 合并就抹掉了「做完」和「收起来」的区别。
     "archived",
+    # 2026-11-14: ``post_processing`` / ``postprocess_failed`` —— 可选的收尾
+    # 阶段（post-processing）。
+    #
+    # 验证通过之后，计划原先直接置 ``completed`` 就算结束；可选收尾阶段给
+    # 「验证通过」与「真的收完」之间留出一个位置：只有声明了结构化收尾要求书
+    # 的计划才会进 ``post_processing``，没有要求书的计划走的还是原来那条
+    # ``completed`` 路径（行为不变）。
+    #
+    # 两个相位都**不在** :data:`TERMINAL_PHASES` 里：``post_processing`` 还在
+    # 干活，``postprocess_failed`` 还要等人决定是否续跑。
+    #
+    # 相位名字由 ``backend/postprocess/state.py`` 拥有（那个包是收尾子系统的
+    # 家），这里登记它们进入词表；两处由测试钉住同步。
+    "post_processing",
+    "postprocess_failed",
 ]
 
 TERMINAL_PHASES = {"completed", "failed", "stopped", "archived"}
@@ -351,6 +366,34 @@ PHASE_TRANSITIONS = {
     # 重来一次。出边不写成「归档之后还能继续跑」的样子（``executing`` 之类），
     # 因为那就等于归档没有归档住。
     "archived": ["queued"],
+    # 2026-11-14: 可选收尾阶段的三条边。
+    #
+    # 相位模型（架构决策 1）：``verification_passed → post_processing →
+    # completed``，失败分支 ``post_processing → postprocess_failed``。
+    #
+    # 为什么这一行在**主表**而不是验证子表：验证子表的 ``verification_passed``
+    # 那一行是冻结的安全边界（通过判定不得被顺手洗成终态），而收尾阶段是
+    # **工作流层**的相位 —— 它由编排器的终态出口进入，不是验证子机器的一步。
+    # ``transition_to`` 取两张表的并集，所以放哪张表不影响可走性；这里选主表
+    # 是为了让那张冻结的子表一个字节都不动。
+    #
+    # 注意：``verification_passed → completed`` 这条**直连**边仍然不存在 ——
+    # 收尾阶段是可选的，进 ``post_processing`` 由收尾要求书的存在性判定把关。
+    "verification_passed": ["post_processing"],
+    # 收尾跑完 → 真的做完了；收尾有条目没通过 → 停在失败相位等人决定是否续跑。
+    #
+    # 2026-11-17: 加上 ``queued`` —— 收尾阶段**后来新增**的相位，而边表是在
+    # 它之前写好的，所以「被人回答之后回到队列」这条边当时并不存在。
+    # PRD A9 要求「等待期间不占执行槽位；唤醒后重新排队」：等待中的计划
+    # 不占槽位成立，但收尾中的计划被人工回答之后若回不到队列，就永远再也
+    # 拿不到槽位 —— 唤醒后重新排队就没有实现。
+    #
+    # 这条边**不改**其它相位：``post_processing`` 仍然不是终态，仍然要靠
+    # ``completed`` / ``postprocess_failed`` 那两条边收尾；``queued`` 只是
+    # 给了它一条「先回队列等一次调度」的出路。
+    "post_processing": ["completed", "postprocess_failed", "queued"],
+    # 续跑：从失败相位回到收尾阶段本身（同相位重入是幂等的 no-op）。
+    "postprocess_failed": ["post_processing"],
 }
 
 #: 相位 ``archived`` 的**通用目标**规则里，唯一不能作为源相位的那些。
