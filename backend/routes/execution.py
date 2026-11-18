@@ -7,10 +7,9 @@ late-binding rule that governs every module in this package.
 from __future__ import annotations
 
 from utils.atomic_io import atomic_write_json
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Request
 
 from typing import Dict, List, NamedTuple, Optional, Set, Tuple, Any, Literal
-from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 from pathlib import Path
 from datetime import datetime, timezone
@@ -71,6 +70,14 @@ from capacity_wait import WAIT_KIND_FIELD, quota_wait_event_data
 # ``server`` import above follows.
 import execution_log_tail
 
+# The reset endpoint's pure logic — which fields a reset writes, what
+# it cleared, what a reset request looks like.  It is imported at
+# **module level** (not inside the handler) so that the module object
+# is reachable as ``routes.execution._task_reset``: a negative control
+# has to be able to swap the implementation out from under the route
+# and watch the contract tests go red.
+import task_reset as _task_reset
+
 # The bounded writer for the plan directory's logs, and the pump that
 # feeds it.  Imported by value: neither carries state a late binding
 # would have to preserve, and the bound they enforce is read when the
@@ -89,6 +96,13 @@ from log_guardian import spawn_guardian
 # owns "one plan, one status" — so the endpoint and the plan listing
 # cannot answer differently about the same plan.
 from plan_status import normalize_exec_status
+
+# The reader for "which plans are working right now".  It is the same
+# reader the scheduler uses, so the reset endpoint and the scheduler
+# cannot answer differently about the same plan: the running set is
+# derived from the database (the execution row's status and whether its
+# pid is still alive), never from a service process's memory.
+from plan_scheduler.facts import PlanFactsReader
 
 # The crash scene.  These are the pure functions that build, write and
 # read back the report of a run that ended badly; the route's own job
@@ -5491,6 +5505,315 @@ def apply_execution_task_delta(plan_id: str, req: _server.TaskDeltaRequest):
         "plan_id": plan_id,
         **summary,
         "is_empty": delta.is_empty,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Reset one task — put a failed task back in the queue
+# ---------------------------------------------------------------------------
+#
+# A failed task used to have exactly two fates: get repaired, or sit on
+# the progress card as a permanent red entry.  The operator had no
+# supported way of saying "run this one again" — the only door was a
+# hand-written ``UPDATE`` against ``state.db``, which left no audit
+# record and took no lock.
+#
+# This endpoint is that door, opened properly.  It writes the task's
+# **execution bookkeeping** — ``status`` / ``failure_reason`` /
+# ``end_ts`` / ``commit_sha`` / ``attempt``, the five fields
+# ``backend/task_reset.py`` names — and leaves the task's
+# **specification** byte-identical.  The split is the whole point: the
+# specification says what the task is for, and rewriting it would
+# break the audit trail; the bookkeeping says what the last run
+# produced, and clearing it is exactly what "run it again" means.
+#
+# It does **not** release the plan.  A plan that failed stays failed
+# until somebody moves its phase through
+# ``POST /api/plan/{plan_id}/state`` — the response says so in
+# ``note``, because a caller who read "the task is pending again" as
+# "the plan is running again" would be wrong.
+#
+# One task at a time, deliberately: a batch reset would need a rule for
+# *which* tasks to reset, and that rule is a different decision.  There
+# is no ``/tasks/reset`` route.
+
+_NOTE = (
+    "Task reset does not change the plan phase. If the plan is still "
+    "failed, call POST /api/plan/{plan_id}/state with "
+    "current_phase=queued yourself."
+)
+
+
+def _plan_is_running(conn, plan_id: str) -> bool:
+    """Whether a live executor holds this plan right now.
+
+    The answer comes from the scheduler's own running set -- the rows
+    ``PlanFactsReader.active_plans()`` derives from the database -- and
+    from nowhere else.  That reader looks at the execution row's status
+    *and* at whether its pid is still alive, so a run whose executor
+    died is not "running" any more, and a plan that is only verifying
+    is running on the other side.
+
+    The in-memory state of this service process is deliberately not
+    consulted: it is empty after a restart, while the execution row in
+    the database still says the run is going.  A guard that read the
+    memory would answer "no live executor" exactly when there is one,
+    and let the reset be overwritten a second later.
+
+    Args:
+        conn: the connection to read through -- the one the handler
+            already holds open.
+        plan_id: the plan to ask about.
+
+    Returns:
+        ``True`` when the plan is in the running set, ``False`` when it
+        is not.
+    """
+    facts = PlanFactsReader(conn, _server.PLANS_DIR)
+    return any(
+        str(row.get("plan_id")) == plan_id for row in facts.active_plans()
+    )
+
+
+@router.post("/api/execution/{plan_id}/tasks/{task_id}/reset")
+def reset_task_status(
+    plan_id: str,
+    task_id: str,
+    request: Request,
+    req: Optional[_task_reset.TaskResetRequest] = None,
+):
+    """Put one failed task back in the queue.
+
+    Writes the five bookkeeping fields and nothing else: the task's
+    specification (title, description, files to modify, test command,
+    dependencies, project dir) is left byte-identical, and the plan's
+    phase is left alone — see the note in the response.
+
+    A task row that does not exist is a 404, not an INSERT: the
+    repository's write path would happily create a row for a task that
+    was never part of this plan, and "reset" must not be a way to add
+    tasks.  The same 404 answers a task that belongs to another plan
+    (the lookup is keyed on ``(plan_id, task_id)``) and a malformed
+    task id (a bad id is a bad request about a task that does not
+    exist, not a server fault).
+
+    A task that is already ``pending`` is a no-op: the answer is 200
+    with ``noop`` set, and **nothing is written** — not the bookkeeping
+    fields, not ``_repo_version``, not ``updated_at``.  Writing the
+    same values again would leave a "reset that changed nothing" in the
+    audit trail.
+
+    The request body is optional.  ``reason`` says why the operator
+    asked for this (it goes to the audit entry this endpoint writes);
+    ``force`` is the escape hatch for re-running work that already
+    finished.
+
+    Every real write appends one audit entry to
+    ``plans/<plan_id>/task_reset_log.json`` — the same append-only
+    shape as ``task_delta_log.json``.  The entry says who asked
+    (``caller``), what changed (``from_status`` → ``to_status``), why
+    (``reason``) and whether the operator forced it (``forced``).
+    A no-op and every refusal append nothing: they did not reset
+    anything, and a "reset that did not happen" in the audit trail is
+    worse than no entry at all.
+
+    A task that is already ``completed`` is refused with **409**
+    unless the body says ``force=true``: re-running finished work is
+    destructive (it overwrites the conclusion, the commit checkpoint
+    and the acceptance trail that task earned), so it takes an explicit
+    request.  The refusal is decided before anything is written, so the
+    row stays byte-identical.  ``force`` excuses **this** refusal
+    only — it does not conjure a missing task into existence (404)
+    and it does not turn the pending no-op into a write.
+
+    A task that is being worked on right now -- ``in_progress`` or
+    ``breakdown_in_progress`` -- is refused with **409** while its plan
+    is running: a live executor writes the task row from its own
+    memory, so the reset would be undone a moment later and the
+    operator would believe a task was queued when it was not.  That
+    refusal reads the scheduler's running set (derived from the
+    database), and a task left ``in_progress`` by an executor that died
+    is reset normally -- the plan is idle, so the reset is the
+    recovery.  ``force`` does not excuse this refusal either: the way
+    through it is to stop the plan first.
+    """
+    from state_machine.db.connection import open as open_db
+    from state_machine.db.schema import migrate
+    from state_machine.repositories.plan_task_repository import (
+        PlanTaskRepository, TaskProgressValidationError,
+    )
+
+    plan_dir = _server._plan_dir(plan_id)
+    if not plan_dir.exists():
+        raise HTTPException(404, {"error": "Plan not found"})
+    archived = _server._archived_plan_response(plan_dir)
+    if archived is not None:
+        return archived
+
+    req = req or _task_reset.TaskResetRequest()
+
+    conn = open_db(_server._state_db_path())
+    try:
+        migrate(conn)
+        repo = PlanTaskRepository(conn)
+        before = repo.get_task(plan_id, task_id)
+        if before is None:
+            raise HTTPException(
+                404,
+                {"error": "Task not found", "plan_id": plan_id,
+                 "task_id": task_id},
+            )
+        # Already queued: a real no-op.  Not "write the same values
+        # again" — that would bump ``_repo_version`` and ``updated_at``
+        # and leave a "reset that changed nothing" in the audit trail.
+        # The whole row has to come back byte-identical, so the answer
+        # is built from ``before`` and nothing is written at all.
+        current = str(before.get("status") or "")
+        if current == "pending":
+            return {
+                "plan_id": plan_id,
+                "task": {"id": task_id, **before},
+                # Nothing was cleared, so nothing is reported as
+                # cleared: echoing the row back would tell the operator
+                # we wiped fields we never touched.
+                "cleared": {
+                    field: None for field in _task_reset.BOOKKEEPING_FIELDS
+                },
+                "noop": True,
+                "note": _NOTE,
+            }
+        # Completed work: re-running it is destructive, so it takes an
+        # explicit request.  Resetting a *failed* task is recovery — it
+        # never finished, so nothing is lost.  Resetting a *completed*
+        # one rewrites history: the conclusion it earned, its commit
+        # checkpoint and its acceptance trail all get overwritten, and
+        # the audit chain grows a hole.  The operator has to say so:
+        # ``force=true`` in the body.
+        #
+        # The refusal writes nothing at all — it is decided before the
+        # write path is entered, so the row stays byte-identical
+        # (``_repo_version`` and ``updated_at`` included).
+        #
+        # ``force`` buys exactly this one bypass.  It does not excuse a
+        # missing task (404) and it does not turn the pending no-op into
+        # a write: those two are not "refusals to re-run", they are
+        # "there is nothing to re-run".
+        #
+        # The body of the refusal is the structured error object under
+        # the standard ``detail`` envelope — ``{"detail": {"error",
+        # "detail", "plan_id", "task_id"}}`` — and it is returned
+        # directly rather than raised, because this endpoint's contract
+        # pins that shape (the app's own ``HTTPException`` handler
+        # unwraps a dict body that carries an ``error`` key, which would
+        # flatten it).
+        if current == "completed" and not req.force:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": {
+                        "error": "task_already_completed",
+                        "detail": (
+                            "Re-running completed work is destructive; pass "
+                            "force=true in the body to do it deliberately."
+                        ),
+                        "plan_id": plan_id,
+                        "task_id": task_id,
+                    }
+                },
+            )
+        # A live executor holds this task.  Resetting it now would be
+        # silently undone: the executor writes the task row from its own
+        # in-memory state, so the next thing it does puts the status
+        # back to what it thinks it is.  The operator would see the
+        # reset succeed and the task keep running.
+        #
+        # This is the same reasoning as the verification reset refusing
+        # a live thread: the live holder wins, the reset has to wait.
+        #
+        # The task status is the half of the condition that says "this
+        # task is being worked on right now"; the running plan is the
+        # half that says "somebody is alive to overwrite it".  A task
+        # left ``in_progress`` by an executor that died is NOT that
+        # case -- the plan is idle, so the reset is the recovery, and
+        # refusing it would lock the task out forever.
+        #
+        # ``force`` does not buy a way past this one: ``force`` says
+        # "I know re-running finished work is destructive", while this
+        # refusal says "you cannot win the race".  The way through is to
+        # stop the plan first.
+        #
+        # Nothing is written: the refusal is decided before the write
+        # path is entered, so the row stays byte-identical.
+        if (
+            current in _EXECUTION_IN_PROGRESS_TASK_STATUSES
+            and _plan_is_running(conn, plan_id)
+        ):
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": {
+                        "error": "task_in_progress",
+                        "detail": (
+                            "A live executor holds this task; it would "
+                            "overwrite the reset. Stop the plan first "
+                            "(POST /api/execution/{plan_id}/stop), then "
+                            "reset."
+                        ),
+                        "plan_id": plan_id,
+                        "task_id": task_id,
+                    }
+                },
+            )
+        try:
+            repo.update_task(
+                plan_id=plan_id,
+                task_id=task_id,
+                fields=_task_reset.build_reset_fields(),
+            )
+        except TaskProgressValidationError:
+            # A malformed task id is a bad request about a task that
+            # does not exist, not a server fault.  The repository's
+            # write path is ``INSERT ... ON CONFLICT DO UPDATE``, so
+            # this 404 is also what keeps a bad id from conjuring a
+            # row into existence.
+            raise HTTPException(
+                404,
+                {"error": "Task not found", "plan_id": plan_id,
+                 "task_id": task_id},
+            )
+        after = repo.get_task(plan_id, task_id) or {}
+        # The audit entry.  Only a *real* write gets one: the no-op
+        # branch returned before reaching this line, and so did every
+        # refusal — they did not reset anything.
+        #
+        # ``caller`` comes from the ``X-PDT-Caller`` header, and NOT
+        # from ``X-PDT-Request``: that one is the CSRF guard, its value
+        # is always "1", and using it would file every caller under the
+        # same name.  With no header there is no identity to record, so
+        # it says "http" — the kind of call, which is honest.
+        #
+        # The write is not allowed to fail quietly: ``append_reset_log``
+        # re-raises, so a reset that cannot be audited surfaces as an
+        # error instead of disappearing.
+        raw_caller = request.headers.get("X-PDT-Caller") or ""
+        caller = raw_caller.strip()[:200] or "http"
+        _task_reset.append_reset_log(plan_dir, {
+            "task_id": task_id,
+            "from_status": current,
+            "to_status": "pending",
+            "reason": req.reason,
+            "caller": caller,
+            "forced": bool(req.force),
+        })
+    finally:
+        conn.close()
+
+    return {
+        "plan_id": plan_id,
+        "task": {"id": task_id, **after},
+        "cleared": _task_reset.cleared_payload(before),
+        "noop": False,
+        "note": _NOTE,
     }
 
 

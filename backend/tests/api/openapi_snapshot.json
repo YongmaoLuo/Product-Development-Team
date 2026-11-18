@@ -799,6 +799,29 @@
         "title": "TaskDeltaRequest",
         "type": "object"
       },
+      "TaskResetRequest": {
+        "description": "\u91cd\u7f6e\u8bf7\u6c42\u4f53\u3002\n\n``reason`` \u662f\u64cd\u4f5c\u8005\u7ed9\u51fa\u7684\u7406\u7531\uff0c\u5199\u8fdb\u5ba1\u8ba1\u8bb0\u5f55\uff1b\u53ef\u9009\uff0c\u53bb\u7a7a\u767d\u540e\u6700\u591a\n\u4fdd\u7559 800 \u5b57\u7b26\uff08\u7406\u7531\u662f\u7ed9\u4eba\u770b\u7684\uff0c\u4e0d\u662f\u6570\u636e\u901a\u9053\uff09\u3002\n\n``force`` \u8868\u793a\"\u6211\u77e5\u9053\u6211\u5728\u505a\u4ec0\u4e48\"\uff1a\u91cd\u8dd1\u4e00\u6761 ``completed`` \u7684\u4efb\u52a1\n\u662f\u7834\u574f\u6027\u7684\uff0c\u9700\u8981\u663e\u5f0f\u8981\u6c42\u3002",
+        "properties": {
+          "force": {
+            "default": false,
+            "title": "Force",
+            "type": "boolean"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "title": "TaskResetRequest",
+        "type": "object"
+      },
       "ValidationError": {
         "properties": {
           "ctx": {
@@ -1756,6 +1779,70 @@
           }
         },
         "summary": "Apply Execution Task Delta"
+      }
+    },
+    "/api/execution/{plan_id}/tasks/{task_id}/reset": {
+      "post": {
+        "description": "Put one failed task back in the queue.\n\nWrites the five bookkeeping fields and nothing else: the task's\nspecification (title, description, files to modify, test command,\ndependencies, project dir) is left byte-identical, and the plan's\nphase is left alone \u2014 see the note in the response.\n\nA task row that does not exist is a 404, not an INSERT: the\nrepository's write path would happily create a row for a task that\nwas never part of this plan, and \"reset\" must not be a way to add\ntasks.  The same 404 answers a task that belongs to another plan\n(the lookup is keyed on ``(plan_id, task_id)``) and a malformed\ntask id (a bad id is a bad request about a task that does not\nexist, not a server fault).\n\nA task that is already ``pending`` is a no-op: the answer is 200\nwith ``noop`` set, and **nothing is written** \u2014 not the bookkeeping\nfields, not ``_repo_version``, not ``updated_at``.  Writing the\nsame values again would leave a \"reset that changed nothing\" in the\naudit trail.\n\nThe request body is optional.  ``reason`` says why the operator\nasked for this (it goes to the audit entry this endpoint writes);\n``force`` is the escape hatch for re-running work that already\nfinished.\n\nEvery real write appends one audit entry to\n``plans/<plan_id>/task_reset_log.json`` \u2014 the same append-only\nshape as ``task_delta_log.json``.  The entry says who asked\n(``caller``), what changed (``from_status`` \u2192 ``to_status``), why\n(``reason``) and whether the operator forced it (``forced``).\nA no-op and every refusal append nothing: they did not reset\nanything, and a \"reset that did not happen\" in the audit trail is\nworse than no entry at all.\n\nA task that is already ``completed`` is refused with **409**\nunless the body says ``force=true``: re-running finished work is\ndestructive (it overwrites the conclusion, the commit checkpoint\nand the acceptance trail that task earned), so it takes an explicit\nrequest.  The refusal is decided before anything is written, so the\nrow stays byte-identical.  ``force`` excuses **this** refusal\nonly \u2014 it does not conjure a missing task into existence (404)\nand it does not turn the pending no-op into a write.\n\nA task that is being worked on right now -- ``in_progress`` or\n``breakdown_in_progress`` -- is refused with **409** while its plan\nis running: a live executor writes the task row from its own\nmemory, so the reset would be undone a moment later and the\noperator would believe a task was queued when it was not.  That\nrefusal reads the scheduler's running set (derived from the\ndatabase), and a task left ``in_progress`` by an executor that died\nis reset normally -- the plan is idle, so the reset is the\nrecovery.  ``force`` does not excuse this refusal either: the way\nthrough it is to stop the plan first.",
+        "operationId": "reset_task_status_api_execution__plan_id__tasks__task_id__reset_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/TaskResetRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Req"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reset Task Status"
       }
     },
     "/api/health": {
