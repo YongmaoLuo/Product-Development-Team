@@ -134,7 +134,11 @@ def test_tick_isolates_sweep_failure(monkeypatch, caplog):
     monitor = _monitor()
     monkeypatch.setattr(monitor, "_check_once", check_once)
 
-    with caplog.at_level(logging.ERROR, logger="server"):
+    # ``server.logger.name`` rather than the literal "server": another
+    # case can load server.py under an alias, and server.py's
+    # ``sys.modules.setdefault("server", ...)`` then makes that alias
+    # module the canonical one — its logger keeps the alias name.
+    with caplog.at_level(logging.ERROR, logger=server.logger.name):
         monitor._tick()  # must not raise
 
     assert check_once.call_count == 1, (
@@ -148,7 +152,7 @@ def test_tick_isolates_sweep_failure(monkeypatch, caplog):
     failures = [
         record
         for record in caplog.records
-        if record.name == "server" and record.levelno >= logging.ERROR
+        if record.name == server.logger.name and record.levelno >= logging.ERROR
     ]
     assert failures, (
         "the failure must be logged — a silent failure is "
