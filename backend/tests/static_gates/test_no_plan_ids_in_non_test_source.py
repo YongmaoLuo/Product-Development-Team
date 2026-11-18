@@ -186,6 +186,52 @@ def test_scan_is_non_empty() -> None:
     )
 
 
+def test_the_first_party_tree_carries_no_plan_id() -> None:
+    """Full-tree scan: zero plan ids in non-test first-party source.
+
+    Every other test in this file feeds :data:`PLAN_ID_SHAPE` a synthetic
+    fixture. This one reads the repository, and it is the only one that
+    can fail when a real plan id is about to ship.
+
+    The gap it closes is the reason this file exists and still was not
+    enough. The shape was pinned and the rule was pinned, but the tree
+    was never read -- so a plan id sat in a production docstring for a
+    whole branch while every test here stayed green, because they all
+    asked "does the shape match?" rather than "does the tree contain
+    one?". The commit-range privacy scan found the same id, but it runs
+    over commits on a push; a pytest gate has to read the tree itself to
+    be a gate.
+
+    The paths handed to the rule are repository-root-relative, which is
+    how the commit-range scan judges the very same file: the test-source
+    exemption is a path-part test, and an absolute path would drag the
+    *checkout's* directory names into that decision -- a checkout that
+    happens to live under a directory called ``tests`` would otherwise
+    exempt the whole tree.
+
+    The offending id is reported as ``rel:lineno`` and nothing more. The
+    id is the private thing; printing it into a failure message would
+    repeat the leak into every log the gate writes.
+    """
+    offenders: list[str] = []
+    for path in source_scan.iter_first_party_sources():
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        rel = source_scan.repo_relative(path)
+        for _, lineno, _snippet in find_plan_ids_in_non_test_source(rel, text):
+            offenders.append(f"{rel}:{lineno}")
+
+    assert not offenders, (
+        "First-party production source carries a plan id. A plan id names a "
+        "private plan directory the operator actually ran; one was published "
+        "to a public remote on 2026-09-29. Replace the id with the date and "
+        "the VP reference, or drop the plan reference entirely -- the rule "
+        "is the plan-id shape, not the plan.\n  " + "\n  ".join(offenders)
+    )
+
+
 def test_the_shape_matches_a_real_leaked_plan_id() -> None:
     """The shape that leaked on 2026-09-29 is detected in production source.
 

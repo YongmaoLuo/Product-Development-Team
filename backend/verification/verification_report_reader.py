@@ -46,6 +46,37 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+def _entry_is_infrastructure_unresolved(entry: Any) -> bool:
+    """Is this report entry a point the environment never let the round judge?
+
+    2026-11-17 (VP-007).  The infra
+    terminal (``infrastructure_unresolved``) says the point was **never
+    asked**: its environment kept breaking until the cross-round retry
+    budget ran out.  It is read from the entry's own fields, the same way
+    ``verification_agent._entry_is_infrastructure_unresolved`` reads it:
+    the marker itself, the terminal it names, or the reason code it
+    writes.  The **status is not consulted** — the status says
+    ``BLOCKED``, which on its own says nothing about *why*.
+
+    The constant comes from :mod:`verification.failure_triage`, so the
+    reader and the agent cannot drift apart over the spelling.  The agent
+    itself is far too heavy to import here (it drags the whole
+    verification phase machinery in), which is why the rule is spelled
+    out a second time rather than imported — the same reason
+    ``verification.failure_history`` is imported lazily inside the
+    functions below.
+    """
+    if not isinstance(entry, dict):
+        return False
+    from verification.failure_triage import INFRA_UNRESOLVED_TERMINAL
+
+    if entry.get("infrastructure_unresolved") is True:
+        return True
+    if str(entry.get("failure_terminal") or "") == INFRA_UNRESOLVED_TERMINAL:
+        return True
+    return str(entry.get("reason_code") or "") == INFRA_UNRESOLVED_TERMINAL
+
+
 def _vp_runnable_command(vp_plan: Dict[str, Any]) -> str:
     """Return the VP's runnable shell command, or ``""`` if it has none.
 
@@ -303,9 +334,10 @@ def extract_failed_vps_with_paths(
 ) -> List[Dict[str, Any]]:
     """Path-based sibling of :func:`extract_failed_vps_from_report`.
 
-    Same FAILED-VP selection and same plan overlay, but the long-form
-    fields are **not** copied into the returned dicts. Instead each entry
-    carries:
+    The same plan overlay and the same evidence shape, but the long-form
+    fields are **not** copied into the returned dicts. (The *selection*
+    is slightly wider than the sibling's — see "What is selected"
+    below.) Instead each entry carries:
 
     * ``actual_result_summary`` / ``evidence_summary`` — collapsed to at
       most :data:`_SUMMARY_LIMIT` characters, so an LLM prompt built from
@@ -330,6 +362,12 @@ def extract_failed_vps_with_paths(
       was never written down, so there is nothing a rework could
       satisfy. The record is **kept** — the evidence paths are what an
       operator reads — but the gate refuses it.
+    * ``infrastructure_unresolved`` / ``failure_terminal`` /
+      ``reason_code`` / ``recommendation`` — the terminal markers and the
+      point's own recommendation, copied when the report carries them
+      (2026-11-17, VP-007). The router reads the markers to recognise a
+      point the environment never judged; the recommendation decides the
+      default answer of the question about it.
 
     Why this exists: ``extract_failed_vps_from_report`` inlines
     ``actual_result`` / ``evidence`` and the repair prompt truncates each
@@ -341,8 +379,22 @@ def extract_failed_vps_with_paths(
     callers that want the old shape should keep using
     :func:`extract_failed_vps_from_report`.
 
+    **What is selected** (2026-11-17, VP-007): the FAILED verdicts
+    **plus** the infra-terminal entries — the points whose environment
+    kept breaking until the retry budget ran out, so they were never
+    judged.  A terminal entry's status is ``BLOCKED`` (it is not a
+    verdict about the deliverable), so a selection rule that read the
+    status alone dropped it: the point bought no repair task (correct)
+    but also no question and no ``deferred`` record — it vanished.  The
+    terminal markers travel with the rebuilt entry so the router can
+    recognise it.
+
+    The terminal is recognised by its markers, never by the status: an
+    ``environment_blocked`` entry is blocked too, and it has a
+    round-level path of its own.
+
     Returns an empty list when the report is missing, unreadable, or
-    contains no FAILED entries.
+    contains neither a FAILED entry nor an infra-terminal entry.
     """
     # The class rule lives in ``verification.failure_history`` — the
     # module the history records and the repair gate read it from — so
@@ -419,7 +471,25 @@ def extract_failed_vps_with_paths(
     seen_ids: set = set()
     for results_list, pointer_prefix in sources:
         for idx, r in enumerate(results_list):
-            if not isinstance(r, dict) or r.get("status") != "FAILED":
+            if not isinstance(r, dict):
+                continue
+            # 2026-11-17 (VP-007): the selection is "a FAILED verdict
+            # **or** an infra terminal" — not "a FAILED verdict" alone.
+            #
+            # A terminal entry's status is ``BLOCKED``, because it is
+            # **not** a verdict about the deliverable: the point was
+            # never asked.  A rule that read the status alone therefore
+            # dropped it, and the point never reached the router — no
+            # repair task (right), but also no question and no
+            # ``deferred`` record (the silent gap this closes).
+            #
+            # The status is still not the rule: an ``environment_blocked``
+            # entry is blocked too, and it has a round-level path of its
+            # own.  Only the terminal markers decide.
+            if (
+                r.get("status") != "FAILED"
+                and not _entry_is_infrastructure_unresolved(r)
+            ):
                 continue
             vp_id = str(r.get("id", ""))
             # Same dedupe rule as the inlining reader: the top-level
@@ -484,6 +554,24 @@ def extract_failed_vps_with_paths(
                 # can still carry this one.
                 "definition_missing": definition_missing,
             }
+            # 2026-11-17 (VP-007): the terminal markers travel with the
+            # entry.  The router
+            # (``orchestrator._route_failed_vps``) reads them to tell a
+            # terminal from a broken deliverable: without them the entry
+            # would look like an ordinary failure and buy a repair task
+            # — or, with an ``infra`` class, land in ``deferred``
+            # without anybody ever being asked.
+            for _marker in (
+                "infrastructure_unresolved",
+                "failure_terminal",
+                "reason_code",
+            ):
+                if _marker in r:
+                    entry[_marker] = r[_marker]
+            # The recommendation travels too: the HITL question's
+            # default answer follows the point's own recommendation.
+            if r.get("recommendation"):
+                entry["recommendation"] = r["recommendation"]
             if vp_plan:
                 # 2026-10-11: point at whichever key actually carries the
                 # command. The pointer is handed to the repair agent as

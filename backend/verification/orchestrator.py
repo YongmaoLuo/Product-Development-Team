@@ -9,8 +9,10 @@ Core responsibilities:
 - Persist all state transitions through PlanState
 """
 
+import contextlib
 import hashlib
 import inspect
+import io
 import json
 import logging
 import os
@@ -71,6 +73,23 @@ from verification.failure_triage import (
 from verification.failure_fingerprint import (
     failure_fingerprint,
     fingerprint_rule,
+)
+# 2026-11-17: the wording, the options and the default for the question
+# asked about a failed point that got no repair task — and for the
+# question asked about a point the environment never let the round judge
+# (the infra terminal).  The module is
+# pure (it imports nothing from the backend), so it can be imported
+# here without a cycle — and the orchestrator must not spell any of
+# these out a second time: the same option table is read by the
+# coverage check that decides *whether* to ask.
+from verification.repair_coverage import (
+    INFRA_TERMINAL_DEFAULT_OPTION,
+    INFRA_TERMINAL_OPTIONS,
+    MISSED_VP_DEFAULT_OPTION,
+    MISSED_VP_OPTIONS,
+    infra_terminal_question,
+    missed_vp_question,
+    recommended_default,
 )
 from verification.triage_agent import VPTriageJudge
 # 2026-11-06: the canonical spelling of a repo-relative path — the ONE
@@ -2584,11 +2603,22 @@ class VerificationOrchestrator:
                 #
                 # The record is still written down — the operator reads
                 # it to see which point the environment ate.
-                deferred.append({
+                record = {
                     "id": str(vp.get("id") or ""),
                     "failure_class": INFRA,
                     "disposition": Disposition.RETRY_NOT_COUNTED,
-                })
+                }
+                # 2026-11-17 (arch decision point 4 — R4): a terminal is
+                # a verdict about the **environment**, not about the
+                # deliverable, and a verdict nobody is asked about is a
+                # dead end — the point was never judged, so it buys no
+                # repair task, and now it also buys no question.  Ask:
+                # the operator decides whether the round gets another
+                # try, whether the point is skipped, or whether it waits.
+                record["decision_id"] = self._ask_human_about_infra_terminal(
+                    vp, round_number,
+                )
+                deferred.append(record)
                 continue
             if disposition == Disposition.RETRY_COUNTED:
                 repairable.append(vp)
@@ -2732,6 +2762,555 @@ class VerificationOrchestrator:
             )
             return ""
         return str(getattr(decision, "decision_id", "") or "")
+
+    def _ask_human_about_missing_repair(
+        self, vp=None, reason=None, round_number=0,
+    ) -> str:
+        """Ask a human about a failed point that got no repair task.
+
+        2026-11-17 (arch decision point 3).  The repair content is
+        generated **once** for the whole round, so a point can fail and
+        then quietly vanish: the generator never mentioned it, or the
+        assembler dropped its row because ``files_to_modify`` was
+        empty.  A vanished point has no repair task **and** no
+        question — nobody knows it failed until it fails again.
+
+        This is the thin wrapper that gives that point a way out
+        (arch decision point 3).  The wording, the options and the
+        default all come from :mod:`verification.repair_coverage`, so
+        the module that decides *which* points are missing and the
+        module that decides *what to ask* cannot disagree; and the
+        question is written through :meth:`_ask_a_human_about`, the
+        only writer of ``plan_decisions``, which already keeps one
+        open question per point (arch decision point 6).
+
+        Parameters
+        ----------
+        vp:
+            The verification point that got no repair task.  Its ``id``
+            names the point, and its ``recommendation`` decides the
+            default answer.
+        reason:
+            Why the point got no task — one of the reason tokens of
+            :mod:`verification.repair_coverage`.
+        round_number:
+            Which round of the verification loop raised it.
+
+        Returns:
+            The decision id, or ``""`` when no question was asked (one
+            was already open, or the question could not be created).
+        """
+        point = vp if isinstance(vp, dict) else {}
+        vp_id = str(point.get("id") or "")
+        question = missed_vp_question(vp_id, reason, round_number)
+        default_option = recommended_default(
+            point, MISSED_VP_OPTIONS, MISSED_VP_DEFAULT_OPTION,
+        )
+        return self._ask_a_human_about(
+            point,
+            DELIVERABLE_DEFECT,
+            round_number,
+            question=question,
+            options=list(MISSED_VP_OPTIONS),
+            default_option=default_option,
+            audit_event="verification_repair_coverage_decision_failed",
+        )
+
+    def _ask_human_about_infra_terminal(
+        self, vp=None, round_number=0,
+    ) -> str:
+        """Ask a human about a point whose infra retry budget ran out.
+
+        2026-11-17 (arch decision point 4 — R4).  The infra terminal
+        says the point was **never asked**: its environment kept
+        breaking until the cross-round retry budget ran out, so the
+        product was never judged.  That verdict used to have no way
+        out — a mixed round only wrote the point down as deferred, and
+        an all-infra round stopped the chain outright.  Neither asked
+        anybody, so ``infrastructure_unresolved`` was a dead end.
+
+        This is the thin wrapper that gives it one: the wording, the
+        options and the default all come from
+        :mod:`verification.repair_coverage`, so the module that decides
+        *what to ask* and the module that decides *when to ask* cannot
+        disagree; and the question is written through
+        :meth:`_ask_a_human_about`, the only writer of
+        ``plan_decisions``, which already keeps one open question per
+        point (arch decision point 6 — R6).
+
+        Parameters
+        ----------
+        vp:
+            The verification point whose budget ran out.  Its ``id``
+            names the point, and its ``recommendation`` decides the
+            default answer.
+        round_number:
+            Which round of the verification loop raised it.
+
+        Returns
+        -------
+        The decision id, or ``""`` when no question was asked (one was
+        already open, or the question could not be created).
+        """
+        point = vp if isinstance(vp, dict) else {}
+        vp_id = str(point.get("id") or "")
+        question = infra_terminal_question(vp_id, round_number)
+        default_option = recommended_default(
+            point, INFRA_TERMINAL_OPTIONS, INFRA_TERMINAL_DEFAULT_OPTION,
+        )
+        return self._ask_a_human_about(
+            point,
+            INFRA,
+            round_number,
+            question=question,
+            options=list(INFRA_TERMINAL_OPTIONS),
+            default_option=default_option,
+            audit_event="verification_infra_terminal_decision_failed",
+        )
+
+    def _ask_humans_about_infra_terminals(
+        self, entries: Any, round_number: int = 0,
+    ) -> List[str]:
+        """Ask a human about every terminal point among these entries.
+
+        The all-infra round stops the chain before anybody is asked, so
+        the question has to be raised here — at the exit — or the point
+        that was never judged stays unanswered forever.
+
+        The entries are filtered and de-duplicated **here**, so the
+        caller can hand over everything it has: the report's top-level
+        results and the last round's snapshot carry the same point
+        twice, and a point is asked about once (arch decision point 6 —
+        R6).  Only the terminal entries are asked about: a point that
+        was judged (passed or failed) is not this method's business.
+
+        Parameters
+        ----------
+        entries:
+            The report entries to look at.
+        round_number:
+            Which round of the verification loop raised them.
+
+        Returns
+        -------
+        The ids of the points a question was actually raised about — a
+        point whose question was already open, or could not be created,
+        is not in the list, because nothing was asked of anybody.
+        """
+        asked: List[str] = []
+        seen: Set[str] = set()
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
+            if not _entry_is_infrastructure_unresolved(entry):
+                continue
+            vp_id = str(entry.get("id") or "")
+            # A terminal entry without an id names no point: there is
+            # nobody to ask about.
+            if not vp_id or vp_id in seen:
+                continue
+            seen.add(vp_id)
+            if self._ask_human_about_infra_terminal(entry, round_number):
+                asked.append(vp_id)
+        return asked
+
+    def _ensure_repair_coverage(
+        self,
+        repair_tasks: List[Dict[str, Any]],
+        repair_candidates: List[Dict[str, Any]],
+        repair_contents: List[Dict[str, Any]],
+        round_number: int,
+        *,
+        failed_vps: List[Dict[str, Any]],
+        vp_test_commands: Optional[Dict[str, str]],
+        plan_file: Any,
+        existing_repair_ids: Set[str],
+        generator_kwargs: Dict[str, Any],
+        repair_generation_error: Optional[str] = None,
+        plan_intent: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """R1/R2 —— 这一批 repair 任务真的覆盖了本轮每一个失败的 VP 吗？
+
+        2026-11-17 (arch 决策点 1/2/5/7)。repair 内容是**一次**生成的：
+        生成器拿到本轮所有候选 VP，产出若干条内容，
+        ``RepairTaskAssembler.assemble`` 再把它们变成任务行。于是有两条路
+        可以让一个候选 VP 悄悄消失 ——
+
+        * 生成器压根没为它产出内容（模型漏了一条）；
+        * 生成器产出了，但 ``assemble`` 把它那行 ``files_to_modify`` 为空
+          的行丢掉了（模型说了「要返工」，却没说改哪个文件）。
+
+        消失的那条 VP 既没有 repair 任务，也没有 HITL：没有人知道它失败
+        过，直到下一轮它再次失败。2026-11-17 的一轮就是这样丢了一个
+        VP-023。
+
+        所以在 assemble 之后、持久化之前做一次核对：缺的那几条补生成
+        **一次**（最多一次 —— 允许循环的补生成会把模型的预算花在整份
+        计划的每一个候选上），补不上的逐个开 HITL。
+
+        覆盖目标 是 ``repair_candidates``（分流之后）：被判 split 的父 VP
+        不参与 —— 它已经有子 VP 这条出路了（R5）。
+
+        Parameters
+        ----------
+        repair_tasks:
+            刚装配出来的那一批任务。
+        repair_candidates:
+            本轮分流之后仍然需要 repair 任务的 VP。
+        repair_contents:
+            首批生成出来的 repair 内容（生成器提到过哪些 VP 从这里读）。
+        round_number:
+            这一轮验证的轮次。
+        failed_vps:
+            本轮全部失败的 VP 记录 —— 提问时要用的 ``recommendation``
+            从这里读。
+        vp_test_commands:
+            首批装配用的 ``{vp_id: command}``，补装配沿用同一份。
+        plan_file:
+            ``verification_plan.json`` 的路径，补装配沿用同一份。
+        existing_repair_ids:
+            这个 plan 已经占用的 repair id（两个 store 合起来的）。
+        generator_kwargs:
+            首批生成用的 kwargs，补生成沿用同一份。
+        repair_generation_error:
+            首批生成失败时的原因。非空说明这一轮要按 2026-09-14 的
+            park 语义挂起 —— 那不是「没有修复任务」，所以这一轮不做
+            覆盖校验，也不提问。
+        plan_intent:
+            计划自己声明的约束（2026-10-23 的意图门禁）。补生成出来
+            的那批内容也要过这道门禁 —— 首批过了，补出来的那批不能
+            不过，否则门禁被绕开了一次。
+
+        Returns
+        -------
+        The task table: the batch as it was, plus the tasks the
+        regeneration produced.  A failure inside the check never
+        strands the round — the batch is returned unchanged.
+        """
+        from repair_generator import (
+            RepairGenerationError,
+            RepairTaskAssembler,
+            next_repair_seq_base,
+        )
+        from verification.repair_coverage import (
+            ensure_repair_coverage,
+            missing_repair_targets,
+        )
+
+        tasks = list(repair_tasks or [])
+
+        # 2026-09-14 的 park 语义：生成失败的一轮由 auto-loop 挂起等待
+        # （而不是被记成「没有修复任务」的终局）。这一轮不做覆盖校验，
+        # 也不提问 —— 「生成器坏了」和「这个 VP 没有出路」是两件事，
+        # 把前者说成后者会把操作员引到错的地方去。
+        if repair_generation_error:
+            print(
+                f"[Repair] round {round_number}: "
+                f"repair_coverage_checked skipped=generation_error"
+            )
+            print(
+                f"[Repair] round {round_number}: "
+                f"repair_coverage_hitl_raised=[]"
+            )
+            return tasks
+
+        candidate_ids: List[str] = []
+        for candidate in repair_candidates or ():
+            if not isinstance(candidate, dict):
+                continue
+            raw = candidate.get("id") or candidate.get("vp_id")
+            text = str(raw or "").strip()
+            if text:
+                candidate_ids.append(text)
+
+        if not candidate_ids:
+            # 本轮没有需要 repair 任务的 VP（失败都被分流/作废/另寻出路
+            # 了）—— 没有覆盖目标，就没有可校验的东西。
+            print(
+                f"[Repair] round {round_number}: "
+                f"repair_coverage_checked missing=[]"
+            )
+            print(
+                f"[Repair] round {round_number}: "
+                f"repair_coverage_hitl_raised=[]"
+            )
+            return tasks
+
+        if not repair_contents:
+            # 生成器这一轮什么内容都没产出。这在生产里等于「生成失败」：
+            # ``generate_repair_contents`` 解析不出可用内容时会抛
+            # ``RepairGenerationError``（上面那条 park 语义已经接住它）。
+            # 一个**成功**却空手的生成器，是同一场失败的另一种穿法：这一
+            # 轮压根没有批次，覆盖无从谈起 —— 拿一个空批次去问「谁没被覆
+            # 盖」，问出来的答案是「谁都没被覆盖」，那不是缺失，是这一轮
+            # 没有内容。
+            print(
+                f"[Repair] round {round_number}: "
+                f"repair_coverage_checked skipped=no_content"
+            )
+            print(
+                f"[Repair] round {round_number}: "
+                f"repair_coverage_hitl_raised=[]"
+            )
+            return tasks
+
+        if tasks and not any(
+            isinstance(task, dict) and task.get("failed_vp_id")
+            for task in tasks
+        ):
+            # 装配出来的行没有一行说得出它修的是哪个点。覆盖判定是
+            # 「哪个候选 VP 没有任务指向它」，而这批行没有名字可比 ——
+            # 判定的输入不完整，硬判就是猜。
+            #
+            # 生产里不会走到这里：``RepairTaskAssembler`` 只会发出
+            # ``failed_vp_id`` 在失败点集合里的行（它自己把不认识的 id
+            # 丢掉），所以每一行都带着它修的那个点。这条是给「行不完整」
+            # 的批次兜底的 —— 遇到就说一声，不猜。
+            print(
+                f"[Repair] round {round_number}: "
+                f"repair_coverage_checked skipped=unattributable_batch"
+            )
+            print(
+                f"[Repair] round {round_number}: "
+                f"repair_coverage_hitl_raised=[]"
+            )
+            return tasks
+
+        # 首批提到的 VP —— 「生成器漏了」和「被 assemble 丢了」要靠它
+        # 区分开：两者的修法完全不同。
+        generated_vp_ids = [
+            str(content.get("failed_vp_id") or "")
+            for content in (repair_contents or [])
+            if isinstance(content, dict) and content.get("failed_vp_id")
+        ]
+
+        # 提问要用的 VP 记录（``id`` 与 ``recommendation``）。补生成与
+        # 补装配也要用它 —— 生成器要的是记录，不是 id。
+        vp_records: Dict[str, Dict[str, Any]] = {}
+        for vp in list(failed_vps or ()) + list(repair_candidates or ()):
+            if not isinstance(vp, dict):
+                continue
+            vp_id = str(vp.get("id") or "").strip()
+            if vp_id:
+                vp_records.setdefault(vp_id, vp)
+
+        def _record(vp_id: Any) -> Dict[str, Any]:
+            """The failed-VP record for ``vp_id`` (a stub if unknown)."""
+            key = str(vp_id or "").strip()
+            return vp_records.get(key) or {"id": key}
+
+        def regenerate(missed_vps: List[str]) -> List[Dict[str, Any]]:
+            """补生成一次 —— 只为缺的那几条 VP。"""
+            try:
+                contents = list(self.repair_generator.generate_repair_contents(
+                    [_record(vp_id) for vp_id in missed_vps],
+                    round_number,
+                    **generator_kwargs,
+                ) or [])
+            except VerificationCancelled:
+                # 操作员叫停了这一轮 —— 这不是生成失败，原样抛出去。
+                raise
+            except RepairGenerationError as exc:
+                # 生成器又坏了：当作「没有内容」，继续往下走（仍然缺失的
+                # VP 会被提问）。让这一轮因为生成器的问题整个搁浅，比
+                # 让一个 VP 静默消失更糟。
+                print(
+                    f"[Repair] round {round_number}: repair-coverage "
+                    f"regeneration failed ({exc})"
+                )
+                return []
+            # 2026-10-23 的意图门禁同样管补出来的那一批。首批过了门禁，
+            # 补出来的那批不能不过 —— 门禁被绕开一次，就等于这一轮的
+            # 约束对补生成的那几条不生效，而补生成的那几条照样会变成
+            # 修复任务被执行。被门禁拦下的行不成为任务：那个 VP 还有
+            # HITL 这条出路（问的是人为什么没有出路）。
+            kept = self._gate_regenerated_contents(
+                contents, round_number, plan_intent,
+            )
+            return kept
+
+        def assemble(
+            contents: List[Dict[str, Any]], missed_vps: List[str],
+        ) -> List[Dict[str, Any]]:
+            """补装配 —— id 从「本批 id ∪ 已有 id」续号，不复用。"""
+            batch_ids = {
+                str(task.get("id") or "")
+                for task in tasks
+                if isinstance(task, dict) and task.get("id")
+            }
+            allocated = batch_ids | set(existing_repair_ids or ())
+            assembled = RepairTaskAssembler(
+                round_number=round_number,
+                failed_vps=[_record(vp_id) for vp_id in missed_vps],
+                vp_test_commands=vp_test_commands,
+                plan_path=str(plan_file or ""),
+                seq_base=next_repair_seq_base(allocated, round_number),
+                existing_task_ids=allocated,
+            ).assemble(list(contents or []))
+            # 装配器拿到的池子里已经有本批的 id，所以它不会再发一个出来 ——
+            # 但这一层不依赖这个承诺：同名的两行会在 ``plan_tasks`` 里互相
+            # 覆盖（那一行的 key 是 ``(plan_id, task_id)``），2026-09-20 的
+            # 事故就是这么来的。宁可这一条被丢掉（那个 VP 还有 HITL 这条
+            # 出路），也不能让两行共用一个 id。
+            return [
+                task
+                for task in assembled
+                if isinstance(task, dict)
+                and str(task.get("id") or "") not in allocated
+            ]
+
+        def ask_human(vp_id: str, reason: str) -> str:
+            """把这个 VP 的问题开出去（幂等由 ``_ask_a_human_about`` 管）。"""
+            return self._ask_human_about_missing_repair(
+                _record(vp_id), reason, round_number,
+            )
+
+        missing = missing_repair_targets(candidate_ids, tasks)
+        print(
+            f"[Repair] round {round_number}: "
+            f"repair_coverage_checked missing={missing}"
+        )
+
+        #: R7 的三个标记 —— 本方法是它们唯一的主人。模块里那三条同名
+        #: 的日志被收进一个缓冲再丢掉（否则一轮里同一个标记会出现两次，
+        #: 而读日志的人会以为这一轮跑了两次覆盖校验），而**不是**标记
+        #: 的行原样写回：装配器自己的记录（``repair_task_dropped_*``）
+        #: 与提问那一侧的日志都在那个缓冲里，它们是操作员 grep 得到
+        #: 的东西，不能被这次「统一标记」吞掉。
+        coverage_markers = (
+            "repair_coverage_checked",
+            "repair_coverage_regenerated",
+            "repair_coverage_hitl_raised",
+        )
+
+        def _write_back_other_logs(buffer: io.StringIO) -> None:
+            """把模块调用期间打的、与覆盖标记无关的行原样写回。"""
+            for line in buffer.getvalue().splitlines():
+                if any(marker in line for marker in coverage_markers):
+                    continue
+                print(line)
+
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buffer):
+                outcome = ensure_repair_coverage(
+                    candidates=list(repair_candidates or []),
+                    repair_tasks=tasks,
+                    generated_vp_ids=generated_vp_ids,
+                    regenerate=regenerate,
+                    assemble=assemble,
+                    ask_human=ask_human,
+                    round_number=round_number,
+                )
+        except VerificationCancelled:
+            _write_back_other_logs(buffer)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # 覆盖校验自己坏了，不能让这一轮搁浅：原来的任务表照用，
+            # 原因写进日志。
+            _write_back_other_logs(buffer)
+            print(
+                f"[Repair] round {round_number}: "
+                f"repair_coverage_check_failed ({exc})"
+            )
+            return tasks
+        _write_back_other_logs(buffer)
+
+        added = [
+            str(task_id) for task_id in outcome.regenerated_task_ids
+        ]
+        if added:
+            print(
+                f"[Repair] round {round_number}: "
+                f"repair_coverage_regenerated added={added}"
+            )
+        print(
+            f"[Repair] round {round_number}: "
+            f"repair_coverage_hitl_raised={list(outcome.hitl_raised)}"
+        )
+        return list(outcome.repair_tasks)
+
+    def _gate_regenerated_contents(
+        self,
+        contents: List[Dict[str, Any]],
+        round_number: int,
+        plan_intent: Optional[List[str]],
+    ) -> List[Dict[str, Any]]:
+        """The regenerated rows that may become repair tasks.
+
+        2026-10-23 的意图门禁（``apply_intent_gate``）对**补生成**出来
+        的那批内容同样成立：首批的行过了门禁，补出来的那批不能不过 ——
+        否则门禁被绕开一次，而补出来的那批照样会变成修复任务被执行。
+
+        The gate is best-effort by contract, exactly as it is for the
+        first batch: a broken gate keeps every row rather than losing the
+        round's repair work, and a conflict is a WARNING — never an
+        error.
+
+        Parameters
+        ----------
+        contents:
+            The rows the regeneration produced.
+        round_number:
+            The round they belong to — it names the conflict in the log.
+        plan_intent:
+            The plan's own constraints.  ``None`` means the plan states
+            none, which is not the same as "every path is forbidden".
+
+        Returns
+        -------
+        The rows that survived the gate, in their original order.
+        """
+        if not contents:
+            return []
+        try:
+            kept, conflicts = apply_intent_gate(
+                contents, list(plan_intent or []),
+            )
+        except Exception as gate_exc:  # noqa: BLE001
+            # Same contract as the first batch: a broken gate keeps every
+            # row.  Losing the round's repair work over a broken check is
+            # the outcome this codebase has fought hardest against.
+            print(
+                f"[Repair] round {round_number}: intent gate failed on the "
+                f"regenerated rows, keeping every one of them ({gate_exc})"
+            )
+            return list(contents)
+        for conflict in conflicts:
+            vp_id = str(conflict.get("vp_id") or "")
+            constraint = str(conflict.get("constraint") or "")
+            reason = str(conflict.get("reason") or "")
+            logged = False
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                try:
+                    logger.warning(
+                        "repair_intent_conflict",
+                        f"regenerated repair content for "
+                        f"{vp_id or '(unknown VP)'} crosses the plan's own "
+                        f"constraint ({constraint}) — dropped "
+                        f"(round {round_number})",
+                        data={
+                            "plan_id": self.plan_dir.name,
+                            "round": round_number,
+                            "vp_id": vp_id,
+                            "constraint": constraint,
+                            "reason": reason,
+                        },
+                    )
+                    logged = True
+                except Exception as log_exc:  # noqa: BLE001
+                    print(
+                        f"[Repair] WARNING: repair_intent_conflict could "
+                        f"not be logged ({log_exc})"
+                    )
+            if not logged:
+                print(
+                    f"[Repair] WARNING: repair_intent_conflict — "
+                    f"{vp_id or '(unknown VP)'} 被意图门禁拦下（补生成） — "
+                    f"{reason or constraint}"
+                )
+        return list(kept)
 
     def _open_decision_for(self, plan_id: str, vp_id: str) -> bool:
         """Whether an open question about this point is already waiting.
@@ -5423,6 +6002,14 @@ class VerificationOrchestrator:
                 f"never let this round judge the deliverable — no verdict, "
                 f"nothing to repair"
             )
+            # 2026-11-17 (arch decision point 4 — R4): the exit stops the
+            # chain, so the question has to be raised **here** — otherwise
+            # the points the environment ate end the round without
+            # anybody ever being told, and ``infrastructure_unresolved``
+            # is a dead end rather than a question.
+            self._ask_humans_about_infra_terminals(
+                self._report_failure_entries(report), round_number,
+            )
             return _infrastructure_unresolved_cycle_result(report)
 
         # PASSED or PARTIAL with no real failures → treat as passed
@@ -6023,6 +6610,12 @@ class VerificationOrchestrator:
         # best-effort by contract — a plan directory it cannot read
         # contributes no constraints, it is never an error.
         plan_intent = _plan_intent(self.plan_dir)
+        # 2026-11-17 — the coverage check below re-generates for the VPs
+        # the first batch missed, and it has to ask the generator the same
+        # question the first batch asked. The kwargs are therefore built
+        # even when this round has no candidate at all (the dict is then
+        # simply never handed to the generator).
+        generator_kwargs: Dict[str, Any] = {}
         if repair_candidates:
             # 2026-10-29 — the round's own run output goes to the
             # generator. The narrowing of a repair task's criterion needs
@@ -6274,6 +6867,27 @@ class VerificationOrchestrator:
             # what that counter reads out.
             existing_task_ids=existing_repair_ids,
         ).assemble(repair_contents)
+        # 2026-11-17 (R1/R2/R7) — 覆盖校验。repair 内容是一次生成的，
+        # 所以生成器漏掉一条、或者 assemble 把它那行 files_to_modify 为空
+        # 的行丢掉，都会让一个失败的 VP 既没有任务也没有问题：没有人知道
+        # 它失败过，直到下一轮它再次失败（2026-11-17 丢过一个 VP-023）。
+        #
+        # 校验必须在**装配之后、持久化之前**：任务表一旦写下去，补出来
+        # 的那几条就追不上了。缺的那几条在这里补生成一次（最多一次），
+        # 补不上的逐个开 HITL —— 两条出路，至少有一条。
+        repair_tasks = self._ensure_repair_coverage(
+            repair_tasks,
+            repair_candidates,
+            repair_contents,
+            round_number,
+            failed_vps=failed_vps,
+            vp_test_commands=vp_test_commands,
+            plan_file=_plan_file,
+            existing_repair_ids=existing_repair_ids,
+            generator_kwargs=generator_kwargs,
+            repair_generation_error=repair_generation_error,
+            plan_intent=plan_intent,
+        )
         self._current_repair_tasks = repair_tasks
 
         # 2026-10-11 (W5): retire earlier rounds' duplicate repair rows
