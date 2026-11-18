@@ -480,6 +480,12 @@ ACKNOWLEDGED_CALL_SITES: Dict[str, str] = {
         "fields={'status','failure_reason'} —— superseded",
     "task_repository.py::TaskRepository.update_status":
         "legacy shim，原样转发调用方给的 fields",
+    "routes/execution.py::reset_task_status":
+        "fields={'status','failure_reason','end_ts','commit_sha','attempt'}"
+        " —— 重置端点写的是 task_reset.build_reset_fields() 那 5 个执行记账"
+        "字段（status 置回 pending、failure_reason/end_ts/commit_sha 清空、"
+        "attempt 归零）。刻意不写 title / description / files_to_modify / "
+        "test_command / depends_on / project_dir：那些是任务规格，一字节都不动",
 }
 
 

@@ -102,7 +102,15 @@ SNAPSHOT_PATH = _TESTS_DIR / "openapi_snapshot.json"
 #: 实际发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零差异、
 #: 指纹相同——才把该值写进本常量。此前本分支沿用的是 base 合并时的旧指纹
 #: （`be49f1b2…`），它描述的是收尾路由加入之前的形状，已经过期。
-BASELINE_FINGERPRINT = "65d40bf4ca0f3b6e9701d2cafba3317941859fd9488d733fbbe9bc75ee51ec8b"
+#:
+#: 2026-11-18（合入 origin/main / 06007bf7）：本次合并两侧各自新增了端点，
+#: 合并后的对外形状是**两侧的并集**（87 条路径 = 本分支侧 82 条 + base 侧
+#: 86 条 − 公共 81 条）。两侧的指纹常量各自只描述自己那一半的形状，合并后
+#: 都已过期，故按同一条规矩重取：先由合并后的
+#: `openapi_snapshot.json` 规范形式现算，再与线上 app 实际发布的 schema
+#: （`openapi_snapshot()`）交叉验证——两者逐项零差异、指纹相同——才写下本值
+#: （`bcd1ce6d…`）。
+BASELINE_FINGERPRINT = "bcd1ce6d43182e0b0bc9d09fbea35a9a33790b926f78692a631bf53def22314c"
 
 #: The capture runs in its own process so the schema is the one a clean
 #: start produces: debug routes off, no schema cache carried over from
