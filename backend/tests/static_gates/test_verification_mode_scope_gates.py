@@ -211,6 +211,21 @@ EXCLUDED_SEGMENTS: frozenset[str] = frozenset({
 #: ``test_verification_repository_surface_is_frozen``), so the rest of
 #: ``backend/state_machine/`` stays frozen inside the diff.
 #:
+#: One more file is excluded for the verification-mirror removal — the
+#: routing repository:
+#: ``backend/state_machine/repositories/routing_repository.py``.
+#: This plan moved the authoritative write of the verification state out
+#: of the routing row's ``verification`` mirror column: ``write_plan_state``
+#: no longer writes that column, and the one thing the column still
+#: records — the frozen baseline — has exactly one writer
+#: (``write_verification_baseline``).  The change is that column's
+#: ownership, and it reaches shared code, so the exclusion is scoped to
+#: that one file; the rest of ``backend/state_machine/`` stays frozen
+#: inside the diff.  Its bytes are frozen by
+#: ``FROZEN_ROUTING_REPOSITORY_SURFACE_SHA256`` (checked by
+#: ``test_routing_repository_surface_is_frozen``), so a later edit to it
+#: fails a gate even though it no longer shows up in the diff.
+#:
 #: The pathspecs are repository-root-relative: the helper runs
 #: ``git -C ..`` from ``backend/``, so the prefix is the repository
 #: root.
@@ -233,6 +248,12 @@ FORBIDDEN_MODULE_PATHS: tuple[str, ...] = (
     ":(exclude)backend/state_machine/repositories/verification_repository.py",
     ":(exclude)backend/state_machine/db/schema.py",
     ":(exclude)backend/state_machine/repositories/verification_repository.py",
+    # 2026-11-19：本计划把验证状态的权威写从路由行的 `verification` 镜像列上
+    # 移走（`write_plan_state` 不再写该列，该列只剩冻结基线且只有一个写者
+    # `write_verification_baseline`），这条改动落在路由仓库上。改动只有这一列
+    # 的归属，按本 gate 的既定流程给它一条窄排除，并把它逐字节钉在
+    # `FROZEN_ROUTING_REPOSITORY_SURFACE_SHA256` 上。
+    ":(exclude)backend/state_machine/repositories/routing_repository.py",
 )
 
 #: The base ref the change surface is measured against, in preference
@@ -1492,6 +1513,27 @@ FROZEN_VERIFICATION_REPOSITORY_SURFACE_SHA256: dict[str, str] = {
     ),
 }
 
+#: The routing-mirror surface, frozen the same way.  The routing row's
+#: ``verification`` column used to carry the verification state; this
+#: plan moved the authoritative write of that state to the
+#: ``plan_verification`` table, and the column now carries only the
+#: frozen baseline.  The file is therefore excluded from the
+#: change-surface diff (above) and frozen here instead, byte for byte:
+#: the diff gate stops reporting the one approved change, and this gate
+#: stops reporting any *other* change to the same file.
+FROZEN_ROUTING_REPOSITORY_SURFACE_SHA256: dict[str, str] = {
+    # 2026-11-19（本次合并 origin/main@021565b9 之后）：该文件只有本分支一侧的
+    # 已批准改动 —— ``write_plan_state`` 不再写 ``verification`` 镜像列，
+    # ``write_verification_baseline`` 成为该列唯一的写者（镜像列只剩冻结基线）。
+    # base 侧未改这个文件，故合并后的内容与本分支逐字节相同，其真实 sha256 就是
+    # 下方所钉的值（`shasum -a 256` 实测值），按本 gate 的既定流程把冻结基线
+    # 钉在**合并态**哈希。表内条目集合与断言强度不变：被钉文件的范围不变、
+    # sha256 仍逐字节比对，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    "backend/state_machine/repositories/routing_repository.py": (
+        "bda605564ba0d5bb6e8d78b656e3e2461da77f44f13c9931614865010a9d6396"
+    ),
+}
+
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -1890,5 +1932,34 @@ def test_verification_repository_surface_is_frozen() -> None:
     ]
     assert mismatched == [], (
         "a file in the round-release surface changed outside the frozen "
+        "baseline:\n  " + "\n  ".join(mismatched)
+    )
+
+
+def test_routing_repository_surface_is_frozen() -> None:
+    """The routing-mirror surface is frozen byte for byte.
+
+    The routing row's ``verification`` column used to carry the
+    verification state; this plan moved the authoritative write of that
+    state to the ``plan_verification`` table, and the column now
+    carries only the frozen baseline.  That change reaches shared code,
+    so the file is excluded from the change-surface diff — which is
+    only safe if something else holds it still.  This gate pins every
+    byte of the file to the hash of the approved state, so any
+    *further* edit to it fails here even though it no longer shows up
+    in the diff.
+
+    The rule does not weaken the change-surface gate; it moves it from
+    "this file never changes" to "this file changes once, and only
+    that way".
+    """
+    mismatched = [
+        f"{rel}: frozen {expected}, actual "
+        f"{hashlib.sha256((REPO_ROOT / rel).read_bytes()).hexdigest()}"
+        for rel, expected in FROZEN_ROUTING_REPOSITORY_SURFACE_SHA256.items()
+        if hashlib.sha256((REPO_ROOT / rel).read_bytes()).hexdigest() != expected
+    ]
+    assert mismatched == [], (
+        "a file in the routing-mirror surface changed outside the frozen "
         "baseline:\n  " + "\n  ".join(mismatched)
     )
