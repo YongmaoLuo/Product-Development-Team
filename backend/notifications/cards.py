@@ -24,6 +24,7 @@ source the notifier feeds into these builders.
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -2733,6 +2734,28 @@ def _progress_context(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             if isinstance(summary.get("tasks"), dict) else {}
         ),
     })
+
+    # The payload IS the snapshot ``GET /api/plan/{id}/status`` answered
+    # with, and its liveness fields are the server's own reading of the
+    # live execution / verification stores. ``_status_from_summary``
+    # cannot know them — it rebuilds a status from a summary, so it
+    # degrades both to ``False`` — which made the panel's header
+    # contradict the Feishu card's on the very same plan: the card (built
+    # from the snapshot via ``plan_status.from_payload``) said
+    # "🔧 修复执行中" while the panel said "❌ 验证失败". Take the
+    # snapshot's word whenever it carries the field, and only then: a
+    # payload that does not carry it (an older shape, or one a caller
+    # assembled itself) keeps the degraded default.
+    _liveness = {
+        key: value
+        for key, value in (
+            ("execution_in_flight", data.get("execution_in_flight")),
+            ("verification_in_flight", data.get("verification_in_flight")),
+        )
+        if isinstance(value, bool)
+    }
+    if _liveness:
+        status = replace(status, **_liveness)
 
     phase = str(
         data.get("current_phase") or data.get("phase") or status.phase or ""
