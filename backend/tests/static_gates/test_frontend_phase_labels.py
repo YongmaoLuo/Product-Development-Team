@@ -274,6 +274,39 @@ def test_tasks_view_branch_accepts_queued() -> None:
     )
 
 
+def test_tasks_view_branch_accepts_execution_terminal_phases() -> None:
+    """A failed or stopped plan must open on the tasks view.
+
+    ``failed`` and ``stopped`` are the **execution** terminal phases:
+    the plan ran, and the run ended.  Where it ended and why is exactly
+    what the operator opened the plan to see — the verification panel
+    carries the stop reason, the round counter, the results and the
+    repair list.  A plan whose verdict is already written down is not a
+    plan that needs re-interviewing.
+
+    Routing these two phases to the interview screen hides all of it:
+    the operator lands on a chat window and is asked to describe the
+    requirement again, while the stop reason stays in the database.  The
+    interview fallback is for the plans that really have no later stage
+    to look at.
+    """
+    body = _function_body(_source(_APP_JS), "resumePlan")
+    condition = _guard_condition(body, "showTasksView(")
+
+    assert '"failed"' in condition, (
+        "the branch that routes a plan to the tasks view does not accept "
+        "`failed`, so a failed plan opens on the interview screen and the "
+        "verification panel — the stop reason and the result — stays out "
+        "of sight."
+    )
+
+    assert '"stopped"' in condition, (
+        "the branch that routes a plan to the tasks view does not accept "
+        "`stopped`, so a stopped plan opens on the interview screen. A "
+        "stopped run is the one the operator most needs to look at."
+    )
+
+
 def test_can_start_verification_includes_queued() -> None:
     """A queued plan must be able to start the verification branch.
 

@@ -44,6 +44,14 @@ What the test does
    It used to repeat the routing row instead, so the same plan read
    ``ready`` in one answer and ``executing`` in the other.
 
+6. Assert the third verdict is read too: a plan that carries a
+   ``plan_verification`` row is judged by the **workflow's** verdict
+   alone.  The run's verdict (``failed`` / ``stopped``) is about a
+   process, and a dead process says nothing about a verification loop
+   that is still going — so such a plan must stay on the board.  A plan
+   without that row keeps the old filtering, and a plan whose routing
+   phase is explicitly ``verification_passed`` is still hidden.
+
 Scope, stated honestly
 ----------------------
 This reads the readers — the listing and the single-plan status endpoint.
@@ -163,14 +171,23 @@ def _entry(plan_id: str) -> dict:
     ``include_terminal``), so the cache is dropped before each read —
     otherwise a second plan seeded into the same tree would never appear.
     """
-    invalidate_plans_cache()
-    response = client.get("/api/plans")
-    assert response.status_code == 200, response.text
-    entries = {e["id"]: e for e in response.json()}
+    entries = _entries()
     assert plan_id in entries, (
         f"{plan_id} is missing from the listing: {entries!r}"
     )
     return entries[plan_id]
+
+
+def _entries() -> dict:
+    """Every entry the default listing answers, keyed by plan id.
+
+    The default listing is the one that hides terminal plans, so this
+    is the view a reader of the sidebar sees.
+    """
+    invalidate_plans_cache()
+    response = client.get("/api/plans")
+    assert response.status_code == 200, response.text
+    return {e["id"]: e for e in response.json()}
 
 
 def test_a_plan_with_no_execution_record_is_not_reported_as_executing():
@@ -235,3 +252,140 @@ def test_the_status_endpoint_agrees_with_the_listing_about_the_phase():
     )
     # And the shared answer is not the refuted runtime claim.
     assert payload["phase"] != "executing", payload
+
+
+# ---------------------------------------------------------------------------
+# The third verdict: a plan that carries a verification row.
+# ---------------------------------------------------------------------------
+
+
+def _seed_verifying_plan(plan_id: str) -> None:
+    """A plan directory in the shape a plan in a verification loop has."""
+    from server import PLANS_DIR
+
+    plan_dir = PLANS_DIR / plan_id
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    (plan_dir / "verification_plan.json").write_text(
+        json.dumps({"verification_points": [
+            {
+                "id": "VP-001", "title": "验证点一",
+                "verification_method": "api_test",
+            },
+        ]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (plan_dir / "interview.json").write_text(
+        json.dumps({
+            "dimensions": {"goals": f"验证收敛性种子计划 {plan_id}"},
+            "created_at": "2026-11-01T00:00:00Z",
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _add_execution_verdict(plan_id: str, exec_status: str) -> None:
+    """The execution row a finished — or dead — run leaves behind."""
+    from server import _state_db_path
+    from state_machine.db.connection import open as open_db
+    from state_machine.db.schema import migrate
+    from state_machine.repositories.execution_repository import (
+        ExecutionRepository,
+    )
+
+    conn = open_db(_state_db_path(None))
+    try:
+        migrate(conn)
+        ExecutionRepository(conn).insert(
+            plan_id,
+            exec_status=exec_status,
+            stop_reason="process_died_unexpectedly",
+        )
+    finally:
+        conn.close()
+
+
+def _add_verification_row(plan_id: str) -> None:
+    """The verification row a plan in a verification loop carries.
+
+    The row is the **evidence that a verification loop exists** — not
+    what the loop concluded.  Its status is ``pending``: the round was
+    released, the loop has not finished.
+    """
+    from server import _state_db_path
+    from state_machine.db.connection import open as open_db
+    from state_machine.db.schema import migrate
+    from state_machine.repositories.verification_repository import (
+        VerificationRepository,
+    )
+
+    conn = open_db(_state_db_path(None))
+    try:
+        migrate(conn)
+        VerificationRepository(conn).insert(
+            plan_id, "pending", round=2, max_rounds=4,
+        )
+    finally:
+        conn.close()
+
+
+def test_a_plan_in_verification_outlives_the_verdict_of_a_dead_executor():
+    """A verification row keeps a plan on the board.
+
+    The shape this pins
+    -------------------
+    A plan whose executor died: the run's verdict on the execution row
+    is ``failed``, and the recovery scan moved the routing phase to
+    ``failed`` as well.  On its own that verdict ends the plan, and the
+    default listing hides it.
+
+    But a plan that carries a ``plan_verification`` row is in — or has
+    been in — a **verification loop**, which is a separate piece of work
+    with its own progress.  The run's verdict is about a *process*; it
+    says nothing about that loop.  A plan in a verification round, a
+    plan whose verification can be started, and the result of a
+    verification loop that stopped are all things the panel must still
+    be able to show — so the run's verdict alone must not hide them.
+
+    Two controls keep the rule from growing: a plan with **no**
+    verification row keeps the old filtering, and a plan whose routing
+    phase says the workflow has concluded (``verification_passed``) is
+    still hidden.
+    """
+    verifying = "verify-listed-1790215922386"
+    _seed_verifying_plan(verifying)
+    _set_routing_phase(verifying, "failed")
+    _add_execution_verdict(verifying, "failed")
+    _add_verification_row(verifying)
+
+    entries = _entries()
+    assert verifying in entries, (
+        f"{verifying} carries a verification row, so the panel must be able "
+        f"to show it; the default listing answered {sorted(entries)!r}"
+    )
+
+    # Control 1: the same shape without the verification row is a plan
+    # that is simply over — it stays hidden.
+    over = "verify-absent-1790215922388"
+    _seed_verifying_plan(over)
+    _set_routing_phase(over, "failed")
+    _add_execution_verdict(over, "failed")
+
+    entries = _entries()
+    assert over not in entries, (
+        f"{over} has no verification row and its run is over, so it must "
+        f"stay out of the default listing; it answered {entries[over]!r}"
+    )
+
+    # Control 2: a verification row does not resurrect a plan whose
+    # workflow has already concluded.
+    passed = "verify-passed-1790215922390"
+    _seed_verifying_plan(passed)
+    _set_routing_phase(passed, "verification_passed")
+    _add_execution_verdict(passed, "failed")
+    _add_verification_row(passed)
+
+    entries = _entries()
+    assert passed not in entries, (
+        f"{passed} reached verification_passed, so it is over; it must stay "
+        f"out of the default listing; it answered {entries[passed]!r}"
+    )

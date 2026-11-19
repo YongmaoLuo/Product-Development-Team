@@ -754,6 +754,19 @@ class VerificationExecutor(BaseExecutor):
         # 直接给；不给就问状态库（``_current_round``）。
         self._round_no = round_no
 
+        # 2026-11-02（轮次隔离）：关卡只认**本轮**产生的结论。
+        #
+        # ``_stale_verdict_ignored`` 记"读到了一条不是本轮的结论"这件事 ——
+        # ``vp_id`` + 它自称的轮次（``seen_round``）。关卡因此报「本轮尚未
+        # 产生结论」，而不是沿用旧轮的结论（2026-11-02 实测：round 3 的
+        # VP-015 因「Phase 1 的 VP-009 为 FAILED」被判 DEFERRED，而本轮
+        # VP-009 实际 PASSED）。
+        #
+        # ``_round_verdicts_history`` 是同一件事的留档：旧轮结论按验证点
+        # 归档（``{vp_id: [verdict, ...]}``），供审计与回归用例使用。
+        self._stale_verdict_ignored: List[Dict[str, Any]] = []
+        self._round_verdicts_history: Dict[str, List[Dict[str, Any]]] = {}
+
         # 2026-10-27（主题相关性判定）：本轮可用的**批量判定器**。
         #
         # ``None`` = 没有模型可问 → 判定内核按「相关」兜底（一条验证点不能
@@ -926,6 +939,19 @@ class VerificationExecutor(BaseExecutor):
     # ------------------------------------------------------------------
     # Public read-only API
     # ------------------------------------------------------------------
+
+    @property
+    def round_no(self) -> Optional[int]:
+        """本轮轮次号（``None`` = 调用方没给 / 不知道）。
+
+        轮次过滤只认这个值：调用方不知道自己是第几轮时，旧行为原样保留
+        （不做轮次过滤），而不是靠猜。
+        """
+        return self._explicit_round()
+
+    @round_no.setter
+    def round_no(self, value: Optional[int]) -> None:
+        self._round_no = value
 
     @property
     def pending_vps(self) -> List[str]:
@@ -3766,6 +3792,101 @@ class VerificationExecutor(BaseExecutor):
                 if isinstance(verdict, dict):
                     bucket.setdefault(vp_id, dict(verdict))
 
+    # Round isolation (2026-11-02)
+    # ------------------------------------------------------------------
+    #
+    # 结论按轮次隔离：每条结论带着"它是第几轮产生的"戳，关卡只读**本轮**
+    # 的结论。读到旧轮的结论时当「本轮尚未产生结论」处理并留痕，绝不沿用
+    # 旧值 —— 2026-11-02 实测：round 3 的 VP-015 因「Phase 1 的 VP-009
+    # 为 FAILED」被判 DEFERRED，而本轮 VP-009 实际 PASSED。
+
+
+    def _explicit_round(self) -> Optional[int]:
+        """调用方**显式**给的轮次号（``None`` = 没给 / 不知道）。
+
+        轮次过滤只认这个值。``_round_number()`` 还会去问状态库，而状态库
+        说的可能是别的进程写的轮次；门禁要判"是不是本轮"，只能认本执行器
+        自己被告知的轮次。没给轮次号时保持旧行为（不做轮次过滤）。
+
+        只认真 int（或数字字符串）：``bool`` 与别的类型一律当"没给" ——
+        猜出来的轮次会把一轮的结论白白作废。
+        """
+        raw = getattr(self, "_round_no", None)
+        if raw is None or isinstance(raw, bool):
+            return None
+        if isinstance(raw, int):
+            explicit = raw
+        elif isinstance(raw, str):
+            try:
+                explicit = int(raw.strip())
+            except ValueError:
+                return None
+        else:
+            return None
+        return explicit if explicit > 0 else None
+
+
+    def _verdict_is_current_round(self, vp_id: Any, verdict: Any) -> bool:
+        """这条结论是不是**本轮**产生的。
+
+        判据只有一条：结论自称的轮次（``round``）是不是本轮。
+
+          * 轮次未知（调用方没给 ``round_no``）→ 一律算本轮的（旧行为，
+            不做轮次过滤）；
+          * 结论没有轮次戳（或戳是 0，即"轮次未知"）→ 算本轮的（老格式的
+            结论无从证明它属于旧轮，
+            拿它去作废一轮的验证是比沿用它更重的副作用）；
+          * 结论自称第 N 轮而本轮不是 N → **旧轮结论，不可用**，并留痕。
+        """
+        current = self._explicit_round()
+        if current is None:
+            return True
+        if not isinstance(verdict, dict):
+            return True
+        seen = verdict.get(VERDICT_ROUND_FIELD)
+        if seen is None:
+            return True
+        try:
+            seen_round = int(seen)
+        except (TypeError, ValueError):
+            return True
+        if seen_round <= 0:
+            # 0 is "the round is unknown", not "round 0": the write side
+            # stamps 0 when it does not know the round, and an unknown
+            # round is never an older round.
+            return True
+        if seen_round == current:
+            return True
+        self._note_stale_verdict(vp_id, seen_round)
+        return False
+
+
+    def _note_stale_verdict(self, vp_id: Any, seen_round: int) -> None:
+        """记一条"旧轮结论被丢弃"的留痕。
+
+        ``_stale_verdict_ignored`` 是**只增不改**的台账：每条记录只写一次
+        （同一个 vp_id + 同一个轮次不重复记），这样"读了几次"不会把台账
+        撑大，而"丢过哪条结论"永远查得到。
+        """
+        record: Dict[str, Any] = {"vp_id": str(vp_id), "seen_round": seen_round}
+        ignored = getattr(self, "_stale_verdict_ignored", None)
+        if ignored is None:
+            ignored = []
+            self._stale_verdict_ignored = ignored
+        if record not in ignored:
+            ignored.append(record)
+
+        history = getattr(self, "_round_verdicts_history", None)
+        if history is None:
+            history = {}
+            self._round_verdicts_history = history
+        verdict = self._verdicts.get(vp_id)
+        if isinstance(verdict, dict):
+            bucket = history.setdefault(str(vp_id), [])
+            if not any(item == verdict for item in bucket):
+                bucket.append(dict(verdict))
+
+
     def _load_orphan_ledger(self, raw: Any) -> None:
         """Read the persisted orphan ledger (``orphaned_vp_ids``).
 
@@ -3904,9 +4025,18 @@ class VerificationExecutor(BaseExecutor):
         )
 
     def _terminal_status_of(self, vp_id: Any) -> Optional[str]:
-        """该 VP 当前记录的结论状态（无结论返回 None）。"""
+        """该 VP **本轮**记录的结论状态（无结论返回 None）。
+
+        2026-11-02（轮次隔离）：只认**本轮**产生的结论。上一轮的结论
+        （``round`` 戳不是本轮）一律不可用 —— 读到它就当"本轮还没有结论"
+        （返回 ``None``），并记一条 ``stale_verdict_ignored``。沿用旧轮的
+        结论等于把上一轮的失败当成本轮的失败：2026-11-02 实测里 round 3
+        的 VP-015 就是这样被判 DEFERRED 的，而本轮 VP-009 实际 PASSED。
+        """
         verdict = self._verdicts.get(vp_id)
         if not isinstance(verdict, dict):
+            return None
+        if not self._verdict_is_current_round(vp_id, verdict):
             return None
         status = verdict.get("status")
         return str(status) if status is not None else None
@@ -3917,7 +4047,11 @@ class VerificationExecutor(BaseExecutor):
         判据统一为"该关卡之前的一切都已终态成功"：Phase 1 的 VP 以及
         ``phase_order`` 更小的关卡。于是"E2E 必须等 Nightly 通过"不需要
         单独规则——它天然被同一条判据覆盖。
+
+        2026-11-02（轮次隔离）：轮次已知时，"本轮还没有结论"的理由写明
+        「本轮」二字 —— 读不到本轮结论时**报未知**，不拿旧轮的结论顶替。
         """
+        round_known = self._explicit_round() is not None
         for vp in self._plan_points():
             if not isinstance(vp, dict) or is_final_gate(vp):
                 continue
@@ -3930,6 +4064,8 @@ class VerificationExecutor(BaseExecutor):
             vp_id = vp.get("id")
             status = self._terminal_status_of(vp_id)
             if status is None:
+                if round_known:
+                    return f"Phase 1 的 {vp_id} 本轮尚未产生结论"
                 return f"Phase 1 的 {vp_id} 尚未产生结论"
             if status not in _TERMINAL_SUCCESS_STATUSES:
                 return f"Phase 1 的 {vp_id} 结论为 {status}"

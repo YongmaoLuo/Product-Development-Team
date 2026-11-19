@@ -91,6 +91,11 @@ from verification.repair_coverage import (
     missed_vp_question,
     recommended_default,
 )
+# 2026-11-01: the failing-file ownership table — "which task declares
+# this file that just failed?". The table itself is a pure function in
+# ``verification.scope_claims``; the orchestrator owns *when* it is
+# computed, written down and handed to the refiner.
+from verification.scope_claims import claim_failed_files, failed_files_from_output
 from verification.triage_agent import VPTriageJudge
 # 2026-11-06: the canonical spelling of a repo-relative path — the ONE
 # rule, owned by the runner that mints the paths and read here, so the
@@ -1197,6 +1202,88 @@ def _accepts_plan_intent(generator: Any) -> bool:
         param.kind is inspect.Parameter.VAR_KEYWORD
         for param in parameters.values()
     )
+
+
+def _accepts_unclaimed_files(generator: Any) -> bool:
+    """Whether ``generator.generate_repair_contents`` takes ``unclaimed_files``.
+
+    Same courtesy as :func:`_accepts_plan_intent`: the unclaimed list is
+    a courtesy to the model, not a precondition for the round. A
+    collaborator whose signature predates the parameter still has to be
+    callable — a round that dies on a keyword argument produces no
+    repair tasks at all, which the auto-loop reads as "nothing to
+    repair", the exact failure this codebase has fought hardest against.
+
+    A callable whose signature cannot be read is assumed to accept the
+    parameter: the modern generator is the common case, and silently
+    withholding the list would weaken the prompt for everybody.
+    """
+    try:
+        parameters = inspect.signature(
+            generator.generate_repair_contents
+        ).parameters
+    except (AttributeError, TypeError, ValueError):
+        return True
+    if "unclaimed_files" in parameters:
+        return True
+    return any(
+        param.kind is inspect.Parameter.VAR_KEYWORD
+        for param in parameters.values()
+    )
+
+
+def _round_failed_run_output(
+    round_evidence: Mapping[str, Mapping[str, Any]],
+) -> str:
+    """The round's own failing output, as one text.
+
+    The failed verification points' ``actual_result`` / ``evidence`` is
+    where the round's output survives (2026-10-29): the path-based
+    failed-VP records carry summaries instead, on purpose, to keep the
+    prompt bounded. Joining them here gives the ownership table the
+    same text the repair prompt reads, so "the file that failed" means
+    the same file on both sides.
+
+    Returns ``""`` when the round named no failing output — the caller
+    reads that as "there is nothing to own", not as a failure.
+    """
+    chunks: List[str] = []
+    for entry in (round_evidence or {}).values():
+        if not isinstance(entry, Mapping):
+            continue
+        text = "\n".join(
+            str(entry.get(key) or "")
+            for key in ("actual_result", "evidence")
+            if entry.get(key)
+        )
+        if text.strip():
+            chunks.append(text)
+    return "\n".join(chunks)
+
+
+def _plan_task_list(plan_dir: Path) -> List[Dict[str, Any]]:
+    """The plan's task list, read from ``tasks.json``.
+
+    Accepts both the ``{"tasks": [...]}`` envelope and a bare list,
+    matching how the rest of the codebase reads this file.
+
+    Returns ``[]`` when the file is missing or unreadable: a plan whose
+    task list cannot be read declares no file, so every failing file is
+    unclaimed — the honest reading, and the one the boundary condition
+    asks for. A malformed ``tasks.json`` is the executor's problem to
+    report, not a reason to abort the repair round.
+    """
+    path = Path(plan_dir) / "tasks.json"
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        return []
+    if isinstance(payload, dict):
+        payload = payload.get("tasks")
+    if not isinstance(payload, list):
+        return []
+    return [entry for entry in payload if isinstance(entry, dict)]
 
 
 def _failing_case_lines(plan_dir: Optional[Path], vp_id: str) -> List[str]:
@@ -6576,6 +6663,28 @@ class VerificationOrchestrator:
             repair_candidates, round_number,
         )
 
+        # 2026-11-01 — 谁认领了这个失败文件？
+        #
+        # §1: 门禁失败时，把「失败文件 → 是否有任务声明它」做成一张表；
+        # 无人认领的文件清单**必须喂给 refiner**，由它产出新任务（或扩大
+        # 现有任务的 files_to_modify），让回路继续迭代，而不是把整轮判死。
+        #
+        # 表由 ``verification.scope_claims`` 计算（纯函数），这里只负责取
+        # 数据、落盘、把 unclaimed 传下去。没有失败文件就没有表：不落盘、
+        # 不传参 —— 一张空表会被读成「本轮没有任何人认领任何东西」这个
+        # 结论，而一份没有失败用例的输出并不是这个意思。
+        scope_claims = self._scope_claims(round_failed_vps)
+        unclaimed_files: Optional[List[str]] = None
+        if scope_claims is not None:
+            unclaimed_files = list(scope_claims.get("unclaimed") or [])
+            self._write_scope_claims_artifact(scope_claims, round_number)
+            if unclaimed_files:
+                print(
+                    f"[Repair] round {round_number}: {len(unclaimed_files)} "
+                    f"failing file(s) are declared by no task — handed to "
+                    f"the refiner: {', '.join(unclaimed_files)}"
+                )
+
         # 2026-09-14 — a FAILED generation must not masquerade as "no
         # repair tasks needed". ``generate_repair_contents`` now raises
         # ``RepairGenerationError`` when the LLM call dies or returns
@@ -6644,6 +6753,15 @@ class VerificationOrchestrator:
             }
             if _accepts_plan_intent(self.repair_generator):
                 generator_kwargs["plan_intent"] = plan_intent
+            # 2026-11-01 — 无人认领的失败文件清单喂给 refiner。清单为空
+            # 也要传：本轮确实有失败文件（只是都有人认领），refiner 看到
+            # 空清单和不看到清单是同一件事，但「本轮有失败文件」这个事实
+            # 不该由参数的有无来表达。没有失败文件时一个参数都不传。
+            if (
+                unclaimed_files is not None
+                and _accepts_unclaimed_files(self.repair_generator)
+            ):
+                generator_kwargs["unclaimed_files"] = unclaimed_files
             try:
                 repair_contents = self.repair_generator.generate_repair_contents(
                     repair_candidates, round_number,
@@ -7099,6 +7217,78 @@ class VerificationOrchestrator:
                 continue
             titles[task_id] = str(task.get("title") or "")
         return titles
+
+    def _scope_claims(
+        self, round_failed_vps: Mapping[str, Mapping[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """The failing-file ownership table for this round.
+
+        2026-11-01 — section 1 of the plan: when the gate fails on a
+        file **no task declared**, the round must not be judged dead.
+        The missing piece was the mapping "failing file -> the task that
+        declares it"; without it there is no way to tell "task 3 broke"
+        from "nobody owns this file", and the second case is the one
+        that has to reach the refiner as work to do.
+
+        The table itself comes from
+        :func:`verification.scope_claims.claim_failed_files` — a pure
+        function, so the same round always yields the same table.
+
+        Returns ``None`` when the round named no failing file: there is
+        nothing to own, so no table is computed, nothing is written and
+        the generator is handed no list. An empty table would read as a
+        conclusion ("nobody owns anything"), which an output without a
+        failing case does not say.
+        """
+        run_output = _round_failed_run_output(round_failed_vps)
+        failed_files = failed_files_from_output(run_output)
+        if not failed_files:
+            return None
+        return claim_failed_files(
+            failed_files,
+            _plan_task_list(self.plan_dir),
+            self.project_dir,
+        )
+
+    def _write_scope_claims_artifact(
+        self, claims: Mapping[str, Any], round_number: int,
+    ) -> bool:
+        """Write the ownership table into the plan directory.
+
+        Returns whether it landed. A table that cannot be written (a
+        full disk, a read-only plan directory) is a **warning**, never
+        a reason to end the round: the unclaimed list still has to
+        reach the refiner, and losing the file on disk is a nuisance
+        while losing it in the prompt is the bug this whole table
+        exists to fix.
+        """
+        path = self.plan_dir / "verification_scope_claims.json"
+        payload = {
+            "claims": dict(claims.get("claims") or {}),
+            "unclaimed": list(claims.get("unclaimed") or []),
+            "out_of_project": list(claims.get("out_of_project") or []),
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+        except (OSError, TypeError, ValueError) as exc:
+            print(
+                f"[Repair] round {round_number}: the scope-claims table was "
+                f"not written to {path.name} ({exc}) — the round continues"
+            )
+            self._log_audit(
+                "verification_scope_claims_write_failed",
+                f"the scope-claims table could not be written: "
+                f"{type(exc).__name__}: {exc}",
+                data={
+                    "plan_id": getattr(self.plan_dir, "name", "?"),
+                    "round": round_number,
+                    "artifact": path.name,
+                    "error": str(exc)[:500],
+                },
+            )
+            return False
+        return True
 
     def _apply_vp_split_decisions(
         self, failed_vps: List[Dict[str, Any]], round_number: int,

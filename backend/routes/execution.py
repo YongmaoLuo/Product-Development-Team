@@ -4887,6 +4887,24 @@ def start_execution(
                     # ``executing`` is then the truthful phase — see
                     # :class:`_VerificationLoopOutcome`.
                     _server._settle_phase_after_verification_loop(plan_dir, loop_outcome)
+                elif _server._shutdown_interrupted(plan_id):
+                    # The server is on its way out and it is what killed
+                    # the executor: ``rc`` is the SIGTERM the shutdown
+                    # sent.  Writing a crash verdict here would say the
+                    # executor died on its own, and it would overwrite
+                    # the shutdown checkpoint — which says "interrupted",
+                    # not "broken" — with a terminal phase.  A plan in a
+                    # terminal phase is never picked up again.
+                    #
+                    # So nothing is written: the exit is recorded (above),
+                    # the verdict is left to the next boot, and the plan
+                    # is parked from the checkpoint that is already on
+                    # disk.
+                    _server.logger.info(
+                        "[executor_watcher] server is shutting down; "
+                        "plan=%s is left for the restart to park",
+                        plan_id,
+                    )
                 elif process.returncode > 0:
                     # The executor reported a failure of its own, and
                     # that is the reason the run ends with.  The verdict

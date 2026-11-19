@@ -80,6 +80,7 @@ from test_command_quality import check_falsifiable as _check_falsifiable
 from config import AgentConfig
 from config_registry import ConfigRegistry
 from failure_classification import (
+    REFINE_WITH_DETAIL,
     REPORT_FORMAT,
     REVERIFY_WITH_MORE_BUDGET,
     Failure,
@@ -975,6 +976,28 @@ REPAIR_MAX_BREAKDOWN_DEPTH = 2
 # always be satisfied by restructuring a little more, so only a count
 # bounds how far a single run may go.
 EXECUTOR_MAX_REFINEMENTS = 8
+
+# How many times ONE failure may buy a "refine with the detail" pass.
+#:
+#: 2026-11-01. ``REFINE_WITH_DETAIL`` is a different thing from the
+#: refinements ``EXECUTOR_MAX_REFINEMENTS`` bounds: those let the
+#: refiner RESTRUCTURE the plan (split a task that is too big), while
+#: this one is a targeted fix -- the failure carries a machine-readable
+#: detail ("declare this path") and the refiner's answer is precise.
+#:
+#: The two budgets have to be separate. Letting the shared cap veto
+#: this refine meant a run that had already refined eight times could
+#: never hear the one precise answer the refiner had, and the task
+#: simply stayed failed -- the failure was judged twice (the occurrence
+#: gate) and then killed by a budget that governs something else.
+#:
+#: One, not more: the refine is a targeted fix, not a decomposition, so
+#: a second pass over the same failure would be the refiner guessing
+#: again rather than the plan converging. Counted PER SIGNATURE -- two
+#: different refused paths are two different failures and each buys its
+#: own pass (see ``AutonomousAgent._detail_refine_available``).
+DETAIL_REFINE_MAX = 1
+
 
 # ---------------------------------------------------------------------------
 # Dispatch-phase failure budget (2026-10-31)
@@ -3280,6 +3303,24 @@ class AutonomousAgent:
         # level and the gate would never open — which is precisely the
         # runaway this replaces.
         self._failure_occurrences: Dict[str, int] = {}
+
+        # 2026-11-01 — the detail-refine budget, which is NOT the shared
+        # refinement budget above. ``REFINE_WITH_DETAIL`` means "the fix
+        # is a targeted refinement (declare this path)", not "the task
+        # is too big", so it is bounded per failure signature instead of
+        # per run: ``_detail_refine_by_signature`` counts how many of
+        # that one failure's passes have been spent, and
+        # ``_detail_refinement_count`` counts how many have been spent
+        # in the whole run (for the logs).
+        #
+        # The counters are separate from ``_refinement_count`` on
+        # purpose. A detail refine is not a plan restructure, so it does
+        # not spend the restructure budget -- and the restructure budget
+        # does not veto it. Charging one to the other is what let an
+        # exhausted budget eat the one chance the refiner had of saying
+        # the precise thing.
+        self._detail_refinement_count = 0
+        self._detail_refine_by_signature: Dict[str, int] = {}
 
         # Architecture decision points 1 & 2 — the dispatcher
         # only modifies runtime state fields, and writes go through
@@ -11093,6 +11134,81 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
             return "extra_attempt"
         return "refine"
 
+    def _detail_refine_available(
+        self,
+        failure: "Failure | None",
+        occurrence: int | None = None,
+    ) -> bool:
+        """Whether ``failure`` may buy one targeted refinement -- and grants it.
+
+        ``REFINE_WITH_DETAIL`` is the one remedy whose fix is a
+        refinement rather than a decomposition: the failure names the
+        path (or the machine-readable detail) the task reached for, and
+        the refiner's answer is precise ("declare this path"). That
+        answer is worth ONE execution, and it must not be eaten by the
+        shared refinement budget, which governs plan restructuring
+        instead (see :data:`DETAIL_REFINE_MAX`).
+
+        The refine is bought by the SECOND occurrence of the failure.
+        The first occurrence is evidence that one answer was wrong, not
+        that the task is too big -- the executor's answer to that is one
+        more attempt at the answer (see :meth:`_failure_disposition`),
+        and the refiner must not spend the precise remedy on a failure
+        that has not repeated.
+
+        Grants are counted PER SIGNATURE: two different refused paths
+        are two different failures, and one of them must not spend the
+        other's pass.
+
+        Args:
+            failure: The classified failure. ``None`` buys nothing.
+            occurrence: How many times the failure has been seen in its
+                lineage. The executor counts occurrences BESIDE the
+                failure (``_note_failure``), so the caller passes it;
+                when it is omitted the failure's own ``occurrence``
+                attribute is read.
+
+        Returns:
+            True when the refine was GRANTED -- and the budget spent --
+            so the second call for the same failure returns False.
+        """
+        if failure is None:
+            return False
+        try:
+            remedy = failure.remedy
+        except (AttributeError, ValueError):
+            # A kind nobody registered raises rather than inventing a
+            # default (see ``remedy_for``), and a failure carrying no
+            # remedy at all has no answer to act on. Neither buys a
+            # refinement.
+            return False
+        if remedy != REFINE_WITH_DETAIL:
+            return False
+        if occurrence is None:
+            occurrence = getattr(failure, "occurrence", 0)
+        try:
+            occurrence = int(occurrence)
+        except (TypeError, ValueError):
+            return False
+        if occurrence < 2:
+            return False
+        signature = str(getattr(failure, "signature", "") or "")
+        # ``getattr`` because the test suite builds agents with
+        # ``__new__`` -- which bypasses ``__init__`` -- so the state is
+        # created here rather than assumed. Such an agent then counts
+        # exactly like a real one.
+        spent = getattr(self, "_detail_refine_by_signature", None)
+        if spent is None:
+            spent = {}
+            self._detail_refine_by_signature = spent
+        if spent.get(signature, 0) >= DETAIL_REFINE_MAX:
+            return False
+        spent[signature] = spent.get(signature, 0) + 1
+        self._detail_refinement_count = (
+            getattr(self, "_detail_refinement_count", 0) + 1
+        )
+        return True
+
     def _refine_after_failure(self, task: SubTask, coder_response: str, result_context: str,
                               file_context: str, exit_code: int,
                               *, failure: Failure | None = None,
@@ -11117,26 +11233,65 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                 which are unchanged by this gate.
             occurrence: How many times ``failure``'s signature has been
                 seen in this task's lineage. Only a value ``>= 2``
-                permits a split.
+                permits a split -- and only a value ``>= 2`` buys the
+                detail refine (``REFINE_WITH_DETAIL``), whose budget is
+                its own and is not the shared one.
         """
+        # 2026-11-01 — the detail refine has its OWN budget, so it is
+        # asked for FIRST: the shared cap below must not veto it. The
+        # ask SPENDS the detail budget when it grants (see
+        # ``_detail_refine_available``), which is what makes the grant
+        # one-shot.
+        detail_refine = self._detail_refine_available(
+            failure, occurrence=occurrence,
+        )
         if self._refinement_count >= EXECUTOR_MAX_REFINEMENTS:
-            if self.logger:
-                self.logger.error(
-                    "refine_budget_exhausted",
-                    (
-                        f"Task [{task.id}] failed, but this run has already "
-                        f"refined the plan {self._refinement_count} times "
-                        f"(cap {EXECUTOR_MAX_REFINEMENTS}); not refining "
-                        f"again. The task stays failed."
-                    ),
-                    task_id=task.id,
-                    data={
-                        "refinements": self._refinement_count,
-                        "cap": EXECUTOR_MAX_REFINEMENTS,
-                        "task_count": len(self.task_manager.tasks),
-                    },
-                )
-            return
+            if detail_refine:
+                # The shared cap is spent, but this failure's own
+                # detail-refine budget is not, and the two budgets
+                # govern different things: the shared one bounds how far
+                # the run may let the refiner RESTRUCTURE the plan, and
+                # this refine is a targeted fix with a precise answer
+                # ("declare this path"). Vetoing it here is what left
+                # the task failed with the refiner never asked.
+                if self.logger:
+                    self.logger.info(
+                        "refine_detail_budget_exempt",
+                        (
+                            f"Task [{task.id}] failed with a "
+                            f"{failure.kind} failure; refining it anyway. "
+                            f"The shared refinement budget is spent "
+                            f"({self._refinement_count}/"
+                            f"{EXECUTOR_MAX_REFINEMENTS}), but this "
+                            f"failure's own detail-refine budget is not."
+                        ),
+                        task_id=task.id,
+                        data={
+                            "kind": failure.kind,
+                            "signature": failure.signature,
+                            "occurrence": occurrence,
+                            "refinements": self._refinement_count,
+                            "cap": EXECUTOR_MAX_REFINEMENTS,
+                        },
+                    )
+            else:
+                if self.logger:
+                    self.logger.error(
+                        "refine_budget_exhausted",
+                        (
+                            f"Task [{task.id}] failed, but this run has already "
+                            f"refined the plan {self._refinement_count} times "
+                            f"(cap {EXECUTOR_MAX_REFINEMENTS}); not refining "
+                            f"again. The task stays failed."
+                        ),
+                        task_id=task.id,
+                        data={
+                            "refinements": self._refinement_count,
+                            "cap": EXECUTOR_MAX_REFINEMENTS,
+                            "task_count": len(self.task_manager.tasks),
+                        },
+                    )
+                return
         # 2026-10-23 — defence in depth. The executor's dispatch (see
         # ``_failure_disposition``) already keeps a verifier timeout
         # away from the refiner, but this method is also called from
@@ -11266,7 +11421,13 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                     },
                 )
             return
-        self._refinement_count += 1
+        # A detail refine does NOT spend the shared budget: it is a
+        # targeted fix, not a plan restructure, and charging it there
+        # would let an unrelated budget eat a chance it does not
+        # govern. The detail budget (``_detail_refinement_count``)
+        # carries its own count.
+        if not detail_refine:
+            self._refinement_count += 1
 
         # 2026-10-19 — hand the refiner the classification, not just
         # the raw output. Its prompt used to say "if the last task

@@ -15,6 +15,7 @@ for the late-binding rule that governs every extracted module.
 from __future__ import annotations
 
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Any
+from collections import deque
 from pathlib import Path
 from datetime import datetime, timezone
 import json
@@ -1613,6 +1614,133 @@ def _reap_orphaned_in_progress_tasks(plan_id: str) -> int:
     return len(orphans)
 
 
+#: The verification-loop statuses that mean "the loop still owns this
+#: plan" — the crash adjudication must not stamp a terminal workflow
+#: phase over them.
+#:
+#: ``pending`` / ``running`` are the obvious ones: a round is queued or
+#: in flight.  ``loop_stopped`` belongs here because it is a verdict
+#: about the *round*, not about the *plan*: the loop reached its stop
+#: reason (max rounds reached, the same failure again, …) and the plan
+#: still has the repair queue and the operator's next move in front of
+#: it.  What the gate asks is not "did the round reach a verdict" but
+#: "is there still a verification loop this plan belongs to" — and a
+#: stopped loop still is.
+_DEAD_PHASE_OPEN_VERIFICATION_STATUSES = frozenset(
+    {"pending", "running", "loop_stopped"}
+)
+
+#: The verification-loop statuses that mean the loop reached its
+#: verdict.  Only these let the crash adjudication stamp the workflow's
+#: terminal phase: there is nothing left for the plan to wait for, so
+#: the crash verdict is the only verdict the plan is left with.
+_DEAD_PHASE_CLOSED_VERIFICATION_STATUSES = frozenset({"passed", "failed"})
+
+
+def _read_verification_row_for_dead_phase(
+    plan_id: str,
+) -> Tuple[str, Optional[str]]:
+    """The plan's own ``plan_verification`` row, for the crash gate.
+
+    Returns a ``(verdict, status)`` pair:
+
+    * ``("absent", None)`` — the plan has no verification row at all;
+    * ``("known", status)`` — the row was read; ``status`` is its
+      ``verification_status`` (possibly ``None`` when the column is
+      empty);
+    * ``("unreadable", None)`` — the row could not be read.
+
+    The three are kept apart on purpose.  A reader that answers
+    ``None`` for both "no row" and "cannot read" makes the caller
+    guess, and the two mean opposite things here: "no row" says this
+    plan never ran a verification loop (the crash verdict stands),
+    while "cannot read" says we do not know — and an unknown must
+    never be turned into a verdict.
+
+    Read through the repository (the same way
+    :func:`_release_unverified_round` writes) rather than through raw
+    SQL, so the row shape — and the status spelling — is the
+    repository's.
+    """
+    conn = None
+    try:
+        from state_machine.db.connection import open as _open_db
+        from state_machine.db.schema import migrate as _migrate
+        from state_machine.repositories.verification_repository import (
+            VerificationRepository as _VerifRepo,
+        )
+
+        conn = _open_db(_server._state_db_path())
+        _migrate(conn)
+        row = _VerifRepo(conn).current(plan_id)
+    except Exception:  # noqa: BLE001 — a failed read is "no answer"
+        return ("unreadable", None)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 — a closed handle is a closed handle
+                pass
+    if row is None:
+        return ("absent", None)
+    return ("known", row.get("verification_status"))
+
+
+def _dead_phase_may_be_stamped(plan_id: str) -> bool:
+    """May the crash adjudication stamp the workflow's terminal phase?
+
+    The death of an executor is a verdict about the *execution*.  It is
+    not automatically a verdict about the *plan*: a plan whose
+    verification loop is still open has not concluded anything, and
+    writing ``failed`` over it parks the plan in a terminal phase that
+    nothing picks up again — the loop is still running, and the plan
+    says it is over.
+
+    So the phase write is ANDed with this gate:
+
+    * no verification row — the plan never ran a verification loop, so
+      the crash verdict is the only verdict there is: stamp it;
+    * ``passed`` / ``failed`` — the loop reached its verdict: stamp it;
+    * ``pending`` / ``running`` / ``loop_stopped`` — the loop is still
+      open: keep the phase the plan has, and say so in the log;
+    * a row that cannot be read, or a status outside the vocabulary —
+      UNKNOWN: keep the phase and say so.  An unknown is not a verdict,
+      and neither the old value nor an old conclusion may stand in for
+      one.
+    """
+    verdict, status = _read_verification_row_for_dead_phase(plan_id)
+    if verdict == "absent":
+        return True
+    if verdict == "unreadable":
+        _server.logger.warning(
+            "[watchdog] plan=%s the verification row could not be read — "
+            "the crash verdict does not stamp the terminal phase (the "
+            "verification state is unknown, and an unknown is not a "
+            "verdict)",
+            plan_id,
+        )
+        return False
+    normalized = "" if status is None else str(status).strip()
+    if normalized in _DEAD_PHASE_CLOSED_VERIFICATION_STATUSES:
+        return True
+    if normalized in _DEAD_PHASE_OPEN_VERIFICATION_STATUSES:
+        _server.logger.warning(
+            "[watchdog] plan=%s verification_status=%s — the verification "
+            "loop is still open, so the crash verdict does not stamp the "
+            "terminal phase 'failed'",
+            plan_id, normalized,
+        )
+        return False
+    _server.logger.warning(
+        "[watchdog] plan=%s verification_status=%r is not a known "
+        "verification status — the crash verdict does not stamp the "
+        "terminal phase (the verification state is unknown, and an "
+        "unknown is not a verdict)",
+        plan_id, status,
+    )
+    return False
+
+
 def _mark_failed_dead(plan_id: str) -> None:
     """Mark an execution as failed because its process is gone.
 
@@ -1622,6 +1750,12 @@ def _mark_failed_dead(plan_id: str) -> None:
     known to be gone, so the plan's orphaned ``in_progress`` task rows
     are handed back to the scheduler too (see
     :func:`_reap_orphaned_in_progress_tasks`).
+
+    The terminal phase write is ANDed with a second gate: the plan's
+    own verification row decides whether the workflow phase may be
+    stamped at all (see :func:`_dead_phase_may_be_stamped`).  A plan
+    whose verification loop is still open keeps the phase it has — the
+    crash is a verdict about the execution, not about the plan.
 
     The verdict is written to the row, not only to memory.  The process
     that notices the crash is the next one to go away, and after a
@@ -1637,6 +1771,20 @@ def _mark_failed_dead(plan_id: str) -> None:
         ExecutionRepository,
         PlanNotFoundError as ExecPlanNotFoundError,
     )
+
+    if _server._shutdown_interrupted(plan_id):
+        # The server is on its way out and this process is one of the
+        # ones it is taking down.  A crash verdict here would overwrite
+        # the shutdown checkpoint — which says "interrupted", not
+        # "broken" — with "failed", and a plan in a terminal phase is
+        # never picked up again.  The next boot parks the plan from the
+        # checkpoint that is already on disk.
+        _server.logger.info(
+            "[watchdog] server is shutting down; plan=%s is left for the "
+            "restart to park",
+            plan_id,
+        )
+        return
 
     lock = _server._execution_locks.setdefault(plan_id, threading.Lock())
     with lock:
@@ -1684,15 +1832,30 @@ def _mark_failed_dead(plan_id: str) -> None:
 
     plan_dir = _server._plan_dir(plan_id)
     if plan_dir.exists():
+        ps = None
+        current_phase = None
         try:
             ps = _server.PlanState(plan_dir)
-            if ps.get_current_phase() not in _server._TERMINAL_PHASES:
-                # Recovery context: override normal transition rules.
-                # A plan may be in 'ready' if the server crashed between
-                # writing execution.json and transitioning to 'executing'.
-                ps.force_set_phase("failed")
+            current_phase = ps.get_current_phase()
         except Exception:
             pass
+        if ps is not None and current_phase not in _server._TERMINAL_PHASES:
+            # 2026-11-15 (VP-030): the phase write is ANDed with the
+            # verification gate.  A dead executor is a verdict about the
+            # execution; a plan whose verification loop is still open has
+            # concluded nothing, so the crash verdict must not stamp a
+            # terminal phase over it.  The gate is called OUTSIDE the
+            # blanket ``except`` on purpose: its warning about an
+            # unreadable (unknown) verification row has to be visible,
+            # not swallowed by the recovery path.
+            if _dead_phase_may_be_stamped(plan_id):
+                try:
+                    # Recovery context: override normal transition rules.
+                    # A plan may be in 'ready' if the server crashed between
+                    # writing execution.json and transitioning to 'executing'.
+                    ps.force_set_phase("failed")
+                except Exception:
+                    pass
 
 
 def _update_plan_state_to_terminal(
@@ -1941,7 +2104,16 @@ def _lazy_check_execution(plan_id: str) -> None:
     - PermissionError    → process exists but isn't ours; treat as alive
     - Success            → alive; no state change
     - No PID but running → check tasks.json for progress; if stale, mark failed
+
+    While the server is shutting down the probe stands down: the pid it
+    is about to find missing is one the shutdown itself killed, and the
+    verdict that would follow ("the executor crashed") overwrites the
+    shutdown checkpoint with a terminal phase.  The stand-down is
+    per plan — a plan the shutdown never touched is still probed, and a
+    crash there is still a crash.
     """
+    if _server._shutdown_interrupted(plan_id):
+        return
     state = _server._execution_state.get(plan_id)
     if not state or state.get("status") != "running":
         return
@@ -2024,6 +2196,173 @@ def _vp_artifact_processes(vp_id: str) -> List[int]:
     return pids
 
 
+# ---------------------------------------------------------------------------
+# The coding-query heartbeat (2026-11-02)
+# ---------------------------------------------------------------------------
+#
+# A dispatch that waits on a provider writes one heartbeat line per
+# interval into the plan's ``execution.log`` — see
+# ``coding_tool._QueryProgressReporter``.  Before this, the watchdog
+# could not read that line, so a round that was *waiting* (busy, healthy,
+# and simply slow) was indistinguishable from a round that was *wedged*.
+# Both look like silence, and silence is the only thing the watchdog had.
+#
+# The line renders with the bracket prefix every other query event uses,
+# so it is found with a plain substring search over the tail of the log.
+# No format-specific parsing: a log that grows a new event type does not
+# break the reader, and a reader that has to understand the whole log
+# format to find one heartbeat is a reader that will one day read it
+# wrong.
+#
+# The stale record below is the other half of the feature.  The heartbeat
+# answers "is the round alive?"; the record answers "what did the
+# watchdog see when it decided the round was stale?" — which is the
+# question an operator asks afterwards, and the one that separates
+# "healthy but slow" from "really dead".
+
+#: The rendered prefix of a heartbeat line.
+_CODING_QUERY_PROGRESS_MARKER = "[CODING_QUERY_PROGRESS]"
+
+#: How many bytes of ``execution.log`` are read looking for the last
+#: heartbeat.  A heartbeat is written every few seconds while a dispatch
+#: waits, so the newest one is always in the tail; the bound keeps the
+#: probe cheap on a multi-megabyte log.
+_HEARTBEAT_SCAN_BYTES = 256 * 1024
+
+#: The recent stale judgements, oldest first.  Bounded so a long-running
+#: backend does not grow without limit.  Each entry is the evidence
+#: record for one staleness decision — see
+#: :func:`_verification_stale_event`.
+_VERIFICATION_STALE_EVENTS: deque = deque(maxlen=200)
+
+
+def _log_entry_epoch(raw_line: bytes) -> Optional[float]:
+    """The epoch seconds a log line was written, or ``None``.
+
+    The line is a JSON entry whose ``ts`` the writer stamped with
+    ``datetime.utcnow().isoformat()`` — a NAIVE stamp that means UTC
+    (the convention ``execution_logger`` writes and
+    ``execution_log_tail`` documents and parses).  Reading it as local
+    time would move every heartbeat by the machine's offset, which on a
+    UTC+8 box turns a 60-second-old heartbeat into one that is eight
+    hours in the future.
+
+    Returns ``None`` for a line that carries no readable stamp.  The
+    caller then falls back to the file's own mtime.
+    """
+    try:
+        entry = json.loads(raw_line.decode("utf-8", errors="replace"))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(entry, dict):
+        return None
+    raw_ts = entry.get("ts")
+    if not isinstance(raw_ts, str) or not raw_ts.strip():
+        return None
+    try:
+        moment = datetime.fromisoformat(raw_ts.strip())
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    try:
+        return moment.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _last_coding_query_progress_age(plan_id: str) -> Optional[float]:
+    """Seconds since the last coding-query heartbeat, or ``None``.
+
+    ``None`` means "no heartbeat could be found" — which is NOT the same
+    as "the heartbeat is old".  The first means nothing was writing; the
+    second means something WAS writing and then stopped.  That
+    difference is the whole point of the evidence, so the two answers
+    stay apart instead of collapsing into one number.
+
+    The age is measured from the heartbeat line's own stamp.  When that
+    stamp cannot be read, the log file's mtime is used instead — which
+    is the same instant in the common case where the heartbeat is the
+    last line of the log, and a slight over-estimate otherwise (other
+    events may have written to the file since).
+
+    Never raises: a plan whose log is missing, unreadable or
+    unparsable is a plan WITHOUT a heartbeat, not an exception in the
+    watchdog.
+    """
+    try:
+        log_path = _server._plan_dir(plan_id) / "execution.log"
+    except Exception:
+        return None
+
+    try:
+        with open(log_path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - _HEARTBEAT_SCAN_BYTES))
+            blob = handle.read()
+    except OSError:
+        return None
+    except Exception:
+        return None
+
+    marker = _CODING_QUERY_PROGRESS_MARKER.encode("utf-8")
+    index = blob.rfind(marker)
+    if index < 0:
+        return None
+
+    # Take the whole line the marker sits in: the stamp is at the
+    # FRONT of the entry, so a line cut short by the tail window may
+    # still carry the marker while losing its stamp.
+    line_start = blob.rfind(b"\n", 0, index) + 1
+    line_end = blob.find(b"\n", index)
+    if line_end < 0:
+        line_end = len(blob)
+    raw_line = blob[line_start:line_end]
+
+    written_at = _log_entry_epoch(raw_line)
+    if written_at is None:
+        try:
+            written_at = log_path.stat().st_mtime
+        except OSError:
+            return None
+    return max(0.0, time.time() - written_at)
+
+
+def _verification_stale_event(
+    plan_id: str,
+    file_pattern: str,
+    age_sec: float,
+    reason: str,
+    heartbeat_age_sec: Optional[float],
+    threshold_sec: float,
+) -> Dict[str, Any]:
+    """The evidence record for one stale judgement.
+
+    The three heartbeat fields are what separate "healthy but slow"
+    from "really dead":
+
+    * ``heartbeat_seen`` — was there a pulse at all?
+    * ``last_heartbeat_age_sec`` — how old was it, really?  ``None``
+      when there was no heartbeat to measure.
+    * ``threshold_sec`` — the budget the judgement was made against, so
+      an old record is still readable after the threshold is retuned.
+    """
+    return {
+        "event": "verification_stale",
+        "plan_id": plan_id,
+        "file": file_pattern,
+        "age_sec": round(float(age_sec), 1),
+        "reason": reason,
+        "threshold_sec": float(threshold_sec),
+        "heartbeat_seen": heartbeat_age_sec is not None,
+        "last_heartbeat_age_sec": (
+            round(float(heartbeat_age_sec), 1)
+            if heartbeat_age_sec is not None else None
+        ),
+    }
+
+
 def _verification_liveness_probe(
     plan_id: str, running_vp_ids: List[str],
 ) -> Tuple[bool, str]:
@@ -2039,12 +2378,24 @@ def _verification_liveness_probe(
          logs) touched within the freshness window;
       3. a ``sub_agent_registry`` handle for this plan whose
          ``last_progress_ts`` — or whose tool's ``_last_output_ts``
-         (streaming stdout) — is fresh.
+         (streaming stdout) — is fresh;
+      4. a **coding-query heartbeat** in the plan's ``execution.log``
+         (see :func:`_last_coding_query_progress_age`) — the pulse a
+         dispatch writes while it waits on a provider.  It is the only
+         signal that can tell "the round is waiting" from "the round is
+         wedged", because a waiting round writes nothing else.
 
     The freshness window is ``min(staleness threshold, 900s)``: "recent
     output" must mean recently, not "since the last stale check" — with
     a 3600s threshold in ``.env``, using the threshold would call a tee
     file last touched 59 minutes ago fresh.
+
+    The heartbeat is judged against the staleness threshold itself, not
+    against that window.  The heartbeat is written every few seconds
+    while a dispatch waits, so "the last heartbeat is younger than the
+    watchdog's own budget" is exactly the question the watchdog is
+    asking — and it is the same budget that decides whether the rest of
+    the round is stale, so the two answers stay comparable.
 
     Returns ``(alive, detail)``. Never raises — a probe failure is
     treated as "no signal" so the watchdog errs toward its hard cap.
@@ -2083,6 +2434,14 @@ def _verification_liveness_probe(
                 continue
     except Exception:
         pass
+    # 2026-11-02: the coding-query heartbeat.  Checked last so the
+    # stronger signals keep their say, and because a round that has a
+    # live process or a streaming handle does not need the heartbeat to
+    # prove it is alive.
+    heartbeat_age = _last_coding_query_progress_age(plan_id)
+    if heartbeat_age is not None:
+        if heartbeat_age < _server.VERIFICATION_WATCHDOG_STALENESS_SECONDS:
+            return True, f"coding_query_progress:{int(heartbeat_age)}s"
     return False, "no fresh liveness signal"
 
 
@@ -3366,6 +3725,15 @@ def _lazy_check_verification(plan_id: str) -> None:
       ``VERIFICATION_WATCHDOG_STALENESS_SECONDS`` →
       ``stop_reason = "verification_results_stale"``
 
+    2026-11-02: every staleness judgement is recorded with the
+    heartbeat evidence that goes with it — whether a coding-query
+    heartbeat was seen, how old it was, and the threshold the
+    judgement was made against (see
+    :func:`_verification_stale_event` and
+    ``_VERIFICATION_STALE_EVENTS``).  A round that was waiting on a
+    provider and one that was wedged look identical to a watchdog that
+    only sees silence; the record is what tells them apart afterwards.
+
     2026-09-06:
     The previous implementation only flipped the in-memory state via
     ``_mark_verification_failed_dead`` and never advanced
@@ -3778,11 +4146,33 @@ def _lazy_check_verification(plan_id: str) -> None:
                     time.time() - latest
                 ) > _server.VERIFICATION_WATCHDOG_STALENESS_SECONDS:
                     age = time.time() - latest
+                    # 2026-11-02: the stale judgement carries the
+                    # heartbeat evidence.  A round whose heartbeat is
+                    # present but old ("healthy but slow, then it
+                    # stopped") and a round that never had a pulse
+                    # ("really dead") are both stale, and the record
+                    # is what tells them apart afterwards.
+                    _stale_event = _verification_stale_event(
+                        plan_id=plan_id,
+                        file_pattern=glob_pattern,
+                        age_sec=age,
+                        reason=reason,
+                        heartbeat_age_sec=_last_coding_query_progress_age(
+                            plan_id
+                        ),
+                        threshold_sec=(
+                            _server.VERIFICATION_WATCHDOG_STALENESS_SECONDS
+                        ),
+                    )
+                    _VERIFICATION_STALE_EVENTS.append(_stale_event)
                     _server.logger.warning(
                         "[verification_watchdog] staleness plan=%s "
-                        "file=%s age=%.1fs threshold=%s reason=%s",
+                        "file=%s age=%.1fs threshold=%s reason=%s "
+                        "heartbeat_seen=%s last_heartbeat_age_sec=%s",
                         plan_id, glob_pattern, age,
                         _server.VERIFICATION_WATCHDOG_STALENESS_SECONDS, reason,
+                        _stale_event["heartbeat_seen"],
+                        _stale_event["last_heartbeat_age_sec"],
                     )
                     stop_reason = reason
                     stale_latest = latest
@@ -4895,6 +5285,12 @@ def _run_repair_execution_async(
     write_exit = _repair_exit_writer(plan_id, plan_dir)
 
     def _run() -> None:
+        # Set when the server's own shutdown ended this round.  A round
+        # the shutdown ended has no verdict of its own: the verdict is
+        # the next boot's, and everything that would write one -- the
+        # exit verdict below and the re-entry callback after it --
+        # stands down together.
+        interrupted_by_shutdown = False
         try:
             # ``process.wait()`` is safe — stdout/stderr redirected to
             # log file (no PIPE-buffer deadlock). The verification
@@ -5016,6 +5412,33 @@ def _run_repair_execution_async(
                     else:
                         state["status"] = "completed"
                         state["stop_reason"] = None
+                    state["ended_at"] = datetime.now().isoformat()
+                elif _server._shutdown_interrupted(plan_id):
+                    # The server is on its way out and it is what killed
+                    # the repair executor.  A "repair_non_zero_exit"
+                    # verdict would say the repair crashed, and it would
+                    # overwrite the shutdown checkpoint with a terminal
+                    # phase; the next boot parks the plan from the
+                    # checkpoint instead.
+                    #
+                    # Nothing is written: the run did not end, the server
+                    # did, and a record that still says "running" must
+                    # not carry an ``ended_at`` — that field is what
+                    # tells "still working" from "over".
+                    _server.logger.info(
+                        "[repair_async] server is shutting down; plan=%s "
+                        "is left for the restart to park",
+                        plan_id,
+                    )
+                    # The re-entry callback stands down with the verdict.
+                    # It is not a verdict writer: it starts a *fresh*
+                    # verification round and writes the plan's phase
+                    # (``begin_verification``).  During a shutdown that
+                    # is new work on a server that is going away, and the
+                    # phase it writes contradicts the checkpoint the next
+                    # boot parks the plan from.  The round is the next
+                    # boot's to start.
+                    interrupted_by_shutdown = True
                 else:
                     # Explicit False, not "leave it alone": the state
                     # dict is keyed by plan_id and survives across
@@ -5070,8 +5493,11 @@ def _run_repair_execution_async(
             # It will route through ``_on_repair_complete`` which
             # bumps max_rounds, CASes routing stage, and invokes a
             # fresh ``start_verification_cycle`` to re-confirm VPs.
+            #
+            # A round the shutdown ended does not fire it: the next
+            # boot owns the round that follows this one.
             cb = state.get("_on_complete")
-            if cb is not None:
+            if cb is not None and not interrupted_by_shutdown:
                 try:
                     cb(process.returncode)
                 except Exception:
@@ -5092,12 +5518,24 @@ def _run_repair_execution_async(
                     _release_verification_state_conn(plan_id)
         except Exception:
             _server.logger.exception("[repair_async] background wait crashed plan=%s", plan_id)
-            with _server._execution_state_lock:
-                state["status"] = "failed"
-                state["stop_reason"] = "process_died_unexpectedly"
-                state["ended_at"] = datetime.now().isoformat()
+            if _server._shutdown_interrupted(plan_id):
+                # The same rule as the exit above.  A crash the shutdown
+                # caused is not a crash verdict, and the re-entry
+                # callback stands down with it: the plan is left for the
+                # restart to park from the checkpoint.
+                interrupted_by_shutdown = True
+                _server.logger.info(
+                    "[repair_async] server is shutting down; plan=%s "
+                    "is left for the restart to park",
+                    plan_id,
+                )
+            else:
+                with _server._execution_state_lock:
+                    state["status"] = "failed"
+                    state["stop_reason"] = "process_died_unexpectedly"
+                    state["ended_at"] = datetime.now().isoformat()
             cb = state.get("_on_complete")
-            if cb is not None:
+            if cb is not None and not interrupted_by_shutdown:
                 try:
                     cb(-1)
                 except Exception:
@@ -9245,6 +9683,250 @@ def _base_drift_round_action(report: Any) -> Optional[str]:
     return "repair" if task_id else "stop"
 
 
+# ---------------------------------------------------------------------------
+# Giving an unmeasured round its number back (2026-11-01)
+# ---------------------------------------------------------------------------
+#
+# The auto-loop writes the round number BEFORE it dispatches the round
+# (``init_round(plan_id, round_n=next)``), and ``init_round`` only ever
+# moves the counter forward.  Two preflights can block a round after
+# that write and before a single verification point is dispatched:
+#
+#   * the base-drift preflight — the branch drifted away from its base
+#     and merging the base back left conflicts (§2);
+#   * the service preflight — the round's services were not usable (§3).
+#
+# Both refusals produce an EMPTY report: the preflight runs before the
+# verification plan is even generated, so nothing was measured.  The
+# round number was already spent, so the plan burned one of its rounds
+# on a turn that never looked at the product.
+#
+# This is the way back.
+
+
+def _release_unverified_round(
+    plan_id: str, round_num: int, reason: str, report: Any = None,
+) -> bool:
+    """Hand a round number back — the round never measured anything.
+
+    2026-11-01 (verification convergence, §2 / §3): asks
+    :meth:`VerificationRepository.release_round` (task 6) to rewind the
+    counter by exactly one and to record WHY in
+    ``executor_state["released_rounds"]``, so the audit trail survives
+    the rewind instead of vanishing together with the number.
+
+    The caller's responsibility: only call this for a round that
+    dispatched NO verification point.  A round that measured something
+    has a verdict, and a verdict owns its round number — releasing that
+    one would hand back work that was actually done.
+
+    2026-11-15: that responsibility is no longer the caller's alone.
+    ``report`` is the round's own report; when the caller hands it
+    over, the helper checks it itself: a report that carries a verdict
+    about the deliverable (PASSED / FAILED / PARTIAL) means the round
+    measured something, and the release is REFUSED — ``False``, and the
+    repository is never asked.  The rule is now an invariant of the
+    helper instead of a promise the four call sites have to keep.
+
+    Best-effort, like every other state write in this module: a release
+    that cannot land (no row, or the row already moved on) is a warning,
+    never an exception.  The terminal verdict the blocked round already
+    wrote has to stand either way — the release only gives the NUMBER
+    back.
+
+    Returns ``True`` when the number went back, ``False`` otherwise.
+    """
+    # 2026-11-15: the "only a round that measured nothing may be
+    # released" rule, enforced here rather than left to the caller.
+    if report is not None:
+        # The same reader the decision helper uses (see
+        # ``_round_release_reason``): the round's own results, or the
+        # last round snapshot when the orchestrator moved them there.
+        entries = _round_verification_entries(report)
+        statuses = {
+            str(entry.get("status") or "").upper() for entry in entries
+        }
+        if statuses & _ROUND_VERDICT_VP_STATUSES:
+            _server.logger.warning(
+                "[verification_round_release] round %d was NOT released "
+                "plan=%s reason=%s — the round measured something "
+                "(%s), and a verdict owns its round number",
+                round_num, plan_id, reason,
+                ", ".join(sorted(statuses & _ROUND_VERDICT_VP_STATUSES)),
+            )
+            return False
+
+    released = False
+    try:
+        from state_machine.db.connection import open as _open_db
+        from state_machine.db.schema import migrate as _migrate
+        from state_machine.repositories.verification_repository import (
+            VerificationRepository as _VerifRepo,
+        )
+
+        conn = _open_db(_server._state_db_path())
+        try:
+            _migrate(conn)
+            released = bool(
+                _VerifRepo(conn).release_round(plan_id, round_num, reason)
+            )
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 — a closed handle is a closed handle
+                pass
+    except Exception as exc:  # noqa: BLE001 — a release must never break a round
+        _server.logger.warning(
+            "[verification_round_release] could not release round %d "
+            "plan=%s reason=%s: %s",
+            round_num, plan_id, reason, exc,
+        )
+        return False
+
+    if not released:
+        _server.logger.warning(
+            "[verification_round_release] round %d was NOT released "
+            "plan=%s reason=%s — the row is gone, or it already moved on",
+            round_num, plan_id, reason,
+        )
+        return False
+
+    _server.logger.info(
+        "[verification_round_release] round %d released plan=%s reason=%s",
+        round_num, plan_id, reason,
+    )
+    # The operator reads the plan's own execution.log; the database row
+    # is not where they look for "what happened to round N".
+    try:
+        from execution_logger import get_logger
+
+        plan_logger = get_logger(plan_id=plan_id)
+        if plan_logger is not None:
+            plan_logger.info(
+                "round_released",
+                f"round {round_num} released: {reason}",
+                data={
+                    "plan_id": plan_id,
+                    "round": round_num,
+                    "reason": reason,
+                },
+            )
+    except Exception:  # noqa: BLE001 — a log line must never break a round
+        pass
+    return True
+
+
+# ---------------------------------------------------------------------------
+#
+# §3: a round that measured nothing must not consume a round number.
+#
+# The round number is written BEFORE the round is dispatched, so every
+# round a plan runs spends one of its rounds — including the rounds
+# that produced no verdict at all.  Two plans were caught doing exactly
+# that (§3): both are named ``<plan-id>`` here — their real ids are
+# private and do not belong in the source — and both ran a round that
+# came out ``overall=SKIPPED`` with nothing measured, so the number was
+# eaten anyway.
+#
+# ``_round_release_reason`` is the decision.  It reads the
+# orchestrator's cycle result and the round's report and answers one
+# question: did this round measure anything?  ``None`` means "yes" —
+# the round keeps its number, because a verdict owns the round it was
+# produced in.  A string is the reason the number goes back, and the
+# auto-loop hands that string to ``_release_unverified_round`` (above),
+# which rewinds the counter and records the reason in
+# ``executor_state["released_rounds"]``.
+
+#: A verification point that carries a verdict about the deliverable.
+#: Such a point means the round measured something.
+_ROUND_VERDICT_VP_STATUSES = frozenset({"PASSED", "FAILED", "PARTIAL"})
+
+#: A verification point that carries no verdict: it was skipped or it
+#: was blocked.
+_ROUND_UNJUDGED_VP_STATUSES = frozenset({"SKIPPED", "BLOCKED"})
+
+
+def _round_verification_entries(report: Any) -> List[Dict[str, Any]]:
+    """The verification entries of the round that just ran.
+
+    The round's own results live in the report's top-level
+    ``verification_results``.  When the orchestrator rebuilt the report
+    at end-of-round they may have been moved into the last round
+    snapshot instead (``rounds[-1].results``) — the same fallback the
+    auto-loop uses when it counts this round's failures.
+
+    An empty list means the round dispatched no verification point (or
+    none of them reported) — that is the "0 VP" shape of §3.
+    """
+    if not isinstance(report, dict):
+        return []
+    top_level = report.get("verification_results")
+    if isinstance(top_level, list) and top_level:
+        return [entry for entry in top_level if isinstance(entry, dict)]
+    rounds = report.get("rounds")
+    if isinstance(rounds, list) and rounds:
+        last_round = rounds[-1]
+        if isinstance(last_round, dict):
+            last_results = last_round.get("results")
+            if isinstance(last_results, list) and last_results:
+                return [
+                    entry for entry in last_results if isinstance(entry, dict)
+                ]
+    return []
+
+
+def _round_release_reason(
+    result: Dict[str, Any], report: Dict[str, Any],
+) -> Optional[str]:
+    """Why the round that just ran should hand its number back.
+
+    Returns the release reason, or ``None`` when the round keeps its
+    number.
+
+    The checks run in the order of what the round actually did:
+
+    1. a VP that carries a verdict (PASSED / FAILED / PARTIAL) means
+       the round measured something — the number stays, whatever the
+       overall status says;
+    2. ``overall=SKIPPED`` means the round judged nothing — even when
+       it carries VP rows, because a skipped or a blocked VP is not a
+       verdict;
+    3. VP rows that are all skipped or blocked say the same thing
+       without an overall status to back it up;
+    4. ``environment_blocked`` means the environment took the round out
+       before anything was measured.
+
+    The two reasons are not interchangeable: the operator reads them in
+    ``executor_state["released_rounds"]`` and has to be able to tell
+    "the environment refused this round" from "this round judged
+    nothing".
+    """
+    if not isinstance(result, dict) or not isinstance(report, dict):
+        return None
+
+    entries = _round_verification_entries(report)
+    statuses = {str(entry.get("status") or "").upper() for entry in entries}
+
+    # 1. A verdict owns the round it was produced in.
+    if statuses & _ROUND_VERDICT_VP_STATUSES:
+        return None
+
+    # 2. The round's own verdict says it measured nothing.
+    overall = str(report.get("overall_status") or "").upper()
+    if overall == "SKIPPED":
+        return "round_judged_nothing"
+
+    # 3. Every VP was skipped or blocked — no verdict anywhere.
+    if statuses and statuses <= _ROUND_UNJUDGED_VP_STATUSES:
+        return "round_judged_nothing"
+
+    # 4. The environment took the round out.
+    if result.get("environment_blocked") is True:
+        return "environment_blocked"
+
+    return None
+
+
 #: The event a round blocked by a base-drift conflict writes before it
 #: hands the plan to the executor.
 BASE_DRIFT_ROUND_BLOCKED_EVENT = "base_drift_round_blocked"
@@ -11286,6 +11968,7 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                         "[Auto-Verification] stop requested before round %d "
                         "plan=%s — exiting the auto-loop", round_num, plan_id,
                     )
+
                     return
             except Exception:  # noqa: BLE001
                 pass
@@ -11379,6 +12062,13 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                     _record_terminal(
                         "loop_stopped", SERVICE_PREFLIGHT_ERROR_KIND,
                     )
+                    # 2026-11-15: the round dispatched nothing, so its
+                    # number goes back — AFTER the terminal write, so the
+                    # verdict the operator reads still stands.
+                    _release_unverified_round(
+                        plan_id, round_num, SERVICE_PREFLIGHT_ERROR_KIND,
+                        report=report,
+                    )
                     return
                 # 2026-11-01: the round was blocked by the binary-freshness
                 # preflight — the working tree was not fresh, so every
@@ -11432,6 +12122,17 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                                 report.get("base_drift_repair_task_id") or ""
                             ),
                         )
+                        # 2026-11-15: the round dispatched nothing, so its
+                        # number goes back.  The release lands AFTER the
+                        # blocked-round row (that row is the evidence that
+                        # the round never ran) and BEFORE the hand-off to
+                        # the executor, so the round the merge comes back
+                        # to is computed without this number in it.
+                        _release_unverified_round(
+                            plan_id, round_num,
+                            BASE_DRIFT_CONFLICTS_STOP_REASON,
+                            report=report,
+                        )
                         _base_drift_on_complete = _make_repair_on_complete(
                             plan_id, project_dir, tool,
                             round_token=round_token,
@@ -11452,6 +12153,14 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                     )
                     _record_terminal(
                         "loop_stopped", BASE_DRIFT_CONFLICTS_STOP_REASON,
+                    )
+                    # 2026-11-15: the round dispatched nothing, so its
+                    # number goes back — AFTER the terminal write, so the
+                    # verdict the operator reads still stands.
+                    _release_unverified_round(
+                        plan_id, round_num,
+                        BASE_DRIFT_CONFLICTS_STOP_REASON,
+                        report=report,
                     )
                     return
                 # The round has run against the addresses the ledger names —
@@ -11816,6 +12525,20 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                         # ``loop_stopped`` anyway, so the two exits agree by
                         # construction.
                         _record_terminal("loop_stopped", stop_reason)
+                        # 2026-11-15: the loop is done, and the round it
+                        # just ran may have measured nothing at all.  The
+                        # decision belongs to the other helper
+                        # (``_round_release_reason``): ``None`` means the
+                        # round measured something and keeps its number,
+                        # a string is the reason the number goes back.
+                        # The release lands AFTER the terminal write, so
+                        # the verdict the operator reads still stands.
+                        _release_reason = _round_release_reason(result, report)
+                        if _release_reason is not None:
+                            _release_unverified_round(
+                                plan_id, round_num, _release_reason,
+                                report=report,
+                            )
                         return
                 if stop_reason == "max_rounds_reached":
                     # 2026-08-25 audit: previous code logged "Per user

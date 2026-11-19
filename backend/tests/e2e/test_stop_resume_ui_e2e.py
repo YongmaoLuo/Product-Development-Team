@@ -70,12 +70,14 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -108,7 +110,23 @@ REQUEST_HEADERS = {
 #: archived-plan guard (``classify_plan`` reads a ``YYYYMMDD-*`` dirname
 #: as the plan's creation date, and anything on or before the
 #: 2026-08-05 cutoff is archived and read-only).
-PLAN_ID = "20261026-stop-resume-e2e"
+#:
+#: The rest of the id names *this* run.  The plan id ends up in the
+#: executor's command line, so any process on the machine that goes
+#: looking for "the plan of this test" -- a peer copy of this file, a
+#: cleanup that still searches by plan id -- finds the executor of
+#: whichever run it hits first.  With a shared constant those lookups
+#: collide, and a SIGTERM that lands on the wrong executor kills it
+#: before it dispatched (``exit_code=-15``).  The pid and the random
+#: suffix keep two copies of this file apart.
+PLAN_ID = f"20261026-stop-resume-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
+#: The plan id every copy of this file used to share.
+#:
+#: It is kept under its own name so that the *old* behaviour has a name
+#: to point at: a copy of this file that still searches the machine for
+#: it must not be able to reach this run's processes.
+SHARED_PLAN_ID = "20261026-stop-resume-e2e"
 
 #: The one task the seeded plan carries.  Its id is what the binding
 #: event names.
@@ -136,6 +154,14 @@ DISPATCH_TIMEOUT = 180.0
 #: (the one the page walk uses) never reaches that: its stream stays
 #: busy, the close completes, and the stop costs ~1.5 s.
 STOP_GRACE_SECONDS = "30"
+
+#: The roles the process ledger records for the executor the backend
+#: started.
+#:
+#: The fake ``claude`` is recorded as a ``subagent``: it is the
+#: executor's own child, and the teardown kills that one from the
+#: invocation record it wrote, not from the ledger.
+EXECUTOR_ROLES = ("executor", "repair_executor")
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +487,87 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _executor_exit_code(work: Path, plan_id: str) -> Optional[int]:
+    """The exit code the server recorded for the executor, if it recorded one.
+
+    The server writes one line per executor exit into its log::
+
+        executor_spawned plan=<id> pid=<pid> pgid=<pgid> role=executor
+        executor_exited  plan=<id> pid=<pid> exit_code=<code>
+
+    The exit code is what tells the two ways an executor can end apart.
+    A *negative* code is the kernel's way of reporting a signal: the
+    process died from that signal, it did not exit on its own.  A
+    positive code is an ordinary exit.
+    """
+    log_path = work / "server.log"
+    if not log_path.exists():
+        return None
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    pattern = re.compile(
+        rf"executor_exited\s+plan={re.escape(plan_id)}\s+pid=(\d+)\s+exit_code=(-?\d+)"
+    )
+    codes = [int(match.group(2)) for match in pattern.finditer(text)]
+    return codes[-1] if codes else None
+
+
+def _executor_exit_story(work: Path, plan_id: str) -> str:
+    """Classify how the executor ended, in the words the exit code earns.
+
+    The number is the evidence, and the three numbers that matter mean
+    three different things:
+
+    * ``143`` -- ``128 + 15``.  ``backend/cli.py`` installs a SIGTERM
+      handler and leaves with this code, so a stop that reached the
+      executor leaves ``143`` behind.  This is the product's own stop
+      path.
+    * ``-15`` -- SIGTERM with the *default* disposition.  The signal
+      landed before ``cli.py`` installed its handler (the handler is
+      installed after the imports and the lock, about a second into the
+      process' life), so the kernel killed the executor outright.  The
+      product's own stop path cannot produce this number -- it always
+      waits for the handler -- so an executor that dies with ``-15``
+      was signalled from *outside* the stop path.
+    * ``-9`` -- SIGKILL: somebody escalated.
+
+    The point of naming them is that "the executor never invoked the
+    claude CLI" on its own reads like a verdict on the dispatch, when
+    it may only be a verdict on who sent the signal.
+    """
+    code = _executor_exit_code(work, plan_id)
+    if code is None:
+        return (
+            "the server recorded no exit for the executor; the log has no "
+            "`executor_exited` line for this plan"
+        )
+    if code == 143:
+        return (
+            "the executor was stopped by the product before it dispatched "
+            "(exit_code=143 = 128+15, the product's own stop path)"
+        )
+    if code == -signal.SIGTERM:
+        return (
+            "the executor was killed by a SIGTERM that the product's stop "
+            "path did not send (exit_code=-15: the signal landed before "
+            "cli.py installed its SIGTERM handler, so the kernel killed the "
+            "process; the product's own stop path exits with 143)"
+        )
+    if code == -signal.SIGKILL:
+        return (
+            "the executor was SIGKILLed from outside the product's stop "
+            "path (exit_code=-9)"
+        )
+    if code < 0:
+        return (
+            f"the executor was killed by signal {-code} (exit_code={code}), "
+            "which is not a number the product's stop path produces"
+        )
+    return (
+        f"the executor left on its own with exit_code={code} before it "
+        "dispatched"
+    )
+
+
 # ---------------------------------------------------------------------------
 # The plan the server sees
 # ---------------------------------------------------------------------------
@@ -491,6 +598,17 @@ def _make_checkout(work: Path) -> Path:
     return checkout
 
 
+def _plan_dir(work: Path, plan_id: str = PLAN_ID) -> Path:
+    """Where this run's plan lives on disk.
+
+    The directory sits under the run's own ``tmp_path``, so it names
+    this run and no other.  That is what makes it usable as the key for
+    "the processes this run started" -- the plan id cannot be, because
+    every copy of this file shares it.
+    """
+    return work / "plans" / plan_id
+
+
 def _seed_plan(work: Path, plan_id: str = PLAN_ID) -> Path:
     """Create the plan directory and the rows the start route needs.
 
@@ -509,7 +627,7 @@ def _seed_plan(work: Path, plan_id: str = PLAN_ID) -> Path:
 
     Returns the plan directory.
     """
-    plan_dir = work / "plans" / plan_id
+    plan_dir = _plan_dir(work, plan_id)
     plan_dir.mkdir(parents=True, exist_ok=True)
     (plan_dir / "tasks.json").write_text(
         json.dumps(
@@ -619,31 +737,22 @@ def _boot_server(work: Path, fake_bin: Path) -> Tuple[str, subprocess.Popen]:
     return base_url, proc
 
 
-def _kill_leftover_executors(plan_id: str) -> None:
-    """Kill an executor that outlived the server (it is found by its id).
+def _kill_leftover_executors(plan_dir: Path) -> None:
+    """Kill the executor this run started, if it outlived the server.
 
-    The executor's command line carries the plan id, so the id is
-    enough to find it.
+    The executor is named by the ledger the server wrote in *this run's*
+    plan directory, and the record is checked against the kernel before
+    anything is signalled: a pid is not an identity.
+
+    The plan id would have been the wrong key.  It is a constant that
+    every copy of this file shares, so a machine-wide search for it
+    reaches into every other pytest session on the machine and kills
+    their executors as well.  A SIGTERM that lands before the executor
+    has installed its own handler kills it outright -- ``exit_code=-15``
+    -- and the run that owned it fails with "the executor never invoked
+    the claude CLI".
     """
-    if not plan_id:
-        return
-    try:
-        listing = subprocess.run(
-            ["pgrep", "-f", plan_id],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return
-    for line in listing.stdout.split():
-        try:
-            pid = int(line)
-        except ValueError:
-            continue
-        if pid == os.getpid():
-            continue
+    for pid in _this_runs_executor_pids(plan_dir):
         for sig in (signal.SIGTERM, signal.SIGKILL):
             try:
                 os.kill(pid, sig)
@@ -652,6 +761,41 @@ def _kill_leftover_executors(plan_id: str) -> None:
             time.sleep(0.5)
             if not _pid_alive(pid):
                 break
+
+
+def _this_runs_executor_pids(plan_dir: Path) -> List[int]:
+    """The pids of this run's executor, as the ledger and the kernel agree.
+
+    Two questions, two sources.  The ledger says which processes this
+    plan started; the kernel says whether the pid still names the same
+    process.  A pid whose start time or command line no longer agrees
+    belongs to somebody else now, and it is left alone.
+    """
+    if str(BACKEND_DIR) not in sys.path:
+        sys.path.insert(0, str(BACKEND_DIR))
+    try:
+        from process_identity import matches, probe
+        from process_ledger import live_records
+    except ImportError:  # pragma: no cover - the backend is importable
+        return []
+
+    pids: List[int] = []
+    for pid, record in live_records(plan_dir).items():
+        if pid <= 1 or pid == os.getpid():
+            continue
+        if record.role not in EXECUTOR_ROLES:
+            continue
+        identity = probe(pid)
+        if identity is None:
+            continue
+        if not matches(
+            identity,
+            create_time=record.create_time,
+            cmdline=record.cmdline,
+        ):
+            continue
+        pids.append(pid)
+    return pids
 
 
 def _kill_fake_claudes(work: Path) -> None:
@@ -680,12 +824,12 @@ def _teardown(base_url: str, proc: subprocess.Popen, plan_id: str, work: Path) -
     """Leave nothing behind: the executor, the fake children, the server.
 
     The order is deliberate, and it is not the polite one.  The
-    executor is killed FIRST, by its plan id: it is the process that
-    owns the fake ``claude`` child, and the server's own shutdown would
-    otherwise stop the executions it knows about *politely* -- for as
-    long as the stop grace allows, which with this file's grace is
-    half a minute.  Killing the executor first keeps the teardown
-    bounded at a couple of seconds.
+    executor is killed FIRST, by the ledger this run's plan directory
+    carries: it is the process that owns the fake ``claude`` child, and
+    the server's own shutdown would otherwise stop the executions it
+    knows about *politely* -- for as long as the stop grace allows,
+    which with this file's grace is half a minute.  Killing the
+    executor first keeps the teardown bounded at a couple of seconds.
 
     The fake ignores SIGTERM -- that is its contract -- so it is
     killed with SIGKILL, and its pids come from the record the fake
@@ -699,7 +843,7 @@ def _teardown(base_url: str, proc: subprocess.Popen, plan_id: str, work: Path) -
     ``base_url`` is accepted so that the teardown has the same shape as
     the boot it undoes; this teardown does not call the API.
     """
-    _kill_leftover_executors(plan_id)
+    _kill_leftover_executors(_plan_dir(work, plan_id))
     _kill_fake_claudes(work)
 
     log_handle = getattr(proc, "_pdt_log_handle", None)
@@ -1053,6 +1197,13 @@ def _run_stop_resume_driver(
         raise AssertionError(
             f"the browser driver failed (exit {result.returncode}); "
             f"stdout={result.stdout!r} stderr={result.stderr!r}"
+            + (
+                " -- exit -15 is SIGTERM with the default disposition: the "
+                "driver was killed from outside the product chain (it is the "
+                "driver process, not the executor, that died)"
+                if result.returncode == -signal.SIGTERM
+                else ""
+            )
         )
     return json.loads(result.stdout.strip().splitlines()[-1])
 
@@ -1120,7 +1271,8 @@ def test_binding_exists_while_real_dispatch_is_in_flight(tmp_path):
         invocations = _wait_for_invocations(work, timeout=DISPATCH_TIMEOUT)
         assert invocations, (
             "the executor never invoked the claude CLI; the dispatch did "
-            f"not happen. server log:\n"
+            f"not happen. {_executor_exit_story(work, PLAN_ID)}. "
+            f"server log:\n"
             f"{(work / 'server.log').read_text(encoding='utf-8', errors='replace')[-4000:]}"
         )
         invocation = invocations[0]
@@ -1212,7 +1364,8 @@ def test_stop_then_restart_resumes_the_same_session(tmp_path):
         invocations = _wait_for_invocations(work, timeout=DISPATCH_TIMEOUT)
         assert invocations, (
             "the executor never invoked the claude CLI; the dispatch did "
-            f"not happen. server log:\n"
+            f"not happen. {_executor_exit_story(work, PLAN_ID)}. "
+            f"server log:\n"
             f"{(work / 'server.log').read_text(encoding='utf-8', errors='replace')[-4000:]}"
         )
         first = invocations[0]
@@ -1589,3 +1742,164 @@ def test_stop_then_start_resumes_the_same_session(tmp_path):
             )
     finally:
         _teardown(base_url, proc, PLAN_ID, work)
+
+
+def test_leftover_cleanup_leaves_another_runs_process_alone(tmp_path):
+    """The teardown must not signal a process that belongs to another run.
+
+    The plan id is a constant every copy of this file shares, so a
+    machine-wide search for it finds the executor of every other pytest
+    session on the machine as well.  A SIGTERM that lands there kills
+    that executor before it can dispatch -- ``exit_code=-15`` -- and the
+    run that owned it fails with "the executor never invoked the claude
+    CLI".
+
+    So a process that merely *mentions* the plan id is not the
+    teardown's business: it has to survive the teardown.
+    """
+    work = tmp_path
+    (work / "plans" / PLAN_ID).mkdir(parents=True)
+    foreign = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)", PLAN_ID],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    server = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        _teardown("http://127.0.0.1:1", server, PLAN_ID, work)
+        # ``poll`` (not ``_pid_alive``): the child is this process' own,
+        # so a process that was killed is a zombie until it is reaped,
+        # and a zombie still answers a signal-0 probe.
+        returncode = foreign.poll()
+        assert returncode is None, (
+            f"the teardown signalled a process that belongs to another run "
+            f"(pid={foreign.pid}, returncode={returncode}); the plan id is "
+            "shared by every copy of this file, so a machine-wide search "
+            "for it reaches into the other pytest sessions on the machine"
+        )
+    finally:
+        for leftover in (foreign, server):
+            try:
+                leftover.kill()
+            except OSError:
+                pass
+            leftover.wait(timeout=15)
+
+
+def test_a_search_for_this_runs_plan_id_finds_only_this_runs_processes(tmp_path):
+    """The plan id must name this run, not every run of this file.
+
+    The plan id ends up in the executor's command line, and the copy of
+    this file that another pytest session on the machine is running
+    searches the machine for the plan id *it* knows.  While that id was a
+    constant, the two searches were one search: the first run's cleanup
+    found the second run's executor and killed it.  A SIGTERM that lands
+    before the executor installed its own handler kills it outright --
+    ``exit_code=-15`` -- and the run that owned it fails with "the
+    executor never invoked the claude CLI".
+
+    So the id has to carry something unique to the process that uses it,
+    and it must not *contain* the shared id either: a search for the
+    shared id has to stay unable to reach this run.
+    """
+    work = tmp_path
+    mine = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)", PLAN_ID],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    shared = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)", SHARED_PLAN_ID],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert SHARED_PLAN_ID not in PLAN_ID, (
+            f"the plan id {PLAN_ID} contains the shared id {SHARED_PLAN_ID}; a "
+            "search for the shared id would reach this run's processes"
+        )
+        found = subprocess.run(
+            ["pgrep", "-f", PLAN_ID],
+            capture_output=True,
+            text=True,
+        ).stdout.split()
+        assert str(mine.pid) in found, (
+            f"a search for this run's plan id {PLAN_ID} did not find this run's "
+            f"own process (pid={mine.pid}); found={found}"
+        )
+        assert str(shared.pid) not in found, (
+            f"a search for this run's plan id {PLAN_ID} found a process that "
+            f"belongs to another run (pid={shared.pid}); the plan id is shared "
+            "by every copy of this file, so the search reaches into the other "
+            "pytest sessions on the machine"
+        )
+    finally:
+        for leftover in (mine, shared):
+            try:
+                leftover.kill()
+            except OSError:
+                pass
+            leftover.wait(timeout=15)
+
+
+def _record_executor_spawn(plan_dir: Path, pid: int) -> None:
+    """Write the ledger record the server writes when it spawns an executor.
+
+    The cleanup reads that ledger to learn which process this run's
+    executor is, so a test that exercises the cleanup has to leave the
+    same record behind.
+    """
+    if str(BACKEND_DIR) not in sys.path:
+        sys.path.insert(0, str(BACKEND_DIR))
+    from process_identity import probe
+    from process_ledger import ProcessRecord, record_spawn
+
+    identity = probe(pid)
+    assert identity is not None, f"the kernel could not describe pid {pid}"
+    record_spawn(
+        plan_dir,
+        ProcessRecord(
+            plan_id=plan_dir.name,
+            role="executor",
+            pid=pid,
+            pgid=identity.pgid or pid,
+            create_time=identity.create_time or 0.0,
+            cmdline=identity.cmdline,
+            cwd=str(identity.cwd or ""),
+            owner_pid=os.getpid(),
+            owner_role="backend",
+        ),
+    )
+
+
+def test_leftover_cleanup_kills_this_runs_executor(tmp_path):
+    """The teardown must still reach the executor this run started.
+
+    Scoping the cleanup is not a licence to skip it: the executor the
+    server spawned has to be gone when the test ends, or it outlives
+    the run that owns it.
+    """
+    work = tmp_path
+    plan_dir = _plan_dir(work)
+    plan_dir.mkdir(parents=True)
+    victim = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        _record_executor_spawn(plan_dir, victim.pid)
+        _kill_leftover_executors(plan_dir)
+        victim.wait(timeout=15)
+        assert victim.returncode == -signal.SIGTERM, (
+            "the cleanup did not kill this run's executor: "
+            f"returncode={victim.returncode}"
+        )
+    finally:
+        if victim.poll() is None:
+            victim.kill()
+            victim.wait(timeout=15)

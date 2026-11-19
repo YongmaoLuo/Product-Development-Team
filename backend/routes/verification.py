@@ -142,6 +142,51 @@ def _read_verification_checkpoint(plan_dir: Path) -> Optional[dict]:
     return checkpoint
 
 
+def _released_round_numbers(row: Optional[dict]) -> frozenset:
+    """The round numbers this row has handed back.
+
+    2026-11-01 (verification convergence, §2 / §3): a round that was
+    blocked BEFORE it dispatched any verification point — the
+    base-drift preflight, the service preflight — did not measure
+    anything, so it must not consume a round number.
+    ``VerificationRepository.release_round`` hands the number back: the
+    counter is rewound by exactly one and the release is recorded in
+    ``executor_state["released_rounds"]`` as
+    ``{round, reason, released_at}``.
+
+    This reads that record back. The blob is free-form — it can be
+    missing, hold a JSON string, hold a list, or hold entries that are
+    not dictionaries with an integer round number. None of that is a
+    reason to raise: a start must not die because an audit record is
+    odd. Anything unrecognisable reads as "nothing was handed back".
+    """
+    state = (row or {}).get("executor_state")
+    if isinstance(state, (bytes, bytearray)):
+        state = state.decode("utf-8", errors="replace")
+    if isinstance(state, str):
+        try:
+            state = json.loads(state)
+        except (TypeError, ValueError):
+            return frozenset()
+    if not isinstance(state, dict):
+        return frozenset()
+    released = state.get("released_rounds")
+    if not isinstance(released, list):
+        return frozenset()
+
+    numbers = set()
+    for entry in released:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            number = int(entry.get("round"))
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            numbers.add(number)
+    return frozenset(numbers)
+
+
 def _resolve_start_round(
     current_row: Optional[dict], checkpoint: Optional[dict],
 ) -> Tuple[int, bool]:
@@ -174,12 +219,53 @@ def _resolve_start_round(
     that never ran — the same mislabelling the other two interrupted
     states are protected from.
 
+    A round that was **handed back** (``release_round``) is a third
+    case, and it is not an interruption at all. The round was blocked
+    before it measured anything, so its number was returned — and its
+    status was left alone, so the row still says ``running`` /
+    ``loop_stopped``. Two things follow from the rewind:
+
+    * the counter sits one below the round that was attempted, so the
+      row's ``round`` no longer names that round — the handed-back
+      number does;
+    * the attempt was **thrown away**, so there is nothing to resume.
+      The handed-back number runs as a FRESH round.
+
+    A plan that read such a row as "the round below was interrupted"
+    would resume a round that was never touched and would never run the
+    number it was given back — it would sit on the same round forever.
+
     Returns ``(next_round, resumed)``.
     """
     row = current_row or {}
     current_round = int(row.get("round") or 0)
     status = str(row.get("verification_status") or "").lower()
     checkpoint_round = int((checkpoint or {}).get("verification_round") or 0)
+    released = _released_round_numbers(row)
+
+    # A checkpoint that names a handed-back round describes the attempt
+    # that was thrown away: it is ignored, and that round starts fresh.
+    # A checkpoint naming a round BELOW the counter is stale — the plan
+    # never goes back — and falls through to the ordinary reading.
+    if (
+        checkpoint_round > 0
+        and checkpoint_round in released
+        and checkpoint_round >= current_round
+    ):
+        return checkpoint_round, False
+
+    # The counter sits BELOW a handed-back round: the release rewound it,
+    # so the row's ``round`` — and the ``running`` / ``loop_stopped``
+    # status that goes with it — describes the handed-back round, not the
+    # round below it. That number is the round to run, and it runs fresh.
+    # A checkpoint that names a round which was NOT handed back is a real
+    # interruption and keeps its claim on the round (resolved below).
+    pending = sorted(n for n in released if n > current_round)
+    checkpoint_is_genuine = (
+        checkpoint_round > 0 and checkpoint_round not in released
+    )
+    if pending and not checkpoint_is_genuine:
+        return pending[-1], False
 
     interrupted = checkpoint is not None or (
         status in ("running", "loop_stopped", "waiting_for_quota")

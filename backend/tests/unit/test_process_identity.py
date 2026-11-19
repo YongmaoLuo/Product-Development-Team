@@ -347,6 +347,97 @@ def test_cmdline_comparison_ignores_empty_strings():
 
 
 # ---------------------------------------------------------------------------
+# matches — the same interpreter under two spellings
+# ---------------------------------------------------------------------------
+#
+# macOS's framework launcher re-executes the interpreter and rewrites
+# ``argv[0]`` to the resolved path inside ``Python.app``.  A command
+# line recorded right after the spawn therefore names the venv's
+# ``python3`` while the kernel reports the framework's ``Python`` a
+# moment later — two spellings of one program.  Comparing the two
+# paths verbatim made every such process look like a stranger, and the
+# caller (which refuses to signal a stranger) then let the executor
+# run on: the plan was never reaped and never adopted.
+
+#: The spelling a spawn records: the venv's interpreter.
+_VENV_PYTHON = "/repo/backend/.venv/bin/python3"
+
+#: The spelling the kernel reports after the framework launcher
+#: re-executed the interpreter.
+_FRAMEWORK_PYTHON = (
+    "/opt/homebrew/Cellar/python@3.11/3.11.13/Resources/"
+    "Python.app/Contents/MacOS/Python"
+)
+
+
+def test_the_same_interpreter_under_two_spellings_matches():
+    """The launcher rewrote ``argv[0]``; the program is the same one."""
+    ident = ProcessIdentity(
+        pid=200,
+        create_time=1700000000.12,
+        cmdline=(_FRAMEWORK_PYTHON, "-c", "import time; time.sleep(30)"),
+    )
+    recorded = (_VENV_PYTHON, "-c", "import time; time.sleep(30)")
+
+    assert matches(ident, create_time=1700000000.12, cmdline=recorded) is True
+    assert ident.matches(create_time=1700000000.12, cmdline=recorded) is True
+
+
+def test_the_interpreter_spelling_does_not_relax_the_rest_of_the_line():
+    """Same program, different invocation — still not the same process."""
+    ident = ProcessIdentity(
+        pid=200,
+        create_time=1700000000.12,
+        cmdline=(_FRAMEWORK_PYTHON, "-c", "import time; time.sleep(30)"),
+    )
+
+    # A different first argument is a different invocation.
+    assert matches(
+        ident,
+        create_time=1700000000.12,
+        cmdline=(_VENV_PYTHON, "-m", "import time; time.sleep(30)"),
+    ) is False
+    # A different length is a different command line.
+    assert matches(
+        ident,
+        create_time=1700000000.12,
+        cmdline=(_VENV_PYTHON, "-c"),
+    ) is False
+
+
+def test_a_different_program_is_still_refused():
+    """The relaxation is for interpreters, not for programs in general."""
+    ident = ProcessIdentity(
+        pid=200, create_time=1700000000.12, cmdline=("/usr/bin/node", "cli.js")
+    )
+
+    assert matches(
+        ident,
+        create_time=1700000000.12,
+        cmdline=("/usr/bin/python3", "cli.js"),
+    ) is False
+    assert matches(
+        ident,
+        create_time=1700000000.12,
+        cmdline=("/opt/bin/other", "cli.js"),
+    ) is False
+
+
+def test_a_different_start_time_is_still_refused():
+    """The interpreter spelling does not relax the start-time check."""
+    ident = ProcessIdentity(
+        pid=200,
+        create_time=1700000000.12,
+        cmdline=(_FRAMEWORK_PYTHON, "-c", "import time; time.sleep(30)"),
+    )
+    recorded = (_VENV_PYTHON, "-c", "import time; time.sleep(30)")
+
+    assert matches(
+        ident, create_time=1700000000.12 + 3600.0, cmdline=recorded
+    ) is False
+
+
+# ---------------------------------------------------------------------------
 # matches — the pids that must never be signalled
 # ---------------------------------------------------------------------------
 

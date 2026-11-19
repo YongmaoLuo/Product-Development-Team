@@ -1924,6 +1924,11 @@ class _QueryProgressReporter:
     MIN_INTERVAL_SEC = 1.0
     #: The event name written into the log.
     EVENT_NAME = "coding_query_progress"
+    #: The rendered prefix, so the line is greppable the way the other
+    #: query events are.
+    EVENT_PREFIX = "[CODING_QUERY_PROGRESS]"
+    #: The phase a heartbeat belongs to, when the caller names none.
+    DEFAULT_PHASE = "elapsed"
     #: The event name written when the wall cap fires.
     EVENT_WALL_TIMEOUT = "coding_query_wall_timeout"
     #: How long ``stop()`` waits for the thread to finish.
@@ -1938,8 +1943,14 @@ class _QueryProgressReporter:
         interval: Optional[float] = None,
         wall_cap_seconds: Optional[float] = None,
         on_wall_timeout=None,
+        phase: Optional[str] = None,
+        clock: Optional[Any] = None,
     ):
         self.logger = logger
+        self.phase = phase if phase is not None else self.DEFAULT_PHASE
+        # The clock is injectable so a test can decide what "elapsed"
+        # means without waiting for it.
+        self._clock = clock if clock is not None else time.monotonic
         self.tool = tool
         self.scene = scene or ""
         self.interval = self._resolve_interval(interval)
@@ -1984,6 +1995,12 @@ class _QueryProgressReporter:
         try:
             interval = float(interval)
         except (TypeError, ValueError):
+            interval = cls.DEFAULT_INTERVAL_SEC
+        if not math.isfinite(interval):
+            # ``nan`` compares False against every bound and would slip
+            # through the clamps below; a NaN timeout also makes the
+            # wait return at once, which would turn the heartbeat into
+            # a busy loop.
             interval = cls.DEFAULT_INTERVAL_SEC
         if interval > cls.MAX_INTERVAL_SEC:
             interval = cls.MAX_INTERVAL_SEC
@@ -2068,7 +2085,7 @@ class _QueryProgressReporter:
         if self._thread is not None and self._thread.is_alive():
             return self
         self._stop.clear()
-        self._started_at = time.monotonic()
+        self._started_at = self._clock()
         self._thread = threading.Thread(
             target=self._run,
             name="pdt-query-progress",
@@ -2097,7 +2114,7 @@ class _QueryProgressReporter:
         """How long the dispatch has been in flight, in seconds."""
         if not self._started_at:
             return 0.0
-        return time.monotonic() - self._started_at
+        return round(max(0.0, self._clock() - self._started_at), 1)
 
     def _next_wait(self) -> float:
         """How long to sleep before the next tick.
@@ -2164,16 +2181,17 @@ class _QueryProgressReporter:
     def _emit(self) -> None:
         if self.logger is None:
             return
-        elapsed = int(time.monotonic() - self._started_at)
+        elapsed = self._elapsed()
         data = {
             "elapsed_sec": elapsed,
+            "phase": self.phase,
             "scene": self.scene,
             "prompt_chars": self.prompt_chars,
         }
         try:
             self.logger.info(
                 self.EVENT_NAME,
-                f"coding query still in flight (elapsed={elapsed}s)",
+                f"{self.EVENT_PREFIX} {json.dumps(data, ensure_ascii=False)}",
                 data=data,
             )
         except Exception:
@@ -2190,7 +2208,6 @@ class _QueryProgressReporter:
     def __exit__(self, exc_type, exc, tb) -> bool:
         self.stop()
         return False
-
 
 class CodingTool(ABC):
     """Abstract base class for AI coding tools."""
@@ -8749,11 +8766,12 @@ class ClaudeCodingTool(CodingTool):
                 "no JSON object / array boundaries found", "", 0
             )
 
-        # 2026-11-01 — the heartbeat starts here, immediately before the
-        # dispatch, so the elapsed time it reports is the time spent
-        # waiting on the provider and not the time spent preparing to
-        # wait. It is stopped in the ``finally`` below, on every path
-        # out of the dispatch — including the ones that raise.
+        # The heartbeat starts HERE, not earlier: the dispatch below is
+        # the part that waits, so the elapsed time it reports is the time
+        # spent waiting on the provider and not the time spent preparing
+        # to wait.  It is started before the try so the finally below can
+        # stop it on every path out of the dispatch — including the ones
+        # that raise.
         _progress.start()
         try:
             if timeout is None:
@@ -8937,6 +8955,12 @@ class ClaudeCodingTool(CodingTool):
                     excluded_providers=new_excluded,
                     scene=scene,
                     resume_session=pinned[0],
+                    # 2026-11-02 — the retry is the SAME wait: it hands
+                    # the heartbeat down so the elapsed time keeps
+                    # growing instead of restarting at zero.  The
+                    # retry therefore does NOT own the reporter and
+                    # must not stop it — this call does, when the retry
+                    # returns.
                     progress=_progress,
                 )
             # Max retries exceeded — raise with detailed error
@@ -9178,15 +9202,15 @@ class ClaudeCodingTool(CodingTool):
                                   data={"error": str(e)[:500], "duration_sec": duration})
             raise
         finally:
-            # 2026-11-01 — the heartbeat must not outlive the dispatch,
-            # on ANY path out of it: the success path, the fallback
-            # path, and every path that raises. ``stop()`` sets the
-            # event and joins the thread, so the reporter is gone
-            # before this call returns.
+            # The heartbeat belongs to the dispatch, so it must not
+            # outlive it, on ANY path out of it: the success path, the
+            # fallback path, and every path that raises.  ``stop()``
+            # sets the event and joins the thread, so the reporter is
+            # gone before this call returns.
             #
-            # Only the call that OWNS the reporter stops it: a
-            # re-entry (the provider-fallback arm) borrows the one its
-            # caller started and must leave it running.
+            # Only the call that OWNS the reporter stops it: a re-entry
+            # (the provider-fallback arm) borrows the one its caller
+            # started and must leave it running.
             if owns_progress:
                 _progress.stop()
                 if self._current_query_reporter is _progress:

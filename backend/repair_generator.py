@@ -2933,6 +2933,72 @@ def _normalise_plan_intent(plan_intent: Any) -> List[str]:
     return normalised
 
 
+#: Heading of the unclaimed-failing-files section inside the repair-content
+#: prompt. A file that fails in this round but is claimed by no repair task
+#: is invisible to the model unless it is named here.
+UNCLAIMED_FILES_HEADING = "[UNCLAIMED FAILING FILES]"
+
+#: What the prompt tells the model to do with the unclaimed files: either
+#: give each one its own repair task, or fold it into the
+#: ``files_to_modify`` of a task that already exists.
+UNCLAIMED_FILES_INSTRUCTION = (
+    "为每个文件产出修复任务，或把它并入某个修复任务的 files_to_modify"
+)
+
+
+def _unclaimed_files_section(files: Optional[Sequence[str]]) -> str:
+    """Render the "unclaimed failing files" section of the repair prompt.
+
+    A file that fails the verification round but is named by no repair
+    candidate is *unclaimed*: no repair task touches it, so it stays
+    broken for the whole round. The repair-content generator cannot see
+    such a file on its own — it only reads the repair candidates — so the
+    orchestration layer hands the list over and this section puts it in
+    front of the model.
+
+    Args:
+        files: The unclaimed failing file paths. ``None`` or an empty
+            sequence renders no section at all (an empty string).
+
+    Returns:
+        The rendered section, or ``""`` when there is nothing to say.
+        The section is a heading, one bullet per file, and the
+        instruction that tells the model what to do with them.
+
+    Normalisation (2026-11-01):
+
+    * a pytest node id (``path/to/test_x.py::TestY::test_z``) names a
+      *test*, not a file — only the file part may be edited, so the
+      node suffix is cut off;
+    * the same file can arrive twice (once per failing test in it) —
+      duplicates collapse to one bullet, and the order of first
+      appearance is kept;
+    * a blank entry names no file and is dropped.
+    """
+    if not files:
+        return ""
+    normalised: List[str] = []
+    seen: Set[str] = set()
+    for entry in files:
+        try:
+            text = str(entry).strip()
+        except Exception:  # noqa: BLE001 — a broken entry is not a failure
+            continue
+        if not text:
+            continue
+        file_path = text.split("::", 1)[0].strip()
+        if not file_path or file_path in seen:
+            continue
+        seen.add(file_path)
+        normalised.append(file_path)
+    if not normalised:
+        return ""
+    lines = [UNCLAIMED_FILES_HEADING]
+    lines.extend(f"- {path}" for path in normalised)
+    lines.append(UNCLAIMED_FILES_INSTRUCTION)
+    return "\n".join(lines)
+
+
 def _build_repair_contents_prompt(
     failed_vps: List[Dict[str, Any]],
     round_number: int,
@@ -2941,6 +3007,7 @@ def _build_repair_contents_prompt(
     previous_failure_feedback: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     repair_outcomes: Optional[Dict[str, Dict[str, Any]]] = None,
     plan_intent: Sequence[str] = (),
+    unclaimed_files: Optional[Sequence[str]] = None,
 ) -> str:
     """Build the single LLM prompt for repair-content generation.
 
@@ -2965,6 +3032,14 @@ def _build_repair_contents_prompt(
     reads the plan's terms of reference before it reads the failures
     it is about to repair. An empty intent renders no section at all —
     a plan that states no constraint gets no constraint section.
+
+    2026-11-01: ``unclaimed_files`` carries the files that failed in
+    this round but are claimed by no repair candidate. They are
+    rendered as their own section *after* the VP list (see
+    :func:`_unclaimed_files_section`), so the model can either give
+    each of them a repair task or fold it into an existing task's
+    ``files_to_modify``. Without this section such a file is invisible
+    to the model and stays broken for the whole round.
     """
     parts = [
         f"Round {round_number}: generate one repair task per FAILED verification point.",
@@ -3131,6 +3206,14 @@ def _build_repair_contents_prompt(
                 "  → 该修复已被验证为无效或未完成，请给出**不同的**修复思路。"
             )
         parts.append("")
+    # 2026-11-01 — the files that failed but that no repair candidate
+    # claims. The model only sees the repair candidates, so without this
+    # section such a file never reaches it and the round ends with the
+    # file still broken and no task that touches it.
+    unclaimed_section = _unclaimed_files_section(unclaimed_files)
+    if unclaimed_section:
+        parts.append(unclaimed_section)
+        parts.append("")
     parts.append(
         "为每个失败 VP 生成一条修复任务（纯 JSON，不要 markdown 代码块标记）："
     )
@@ -3153,6 +3236,7 @@ class _RepairContentGeneratorMixin:
         previous_failure_feedback: Optional[Dict[str, List[Dict[str, Any]]]] = None,
         repair_outcomes: Optional[Dict[str, Dict[str, Any]]] = None,
         plan_intent: Optional[Sequence[str]] = None,
+        unclaimed_files: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Single LLM call producing repair content for each failed VP.
 
@@ -3194,6 +3278,17 @@ class _RepairContentGeneratorMixin:
                 list, and the system prompt (:data:`REPAIR_CONTENT_SYSTEM_PROMPT`)
                 declares them hard constraints: a fix that would cross
                 one has to be reported rather than generated.
+            unclaimed_files: 2026-11-01: the files that failed in this
+                round but that no repair candidate claims. The prompt
+                only shows the model the repair candidates, so such a
+                file is invisible to it — the round ends with the file
+                still broken and no task touching it. This list is
+                handed over by the orchestration layer and reaches the
+                prompt as its own section (see
+                :func:`_unclaimed_files_section`), telling the model to
+                produce a repair task for each file or to fold it into
+                an existing task's ``files_to_modify``. ``None`` (the
+                default) renders no section.
 
         Returns:
             A list of content dicts, one per failed VP, each carrying:
@@ -3282,6 +3377,7 @@ class _RepairContentGeneratorMixin:
             previous_failure_feedback=previous_failure_feedback,
             repair_outcomes=repair_outcomes,
             plan_intent=plan_intent,
+            unclaimed_files=unclaimed_files,
         )
         # 2026-10-22 — the session handle is bound before the dispatch so
         # the id can be recorded afterwards, whether the call answered or

@@ -268,8 +268,13 @@ except Exception:  # noqa: BLE001
 # that function-level import can no longer fail.
 try:  # pragma: no cover - the repo always ships shutdown_checkpoint.py
     import shutdown_checkpoint  # noqa: F401
+    from shutdown_checkpoint import SHUTDOWN_STOP_REASON
 except Exception:  # noqa: BLE001 - a missing module must not break startup
     shutdown_checkpoint = None
+    # The spelling the recovery path compares a row's reason against.
+    # A backend whose writer module is missing has no checkpoint to be
+    # consistent with, and this is the spelling that module carries.
+    SHUTDOWN_STOP_REASON = "server_shutdown"
 
 # ---------------------------------------------------------------------------
 # secret_sweep (credential-residue reaping) — resolved once, at import time
@@ -4938,6 +4943,178 @@ def _sweep_process_ledgers(
     return _reap_all_plans(plans_dir, reason=reason, **sweep_options)
 
 
+# ---------------------------------------------------------------------------
+# The shutdown flag
+# ---------------------------------------------------------------------------
+#
+# The checkpoint the shutdown writes says one thing: *the server went
+# down under this work*.  A verdict written after it says another:
+# *the executor crashed*.  The two cannot both be true, and the verdict
+# wins because it is written last — the checkpoint's ``queued`` was
+# overwritten with ``failed``, and a plan in a terminal phase is never
+# picked up again.
+#
+# The flag is how a watcher learns which of the two it is looking at.
+# It is set *before* the first SIGTERM, so a watcher that wakes up from
+# ``process.wait()`` already sees it, and it stands for the life of
+# this process only: it is never written to disk, and the next boot
+# starts with it clear.
+#
+# The flag alone is process-level, and a verdict is about one plan.  So
+# the shutdown also marks the plans it interrupted, and the verdict
+# paths ask :func:`_shutdown_interrupted` — the per-plan answer — rather
+# than the flag on its own.  A plan the shutdown never touched still
+# gets its crash verdict: the shutdown is not an excuse for every dead
+# process in the process.
+
+#: True once the shutdown path has started.  Process-level and
+#: deliberately sticky: the process that sets it is on its way out.
+_shutdown_in_progress: bool = False
+
+
+#: The field the shutdown writes into the execution record of a plan it
+#: interrupts.  The process-level flag answers "is this server going
+#: down?"; this field answers "did *this* plan's work end because the
+#: server went down?".  Both are needed: a verdict path judges one
+#: plan, and the shutdown is not an excuse for every dead process in
+#: the process — a plan the shutdown never touched still gets its
+#: crash verdict.
+SHUTDOWN_INTERRUPTED_FIELD = "shutdown_interrupted"
+
+
+def _is_shutting_down() -> bool:
+    """True while this process is on its way out.
+
+    The question every "the process is gone" path asks: *did the work
+    die, or did the server go down under it?*  A SIGTERM sent by
+    :func:`_shutdown_all_executions` is the server's own doing, and
+    answering "the executor crashed" about it destroys the evidence
+    that the work was interrupted rather than broken — the next boot
+    parks such a plan as ``queued`` instead of leaving it terminal.
+
+    The flag is process-level, so on its own it is too coarse for a
+    verdict: it says the server is going down, not that *this* plan was
+    among the work it took down.  :func:`_shutdown_interrupted` is the
+    per-plan answer, and it is what the verdict paths ask.
+    """
+    return _shutdown_in_progress
+
+
+def _mark_shutdown_interrupted(plan_id: str) -> None:
+    """Record that the shutdown ended this plan's work.
+
+    Written into the plan's own execution record, next to the status
+    the watchers read.  It is a runtime marker: in memory, for the life
+    of this process, never written to disk.  The next boot learns the
+    same thing from the checkpoint the shutdown left behind.
+    """
+    state = _execution_state.get(plan_id)
+    if isinstance(state, dict):
+        state[SHUTDOWN_INTERRUPTED_FIELD] = True
+
+
+def _shutdown_interrupted(plan_id: str) -> bool:
+    """True when the shutdown ended *this* plan's work.
+
+    Both facts have to hold: the server is going down (the
+    process-level flag), and this plan is among the work the shutdown
+    took down (the per-plan marker).  The marker lives in the plan's
+    execution record, which is per plan by construction — so a plan the
+    shutdown never touched is unaffected, and a shutdown that happened
+    in another test's process state cannot excuse a crash here.
+    """
+    if not _is_shutting_down():
+        return False
+    state = _execution_state.get(plan_id)
+    if not isinstance(state, dict):
+        return False
+    return bool(state.get(SHUTDOWN_INTERRUPTED_FIELD))
+
+
+def _begin_shutdown() -> None:
+    """Mark this process as shutting down.
+
+    Called before the checkpoint pass and before the first SIGTERM, so
+    every path that judges a dead process can tell the shutdown's own
+    kill from a crash.
+
+    Every plan that is in flight right now is work this shutdown ends,
+    so each one is marked as well: the mark is what a verdict path
+    reads to tell "the server took this down" from "this died on its
+    own", and it has to be on the record before the first kill.
+    """
+    global _shutdown_in_progress
+    _shutdown_in_progress = True
+    for plan_id, state in list(_execution_state.items()):
+        if isinstance(state, dict) and state.get("status") == "running":
+            _mark_shutdown_interrupted(plan_id)
+
+
+def _reset_shutdown_flag() -> None:
+    """Clear the shutdown flag.  A test seam, not a production path.
+
+    In production the flag is deliberately sticky — the process that
+    sets it is on its way out and never needs the answer again.  A test
+    that drives the shutdown path, though, would otherwise leave the
+    flag set for the rest of the session, and every later test would
+    read its dead processes as "interrupted by a shutdown".
+    """
+    global _shutdown_in_progress
+    _shutdown_in_progress = False
+
+
+def _stand_down_shutdown_interrupted_plans() -> None:
+    """Record the plans the shutdown took down as stopped, not running.
+
+    The verdict paths ask two questions, and the second one is not
+    enough.  "Did the server go down under this work?" is answered by
+    the flag and the per-plan mark.  But the executor watcher's own
+    fallback does not ask that question at all: it asks "is this plan
+    still running?", and a plan the shutdown took down is not running
+    any more -- so there is no crash to record.  The answer has to be
+    *in the record*, because the fallback reads the record and nothing
+    else: it is the one verdict path that never asks the server whether
+    the server is going down.
+
+    So the shutdown says it in the record: the plan's status becomes
+    ``stopped`` and its reason becomes ``server_shutdown``.  The watcher
+    reads that status after the executor is gone -- it is the status it
+    has always read -- and every branch that would have written a crash
+    verdict finds a plan that is not running, so it writes nothing.  The
+    row is left for the next boot, which parks the plan from the
+    checkpoint that is already on disk.
+
+    Two orders matter.  The checkpoint pass comes **first**: it writes
+    about the work that was *in flight*, and a plan that already reads
+    ``stopped`` is not in flight any more, so the checkpoint would skip
+    it.  The kill comes **last**: the watcher wakes up from
+    ``process.wait()`` as soon as the process dies, so the stand-down
+    has to be on the record before the first SIGTERM.
+
+    Only the work the shutdown took down stands down.  A plan that
+    carries no mark is none of this shutdown's business, and its crash
+    is still a crash.
+
+    Never raises: this runs on the shutdown path, where an exception
+    would cost the remaining plans their SIGTERM.
+    """
+    for plan_id, state in list(_execution_state.items()):
+        if not isinstance(state, dict):
+            continue
+        if not state.get(SHUTDOWN_INTERRUPTED_FIELD):
+            continue
+        if state.get("status") != "running":
+            # Already over, or already standing down.
+            continue
+        state["status"] = "stopped"
+        state["stop_reason"] = SHUTDOWN_STOP_REASON
+        logger.info(
+            "[shutdown_checkpoint] plan %s was taken down by the shutdown; "
+            "it is left for the restart to park",
+            plan_id,
+        )
+
+
 def _shutdown_all_executions() -> None:
     """Terminate all running execution and verification subprocesses.
 
@@ -4950,6 +5127,14 @@ def _shutdown_all_executions() -> None:
     fact been torn down mid-flight — so the resume point has to be on
     disk before the first SIGTERM.
 
+    The shutdown flag goes up before both of them, for the same reason
+    the checkpoint goes first: the processes this function kills are
+    killed *by the shutdown*, and the watchers that see them die have
+    to be able to tell that apart from a crash.  Raising the flag also
+    marks every plan that is in flight right now, so the mark is on
+    the record before the first SIGTERM — the watcher wakes up from
+    ``process.wait()`` as soon as the process dies.
+
     Nothing here may raise.  The shutdown path is the last code to run
     before the process goes away: a checkpoint that cannot be written
     costs one plan its resume point, while an exception would cost the
@@ -4961,6 +5146,19 @@ def _shutdown_all_executions() -> None:
     which is what covers the plans whose handle the backend no longer
     has.
     """
+    try:
+        _begin_shutdown()
+    except Exception:
+        # The marking is a courtesy to the watchers, not the resume
+        # point.  A failure here (a record that is not a dict, a
+        # registry another thread is mutating) must not cost the plan
+        # its checkpoint -- that is the one thing that has to reach the
+        # disk -- and must not escape a function whose contract is that
+        # nothing here raises.
+        logger.exception(
+            "[shutdown_checkpoint] marking the interrupted plans failed; "
+            "the shutdown continues"
+        )
     try:
         from shutdown_checkpoint import write_shutdown_checkpoints
 
@@ -4975,6 +5173,19 @@ def _shutdown_all_executions() -> None:
     except Exception:
         logger.exception(
             "[shutdown_checkpoint] checkpoint pass failed; shutdown continues"
+        )
+
+    # The stand-down comes between the checkpoint and the first SIGTERM:
+    # the checkpoint is about the work that was in flight, and the
+    # stand-down is what the watcher reads once the executor is gone.
+    # Both orders matter -- see
+    # :func:`_stand_down_shutdown_interrupted_plans`.
+    try:
+        _stand_down_shutdown_interrupted_plans()
+    except Exception:
+        logger.exception(
+            "[shutdown_checkpoint] standing the interrupted plans down "
+            "failed; the shutdown continues"
         )
 
     for plan_id, state in list(_execution_state.items()):

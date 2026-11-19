@@ -675,7 +675,16 @@ async function resumePlan(planId) {
         } else {
             showTestReviewView(planId);
         }
-    } else if (phase === "test_approved" || phase === "tasks_generation" || phase === "queued" || phase === "ready" || phase === "executing" || phase.startsWith("verification")) {
+    } else if (phase === "test_approved" || phase === "tasks_generation" || phase === "queued" || phase === "ready" || phase === "executing" || phase === "failed" || phase === "stopped" || phase.startsWith("verification")) {
+        // `failed` and `stopped` are the EXECUTION terminal phases: the
+        // plan ran and the run ended.  Where it ended and why is what the
+        // operator opened the plan to see — the verification panel carries
+        // the stop reason, the round counter, the results and the repair
+        // list.  Landing on the interview screen instead asked the operator
+        // to re-describe a requirement whose verdict was already written
+        // down, and kept the stop reason in the database where nobody sees
+        // it.  The interview fallback below is for the plans that really
+        // have no later stage to look at.
         showTasksView(planId);
     } else {
         showInterview(planId);

@@ -39,11 +39,38 @@ The pins
 3. A real spawned child runs in a session of its own.
 4. The mechanism this module acts on is the mechanism the document
    names.
-5. The capture holds the **service's** spawn, even after the start
-   path has run a probe of its own: the CI gate's own spawn registry
-   does not turn into a second spawn, because the recorder tells the
-   service's spawn apart from every other subprocess by its shape,
-   not by the order the calls came in.
+5. A probe the spawn path makes is not the service's own spawn: the
+   capture holds the **service's** spawn, even after the start path has
+   run a probe of its own.  The CI gate's own spawn registry does not
+   turn into a second spawn, because the recorder tells the service's
+   spawn apart from every other subprocess by its shape, not by the
+   order the calls came in.
+
+The pid scope of the signals this file sends
+--------------------------------------------
+This file signals processes, so it has to say which ones.  The
+``pid_scope`` of every signal sent from here is **the child process
+this test spawned, and that child's own process group** -- never a
+machine-wide scan, and never a pid this file did not start.
+
+Two things pin that scope down:
+
+* the pids and pgids that reach ``_kill_group`` are the ones the
+  spawn path handed back in the runtime it had just created for this
+  test -- ``runtime.pid`` / ``runtime.pgid`` for the declared
+  service, and the pid of the ``Popen`` handle this test opened for
+  the child it watches.  Nothing else can get in: those values are
+  not read out of a process table, they are the handles of the
+  processes this test started;
+* ``_kill_group`` refuses to signal this process' own group.  It
+  compares the candidate pgid against ``os.getpgid(0)`` and skips the
+  group kill when the two are the same, so a mis-read pgid costs
+  the stray child its life and never this process' siblings.
+
+The reaper's vocabulary appears here -- the spawn registry this file
+names, and the verdicts that registry holds -- because the spawn
+path really does talk to the reaper.  That vocabulary is not a
+licence to signal anything: the two pids above are the whole scope.
 
 Run them with:
 
@@ -60,7 +87,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import pytest
 
@@ -216,6 +243,10 @@ class _Spawn:
         self.posix_spawn_calls: List[Tuple[Any, ...]] = []
         #: The command the service was declared with, when the caller knows it.
         self.declared = ""
+        #: The spawns that were **not** the service's own -- the probes
+        #: the spawn path makes around it.  Kept apart from the
+        #: service's spawn so that a probe is never read as the service.
+        self.probe_argvs: List[List[str]] = []
         #: Every service spawn the capture took, in order.
         self.wrapper_spawns: List[List[str]] = []
 
@@ -285,6 +316,32 @@ class _Spawn:
         return self.spawned_kwargs
 
 
+def _is_service_spawn(argv: Optional[Sequence[str]]) -> bool:
+    """True when *argv* is the spawn of the service itself.
+
+    The spawn path probes the machine around the spawn it makes: it
+    reads the owner's start time (``ps -o lstart= -p ...``) before the
+    spawn, and -- when a spawn registry is named -- it reads the
+    started process' start time again after it.  Those probes go
+    through ``subprocess`` as well, so a recorder that keeps the last
+    call it saw keeps a probe as often as it keeps the service.
+
+    The service is started by the interpreter -- the wrapper runs
+    under it -- and a probe is a system tool.  That is what tells the
+    two apart, and it is the only thing that does: the probe's argv
+    has the same shape as the service's otherwise.
+
+    This is the weaker of the two judgements about "the service's
+    spawn": it says which *program* started the process, where
+    :func:`_is_the_service_spawn` says which of the spawns carries
+    the detached wrapper.  The recorder tells them apart by the
+    wrapper's shape; this one says what a probe is.
+    """
+    if not argv:
+        return False
+    return argv[0] == (sys.executable or "/usr/bin/python3")
+
+
 def _install_recorders(monkeypatch, declared: str = "") -> _Spawn:
     """Record what the spawn path asks for, without starting anything."""
     record = _Spawn()
@@ -300,7 +357,10 @@ def _install_recorders(monkeypatch, declared: str = "") -> _Spawn:
             # Not the service: a probe of the production's own.  It is
             # handed to the real ``Popen`` so that the production sees
             # what it would see, and so that the capture holds the
-            # service's spawn and nothing else.
+            # service's spawn and nothing else.  The probe's own argv
+            # is kept as well, so a pin can say that the probe really
+            # happened instead of passing by never seeing one.
+            record.probe_argvs.append(list(argv))
             return real_popen(argv, **kwargs)
         record.wrapper_spawns.append(list(argv))
         return _FakeProc()
@@ -488,6 +548,16 @@ def test_popen_shape_matches_documented_mechanism(tmp_path, monkeypatch):
     The expected shape is read from the document's ``- 机制：`` line
     rather than written out here, so the pin follows the document
     instead of keeping a second copy of it.
+
+    The recorded spawn is the service's own: a probe the spawn path
+    makes around it -- ``ps -o lstart= -p ...`` -- is not a service and
+    is not allowed to answer for one.  This case already refuses a
+    probe (it asserts that the recorded argv[0] is the interpreter),
+    but it says nothing about the probe itself.  The judgement is
+    pinned on its own in
+    ``test_a_ps_probe_is_not_the_declared_service_process`` below,
+    which also pins that the probe really happens -- so this case
+    cannot pass by never seeing one.
     """
     mechanism = _documented_mechanism()
     assert mechanism in _SHAPE_ASSERTERS, (
@@ -725,6 +795,67 @@ def test_mechanism_token_matches_doc():
 
 
 # ---------------------------------------------------------------------------
+# 5. A probe the spawn path makes is not the service's own spawn
+# ---------------------------------------------------------------------------
+
+
+def test_a_ps_probe_is_not_the_declared_service_process(tmp_path, monkeypatch):
+    """The probe the spawn path makes is not the declared service.
+
+    The spawn path probes the machine around the spawn it makes.  It
+    reads the owner's start time (``ps -o lstart= -p ...``) before the
+    spawn, and -- when a spawn registry is named -- it reads the
+    started process' start time again *after* the spawn.  Those probes
+    go through ``subprocess`` as well, so a recorder that keeps "the
+    last call it saw" keeps a probe as often as it keeps the service:
+    the probe's program is ``ps``, not the interpreter, and a reader
+    that believes it is looking at a service that was never started.
+
+    The registry is named here so that the second probe really
+    happens -- this test is about the judgement, not about the probe.
+    The start time is read with ``ps`` on purpose: that is how macOS
+    reads it, and it is the route that leaves a probe behind.  On
+    Linux the same reading comes out of ``/proc``, which would leave
+    no probe to catch and make this test say nothing.
+
+    2026-11-13（合并 main 之后）：起停时刻改由 :mod:`process_identity`
+    读 —— psutil 在，就走 psutil；psutil 不在，才落到 ``ps``。要逼
+    这一次真的走 ``ps``，就得让 psutil 在这一刻"不可用"，而那正是
+    那个模块自己文档里写明的状态之一。原来那句 monkeypatch
+    ``orphan_reaper._proc_start_ticks`` 已经不在这条路上：main 把自己
+    进程的起停时刻挪到了 import 时解析（``orphan_reaper`` 模块末尾
+    那次调用），探测发生在 import，不在这次 spawn 里，录不到。
+    """
+    import orphan_reaper
+    import process_identity
+
+    monkeypatch.setenv(
+        orphan_reaper.SPAWN_REGISTRY_ENV,
+        str(tmp_path / "spawn_registry.jsonl"),
+    )
+    # 让 psutil "不可用"，探测就落到 ``ps`` 上。
+    monkeypatch.setattr(
+        process_identity, "_resolve_psutil", lambda: None,
+    )
+
+    record, _runtime = _start_recording(
+        monkeypatch, tmp_path, port=_free_port()
+    )
+
+    argv = record.spawned_argv
+    assert argv, "the spawn path created no process at all"
+    assert argv[0] == (sys.executable or "/usr/bin/python3"), (
+        f"the spawn that was recorded is a probe, not the declared "
+        f"service: {argv[0]!r}"
+    )
+    assert any(
+        os.path.basename(probe[0]) == "ps" for probe in record.probe_argvs
+    ), (
+        "the spawn path made no ps probe, so this test is not exercising "
+        "the race it exists for"
+    )
+
+
 # 5. The capture survives a probe that comes later
 # ---------------------------------------------------------------------------
 

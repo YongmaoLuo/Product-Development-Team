@@ -40,10 +40,15 @@ Two limits belong to the sources, and the caller has to know about both.
   command line read a moment later. ``matches`` compares the first
   two entries, and the executable is compared by *what it is* rather
   than by how it is spelled: two spellings of one program are one
-  program. The rest of the rule is unchanged — a different program,
-  a different first argument, a different length, or a start time
-  that does not match is still a mismatch, and a mismatch is the safe
-  direction: the caller refuses to signal.
+  program. The two spellings name one program when they are the same
+  file -- or the same file once symlinks are resolved -- when they
+  live in the same macOS framework bundle, or when both name an
+  interpreter, which is the case the launcher creates: it re-execs
+  the interpreter under a path inside ``Python.app`` that neither
+  path names the other. The rest of the rule is unchanged — a
+  different program, a different first argument, a different length,
+  or a start time that does not match is still a mismatch, and a
+  mismatch is the safe direction: the caller refuses to signal.
 """
 
 from __future__ import annotations
@@ -75,6 +80,20 @@ CREATE_TIME_TOLERANCE = 2.0
 #: executable and its first argument are the stable part; the rest of
 #: the line is whatever the process chose to put there.
 CMDLINE_PREFIX_LEN = 2
+
+
+#: The basename of a Python interpreter: ``python``, ``python3``,
+#: ``python3.11``.  macOS's framework launcher re-executes the
+#: interpreter and rewrites ``argv[0]`` to the resolved path inside
+#: ``Python.app``, so the spelling a spawn records (the venv's
+#: ``python3``) and the spelling the kernel reports a moment later
+#: (``.../MacOS/Python``) are two names for one program.  Comparing
+#: the paths verbatim made every such process look like a stranger,
+#: and the caller — which refuses to signal a stranger — then let the
+#: executor run on unsupervised.
+_INTERPRETER_BASENAME_RE: re.Pattern[str] = re.compile(
+    r"^python(\d+(\.\d+)*)?$", re.IGNORECASE
+)
 
 
 #: The ``ps`` format the fallback reads. ``lstart`` is the start time in
@@ -358,11 +377,13 @@ def matches(
     * both sides must have a start time, and they must be within
       ``tolerance`` seconds — a pid that has been recycled reports a
       start time from a different life;
-    * the command lines must be the same length and their first two
+    * the command lines must be the same length, their first entries
+      must name the same program (two spellings of one program are
+      one program — see :func:`_same_executable`), and their second
       entries must agree — empty entries are padding and are ignored.
       The *executable* may be spelled differently as long as both
-      spellings name the same program (see :func:`_same_executable`);
-      the first argument has to be the same one.
+      spellings name the same program; the first argument has to be
+      the same one.
 
     Every check can only *prevent* a match. There is no reading of the
     arguments that makes a mismatched identity match.
@@ -573,15 +594,53 @@ def _normalize_cmdline(cmdline: Optional[Sequence[str]]) -> Tuple[str, ...]:
     return tuple(part for part in parts if part)
 
 
+def _same_interpreter(live: str, expected: str) -> bool:
+    """True when two ``argv[0]`` spellings name the same program.
+
+    Three ways to say yes, in the order they are tried:
+
+    * the two spellings are the same string;
+    * both are the basename of a Python interpreter — ``python``,
+      ``python3``, ``python3.11`` — which is how the framework
+      launcher names the interpreter it re-executed;
+    * the two paths resolve to the same file.
+
+    Everything else is a different program.  The comparison is on the
+    *program*, not on the path: the path is exactly what the launcher
+    rewrote.  It is deliberately narrow — a non-interpreter pair still
+    has to agree verbatim or resolve to the same file — so the check
+    that stands between "our process" and "a stranger's process" keeps
+    its teeth.
+
+    This is the rule :func:`_same_executable` reaches last, once the
+    file-level rules have had their say.  The framework bundle has the
+    last word of all when both paths live in one, so a different
+    version inside the same bundle is a different program and never
+    comes here.
+    """
+    if live == expected:
+        return True
+    if (
+        _INTERPRETER_BASENAME_RE.match(os.path.basename(live))
+        and _INTERPRETER_BASENAME_RE.match(os.path.basename(expected))
+    ):
+        return True
+    return os.path.realpath(live) == os.path.realpath(expected)
+
+
 def _cmdline_matches(
     live: Optional[Sequence[str]], expected: Optional[Sequence[str]]
 ) -> bool:
     """True when two command lines describe the same invocation.
 
-    The lengths have to agree and the first two entries have to be
-    equal. The rest of the line is not compared: a wrapper may add
-    arguments of its own between the recording and the reading, and the
-    executable plus its first argument are what identify the program.
+    The lengths have to agree.  The first entry is the program, and
+    the program is compared as a program: two spellings of one
+    program are one program (see :func:`_same_executable`).  The
+    second entry is compared verbatim — it is the first argument, and a
+    different argument is a different invocation.  The rest of the line
+    is not compared: a wrapper may add arguments of its own between the
+    recording and the reading, and the executable plus its first
+    argument are what identify the program.
 
     **The executable may be spelled differently.**  A process that
     re-executes itself -- which is what the macOS framework launcher
@@ -596,35 +655,44 @@ def _cmdline_matches(
     expected_parts = _normalize_cmdline(expected)
     if len(live_parts) != len(expected_parts):
         return False
-    if list(live_parts[:CMDLINE_PREFIX_LEN]) == list(expected_parts[:CMDLINE_PREFIX_LEN]):
+    if not live_parts:
         return True
-    if len(live_parts) < CMDLINE_PREFIX_LEN or len(expected_parts) < CMDLINE_PREFIX_LEN:
+    if not _same_executable(live_parts[0], expected_parts[0]):
         return False
-    if live_parts[1] != expected_parts[1]:
-        return False
-    return _same_executable(live_parts[0], expected_parts[0])
+    if len(live_parts) < CMDLINE_PREFIX_LEN:
+        return True
+    return live_parts[1] == expected_parts[1]
 
 
 def _same_executable(first: str, second: str) -> bool:
     """True when two ``argv[0]`` spellings name the same program.
 
-    Three ways to say yes, in the order they are cheapest to answer:
+    The two spellings are one program when they are the same string,
+    when they are the same file -- ``os.path.samefile`` answers that,
+    and it follows symlinks, so a virtual environment's ``bin/python``
+    and the interpreter it points at are the same file -- or when the
+    two paths resolve to the same file.
 
-    * the two strings are equal;
-    * they are the same file -- ``os.path.samefile`` answers that, and
-      it follows symlinks, so a virtual environment's ``bin/python``
-      and the interpreter it points at are the same file;
-    * they are the same **macOS framework bundle**.  A framework build
-      of Python is a launcher that re-executes the real interpreter
-      with a rewritten ``argv[0]`` -- its own path inside
-      ``Python.app``.  The launcher is not the interpreter (so
-      ``samefile`` says no), but it is the same interpreter, and the
-      version inside the bundle is what says which one.
+    They are also one program when they live in the same **macOS
+    framework bundle**.  A framework build of Python is a launcher
+    that re-executes the real interpreter with a rewritten ``argv[0]``
+    -- its own path inside ``Python.app``.  The launcher is not the
+    interpreter (so ``samefile`` says no), but it is the same
+    interpreter, and the version inside the bundle is what says which
+    one.
 
     A framework bundle holds one interpreter per version, so the
     version is part of the answer: 3.11 and 3.12 are not the same
     program, and neither is the launcher of one against the
-    interpreter of the other.
+    interpreter of the other.  The bundle therefore has the last word
+    whenever *both* paths live in one: a different bundle, or a
+    different version inside it, is a different program, and the
+    interpreter rule below does not soften that.
+
+    What is left is the interpreter rule (see :func:`_same_interpreter`):
+    a launcher also re-execs interpreters that live outside a framework
+    bundle, and the spelling it then reports names neither the
+    recorded path nor the recorded file.
     """
     if first == second:
         return True
@@ -642,15 +710,15 @@ def _same_executable(first: str, second: str) -> bool:
         return True
     first_bundle = _framework_bundle(first_real)
     second_bundle = _framework_bundle(second_real)
-    if first_bundle is None or second_bundle is None:
-        return False
-    first_root, first_version = first_bundle
-    second_root, second_version = second_bundle
-    if first_root != second_root:
-        return False
-    if first_version and second_version:
-        return first_version == second_version
-    return True
+    if first_bundle is not None and second_bundle is not None:
+        first_root, first_version = first_bundle
+        second_root, second_version = second_bundle
+        if first_root != second_root:
+            return False
+        if first_version and second_version:
+            return first_version == second_version
+        return True
+    return _same_interpreter(first, second)
 
 
 #: A macOS framework bundle: the ``.framework`` directory and the

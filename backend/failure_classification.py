@@ -29,12 +29,13 @@ genuinely does not pass) -- only the latter is evidence that the task is
 too big for one subagent.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import os
 import pathlib
 import re
 import tempfile
+from typing import Dict, List, Optional, Union
 
 #: The answer's shape was rejected -- truncated evidence, a claimed
 #: ``TEST_RESULT: PASSED`` the run did not support, a vacuous test
@@ -65,6 +66,13 @@ LOCK_CONFLICT = "lock_conflict"
 #: the write was refused (2026-10-19). Also not a decomposition problem:
 #: the children would each carry the same incomplete declaration. It is a
 #: one-path fix, which is why ``detail`` carries the refused path.
+#:
+#: The one-path fix only applies to a path THIS plan could declare. A
+#: refused path outside the run's project dir belongs to another plan's
+#: worktree (or the operator's checkout): nobody here declared it, and
+#: "declare this path" would put a file this plan does not own into this
+#: plan's declaration. Such a refusal is not a write-contract failure at
+#: all, so it is filed as ``unknown`` -- see ``classify_failure``.
 UNDECLARED_WRITE = "undeclared_write"
 
 #: No error text, or text that matches no rule above.
@@ -244,7 +252,14 @@ def _split_allowed(failure: "Failure") -> bool:
     return failure.remedy == RETRY_THEN_SPLIT
 
 
-def _extract_detail(text: str) -> str:
+#: The key under which an out-of-scope refusal records its paths in
+#: ``Failure.detail``.
+FOREIGN_PATHS_KEY = "foreign_paths"
+
+
+def _extract_detail(
+    text: str, project_dir=None, kind: Optional[str] = None,
+) -> Union[str, Dict[str, List[str]]]:
     """The machine-readable payload of a failure, or ``""``.
 
     Only ``undeclared_write`` carries one today, and it exists because
@@ -252,14 +267,45 @@ def _extract_detail(text: str) -> str:
     one action that fixes it is a task whose ``files_to_modify`` names
     the specific refused path, and the refiner cannot guess which file
     that was.
+
+    When the run's ``project_dir`` is known, the refused paths are also
+    checked against it. A path OUTSIDE the project dir is not this
+    plan's file, and the "declare this path" fix would be wrong for it,
+    so the payload becomes ``{FOREIGN_PATHS_KEY: [...]}`` -- the shape
+    that tells the caller the failure lost its write-contract reading.
+    Without a project dir there is nothing to compare against and the
+    payload stays the plain path text.
+
+    Args:
+        text: The failure text.
+        project_dir: The run's project dir, when known.
+        kind: The kind the text was classified as. The out-of-scope
+            reading belongs to the REFUSED WRITE, so a text that merely
+            quotes a refusal inside a failure of another kind (an audit
+            rejection that repeats what the guard said) keeps the plain
+            path text: the paths in it are still paths, but this failure
+            is not about a write.
+
+    Returns:
+        ``""``, the refused-path text, or a dict naming the paths that
+        are outside the project dir.
     """
     m = _UNDECLARED_WRITE_RE.search(text or "")
     if m:
-        return m.group("paths").strip()
-    m = _GUARD_REFUSAL_RE.search(text or "")
-    if m:
-        return m.group("paths").strip()
-    return ""
+        paths = m.group("paths").strip()
+    else:
+        m = _GUARD_REFUSAL_RE.search(text or "")
+        paths = m.group("paths").strip() if m else ""
+    if not paths:
+        return ""
+    if project_dir is None:
+        return paths
+    if kind is not None and kind != UNDECLARED_WRITE:
+        return paths
+    foreign = _foreign_paths(paths, project_dir)
+    if foreign:
+        return {FOREIGN_PATHS_KEY: foreign}
+    return paths
 
 #: Upper bound for ``Failure.label``. It is rendered into the refiner
 #: prompt, so it must stay one readable line.
@@ -337,6 +383,76 @@ def _normalize_path_token(token: str, project_dir=None) -> str:
     return token
 
 
+def _is_under(child: str, base: str) -> bool:
+    """Whether ``child`` is ``base`` itself or lives under it.
+
+    Component-wise (``PurePath.relative_to``) and not a string prefix:
+    ``/w/project-other`` is not under ``/w/project``.
+    """
+    try:
+        pathlib.PurePath(child).relative_to(base)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_outside_project(raw: str, project_dir) -> bool:
+    """Whether a refused path points outside ``project_dir``.
+
+    The module already owns one spelling rule for project paths --
+    ``_normalize_path_token`` -- and this reuses it rather than
+    re-deriving the comparison: a path under the project dir
+    normalizes to a RELATIVE token, while one that is not under it
+    keeps its absolute spelling (a leftover tmpdir keeps the ``<tmp>``
+    prefix instead). Either spelling therefore means "outside".
+
+    A relative token is inside unless it climbs out with ``..``, which
+    is checked against the project dir directly: ``..`` is resolved
+    against the project dir, so ``../elsewhere`` lands outside it.
+    """
+    base = os.path.realpath(str(project_dir))
+    text = str(raw).strip()
+    if not text:
+        return False
+    token = _normalize_path_token(text, project_dir)
+    if token.startswith("<tmp>") or os.path.isabs(token):
+        return True
+    return not _is_under(
+        os.path.realpath(os.path.join(base, token)), base,
+    )
+
+
+def _split_refused_paths(paths_text: str) -> List[str]:
+    """The individual paths in a refused-path list.
+
+    The executor joins up to five refused paths into one message, so the
+    list is comma-separated. The empty pieces a stray comma leaves
+    behind are dropped rather than reported as paths.
+    """
+    return [
+        piece.strip()
+        for piece in str(paths_text).split(",")
+        if piece.strip()
+    ]
+
+
+def _foreign_paths(paths_text: str, project_dir) -> List[str]:
+    """The refused paths that point OUTSIDE ``project_dir``.
+
+    Every foreign path is returned, not just the first one: the
+    executor reports up to five refused paths in one message, and the
+    ones that were inside the project dir must not hide the ones that
+    were not.
+    """
+    if project_dir is None:
+        return []
+    return [
+        raw
+        for raw in _split_refused_paths(paths_text)
+        if _is_outside_project(raw, project_dir)
+    ]
+
+
 def _structured_tokens(error, project_dir=None) -> dict:
     """The paraphrase-invariant identity of ``error``.
 
@@ -391,20 +507,52 @@ class Failure:
             two different ``audit_second_pass_failed`` rejections would
             then share one key and the second would be miscounted as a
             confirmation of the first.
-        detail: Optional[str], the machine-readable payload behind the
+        detail: The machine-readable payload behind the
             label — today, the path(s) a write was refused for. Empty for
             every other kind. Carried in its own field rather than
             appended to ``label`` because ``label`` is a display string
             that is truncated to ``_LABEL_MAX_CHARS`` and rendered into
             the prompt, and a truncated path is worse than no path: the
             refiner would act on a partial one.
+
+            It is a ``str`` for every failure whose payload is a path
+            list, and a ``dict`` for the one case that is not a path
+            list at all: a refusal whose paths lie OUTSIDE the run's
+            project dir carries ``{FOREIGN_PATHS_KEY: [...]}``, because
+            the payload of such a failure is "these paths are not ours"
+            rather than "this path was refused".
+        scope_violation: The paths this failure names that lie OUTSIDE
+            the run's project dir — the files another plan's worktree
+            (or the operator's checkout) owns. Empty for every failure
+            that is about this plan. It is the record of WHAT was out of
+            scope, kept beside the kind that says the failure could not
+            be understood.
     """
 
     kind: str
     signature: str
     label: str
-    detail: str = ""
+    detail: Union[str, Dict[str, List[str]]] = ""
     fingerprint: str = ""
+    scope_violation: List[str] = field(default_factory=list)
+
+    def __hash__(self) -> int:
+        """Hash on the failure's identity, not on its payload.
+
+        The default frozen-dataclass hash folds in every field, and two
+        of them are containers: ``detail`` is a dict for an out-of-scope
+        refusal and ``scope_violation`` is a list. Hashing either raises
+        ``TypeError: unhashable type``, which leaves a failure that
+        cannot go into a set or be used as a dict key -- and the
+        executor counts and compares failures.
+
+        The identity fields carry it instead: two failures with the same
+        kind, signature and fingerprint are the same failure for every
+        purpose this module uses them for. The hash stays CONSISTENT
+        with ``__eq__``: equal failures have equal identity fields, and
+        unequal ones may share a hash, which is what a hash may do.
+        """
+        return hash((self.kind, self.signature, self.fingerprint))
 
     @property
     def remedy(self) -> str:
@@ -419,6 +567,19 @@ class Failure:
         inventing a default.
         """
         return remedy_for(self.kind)
+
+    @property
+    def retryable(self) -> bool:
+        """Whether the same task may be run again as it is.
+
+        DERIVED from the remedy, like every other action this module
+        takes: the remedy table is the single source of truth, and a
+        stored copy could disagree with it. ``retry_then_split`` is the
+        remedy that asks for another attempt of the same task; the
+        others each name a different action (refine with the detail,
+        re-verify with a bigger budget, never split).
+        """
+        return self.remedy == RETRY_THEN_SPLIT
 
 
 # A run of hex characters. After lower-casing, a maximal run of >= 8
@@ -542,17 +703,31 @@ def classify_failure(error, project_dir=None):
 
     Args:
         error: The failure text the executor recorded for a task.
-        project_dir: The run's project dir, when known. Used only to
-            spell paths relatively in the fingerprint — a pytest tmpdir
-            differs on every run, so an absolute path would make one
-            failure count as a new one each time.
+        project_dir: The run's project dir, when known. Used to spell
+            paths relatively in the fingerprint — a pytest tmpdir differs
+            on every run, so an absolute path would make one failure
+            count as a new one each time — and to tell a refused path
+            that is OURS from one that belongs to somebody else.
 
     Returns:
         A frozen :class:`Failure`. Never raises: an empty or odd-shaped
         input yields ``UNKNOWN`` rather than taking down the executor.
+
+    A refused write whose path lies outside ``project_dir`` is filed as
+    ``UNKNOWN``, not ``undeclared_write``: the refused path belongs to
+    another plan's worktree, nobody here declared it, and the
+    write-contract reading ("declare this path and run again") would
+    hand the refiner a file this plan must not touch. The paths that
+    were out of scope are recorded on ``Failure.scope_violation``.
     """
     text = error or ""
     kind = _classify_kind(text)
+    detail = _extract_detail(text, project_dir, kind=kind)
+    scope_violation: List[str] = []
+    if kind == UNDECLARED_WRITE and isinstance(detail, dict):
+        scope_violation = list(detail.get(FOREIGN_PATHS_KEY, []))
+        if scope_violation:
+            kind = UNKNOWN
     digest = hashlib.sha256(_normalize(text).encode("utf-8")).hexdigest()[:12]
     signature = f"{kind}:{digest}"
     tokens = _structured_tokens(text, project_dir)
@@ -577,8 +752,9 @@ def classify_failure(error, project_dir=None):
         kind=kind,
         signature=signature,
         label=_build_label(kind, text),
-        detail=_extract_detail(text),
+        detail=detail,
         fingerprint=fingerprint,
+        scope_violation=scope_violation,
     )
 
 
