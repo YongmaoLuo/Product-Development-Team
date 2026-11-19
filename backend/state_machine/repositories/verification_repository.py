@@ -290,13 +290,17 @@ class VerificationRepository:
         admits the next round, and a ``running`` status here would make
         the dashboard (and any status reader) claim otherwise.
 
-        2026-09-15: the reset also clears ``results`` and re-syncs the
-        ``plan_routing.verification`` mirror. The old envelope still
-        carried ``recorded_by="_persist_verification_terminal"``, and
-        ``repair_stale_terminal_state`` (fired by every /progress read)
+        2026-09-15: the reset also clears ``results``. The old envelope
+        still carried ``recorded_by="_persist_verification_terminal"``,
+        and ``repair_stale_terminal_state`` (fired by every /progress read)
         re-derived ``verification_status`` from it — instantly un-reset
         the row to the previous terminal verdict. Clearing the envelope
-        and the mirror at reset time makes the reset stick.
+        at reset time makes the reset stick.
+
+        2026-11-04 (arch decision point 3): the routing-row mirror of
+        the verification state is gone. ``plan_verification`` is the
+        only home of that state, so the reset writes nothing outside
+        the authoritative row.
         """
         self.init_round(plan_id, round_n=round_n, max_rounds=max_rounds)
         self._update(
@@ -305,30 +309,78 @@ class VerificationRepository:
             verification_stop_reason=None,
             results=None,
         )
+
+    def set_state(
+        self,
+        plan_id: str,
+        *,
+        status: Optional[str] = None,
+        round_n: Optional[int] = None,
+        max_rounds: Optional[int] = None,
+        stop_reason: Optional[str] = None,
+    ) -> None:
+        """Narrow write of the four verification-state columns.
+
+        ``plan_verification`` is the single authoritative home of the
+        verification state (arch decision point 1) and the routing-row
+        mirror no longer carries writes (arch decision point 3).
+        Callers that need to adjust one field of that state have no
+        other way in: ``insert`` overwrites the whole row,
+        ``init_round`` hard-codes ``running`` and clears ``results``,
+        and ``complete_round`` is bound to a terminal settlement (it
+        fires ``plan_closed`` and asserts the post-write invariant).
+        This method is the narrow door: it touches ONLY
+        ``verification_status`` / ``round`` / ``max_rounds`` /
+        ``verification_stop_reason`` and leaves every other column
+        exactly as it found it.
+
+        Semantics:
+
+        * Every argument is optional and ``None`` means "leave this
+          column alone" — NOT "clear it". ``stop_reason=None`` keeps
+          whatever reason the row already carries; clearing is an
+          explicit empty string (``stop_reason=""``).
+        * All four ``None`` → a no-op: not one statement is sent to
+          SQLite, so ``updated_at`` stays where it was.
+        * A missing row is created rather than raising: the caller gets
+          a row that says what it was told (``status`` defaults to
+          ``not_started``, ``round`` / ``max_rounds`` to ``0``).
+
+        Unlike the round-lifecycle writers this is NOT a VP state
+        change — no ``vp_state_changed`` event is published. The write
+        still goes through :meth:`_update`, so the writeable-column
+        guard (``_WRITEABLE_COLUMNS``) applies unchanged; this method
+        never hand-rolls its own UPDATE.
+        """
+        fields: dict[str, Any] = {}
+        if status is not None:
+            fields["verification_status"] = status
+        if round_n is not None:
+            fields["round"] = round_n
+        if max_rounds is not None:
+            fields["max_rounds"] = max_rounds
+        if stop_reason is not None:
+            fields["verification_stop_reason"] = stop_reason
+
+        if not fields:
+            # Nothing to change — do not touch the row at all (and do
+            # not bump ``updated_at``).
+            return
+
         try:
-            with self._txn() as conn:
-                conn.execute(
-                    "UPDATE plan_routing SET verification = ?, "
-                    "updated_at = ? WHERE plan_id = ?",
-                    (
-                        json.dumps(
-                            {
-                                "status": "pending",
-                                "round": round_n,
-                                "max_rounds": max_rounds,
-                                "stop_reason": None,
-                            },
-                            ensure_ascii=False,
-                        ),
-                        _now_iso(),
-                        plan_id,
-                    ),
-                )
-        except Exception:
-            # Mirror is best-effort; the plan_verification row is the
-            # source of truth and the next terminal persist rewrites
-            # the mirror anyway.
-            pass
+            self._update(plan_id, **fields)
+        except KeyError:
+            # No row for this plan yet: create one carrying exactly
+            # what the caller asked for. ``_update`` rolls its
+            # transaction back before raising, so the insert gets a
+            # clean slate.
+            self.insert(
+                plan_id,
+                status or "not_started",
+                round=round_n or 0,
+                max_rounds=max_rounds or 0,
+                verification_stop_reason=stop_reason,
+            )
 
     def complete_round(
         self,
@@ -818,9 +870,11 @@ class VerificationRepository:
         The fix derives ``verification_status`` from
         ``results.status`` (which is the field ``_persist_verification_terminal``
         stamps at line server.py:4832 with ``status=passed|failed|loop_stopped``
-        mapped to ``{passed, failed, loop_stopped}``). On repair, we
-        also mirror ``plan_routing.verification.status`` so the
-        ``/progress`` endpoint sees the same value.
+        mapped to ``{passed, failed, loop_stopped}``).
+
+        2026-11-04 (arch decision point 3): the repair writes the
+        authoritative row only. The routing-row mirror of the
+        verification state no longer exists.
 
         Idempotent: a no-op if the row is already consistent.
 
@@ -880,33 +934,6 @@ class VerificationRepository:
                     plan_id,
                 ),
             )
-            # Mirror to plan_routing.verification JSON column so the
-            # /progress endpoint (which reads from PlanState → routing
-            # JSON column) sees the same verdict.
-            try:
-                rrow = conn.execute(
-                    "SELECT verification FROM plan_routing WHERE plan_id = ?",
-                    (plan_id,),
-                ).fetchone()
-                if rrow is not None and rrow[0]:
-                    decoded = json.loads(rrow[0])
-                else:
-                    decoded = {}
-                decoded["status"] = target
-                decoded.setdefault("round", 0)
-                decoded.setdefault("max_rounds", 10)
-                decoded["stop_reason"] = decoded.get("stop_reason") or results.get("stop_reason")
-                conn.execute(
-                    "UPDATE plan_routing SET verification = ?, updated_at = ? "
-                    "WHERE plan_id = ?",
-                    (json.dumps(decoded, ensure_ascii=False), _now_iso(), plan_id),
-                )
-            except Exception:
-                # Routing mirror is best-effort; the plan_verification
-                # column is the primary fix. /progress will pick up
-                # on the next ``PlanState.reload()`` once the routing
-                # mirror succeeds elsewhere.
-                pass
         return status
 
     def _update(self, plan_id: str, **fields: Any) -> None:

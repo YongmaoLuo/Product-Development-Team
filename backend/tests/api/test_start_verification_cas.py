@@ -305,7 +305,12 @@ def _record_routing_row(
     The baseline lives in the routing row's ``verification`` column, so the
     fixture writes it through the repository layer rather than through a
     hand-made file — the reader under test must find it where the freeze
-    step puts it.
+    step puts it.  The column's only writer is
+    ``RoutingRepository.write_verification_baseline``.
+
+    The four lifecycle keys in ``verification`` have no home left: they
+    belong to the authoritative ``plan_verification`` table, and this
+    plan has not started a round, so that row does not exist yet.
     """
     from config_paths import resolve_state_db_path
     from state_machine.db.connection import open as open_db
@@ -317,15 +322,22 @@ def _record_routing_row(
     conn = open_db(resolve_state_db_path())
     try:
         migrate(conn)
-        RoutingRepository(conn).write_plan_state(
+        repo = RoutingRepository(conn)
+        repo.write_plan_state(
             plan_id,
             phase=phase,
             completed_phases=[],
             review_rounds={},
             flags={},
-            verification=verification,
             last_updated=None,
         )
+        baseline = verification.get("baseline")
+        if baseline is not None:
+            repo.write_verification_baseline(
+                plan_id,
+                baseline,
+                verification.get("baseline_doc_sha256", ""),
+            )
     finally:
         conn.close()
 

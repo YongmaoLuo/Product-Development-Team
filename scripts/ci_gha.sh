@@ -8,6 +8,14 @@ set -euo pipefail
 #   1 -> gate red     (a CI job really failed)
 #   3 -> inconclusive (environment, queueing, network or timeout -- not a code fault)
 #
+# The red verdict needs one more distinction, and that distinction is
+# the point of this script.  A run is red because *something* went wrong,
+# but "something" has two flavours:
+#
+#   * a lane ran and failed        -- a code fault, the gate is red;
+#   * a job never reached a runner -- the hosted-runner pool was out of
+#     capacity, the machine could not answer, the gate is inconclusive.
+#
 # The verdict is decided from *job level* evidence, not from the run level
 # conclusion alone.  GitHub reports a run as "failure" even when the only
 # thing that went wrong was a single job that was cancelled without ever
@@ -17,6 +25,25 @@ set -euo pipefail
 # the cancelled jobs and only gives up with "inconclusive" once the retry
 # budget is spent.  A cancelled job never becomes a pass: it either runs
 # for real on the retry, or the gate ends inconclusive.
+#
+# The run-level conclusion cannot tell the two apart -- a run whose only
+# failing job sat in the queue for sixteen minutes and was then cancelled
+# concludes "failure" all the same.  The job list can: a job GitHub
+# never handed to a runner has zero steps, because no step ever ran.
+#
+# So the classification lives in scripts/ci_gha_verdict.sh, which is
+# sourced below and holds nothing but pure functions -- the unit tests
+# drive it with recorded job lists, without a network.  An infrastructure
+# failure gets exactly one bounded re-run of the failed jobs; a lane
+# that ran and failed is still red, and nothing is relaxed.
+#
+# The run-conclusion shape of the same decision is also available on its
+# own, as the pure functions ``classify_run`` and ``decide_verdict``
+# below: they take the run conclusion and the job counts and answer
+# GREEN / RED / INFRA / UNKNOWN, and they are reachable offline through
+# the ``--classify`` and ``--decide`` modes, so the offline tests can
+# drive them without a repository, without the gh CLI and without a
+# network.
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -144,6 +171,18 @@ case "${1:-}" in
 esac
 
 # ---------------------------------------------------------------------------
+# the verdict library
+#
+# Sourced *after* the offline entry points on purpose: those modes must
+# answer without a single external command, and resolving this script's
+# own directory needs ``dirname``.
+# ---------------------------------------------------------------------------
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/ci_gha_verdict.sh
+. "${SCRIPT_DIR}/ci_gha_verdict.sh"
+
+# ---------------------------------------------------------------------------
 # 0. run from the repository root
 # ---------------------------------------------------------------------------
 
@@ -152,6 +191,10 @@ if [ -z "${repo_root}" ]; then
     die_inconclusive "not inside a git repository"
 fi
 cd "${repo_root}"
+
+# The verdict library falls back to the repository's own virtualenv when
+# no interpreter is on PATH; it needs the root to find it.
+CI_GHA_REPO_ROOT="${repo_root}"
 
 command -v gh >/dev/null 2>&1 || die_inconclusive "gh CLI is not installed"
 
@@ -262,11 +305,9 @@ case "${timeout_s}" in
     ''|*[!0-9]*) timeout_s="3000" ;;
 esac
 
-watch_deadline=$(( $(now_epoch) + timeout_s ))
-
-# How often a cancelled job may be retried before the gate gives up with
-# "inconclusive".  The retry is not a second chance for red: only a job
-# that was cancelled without ever running is retried.
+# How often a job that never reached a runner may be retried before the
+# gate gives up with "inconclusive".  The retry is not a second chance
+# for red: only a job that was cancelled without ever running is retried.
 max_infra_reruns="${PDT_CI_GHA_INFRA_RERUNS:-1}"
 case "${max_infra_reruns}" in
     ''|*[!0-9]*) max_infra_reruns="1" ;;
@@ -274,46 +315,76 @@ esac
 
 infra_reruns_done=0
 
+# The re-run has its own budget, so that it cannot eat the budget the
+# first attempt had.
+rerun_timeout="${PDT_CI_GHA_RERUN_TIMEOUT:-1800}"
+case "${rerun_timeout}" in
+    ''|*[!0-9]*) rerun_timeout="1800" ;;
+esac
+
 status=""
 conclusion=""
+attempt=""
 failed_jobs=0
 cancelled_jobs=0
 cancelled_job_ids=""
 cancelled_job_names=""
 
-wait_for_run_completion() {
-    # wait_for_run_completion <run-id>
-    # Blocks until the run is completed; sets status and conclusion.
-    local rid="$1"
-    local view_out=""
+# wait_for_run <run_id> <timeout_s> <min_attempt>
+#
+# Waits until the run is "completed" *and* its attempt counter reached
+# <min_attempt>.  The attempt guard is what keeps a re-run from being
+# read as the finished first attempt: right after "gh run rerun" the run
+# still reports the old attempt as completed for a moment.
+#
+# Prints "<status> <conclusion> <attempt>" and returns 0; returns 1 when
+# the timeout expired and 2 when the run could not be read at all.
+wait_for_run() {
+    local wait_run_id="$1"
+    local wait_timeout="$2"
+    local wait_min_attempt="$3"
+    local wait_deadline=$(( $(now_epoch) + wait_timeout ))
     local view_failures=0
+    local view_out=""
+    local run_status=""
+    local run_conclusion=""
+    local run_attempt=""
+    local run_rest=""
 
     while :; do
-        if ! view_out="$(gh run view "${rid}" --json status,conclusion --jq '.status + " " + (.conclusion // "")' 2>/dev/null)"; then
+        if ! view_out="$(gh run view "${wait_run_id}" --json status,conclusion,attempt --jq '.status + " " + (.conclusion // "") + " " + ((.attempt // 1) | tostring)' 2>/dev/null)"; then
             view_failures=$(( view_failures + 1 ))
             if [ "${view_failures}" -ge 5 ]; then
-                die_inconclusive "cannot read the status of run ${rid}"
+                return 2
             fi
         else
             view_failures=0
-            status="${view_out%% *}"
-            conclusion="${view_out##* }"
-            if [ "${status}" = "completed" ]; then
+            run_status="${view_out%% *}"
+            run_rest="${view_out#* }"
+            run_conclusion="${run_rest%% *}"
+            run_attempt="${run_rest##* }"
+            case "${run_attempt}" in
+                ''|*[!0-9]*) run_attempt=1 ;;
+            esac
+            if [ "${run_status}" = "completed" ] && [ "${run_attempt}" -ge "${wait_min_attempt}" ]; then
+                printf '%s %s %s\n' "${run_status}" "${run_conclusion}" "${run_attempt}"
                 return 0
             fi
         fi
 
-        if [ "$(now_epoch)" -ge "${watch_deadline}" ]; then
-            die_inconclusive "run ${rid} did not finish within ${timeout_s}s"
+        if [ "$(now_epoch)" -ge "${wait_deadline}" ]; then
+            return 1
         fi
         sleep 20
     done
 }
 
+# fetch_job_evidence <run-id>
+#
+# Reads the job list of the run and sets failed_jobs, cancelled_jobs,
+# cancelled_job_ids and cancelled_job_names.  The ids are what lets the
+# retry address the job that never reached a runner.
 fetch_job_evidence() {
-    # fetch_job_evidence <run-id>
-    # Reads the job list of the run and sets failed_jobs, cancelled_jobs,
-    # cancelled_job_ids and cancelled_job_names.
     local rid="$1"
     local jobs_tsv=""
     local job_id
@@ -349,52 +420,109 @@ fetch_job_evidence() {
     return 0
 }
 
+# rerun_cancelled_jobs <run-id>
+#
+# Re-runs every cancelled job on its own -- the retry addresses the job
+# that never reached a runner.  When the per-job retry is refused, or
+# when the job list carried no id to address, it falls back to re-running
+# the failed jobs of the run, and then to re-running the whole run.
 rerun_cancelled_jobs() {
-    # rerun_cancelled_jobs <run-id>
-    # Re-runs every cancelled job on its own; falls back to a full rerun of
-    # the run when the per-job rerun is refused.
     local rid="$1"
     local job_id
     local per_job_ok=1
+    local per_job_done=0
 
     for job_id in ${cancelled_job_ids}; do
-        if ! gh run rerun "${rid}" --job "${job_id}" >/dev/null 2>&1; then
+        case "${job_id}" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        if gh run rerun "${rid}" --job "${job_id}" >/dev/null 2>&1; then
+            per_job_done=$(( per_job_done + 1 ))
+        else
             per_job_ok=0
             break
         fi
     done
 
-    if [ "${per_job_ok}" -eq 0 ]; then
-        printf 'ci_gha: per-job rerun failed; falling back to a full rerun of run %s\n' "${rid}"
-        if ! gh run rerun "${rid}" >/dev/null 2>&1; then
-            die_inconclusive "cannot rerun run ${rid}"
+    if [ "${per_job_ok}" -eq 0 ] || [ "${per_job_done}" -eq 0 ]; then
+        printf 'ci_gha: re-running the failed jobs of run %s\n' "${rid}"
+        if ! gh run rerun "${rid}" --failed; then
+            printf 'ci_gha: re-run of the failed jobs refused; re-running the whole run %s\n' "${rid}"
+            if ! gh run rerun "${rid}"; then
+                die_inconclusive "could not re-run run ${rid}"
+            fi
         fi
     fi
 }
 
-wait_for_rerun_to_start() {
-    # wait_for_rerun_to_start <run-id>
-    # Waits until the run leaves the completed state again, which means the
-    # rerun was accepted.  Bounded, so a rerun that never starts cannot
-    # block the gate forever.
-    local rid="$1"
-    local rerun_deadline=$(( $(now_epoch) + 180 ))
-    local view_out=""
+# ---------------------------------------------------------------------------
+# 6. map the conclusion to the verdict
+# ---------------------------------------------------------------------------
 
-    while [ "$(now_epoch)" -lt "${rerun_deadline}" ]; do
-        if view_out="$(gh run view "${rid}" --json status --jq '.status' 2>/dev/null)"; then
-            if [ "${view_out}" != "completed" ]; then
-                return 0
-            fi
-        fi
-        sleep 5
-    done
-    die_inconclusive "run ${rid} did not leave the completed state within 180s of the rerun request"
-}
+# The attempt the gate is waiting for, and the budget it may spend on it.
+# The first attempt waits on the main budget; a re-run waits on its own.
+min_attempt=1
+run_budget="${timeout_s}"
 
 while :; do
-    wait_for_run_completion "${run_id}"
+    wait_rc=0
+    wait_out="$(wait_for_run "${run_id}" "${run_budget}" "${min_attempt}")" || wait_rc=$?
+    if [ "${wait_rc}" -eq 2 ]; then
+        die_inconclusive "cannot read the status of run ${run_id}"
+    fi
+    if [ "${wait_rc}" -ne 0 ]; then
+        die_inconclusive "run ${run_id} did not finish within ${run_budget}s"
+    fi
 
+    status="${wait_out%% *}"
+    wait_rest="${wait_out#* }"
+    conclusion="${wait_rest%% *}"
+    attempt="${wait_rest##* }"
+    printf 'ci_gha: run finished (status=%s conclusion=%s attempt=%s)\n' \
+        "${status}" "${conclusion}" "${attempt}"
+
+    # The job list is the evidence.  The run level conclusion cannot tell
+    # a lane that ran and failed from a job that never reached a runner.
+    jobs_json="$(gh run view "${run_id}" --json jobs 2>/dev/null || true)"
+    verdict="$(ci_gha_classify_jobs "${jobs_json}")"
+    printf 'ci_gha: job verdict=%s\n' "${verdict}"
+
+    if [ "${conclusion}" = "success" ]; then
+        if [ "${verdict}" != "infrastructure" ]; then
+            emit_gate "PASSED" "0"
+            exit 0
+        fi
+        # A run level "success" that still carries a job that never ran
+        # is not a green gate -- that job produced no evidence at all.
+        printf 'ci_gha: no runner picked up a job of run %s:\n' "${run_id}"
+        ci_gha_describe_jobs "${jobs_json}" || true
+    else
+        case "${conclusion}" in
+            failure|timed_out|action_required)
+                # Decided below: the job list says whether a lane ran and
+                # failed or whether the job never reached a runner.
+                ;;
+            *)
+                die_inconclusive "run ${run_id} concluded '${conclusion:-unknown}'"
+                ;;
+        esac
+
+        if [ "${verdict}" != "infrastructure" ]; then
+            # A lane that ran and failed -- or a job list that could not
+            # be read, which is the fail-safe direction.  Nothing is
+            # relaxed here.
+            emit_gate "FAILED" "1"
+            exit 1
+        fi
+
+        printf 'ci_gha: no runner picked up the failing job(s):\n'
+        ci_gha_describe_jobs "${jobs_json}" || true
+    fi
+
+    # The retry addresses the job that never reached a runner, so the
+    # evidence that names it has to be in hand first.  The read is
+    # retried a bounded number of times: a transient failure of ``gh``
+    # must not silently zero the counters that decide what gets re-run.
     job_fetch_failures=0
     while :; do
         if fetch_job_evidence "${run_id}"; then
@@ -406,44 +534,32 @@ while :; do
         fi
         sleep 10
     done
-
     printf 'ci_gha: run %s concluded %s (failed jobs: %s, cancelled jobs: %s)\n' \
         "${run_id}" "${conclusion:-unknown}" "${failed_jobs}" "${cancelled_jobs}"
 
-    verdict="$(classify_run "${conclusion}" "${failed_jobs}" "${cancelled_jobs}")"
-
-    # A run level "success" that still carries a cancelled job is not a
-    # green gate -- that job never produced evidence.  Treat it as
-    # infrastructure so it gets retried instead of passed.
-    if [ "${verdict}" = "GREEN" ] && [ "${cancelled_jobs}" -gt 0 ]; then
-        verdict="INFRA"
+    # Infrastructure failure: a bounded re-run of the jobs that never ran.
+    # The policy is the pure ``decide_verdict``: only an infrastructure
+    # verdict may be retried, only while the retry budget is left, and
+    # only when the time the retry gets is worth spending.  The time that
+    # matters is the budget of the retry itself -- the re-run has its own,
+    # so it cannot eat what the first attempt had.
+    if [ "${rerun_timeout}" -eq 0 ]; then
+        die_inconclusive "the re-run budget is disabled and no runner picked up the failing job(s)"
     fi
 
-    remaining=$(( watch_deadline - $(now_epoch) ))
-    decision="$(decide_verdict "${verdict}" "${infra_reruns_done}" "${max_infra_reruns}" "${remaining}")"
-
+    decision="$(decide_verdict "INFRA" "${infra_reruns_done}" "${max_infra_reruns}" "${rerun_timeout}")"
     case "${decision}" in
-        GREEN)
-            emit_gate "PASSED" "0"
-            exit 0
-            ;;
-        RED)
-            emit_gate "FAILED" "1"
-            exit 1
-            ;;
         RERUN)
-            printf 'ci_gha: retrying %s cancelled job(s) of run %s: %s\n' \
-                "${cancelled_jobs}" "${run_id}" "${cancelled_job_names:-unknown}"
+            printf 'ci_gha: re-running the failed jobs of run %s (budget %ss)\n' \
+                "${run_id}" "${rerun_timeout}"
             rerun_cancelled_jobs "${run_id}"
+
             infra_reruns_done=$(( infra_reruns_done + 1 ))
-            wait_for_rerun_to_start "${run_id}"
-            continue
-            ;;
-        INCONCLUSIVE)
-            die_inconclusive "run ${run_id}: ${failed_jobs} failed job(s), ${cancelled_jobs} cancelled job(s), ${infra_reruns_done}/${max_infra_reruns} infrastructure rerun(s) used"
+            min_attempt=$(( attempt + 1 ))
+            run_budget="${rerun_timeout}"
             ;;
         *)
-            die_inconclusive "run ${run_id}: unknown verdict '${decision}'"
+            die_inconclusive "run ${run_id}: ${failed_jobs} failed job(s), ${cancelled_jobs} cancelled job(s), ${infra_reruns_done}/${max_infra_reruns} infrastructure rerun(s) used"
             ;;
     esac
 done

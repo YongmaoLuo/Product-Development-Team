@@ -140,7 +140,6 @@ def _set_routing_phase(plan_id: str, phase: str) -> None:
                 completed_phases=[],
                 review_rounds={},
                 flags={},
-                verification={},
                 last_updated=None,
             )
     finally:

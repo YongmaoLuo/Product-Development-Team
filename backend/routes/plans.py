@@ -16,7 +16,6 @@ from datetime import datetime, timezone
 import json
 import os
 import sqlite3
-import time
 
 import capacity_wait
 
@@ -1069,25 +1068,36 @@ def _log_divergences(status: Any) -> None:
     )
 
 
-#: Verification verdicts that mean "this round is over". Used by the
-#: reconciliation in :func:`_build_plan_status` to decide when
-#: ``plan_routing.verification`` is allowed to override a stale
-#: ``plan_verification.verification_status``. Distinct from
-#: ``cards.VERIFICATION_TERMINAL_STATUSES``, which spells the same idea
-#: in the card's own vocabulary and also carries the
-#: ``verification_*`` phase-prefixed forms.
-_TERMINAL_VERIFICATION_STATUSES = frozenset({
-    "passed", "failed", "loop_stopped",
-    "verification_passed", "verification_failed",
-    "verification_loop_stopped",
-})
-
-#: ``(plan_id, stale_value, routing_value) -> last_logged_monotonic``.
-#: Bounded by pruning on write, and only ever as large as the number of
-#: distinct drifts seen in one process — not the poll rate.
-_RECONCILE_LOGGED: dict = {}
-_RECONCILE_LOG_WINDOW_SECONDS = 300.0
-_RECONCILE_LOG_MAX_ENTRIES = 256
+# ---------------------------------------------------------------------------
+# Where the verification fields come from
+# ---------------------------------------------------------------------------
+#
+# ONE source: the ``plan_verification`` row.  ``plan_routing.verification``
+# used to be a second one — a mirror column the state machine advanced at
+# every round boundary — and :func:`_build_plan_status` reconciled the two:
+# a TERMINAL mirror verdict overrode a stale ``plan_verification`` value,
+# and said so in a rate-limited warning.
+#
+# That overlay is gone, because the mirror no longer carries a verdict:
+# the round-close writes go to ``plan_verification`` (the authoritative
+# table), and the column's one remaining writer —
+# ``RoutingRepository.write_verification_baseline`` — freezes the reviewed
+# baseline, and the hash of the document it was frozen from, into it.  A
+# column whose only content is a frozen baseline cannot answer "what is
+# this plan's verdict", so there is nothing in it for the read path to
+# reconcile against, and letting it override the authoritative row
+# published exactly that — the card header said "failed" above a body
+# reading "正在跑 [repair-r1-01]".  The overlay was also a read-side patch
+# for a write-side miss, which its own comment said did not belong there:
+# "the fix belongs in the round-close write, not in the read path".
+#
+# The column itself was NOT deleted, and this note must not say it was:
+# the baseline lives there and nowhere else.  "Nobody writes it any more"
+# would be the wrong reason to stop reading it — the right reason is
+# that what it holds is not verification state.
+#
+# The reconciliation's rate-limit table went with it: it existed only to
+# throttle the warning that overlay produced.
 
 
 # ---------------------------------------------------------------------------
@@ -1245,10 +1255,20 @@ def _build_plan_status(plan_id: str) -> Any:
     """Assemble the one plan-status snapshot every reader renders from.
 
     One read, one answer. The stores that used to answer separately —
-    ``plan_routing.current_phase``, ``plan_routing.verification``,
-    ``plan_verification``, ``plan_tasks``, and the two in-memory
-    liveness records — are read here, together, and reconciled once.
-    See :mod:`plan_status` for why that matters.
+    ``plan_routing.current_phase``, ``plan_verification``,
+    ``plan_tasks``, and the two in-memory liveness records — are read
+    here, together. See :mod:`plan_status` for why that matters.
+
+    The four verification fields have exactly ONE source: the
+    ``plan_verification`` row.  The mirror column the state machine
+    used to advance at every round boundary is not read here at all.
+    Its only remaining writer,
+    ``RoutingRepository.write_verification_baseline``, freezes the
+    reviewed baseline into it — and on rows that predate that change
+    the column still holds the old verdict beside the baseline, since
+    the baseline writer keeps every other key verbatim.  A column that
+    can hold both is not a source to reconcile against; it is a record
+    of what was frozen.
 
     The phase is not decided here: it comes from :func:`derive_phase`,
     which owns the priority between the three things a reader can know
@@ -1286,7 +1306,7 @@ def _build_plan_status(plan_id: str) -> Any:
     v_round = 0
     v_max = 0
     v_stop: Optional[str] = None
-    # Bound before the try: the reconciliation below reads ``route``, and
+    # Bound before the try: the phase rule below reads ``route``, and
     # the except path leaves it unassigned. A status read must degrade,
     # not raise NameError on top of the failure it is already handling.
     route: Optional[Dict[str, Any]] = None
@@ -1386,88 +1406,31 @@ def _build_plan_status(plan_id: str) -> Any:
     # a plan waiting for a human to accept / skip its plan-doc items has
     # not started a verification round, so its verdict is "pending" — not
     # an empty string the display surface has to guess at. A recorded
-    # verdict always wins over this default, and the reconciliation
-    # below may still replace it with a terminal one.
+    # verdict always wins over this default.
     if phase == _PLAN_DOC_REVIEW_PHASE and not v_status:
         v_status = "pending"
 
-    # Reconcile the two verification stores BEFORE the snapshot is built.
-    # ``plan_routing.verification`` is CAS-advanced by the state machine
-    # at every round boundary; ``plan_verification.verification_status``
-    # is written by a separate best-effort path. When the second write
-    # does not land, the top-level ``verification_status`` keeps saying
-    # "running" for a round that ended, and the card header — which is a
-    # pure function of this snapshot — says "🔄 验证中" above a body
-    # reading "执行中 → 正在跑 `[repair-*]`". The drift persists for as
-    # long as the repair round runs, which is long.
+    # The four verification fields are the ``plan_verification`` row and
+    # nothing else.  The mirror column is still written — the baseline
+    # freeze writes there, and the frozen baseline lives nowhere else —
+    # but it carries no verdict of its own, and on the rows that predate
+    # that change it still carries the OLD one beside the baseline.  So
+    # it is not a source: there is nothing in it to reconcile against,
+    # and a reader of it would be answering from a record of what was
+    # frozen.  The overlay that used to let it override a stale row is
+    # gone — see the note above for why, and for what it cost.
     #
-    # Only a TERMINAL routing verdict overrides a non-terminal
-    # ``plan_verification`` value, and only the reverse. Two stores both
-    # claiming a live state is not a conflict — that is the normal shape
-    # of a round in progress — and picking a winner there would invent an
-    # answer neither store supports.
-    routing_verif = (route or {}).get("verification")
-    if isinstance(routing_verif, str):
-        # ``plan_routing.verification`` is a TEXT column holding JSON;
-        # whether ``routing.current()`` hands it back parsed depends on
-        # the repository version, and both shapes are in the wild. Take
-        # whichever arrives; a malformed blob is treated as "no routing
-        # verdict", which leaves ``plan_verification`` authoritative.
-        try:
-            routing_verif = json.loads(routing_verif) if routing_verif else {}
-        except (ValueError, TypeError):
-            routing_verif = {}
-    if not isinstance(routing_verif, dict):
-        routing_verif = {}
-    routing_v_status = str(routing_verif.get("status") or "").strip().lower()
-    if routing_v_status in _TERMINAL_VERIFICATION_STATUSES and v_status in (
-        "", "running", "in_progress", "pending", "not_started",
-    ):
-        # Rate-limited, not silent. ``/api/plan/{id}/status`` is polled
-        # several times a minute per plan (the notifier rebuilds from it
-        # and its stale-watch ticks on it), so an unconditional warning
-        # would bury the log under one line per poll for as long as the
-        # drift lasts — which is the whole repair round. First sighting
-        # per (plan, stale value) is logged; repeats within the window
-        # are counted and summarised when the window rolls.
-        _key = (plan_id, v_status or "<empty>", routing_v_status)
-        _now = time.monotonic()
-        if len(_RECONCILE_LOGGED) >= _RECONCILE_LOG_MAX_ENTRIES:
-            # Never grows without bound across a long-lived server that
-            # sees many plans. The oldest half is the least interesting:
-            # anything still drifting will re-log on its next window.
-            for _stale_key in sorted(
-                _RECONCILE_LOGGED, key=_RECONCILE_LOGGED.get,
-            )[: _RECONCILE_LOG_MAX_ENTRIES // 2]:
-                _RECONCILE_LOGGED.pop(_stale_key, None)
-        if _key not in _RECONCILE_LOGGED:
-            _RECONCILE_LOGGED[_key] = _now
-            _server.logger.warning(
-                "[plan_status] plan_verification.verification_status=%r is "
-                "stale against plan_routing.verification.status=%r plan=%s — "
-                "using the routing verdict. This repeats; the fix belongs in "
-                "the round-close write, not in the read path.",
-                v_status, routing_v_status, plan_id,
-            )
-        elif _now - _RECONCILE_LOGGED[_key] >= _RECONCILE_LOG_WINDOW_SECONDS:
-            _RECONCILE_LOGGED[_key] = _now
-            _server.logger.warning(
-                "[plan_status] plan_verification.verification_status=%r is "
-                "still stale against plan_routing.verification.status=%r "
-                "plan=%s — still using the routing verdict",
-                v_status, routing_v_status, plan_id,
-            )
-        v_status = routing_v_status
-        try:
-            v_round = int(routing_verif.get("round") or v_round or 0)
-        except (TypeError, ValueError):
-            pass
-        try:
-            v_max = int(routing_verif.get("max_rounds") or v_max or 0)
-        except (TypeError, ValueError):
-            pass
-        if routing_verif.get("stop_reason"):
-            v_stop = routing_verif.get("stop_reason")
+    # The ``verification_running`` phase does NOT force ``running`` here,
+    # and that is deliberate.  The snapshot reports the row; the phase
+    # rule lives in the two readers that own a verdict of their own —
+    # ``routes.verification._verification_status_from_db`` (the
+    # verification status endpoint) and ``_authoritative_verification_block``
+    # (the summary body) — while ``plan_status.find_divergences`` Rule 2
+    # uses the phase/verdict disagreement as a detector.  Forcing
+    # ``running`` over a terminal verdict in this snapshot would silence
+    # that detector, and it would reintroduce, in a new shape, the
+    # overlay this task removed: a value in the snapshot that no store
+    # holds.
 
     rows = _read_task_rows(plan_id)
     current_task: Optional[Dict[str, Any]] = None
@@ -3696,6 +3659,105 @@ def get_plan_summary(request: Request, plan_id: str):
         _server._close_state_machine(sm)
 
 
+def _normalize_summary_verification_status(raw_status: Any) -> str:
+    """Map an orchestrator status onto the public status set.
+
+    The table is :data:`server._VERIFICATION_STATUS_NORMALIZATION` — the
+    same one ``routes.verification._normalize_verification_status`` uses
+    for ``GET /api/verification/{id}/status``.  Both endpoints read the
+    same row, so both must speak the same vocabulary.
+
+    An unrecognised value is returned **verbatim**: it is a value this
+    code does not understand, and reporting it as ``not_started`` would
+    claim a plan never ran a verification round when the table says
+    otherwise.
+    """
+    if not raw_status:
+        return "not_started"
+    return _server._VERIFICATION_STATUS_NORMALIZATION.get(raw_status, raw_status)
+
+
+def _summary_current_phase(routing_repo: Any, plan_id: str) -> Optional[str]:
+    """The plan's current phase, read from ``plan_routing``.
+
+    Read from the routing repository (not from the already-loaded
+    ``state``) so the summary and ``/api/verification/{id}/status``
+    consult the same row for the same answer.
+    """
+    if routing_repo is None:
+        return None
+    try:
+        route = routing_repo.current(plan_id)
+    except Exception:  # noqa: BLE001 — an unreadable row is "no phase"
+        return None
+    if not isinstance(route, dict):
+        return None
+    return route.get("current_phase")
+
+
+def _authoritative_verification_block(
+    plan_id: str,
+    routing_repo: Any,
+    verification_repo: Any,
+    state: Dict[str, Any],
+) -> Dict[str, Any]:
+    """The ``state.verification`` block, sourced from ``plan_verification``.
+
+    2026-11-04: the summary reported ``plan_routing.verification`` — a
+    *mirror* column the verification loop used to write on its way past.
+    The authoritative record is the ``plan_verification`` row, the same
+    table ``GET /api/verification/{id}/status`` reads.  The two had
+    drifted apart on live plans (two plans reported a verdict the
+    authoritative table contradicted), so the summary answered "how did
+    verification go?" with a value nobody else agreed with.
+
+    The four lifecycle keys (``status`` / ``round`` / ``max_rounds`` /
+    ``stop_reason``) are replaced by the row's values.  Everything else
+    in the block is carried over untouched — in particular the frozen
+    ``baseline`` / ``baseline_doc_sha256``, which the modules deciding
+    whether a plan may enter verification read from there.
+
+    A plan that has no ``plan_verification`` row has never run a
+    round, and says so with the documented defaults.  A plan whose phase
+    is ``verification_running`` IS running, even when the row has not
+    been stamped yet — the same rule the status endpoint applies.
+    """
+    # Copy first: the baseline keys live in the same dict and must
+    # survive the override of the four lifecycle keys.
+    block = dict(state.get("verification") or {})
+
+    record: Optional[Dict[str, Any]] = None
+    if verification_repo is not None:
+        try:
+            record = verification_repo.current(plan_id)
+        except Exception:  # noqa: BLE001 — an unreadable row is "no row"
+            record = None
+
+    if record is None:
+        status = "not_started"
+        round_n = 0
+        max_rounds = _server.DEFAULT_MAX_VERIFICATION_ROUNDS
+        stop_reason: Optional[str] = None
+    else:
+        status = _normalize_summary_verification_status(
+            record.get("verification_status")
+        )
+        round_n = record.get("round", 0)
+        max_rounds = record.get(
+            "max_rounds", _server.DEFAULT_MAX_VERIFICATION_ROUNDS,
+        )
+        stop_reason = record.get("verification_stop_reason")
+
+    if _summary_current_phase(routing_repo, plan_id) == "verification_running":
+        status = "running"
+
+    block["status"] = status
+    block["round"] = round_n
+    block["max_rounds"] = max_rounds
+    block["stop_reason"] = stop_reason
+    return block
+
+
 def _get_plan_summary_body(
     request: Request, plan_id: str, sm: Optional[Tuple[Any, ...]],
 ) -> Dict[str, Any]:
@@ -3915,6 +3977,25 @@ def _get_plan_summary_body(
                 ).strip() or None
         except Exception:
             routing_phase = None
+
+        # 2026-11-04: the verification block is owned by
+        # ``plan_verification`` — the table ``/api/verification/{id}/
+        # status`` reads — not by the ``plan_routing.verification``
+        # mirror column.  The two had drifted apart on live plans, so
+        # the summary reported a verdict the authoritative table
+        # contradicted.  The keys do not change, so
+        # the consumers (feishu_notifier / cards) need no change; they
+        # just start reading the authoritative value.
+        #
+        # Without a state machine (``sm is None``) there is nothing to
+        # read the authoritative value from, so the plan state's own
+        # value stands — no key added, none dropped.
+        state["verification"] = _authoritative_verification_block(
+            plan_id=plan_id,
+            routing_repo=routing_repo,
+            verification_repo=_verification_repo,
+            state=state,
+        )
 
         # When the state-machine has a row for this plan, it is
         # authoritative for ``exec_status`` / ``pid`` / ``project_dir``

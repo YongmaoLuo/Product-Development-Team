@@ -41,6 +41,7 @@ The contract pinned here:
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -601,3 +602,285 @@ def test_the_deferred_check_also_judges_the_subject(tmp_path, monkeypatch):
     assert applied == ["VP-028"]
     assert executor._verdicts["VP-028"]["status"] == "FAILED"
     assert "subject_check_downgraded" in [event[1] for event in events]
+
+
+# ---------------------------------------------------------------------------
+# A command point asks about its own command (VP-022, 2026-11-14)
+# ---------------------------------------------------------------------------
+#
+# 2026-11-14, round 23: VP-022 is an ``e2e``/``command`` point.  Its
+# ``expected_result`` mentions ``scripts/run_tests.sh`` — but only as a
+# *reference* ("与 scripts/run_tests.sh 的 phase 2 选择一致").  The question
+# it asks is one question: does the declared ``entry_command`` exit 0.
+#
+# The subject check read the referenced path as the **subject** of the
+# point, so a verdict that records the command it ran and its exit code
+# — which is the whole answer to that question — was downgraded for
+# "answering another question", because the log of what ran names the
+# test files, never ``scripts/run_tests.sh``.  The gate could not pass:
+# the greener the run, the more certain the downgrade.
+#
+# The carve-out below is mechanical: the verdict records **the very
+# command the point declared** together with the exit code the framework
+# read.  That is a proof that the answer is about this question, and it
+# opens no door for a verdict about another question.
+
+
+def _command_project(tmp_path: Path) -> Path:
+    """A tree with the referenced script and the lane the entry runs."""
+    project = tmp_path / "project"
+    (project / "scripts").mkdir(parents=True, exist_ok=True)
+    (project / "backend" / "tests" / "e2e").mkdir(parents=True, exist_ok=True)
+    (project / "scripts" / "run_tests.sh").write_text(
+        "#!/bin/sh\nexit 0\n", encoding="utf-8",
+    )
+    (project / "backend" / "tests" / "e2e" / "test_lane.py").write_text(
+        "def test_lane():\n    assert True\n", encoding="utf-8",
+    )
+    return project
+
+
+_COMMAND = (
+    'python3 -m pytest backend/tests -m "(e2e or integration) '
+    'and not time_sensitive" --timeout=600 -q'
+)
+
+_EXPECTED = (
+    "仓库的 e2e + integration lane 整体跑通（与 scripts/run_tests.sh 的 "
+    "phase 2 选择一致）：命令退出码 0 表示全量端到端通过。"
+)
+
+
+def _command_vp(entry: str = _COMMAND, method: str = "e2e") -> dict:
+    return {
+        "id": "VP-022",
+        "verification_method": method,
+        "e2e_kind": "command",
+        "entry_command": entry,
+        "expected_result": _EXPECTED,
+    }
+
+
+def _command_verdict(
+    entry: str = _COMMAND, exit_code=0, key: str = "entry_command",
+) -> dict:
+    """The verdict the CI runner produces for a command point."""
+    return {
+        "status": "PASSED",
+        "reasons": [f"[e2e] `{entry}` 退出码 {exit_code}（用时 1632s）"],
+        "evidence": {
+            key: entry,
+            "exit_code": exit_code,
+            "stdout_tail": (
+                "backend/tests/e2e/test_lane.py ....\n"
+                "= 685 passed, 16 skipped in 1619.77s ="
+            ),
+        },
+    }
+
+
+def test_a_command_point_that_ran_its_own_entry_is_on_subject(tmp_path):
+    """The carve-out: the point's own command, with its exit code."""
+    project = _command_project(tmp_path)
+    vp = _command_vp()
+    verdict = _command_verdict()
+
+    assert verification_evidence.verdict_subject_mismatch(
+        vp, verdict, project,
+    ) is None
+
+
+def test_the_apply_keeps_a_command_point_that_ran_its_own_entry(tmp_path):
+    project = _command_project(tmp_path)
+    vp = _command_vp()
+    verdict = _command_verdict()
+
+    checked = verification_evidence.apply_subject_check_to_verdict(
+        verdict, vp, project,
+    )
+
+    assert checked["status"] == "PASSED"
+    assert "actual_result" not in checked
+
+
+def test_the_carve_out_does_not_cover_another_command(tmp_path):
+    """A verdict that ran a *different* command is still off subject."""
+    project = _command_project(tmp_path)
+    vp = _command_vp()
+    verdict = _command_verdict(
+        entry="python3 -m pytest backend/tests/unit/test_other.py -q",
+    )
+
+    reason = verification_evidence.verdict_subject_mismatch(
+        vp, verdict, project,
+    )
+
+    assert reason is not None
+    assert "本验证点点名" in reason
+
+
+def test_the_carve_out_needs_a_recorded_exit_code(tmp_path):
+    """An exit code the framework did not read proves nothing."""
+    project = _command_project(tmp_path)
+    vp = _command_vp()
+    verdict = _command_verdict()
+    verdict["evidence"].pop("exit_code")
+
+    reason = verification_evidence.verdict_subject_mismatch(
+        vp, verdict, project,
+    )
+
+    assert reason is not None
+    assert "本验证点点名" in reason
+
+
+def test_the_carve_out_reads_the_ci_entry_face_too(tmp_path):
+    """``ci_entry`` is the other face of the same question.
+
+    A ``full_ci`` point never reaches the subject check (the method
+    gate stops it first), so the two faces are pinned on the helper
+    itself: the entry the point declared is the entry the verdict has
+    to record.
+    """
+    vp = _command_vp(entry="bash scripts/run_tests.sh", method="full_ci")
+    vp.pop("e2e_kind")
+    vp.pop("entry_command")
+    vp["ci_entry"] = "bash scripts/run_tests.sh"
+    verdict = _command_verdict(
+        entry="bash scripts/run_tests.sh", key="ci_entry",
+    )
+
+    assert verification_evidence._ran_the_declared_entry(vp, verdict) is True
+
+    other = _command_verdict(entry="bash scripts/other.sh", key="ci_entry")
+    assert verification_evidence._ran_the_declared_entry(vp, other) is False
+
+
+# ---------------------------------------------------------------------------
+# The projected shape — what the gate really receives (VP-022, 2026-11-18)
+# ---------------------------------------------------------------------------
+#
+# 2026-11-18, round 30: the carve-out above reads a **flat** evidence dict
+# (``{"entry_command": ..., "exit_code": 0}``).  The verdict that really
+# reaches the gate is the **projection** the agent builds in
+# ``_verdict_to_result`` —— ``{"details": str, "raw": list[str]}`` —— and
+# the runner's evidence dict survives inside ``raw`` as one JSON string
+# (``verification_subagent._verdict_from_outcome`` dumps it there).
+#
+# So on the real path the carve-out never fired: a command point whose
+# declared entry had just exited 0 was downgraded for "answering another
+# question", because the log of what ran names the test files and never
+# names ``scripts/run_tests.sh``.  The greener the lane, the more certain
+# the downgrade — and the lane *was* green (769 passed, exit code 0).
+#
+# The projection has to be read as what it is: the runner's own record of
+# the command it ran and the exit code it read.  Nothing else in the
+# projection (a non-empty ``raw``, a prose line) buys the exemption.
+
+_OTHER_COMMAND = "python3 -m pytest backend/tests/unit/test_other.py -q"
+
+
+def _projected_command_verdict(
+    entry: str = _COMMAND, exit_code: int = 0, with_exit_code: bool = True,
+) -> dict:
+    """The verdict the agent's projection produces for a command point.
+
+    ``raw`` holds the runner's evidence dict as one JSON string — the
+    only place the entry command and the exit code survive the
+    projection.
+    """
+    record = {
+        "vp_id": "VP-022",
+        "entry_command": entry,
+        "timed_out": False,
+        "duration_seconds": 1996.53,
+        "stdout_head": "backend/tests/e2e/test_lane.py ....\n",
+        "stdout_tail": "= 769 passed, 16 skipped in 1994.10s =\n",
+    }
+    if with_exit_code:
+        record["exit_code"] = exit_code
+    raw = [
+        f"exit_code: {exit_code if with_exit_code else 'unknown'}",
+        "stdout: backend/tests/e2e/test_lane.py ....\n"
+        "= 769 passed, 16 skipped, 14868 deselected in 1994.10s =",
+        json.dumps(record, ensure_ascii=False),
+    ]
+    return {
+        "status": "PASSED",
+        "reasons": [f"[e2e] `{entry}` 退出码 {exit_code}（用时 1996s）"],
+        "evidence": {"details": "", "raw": raw},
+    }
+
+
+def test_a_command_point_whose_verdict_carries_the_runner_artifact_is_on_subject(
+    tmp_path,
+):
+    """The carve-out on the real shape: the projection of the runner's record.
+
+    The declared entry ran and exited 0 — that *is* the answer to a
+    command point's one question.  The file names in the log are the
+    record of what ran, not the subject of the question.
+    """
+    project = _command_project(tmp_path)
+    vp = _command_vp()
+    verdict = _projected_command_verdict()
+
+    assert verification_evidence.verdict_subject_mismatch(
+        vp, verdict, project,
+    ) is None
+
+
+def test_a_projected_command_verdict_that_ran_another_command_is_off_subject(
+    tmp_path,
+):
+    """A record of a *different* command answers a different question."""
+    project = _command_project(tmp_path)
+    vp = _command_vp()
+    verdict = _projected_command_verdict(entry=_OTHER_COMMAND)
+
+    reason = verification_evidence.verdict_subject_mismatch(
+        vp, verdict, project,
+    )
+
+    assert reason is not None
+    assert "本验证点点名" in reason
+
+
+def test_a_projected_command_verdict_without_an_exit_code_is_off_subject(
+    tmp_path,
+):
+    """The command alone proves nothing — no exit code, no answer."""
+    project = _command_project(tmp_path)
+    vp = _command_vp()
+    verdict = _projected_command_verdict(with_exit_code=False)
+
+    reason = verification_evidence.verdict_subject_mismatch(
+        vp, verdict, project,
+    )
+
+    assert reason is not None
+    assert "本验证点点名" in reason
+
+
+def test_a_point_that_is_not_a_command_point_is_not_exempted_by_the_raw_record(
+    tmp_path,
+):
+    """Only the framework's own command points get the projection carve-out.
+
+    A browser point's evidence is the sub-agent's prose, not a runner
+    artifact — so a raw record that *would* exempt a command point buys
+    nothing here.  (The point still declares an entry on purpose: the
+    only reason it is not exempt is the sub-class, not a missing entry.)
+    """
+    project = _command_project(tmp_path)
+    vp = _command_vp()
+    vp["e2e_kind"] = "browser"
+    vp["target_url"] = "http://127.0.0.1:8000/plan"
+    verdict = _projected_command_verdict()
+
+    reason = verification_evidence.verdict_subject_mismatch(
+        vp, verdict, project,
+    )
+
+    assert reason is not None
+    assert "本验证点点名" in reason

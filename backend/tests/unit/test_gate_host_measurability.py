@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -698,9 +699,16 @@ def test_the_suites_that_wait_for_a_service_use_the_shared_decision() -> None:
 # the run recorded was only the answer ("the executor left its children
 # running", "the root carries 0 daemons after 5 launches: []"), which is
 # why the gate could not tell them from a code failure; the lines below
-# are those recorded lines with the wait they gave up on named — the
-# wording the two cases write today, and which is pinned to their
-# source further down.
+# are those recorded lines with the wait they gave up on named.
+#
+# Those lines are the **record of that run**: the wait they name is the
+# wait that run gave up on, and the wording of the source has moved on
+# since (the executor's case waits 90s now, and says what its sweep
+# found besides).  So the record is not edited to match today's source
+# — a record that is rewritten to fit the present no longer says what
+# happened — and today's wording is pinned on its own terms instead:
+# further down, by the prefix each message opens with and by the
+# wall-clock shape the gate has to keep reading it as.
 #
 # The other two are the code's: an assertion about the verdict the gate
 # produced, and a browser that could not reach the server.  The
@@ -887,34 +895,93 @@ def test_a_census_the_machine_could_not_read_is_the_hosts_shape() -> None:
     )
 
 
+def _the_pinned_wait_message(constants: Set[str], prefix: str) -> str:
+    """The one message in ``constants`` that opens with ``prefix``.
+
+    The match is on the **prefix**, not on a substring: the source also
+    carries a long docstring that mentions the executor's message in
+    passing, and a mention is not a message the gate ever reads.
+
+    The message has to be there — exactly one of them, because a
+    message that went missing, or that was written twice, is a message
+    the gate can no longer read the way it reads this one — and it has
+    to keep the **wall-clock shape** the gate classifies on, because
+    the wording the gate reads as the clock's has to still be the
+    wording the case writes.
+    """
+    matches = [c for c in constants if c.startswith(prefix)]
+    assert len(matches) == 1, (
+        f"expected exactly one message opening with {prefix!r}, found "
+        f"{len(matches)}"
+    )
+    assert is_wall_clock_shaped(matches[0]), (
+        f"the message opening with {prefix!r} is not a wall-clock shape, "
+        f"so the gate would blame the code for the machine's answer: "
+        f"{matches[0]!r}"
+    )
+    return matches[0]
+
+
 def test_the_process_control_cases_still_say_how_long_they_waited() -> None:
-    """The two cases name the wait they gave up on.
+    """The two cases still name the wait they gave up on.
 
     The attribution is read off the message the case writes, so a case
     that stops naming its wait stops being excusable — silently, and
-    with nothing to say so.  The two strings below are the ones the
-    recorded run's classification depends on, and they are pinned to
-    the source that writes them.
+    with nothing to say so.
+
+    What is pinned is the **stable prefix** of each message, not its
+    whole text: the wait a case gives up on is allowed to change (the
+    executor's case waits 90s now, and says what its sweep found
+    besides), because the attribution depends on the wording that says
+    *the clock ran out*, not on the number that follows it.  What may
+    not change is that the case still writes a message that opens with
+    the wait it gave up on, and that the gate still reads that wording
+    as the clock's.
     """
     expected = (
         (
             "tests/integration/test_process_ownership_negative_controls.py",
             "the executor left its children running: the children did not "
-            "settle within 30s of the SIGTERM",
+            "settle within ",
         ),
         (
             "tests/integration/test_reaper_daemon_leak_acceptance.py",
-            "the daemon count did not settle within 30s: the root carries "
-            "%d daemons after %d launches: %r",
+            "the daemon count did not settle within ",
         ),
     )
 
-    for relative, message in expected:
+    for relative, prefix in expected:
         constants = _string_constants(REPO_ROOT / "backend" / relative)
-        assert message in constants, (
-            f"{relative} no longer writes the message the attribution "
-            f"depends on: {message!r}"
-        )
+        _the_pinned_wait_message(constants, prefix)
+
+
+def test_the_pin_notices_when_the_gate_stops_reading_the_wait_as_a_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shape check is what keeps the pin from going slack.
+
+    The pinned wording is allowed to move — the wait it gives up on, the
+    detail it carries — but the gate has to keep reading it as the
+    clock's.  The moment the gate stops classifying "did not settle
+    within" that way, the wording the cases write is no longer
+    excusable, and the pin has to go red instead of passing in silence.
+    """
+    prefix = "the daemon count did not settle within "
+    constants = {
+        prefix + "30s: the root carries 0 daemons after 5 launches: []",
+    }
+
+    pinned = _the_pinned_wait_message(constants, prefix)
+    assert pinned.startswith(prefix)
+
+    monkeypatch.setattr(
+        ci_runner,
+        "_WALL_CLOCK_SHAPE_PATTERNS",
+        (re.compile(r"never-matches-anything"),),
+    )
+
+    with pytest.raises(AssertionError):
+        _the_pinned_wait_message(constants, prefix)
 
 
 def test_a_process_control_failure_is_inconclusive_on_an_unmeasurable_host(

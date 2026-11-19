@@ -103,6 +103,26 @@ def _decode_completed_phases(raw: Any) -> list[str]:
     return [str(item) for item in value]
 
 
+def _decode_verification_mirror(raw: Any) -> dict[str, Any]:
+    """Decode the ``verification`` mirror column into a dict.
+
+    The column is free-form TEXT (whatever JSON the last writer left
+    behind), so an empty string / NULL / unparsable text / a payload
+    that is not an object all degrade to ``{}``.  A broken mirror must
+    never cost us the baseline we are about to write — it is a
+    container, not a source of truth.
+    """
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    return dict(value)
+
+
 def _next_completed_phases(
     current_phase: Optional[str],
     new_phase: str,
@@ -494,6 +514,48 @@ class RoutingRepository:
                 (plan_id, phase, substage, self._now_iso()),
             )
 
+    def insert_if_missing(self, plan_id: str, phase: str) -> bool:
+        """Create the ``plan_routing`` row only when it does not exist yet.
+
+        **Create-only.**  When the row is already there, NOT ONE column
+        is written: ``ON CONFLICT(plan_id) DO NOTHING`` makes the whole
+        statement a no-op, so a phase another writer CAS'd in stays
+        exactly where it is.  That is the load-bearing half — the
+        broad routing write (:meth:`write_plan_state`) re-states the
+        columns ``PlanState`` owns from that instance's *cached*
+        snapshot, which is the shape that made
+        ``POST /api/verification/{id}/reset_rounds`` answer
+        ``409 stage_mismatch`` on the very next ``/start``.
+
+        Why this exists (2026-11-13, merge of upstream ``aabce578``):
+        the upstream contract is "the first real write CREATES the
+        routing row, and the row carries the phase the plan holds".
+        Without it, a plan whose state says ``prd_review`` would get a
+        row saying ``interview`` — the column DEFAULT — and the routing
+        row would contradict the state it was created from.
+
+        Only ``plan_id`` / ``current_phase`` / ``version`` /
+        ``updated_at`` are named.  The JSON columns (``completed_phases``
+        / ``review_rounds`` / ``flags`` / ``verification`` /
+        ``last_updated``) stay NULL and decode to their documented
+        defaults; the ``verification`` column in particular is NOT
+        touched here — it has exactly one writer,
+        :meth:`write_verification_baseline`.
+
+        Returns:
+            ``True`` when this call created the row; ``False`` when the
+            row was already there (nothing was written).
+        """
+        with self._txn():
+            cur = self._conn.execute(
+                "INSERT INTO plan_routing "
+                "(plan_id, current_phase, version, updated_at) "
+                "VALUES (?, ?, 0, ?) "
+                "ON CONFLICT(plan_id) DO NOTHING",
+                (plan_id, phase, self._now_iso()),
+            )
+        return cur.rowcount > 0
+
     def write_plan_state(
         self,
         plan_id: str,
@@ -502,15 +564,22 @@ class RoutingRepository:
         completed_phases: list,
         review_rounds: dict,
         flags: dict,
-        verification: dict,
         last_updated: Optional[str],
         completed_phases_mode: str = "merge",
     ) -> None:
         """Write the ``PlanState``-owned columns.
 
         Owns: ``completed_phases`` / ``review_rounds`` / ``flags`` /
-        ``verification`` / ``last_updated``, plus ``current_phase``
-        **only when** the caller passes one.
+        ``last_updated``, plus ``current_phase`` **only when** the
+        caller passes one.
+
+        Does NOT own the ``verification`` column: it is the mirror of
+        the verification state, whose authoritative home is the
+        ``plan_verification`` table (arch decision point 1), and the
+        mirror no longer carries the verification state at all (arch
+        decision point 3).  The one thing the column still records is
+        the frozen baseline — see :meth:`write_verification_baseline`,
+        which is its only writer.
 
         Does NOT own — and must never touch — ``version`` and
         ``substage``.  ``version`` is the CAS counter that
@@ -600,7 +669,6 @@ class RoutingRepository:
                 json.dumps(merged),
                 json.dumps(review_rounds),
                 json.dumps(flags),
-                json.dumps(verification),
                 last_updated,
                 self._now_iso(),
             )
@@ -608,7 +676,6 @@ class RoutingRepository:
                 " completed_phases = excluded.completed_phases,"
                 " review_rounds = excluded.review_rounds,"
                 " flags = excluded.flags,"
-                " verification = excluded.verification,"
                 " last_updated = excluded.last_updated,"
                 " updated_at = excluded.updated_at"
             )
@@ -619,17 +686,17 @@ class RoutingRepository:
                 sql = (
                     "INSERT INTO plan_routing ("
                     " plan_id, completed_phases, review_rounds, flags,"
-                    " verification, last_updated, version, updated_at"
-                    ") VALUES (?, ?, ?, ?, ?, ?, 0, ?) "
+                    " last_updated, version, updated_at"
+                    ") VALUES (?, ?, ?, ?, ?, 0, ?) "
                     "ON CONFLICT(plan_id) DO UPDATE SET" + _updates
                 )
             else:
                 sql = (
                     "INSERT INTO plan_routing ("
                     " plan_id, completed_phases, review_rounds, flags,"
-                    " verification, last_updated, version, current_phase,"
+                    " last_updated, version, current_phase,"
                     " updated_at"
-                    ") VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?) "
+                    ") VALUES (?, ?, ?, ?, ?, 0, ?, ?) "
                     "ON CONFLICT(plan_id) DO UPDATE SET"
                     " current_phase = excluded.current_phase,"
                     + _updates
@@ -639,12 +706,69 @@ class RoutingRepository:
                     json.dumps(merged),
                     json.dumps(review_rounds),
                     json.dumps(flags),
-                    json.dumps(verification),
                     last_updated,
                     phase,
                     self._now_iso(),
                 )
             self._conn.execute(sql, params)
+
+    def write_verification_baseline(
+        self,
+        plan_id: str,
+        baseline: dict,
+        doc_sha256: str = "",
+    ) -> None:
+        """Write ONLY the frozen baseline into the ``verification`` column.
+
+        The ``plan_routing.verification`` column is a **mirror** of the
+        verification state; the authoritative home of that state is the
+        ``plan_verification`` table (arch decision point 1).  Since arch
+        decision point 3 the mirror no longer carries the four lifecycle
+        keys (``status`` / ``round`` / ``max_rounds`` / ``stop_reason``)
+        — :meth:`write_plan_state` does not touch the column at all.
+
+        The one thing the column still records is the frozen **baseline**
+        and the hash of the document it was frozen from: they are not
+        verification state and ``plan_verification`` has no such
+        columns.  This method is therefore the column's only writer, and
+        it is a narrow read-modify-write:
+
+        * the read and the write happen in the SAME ``_txn()``
+          transaction, so the merge is computed against the committed
+          state, not against a value another writer could change in
+          between;
+        * only ``baseline`` / ``baseline_doc_sha256`` are overwritten —
+          every other key already in the column is kept verbatim;
+        * a corrupted blob is treated as "no keys" and rewritten, never
+          raised: a broken container must not cost us the baseline;
+        * a missing row is created (the baseline must not be silently
+          dropped) with the schema's default phase (``interview``) and
+          ``insert``'s defaults for everything else.
+        """
+        with self._txn():
+            cur = self._conn.execute(
+                "SELECT verification FROM plan_routing WHERE plan_id = ?",
+                (plan_id,),
+            )
+            row = cur.fetchone()
+            payload = _decode_verification_mirror(row[0]) if row else {}
+            payload["baseline"] = dict(baseline)
+            payload["baseline_doc_sha256"] = str(doc_sha256 or "")
+            blob = json.dumps(payload)
+            if row is None:
+                self._conn.execute(
+                    "INSERT INTO plan_routing ("
+                    " plan_id, current_phase, verification, version,"
+                    " updated_at"
+                    ") VALUES (?, ?, ?, 0, ?)",
+                    (plan_id, "interview", blob, self._now_iso()),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE plan_routing SET verification = ?, updated_at = ?"
+                    " WHERE plan_id = ?",
+                    (blob, self._now_iso(), plan_id),
+                )
 
     def _merge_completed_phases(
         self,

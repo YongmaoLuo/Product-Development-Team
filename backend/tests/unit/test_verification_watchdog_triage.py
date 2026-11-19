@@ -127,7 +127,6 @@ def _run_lazy_check() -> Mock:
     """Invoke the lazy check with the terminal-persist call observable."""
     with patch.object(server_mod, "_persist_verification_terminal") as persist, \
          patch.object(server_mod, "_mark_verification_failed_dead") as mark, \
-         patch.object(server_mod, "_update_plan_state_to_terminal"), \
          patch.object(server_mod, "_kill_orphaned_vp_processes",
                       return_value=[]) as orphan_kill, \
          patch.object(server_mod, "_kill_sub_agent_process") as handle_kill:

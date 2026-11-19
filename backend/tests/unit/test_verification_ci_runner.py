@@ -19,6 +19,7 @@ Covers:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import hashlib
 import os
@@ -59,6 +60,20 @@ def _vp(entry, **extra):
     }
     vp.update(extra)
     return vp
+
+
+@contextlib.contextmanager
+def _path_set_to(value: str):
+    """Run the block with ``PATH`` set to ``value``; restore it afterwards."""
+    original = os.environ.get("PATH")
+    os.environ["PATH"] = value
+    try:
+        yield
+    finally:
+        if original is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = original
 
 
 #: VP-022 冻结入口的**形状**（逐字取自
@@ -1822,6 +1837,66 @@ class TestSharedVenv:
         )
         assert result.status == STATUS_PASSED
         assert shared in result.evidence["stdout_head"]
+
+
+class TestGatePathUsesTheProjectVenv:
+    """门禁的 PATH 以前排的是被测树自己的 venv。
+
+    ``scripts/run_tests.sh`` 第 14-48 行解析并 source
+    ``$PROJECT_ROOT/backend/.venv``，之后都用这个 venv 的解释器执行 ——
+    「在项目里运行」不只是 cwd 正确，还包括「解释器是项目自己的 venv」。
+
+    而门禁入口是人会在项目里敲的命令（``python3 -m pytest …``）：后端
+    进程的 PATH 继承自它启动时那个 shell，指望的是「某个」checkout 的
+    venv（本机上另一个项目的，缺 filelock，把整条 e2e lane 变成 68 个收集
+    错误），所以那个 ``python3`` 落不到项目自己的解释器上。
+
+    判据：把 shared venv 的 ``bin`` 幂等地前置到门禁的 PATH。
+    """
+
+    def test_the_gate_path_starts_with_the_project_venv_bin(self, tmp_path):
+        """被测树自己的 venv/bin 排在 PATH 最前。"""
+        venv_bin = tmp_path / "backend" / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+
+        result = run_ci_verification(_vp("printenv PATH"), project_dir=tmp_path)
+
+        assert result.status == STATUS_PASSED
+        entries = result.evidence["stdout_head"].strip().split(os.pathsep)
+        assert entries[0] == str(venv_bin)
+
+    def test_the_project_venv_bin_is_not_on_the_path_twice(self, tmp_path):
+        """已经在 PATH 上的 venv 不重复插入 —— 插入是幂等的。"""
+        venv_bin = tmp_path / "backend" / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        inherited = os.pathsep.join([str(venv_bin), "/usr/bin", "/bin"])
+
+        with _path_set_to(inherited):
+            result = run_ci_verification(
+                _vp("printenv PATH"), project_dir=tmp_path,
+            )
+
+        assert result.status == STATUS_PASSED
+        entries = result.evidence["stdout_head"].strip().split(os.pathsep)
+        assert entries.count(str(venv_bin)) == 1
+
+    def test_a_venv_without_a_bin_directory_leaves_the_path_alone(
+        self, tmp_path, monkeypatch,
+    ):
+        """venv 没有 bin 目录 → 什么都不改（PATH 原样继承）。"""
+        monkeypatch.setattr(
+            ci_runner, "shared_venv_for",
+            lambda project_dir: str(tmp_path / "no-such-venv"),
+        )
+
+        with _path_set_to("/usr/bin:/bin"):
+            result = run_ci_verification(
+                _vp("printenv PATH"), project_dir=tmp_path,
+            )
+
+        assert result.status == STATUS_PASSED
+        entries = result.evidence["stdout_head"].strip().split(os.pathsep)
+        assert entries == ["/usr/bin", "/bin"]
 
 
 _REPO_ROOT = _BACKEND_DIR.parent

@@ -106,7 +106,8 @@ def _write_routing_row(
     """写一行 ``plan_routing``：阶段 + 记录下来的基线。
 
     基线冻在 routing 行的 ``verification`` 段里 —— 与生产路径同一条，所以
-    读侧找到的就是写入侧放进去的那份。
+    读侧找到的就是写入侧放进去的那份；那一段如今唯一的写者是
+    ``RoutingRepository.write_verification_baseline``。
     """
     from config_paths import resolve_state_db_path
     from state_machine.db.connection import open as open_db
@@ -115,27 +116,20 @@ def _write_routing_row(
         RoutingRepository,
     )
 
-    verification: Dict[str, Any] = {
-        "status": "pending",
-        "round": 0,
-        "max_rounds": 3,
-        "stop_reason": None,
-    }
-    if baseline is not None:
-        verification["baseline"] = baseline
-
     conn = open_db(resolve_state_db_path())
     try:
         migrate(conn)
-        RoutingRepository(conn).write_plan_state(
+        repo = RoutingRepository(conn)
+        repo.write_plan_state(
             plan_id,
             phase=phase,
             completed_phases=[],
             review_rounds={},
             flags={},
-            verification=verification,
             last_updated=None,
         )
+        if baseline is not None:
+            repo.write_verification_baseline(plan_id, baseline)
     finally:
         conn.close()
 

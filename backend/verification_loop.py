@@ -1858,133 +1858,6 @@ def _mark_failed_dead(plan_id: str) -> None:
                     pass
 
 
-def _update_plan_state_to_terminal(
-    plan_id: str,
-    stop_reason: str,
-    status: str = "failed",
-    round_: Optional[int] = None,
-) -> None:
-    """Side-effect: rewrite ``plan_routing.verification`` so
-    ``/api/plan/{id}/summary`` reflects the terminal transition.
-
-    2026-09-19: ``status`` used to be hard-coded ``"failed"``. That was
-    fine while the only caller was the watchdog, but it loses the
-    verdict for a loop that stopped on ``same_failure_repeated`` /
-    ``max_rounds_reached`` (``loop_stopped``) — and this column is what
-    ``/api/plan/{id}/summary`` serves as ``state.verification.status``,
-    i.e. what the Feishu notifier reads to decide the card header.
-    Callers now pass the real verdict; the default keeps the two
-    pre-existing call sites unchanged.
-
-    The verification→terminal helpers (``_persist_verification_terminal``
-    and the new ``force_terminal`` API) all do the authoritative write
-    to ``plan_routing.current_phase`` via SQL CAS, but the summary endpoint
-    reads ``state.verification`` from the JSON column on the same row
-    (see ``PlanState._sqlite_row_to_state``). Without this side
-    effect ``state.verification.status`` would keep showing
-    ``running`` while ``plan_routing.current_phase`` is already
-    ``terminal_failed`` — and the Feishu notifier (which reads via
-    ``/api/plan/{id}/summary``) would render a stale "still verifying"
-    card despite the CAS having succeeded.
-
-    2026-09-07: kept the raw-SQL-UPDATE implementation (rather
-    than routing through ``PlanState.set_verification_status``) so
-    this helper stays in lockstep with the test fixture
-    ``tests/test_verification_watchdog_fix.py::TestPlanStateMirror``
-    which monkeypatches ``server._state_db_path`` — the previous
-    refactor that used ``PlanState._save_state`` ended up calling
-    ``plan_state._state_db_path`` (a *separate* function) and
-    writing to a different DB than the test fixture seeded/asserted
-    against. The current implementation explicitly opens
-    ``server._state_db_path()`` so the test's monkeypatch takes
-    effect.
-
-    Why not ``PlanState._save_state()`` directly: ``_save_state``
-    rebuilds the full row from the in-memory state dict and writes
-    ``stage`` from ``_PLAN_PHASE_TO_ROUTING_STAGE[current_phase]``
-    (which has no mapping for ``"failed"`` → falls back to
-    ``"failed"``). That would overwrite the SQL-CAS'd
-    ``stage='terminal_failed'`` we just won with ``terminal_failed
-    → failed``, regressing the very transition this function is
-    supposed to mirror. Only the ``verification`` column is stale;
-    only ``verification`` should be touched.
-
-    Idempotent and best-effort — the routing CAS is the
-    authoritative write; this only ensures the verification sub-state
-    on the same row catches up. Failures are logged but never raised
-    so they don't block the rest of the terminal transition (e.g.
-    ``complete_round`` firing ``KIND_PLAN_CLOSED``).
-    """
-    try:
-        import json as _json
-        from state_machine.db.connection import open as _open_db
-        from state_machine.db.schema import migrate as _migrate
-        conn = _open_db(_server._state_db_path())
-        try:
-            _migrate(conn)
-            # Read the existing verification JSON so we preserve
-            # ``round`` / ``max_rounds`` rather than clobbering them.
-            row = conn.execute(
-                "SELECT verification FROM plan_routing WHERE plan_id = ?",
-                (plan_id,),
-            ).fetchone()
-            if row is None:
-                _server.logger.warning(
-                    "[plan_state_mirror] no plan_routing row for plan=%s; "
-                    "skipping verification sub-state update",
-                    plan_id,
-                )
-                return
-            existing_raw = row[0]
-            try:
-                existing_verif = _json.loads(existing_raw) if existing_raw else {}
-            except (TypeError, ValueError):
-                existing_verif = {}
-            new_verif = {
-                "status": status,
-                # ``round_`` is authoritative when the caller has it
-                # (``_persist_verification_terminal`` reads it straight
-                # off ``plan_verification``). Falling back to the routing
-                # JSON matters because step 3 above writes that column
-                # from ``PlanState._state``, which may still hold the
-                # pre-round value.
-                "round": (
-                    round_
-                    if round_ is not None
-                    else existing_verif.get("round", 0)
-                ),
-                "max_rounds": existing_verif.get(
-                    "max_rounds", _server.DEFAULT_MAX_VERIFICATION_ROUNDS,
-                ),
-                "stop_reason": stop_reason,
-            }
-            # ``verification`` is the only column we touch. We do NOT
-            # touch ``current_phase`` (already written by the caller's
-            # CAS→transition chain) — going through
-            # ``PlanState._save_state`` here would risk overwriting that
-            # authoritative write.
-            #
-            # Before schema v5 this comment had to spell out that
-            # ``_PLAN_PHASE_TO_ROUTING_STAGE`` had no mapping for
-            # ``"failed"``, so a re-derive would write ``stage='failed'``
-            # and clobber the caller's ``terminal_failed``. There is no
-            # map and no second column now, so that failure mode is gone
-            # rather than merely avoided.
-            conn.execute(
-                "UPDATE plan_routing SET verification = ?, last_updated = ? WHERE plan_id = ?",
-                (_json.dumps(new_verif), datetime.now().isoformat(), plan_id),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-    except Exception:
-        _server.logger.exception(
-            "[plan_state_mirror] update failed for plan=%s; "
-            "SQLite stage is correct but summary endpoint may show stale verification.status",
-            plan_id,
-        )
-
-
 def _mark_verification_failed_dead(
     plan_id: str, stop_reason: Optional[str] = None,
 ) -> None:
@@ -4334,13 +4207,6 @@ def _lazy_check_verification(plan_id: str) -> None:
             round_token=None,
         )
         _server._record_watchdog_action(plan_id, stop_reason)
-        # Also rewrite the ``plan_routing.verification`` JSON column so
-        # ``/api/plan/{id}/summary`` reflects the new status (it reads
-        # the verification sub-state via
-        # ``PlanState._sqlite_row_to_state``). Without this, the Feishu
-        # card would keep rendering "still verifying" even though the
-        # SQL CAS just transitioned the plan to ``failed``.
-        _server._update_plan_state_to_terminal(plan_id, stop_reason)
         _server.logger.warning(
             "[verification_watchdog] completed plan=%s", plan_id,
         )
@@ -5780,10 +5646,9 @@ def _persist_verification_terminal(
     )
 
     # ----- 1) Persist ``plan_verification.verification_status`` -----
-    # Defaults so step 4 below can still mirror a terminal verdict when
-    # this block raises before assigning them.
+    # Default; the branch inside the try narrows it to the caller's
+    # verdict.
     sqlite_status = "failed"
-    _round_after: Optional[int] = None
     try:
         from state_machine.repositories.verification_repository import (
             VerificationRepository as _VerifRepo,
@@ -5839,13 +5704,6 @@ def _persist_verification_terminal(
                 stop_reason=stop_reason,
                 publish_closed=publish_closed,
             )
-            # Read the round back so step 4's mirror writes the real one
-            # rather than whatever ``plan_routing.verification`` held
-            # before this round ran.
-            try:
-                _round_after = (repo.summary(plan_id) or {}).get("round")
-            except Exception:
-                _round_after = None
             _server.logger.info(
                 "[verification_terminal] step1 OK plan=%s sqlite_status=%s",
                 plan_id, sqlite_status,
@@ -6070,31 +5928,6 @@ def _persist_verification_terminal(
         _server.logger.exception(
             "[verification_terminal] step3 failed plan=%s: %s",
             plan_id, e,
-        )
-
-    # ----- 4) Mirror the verdict into ``plan_routing.verification`` -----
-    #
-    # 2026-09-19: this call was missing. Step 2/3 write
-    # ``plan_routing.current_phase`` (so /api/plans and the state machine
-    # are correct), but ``/api/plan/{id}/summary`` serves the *separate*
-    # ``verification`` JSON column — and the Feishu notifier reads
-    # ``state.verification.status`` from it to pick the card header.
-    # Without this, a plan that stopped its loop kept that column at
-    # whatever it held before the round (observed live in that run: the
-    # terminal write left it at ``pending`` from the earlier reset, so the
-    # card never rendered a terminal verdict). The watchdog path has
-    # called this since 2026-09-07 for exactly this reason; the auto-loop
-    # termination path never did.
-    #
-    # It runs AFTER step 3 on purpose: step 3's PlanState write rewrites
-    # the same column from ``PlanState._state``, which may still carry the
-    # pre-round value.
-    if _chain_ending:
-        _server._update_plan_state_to_terminal(
-            plan_id,
-            stop_reason or "",
-            status=sqlite_status,
-            round_=_round_after,
         )
 
     # Usage accounting: a verification round just ended, so the plan's
