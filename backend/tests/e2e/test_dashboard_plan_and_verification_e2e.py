@@ -103,6 +103,32 @@ SEEDED_MAX_ROUNDS = 3
 EXPECTED_VERIFICATION_STATUS = "已通过"
 EXPECTED_VERIFICATION_ROUND = "Round 2/3"
 
+# --- 「循环停止」现场 ------------------------------------------------------
+#
+# 这是**另一个**计划，与 :data:`PLAN_ID` 分开：那个计划的验证结论是
+# 「已通过」，这个计划的结论是「循环停止」—— 循环在第 2 轮因为基线漂移
+# 冲突停下来了。两者的断言互不干扰。
+
+#: 「循环停止」那个计划的 id。
+LOOP_STOPPED_PLAN_ID = "e2e-dashboard-loop-stopped"
+
+#: 种子里写进 ``plan_verification`` 的那一轮：第 2 轮，上限 4 轮。
+LOOP_STOPPED_ROUND = 2
+LOOP_STOPPED_MAX_ROUNDS = 4
+
+#: 停止原因 —— 基线漂移冲突。
+LOOP_STOPPED_REASON = "base_drift_conflicts"
+
+#: 页面上必须出现的两个词（这一条场景的）。
+EXPECTED_LOOP_STOPPED_STATUS = "循环停止"
+EXPECTED_LOOP_STOPPED_ROUND = "Round 2/4"
+
+#: 这个计划的任务：一条，够任务视图渲染出任务卡就行。
+LOOP_STOPPED_TASKS = (
+    {"id": "T1", "title": "收尾那条验证结论", "description": "d",
+     "files_to_modify": [], "depends_on": []},
+)
+
 #: 浏览器在等各个页面元素时的预算（毫秒）。没有固定 sleep：一个等不到的
 #: 等待就是一次带原因的失败。
 BROWSER_TIMEOUT_MS = 30000
@@ -324,6 +350,126 @@ print(json.dumps(report, ensure_ascii=False))
 
 
 # ---------------------------------------------------------------------------
+# The browser driver for the 「循环停止」 scene
+# ---------------------------------------------------------------------------
+#
+# Its own driver, not a flag on the one above: the two scenes assert
+# different things about the same panel, and the assertions that belong
+# to one of them must not be able to satisfy — or break — the other.
+
+_LOOP_STOPPED_BROWSER_DRIVER = r'''
+"""Drive the served page and read the 「循环停止」 verification panel.
+
+argv: <base_url> <plan_id> <screenshot_path> <chromium_executable>
+
+Same road as the driver above — load, click the plan card, read the
+panel — with one difference: what it reads is the **loop-stopped**
+verdict.  The stop reason and the round have to be on the page, not
+only in the database: 「停止原因与结果必须能在面板上被看到」.
+
+Every step is a click, so the frontend's own handlers run
+(``resumePlan`` → ``showTasksView`` → ``resumeVerificationPanel``).
+Nothing here reaches into the application's internals.
+
+The report is one JSON object on stdout.
+"""
+import json
+import sys
+from pathlib import Path
+
+from playwright.sync_api import sync_playwright
+
+
+base_url, plan_id, screenshot_path, chromium = sys.argv[1:5]
+
+#: How long the browser waits for each of the things it needs.
+timeout_ms = 30000
+
+report = {"page_errors": [], "console_errors": []}
+
+with sync_playwright() as driver:
+    browser = driver.chromium.launch(executable_path=chromium)
+    page = browser.new_page(viewport={"width": 1280, "height": 900})
+
+    page.on("pageerror", lambda exc: report["page_errors"].append(str(exc)))
+
+    def _on_console(message):
+        if message.type != "error":
+            return
+        text = message.text or ""
+        # A resource that 404s is reported by the browser as a console
+        # error; the dashboard asks for a handful of optional assets.
+        # That is not a page error.  Everything else is.
+        if "Failed to load resource" in text:
+            return
+        report["console_errors"].append(text)
+
+    page.on("console", _on_console)
+
+    page.goto(base_url, wait_until="load")
+    page.wait_for_selector("#app", timeout=timeout_ms)
+
+    # --- 1: the plan card ---------------------------------------------
+    card = '.plan-card[data-plan="%s"]' % plan_id
+    page.wait_for_selector(card, timeout=timeout_ms)
+    report["plan_card_visible"] = page.is_visible(card)
+
+    # --- 2: the user clicks it -----------------------------------------
+    page.click(card)
+
+    # --- 3: the verification panel opens -------------------------------
+    page.wait_for_selector(
+        "#verification-panel", state="visible", timeout=timeout_ms
+    )
+    report["verification_panel_visible"] = page.is_visible(
+        "#verification-panel"
+    )
+
+    # The panel is un-hidden one step BEFORE the badge is written, so the
+    # panel being visible is not yet "the badge has been painted".  Wait
+    # for the badge to leave its static initial value -- the assertion
+    # in the test then still has teeth: it must be exactly 「循环停止」.
+    page.wait_for_function(
+        """() => {
+            const badge = document.querySelector('#verification-status-badge');
+            if (!badge) return false;
+            const text = (badge.textContent || '').trim();
+            return text !== '' && text !== '未开始';
+        }""",
+        timeout=timeout_ms,
+    )
+
+    # --- 4: what the panel says ----------------------------------------
+    report["verification_badge"] = (
+        page.inner_text("#verification-status-badge") or ""
+    ).strip()
+    report["verification_round"] = (
+        page.inner_text("#verification-round") or ""
+    ).strip()
+    report["verification_result_area_visible"] = page.is_visible(
+        "#verification-result-area"
+    )
+    report["verification_overall_result"] = (
+        page.inner_text("#verification-overall-result") or ""
+    ).strip()
+    report["verification_repair_area_visible"] = page.is_visible(
+        "#verification-repair-area"
+    )
+
+    # --- 5: the screenshot ---------------------------------------------
+    shot = Path(screenshot_path)
+    shot.parent.mkdir(parents=True, exist_ok=True)
+    page.screenshot(path=str(shot), full_page=True)
+    report["screenshot"] = str(shot)
+    report["screenshot_size"] = shot.stat().st_size if shot.exists() else 0
+
+    browser.close()
+
+print(json.dumps(report, ensure_ascii=False))
+'''
+
+
+# ---------------------------------------------------------------------------
 # Running the driver
 # ---------------------------------------------------------------------------
 
@@ -360,7 +506,9 @@ def _parse_report(stdout: str) -> Dict[str, Any]:
     return json.loads(lines[-1])
 
 
-def _drive_in_process(argv: List[str]) -> Dict[str, Any]:
+def _drive_in_process(
+    argv: List[str], driver_source: str = _BROWSER_DRIVER
+) -> Dict[str, Any]:
     """Run the driver inside this interpreter (it has playwright)."""
     buffer = io.StringIO()
     previous_argv = list(sys.argv)
@@ -370,7 +518,7 @@ def _drive_in_process(argv: List[str]) -> Dict[str, Any]:
     try:
         with redirect_stdout(buffer):
             exec(  # noqa: S102  # nosec B102 - the driver, run verbatim
-                compile(_BROWSER_DRIVER, "<dashboard-browser-driver>", "exec"),
+                compile(driver_source, "<dashboard-browser-driver>", "exec"),
                 {"__name__": "__main__"},
             )
     finally:
@@ -379,11 +527,15 @@ def _drive_in_process(argv: List[str]) -> Dict[str, Any]:
 
 
 def _drive_in_subprocess(
-    interpreter: str, argv: List[str], work: Path
+    interpreter: str,
+    argv: List[str],
+    work: Path,
+    driver_source: str = _BROWSER_DRIVER,
+    script_name: str = "drive_dashboard.py",
 ) -> Dict[str, Any]:
     """Run the driver as its own process, with an interpreter that has playwright."""
-    script = work / "drive_dashboard.py"
-    script.write_text(_BROWSER_DRIVER, encoding="utf-8")
+    script = work / script_name
+    script.write_text(driver_source, encoding="utf-8")
     result = subprocess.run(
         [interpreter, str(script), *argv],
         capture_output=True,
@@ -419,6 +571,33 @@ def _drive(
             "no interpreter with playwright is installed in this environment"
         )
     return _drive_in_subprocess(interpreter, argv, work)
+
+
+def _drive_loop_stopped(
+    base_url: str, screenshot_path: Path, work: Path
+) -> Dict[str, Any]:
+    """Drive the page of the 「循环停止」 plan and return what it showed."""
+    chromium = _upstream_browser_executable()
+    if not chromium:
+        pytest.skip("chromium is not installed")
+
+    argv = [base_url, LOOP_STOPPED_PLAN_ID, str(screenshot_path), chromium]
+
+    if _current_interpreter_has_playwright():
+        return _drive_in_process(argv, _LOOP_STOPPED_BROWSER_DRIVER)
+
+    interpreter = _playwright_interpreter()
+    if interpreter is None:
+        pytest.skip(
+            "no interpreter with playwright is installed in this environment"
+        )
+    return _drive_in_subprocess(
+        interpreter,
+        argv,
+        work,
+        _LOOP_STOPPED_BROWSER_DRIVER,
+        "drive_dashboard_loop_stopped.py",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +648,75 @@ def _seed_plan(work: Path) -> None:
             },
             status="passed",
             publish_closed=False,
+        )
+    finally:
+        conn.close()
+
+
+def _seed_loop_stopped_plan(work: Path) -> None:
+    """Write the plan whose verification loop **stopped**.
+
+    Four pieces, each on the surface the server reads it from:
+
+    * ``plans/<id>/tasks.json`` —— 任务列表。计划目录必须存在：页面读的
+      ``GET /api/plan/{id}/state`` 与 ``GET /api/verification/{id}/status``
+      都拒绝一个没有目录的计划；
+    * ``plan_routing`` 行 —— 相位写成 ``verification``。前端
+      ``resumePlan`` 靠 ``phase.startsWith("verification")`` 进任务视图，
+      验证面板才会在那里渲染；
+    * ``plan_verification`` 行 —— 第 2 轮、上限 4 轮，结论
+      ``loop_stopped``，停止原因 ``base_drift_conflicts``。这一行走的是
+      生产路径：``init_round`` 开一轮，``mark_stopped`` 写下结论与原因；
+    * ``plan_execution`` 行 —— ``running`` 且**没有 pid**。这是现场本身：
+      后端启动时的恢复扫描看到「说是运行中、却没有进程」，会走崩溃裁决。
+      裁决要给这个计划写下终局相位 —— 而这条计划**还有一条开着的验证
+      循环**，它的结论（循环停止）必须在面板上被看到。少了这一行，这
+      条用例就绕开了缺陷，等于没测。
+
+    The row is written through the repositories, exactly the way the
+    product writes it.
+    """
+    from state_machine.db.connection import open as db_open
+    from state_machine.db.schema import migrate
+    from state_machine.repositories.execution_repository import (
+        ExecutionRepository,
+    )
+    from state_machine.repositories.routing_repository import (
+        RoutingRepository,
+    )
+    from state_machine.repositories.verification_repository import (
+        VerificationRepository,
+    )
+
+    plan_dir = work / "plans" / LOOP_STOPPED_PLAN_ID
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    (plan_dir / "tasks.json").write_text(
+        json.dumps({"tasks": list(LOOP_STOPPED_TASKS)}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    conn = db_open(work / "state.db")
+    try:
+        migrate(conn)
+
+        # The phase: the plan is in its verification stage.
+        RoutingRepository(conn).insert(LOOP_STOPPED_PLAN_ID, "verification")
+
+        # The verification row: round 2 of 4, and the loop stopped on a
+        # base-drift conflict.
+        verification = VerificationRepository(conn)
+        verification.init_round(
+            LOOP_STOPPED_PLAN_ID, LOOP_STOPPED_ROUND, LOOP_STOPPED_MAX_ROUNDS
+        )
+        verification.mark_stopped(LOOP_STOPPED_PLAN_ID, LOOP_STOPPED_REASON)
+
+        # The execution row: running, with no pid.  The startup recovery
+        # scan judges it dead — the scene the panel has to survive.
+        ExecutionRepository(conn).update_fields(
+            LOOP_STOPPED_PLAN_ID,
+            create_if_missing=True,
+            exec_status="running",
+            exec_pid=None,
         )
     finally:
         conn.close()
@@ -537,6 +785,47 @@ def dashboard(tmp_path_factory, repo_status_before) -> Dict[str, Any]:
             # ``TimeoutExpired`` / a failed subprocess are all ``Exception``
             # subclasses, so they still arrive here with the backend's own
             # output attached.
+            raise AssertionError(
+                f"{exc}\n--- tail of the backend's own output ---\n"
+                f"{_server_output(proc)}"
+            ) from exc
+    finally:
+        # The failure path stops the backend too.
+        _teardown(proc)
+
+    return {
+        "base_url": base_url,
+        "work": work,
+        "report": report,
+        "screenshot": Path(str(report.get("screenshot") or screenshot_path)),
+        "repo_status_before": repo_status_before,
+    }
+
+
+@pytest.fixture(scope="module")
+def loop_stopped_dashboard(tmp_path_factory, repo_status_before) -> Dict[str, Any]:
+    """A real backend, a real browser, and the 「循环停止」 panel.
+
+    Its own backend: this scene needs a plan tree whose only plan is the
+    stopped one, so that what the page shows cannot be another plan's
+    card.  Everything else is the same road as :func:`dashboard` — a
+    real ``backend.server`` process, a real Chromium, real clicks.
+    """
+    work = tmp_path_factory.mktemp("dashboard-loop-stopped-e2e")
+    _seed_loop_stopped_plan(work)
+
+    port = _free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    screenshot_path = work / SCREENSHOT_NAME
+
+    proc = _boot(work, port)
+    try:
+        _wait_ready(base_url, proc)
+        try:
+            report = _drive_loop_stopped(base_url, screenshot_path, work)
+        except Exception as exc:  # noqa: BLE001 - the server log is context
+            # ``Exception``, not ``BaseException`` — see the fixture above
+            # for why: a ``pytest.skip`` must stay a skip.
             raise AssertionError(
                 f"{exc}\n--- tail of the backend's own output ---\n"
                 f"{_server_output(proc)}"
@@ -649,4 +938,73 @@ def test_the_run_leaves_the_repository_clean(dashboard):
     assert new_entries == [], (
         f"the run left {len(new_entries)} new entries in the repository "
         f"workspace: {new_entries!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The 「循环停止」 scene: the loop's verdict has to be visible
+# ---------------------------------------------------------------------------
+#
+# §3 的用户可见面：**停止原因与结果必须能在面板上被看到，而不是只留在
+# 数据库里。**
+#
+# 场景：验证循环在第 2 轮因为基线漂移冲突停下来了；同时后端重启时的
+# 恢复扫描看到一条「running 却没有 pid」的执行行，给这个计划下了崩溃
+# 裁决。这条计划**还有一条开着的验证循环**，所以崩溃这个结论不替它
+# 说话 —— 面板上必须仍然是「循环停止」，而不是别的什么。
+
+
+def test_a_loop_stopped_verification_is_visible_on_the_panel(loop_stopped_dashboard):
+    """点开那个计划，面板上写的是「循环停止」，第 2 轮，共 4 轮。
+
+    走的是用户的那条路：真后端、真 Chromium、真点击。每一句断言读的都是
+    **页面自己的 DOM** —— 徽标、轮次、结论区、修复区。数据库里的
+    ``loop_stopped`` 不算数：这一条钉的就是「结论在面板上被看到」。
+    """
+    report = loop_stopped_dashboard["report"]
+
+    assert report.get("plan_card_visible") is True, (
+        f"the plan card never appeared on the page: {report!r}"
+    )
+    assert report.get("verification_panel_visible") is True, (
+        f"the verification panel did not open: {report!r}"
+    )
+
+    assert report.get("verification_badge") == EXPECTED_LOOP_STOPPED_STATUS, (
+        f"the verification badge reads {report.get('verification_badge')!r}, "
+        f"not {EXPECTED_LOOP_STOPPED_STATUS!r}: {report!r}"
+    )
+    assert report.get("verification_round") == EXPECTED_LOOP_STOPPED_ROUND, (
+        f"the verification round reads {report.get('verification_round')!r}, "
+        f"not {EXPECTED_LOOP_STOPPED_ROUND!r}: {report!r}"
+    )
+
+    assert report.get("verification_result_area_visible") is True, (
+        f"the verification result area is not visible: {report!r}"
+    )
+    assert EXPECTED_LOOP_STOPPED_STATUS in (
+        report.get("verification_overall_result") or ""
+    ), (
+        f"the overall result reads "
+        f"{report.get('verification_overall_result')!r}, which does not "
+        f"say {EXPECTED_LOOP_STOPPED_STATUS!r}: {report!r}"
+    )
+    assert report.get("verification_repair_area_visible") is True, (
+        f"the verification repair area is not visible: {report!r}"
+    )
+
+
+def test_the_loop_stopped_page_raised_no_errors(loop_stopped_dashboard):
+    """这条场景的页面也没有未捕获异常，也没有 console error。
+
+    资源 404 不算 —— 与本文件既有的那条断言同一把尺子。
+    """
+    report = loop_stopped_dashboard["report"]
+
+    assert report.get("page_errors") == [], (
+        f"the page raised uncaught JavaScript exceptions: "
+        f"{report.get('page_errors')!r}"
+    )
+    assert report.get("console_errors") == [], (
+        f"the page logged console errors: {report.get('console_errors')!r}"
     )

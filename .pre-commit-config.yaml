@@ -153,3 +153,41 @@ repos:
         language: system
         stages: [commit-msg]
         entry: python3 scripts/check_commit_msg.py
+
+      # ---------------------------------------------------------------
+      # Pasted copies — the rule moved forward to the commit.
+      #
+      # The static gate that rejects a pasted copy runs in pytest and in
+      # CI, so a copy is found once the commit carrying it already
+      # exists — at which point it is in the history and taking it out
+      # costs a rewrite. This hook asks the same rules about the
+      # *index*, so the refusal happens while the copy is still a file
+      # somebody can edit.
+      #
+      # The rules are not restated here, and they are not restated in
+      # the wrapper either: ``scripts/check_no_paste_artifacts.py`` puts
+      # the backend package on ``sys.path``, imports the gate module
+      # that owns the rules, and forwards the call to it. One
+      # definition of what a pasted copy is, in one place.
+      #
+      # ``--check-staged`` is the mode that matters here: it reads the
+      # index rather than the working tree, because the index and the
+      # working tree differ exactly when it matters — a file edited back
+      # to clean after it was staged is still committed as it was
+      # staged. Hence ``pass_filenames: false`` as well: the scan reads
+      # the index itself rather than trusting a filename list.
+      #
+      # ``language: system`` for the same reason as the commit-message
+      # hook above: the wrapper is a stdlib-only Python file run with
+      # the interpreter on PATH, so a managed venv would be pure
+      # overhead. The gate module it imports therefore has to import
+      # without pytest installed, which is why that module's pytest
+      # import is optional.
+      # ---------------------------------------------------------------
+      - id: no-paste-artifacts
+        name: pasted copies (path and body)
+        language: system
+        stages: [pre-commit]
+        pass_filenames: false
+        always_run: true
+        entry: python3 scripts/check_no_paste_artifacts.py --check-staged

@@ -20,10 +20,10 @@
 会真的把这个假 ``claude`` 拉成子进程 —— 于是这一轮是真的在跑一个真的
 进程，而不是一个 mock。
 
-判死也是真的判死：这一轮挂着不动，它写的日志仍然是新鲜的（心跳被调快到
-5 秒，所以日志这一路永远是「新」的，判死走的是**结果文件**那条信号），
-于是 ``_lazy_check_verification`` 的判定阶梯会落到
-``verification_results_stale``，然后走完整的死亡序列：
+判死也是真的判死：这一轮挂着不动，而它**不发声**（心跳是判活证据，
+所以死亡用例必须没有新鲜心跳），于是 ``_lazy_check_verification`` 的判定
+阶梯会落到 ``verification_results_stale``（陈旧的结果文件、陈旧的日志），
+然后走完整的死亡序列：
 
     cleanup → force-release → invalidate → 终态写盘
 
@@ -163,10 +163,23 @@ STALE_ARTIFACT_AGE_SECONDS = 7200.0
 WATCHDOG_ENV = {
     "VERIFICATION_WATCHDOG_STALENESS_SECONDS": "20",
     "VERIFICATION_HARD_STALE_SECONDS": "60",
-    # 心跳调快：coding tool 每 5 秒往 ``execution.log`` 写一次进度，
-    # 于是「日志陈旧」那一路永远是新鲜的，判死只可能走结果文件那一路 ——
-    # 也就是下面种出来的那一条。
-    "PDT_CODING_QUERY_PROGRESS_SECONDS": "5",
+    # 心跳**关掉**：这一轮必须是真正「无声」的，否则根本判不了死。
+    #
+    # 心跳现在是**判活证据**（``_verification_liveness_probe`` 的第 4 号
+    # 信号）：一条新鲜心跳（年龄 < ``VERIFICATION_WATCHDOG_STALENESS_SECONDS``）
+    # 就足以让探针说「活着」，于是判死永远不会触发。上一轮把心跳调到 5 秒
+    # —— coding tool 每 5 秒往 ``execution.log`` 写一次进度 —— 正是这一点
+    # 把死亡用例挡在了门外。
+    #
+    # 所以这里把间隔调到 3600 秒：测试窗口（240 秒）之内**不产生新鲜心跳**，
+    # 这一轮是真正无声的。判死仍然由那两条陈旧证据触发 ——
+    # 种出来的 ``verification_execution_results.json``（两小时前），
+    # 以及陈旧的日志。
+    #
+    # 注意：coding tool 会把间隔夹在 1~120 秒之间（``MAX_INTERVAL_SEC``），
+    # 所以 3600 实际生效为 120 秒 —— 第一次心跳落在启动之后约 120 秒，
+    # 仍然晚于宽限期（60 秒）结束、判死落地的那一刻。
+    "PDT_CODING_QUERY_PROGRESS_SECONDS": "3600",
 }
 
 #: 后端日志里那几行判死的证据。
@@ -493,8 +506,8 @@ def _seed_death_plan(work: Path, plan_id: str) -> Path:
     * ``plans/<id>/verification_plan.json`` —— 一个真的验证点，真的验证轮
       会真的去跑它，于是真的 coding tool 会真的把假 ``claude`` 拉起来；
     * ``plans/<id>/verification_execution_results.json`` —— **两小时前**
-      的结果文件。守护进程的判定阶梯读的就是它：日志那一路被调快的心跳
-      顶住了（新），只有这一路是陈旧的。
+      的结果文件。守护进程的判定阶梯读的就是它：心跳被调宽了（这一轮
+      没有新鲜心跳），陈旧的那两路 —— 结果文件与日志 —— 一起作证。
     """
     _seed(work, plan_id)
     plan_dir = _plan_dir(work, plan_id)

@@ -188,6 +188,89 @@ class VerificationRepository:
             max_rounds=max_rounds,
         )
 
+    def release_round(self, plan_id: str, round_n: int, reason: str) -> bool:
+        """Hand a round number BACK — the round never really happened.
+
+        2026-11-01 (verification convergence, §2 / §3): a round that
+        was blocked BEFORE any verification point was dispatched (the
+        base-drift preflight, the service preflight) must not consume a
+        round number. ``init_round`` overwrites the counter and there
+        was no way back, so once the number was written it was spent:
+        the plan burned one of its rounds on a turn that never measured
+        anything.
+
+        This is the way back. It rewinds the counter by exactly one and
+        records WHY in ``executor_state["released_rounds"]``, so the
+        audit trail survives the rewind instead of vanishing together
+        with the number.
+
+        Contract:
+
+          * the release only happens when the row's CURRENT round is
+            exactly ``round_n`` — releasing a stale number is refused
+            (``False``) instead of decrementing the counter twice;
+          * a plan without a row is refused (``False``); no row is
+            created on the way out;
+          * the rewind stops at 0 — a round number is never written
+            negative;
+          * ``max_rounds`` is the plan's budget and is left alone;
+          * ``verification_status`` is NOT rewritten here — how a
+            released round reads downstream is the caller's business;
+          * a ``executor_state`` that is not a JSON object is rebuilt
+            as an empty object rather than raising into the caller.
+        """
+        target = int(round_n)
+        with self._txn() as conn:
+            row = conn.execute(
+                "SELECT round, executor_state FROM plan_verification "
+                "WHERE plan_id = ?",
+                (plan_id,),
+            ).fetchone()
+            if row is None:
+                # No row for this plan — refuse; never create one here.
+                return False
+            try:
+                current = int(row[0] or 0)
+            except (TypeError, ValueError):
+                current = 0
+            if current != target:
+                # The row already moved on (released before, or re-run
+                # past this number). Refuse rather than double-decrement.
+                return False
+
+            blob = self._decode_executor_state(row[1])
+            released = blob.get("released_rounds")
+            if not isinstance(released, list):
+                released = []
+            released.append(
+                {
+                    "round": target,
+                    "reason": reason,
+                    "released_at": _now_iso(),
+                }
+            )
+            blob["released_rounds"] = released
+
+            now = _now_iso()
+            conn.execute(
+                "UPDATE plan_verification SET round = ?, executor_state = ?, "
+                "updated_at = ? WHERE plan_id = ?",
+                (
+                    max(current - 1, 0),
+                    json.dumps(blob, ensure_ascii=False),
+                    now,
+                    plan_id,
+                ),
+            )
+
+        self._publish_vp_event(
+            plan_id,
+            sub_kind="release_round",
+            round_id=target,
+            reason=reason,
+        )
+        return True
+
     def reset_round_counter(
         self, plan_id: str, round_n: int, max_rounds: int,
     ) -> None:
@@ -895,3 +978,34 @@ class VerificationRepository:
             if raw is not None:
                 record[column] = json.loads(raw)
         return record
+
+    @staticmethod
+    def _decode_executor_state(raw: Any) -> dict[str, Any]:
+        """Read the ``executor_state`` column as a JSON OBJECT.
+
+        The column is a free-form blob with no schema, so it can hold
+        anything a previous writer left behind — including a JSON array,
+        a bare string, or text that does not parse at all. This method
+        is the tolerant reader used by the writers that need to MERGE
+        into that blob: anything that is not an object is treated as an
+        empty object, so a corrupt blob costs the caller its
+        sidecar content but never raises into the caller's path.
+        """
+        if raw is None:
+            return {}
+        if isinstance(raw, dict):
+            return dict(raw)
+        if isinstance(raw, (bytes, bytearray)):
+            try:
+                raw = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                return {}
+        if not isinstance(raw, str):
+            return {}
+        try:
+            loaded = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        if isinstance(loaded, dict):
+            return dict(loaded)
+        return {}

@@ -371,6 +371,19 @@ TERMINAL_PHASES = frozenset({
 #: verdict on the execution row and the routing row never catches up.
 TERMINAL_EXEC_STATUSES = frozenset({"failed", "stopped"})
 
+#: The phases that end a plan's **workflow** — the plan's own answer,
+#: as opposed to the run's answer (:data:`TERMINAL_EXEC_STATUSES`).
+#:
+#: ``failed`` / ``stopped`` are deliberately NOT in this set: they are
+#: the words the *run* uses, and a run that died says nothing about a
+#: verification loop that is still going.  A plan that carries a
+#: verification row is therefore judged by this set alone — see
+#: :func:`_workflow_phase_is_terminal`.
+WORKFLOW_TERMINAL_PHASES = frozenset({
+    "completed", "verification_passed", "verification_failed",
+})
+
+
 #: The prefix of the stop reason an eviction writes on the victim's
 #: execution row: ``evicted:<requester>`` — the run was stopped because
 #: another plan needed the capacity, and the victim was put back in the
@@ -497,6 +510,39 @@ def _persisted_exec_status(exec_row: Any) -> Optional[str]:
     return status or None
 
 
+def _workflow_phase_is_terminal(
+    current_phase: Any,
+    *,
+    has_verification: bool = False,
+) -> bool:
+    """Is the **workflow's** verdict terminal?
+
+    Two vocabularies live here and they must not be mixed:
+
+      * the workflow's own answer — the phase the plan reached:
+        ``completed`` / ``verification_passed`` / ``verification_failed``
+        (:data:`WORKFLOW_TERMINAL_PHASES`);
+      * the run's answer — the last execution's outcome: ``failed`` /
+        ``stopped`` (:data:`TERMINAL_EXEC_STATUSES`).
+
+    A plan that carries a ``plan_verification`` row is judged by the
+    first one alone.  Its run may well have died — that is exactly
+    what the recovery scan writes — but the verification loop it
+    started is a separate piece of work, and the panel has to be able
+    to show it: a plan in a verification round, a plan whose
+    verification can be started, and the result of a verification loop
+    that stopped are all things a reader must still be able to see.
+
+    Without a verification row nothing changes: the phase vocabulary is
+    the full :data:`TERMINAL_PHASES` set, and the run's verdict hides
+    the plan on its own (see :func:`_plan_is_terminal`).
+    """
+    phase = str(current_phase or "").strip()
+    if has_verification:
+        return phase in WORKFLOW_TERMINAL_PHASES
+    return phase in TERMINAL_PHASES
+
+
 def _persisted_stop_reason(exec_row: Any) -> Optional[str]:
     """``plan_execution.stop_reason`` of one execution row, or ``None``.
 
@@ -515,6 +561,8 @@ def _plan_is_terminal(
     current_phase: Any,
     exec_status: Any,
     stop_reason: Any = None,
+    *,
+    has_verification: bool = False,
 ) -> bool:
     """Is this plan in a terminal state?
 
@@ -555,10 +603,22 @@ def _plan_is_terminal(
     ``waiting_for_quota`` is not terminal: a plan parked for capacity
     is alive and resumes when the window opens, so it never enters
     :data:`TERMINAL_PHASES`.
+
+    ``has_verification`` says the plan carries a ``plan_verification``
+    row — it is in, or has been in, a verification loop.  Then the
+    workflow's verdict alone decides: the run's verdict is about a
+    *process*, and a dead process says nothing about a verification
+    loop that is still going.  See :func:`_workflow_phase_is_terminal`.
     """
-    phase = str(current_phase or "").strip()
-    if phase in TERMINAL_PHASES:
+    if _workflow_phase_is_terminal(
+        current_phase, has_verification=has_verification
+    ):
         return True
+    if has_verification:
+        # The run's verdict is not this plan's verdict: the verification
+        # loop is a separate piece of work, and it is still visible.
+        return False
+    phase = str(current_phase or "").strip()
     status = str(exec_status or "").strip()
     if status not in TERMINAL_EXEC_STATUSES:
         return False
@@ -3045,15 +3105,17 @@ def _list_plans_body(
     # 2026-10-26 (merge): main 的运行相位反驳与终局相位集合，两边都要。
     from plan_status import resolve_phase
 
-    terminal_phases = {
-        "completed", "failed", "stopped",
-        "verification_passed",
-        "verification_failed",
-        # 2026-11-09: ``archived`` — an archived plan is shelved for
-        # good, so the default listing drops it (it stays reachable
-        # through ``?include_terminal=true``).
-        "archived",
-    }
+    # The terminal phases live at module level: :data:`TERMINAL_PHASES`
+    # (the whole phase vocabulary that ends a plan) and
+    # :data:`WORKFLOW_TERMINAL_PHASES` (the subset that is the *workflow's*
+    # own verdict, as opposed to the run's).  The distinction matters for a
+    # plan that carries a verification row — see
+    # :func:`_workflow_phase_is_terminal`.
+    #
+    # There is deliberately **no second copy** of the set here: the
+    # listing has ONE terminal gate, and that gate asks which vocabulary
+    # applies (see :func:`_plan_is_terminal`).  A local set beside it
+    # would be a second, contradicting answer to the same question.
 
     plans: List[Dict[str, Any]] = []
 
@@ -3141,6 +3203,16 @@ def _list_plans_body(
     if sm is not None and new_plan_ids:
         _, _, execution, _, _ = sm
         execution_by_plan = execution.snapshot_for_list(new_plan_ids)
+
+    # Bulk-fetch the verification rows for the same plan_ids.  They are the
+    # third verdict this listing needs: a plan that carries one is in — or
+    # has been in — a verification loop, and the run's verdict does not
+    # speak for that loop.  Only the ids that HAVE a row come back, so
+    # membership in this mapping is the evidence.
+    verification_by_plan: Dict[str, Dict[str, Any]] = {}
+    if sm is not None and new_plan_ids:
+        _, _, _, verification, _ = sm
+        verification_by_plan = verification.snapshot_for_list(new_plan_ids)
 
     for row in routing_rows:
         plan_id = row["plan_id"]
@@ -3233,23 +3305,47 @@ def _list_plans_body(
             # 跑。它还明确把 ``waiting_for_quota`` 排除在终局之外：等配额的
             # 计划是活的，窗口一开就继续。
             #
-            # main 的 ``terminal_phases`` 是同一件事的另一份写法，它多认了
-            # 两个验证终局相位（``verification_passed`` / ``verification_failed``）。
-            # 两个判定取并集：谁认它终局，谁就把它滤掉。
+            # 2026-11-02: 第三个裁决进来了 —— **验证行**（``plan_verification``）。
+            # 有验证行的计划是在（或进过）一轮验证里的，那轮验证是另一件活：
+            # 执行的裁决说的是**进程**的死活，对还开着的验证循环什么也证明不了。
+            # 所以有验证行时只看**工作流**的终局相位
+            # （:data:`WORKFLOW_TERMINAL_PHASES`）：执行裁决（``failed`` /
+            # ``stopped``）单独一条不许把这样的计划藏起来 —— 验证中、能启动
+            # 验证、验证循环停下来的结果，都是面板必须看得见的东西。没有验证
+            # 行的失败计划保持原样：它就是结束了。
             persisted_exec_status = _persisted_exec_status(exec_row)
+            has_verification_row = plan_id in verification_by_plan
             # The stop reason is the third verdict: it tells a *stopped*
             # run apart from a *dead plan*.  A plan the scheduler
             # evicted was put back in the queue — it is waiting for its
             # next turn, not gone — so the listing must not filter it
             # out on the strength of the execution row alone.
             persisted_stop_reason = _persisted_stop_reason(exec_row)
-            if not include_terminal and (
-                _plan_is_terminal(
-                    current_phase,
-                    persisted_exec_status,
-                    persisted_stop_reason,
-                )
-                or current_phase in terminal_phases
+            # The ONE terminal gate of this listing.
+            #
+            # Two verdicts, one rule: the phase verdict and the run's
+            # verdict.  :func:`_plan_is_terminal` owns both — and it owns
+            # the question of WHICH phase vocabulary applies.  With a
+            # verification row only the workflow's own verdict counts
+            # (:func:`_workflow_phase_is_terminal`): the run's verdict is
+            # about a *process*, and says nothing about a verification
+            # loop that is still going.  Without one the full phase
+            # vocabulary applies, so a failed plan that carries no
+            # verification row stays hidden exactly as before.
+            #
+            # There is deliberately no second, parallel phase test beside
+            # this one: it would answer the same question a second time
+            # with the *other* vocabulary — which is exactly how a plan
+            # whose verification loop is still going disappeared from the
+            # default listing once already.  The redundant parallel clause
+            # came back in a merge-conflict resolution (cfba0c53) although
+            # the code before it (e5a725d8) never had it.  One gate, one
+            # rule.
+            if not include_terminal and _plan_is_terminal(
+                current_phase,
+                persisted_exec_status,
+                persisted_stop_reason,
+                has_verification=has_verification_row,
             ):
                 continue
 
@@ -3342,7 +3438,13 @@ def _list_plans_body(
                 fallback=status,
             )
 
-            if not include_terminal and current_phase in terminal_phases:
+            # The second terminal gate: the phase AFTER the runtime claim
+            # was refuted.  Same rule as the first one — a plan that
+            # carries a verification row is judged by the workflow's
+            # verdict alone.
+            if not include_terminal and _workflow_phase_is_terminal(
+                current_phase, has_verification=has_verification_row
+            ):
                 continue
 
             if (

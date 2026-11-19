@@ -762,3 +762,216 @@ class TestDirectHelperContract:
             assert _task_statuses(plan_id) == {"task-1": "in_progress"}
         finally:
             _execution_state.clear()
+
+
+class TestDeadExecutorVerificationGate:
+    """A dead executor must not stamp a terminal workflow phase over a
+    plan whose verification loop is still open.
+
+    The crash adjudication writes two verdicts: the execution row's
+    ("this executor died") and the workflow phase's ("this plan is
+    over").  The second one used to be written unconditionally, so a
+    plan whose verification loop was still running was parked at
+    ``failed`` -- a terminal phase over a loop that was still going,
+    and a plan that nothing would ever pick up again.
+
+    The gate reads the plan's own ``plan_verification`` row and only
+    stamps the phase when the loop has reached its verdict (``passed``
+    / ``failed``) or never ran at all (no row).  An open loop
+    (``pending`` / ``running`` / ``loop_stopped``) keeps the phase it
+    has, and a row that cannot be read is an *unknown* -- an unknown is
+    not a verdict, so nothing is stamped and a warning says so.
+    """
+
+    def _seed_routing_row(self, plan_id, phase):
+        from server import _state_db_path
+        from state_machine.db.connection import open as db_open
+        from state_machine.db.schema import migrate
+        from state_machine.repositories.routing_repository import (
+            RoutingRepository,
+        )
+
+        conn = db_open(_state_db_path())
+        try:
+            migrate(conn)
+            RoutingRepository(conn).insert(plan_id, phase)
+        finally:
+            conn.close()
+
+    def _seed_verification_row(self, plan_id, status, round_=2, max_rounds=4):
+        from server import _state_db_path
+        from state_machine.db.connection import open as db_open
+        from state_machine.db.schema import migrate
+        from state_machine.repositories.verification_repository import (
+            VerificationRepository,
+        )
+
+        conn = db_open(_state_db_path())
+        try:
+            migrate(conn)
+            VerificationRepository(conn).insert(
+                plan_id, status, round=round_, max_rounds=max_rounds,
+            )
+        finally:
+            conn.close()
+
+    def _read_phase(self, plan_id):
+        from server import _state_db_path
+        from state_machine.db.connection import open as db_open
+
+        conn = db_open(_state_db_path())
+        try:
+            row = conn.execute(
+                "SELECT current_phase FROM plan_routing WHERE plan_id = ?",
+                (plan_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        return row[0] if row else None
+
+    def _read_execution(self, plan_id):
+        from server import _state_db_path
+        from state_machine.db.connection import open as db_open
+
+        conn = db_open(_state_db_path())
+        try:
+            row = conn.execute(
+                "SELECT exec_status, stop_reason, exec_pid FROM plan_execution "
+                "WHERE plan_id = ?",
+                (plan_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        return tuple(row) if row else None
+
+    def _kill_the_executor(self, plan_id):
+        """Run the crash adjudication the way the watchdog does."""
+        _execution_state.clear()
+        _execution_state[plan_id] = {"status": "running", "pid": DEAD_PID}
+        try:
+            _mark_failed_dead(plan_id)
+        finally:
+            _execution_state.clear()
+
+    def _prepare(self, sample_plan_factory, plan_id, phase, status=None):
+        plan_dir = _make_plan(sample_plan_factory, plan_id, phase=phase)
+        self._seed_routing_row(plan_id, phase)
+        _seed_execution_row(
+            plan_id,
+            exec_status="running",
+            exec_pid=DEAD_PID,
+            project_dir=str(plan_dir),
+        )
+        if status is not None:
+            self._seed_verification_row(plan_id, status)
+        return plan_dir
+
+    def test_a_pending_verification_keeps_the_executing_phase(
+        self, sample_plan_factory
+    ):
+        plan_id = "dead-gate-pending"
+        self._prepare(sample_plan_factory, plan_id, "executing", "pending")
+        self._kill_the_executor(plan_id)
+        assert self._read_phase(plan_id) == "executing"
+
+    def test_a_running_verification_keeps_the_executing_phase(
+        self, sample_plan_factory
+    ):
+        plan_id = "dead-gate-running"
+        self._prepare(sample_plan_factory, plan_id, "executing", "running")
+        self._kill_the_executor(plan_id)
+        assert self._read_phase(plan_id) == "executing"
+
+    def test_a_loop_stopped_verification_keeps_the_verification_phase(
+        self, sample_plan_factory
+    ):
+        plan_id = "dead-gate-loop-stopped"
+        self._prepare(sample_plan_factory, plan_id, "verification", "loop_stopped")
+        self._kill_the_executor(plan_id)
+        assert self._read_phase(plan_id) == "verification"
+
+    def test_a_passed_verification_is_stamped_failed(self, sample_plan_factory):
+        plan_id = "dead-gate-passed"
+        self._prepare(sample_plan_factory, plan_id, "verification", "passed")
+        self._kill_the_executor(plan_id)
+        assert self._read_phase(plan_id) == "failed"
+
+    def test_a_failed_verification_is_stamped_failed(self, sample_plan_factory):
+        plan_id = "dead-gate-failed"
+        self._prepare(sample_plan_factory, plan_id, "verification", "failed")
+        self._kill_the_executor(plan_id)
+        assert self._read_phase(plan_id) == "failed"
+
+    def test_a_plan_without_a_verification_row_is_stamped_failed(
+        self, sample_plan_factory
+    ):
+        """No verification loop ever ran: the crash verdict stands."""
+        plan_id = "dead-gate-no-row"
+        self._prepare(sample_plan_factory, plan_id, "executing")
+        self._kill_the_executor(plan_id)
+        assert self._read_phase(plan_id) == "failed"
+
+    def test_the_execution_verdict_is_unchanged_by_the_gate(
+        self, sample_plan_factory
+    ):
+        """The gate only touches the workflow phase; the execution row
+        still carries the death verdict."""
+        plan_id = "dead-gate-execution-row"
+        self._prepare(sample_plan_factory, plan_id, "executing", "pending")
+        self._kill_the_executor(plan_id)
+        assert self._read_execution(plan_id) == (
+            "failed", "process_died_unexpectedly", None,
+        )
+
+    def test_an_unreadable_verification_row_keeps_the_phase_and_warns(
+        self, sample_plan_factory, monkeypatch, caplog
+    ):
+        """An unknown is not a verdict: nothing is stamped, and the
+        operator is told why."""
+        from state_machine.repositories import verification_repository
+
+        plan_id = "dead-gate-unreadable"
+        self._prepare(sample_plan_factory, plan_id, "executing", "pending")
+
+        def _boom(self, plan_id):
+            raise RuntimeError("the state database is gone")
+
+        monkeypatch.setattr(
+            verification_repository.VerificationRepository, "current", _boom,
+        )
+
+        with caplog.at_level("WARNING"):
+            self._kill_the_executor(plan_id)
+
+        assert self._read_phase(plan_id) == "executing"
+        messages = [rec.getMessage() for rec in caplog.records]
+        assert any(plan_id in message for message in messages), messages
+
+    def test_an_unknown_verification_status_keeps_the_phase_and_warns(
+        self, sample_plan_factory, caplog
+    ):
+        """A status outside the vocabulary is unknown, not a verdict."""
+        plan_id = "dead-gate-unknown-status"
+        self._prepare(sample_plan_factory, plan_id, "executing", "not_a_status")
+
+        with caplog.at_level("WARNING"):
+            self._kill_the_executor(plan_id)
+
+        assert self._read_phase(plan_id) == "executing"
+        messages = [rec.getMessage() for rec in caplog.records]
+        assert any(plan_id in message for message in messages), messages
+
+    def test_the_idempotency_gate_still_short_circuits_the_gate(
+        self, sample_plan_factory
+    ):
+        """A non-``running`` in-memory state returns before the gate, so
+        a plan with an open verification loop is left alone."""
+        plan_id = "dead-gate-idempotency"
+        self._prepare(sample_plan_factory, plan_id, "executing", "pending")
+        _execution_state.clear()
+        _execution_state[plan_id] = {"status": "completed", "pid": None}
+        try:
+            _mark_failed_dead(plan_id)
+        finally:
+            _execution_state.clear()
+        assert self._read_phase(plan_id) == "executing"

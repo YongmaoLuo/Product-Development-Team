@@ -40,6 +40,9 @@ from coding_tool import (
     HardTimeoutError,
     ProviderSlotWaitExpired,
     is_deterministic_local_error,
+    # 2026-11-02: the heartbeat for a dispatch that waits on a provider
+    # (task 9).  Reused as-is — this module does not build a second one.
+    _QueryProgressReporter,
 )
 from config_paths import resolve_plans_dir, resolve_state_db_path
 import provider_capacity
@@ -4176,6 +4179,26 @@ def _health_endpoint_answers(health_url: str, timeout: float = 3.0) -> bool:
         return False
 
 
+class _EventLoggerShim:
+    """Give any logger the ``info(event, message, **kwargs)`` shape.
+
+    ``ExecutionLogger`` already has that shape; a stdlib logger does not
+    (its ``info`` takes one message and no ``data=``).  The heartbeat is
+    a side channel: it has to work with either, and it must never take
+    the dispatch down with it.
+    """
+
+    def __init__(self, logger):
+        self._logger = logger
+
+    def info(self, event: str, message: str, **kwargs) -> None:
+        try:
+            self._logger.info(event, message, **kwargs)
+        except TypeError:
+            # A stdlib logger: one message, no structured fields.
+            self._logger.info("%s %s", event, message)
+
+
 def _runner_accepts_kwarg(runner: Callable[..., Any], name: str) -> bool:
     """Does ``runner`` take the keyword argument ``name``?
 
@@ -6149,9 +6172,10 @@ class Orchestrator:
         _gate_entries = detect_full_gate_entries(self.project_dir)
         for attempt in range(retry_llm):
             try:
-                plan_data = self.coding_tool.query_json(
+                plan_data = self._query_with_heartbeat(
                     prompt=prompt,
                     system_instruction=VERIFICATION_PLAN_SYSTEM_PROMPT,
+                    phase="planning",
                 )
 
                 # Validate structure
@@ -13343,9 +13367,10 @@ class Orchestrator:
             # smaller number.
             self._judgment_heartbeat("report_judgment")
             try:
-                report_data = self.coding_tool.query_json(
+                report_data = self._query_with_heartbeat(
                     prompt=prompt,
                     system_instruction=VERIFICATION_JUDGMENT_SYSTEM_PROMPT,
+                    phase="judgment",
                 )
 
                 # Validate structure
@@ -13638,6 +13663,69 @@ class Orchestrator:
             parts.append("")
 
         return "\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # 2026-11-02 — one heartbeat for both long LLM phases
+    # ------------------------------------------------------------------
+    #
+    # §4 实测：一次 ``coding_query_json`` 跑了 9993 秒，期间**零写入**。
+    # planning 阶段（``generate_verification_plan`` 里那次调用）一行进度
+    # 都没有；judgment 阶段只有 ``_judgment_heartbeat`` 写的那一行，不是
+    # 周期的。于是"在等 provider"和"卡死了"从外面看是同一件事 —— 看门狗
+    # 只能按陈旧阈值把一个健康的 round 判死。
+    #
+    # 修法不是再造一套心跳，而是复用 ``coding_tool._QueryProgressReporter``
+    # （任务 9 建的）。两处不同：
+    #
+    #   * 阶段名 —— reporter 默认写 ``elapsed``；这里按调用点写成
+    #     ``planning`` / ``judgment``，看的人一眼知道卡在哪一段。
+    #   * 主人 —— coding_tool 内部那一份只在它自己有 logger 时才存在
+    #     （``ClaudeCodingTool()`` 默认 ``logger=None``，于是一个线程都
+    #     不长，这正是那 9993 秒零写入的原因）。这一份由 agent 持有，
+    #     写进 agent 自己的 ``ExecutionLogger``（``execution.log``）——
+    #     看门狗读的三个文件之一就是它。
+    #
+    # ``finally`` 里停 reporter：异常路径也必须停 —— 活过自己那次调用的
+    # 心跳会把下一段等待的日志写脏。
+
+    def _query_with_heartbeat(
+        self,
+        prompt: str,
+        system_instruction: Optional[str] = None,
+        phase: str = "elapsed",
+        **kwargs,
+    ) -> dict:
+        """调用 ``coding_tool.query_json``，期间周期性地写一行进度。
+
+        参数与返回值和 ``coding_tool.query_json`` 完全一致：``phase``
+        之外的都原样透传，返回值原样返回，异常也原样抛出。多出来的只有
+        一件事 —— 调用期间日志里会周期性地出现::
+
+            [CODING_QUERY_PROGRESS] {"elapsed_sec": 120.0, "phase": "planning"}
+        """
+        reporter = self._make_query_progress_reporter(phase)
+        reporter.start()
+        try:
+            return self.coding_tool.query_json(
+                prompt=prompt,
+                system_instruction=system_instruction,
+                **kwargs,
+            )
+        finally:
+            reporter.stop()
+
+    def _make_query_progress_reporter(
+        self, phase: str,
+    ) -> _QueryProgressReporter:
+        """造一个属于这个 agent 的进度 reporter。
+
+        日志落在 agent 自己的 logger（``execution.log``）—— 看门狗读的
+        就是那个文件，所以写在那里才真的能证明"这一段还在动"。
+        """
+        logger = getattr(self, "logger", None)
+        if logger is None:
+            return _QueryProgressReporter(None, phase=phase)
+        return _QueryProgressReporter(_EventLoggerShim(logger), phase=phase)
 
     def _judgment_heartbeat(self, stage: str, vp_id: str = "") -> None:
         """Append a liveness line to the round log during Phase 3.
@@ -14640,7 +14728,26 @@ class Orchestrator:
             plan_dir=self.plan_dir,
             sub_agent_runner=_sub_agent_runner,
             verif_repo=getattr(self, "verif_repo", None),
+            # 2026-11-02（轮次隔离）：把本轮号告诉执行器 —— 关卡只认**本轮**
+            # 产生的结论。上一轮的结论（2026-11-02 实测：round 3 的 VP-015
+            # 因上一轮的 VP-009 FAILED 被判 DEFERRED，而本轮 VP-009 实际
+            # PASSED）不带轮次戳就分不出来。
+            round_no=self._agent_round_no(),
         )
+
+    def _agent_round_no(self) -> Optional[int]:
+        """本轮轮次号（``None`` = 不知道）。
+
+        ``_current_round`` 是本 agent 正在跑的那一轮（``start_verification_round``
+        写的）。0 / 非法值一律当成"不知道"：那是"轮次未知"，不是"第 0 轮"。
+
+        只认真 int：``bool`` 与别的类型（测试里常见的 mock）一律当"不知道" ——
+        猜出来的轮次会让门禁把本轮的结论当成旧轮结论丢弃。
+        """
+        raw = getattr(self, "_current_round", 0)
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            return None
+        return raw if raw > 0 else None
 
     # ------------------------------------------------------------------
     # BLOCKED verdicts — retired / unknown verification_method

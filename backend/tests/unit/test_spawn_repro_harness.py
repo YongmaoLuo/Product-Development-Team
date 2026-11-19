@@ -198,7 +198,22 @@ def test_popen_kwargs_mirror_service_manager(tmp_path, monkeypatch):
 
     class _FakePopen:
         def __init__(self, args, **kwargs):
-            captured.append((args, kwargs))
+            # The spawn path probes the machine around the spawn it
+            # makes: it reads the owner's start time
+            # (``ps -o lstart= -p ...``) before the spawn, and -- when a
+            # spawn registry is named -- it reads the started process'
+            # start time again after it.  Those probes go through
+            # ``subprocess`` as well, so a record that counts every
+            # call counts a probe as a spawn.  The service's own spawn
+            # is the one that runs the interpreter; a probe runs a
+            # system tool.
+            #
+            # The judgement is pinned on its own in
+            # ``test_service_spawn_shape.py``::
+            #
+            #     test_a_ps_probe_is_not_the_declared_service_process
+            if args and args[0] == (sys.executable or "/usr/bin/python3"):
+                captured.append((args, kwargs))
             self.args = args
             self.kwargs = kwargs
             self.pid = os.getpid()
