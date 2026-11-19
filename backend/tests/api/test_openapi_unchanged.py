@@ -110,7 +110,18 @@ SNAPSHOT_PATH = _TESTS_DIR / "openapi_snapshot.json"
 #: `openapi_snapshot.json` 规范形式现算，再与线上 app 实际发布的 schema
 #: （`openapi_snapshot()`）交叉验证——两者逐项零差异、指纹相同——才写下本值
 #: （`bcd1ce6d…`）。
-BASELINE_FINGERPRINT = "bcd1ce6d43182e0b0bc9d09fbea35a9a33790b926f78692a631bf53def22314c"
+#:
+#: 2026-11-19（导入请求体新增 `mode` 字段 / 本分支）：本次变更给导入请求体
+#: 模型 `ImportPlanRequest` 增加了一个 `mode` 字段（不传时取 'production'），
+#: 对外 HTTP 契约的形状随之改变，故按同一条规矩重取基线：
+#: `openapi_snapshot.json` 相对上一版**只增不删**（新增 5 行、删除 0 行，唯一
+#: 新增是 `components.schemas.ImportPlanRequest.properties.mode`；`paths` 与
+#: `info` 零差异，路径与 schema 的集合均未变）。快照与指纹在**同一次变更**里
+#: 更新：先由重新生成后落盘的快照现算
+#: （`_fingerprint(json.loads(SNAPSHOT_PATH.read_text()))`），再与线上 app
+#: 实际发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零差异、指纹
+#: 相同——才把该值写进本常量（`c74a35fc…`）。
+BASELINE_FINGERPRINT = "c74a35fc8de293ba99b8427c34af0285bb781324ec949cd9c91dfb0140e2989b"
 
 #: The capture runs in its own process so the schema is the one a clean
 #: start produces: debug routes off, no schema cache carried over from

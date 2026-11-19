@@ -423,6 +423,12 @@ LEGACY_FIELD_TYPES: Dict[str, Dict[str, Optional[str]]] = {
         "content": None,
         "hook_destination": "union(null,string)",
         "hook_session_id": "union(null,string)",
+        # `mode` was added to this request later, as a non-optional
+        # string carrying a default — so the published shape has no
+        # null branch for it.  It is recorded here as an approved growth
+        # of the contract; the fields that were already here kept both
+        # their names and their types.
+        "mode": "string",
         "priority": "integer",
         "project_dir": "union(null,string)",
         "raw": None,
