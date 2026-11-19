@@ -15484,11 +15484,13 @@ class Orchestrator:
 
         The record phase is also the only place that knows **both**
         numbers at once: the count the instance answered with, and the
-        count the round's own fixture holds.  When they disagree, the
-        instance is not serving this round's fixture — so the phase says
-        so, once, in a ``data_plane_fixture_mismatch`` event, instead of
-        storing the contradiction silently and letting every ``api_test``
-        VP of the round rediscover it on its own.
+        count of the database **that instance declares** it reads (the
+        backend's own database is only the fallback for a service that
+        declares none).  When they disagree, the instance is not
+        serving the database it names — so the phase says so, once, in
+        a ``data_plane_fixture_mismatch`` event, instead of storing the
+        contradiction silently and letting every ``api_test`` VP of the
+        round rediscover it on its own.
 
         Never raises — a probe that fails is a service that is not
         recorded, not a broken preflight.
@@ -15501,19 +15503,26 @@ class Orchestrator:
         # database it was read from travel together: "49 rows" means
         # nothing without "in *this* file", and the mismatch event has
         # to name the file it read.
-        db_path: Optional[Path] = None
+        # 2026-11-19 (identity fix): the backend's own database is the
+        # **fallback** baseline only.  The database a service really
+        # serves is the one **it** names in its ``instance`` block
+        # (``PDT_STATE_DB_PATH`` of the round's own service), and the
+        # expected count has to be read from *that* file -- otherwise
+        # the round compares a fixture service against the production
+        # database and declares a mismatch that is not one.
+        fallback_db_path: Optional[Path] = None
         try:
             from config_paths import resolve_state_db_path
 
-            db_path = resolve_state_db_path()
+            fallback_db_path = resolve_state_db_path()
         except Exception as exc:  # noqa: BLE001 - defensive
             logger.warning(
                 "[data_plane] could not resolve the fixture's database: %s",
                 exc,
             )
-        expected: Optional[int] = None
+        fallback_expected: Optional[int] = None
         try:
-            expected = expected_routing_rows(db_path)
+            fallback_expected = expected_routing_rows(fallback_db_path)
         except Exception as exc:  # noqa: BLE001 - defensive
             logger.warning(
                 "[data_plane] could not read the fixture's row count: %s", exc,
@@ -15533,6 +15542,39 @@ class Orchestrator:
                 port = int(decl.port)
             except (TypeError, ValueError):
                 continue
+            # 2026-11-19 (identity fix): the instance block has to be
+            # read **before** the probe, because it names the database
+            # this service really serves -- and the expected row count
+            # belongs to *that* database.  Read once per service.
+            self._record_service_instance_identity(name, port)
+            identity = (
+                getattr(self, "_service_instance_identity", None) or {}
+            )
+            recorded_instance = (
+                identity.get(str(name).lower()) or {}
+            )
+            service_db_text = str(
+                recorded_instance.get("state_db_path") or ""
+            )
+            db_path: Optional[Path] = fallback_db_path
+            expected: Optional[int] = fallback_expected
+            if service_db_text:
+                # The service published the database it reads: the
+                # expected count is read from **that** file.  When the
+                # file cannot be read the expected count stays unknown
+                # -- it must NOT fall back to the backend's own
+                # database, because "no count" and "another database's
+                # count" are different answers.
+                db_path = Path(service_db_text)
+                try:
+                    expected = expected_routing_rows(db_path)
+                except Exception as exc:  # noqa: BLE001 - defensive
+                    logger.warning(
+                        "[data_plane] could not read the row count of the "
+                        "database service %s serves (%s): %s",
+                        name, db_path, exc,
+                    )
+                    expected = None
             try:
                 fingerprint = probe_data_plane(port, expected_rows=expected)
             except Exception as exc:  # noqa: BLE001 - a probe never raises
@@ -15564,6 +15606,14 @@ class Orchestrator:
                 # the round must not make every VP rediscover the same
                 # contradiction on its own.  One event per service, so
                 # the event stays actionable.
+                #
+                # 2026-11-19 (identity fix): the count the instance
+                # answered with is compared with the count **in the
+                # database the instance itself declared**.  A
+                # disagreement now means a real contradiction — the
+                # service serves a different database than the one it
+                # names — and not merely "the backend's own database
+                # holds something else".
                 try:
                     self._safe_log_freshness_event(
                         "__preflight__", "data_plane_fixture_mismatch",
@@ -15594,7 +15644,10 @@ class Orchestrator:
             # the block says "which process".  A service that does not
             # publish one is left alone: nothing to compare, nothing to
             # gate.
-            self._record_service_instance_identity(name, port)
+            #
+            # 2026-11-19 (identity fix): the block is read **before**
+            # the probe now (it names the database the service serves),
+            # so it is not read a second time here.
         self._data_plane_fingerprints = fingerprints
         if fingerprints:
             self._safe_log_freshness_event(
@@ -15778,6 +15831,54 @@ class Orchestrator:
         if actual is None:
             return None
         return self._compare_service_instance(name, actual, port)
+
+    def _same_instance_same_db(self, name: str, decl: Any) -> bool:
+        """Is the service still the same instance, reading the same file?
+
+        2026-11-19 (identity fix): the **row count** of the data plane
+        is a *mutable* state signal -- a service that legitimately adds
+        a row answers with a different count, without being a different
+        data plane.  The **identity** of the data plane is the boot id
+        of the process plus the inode of the database file it reads, and
+        those two are what say "same instance, same database".
+
+        ``True`` only when all of that holds:
+
+          * the round **recorded** an instance block for this service
+            and the service publishes one **now**;
+          * both blocks name the same, non-empty ``boot_id``;
+          * both blocks name the same database file -- their
+            ``state_db_inode`` is known and equal.
+
+        Anything else answers ``False``: "not comparable" is not
+        "comparable and fine", and the round keeps its old blocking
+        behaviour whenever the answer cannot be backed by evidence.
+        """
+        recorded = (
+            getattr(self, "_service_instance_identity", None) or {}
+        ).get(str(name).lower()) or {}
+        if not recorded:
+            return False
+        try:
+            port = int(getattr(decl, "port", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        if not port:
+            return False
+        actual = _health_data_instance(port)
+        if not isinstance(actual, dict):
+            return False
+        recorded_boot_id = str(recorded.get("boot_id") or "")
+        actual_boot_id = str(actual.get("boot_id") or "")
+        if not recorded_boot_id or not actual_boot_id:
+            return False
+        if recorded_boot_id != actual_boot_id:
+            return False
+        recorded_inode = _instance_state_db_inode(recorded)
+        actual_inode = _instance_state_db_inode(actual)
+        if recorded_inode is None or actual_inode is None:
+            return False
+        return int(recorded_inode) == int(actual_inode)
 
     def _compare_service_instance(
         self, name: str, actual: Dict[str, Any], port: int,
@@ -16958,6 +17059,35 @@ class Orchestrator:
                         vp_id, mismatch,
                     )
                 continue
+            # 2026-11-19 (identity fix): the row count is a **mutable**
+            # state signal, the identity is the boot id plus the inode
+            # of the database file -- so a row count that grew on the
+            # **same instance reading the same file** is a legal state
+            # change, not another data plane.  The check happens before
+            # the mismatch event and before the re-ensure: neither may
+            # run for a service that never changed its identity.
+            if (
+                observed is not None
+                and observed.answered
+                and self._same_instance_same_db(name, decl)
+            ):
+                self._data_plane_fingerprints[name] = observed
+                self._safe_log_freshness_event(
+                    vp_id, "data_plane_state_growth",
+                    {
+                        "service": name,
+                        "recorded": recorded.to_dict(),
+                        "observed": observed.to_dict(),
+                    },
+                )
+                logger.info(
+                    "[data_plane] vp=%s: service %r grew its data plane "
+                    "(%s -> %s) on the same instance and the same "
+                    "database; the round follows the new count",
+                    vp_id, name, recorded.routing_rows,
+                    observed.routing_rows,
+                )
+                continue
             self._safe_log_freshness_event(
                 vp_id, "data_plane_mismatch",
                 {
@@ -17065,6 +17195,30 @@ class Orchestrator:
         expected = getattr(recorded, "expected_rows", None)
         if expected is not None:
             restored = fingerprint.routing_rows == expected
+            if not restored:
+                # 2026-11-19 (identity fix): the row count is mutable
+                # state, the identity is the boot id plus the inode of
+                # the database file.  A service that came back reading
+                # **the same file** with **more rows** is the same data
+                # plane as before -- the count only grew.  When no inode
+                # can be read, nothing is relaxed.
+                restored = False
+                try:
+                    fresh_port = int(getattr(effective, "port", 0) or 0)
+                except (TypeError, ValueError):
+                    fresh_port = 0
+                fresh = (
+                    _health_data_instance(fresh_port) if fresh_port else None
+                )
+                fresh_inode = (
+                    _instance_state_db_inode(fresh)
+                    if isinstance(fresh, dict) else None
+                )
+                if (
+                    fresh_inode is not None
+                    and fresh_inode in self._expected_state_db_inodes(name)
+                ):
+                    restored = True
         else:
             # No row count to compare: the instance the round just
             # started is the one that answers, and it is up.
