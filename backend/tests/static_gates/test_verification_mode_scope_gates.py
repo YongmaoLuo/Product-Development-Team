@@ -815,8 +815,16 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # **不同位置**，互不覆盖，故两边都保留；文件内容因此再次变化，按本 gate 的既定流程
     # 把冻结基线前移到**合并态**哈希（`shasum -a 256` 实测值）。表内条目集合与断言强度
     # 不变：被钉文件的范围不变、sha256 仍逐字节比对。
+    # 2026-11-19：因已批准的「侧栏计划状态词表统一并自动刷新」改动了 `frontend/app.js`
+    # —— `phaseLabel` / `phaseClass` 补上 running / failed / completed / stopped /
+    # verification / conflict / archived 七个执行相位，并新增侧栏轮询
+    # （`SIDEBAR_POLL_MS` / `startSidebarPolling` / `stopSidebarPolling` /
+    # `refreshSidebar` / `handleSidebarVisibilityChange`），按本 gate 的既定流程把
+    # 冻结基线前移到本分支的批准态。哈希取自工作区文件的 `shasum -a 256` 实测值，
+    # 不是抄来的。表内条目集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节
+    # 比对，该文件此后仍被逐字节钉住，任何再编辑照样红。
     "frontend/app.js": (
-        "9fc210be6ecabff8b341e1b4050f1c42d45ce63d1fe267cbf27b8c1a5c1e96f2"
+        "da10420303c8d7537d448d1664cfa773633345ee8cb7b265bf134464182ff041"
     ),
     # 2026-11-01：因「调度卡片容器与收起态样式」（task-11）改动了 `frontend/style.css`，
     # 按本 gate 的既定流程把哈希前移到本分支的批准态；表内条目集合不变。
@@ -835,8 +843,14 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 该文件只被 base 侧改动（本分支未动它），合并后的内容与 base 侧一致；按本 gate
     # 的既定流程把冻结基线钉在**合并态**哈希（`shasum -a 256` 实测值）。
     # 表内条目集合与断言强度不变：被钉文件的范围不变、sha256 逐字节比对。
+    # 2026-11-19：因已批准的「侧栏计划状态词表统一并自动刷新」给该文件加了七个执行
+    # 相位的配色规则（`.phase-running` / `.phase-failed` / `.phase-completed` /
+    # `.phase-stopped` / `.phase-verification` / `.phase-conflict` /
+    # `.phase-archived`），按本 gate 的既定流程把冻结基线前移到本分支的批准态。
+    # 哈希取自工作区文件的 `shasum -a 256` 实测值，不是抄来的。表内条目集合与断言
+    # 强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
     "frontend/style.css": (
-        "7703bc855086748565e8b79e25bf01d63936764e527d4241476d889f8b03618f"
+        "626864d268af3dd1f03ffdf736f8882d1e3c0845f33a5a24b44f1336911c8de2"
     ),
     # 2026-10-31：因本分支新增 `_repair_exit_writer`（修复轮退出事件的单一写入器）
     # 改动本文件，按本 gate 的既定流程重新钉住该文件的哈希。

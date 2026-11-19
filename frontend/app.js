@@ -14,12 +14,45 @@ window.verificationState = null;
 
 // --- Sidebar ---
 
+// The phases the sidebar knows how to name.  The execution phases
+// (running / failed / completed / stopped / verification / conflict /
+// archived) are named here too: they are the phases a plan spends most
+// of its life in, and a plan in one of them used to render as the raw
+// English word.  A phase this map does not know is shown as the raw
+// word it is (the `|| status` below) rather than as a word nobody else
+// uses.
 function phaseLabel(status) {
-    return { new: "新建", interviewed: "需求收集", prd: "PRD已生成", reviewed: "审阅中", queued: "排队中" }[status] || status;
+    return {
+        new: "新建",
+        interviewed: "需求收集",
+        prd: "PRD已生成",
+        reviewed: "审阅中",
+        queued: "排队中",
+        running: "执行中",
+        failed: "失败",
+        completed: "已完成",
+        stopped: "已停止",
+        verification: "验证中",
+        conflict: "冲突",
+        archived: "已归档",
+    }[status] || status;
 }
 
 function phaseClass(status) {
-    const known = ["new", "interviewed", "prd", "reviewed", "queued"];
+    const known = [
+        "new",
+        "interviewed",
+        "prd",
+        "reviewed",
+        "queued",
+        "running",
+        "failed",
+        "completed",
+        "stopped",
+        "verification",
+        "conflict",
+        "archived",
+    ];
     return known.includes(status) ? `phase-${status}` : "phase-default";
 }
 
@@ -81,6 +114,66 @@ function updateSidebarActiveItem(planId) {
     $$(".sidebar-plan-item").forEach((item) => {
         item.classList.toggle("active", item.dataset.plan === planId);
     });
+}
+
+// --- Sidebar auto-refresh ---
+
+/** How often the sidebar re-reads the plan list.
+
+    The plan list moves while the operator works: a plan starts, a run
+    ends, a plan is archived.  The sidebar was painted once, at load
+    time, so the status it showed was the status the plan had when the
+    page was opened — and, for a plan started from another tab, the
+    status it had before this page existed. */
+const SIDEBAR_POLL_MS = 30000;
+
+/** The one timer handle.  A second handle would be a second set of
+    reads against the same list. */
+let _sidebarPoller = null;
+
+/** Re-read the plan list and repaint the sidebar.
+
+    The read is the one the existing ``loadSidebar`` already performs,
+    with the one failure behaviour it already has: a refused read
+    paints 「计划列表加载失败」 into the sidebar and raises no dialog. */
+async function refreshSidebar() {
+    if (document.hidden) return;
+    await loadSidebar();
+}
+
+/** Start the sidebar's timer.
+
+    The previous timer is stopped first, so a second call leaves one
+    timer instead of two.  A hidden page starts no timer at all:
+    nobody is looking at the sidebar, and every tick would cost the
+    backend a read nobody sees. */
+function startSidebarPolling() {
+    stopSidebarPolling();
+    if (document.hidden) return;
+    _sidebarPoller = setInterval(refreshSidebar, SIDEBAR_POLL_MS);
+}
+
+/** Stop the sidebar's timer. */
+function stopSidebarPolling() {
+    if (_sidebarPoller) {
+        clearInterval(_sidebarPoller);
+        _sidebarPoller = null;
+    }
+}
+
+/** The page came back to the foreground.
+
+    The plan list may have moved on while the page was hidden — a plan
+    started from another tab, a run that ended.  The list is read once
+    right away, and only then the timer is started again, so the first
+    read after a long absence is not one tick late. */
+function handleSidebarVisibilityChange() {
+    if (document.hidden) {
+        stopSidebarPolling();
+        return;
+    }
+    refreshSidebar();
+    startSidebarPolling();
 }
 
 // --- Helpers ---
@@ -4390,12 +4483,26 @@ function init() {
     loadInBackground(loadPlans, "plans");
     loadInBackground(loadSidebar, "sidebar");
     loadInBackground(loadSchedulerState, "scheduler state");
+
+    // The sidebar keeps its own list current from here on: the poll
+    // reads the plan list on a timer, and a hidden page polls nothing.
+    startSidebarPolling();
 }
 
 document.addEventListener("DOMContentLoaded", init);
+
+/** One event, two consumers.
+
+    The scheduler panel and the sidebar both want to know that the page
+    came back to the foreground.  They share this one registration
+    instead of each adding a listener for the same event. */
+function handleVisibilityChange() {
+    handleSchedulerVisibilityChange();
+    handleSidebarVisibilityChange();
+}
 
 // Registered here, at the top level of the module, and not inside
 // init(): init() is re-callable, and a listener registered per call
 // would run the handler once per registration — another refresh and
 // another timer every time the tab is switched.
-document.addEventListener("visibilitychange", handleSchedulerVisibilityChange);
+document.addEventListener("visibilitychange", handleVisibilityChange);

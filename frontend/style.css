@@ -212,6 +212,13 @@ body {
 .phase-reviewed { background: var(--success-bg); color: var(--success); }
 .phase-ready { background: var(--primary-bg); color: var(--primary); }
 .phase-queued { background: var(--primary-bg); color: var(--primary); }
+.phase-running { background: var(--primary-bg); color: var(--primary); }
+.phase-failed { background: var(--danger-bg); color: var(--danger); }
+.phase-completed { background: var(--success-bg); color: var(--success); }
+.phase-stopped { background: var(--warning-bg); color: var(--warning); }
+.phase-verification { background: var(--info-bg); color: var(--info); }
+.phase-conflict { background: var(--danger-bg); color: var(--danger); }
+.phase-archived { background: var(--surface2); color: var(--text-dim); }
 .phase-default { background: var(--surface2); color: var(--text-dim); }
 
 .sidebar-plan-dots {

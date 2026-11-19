@@ -36,6 +36,20 @@ still maps it to 「就绪」 shows the operator a word nobody else uses.
 It still works as a *phase* on the read path — a plan row written
 before the merge still reads ``ready`` — but it must never be rendered.
 
+The same rule, one step further
+------------------------------
+The execution phases — ``running``, ``failed``, ``completed``,
+``stopped``, ``verification``, ``conflict`` and ``archived`` — are
+named in the sidebar as well. A plan in one of them used to render as
+the raw English word (``running``) and to fall back to the grey used
+for phases nobody knows (``phase-default``): the operator was shown
+``running`` where every other surface said 「执行中」.
+
+The rules below pin the word each of those phases wears, the colour it
+wears it in, and the fact that the colours are the sheet's own
+variables — a colour spelled with a variable the sheet does not define
+is an unstyled pill, and it looks like a phase nobody knows.
+
 Scan target
 -----------
 ``frontend/app.js`` and ``frontend/style.css``, read as source. These
@@ -70,6 +84,36 @@ _QUEUED_LABEL = 'queued: "排队中"'
 #: phase is ``queued`` now and the backend never reports ``ready``, so
 #: a map that still maps it to 「就绪」 shows a word nobody else uses.
 _LEGACY_READY_LABEL = 'ready: "就绪"'
+
+#: The phases a plan spends the rest of its life in, and the words the
+#: sidebar must show for them. The backend writes the phase word; the
+#: frontend keeps its own copy of the label map — there is no build
+#: step that could import a Python constant from — so the copy is
+#: pinned to these strings here.
+_EXECUTION_PHASE_LABELS = {
+    "running": "执行中",
+    "failed": "失败",
+    "completed": "已完成",
+    "stopped": "已停止",
+    "verification": "验证中",
+    "conflict": "冲突",
+    "archived": "已归档",
+}
+
+#: The colour each of those phases wears in the sidebar pill, spelled
+#: with the variables the sheet already defines. A phase with no rule
+#: of its own falls back to ``phase-default`` — the grey used for
+#: phases nobody knows — so a plan in the middle of a run would look
+#: exactly like a plan nobody has heard of.
+_EXECUTION_PHASE_COLOURS = {
+    "running": ("var(--primary-bg)", "var(--primary)"),
+    "failed": ("var(--danger-bg)", "var(--danger)"),
+    "completed": ("var(--success-bg)", "var(--success)"),
+    "stopped": ("var(--warning-bg)", "var(--warning)"),
+    "verification": ("var(--info-bg)", "var(--info)"),
+    "conflict": ("var(--danger-bg)", "var(--danger)"),
+    "archived": ("var(--surface2)", "var(--text-dim)"),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +200,25 @@ def _declarations(body: str) -> set[str]:
         for declaration in body.split(";")
         if declaration.strip()
     }
+
+
+def _root_variables(css: str) -> set[str]:
+    """Return the custom properties the sheet defines in ``:root``.
+
+    A colour spelled with a variable the sheet does not define is not
+    a colour: the browser drops the declaration and the pill renders
+    unstyled — which is what a phase nobody knows looks like anyway.
+
+    Raises :class:`AssertionError` when the sheet has no ``:root``
+    block, so a renamed selector fails loudly instead of matching
+    nothing and passing.
+    """
+    match = re.search(r":root\s*\{([^}]*)\}", css)
+    assert match is not None, (
+        "style.css has no :root block, so it defines no custom "
+        "properties and no phase rule can be spelled with one."
+    )
+    return set(re.findall(r"(--[A-Za-z0-9_-]+)\s*:", match.group(1)))
 
 
 # ---------------------------------------------------------------------------
@@ -372,3 +435,96 @@ def test_style_has_phase_queued_class() -> None:
         f"words name the same situation; expected {sorted(ready)}, got "
         f"{sorted(queued)}."
     )
+
+
+def test_phase_label_names_the_execution_phases() -> None:
+    """Every execution phase must have a Chinese label in the sidebar.
+
+    The backend reports the phase word; the sidebar shows a label. A
+    phase with no entry in the map is shown as the raw word it is —
+    ``running``, ``failed``, ``archived`` — so the operator reads the
+    one surface of the page that speaks English while every other
+    surface speaks the system's own vocabulary.
+
+    The words are pinned here because the frontend keeps its own copy
+    of the map: there is no build step that could import the backend's
+    labels, so two copies of one string is exactly the shape that
+    drifts.
+    """
+    body = _function_body(_source(_APP_JS), "phaseLabel")
+
+    for phase, label in _EXECUTION_PHASE_LABELS.items():
+        assert f'{phase}: "{label}"' in body, (
+            f"phaseLabel() has no `{phase}` entry, so a plan in that "
+            f"phase renders as the raw string `{phase}` in the sidebar "
+            f"instead of 「{label}」."
+        )
+
+
+def test_phase_class_knows_the_execution_phases() -> None:
+    """Every execution phase must have a class of its own.
+
+    The class carries the colour. A phase that is not in the ``known``
+    list falls back to ``phase-default`` — the grey used for phases
+    nobody knows — so a plan that is running looks exactly like a plan
+    the page has never heard of.
+    """
+    body = _function_body(_source(_APP_JS), "phaseClass")
+
+    match = re.search(r"known\s*=\s*\[(.*?)\]", body, re.DOTALL)
+    assert match is not None, (
+        "phaseClass() no longer declares its `known` list of phases; the "
+        "gate cannot tell which phases get their own colour."
+    )
+
+    known = match.group(1)
+    for phase in _EXECUTION_PHASE_LABELS:
+        assert f'"{phase}"' in known, (
+            f"phaseClass() does not know the `{phase}` phase, so a plan "
+            "in that phase falls back to `phase-default` — the grey "
+            "used for unknown phases."
+        )
+
+
+def test_style_has_a_colour_for_every_execution_phase() -> None:
+    """Every execution phase must be styled, in the sheet's own colours.
+
+    Without a rule of its own the pill has no background at all: an
+    unstyled chip that reads as a phase nobody knows. The colours are
+    pinned to the variables the sheet already defines — the running
+    phase in the primary colour, a failure and a conflict in the
+    danger colour, a finished plan in the success colour, a stopped
+    run in the warning colour, verification in the info colour, and an
+    archived plan in the grey.
+
+    The variables are checked against ``:root``: a colour spelled with
+    a variable the sheet does not define is dropped by the browser, so
+    the pill would render unstyled while the rule still reads as a
+    colour.
+    """
+    css = _source(_STYLE_CSS)
+    variables = _root_variables(css)
+
+    for phase, (background, colour) in _EXECUTION_PHASE_COLOURS.items():
+        bodies = _css_rule_bodies(css, f".phase-{phase}")
+        assert bodies, (
+            f"style.css has no .phase-{phase} rule; the {phase} pill "
+            "renders unstyled."
+        )
+
+        declarations = {
+            declaration for body in bodies for declaration in _declarations(body)
+        }
+        expected = {f"background: {background}", f"color: {colour}"}
+        assert declarations == expected, (
+            f".phase-{phase} does not wear the colours the phase wears "
+            f"in the rest of the sheet; expected {sorted(expected)}, got "
+            f"{sorted(declarations)}."
+        )
+
+        for used in re.findall(r"var\(\s*(--[A-Za-z0-9_-]+)", " ".join(declarations)):
+            assert used in variables, (
+                f".phase-{phase} is spelled with `{used}`, which "
+                "style.css does not define in :root. The browser drops "
+                "the declaration and the pill renders unstyled."
+            )
