@@ -11495,8 +11495,18 @@ def _make_repair_on_complete(
                         on_complete=_on_repair_complete,
                     )
                 elif _result.get("status") == "passed":
-                    _record_terminal(
-                        "passed", None, token=_instance_token,
+                    # 2026-11-19: this exit used to write the terminal
+                    # itself, which BYPASSED the finishing gate: a plan
+                    # that declares a requirement book was closed as
+                    # ``completed`` right here and the finishing stage
+                    # never started.  The passed exit now goes through the
+                    # ONE decision point (:func:`_handle_passed_round`),
+                    # so both exits from a passed round agree.
+                    _handle_passed_round(
+                        plan_id,
+                        _next_round,
+                        _server.PlanState(_server._plan_dir(plan_id)),
+                        round_token=_instance_token,
                     )
                     _instance_terminal = True
                 elif _result.get("status") == "loop_stopped":
