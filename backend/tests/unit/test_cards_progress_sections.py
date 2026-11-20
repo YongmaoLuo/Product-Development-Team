@@ -201,3 +201,85 @@ def test_status_section_carries_the_started_at():
     status = build_progress_sections(_payload())[0]
 
     assert status["started_at"] == "2026-11-14T10:00:00"
+
+
+# ---------------------------------------------------------------------------
+# Header parity with the Feishu card
+# ---------------------------------------------------------------------------
+
+
+def _repair_payload(**overrides: Any) -> Dict[str, Any]:
+    """A snapshot of a plan whose repair round is executing.
+
+    The shape is the one ``GET /api/plan/{id}/status`` answers with: the
+    top-level fields the server computed (``execution_in_flight`` among
+    them) AND the summary section the panel reads its state from. The
+    verification verdict is already ``failed`` — the repair round that
+    follows it is what is running now.
+    """
+    payload = _payload(
+        current_phase="executing",
+        summary={
+            "state": {
+                "current_phase": "executing",
+                "verification": {
+                    "status": "failed",
+                    "round": 3,
+                    "max_rounds": 4,
+                },
+            },
+            "tasks": {"total": 4, "completed": 3},
+        },
+        verification_status="failed",
+        verification_round=3,
+        verification_max_rounds=4,
+        execution_in_flight=True,
+        verification_in_flight=False,
+        tasks={"total": 4, "completed": 3},
+    )
+    payload.update(overrides)
+    return payload
+
+
+def test_sections_header_live_repair_reads_payload_execution_in_flight():
+    """A running repair round reads as running, from the snapshot's word.
+
+    The panel rebuilt its status from the summary alone, and that rebuild
+    cannot see liveness — so a plan mid-repair said "❌ 验证失败" while
+    the Feishu card on the very same plan said "🔧 修复执行中".
+    """
+    sections = build_progress_sections(_repair_payload())
+
+    assert sections[0]["title"] == "🔧 修复执行中 · p1 round 3/4"
+    assert sections[0]["color"] == "blue"
+
+
+def test_sections_header_terminal_failed_when_execution_not_in_flight():
+    """A finished repair round stays a failed verification.
+
+    The liveness flag must only ever turn a terminal verdict into a live
+    one — never the other way round.
+    """
+    sections = build_progress_sections(
+        _repair_payload(execution_in_flight=False),
+    )
+
+    assert sections[0]["title"] == "❌ 验证失败 · p1"
+    assert sections[0]["color"] == "red"
+
+
+def test_sections_header_matches_feishu_card_header():
+    """The panel's header and the Feishu card's header are one answer.
+
+    Both are rendered from the same snapshot, so they must read the same
+    — this test is the tie between the two surfaces.
+    """
+    from plan_status import from_payload
+
+    payload = _repair_payload()
+    sections = build_progress_sections(payload)
+    status = from_payload(payload)
+    card = cards.build_card("p1", status, summary={"tasks": payload["tasks"]})
+
+    assert sections[0]["title"] == card["header"]["title"]["content"]
+    assert sections[0]["title"] == "🔧 修复执行中 · p1 round 3/4"

@@ -40,6 +40,12 @@ from utils.secret_files import private_dir, redact_all, write_private_json
 # nothing else.  See ``_plan_context_env`` for why the plans root is not
 # among them.
 from plan_env import PLAN_ID_ENV, plan_env
+# 2026-11-18 — the plan's mode (stdlib only, no backend imports): the
+# value the cost gate, the executor and the verification sub-agent all
+# have to agree on.  The parsing lives in ``plan_mode`` so this module
+# cannot answer "test" where the gate answers "production".  See
+# ``_stamp_plan_mode`` for how it reaches a child process.
+from plan_mode import PLAN_MODE_ENV, resolve_mode
 # Sub-agent sandbox wrapping (2026-10-06). Dependency-free (stdlib only)
 # and it imports nothing from this module, so a top-level import is safe.
 import claude_sandbox
@@ -1820,6 +1826,51 @@ def _stamp_allowed_write_files(
         settings_data["env"]["PDT_DECLARED_MANIFEST_HASH"] = (
             hashlib.sha256(manifest.encode()).hexdigest()[:16]
         )
+
+
+def _stamp_plan_mode(settings_data: dict, plan_mode: Optional[str]) -> None:
+    """Tell this sub-agent's child which mode the plan runs in (2026-11-18).
+
+    A plan may declare that it runs in ``test`` mode: the pipeline is
+    exercised, but the run must not touch anything real.  The child has
+    to be told, because a child that does not know runs for real --
+    which is the one outcome a ``test`` plan must never produce.
+
+    The channel is the ``--settings`` payload's ``env``, not the
+    process environment: the CLI folds its settings scopes into
+    ``process.env`` late enough to win over what the child inherited,
+    so a value written here is the value the child sees.
+
+    Three guards, all deliberate:
+
+    * **no mode means no key.**  ``None`` (and an empty string) leave
+      the key ABSENT rather than writing ``""`` or ``production``: an
+      ordinary coding task is not part of a plan, and must not be told
+      it runs in a mode it was never given.  An absent key is also what
+      makes "this sub-agent was never told" distinguishable from "the
+      mode happened to be blank".
+
+    * **the value is resolved, never passed through.**  A mode nobody
+      recognises becomes ``production`` -- the mode that must be safe
+      to assume -- by :func:`plan_mode.resolve_mode`, the one parser in
+      the codebase.  A child must never see a value its siblings would
+      read as something else.
+
+    * it never CLEARS the key: ``settings_data`` is rebuilt per dispatch
+      from the pristine template, so one dispatch's mode cannot leak
+      onto the next one sharing this process.
+
+    Extracted next to :func:`_stamp_readonly_task` for the same reason
+    that one was: the seam is otherwise only reachable by spawning a
+    CLI, and a seam nobody can reach is a seam nobody tests.
+    """
+    if plan_mode is None:
+        return
+    if isinstance(plan_mode, str) and not plan_mode.strip():
+        return
+    resolved, _is_fallback = resolve_mode(plan_mode)
+    env = settings_data.setdefault("env", {})
+    env[PLAN_MODE_ENV] = resolved
 
 
 def _build_guard_hook() -> Dict[str, str]:
@@ -4037,7 +4088,8 @@ class ClaudeCodingTool(CodingTool):
                  base_url: Optional[str] = None,
                  auth_token: Optional[str] = None,
                  scene: Optional[str] = None,
-                 concurrency_tracker=None):
+                 concurrency_tracker=None,
+                 plan_mode: Optional[str] = None):
         # Default: inherit from parent process env (no override).
         # Only when explicitly passed do we override the child process.
         self.model = model
@@ -4094,6 +4146,13 @@ class ClaudeCodingTool(CodingTool):
         # scene chain via ``provider_routing.resolve_provider_chain``
         # (hot-reload friendly) and uses its candidates exclusively.
         self.scene = scene
+        # 2026-11-18: the plan's mode, when this tool belongs to a plan
+        # that declared one.  ``None`` means "this tool is not part of a
+        # plan" -- an ordinary coding task carries no mode, and the
+        # settings payload must not grow one.  When it IS set, the value
+        # is stamped into the payload's ``env`` (see ``_stamp_plan_mode``)
+        # so the child process runs in the mode its plan asked for.
+        self.plan_mode = plan_mode
         # 2026-11-10 — the wall cap for a verification query is a
         # CONSTRUCT-TIME default, not something a caller has to
         # remember to set.  It used to be applied by a helper in the
@@ -4762,6 +4821,12 @@ class ClaudeCodingTool(CodingTool):
             # inherited, so a process in a worktree was handed the
             # production root.  See ``_plan_context_env``.
             settings_data["env"].update(_plan_context_env())
+            # 2026-11-18: the plan's mode, when this tool belongs to a
+            # plan that declared one.  It rides the same payload as the
+            # other ``PDT_*`` stamps, so the child process cannot run in
+            # a mode its plan did not ask for.  A tool with no mode
+            # writes no key at all.
+            _stamp_plan_mode(settings_data, self.plan_mode)
             settings_data.setdefault("hooks", {})
             settings_data["hooks"].setdefault("PreToolUse", [])
             guard_hook = _build_guard_hook()

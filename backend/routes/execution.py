@@ -97,6 +97,17 @@ from log_guardian import spawn_guardian
 # cannot answer differently about the same plan.
 from plan_status import normalize_exec_status
 
+# The plan's mode — "production" or "test" — has to reach the executor
+# subprocess, which is a *different process* and cannot see the plan's
+# flags.  It travels in the environment (``PDT_PLAN_MODE``).
+#
+# The read goes through the one reader that resolves the mode the same
+# way every other reader does, so the subprocess cannot be told a
+# different mode than the cost gate and the verification sub-agent see.
+# A plan that says nothing reads as ``production``, and says so in the
+# log — that warning belongs to the reader, not here.
+from plan_state import read_plan_mode
+
 # The reader for "which plans are working right now".  It is the same
 # reader the scheduler uses, so the reset endpoint and the scheduler
 # cannot answer differently about the same plan: the running set is
@@ -1882,7 +1893,9 @@ def _spawn_executor_subprocess(
             existing log rotation convention is preserved. Parent
             directories are created automatically.
         extra_env: extra env vars to merge into the subprocess env
-            (PYTHONUNBUFFERED=1 and PDT_PLAN_ID are always set).
+            (PYTHONUNBUFFERED=1, PDT_PLAN_ID and PDT_PLAN_MODE are always
+            set; ``extra_env`` is merged last, so it can override the
+            mode).
         role: the role the process is recorded under in the process
             ledger. Defaults to ``"executor"``; the reaper decides what
             to do with a process by its role, so a caller that starts a
@@ -1940,6 +1953,29 @@ def _spawn_executor_subprocess(
     venv_bin = str(backend_dir / ".venv" / "bin")
     if os.path.isdir(venv_bin):
         env["PATH"] = venv_bin + ":" + env.get("PATH", "")
+
+    # 2026-11-18: the plan's mode travels to the child in the
+    # environment.  The child is a different process — it cannot see
+    # the plan's flags — so "the plan said test" and "the executor ran
+    # as if it were production" must not both be true.  A plan that
+    # says nothing reads as ``production`` (the mode that must be safe
+    # to assume); the warning for that belongs to ``read_plan_mode``.
+    #
+    # The read is a *read*: it never writes the plan's state, and it
+    # never writes another env key.  A read that fails outright must
+    # not cost the plan its execution, so the fallback is the same
+    # ``production`` the reader itself would answer — and it is said
+    # out loud rather than swallowed.
+    try:
+        env["PDT_PLAN_MODE"] = read_plan_mode(plan_dir)
+    except Exception:  # noqa: BLE001 — a mode is metadata, not a gate
+        env["PDT_PLAN_MODE"] = "production"
+        _server.logger.warning(
+            "executor_plan_mode_read_failed plan=%s", plan_id, exc_info=True
+        )
+
+    # ``extra_env`` is merged last, so a caller that knows more about
+    # the run than the plan's flag does can override the mode.
     if extra_env:
         env.update(extra_env)
 
