@@ -644,6 +644,11 @@ def test_reimport_does_not_duplicate(
         "content": "the first import",
         "title": "Re-imported plan",
         "priority": 7,
+        # The same material for the same checkout is a repeat import, and
+        # a repeat import is refused unless the caller says otherwise.
+        # This case is about the *queue row*, not about the refusal, so
+        # it asks for the import to go ahead.
+        "allow_duplicate": True,
     })
     assert second.status_code == 200, second.text
     assert second.json()["plan_id"] == plan_id

@@ -420,6 +420,10 @@ LEGACY_FIELD_TYPES: Dict[str, Dict[str, Optional[str]]] = {
         "detail": "array<ValidationError>",
     },
     "ImportPlanRequest": {
+        # `allow_duplicate` 是 2026-11-20 给这个请求体加的默认 False 布尔：
+        # 重复导入默认被 409 拒绝，只有显式置 True 才放行。它与 `mode` 一样
+        # 是**已批准的契约增长**，原有字段的名字与类型全部未变。
+        "allow_duplicate": "boolean",
         "content": None,
         "hook_destination": "union(null,string)",
         "hook_session_id": "union(null,string)",

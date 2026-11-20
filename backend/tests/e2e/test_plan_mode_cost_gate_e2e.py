@@ -814,6 +814,9 @@ def mode_chain(tmp_path_factory) -> Dict[str, Any]:
             {
                 "project_dir": str(project_dir),
                 "content": IMPORT_CONTENT,
+                # 同一份材料、同一个项目，这里**故意**要第二个计划来对比
+                # test / production 两种用途，所以显式声明允许重复导入。
+                "allow_duplicate": True,
                 "title": IMPORT_TITLE_PRODUCTION,
             },
             timeout=IMPORT_TIMEOUT_SECONDS,
