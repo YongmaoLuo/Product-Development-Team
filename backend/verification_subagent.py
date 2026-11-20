@@ -83,6 +83,11 @@ from verification_evidence import (
     verify_evidence,
 )
 from config_paths import resolve_plans_dir
+# 2026-11-18: the plan's mode.  The cost gate, the executor and this
+# sub-agent are three different processes that have to agree on it, so
+# the value comes off the plan's own state row through the ONE reader
+# (``read_plan_mode``) -- never parsed here a second time.
+from plan_state import read_plan_mode
 # 2026-10-31（计划日志有界轮转）：attempt 日志走有界追加，写入方不再
 # 裸 ``open(..., "a")`` —— 一个只涨不落的文件是没有上限的文件。
 from bounded_log import append_bounded_line
@@ -214,6 +219,26 @@ def plan_dir_of_artifact_dir(artifact_dir: Any) -> str:
     if not result or result == os.sep:
         return ""
     return result
+
+
+def _scoped_plan_mode(plan_dir: Optional[Path]) -> Optional[str]:
+    """The mode of the plan this sub-agent verifies (2026-11-18).
+
+    A thin wrapper over :func:`plan_state.read_plan_mode` — the one
+    reader of the mode -- so the scoped tool, the cost gate and the
+    executor cannot answer three different things about the same plan.
+
+    ``None`` (no plan directory: the refiner's own queries, the
+    sub-agent's own bookkeeping) means "this run belongs to no plan",
+    and the answer is ``None`` too — the tool then carries no mode at
+    all, which is what an ordinary coding task gets.
+
+    A plan that says nothing reads as ``production``: the mode that must
+    be safe to assume.
+    """
+    if plan_dir is None:
+        return None
+    return read_plan_mode(Path(plan_dir))
 
 
 def _marshal_safe_on_worker_thread(func: Any) -> Any:
@@ -1013,6 +1038,11 @@ class VerificationSubAgent:
     # 替身覆盖过（``_build_prompt(self, vp_node, attempt)``），加参数会把
     # 那些替身炸掉。
     pending_evidence_issues: List[str] = field(default_factory=list)
+    # 2026-11-18: the plan this sub-agent verifies.  ``None`` until
+    # ``run()`` is called with one; it is what the scoped tool reads the
+    # plan's mode from, so the child process runs in the mode the plan
+    # asked for rather than in the mode the gate believes.
+    plan_dir: Optional[Path] = None
 
     def __post_init__(self) -> None:
         # Resolve the template eagerly so construction fails fast for
@@ -1476,6 +1506,13 @@ class VerificationSubAgent:
             security net (the LLM never emits it).
         """
         vp_id = str(vp_node.get("id", "unknown"))
+
+        # 2026-11-18: the plan this run belongs to.  The scoped tool is
+        # built further down (inside the self-heal loop), and it is the
+        # plan's own state row that says which mode the run is in — so
+        # the plan directory is recorded on the instance here, where the
+        # caller hands it over.
+        self.plan_dir = plan_dir
 
         # 2026-10-27（分派表）：先问分派表。这条验证点的判据如果本来就是
         # 可机械执行的，就**不要**起 LLM 会话 —— 判定住在 runner 里，
@@ -2164,6 +2201,13 @@ class VerificationSubAgent:
                 settings=_Path(settings_path),
                 cwd=str(project_dir) if project_dir else None,
                 scene=self.scene,
+                # 2026-11-18: the plan's mode, read off the plan's own
+                # state row.  The scoped tool's ``--settings`` payload is
+                # what the child process reads, so this is where the mode
+                # reaches it — without it the sub-agent would run for
+                # real while the cost gate believes the plan is only
+                # being rehearsed.
+                plan_mode=_scoped_plan_mode(self.plan_dir),
             )
 
         # 2026-08-25: register scoped_tool with the HB watchdog so a

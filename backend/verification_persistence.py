@@ -49,7 +49,12 @@ from typing import Optional, List, Dict, Any, Sequence
 
 from bounded_log import append_bounded_line, rotated_log_paths
 from plan_artifacts import TASKS_FILENAME
-from verification_report_md import render as render_markdown
+from verification_report_md import (
+    _entry_id,
+    cost_deferred_entries,
+    is_test_mode_cost_skip,
+    render as render_markdown,
+)
 
 
 #: The derived Markdown view's filename, next to ``verification_report.json``.
@@ -83,7 +88,18 @@ _VERDICT_TEXT_KEYS = ("verdict", "status", "result", "state", "decision", "value
 _PLAN_TASK_VP_KEYS = ("vp_id", "failed_vp_id")
 
 #: The report fields that are lists, and default to an empty list.
-_REPORT_LIST_FIELDS = ("skipped_items", "confirmed_defects", "unresolved", "human_decisions")
+#:
+#: ``cost_gate_skipped_test_mode`` is derived (see
+#: :func:`_collect_test_mode_skips`), but it is listed here because the
+#: readers key on it being present — a reader that has to ask "is this
+#: field there?" for every report is a reader that will one day guess.
+_REPORT_LIST_FIELDS = (
+    "skipped_items",
+    "confirmed_defects",
+    "unresolved",
+    "human_decisions",
+    "cost_gate_skipped_test_mode",
+)
 
 #: The suffix a rotated copy of a log carries: ``<name>.1`` … ``<name>.N``.
 #: The highest number holds the oldest lines.
@@ -109,6 +125,35 @@ def _log_candidates(live: Path) -> List[Path]:
         for candidate in (*rotated_log_paths(live), live)
         if candidate.exists()
     ]
+
+
+def _collect_test_mode_skips(report: Dict[str, Any]) -> List[str]:
+    """The verification points the cost gate held back because the run is a test.
+
+    The judgement is the Markdown view's judgement: ``cost_deferred_entries``
+    finds the ``DEFERRED`` entries, ``is_test_mode_cost_skip`` picks the ones
+    marked ``test``.  Both live in :mod:`verification_report_md` and are used
+    here on purpose — two implementations of "which points did the test-mode
+    cost gate skip" would drift, and the report would end up claiming a skip
+    the Markdown does not show (or the other way round).
+
+    The same verification point can show up in several fields of the report
+    (the plan side writes ``cost``, the execution side writes ``reasons``),
+    so the ids are de-duplicated — one point, one entry, however many records
+    mention it.
+
+    :param report: The report (the JSON one).
+    :return: The verification-point ids, de-duplicated and sorted; empty when
+        nothing was skipped.
+    """
+    vp_ids = set()
+    for entry in cost_deferred_entries(report):
+        if not is_test_mode_cost_skip(entry):
+            continue
+        vp_id = _entry_id(entry)
+        if vp_id:
+            vp_ids.add(vp_id)
+    return sorted(vp_ids)
 
 
 def _discard(path: Optional[Path]) -> None:
@@ -495,6 +540,15 @@ class VerificationPersistenceManager:
         for field in _REPORT_LIST_FIELDS:
             if not isinstance(report_data.get(field), list):
                 report_data[field] = []
+        # Which verification points the cost gate held back because this
+        # run is a rehearsal.  Derived here (rather than left to the
+        # caller) so the JSON carries the same answer the Markdown view
+        # shows — and carries it even when there is nothing to skip, so
+        # the readers never have to ask whether the field is there.
+        report_data["cost_gate_skipped_test_mode"] = _collect_test_mode_skips(report_data)
+        report_data["cost_gate_skipped_test_mode_count"] = len(
+            report_data["cost_gate_skipped_test_mode"]
+        )
         if "final_verdict" not in report_data:
             report_data["final_verdict"] = self._derive_final_verdict(report_data)
         report_data["repair_records"] = self._build_repair_records(report_data)

@@ -666,7 +666,8 @@ def test_command_e2e_runs_without_llm(tmp_path, monkeypatch, acceptance_summary)
     * 分派结论是「确定性 runner」而不是 LLM 路径 —— 这条判定不开任何模型
       会话，退出码就是结论；
     * ``cost=llm_quota`` 的验证点在默认开关下是 DEFERRED（**没有**被执行），
-      报告里单列「因成本跳过（DEFERRED）」小节，且它不进失败清单。
+      报告里单列「test 模式下因成本门跳过」小节（普通「因成本跳过
+      （DEFERRED）」小节不收它），且它不进失败清单。
     """
     repo = _init_repo(tmp_path / "repo")
     (repo / "e2e_entry.sh").write_text(
@@ -726,6 +727,11 @@ def test_command_e2e_runs_without_llm(tmp_path, monkeypatch, acceptance_summary)
         plan_id="plan-e2e-cost-gate",
         plan_dir=tmp_path / "plan",
         sub_agent_runner=_runner,
+        # 成本门按**计划** mode 分流（2026-11-18）：这条用例要验的是 test
+        # 模式下「要花钱的验证点被挡下」，所以 mode 显式给成 test。省略它
+        # 的话执行器会去计划状态行里读，而一个没写过 mode 的计划读出来的是
+        # production（成本门不生效）。
+        plan_mode="test",
     )
 
     cost_verdict = asyncio.run(executor._run_single_vp(dict(cost_vp)))
@@ -734,7 +740,7 @@ def test_command_e2e_runs_without_llm(tmp_path, monkeypatch, acceptance_summary)
     assert calls == [], "成本闸拦下的验证点绝不许真去执行"
     assert cost_verdict["evidence"]["cost"] == "llm_quota", cost_verdict
 
-    # --- 报告：「因成本跳过」单列成节，且不进失败清单 --------------------
+    # --- 报告：test 档的成本跳过单列成节，且不进失败清单 ----------------
     report = {
         "final_verdict": "passed",
         "verification_results": [
@@ -759,14 +765,29 @@ def test_command_e2e_runs_without_llm(tmp_path, monkeypatch, acceptance_summary)
 
     markdown = verification_report_md.render(report)
 
-    section_title = "## " + verification_report_md.COST_DEFERRED_SECTION_TITLE
-    assert section_title in markdown, markdown
-    section = markdown.split(section_title, 1)[1].split("\n## ", 1)[0]
+    # A test-mode cost-gate deferral is listed in its **own** section
+    # (``test 模式下因成本门跳过``) and is excluded from the ordinary
+    # 「因成本跳过（DEFERRED）」 section: "this round was not supposed to
+    # spend money" and "deferred for some other reason" are different
+    # facts, and mixing them in one section makes the reader dig
+    # through ``evidence`` to tell them apart.  So this case pins the
+    # test-mode section (and its count) and pins the ordinary section's
+    # **absence**.
+    test_mode_title = "## " + verification_report_md.COST_GATE_TEST_MODE_SECTION_TITLE
+    title_lines = [
+        line for line in markdown.splitlines() if line.startswith(test_mode_title)
+    ]
+    assert len(title_lines) == 1, markdown
+    assert title_lines[0].endswith("（共 1 条）"), title_lines
+    section = markdown.split(title_lines[0], 1)[1].split("\n## ", 1)[0]
     deferred_rows = [
         line for line in section.splitlines() if line.startswith("| VP-E2E-002")
     ]
     assert len(deferred_rows) == 1, section
     assert "llm_quota" in deferred_rows[0], deferred_rows
+
+    ordinary_title = "## " + verification_report_md.COST_DEFERRED_SECTION_TITLE
+    assert ordinary_title not in markdown, markdown
 
     # DEFERRED 不是失败：它不得出现在失败清单里。
     failure_rows = [
@@ -777,3 +798,48 @@ def test_command_e2e_runs_without_llm(tmp_path, monkeypatch, acceptance_summary)
     assert not any("VP-E2E-002" in line for line in failure_rows), failure_rows
 
     acceptance_summary["deferred_section"] = True
+
+
+# ---------------------------------------------------------------------------
+# 4) 生产模式：成本门不生效，要花钱的验证点照常执行
+# ---------------------------------------------------------------------------
+
+
+def test_production_plan_mode_does_not_defer(tmp_path, monkeypatch):
+    """``plan_mode="production"`` → ``cost=llm_quota`` 的验证点**不被延后**。
+
+    生产计划里真花钱是预期：成本门是**测试模式**的闸门。把生产计划里
+    「要花钱才能验」的验证点延后，等于让生产计划「没验就过」—— 而延后
+    不计失败（DEFERRED 不是 FAILED），这条缺陷会一路安静地走到「验证通过」。
+
+    断言的是**真的派发出去了**：runner 被调用了一次，且结论不是 DEFERRED。
+    """
+    monkeypatch.delenv(ALLOW_LLM_QUOTA_ENV, raising=False)
+    calls: List[Dict[str, Any]] = []
+
+    def _runner(vp_arg: Dict[str, Any]) -> Dict[str, Any]:
+        calls.append(vp_arg)
+        return {"status": "PASSED", "reasons": ["ok"], "evidence": {}}
+
+    cost_vp: Dict[str, Any] = {
+        "id": "VP-E2E-003",
+        "verification_method": "e2e",
+        "e2e_kind": "command",
+        "title": "生产模式成本闸",
+        "expected_result": "exit 0",
+        "cost": "llm_quota",
+    }
+    executor = verification_executor.VerificationExecutor(
+        verification_plan={"verification_points": [dict(cost_vp)]},
+        plan_id="plan-e2e-cost-gate-production",
+        plan_dir=tmp_path / "plan-production",
+        sub_agent_runner=_runner,
+        plan_mode="production",
+    )
+
+    verdict = asyncio.run(executor._run_single_vp(dict(cost_vp)))
+
+    assert verdict["status"] != "DEFERRED", verdict
+    assert verdict["status"] == "PASSED", verdict
+    assert len(calls) == 1, "生产模式下这条验证点必须真的被派发出去"
+    assert calls[0]["id"] == "VP-E2E-003", calls

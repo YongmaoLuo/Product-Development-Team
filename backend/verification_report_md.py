@@ -61,11 +61,24 @@
 
 所以报告给它们单列一节（见 :func:`_cost_deferred_rows`），不混进失败
 清单；没有这类验证点时整节省略 —— 旧报告逐字节不变。
+
+``DEFERRED`` 还有两种来路，操作者关心的程度并不一样：test 模式下被
+成本门挡下（本轮本来就不该花钱，跳过是**预期**的）与别的来路（运行器
+自己挡下的、计划侧声明的）。报告把前者单列一节并写清计数（见
+:func:`is_test_mode_cost_skip`）—— 否则读者得逐条去翻 ``evidence``
+才知道哪些是「test 模式省下来的钱」。
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+
+#: test 模式的模式名。
+#:
+#: 只取**名字**，不取 :func:`plan_mode.resolve_mode` —— 那个解析器对「缺失」
+#: 与「非法」的值都会打一条告警，而这里是逐条读报告里的裁决：一份报告里
+#: 没有模式标记的 ``DEFERRED`` 是常态，不该刷一屏告警。
+from plan_mode import MODE_TEST
 
 #: 表格单元格里没有内容时的占位符。
 _MISSING_CELL = "—"
@@ -178,6 +191,11 @@ _COST_DEFERRED_HEADER = ("VP", "成本", "原因")
 
 #: 「因成本跳过」小节的标题（渲染时前面加 ``##``）。
 COST_DEFERRED_SECTION_TITLE = "因成本跳过（DEFERRED）"
+
+#: 「test 模式下因成本门跳过」小节的标题（渲染时前面加 ``##``）。
+#:
+#: 标题本身是常量，**条数是数据** —— 计数（``（共 N 条）``）在渲染时补上。
+COST_GATE_TEST_MODE_SECTION_TITLE = "test 模式下因成本门跳过"
 
 #: 复用标记：一条结论是从**第几轮**复用来的。
 #:
@@ -508,7 +526,7 @@ def _repair_rows(
     prepared.sort(key=lambda row: (row[0], row[1], row[2], row[3]))
     return [[_escape(value or _MISSING_CELL) for value in row] for row in prepared]
 
-def _cost_deferred_entries(report: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+def cost_deferred_entries(report: Mapping[str, Any]) -> List[Mapping[str, Any]]:
     """报告里状态为 ``DEFERRED`` 的验证点条目（按字段优先级，未去重）。
 
     :param report: 报告 JSON。
@@ -526,6 +544,45 @@ def _cost_deferred_entries(report: Mapping[str, Any]) -> List[Mapping[str, Any]]
                 continue
             entries.append(entry)
     return entries
+
+
+#: 旧名（私有）保留为别名 —— 按旧名调用的地方不至于断。
+_cost_deferred_entries = cost_deferred_entries
+
+
+def _entry_plan_mode(entry: Mapping[str, Any]) -> str:
+    """一条结论声明的计划模式（小写；取不到就是空串）。
+
+    标记有两处：条目顶层的 ``plan_mode`` 与证据里的 ``evidence.plan_mode``。
+    执行器把模式写进证据（成本门据此记下裁决），计划侧也可能直接把它写在
+    条目上 —— 两处都认。
+
+    :param entry: 报告里的一条验证点结论。
+    :return: 模式文本（小写；可能为空串）。
+    """
+    raw = _text(entry.get("plan_mode"))
+    if not raw:
+        evidence = entry.get("evidence")
+        if isinstance(evidence, Mapping):
+            raw = _text(evidence.get("plan_mode"))
+    return raw.lower()
+
+
+def is_test_mode_cost_skip(entry: Mapping[str, Any]) -> bool:
+    """这条结论是不是「test 模式下被成本门挡下」。
+
+    判据只有两条：状态是 ``DEFERRED``（这轮没跑，不是跑挂了），且计划
+    模式标成 ``test``（本轮本来就不该花钱，跳过是预期行为）。别的来路的
+    ``DEFERRED`` 不归这一节管 —— 它们留在普通「因成本跳过」小节里。
+
+    :param entry: 报告里的一条验证点结论。
+    :return: 是 test 模式的成本门跳过则 ``True``。
+    """
+    if not isinstance(entry, Mapping):
+        return False
+    if _text(entry.get("status")).upper() != _COST_DEFERRED_STATUS:
+        return False
+    return _entry_plan_mode(entry) == MODE_TEST
 
 
 def _cost_value(entry: Mapping[str, Any]) -> str:
@@ -569,6 +626,59 @@ def _reason_text(entry: Mapping[str, Any]) -> str:
     return _first_text(entry, _COST_REASON_KEYS)
 
 
+def _deferred_groups(report: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """``DEFERRED`` 条目按 VP id 合并后的分组（成本 / 原因互补）。
+
+    同一条验证点可能同时出现在报告的几个字段里（计划侧给 ``cost``，执行
+    侧给 ``reasons``）—— 按 VP id 合并，字段互补。
+
+    合并**先于**分类：一条 VP 只要有一份记录写着「test 模式」，它就归
+    test 模式那节 —— 同一条 VP 不该在两节里各出现一次。
+
+    :param report: 报告 JSON。
+    :return: 分组列表（每组含 ``vp_id`` / ``cost`` / ``reason`` /
+        ``test_mode``，按 VP id 排序）。
+    """
+    merged: Dict[str, Dict[str, Any]] = {}
+    for index, entry in enumerate(cost_deferred_entries(report)):
+        vp_id = _text(entry.get("id")) or _text(entry.get("vp_id"))
+        key = vp_id or f"#{index}"
+        cost = _cost_value(entry)
+        reason = _reason_text(entry)
+        known = merged.get(key)
+        if known is None:
+            merged[key] = {
+                "vp_id": vp_id,
+                "cost": cost,
+                "reason": reason,
+                "test_mode": is_test_mode_cost_skip(entry),
+            }
+        else:
+            known["cost"] = known["cost"] or cost
+            known["reason"] = known["reason"] or reason
+            known["test_mode"] = known["test_mode"] or is_test_mode_cost_skip(entry)
+    return sorted(
+        merged.values(),
+        key=lambda group: (group["vp_id"], group["cost"], group["reason"]),
+    )
+
+
+def _deferred_rows(groups: Sequence[Mapping[str, Any]]) -> List[List[str]]:
+    """把分组变成表格行（VP / 成本 / 原因，已转义）。
+
+    :param groups: :func:`_deferred_groups` 的分组。
+    :return: 数据行列表（每行三格）。
+    """
+    return [
+        [
+            _escape(group["vp_id"] or _MISSING_CELL),
+            _escape(group["cost"] or _MISSING_CELL),
+            _escape(group["reason"] or _MISSING_CELL),
+        ]
+        for group in groups
+    ]
+
+
 def _cost_deferred_rows(report: Mapping[str, Any]) -> List[List[str]]:
     """「因成本跳过（DEFERRED）」小节的数据行（已转义、按 VP id 排序）。
 
@@ -576,33 +686,27 @@ def _cost_deferred_rows(report: Mapping[str, Any]) -> List[List[str]]:
     这个验证点会烧 provider 配额」的验证点挡下，操作者必须一眼看出「没
     花钱」与「跑挂了」的区别，所以这些条目单独成节，不混进失败清单。
 
-    同一条验证点可能同时出现在报告的几个字段里（计划侧给 ``cost``，执行
-    侧给 ``reasons``）—— 按 VP id 合并，字段互补。
+    **test 模式的成本门跳过不在这里** —— 它们单列一节（见
+    :func:`_test_mode_cost_skip_rows`），因为「本轮不该花钱所以跳过」与
+    「别的来路挡下的」在报告里该被分开看。
 
     :param report: 报告 JSON。
     :return: 数据行列表（每行三格：VP / 成本 / 原因）。
     """
-    merged: Dict[str, Tuple[str, str, str]] = {}
-    for index, entry in enumerate(_cost_deferred_entries(report)):
-        vp_id = _text(entry.get("id")) or _text(entry.get("vp_id"))
-        key = vp_id or f"#{index}"
-        cost = _cost_value(entry)
-        reason = _reason_text(entry)
-        known = merged.get(key)
-        if known is None:
-            merged[key] = (vp_id, cost, reason)
-        else:
-            merged[key] = (known[0], known[1] or cost, known[2] or reason)
+    return _deferred_rows(
+        [group for group in _deferred_groups(report) if not group["test_mode"]]
+    )
 
-    rows = sorted(merged.values(), key=lambda row: (row[0], row[1], row[2]))
-    return [
-        [
-            _escape(row[0] or _MISSING_CELL),
-            _escape(row[1] or _MISSING_CELL),
-            _escape(row[2] or _MISSING_CELL),
-        ]
-        for row in rows
-    ]
+
+def _test_mode_cost_skip_rows(report: Mapping[str, Any]) -> List[List[str]]:
+    """「test 模式下因成本门跳过」小节的数据行（已转义、按 VP id 排序）。
+
+    :param report: 报告 JSON。
+    :return: 数据行列表（每行三格：VP / 成本 / 原因）。
+    """
+    return _deferred_rows(
+        [group for group in _deferred_groups(report) if group["test_mode"]]
+    )
 
 
 def _table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
@@ -914,6 +1018,11 @@ def render(
     没跑」而不是「跑挂了」—— 两者混在一起，操作者会把「没花钱」读成
     「失败」。
 
+    「test 模式下因成本门跳过」一节只放**test 模式**被成本闸挡下的那些
+    验证点，并写清有几条：这一类是本轮**预期**省下来的钱，与其它来路的
+    ``DEFERRED`` 不是一回事，混在一节里读者得逐条翻 ``evidence`` 才分得
+    出来。没有这类验证点时整节省略 —— 旧报告逐字节不变。
+
     「回溯问题」一节只在**给了机器计划 / 计划书且确实查出问题**时出现：
     没给就不查（无从查起），查了没问题就不渲染（空节不携带信息）。
     """
@@ -941,6 +1050,17 @@ def render(
             + COST_DEFERRED_SECTION_TITLE
             + "\n"
             + _table(_COST_DEFERRED_HEADER, deferred_rows)
+        )
+
+    test_mode_rows = _test_mode_cost_skip_rows(report)
+    if test_mode_rows:
+        sections.append(
+            "## "
+            + COST_GATE_TEST_MODE_SECTION_TITLE
+            + "（共 "
+            + str(len(test_mode_rows))
+            + " 条）\n"
+            + _table(_COST_DEFERRED_HEADER, test_mode_rows)
         )
 
     review_rows = _review_rows(reviews)
