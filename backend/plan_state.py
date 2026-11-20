@@ -36,6 +36,7 @@ from plan_artifacts import (
     ArtifactConflictError,
     detect,
 )
+from plan_mode import MODE_PRODUCTION, mode_from_flags, resolve_mode
 from verification_gate import verification_branch_ready
 from verification_plan_review import doc_sha256, prd_is_resolved
 
@@ -707,6 +708,12 @@ class PlanState:
                 "test_enabled": (self.plan_dir / "test-design.md").exists(),
                 "preflight_enabled": True,
                 "self_review_enabled": True,
+                # A plan that says nothing runs for real.  The mode is
+                # stored next to the other flags so it travels with the
+                # routing row -- the cost gate, the executor and the
+                # verification sub-agent are three processes, and they
+                # have to agree on it.
+                "mode": MODE_PRODUCTION,
             },
             "verification": {
                 "status": "pending",
@@ -992,6 +999,23 @@ class PlanState:
         """
         return self._state.get("flags", {}).get("self_review_enabled", True)
 
+    def get_mode(self) -> str:
+        """Return the plan's mode -- ``"production"`` or ``"test"``.
+
+        The mode is read from ``flags["mode"]`` through
+        :func:`plan_mode.mode_from_flags`, so this method and every other
+        reader of the mode get the same answer for the same row.
+
+        A plan written before modes existed has no ``mode`` key at all.
+        That is a **missing** mode, not an error: the reader falls back
+        to ``production`` and says so in the log (``plan_mode_missing``).
+        The fallback is ``production`` because that is the mode that must
+        be safe to assume -- falling back to ``test`` would silently
+        turn real work into a rehearsal.
+        """
+        mode, _is_fallback = mode_from_flags(self._state.get("flags", {}))
+        return mode
+
     # --- Phase Transitions ---
 
     def force_set_phase(self, phase: str):
@@ -1257,6 +1281,26 @@ class PlanState:
         """
         self._state["flags"]["self_review_enabled"] = enabled
         self._save_state()
+
+    def set_mode(self, mode: Any) -> str:
+        """Set the plan's mode and persist it.  Returns what was stored.
+
+        The value is **resolved** first (:func:`plan_mode.resolve_mode`),
+        so what lands in ``flags["mode"]`` is always one of the known
+        modes.  An unrecognised value falls back to ``production``, is
+        logged (``plan_mode_invalid=``), and the fallback is what gets
+        stored -- so the row can never carry a mode that some other
+        reader would have to guess about.
+
+        The write follows the same shape as the other flag setters
+        (:meth:`enable_arch` and friends): change ``self._state["flags"]``,
+        then :meth:`_save_state`.  The write is immediate -- the mode is
+        read by other processes, so it cannot wait for a later save.
+        """
+        resolved, _is_fallback = resolve_mode(mode)
+        self._state["flags"]["mode"] = resolved
+        self._save_state()
+        return resolved
 
     # --- Convenience Helpers ---
 
@@ -1728,6 +1772,26 @@ class PlanState:
 # ---------------------------------------------------------------------------
 # Module-level reader helpers
 # ---------------------------------------------------------------------------
+
+
+def read_plan_mode(plan_dir: Path) -> str:
+    """Read a plan's mode without constructing a writer for it.
+
+    The one-line version of ``PlanState(plan_dir).get_mode()``, for
+    callers that only want to *read* the mode and have no business
+    touching the plan's state.
+
+    This is a **pure read**.  Constructing a ``PlanState`` writes
+    nothing (2026-11-11) -- the routing row appears on the first real
+    write -- so calling this never creates a row for a plan that has
+    none.
+
+    Returns ``"production"`` or ``"test"``.  A plan with no ``mode`` in
+    its flags -- one written before modes existed -- reads as
+    ``production``, with a warning in the log.  See
+    :meth:`PlanState.get_mode` for why the fallback is ``production``.
+    """
+    return PlanState(Path(plan_dir)).get_mode()
 
 
 def get_migration_audit(plan_id: str) -> Optional[Dict[str, Any]]:

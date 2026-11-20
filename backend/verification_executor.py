@@ -48,11 +48,14 @@ What is implemented in this skeleton
 Cost gate
 ---------
 * ``_cost_gate_verdict`` — a verification point that declares
-  ``cost="llm_quota"`` is **not executed** by default: it produces a
+  ``cost="llm_quota"`` is **not executed** in ``test`` mode: it produces a
   ``DEFERRED`` verdict instead (never a ``FAILED`` one — "we didn't spend
   anything" and "it crashed" must stay distinguishable).  The operator's
-  switch ``PDT_VERIFY_ALLOW_LLM_QUOTA=1`` lets it through.  See the
-  cost-gate note next to :data:`COST_FIELD`.
+  switch ``PDT_VERIFY_ALLOW_LLM_QUOTA=1`` lets it through.  In
+  ``production`` mode the gate does not apply at all: spending quota is
+  what a production verification is *for*, and deferring it there would
+  let the plan pass without having verified anything.  See the cost-gate
+  note next to :data:`COST_FIELD`.
 
 What is NOT implemented in this skeleton
 ----------------------------------------
@@ -78,6 +81,11 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, 
 
 from base_executor import BaseExecutor, _build_layers, _now_iso, stable_fingerprint
 from utils.atomic_io import atomic_write_json
+# 2026-11-18（计划级 mode · 成本门分流）：成本门按**计划**的 mode 分流 ——
+# ``production`` 下成本门不生效，``test`` 下维持从前的行为。mode 的解析只有
+# 这一份（``plan_mode`` 模块），免得成本门与子进程各解析一次、解析出两个
+# 答案（那正是「成本门以为在 test、子进程以为在 production」的来路）。
+from plan_mode import MODE_PRODUCTION, MODE_TEST, resolve_mode
 # 2026-10-27（归因绑定点 · 轮次侧）：台账认 ``vp_id`` / ``round`` 两个
 # 归因坐标（``usage_registry``），执行器是**轮次**的持有者 —— 验证点号由
 # 子 agent 在发起会话时绑（``verification_subagent``），轮次号由这里在
@@ -192,7 +200,7 @@ CONCLUSIVE_VERDICT_STATUSES = frozenset(
 #
 # A verification point now declares its own cost:
 #
-#   * missing / ``"none"`` → runs as usual;
+#   * missing / ``"none"`` / ``"low"`` → runs as usual;
 #   * ``"llm_quota"``      → skipped by default, recorded as ``DEFERRED``;
 #   * anything else        → handled as ``"llm_quota"`` (conservative: a
 #                            cost declaration nobody can read must never be
@@ -211,6 +219,29 @@ CONCLUSIVE_VERDICT_STATUSES = frozenset(
 #   * ``DEFERRED`` means "not run this round": it enters no terminal
 #     bucket, no ``FAILED`` is written, and the ``failure_class`` value
 #     domain is untouched.
+#
+# The gate and the plan's mode (2026-11-18) --------------------------------
+#
+# The gate above answers "does this verification point cost money?".  It
+# does not answer "is spending money **here** a problem?" — and that
+# depends on what the plan is *for*:
+#
+#   * ``test``       → the gate applies, exactly as it always has: a
+#                       quota-spending verification point is deferred and
+#                       leaves the ``cost_gate_skipped_test_mode`` anchor
+#                       behind;
+#   * ``production`` → the gate does not apply: spending quota is what a
+#                       production verification is *for*, and deferring it
+#                       there would let the plan reach "verified" without
+#                       having verified the expensive part (a deferred
+#                       point is not a failure, so nothing would complain).
+#
+# The mode is a **plan-level** property, so it is read from the plan (its
+# state row), not from a process-level environment variable: one process
+# runs several plans at once, and a process-wide switch could not tell
+# them apart.  A free cost declaration (missing / ``none`` / ``low``) runs
+# in both modes; the gate only ever defers in ``test`` mode, so a
+# production round has no "skipped for cost" entries at all.
 
 #: The verification-point field that declares what executing it costs.
 COST_FIELD = "cost"
@@ -218,9 +249,18 @@ COST_FIELD = "cost"
 #: Cost value: executing this verification point costs nothing.
 COST_NONE = "none"
 
+#: Cost value: a cost *level* — cheap, but not quota.  It is free in the
+#: same sense as ``none``: no quota is burned by running it.
+COST_LOW = "low"
+
 #: Cost value: executing this verification point makes the product under
 #: test really call a provider (real quota is burned).
 COST_LLM_QUOTA = "llm_quota"
+
+#: The cost declarations that mean "this verification point is free" — it
+#: runs as usual, in every plan mode.  A declaration outside this set is
+#: either ``llm_quota`` or an unknown value (handled conservatively).
+_FREE_COST_VALUES = frozenset({COST_NONE, COST_LOW})
 
 #: The environment variable that lets ``llm_quota`` verification points run.
 ALLOW_LLM_QUOTA_ENV = "PDT_VERIFY_ALLOW_LLM_QUOTA"
@@ -249,31 +289,47 @@ def _llm_quota_allowed() -> bool:
     return str(raw).strip().lower() in _ALLOW_LLM_QUOTA_TRUTHY
 
 
-def _cost_gate_verdict(vp: Any) -> Optional[Dict[str, Any]]:
+def _cost_gate_verdict(
+    vp: Any,
+    plan_mode: str = MODE_TEST,
+) -> Optional[Dict[str, Any]]:
     """The ``DEFERRED`` verdict this VP's cost declaration earns.
 
     :param vp: The verification point (executor-schema or LLM-schema —
         only the ``cost`` field is read).
+    :param plan_mode: The **plan's** mode (``"test"`` / ``"production"``).
+        ``"production"`` turns the cost gate off: spending quota is what a
+        production verification is for, and a deferred verification point
+        is not a failure — so gating it there would let the plan pass
+        without having verified anything.  ``"test"`` keeps the
+        historical behaviour.
     :return: The ``DEFERRED`` verdict when the cost gate blocks this VP,
         ``None`` when it may run.
 
     Blocking rules (see the cost-gate note above):
 
-      * ``cost`` missing / empty / ``"none"`` → ``None`` (runs as usual);
-      * ``cost == "llm_quota"`` → blocked unless the operator's switch is
-        on;
-      * any other value → blocked like ``"llm_quota"`` (conservative).
+      * ``cost`` missing / empty / a free declaration (``"none"`` /
+        ``"low"``) → ``None`` (runs as usual) in **both** modes;
+      * ``cost == "llm_quota"`` → blocked in ``test`` mode unless the
+        operator's switch is on; never blocked in ``production`` mode;
+      * any other value → handled like ``"llm_quota"`` (conservative): it
+        is blocked in ``test`` mode as well, and the gate does not apply
+        in ``production`` mode.
 
     The unknown-value branch is logged: a cost declaration nobody can
     read is worth a warning, but it is not worth failing the round over.
     """
+    # The mode is resolved here as well as by the caller, so the verdict's
+    # ``evidence`` always names the mode that actually decided it.
+    mode, _is_fallback = resolve_mode(plan_mode)
+
     if not isinstance(vp, Mapping):
         return None
     raw = vp.get(COST_FIELD)
     if raw is None:
         return None
     declared = str(raw).strip()
-    if not declared or declared.lower() == COST_NONE:
+    if not declared or declared.lower() in _FREE_COST_VALUES:
         return None
     if declared.lower() != COST_LLM_QUOTA:
         logger.warning(
@@ -281,12 +337,22 @@ def _cost_gate_verdict(vp: Any) -> Optional[Dict[str, Any]]:
             declared,
             COST_LLM_QUOTA,
         )
+    # 2026-11-18：production 下成本门**不生效** —— 真花钱是生产验证的预期。
+    if mode == MODE_PRODUCTION:
+        return None
     if _llm_quota_allowed():
         return None
+    # 2026-11-18：test 模式下被成本门挡下的验证点留下日志锚点（production
+    # 永远不写它 —— 报告按这条锚点统计「test 模式下因成本门跳过」的清单）。
+    logger.info("cost_gate_skipped_test_mode=%r", [vp.get("id")])
     return {
         "status": "DEFERRED",
         "reasons": [_COST_DEFERRED_REASON],
-        "evidence": {"cost": COST_LLM_QUOTA, "gate": COST_LLM_QUOTA},
+        "evidence": {
+            "cost": COST_LLM_QUOTA,
+            "gate": COST_LLM_QUOTA,
+            "plan_mode": mode,
+        },
     }
 
 
@@ -710,7 +776,15 @@ class VerificationExecutor(BaseExecutor):
         verification point half (``vp_id``) is bound one layer down, by
         the sub-agent that opens the session (see
         :mod:`verification_subagent`).  ``None`` means "ask the state
-        store" (see :meth:`_round_number`).
+        store" (see :meth:`_round_number`);
+      * ``plan_mode`` — optional keyword.  **What this plan is for.**
+        The cost gate is a ``test``-mode gate: in ``test`` mode a
+        verification point that spends quota is deferred (``DEFERRED``),
+        while in ``production`` mode the gate does not apply — spending
+        quota is what a production verification is for.  ``None`` means
+        "ask the plan" (see :meth:`_resolve_plan_mode`): the mode lives
+        in the plan's own state row, because one process runs several
+        plans at once.
 
     The class is intentionally stateless across instances: every
     mutation goes through :meth:`_save_state`, so two processes
@@ -744,11 +818,18 @@ class VerificationExecutor(BaseExecutor):
         *,
         topic_relevance_llm_batch: Optional[Callable[..., Any]] = None,
         round_no: Optional[int] = None,
+        plan_mode: Optional[str] = None,
     ) -> None:
         self.verification_plan = verification_plan
         self.plan_id = plan_id
         self.plan_dir = Path(plan_dir)
         self.sub_agent_runner = sub_agent_runner
+
+        # 2026-11-18（计划级 mode）：成本门按**计划**的 mode 分流。给了就
+        # 用给的；没给就去这个**计划**的状态行里读（``read_plan_mode``）——
+        # mode 是计划级属性，同一个进程里可以同时跑着一个 production 计划
+        # 和一个 test 计划，进程级开关区分不了它们。
+        self.plan_mode = self._resolve_plan_mode(plan_mode)
 
         # 2026-10-27（归因）：本轮的轮次号。调用方知道自己是第几轮时
         # 直接给；不给就问状态库（``_current_round``）。
@@ -907,7 +988,7 @@ class VerificationExecutor(BaseExecutor):
             # ``BaseExecutor.run`` 驱动的是这个闭包 —— 闸只落在前者上的
             # 话，一份声明了 ``cost=llm_quota`` 的计划在真跑一轮时照样会
             # 去调 provider。
-            cost_verdict = _cost_gate_verdict(vp)
+            cost_verdict = _cost_gate_verdict(vp, plan_mode=self.plan_mode)
             if cost_verdict is not None:
                 return cost_verdict
             result = sub_agent_runner(vp)
@@ -935,6 +1016,38 @@ class VerificationExecutor(BaseExecutor):
         self._completed_vps = list(self._completed_items)
         self._failed_vps = list(self._failed_items)
         self._skipped_vps = list(self._skipped_items)
+
+    # ------------------------------------------------------------------
+    # Construction helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_plan_mode(self, plan_mode: Optional[str]) -> str:
+        """Resolve the mode the cost gate must use for this plan.
+
+        ``None`` means "ask the plan": the mode is a **plan-level**
+        property, so it is read from the plan's own state row
+        (:func:`plan_state.read_plan_mode`) — one process runs several
+        plans at once, and a process-wide switch cannot tell them apart.
+        A plan that never declared a mode reads as ``production``: a plan
+        that says nothing is run for real, which is the mode that has to
+        be safe to assume.
+
+        An explicitly given mode is resolved through
+        :func:`plan_mode.resolve_mode`, so ``" Test "`` means ``test`` and
+        a value nobody recognises means ``production`` (with a warning) —
+        the same answer every other reader of the mode gets.
+        """
+        if plan_mode is None:
+            # Imported here, not at module level: ``plan_state`` drags in
+            # the state store, and this module is imported by the server's
+            # startup path — the cost gate must not make startup slower
+            # for a plan that states its mode explicitly.
+            from plan_state import read_plan_mode
+
+            return read_plan_mode(self.plan_dir)
+
+        mode, _is_fallback = resolve_mode(plan_mode)
+        return mode
 
     # ------------------------------------------------------------------
     # Public read-only API
@@ -1341,7 +1454,7 @@ class VerificationExecutor(BaseExecutor):
         # 调用 runner 之前」。被闸拦下的验证点**不执行**，产出的是一条
         # DEFERRED 裁决（不是 FAILED：「没花钱」与「跑挂了」必须一眼可分，
         # 而 FAILED 会凭空制造一个修复任务）。
-        cost_verdict = _cost_gate_verdict(vp)
+        cost_verdict = _cost_gate_verdict(vp, plan_mode=self.plan_mode)
         if cost_verdict is not None:
             return cost_verdict
 

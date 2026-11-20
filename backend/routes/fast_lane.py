@@ -74,6 +74,7 @@ from coding_tool import JsonSession
 from framework.ids import derive_plan_id
 from framework.task_graph import DanglingTaskDependency
 from hooks.config import write_for_plan
+from plan_mode import MODE_PRODUCTION
 from plan_scheduler.engine import SCHEDULER_INTENT_FILE
 from task import SubTask
 from task_manager import CycleInTaskGraph, TaskManager
@@ -132,6 +133,19 @@ class ImportPlanRequest(BaseModel):
     #: queue would no longer be the caller's queue.  A request that
     #: says nothing gets ``0``.
     priority: int = 0
+    #: The mode this plan runs in: ``production`` (it runs for real) or
+    #: ``test`` (the pipeline is exercised and nothing real is touched).
+    #: The caller declares it **once**, here, and the plan keeps it: the
+    #: cost gate, the executor and the verification sub-agent are three
+    #: processes that have to agree on the mode, and they read it from
+    #: the plan's flags rather than from a request.  A request that says
+    #: nothing gets ``production`` -- the mode that is safe to assume,
+    #: because falling back to ``test`` would silently turn real work
+    #: into a rehearsal.  A value that is not a mode at all is resolved
+    #: by ``plan_mode.resolve_mode``: it falls back to ``production`` and
+    #: says so in the log, so the caller is told what the plan actually
+    #: is instead of finding out later that its mode was ignored.
+    mode: str = MODE_PRODUCTION
 
 
 class RevisePlanRequest(BaseModel):
@@ -232,8 +246,11 @@ def _persist_tasks(plan_dir: Path, requirement: str, tasks_data: Dict[str, Any])
     return list(saved.get("tasks", []))
 
 
-def _mark_queued(plan_id: str, plan_dir: Path) -> None:
-    """Put the new plan in ``queued``, through the existing state store.
+def _mark_queued(
+    plan_id: str, plan_dir: Path, mode: str = MODE_PRODUCTION
+) -> str:
+    """Put the new plan in ``queued`` **with its mode**, through the
+    existing state store.
 
     2026-10-25 (R10): the phase this lane writes is ``queued`` — the
     one waiting phase, and the phase the scheduler collects from. The
@@ -249,6 +266,18 @@ def _mark_queued(plan_id: str, plan_dir: Path) -> None:
     and is a no-op when the seed already landed. If SQLite is
     unavailable both fall back to the on-disk inference, which reads
     ``tasks.json``'s existence as ``queued`` - the same answer.
+
+    The **mode** is written here too, and *after* the transition: the
+    transition is what makes the plan a plan, and the mode is a property
+    of a plan that exists.  It is written once, in the plan's flags,
+    because that is where every other reader of the mode looks — the
+    cost gate, the executor and the verification sub-agent are three
+    processes, and none of them sees this request.
+
+    Returns the mode the plan actually carries, not the one that was
+    asked for: ``set_mode`` resolves the value (an unknown mode falls
+    back to ``production`` and says so in the log), so the caller
+    answers with the mode that was stored.
     """
     _server._seed_plan_routing_phase(plan_id, phase="queued")
     try:
@@ -262,6 +291,7 @@ def _mark_queued(plan_id: str, plan_dir: Path) -> None:
         _ps = _server.PlanState(plan_dir)
         _ps.ensure_row()
         _ps.transition_to("queued")
+        resolved_mode = _ps.set_mode(mode)
     except ValueError as exc:  # noqa: BLE001 - surfaced, never swallowed
         raise HTTPException(
             500,
@@ -271,6 +301,7 @@ def _mark_queued(plan_id: str, plan_dir: Path) -> None:
                 "plan_id": plan_id,
             },
         )
+    return resolved_mode
 
 
 #: The phase a plan whose import failed is registered in.
@@ -732,7 +763,13 @@ def import_plan(req: ImportPlanRequest, request: Request):
     warnings.extend(_harden_warnings(tasks_data))
 
     written = _persist_tasks(plan_dir, seed, tasks_data)
-    _mark_queued(plan_id, plan_dir)
+    # The plan's mode is written with its phase and kept there: the
+    # caller declares it once, here, and every reader downstream reads it
+    # from the plan's flags.  The value that comes back is the one the
+    # plan actually carries (an unknown mode was resolved to
+    # ``production`` and logged), so the response never disagrees with
+    # the plan.
+    mode = _mark_queued(plan_id, plan_dir, req.mode)
     # The plan's place in the scheduler's line, and the priority the
     # caller asked for when it asked for the plan.  The number is the
     # caller's, so it is written into the plan's own artifact — and the
@@ -803,6 +840,7 @@ def import_plan(req: ImportPlanRequest, request: Request):
         "source_field": payload_field,
         "tasks": written,
         "warnings": warnings,
+        "mode": mode,
     }
 
 

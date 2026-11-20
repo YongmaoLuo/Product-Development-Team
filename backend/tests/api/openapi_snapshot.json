@@ -290,6 +290,11 @@
             ],
             "title": "Hook Session Id"
           },
+          "mode": {
+            "default": "production",
+            "title": "Mode",
+            "type": "string"
+          },
           "priority": {
             "default": 0,
             "title": "Priority",

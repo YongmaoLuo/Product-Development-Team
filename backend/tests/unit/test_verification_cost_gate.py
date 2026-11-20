@@ -71,7 +71,13 @@ def _clean_switch_and_cancel_flag(monkeypatch):
 
 
 def _executor(plan_dir: Path, runner: Any = None) -> VerificationExecutor:
-    """一个只关心「runner 有没有被调用」的执行器。"""
+    """一个只关心「runner 有没有被调用」的执行器。
+
+    ``plan_mode="test"`` 是**显式**给的：成本门按计划 mode 分流
+    （2026-11-18）—— ``production`` 下成本门不生效，这条文件要验的是
+    ``test`` 模式下「要花钱的验证点被挡下」那一条。省略它的话，执行器会去
+    计划的状态行里读，而一个没写过 mode 的计划读出来的是 ``production``。
+    """
     return VerificationExecutor(
         verification_plan={"verification_points": [dict(_VP)]},
         plan_id="plan-cost-gate",
@@ -80,6 +86,7 @@ def _executor(plan_dir: Path, runner: Any = None) -> VerificationExecutor:
         or Mock(
             return_value={"status": "PASSED", "reasons": ["ok"], "evidence": {}}
         ),
+        plan_mode="test",
     )
 
 
@@ -113,7 +120,11 @@ async def test_llm_quota_vp_deferred_by_default(tmp_path):
 
     assert verdict["status"] == "DEFERRED", verdict
     assert verdict["reasons"] == [_DEFERRED_REASON], verdict
-    assert verdict["evidence"] == {"cost": "llm_quota", "gate": "llm_quota"}, verdict
+    assert verdict["evidence"] == {
+        "cost": "llm_quota",
+        "gate": "llm_quota",
+        "plan_mode": "test",
+    }, verdict
     runner.assert_not_called(), (
         "成本闸拦下的验证点绝不许真去调 provider"
     )
