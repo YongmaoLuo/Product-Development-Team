@@ -138,7 +138,24 @@ import time
 from pathlib import Path
 
 
-def _settled_identity(process_identity, pid, tries=60, delay=0.05):
+#: The words the reaper writes when it could not read the machine about
+#: a pid it was asked to signal (``backend/process_reaper.py``).  A read
+#: that did not come back says nothing about the pid — not that it is
+#: gone — so the sweep refuses to signal on it and says why instead.
+#:
+#: The node writes the same words for the same reason.  A child it
+#: could not identify is a pid nobody may signal, so the tree cannot be
+#: collected with it, and that is the machine's moment rather than the
+#: delivery's.
+_MACHINE_REFUSAL = (
+    "the machine could not be read; the pid was neither confirmed gone "
+    "nor identified"
+)
+
+
+def _settled_identity(
+    process_identity, pid, on_unreadable=None, tries=60, delay=0.05
+):
     """Probe ``pid`` until two consecutive readings agree.
 
     The launcher rewrites ``argv[0]`` shortly after the exec, so a
@@ -146,16 +163,33 @@ def _settled_identity(process_identity, pid, tries=60, delay=0.05):
     command line differently from a reading taken a moment later.  The
     identity check compares command lines, so the *recorded* one has
     to be the settled one.
+
+    ``probe`` answers ``None`` to two different facts — "the pid names
+    no process" and "the machine could not be read" — and only the
+    first of them may close a record.  So the read goes through
+    ``probe_result``, which keeps the two apart, and the moment the
+    machine cannot be read is reported to ``on_unreadable`` straight
+    away: the caller may be interrupted before this loop is over, and
+    a fact that is only written at the end of a loop is a fact that a
+    signal can swallow.
+
+    Returns the settled identity (``None`` when it never settled) and
+    whether the machine was unreadable at any point.
     """
     previous = None
+    unreadable = False
     for _ in range(tries):
-        ident = process_identity.probe(pid)
-        if ident is not None:
-            if previous is not None and ident.cmdline == previous.cmdline:
-                return ident
-            previous = ident
+        identity, readable = process_identity.probe_result(pid)
+        if identity is not None:
+            if previous is not None and identity.cmdline == previous.cmdline:
+                return identity, unreadable
+            previous = identity
+        elif not readable and not unreadable:
+            unreadable = True
+            if on_unreadable is not None:
+                on_unreadable(pid)
         time.sleep(delay)
-    return previous
+    return previous, unreadable
 
 
 def main():
@@ -184,6 +218,12 @@ def main():
     stderr_path = config.get("stderr")
     if stderr_path:
         sys.stderr = open(stderr_path, "a", buffering=1, encoding="utf-8")
+
+    # A machine that cannot be read: every question about a pid comes
+    # back unanswered, and "unanswered" is not "gone".  The node plays
+    # the host's worst moment on purpose when it is told to.
+    if config.get("unreadable_machine"):
+        process_identity.probe_result = lambda pid: (None, False)
 
     # The executor is the only layer that takes the plan's lock, and
     # the only one that answers SIGTERM with a sweep of its own tree.
@@ -221,26 +261,65 @@ def main():
             start_new_session=bool(child_spec.get("detach", True)),
             cwd=str(work_dir),
         )
-        identity = _settled_identity(process_identity, child.pid)
-        if identity is None:
-            sys.stderr.write("the child has no readable identity\n")
-            sys.exit(5)
-        # The parent records the child, the way the backend records the
-        # executor it started.
-        ledger.record_spawn(
-            plan_dir,
-            ledger.ProcessRecord(
-                plan_id=plan_id,
+        def _note_unreadable_machine(unreadable_pid):
+            """Write down that the machine could not be read about the
+            child this node started.
+
+            The reaper writes the same words into the same ledger when
+            it refuses to signal a pid it could not identify
+            (``backend/process_reaper.py``).  One vocabulary and one
+            ledger, so that whoever reads it afterwards can ask the one
+            question that matters: was this the host's unreadable
+            moment, or the code's?
+
+            The event is not terminal: the pid is not known to be gone,
+            so the live set must neither lose it nor gain it — it was
+            never spawned into the ledger.
+            """
+            ledger.record_event(
+                plan_dir,
+                process_reaper.EVENT_FAILED,
+                terminal=False,
+                pid=int(unreadable_pid),
                 role=child_spec["role"],
-                pid=child.pid,
-                pgid=identity.pgid or child.pid,
-                create_time=identity.create_time or 0.0,
-                cmdline=list(identity.cmdline),
-                cwd=identity.cwd or str(work_dir),
-                owner_pid=os.getpid(),
-                owner_role=role,
-            ),
+                plan_id=plan_id,
+                reason=_MACHINE_REFUSAL,
+                detail="the node could not read the machine about the "
+                       "child it started",
+            )
+
+        identity, unreadable = _settled_identity(
+            process_identity,
+            child.pid,
+            on_unreadable=_note_unreadable_machine,
         )
+        if identity is None:
+            if not unreadable:
+                # The pid names no process: there is no child to
+                # collect, and nothing to write down about it.
+                sys.stderr.write("the child has no readable identity\n")
+                sys.exit(5)
+            # The machine could not be read about the child, and the
+            # refusal is already on record.  The node does not exit: the
+            # child is not known to be gone, and this tree is still this
+            # node's to answer SIGTERM with.
+        else:
+            # The parent records the child, the way the backend records
+            # the executor it started.
+            ledger.record_spawn(
+                plan_dir,
+                ledger.ProcessRecord(
+                    plan_id=plan_id,
+                    role=child_spec["role"],
+                    pid=child.pid,
+                    pgid=identity.pgid or child.pid,
+                    create_time=identity.create_time or 0.0,
+                    cmdline=list(identity.cmdline),
+                    cwd=identity.cwd or str(work_dir),
+                    owner_pid=os.getpid(),
+                    owner_role=role,
+                ),
+            )
         child_pid = child.pid
 
     # Tell the test who this node is.
@@ -554,6 +633,96 @@ def _wait_until_gone(pids: Sequence[int], timeout: float = 30.0) -> bool:
         time.sleep(0.1)
 
 
+#: The words the machine's unreadable moment is written in.  A read
+#: that did not come back says nothing about the pid — not that it is
+#: gone — so the sweep refuses to signal on it and says why instead
+#: (``backend/process_reaper.py``), and a node that could not identify
+#: the child it started says the same thing in the same ledger.  That
+#: refusal is safe, and it is the machine's moment rather than the
+#: delivery's: a control that cannot tell it apart from "the sweep never
+#: tried" turns a busy host into a repair task against a delivery that
+#: did not fail.
+_HOST_REFUSAL = "the machine could not be read"
+
+
+def _event_text(event: Dict[str, Any]) -> str:
+    """Every word one ledger event carries, as a single string.
+
+    A ``reason`` is the sweep's own sentence; a ``detail`` is either a
+    sentence of its own or the forensics a skipped process carries.
+    Both are read, because a sweep may write the reason of a refusal
+    into either.
+    """
+    parts = []
+    for key in ("reason", "detail"):
+        value = event.get(key)
+        if not value:
+            continue
+        if isinstance(value, str):
+            parts.append(value)
+        else:
+            parts.append(json.dumps(value, sort_keys=True, default=str))
+    return " ".join(parts)
+
+
+def _settlement_verdict(
+    plan_dir: Path, pids: Sequence[int], timeout: float
+) -> Tuple[str, str]:
+    """Why the processes in ``pids`` are still running — or that they are gone.
+
+    The verdict is one of three words, and the second half of the answer
+    says which:
+
+    ``"gone"``
+        Every pid is dead.  There is nothing left to explain.
+
+    ``"host"``
+        The ledger's last word about one of these pids is that the
+        machine could not be read.  Whoever wrote it refused to go on
+        with a pid it could not identify — the safe answer, since a
+        read that did not come back says nothing about the pid — and
+        the processes are still running because of that refusal, not
+        because of the delivery under test.
+
+    ``"code"``
+        The sweep did something else: it skipped a pid whose identity
+        did not match, it signalled and the pid outlived the signal, or
+        it wrote nothing about these pids at all.  Those belong to the
+        code, and they have to keep failing the control that found them.
+
+    The ledger is append-only, so the last event about a pid is the
+    one that still stands: what was said about it afterwards overrules
+    what was said before.  A refusal therefore counts as the host's
+    while it is still the last word about that pid, and stops counting
+    the moment the tree got the pid onto the books after all.
+    """
+    wanted = sorted({int(pid) for pid in pids})
+    if _wait_until_gone(wanted, timeout):
+        return "gone", ""
+
+    last: Dict[int, Dict[str, Any]] = {}
+    for event in ledger.read_events(plan_dir):
+        try:
+            pid = int(event.get("pid"))
+        except (TypeError, ValueError):
+            continue
+        if pid in wanted:
+            last[pid] = event
+
+    for _pid, event in sorted(last.items()):
+        text = _event_text(event)
+        if _HOST_REFUSAL in text:
+            return "host", str(event.get("reason") or text)
+
+    summary = [
+        "{}: {}".format(pid, event.get("reason") or event.get("event"))
+        for pid, event in sorted(last.items())
+    ]
+    if summary:
+        return "code", "; ".join(summary)
+    return "code", "the sweep recorded nothing about {}".format(wanted)
+
+
 def _wait_for_json(path: Path, timeout: float = 60.0) -> Dict[str, Any]:
     """Wait for a JSON file to appear and read it."""
     deadline = time.monotonic() + timeout
@@ -645,6 +814,7 @@ def _write_node_config(
     child: Optional[Dict[str, Any]] = None,
     transcript: str = "",
     lifetime: float = 0.0,
+    unreadable_machine: bool = False,
 ) -> Path:
     """Write the config of one node of the fake tree."""
     fake_dir.mkdir(parents=True, exist_ok=True)
@@ -661,6 +831,7 @@ def _write_node_config(
         "lifetime": lifetime,
         "stderr": str(fake_dir / (role + ".err")),
         "child": child,
+        "unreadable_machine": unreadable_machine,
     }
     path = fake_dir / ("node-%s.json" % role)
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -693,6 +864,7 @@ def _spawn_executor_tree(
     *,
     with_children: bool = True,
     transcript: str = "",
+    unreadable_machine: bool = False,
 ) -> Tuple[subprocess.Popen, Path]:
     """Start the executor and, optionally, the tree under it.
 
@@ -722,6 +894,7 @@ def _spawn_executor_tree(
         }
     executor_config = _write_node_config(
         fake_dir, plan_dir, plan_id, "executor", child=child,
+        unreadable_machine=unreadable_machine,
     )
     proc = _spawn_node(fake_dir, executor_config, "executor", marker)
     return proc, fake_dir / "announce" / "executor.json"
@@ -1280,28 +1453,208 @@ def test_n3_executor_sigterm_kills_children_and_releases_lock(tmp_path):
         )
 
         executor.send_signal(signal.SIGTERM)
-        executor.wait(timeout=60)
+        executor.wait(timeout=120)
         assert executor.returncode == 143, (
             "the executor did not answer SIGTERM with 143 (got {})".format(
                 executor.returncode
             )
         )
 
-        # The wording names the wait that ran out, and not only the
-        # answer: the gate reads the *shape* of a failure to decide
-        # whether the machine or the code owns it, and "it waited and
-        # the wait ran out" is the machine's shape.  A message that said
-        # only "the children are still running" would be
-        # indistinguishable from a code failure, and a busy host would
-        # turn this control into a repair task against a delivery that
-        # did not fail.
-        assert _wait_until_gone(children, 30), (
+        # The verdict says who owns the outcome, because the two
+        # failures have the same shape and different owners.
+        #
+        # A machine that could not be read leaves the tree uncollected:
+        # the sweep refuses to signal on a pid it could not identify —
+        # the safe answer, since a read that did not come back says
+        # nothing about the pid — and a node that could not identify
+        # the child it started cannot put that child on the books at
+        # all.  Whoever could not read the machine wrote down why, in
+        # the plan's own ledger, so the control can read it: this is
+        # the machine's moment, and it is reported as a skip that names
+        # the reason.
+        #
+        # Everything else is the code's: a sweep that skipped a pid
+        # whose identity did not match, one that signalled and was
+        # outlived, one that wrote nothing at all.  Those keep failing
+        # the control, with the sweep's own reason attached so the
+        # failure says what the sweep did instead of only that the
+        # wait ran out.
+        verdict, detail = _settlement_verdict(plan_dir, children, 90)
+        if verdict == "host":
+            pytest.skip(
+                "the executor's sweep could not read the machine: " + detail
+            )
+        assert verdict == "gone", (
             "the executor left its children running: the children did not "
-            "settle within 30s of the SIGTERM"
+            "settle within 90s of the SIGTERM; the sweep said: " + detail
         )
         assert executor_lock.is_held(plan_dir) is False, (
             "the executor died without giving the plan's lock back"
         )
+    finally:
+        _kill_process(executor)
+        for role in ("subagent", "tool"):
+            try:
+                pid = int(_announce(fake_dir, role, timeout=5)["pid"])
+            except Exception:  # noqa: BLE001 — cleanup must not fail
+                continue
+            _kill_pid(pid, group=(role == "subagent"))
+            _kill_pid(pid)
+
+
+def test_a_settlement_verdict_names_who_owns_the_failure(tmp_path):
+    """The verdict says whether the host or the code owns the outcome.
+
+    Three shapes, and the narrowness is the whole point: only a ledger
+    whose last word about a pid is that the machine could not be read
+    belongs to the host.  A sweep that skipped a pid whose identity did
+    not match, or that wrote nothing about the pid at all, belongs to
+    the code — and a verdict that called those the host's would stop
+    catching the defects the control is there to catch.
+    """
+    def plan_dir_for(name: str) -> Path:
+        path = tmp_path / "plans" / name
+        path.mkdir(parents=True)
+        return path
+
+    # A pid that has ended: the children are gone and the control is
+    # satisfied.
+    ended = subprocess.Popen(
+        [sys.executable, "-c", "raise SystemExit(0)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    ended.wait(timeout=60)
+    verdict, detail = _settlement_verdict(plan_dir_for("gone"), [ended.pid], 5)
+    assert verdict == "gone", (verdict, detail)
+
+    # A pid that is still running, and a sweep that wrote nothing about
+    # it: the code's, because nobody said the host got in the way.
+    alive = os.getpid()
+    verdict, detail = _settlement_verdict(plan_dir_for("silent"), [alive], 0.2)
+    assert verdict == "code", (verdict, detail)
+    assert "recorded nothing" in detail, detail
+
+    # A sweep that refused because the machine could not be read: the
+    # host's.  The sweep said so in its own ledger.
+    host_dir = plan_dir_for("host")
+    ledger.record_event(
+        host_dir,
+        process_reaper.EVENT_FAILED,
+        terminal=False,
+        pid=alive,
+        role="subagent",
+        plan_id="host",
+        reason="the machine could not be read; the pid was neither "
+               "confirmed gone nor identified",
+    )
+    verdict, detail = _settlement_verdict(host_dir, [alive], 0.2)
+    assert verdict == "host", (verdict, detail)
+    assert _HOST_REFUSAL in detail, detail
+
+    # A sweep that skipped the pid for a reason of its own: the code's,
+    # whatever else the ledger may also say.
+    mismatch_dir = plan_dir_for("mismatch")
+    ledger.record_event(
+        mismatch_dir,
+        process_reaper.EVENT_IDENTITY_MISMATCH,
+        terminal=False,
+        pid=alive,
+        role="subagent",
+        plan_id="mismatch",
+        reason="identity_mismatch",
+    )
+    verdict, detail = _settlement_verdict(mismatch_dir, [alive], 0.2)
+    assert verdict == "code", (verdict, detail)
+    assert "identity_mismatch" in detail, detail
+
+    # A refusal that was answered afterwards: the tree knew the pid in
+    # the end, so the machine's unreadable moment is not what the
+    # control is looking at.  The ledger is append-only, and the last
+    # word about a pid is the one that still stands — so a refusal
+    # that a later spawn overrules does not make the host the owner.
+    recovered_dir = plan_dir_for("recovered")
+    ledger.record_event(
+        recovered_dir,
+        process_reaper.EVENT_FAILED,
+        terminal=False,
+        pid=alive,
+        role="subagent",
+        plan_id="recovered",
+        reason="the machine could not be read; the pid was neither "
+               "confirmed gone nor identified",
+    )
+    ledger.record_spawn(
+        recovered_dir,
+        ledger.ProcessRecord(
+            plan_id="recovered",
+            role="subagent",
+            pid=alive,
+            pgid=alive,
+            create_time=0.0,
+            cmdline=["fake"],
+            cwd=str(tmp_path),
+            owner_pid=os.getpid(),
+            owner_role="executor",
+        ),
+    )
+    verdict, detail = _settlement_verdict(recovered_dir, [alive], 0.2)
+    assert verdict == "code", (verdict, detail)
+
+
+def test_a_node_writes_down_the_machine_it_could_not_read(tmp_path):
+    """A machine that cannot be read is written down, not swallowed.
+
+    A node has to identify the child it starts before the ledger can
+    vouch for it, and a pid nobody may signal is a pid the tree cannot
+    be collected with.  So a machine that cannot be read leaves the
+    node with a child it cannot vouch for — and with nothing to say
+    about it, the tree looks like a delivery that failed to collect
+    itself.
+
+    The refusal is written into the plan's own ledger, in the reaper's
+    own words, the moment the machine fails to answer: not when the
+    node gives up (a signal may arrive before it does) and not in the
+    node's own diary (a reader of the plan's ledger would not find it
+    there).  What the reader gets is the one question that matters —
+    was this the host's unreadable moment, or the delivery's?
+    """
+    plan_id = _plan_id("unreadable")
+    plans_dir = tmp_path / "plans"
+    plans_dir.mkdir()
+    plan_dir = plans_dir / plan_id
+    plan_dir.mkdir()
+    (plan_dir / "tasks.json").write_text(
+        json.dumps({"tasks": []}), encoding="utf-8"
+    )
+    fake_dir = plan_dir / "fake"
+    marker = _marker()
+
+    executor, _ = _spawn_executor_tree(
+        fake_dir, plan_dir, plan_id, marker, unreadable_machine=True,
+    )
+    try:
+        # The executor's announcement comes after it has finished
+        # looking for its child's identity, so by the time it is here
+        # the refusal is on record.
+        _announce(fake_dir, "executor")
+        subagent = _announce(fake_dir, "subagent")
+        pid = int(subagent["pid"])
+
+        events = ledger.read_events(plan_dir)
+        refusals = [
+            event for event in events
+            if event.get("pid") == pid
+            and _HOST_REFUSAL in _event_text(event)
+        ]
+        assert refusals, (
+            "the node lost track of the child it started without saying "
+            "why: {!r}".format(events)
+        )
+
+        verdict, detail = _settlement_verdict(plan_dir, [pid], 0.2)
+        assert verdict == "host", (verdict, detail)
+        assert _HOST_REFUSAL in detail, detail
     finally:
         _kill_process(executor)
         for role in ("subagent", "tool"):

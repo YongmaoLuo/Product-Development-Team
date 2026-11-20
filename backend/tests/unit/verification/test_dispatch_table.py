@@ -35,6 +35,18 @@ TDD contract — 4 cases
 * ``test_dispatch_never_exceeds_scan_criteria`` — 分派口径以全库扫描
   （:func:`verification.scan.scan_plans`）为对照：分派判成「可确定性
   判定」的，扫描必须也判成可确定性判定（分派不得比扫描更宽松）。
+
+CI runner 的出处（同一份文件）：
+
+* ``test_ci_runner_is_loaded_from_the_tree_under_test`` — 判定用的
+  ``verification_ci_runner`` 是**被测树自己那份**，不是 harness 副本
+  （2026-11-05 / VP-035：判定跑的是没修过的那份，于是"修好了"永远
+  轮不到被判定）。
+* ``test_the_validator_comes_from_the_tree_under_test`` — 校验器与执行
+  入口取自**同一个模块对象**（一个复制品的校验器配另一个复制品的执行
+  入口，等于让两份口径互相背书）。
+* ``test_ci_runner_falls_back_to_the_harness_copy`` — 被测树不是框架检出
+  时回落到 harness 副本，且 harness 那份仍是替换 runner 的注入点。
 """
 
 from __future__ import annotations
@@ -497,3 +509,176 @@ def test_dispatch_never_exceeds_scan_criteria(tmp_path: Path) -> None:
     assert scanned["full_ci"] == 1
     assert dispatched["api_test"] == 1
     assert dispatched["full_ci"] == 1
+
+
+# ---------------------------------------------------------------------------
+# the CI runner that judges a VP is the tree under test's own copy
+# ---------------------------------------------------------------------------
+
+#: A stand-in for the tree under test's own ``verification_ci_runner``.
+#: It answers two questions at once: *which file judged* (the probe
+#: markers) and *were the validator and the executor the same module*
+#: (they are — one file, one module object).
+_PROBE_RUNNER_SOURCE = '''
+"""A stand-in for the tree under test's own ``verification_ci_runner``."""
+
+
+class _Issue:
+    def __init__(self, detail):
+        self.detail = detail
+
+    def to_dict(self):
+        return {"detail": self.detail}
+
+
+def validate_vp(vp, *, require_single_entry=True, project_dir=None):
+    """Reject exactly one probe VP, so the caller can see whose validator."""
+    vp_id = str((vp or {}).get("id") or "")
+    if vp_id == "validator-probe":
+        return [_Issue("project-tree-validator")]
+    if vp_id == "exploding-validator":
+        raise TypeError("this validator does not take the modern arguments")
+    return []
+
+
+def run_ci_verification(vp, *, project_dir=None, artifact_dir=None):
+    return {
+        "status": "PASSED",
+        "reasons": ["judged by the tree under test"],
+        "evidence": {
+            "probe_source": "project-tree",
+            "probe_file": __file__,
+        },
+    }
+'''
+
+
+def _framework_checkout(root: Path) -> Path:
+    """Turn ``root`` into a tree under test that **is** a framework checkout.
+
+    Two files say "this tree is the framework": the runner module itself
+    and ``backend/pyproject.toml``.  The loader insists on both, so the
+    fixture has to carry both.
+    """
+    backend = root / "backend"
+    backend.mkdir(parents=True, exist_ok=True)
+    (backend / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    (backend / "verification_ci_runner.py").write_text(
+        _PROBE_RUNNER_SOURCE, encoding="utf-8",
+    )
+    return backend / "verification_ci_runner.py"
+
+
+def _probe_vp(**overrides) -> dict:
+    """A ``full_ci`` VP the probe runner accepts."""
+    vp = {
+        "id": "VP-PROBE",
+        "verification_method": "full_ci",
+        "verification_phase": 2,
+        "phase_order": 1,
+        "ci_entry": "true",
+    }
+    vp.update(overrides)
+    return vp
+
+
+def test_ci_runner_is_loaded_from_the_tree_under_test(tmp_path: Path) -> None:
+    """The runner that judges must be the tree under test's own copy.
+
+    2026-11-05 (VP-015) 与 2026-11-14 (VP-035) 是同一个坑：判定由
+    harness 副本执行，而工作树里那份早就修好了 —— 修复停在分支上，
+    判定跑的是旧代码，于是"修好了"永远轮不到被判定，循环只会看到失败。
+
+    所以分派器解析 CI runner 时必须走
+    :func:`verification_ci_runner_loader.load_ci_runner`：它每轮从被测树
+    重载，并如实报告出处。
+    """
+    runner_path = _framework_checkout(tmp_path)
+
+    outcome = run_deterministic(_probe_vp(), project_dir=tmp_path)
+
+    assert outcome.status == OUTCOME_PASS, outcome.reasons
+    assert outcome.route == "verification_ci_runner"
+    assert outcome.evidence.get("probe_source") == "project-tree", (
+        "the harness copy judged the point instead of the tree under "
+        f"test — evidence: {outcome.evidence!r}"
+    )
+    judged = Path(str(outcome.evidence.get("probe_file") or "")).resolve()
+    assert judged == runner_path.resolve(), (
+        "a different file judged the point than the tree under test's "
+        f"own runner: {judged}"
+    )
+
+
+def test_the_validator_comes_from_the_tree_under_test(tmp_path: Path) -> None:
+    """The validator and the executor must be the same module object.
+
+    校验器问的是「这条验证点你能不能执行」，执行入口负责跑它 —— 两者
+    来自同一个模块，才谈得上「谁判的谁说了算」。校验器来自被测树时，
+    它拒收的那条验证点必须真的被拒收。
+    """
+    _framework_checkout(tmp_path)
+
+    outcome = run_deterministic(
+        _probe_vp(id="validator-probe"), project_dir=tmp_path,
+    )
+
+    assert outcome.status == OUTCOME_ESCALATE, outcome.reasons
+    assert outcome.needs_llm is True
+    assert "project-tree-validator" in str(outcome.evidence), (
+        "validate_vp did not come from the tree under test — evidence: "
+        f"{outcome.evidence!r}"
+    )
+
+
+def test_a_crashing_validator_escalates_instead_of_crashing_the_round(
+    tmp_path: Path,
+) -> None:
+    """A validator from the tree under test may not fit the caller's mouth.
+
+    校验器现在可能来自**别的文件**（被测树那份）。它要是接不住分派器的
+    调用方式，那是「判不了」，不是「这一轮崩了」 —— 崩了会把整轮验证
+    带走，而落回 LLM 路径至少还能判。
+    """
+    _framework_checkout(tmp_path)
+
+    outcome = run_deterministic(
+        _probe_vp(id="exploding-validator"), project_dir=tmp_path,
+    )
+
+    assert outcome.status == OUTCOME_ESCALATE, outcome.reasons
+    assert outcome.needs_llm is True
+    assert outcome.verdict is None
+    assert "does not take the modern arguments" in " ".join(outcome.reasons)
+
+
+def test_ci_runner_falls_back_to_the_harness_copy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A tree that is not a framework checkout is judged by the harness.
+
+    回落必须**与 importlib.import_module 的答案一致** —— harness 那份
+    是框架替换 runner 的注入点（``monkeypatch.setattr`` 换掉
+    ``verification_ci_runner.run_ci_verification``），回落绕过它，框架
+    自己的测试就换不动 runner 了。
+    """
+    from verification_ci_runner import CiRunResult
+
+    def _fake_run(vp, *, project_dir, artifact_dir=None):
+        return CiRunResult(
+            status="PASSED",
+            reasons=["judged by the harness copy"],
+            evidence={"probe_source": "harness"},
+        )
+
+    monkeypatch.setattr(
+        "verification_ci_runner.run_ci_verification", _fake_run
+    )
+
+    outcome = run_deterministic(_ci_vp(), project_dir=tmp_path)
+
+    assert outcome.status == OUTCOME_PASS, outcome.reasons
+    assert outcome.evidence.get("probe_source") == "harness", (
+        "a tree that is not a framework checkout must be judged by the "
+        f"harness' own copy — evidence: {outcome.evidence!r}"
+    )

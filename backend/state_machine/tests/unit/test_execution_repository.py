@@ -551,7 +551,7 @@ def test_update_status_does_not_touch_routing(
 
     RoutingRepository(repo._conn).write_plan_state(
         "p1", phase="ready", completed_phases=[], review_rounds={},
-        flags={}, verification={}, last_updated=None,
+        flags={}, last_updated=None,
     )
     repo.insert(plan_id="p1", exec_status="running")
 

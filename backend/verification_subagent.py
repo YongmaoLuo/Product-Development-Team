@@ -4982,6 +4982,9 @@ _RUNNER_EXECUTORS: Dict[str, str] = {
     "verification_ci_runner": "run_ci_verification",
 }
 
+#: 分派区自己的 logger —— 回落这类事必须留痕，不能悄悄发生。
+_dispatch_logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class DeterministicOutcome:
@@ -5097,14 +5100,61 @@ def _runner_module(name: str, project_dir: Optional[Path] = None) -> Any:
         return importlib.import_module(name)
 
 
+def _runner_for(
+    runner_name: str,
+    project_dir: Optional[Path],
+) -> Tuple[Any, Dict[str, Any]]:
+    """将要判这条验证点的模块 —— 校验器和执行入口都取自它。
+
+    CI runner 每轮从**被测树**重载（``verification_ci_runner_loader.
+    load_ci_runner``），与 ``verification_agent`` 判 full_ci 时同源：
+    2026-11-05 与 2026-11-14 两次都是 harness 副本在判，而工作树里
+    那份早就修好了 —— 修复停在分支上，判定跑的是旧代码，于是「修好了」
+    永远轮不到被判定。
+
+    ``project_dir`` 为空、或它不是框架检出时，loader 自己回落到已导入的
+    那份（harness 副本）—— 那正是 ``importlib.import_module`` 原来的
+    答案，所以框架替换 runner 的注入点仍然有效。
+
+    其余 runner 走**被测树自己那份**（``_runner_module`` 的按路径加载，
+    2026-11-04）：分派表点名的 runner 必须是被测的那个，否则这条验证点
+    判的是另一棵树。
+
+    Returns:
+        ``(module, provenance)`` —— 模块对象，和它的出处（loader 的
+        provenance；不经过 loader 时是空字典）。
+    """
+    if runner_name == "verification_ci_runner" and project_dir is not None:
+        try:
+            from verification_ci_runner_loader import load_ci_runner
+
+            loaded = load_ci_runner(project_dir)
+        except Exception as exc:  # noqa: BLE001 — 回落到 harness 副本
+            _dispatch_logger.warning(
+                "[dispatch] could not load the tree under test's own "
+                "verification_ci_runner (%s); falling back to the "
+                "harness' copy: %s", project_dir, exc,
+            )
+            return _runner_module(runner_name), {}
+        return loaded.module, dict(loaded.provenance or {})
+    return _runner_module(runner_name, project_dir), {}
+
+
 def _runner_issues(
-    runner_name: str, vp: Any, project_dir: Optional[Path] = None,
+    runner_name: str,
+    vp: Any,
+    project_dir: Optional[Path] = None,
+    module: Optional[Any] = None,
 ) -> List[Any]:
     """runner 的校验器给出的全部问题（空列表 = 判得了）。
 
     校验器问的是「这条验证点你能不能执行」，答案只有它能给：分派器不替
     runner 做这个判断。抄一份规则进分派器，抄出来的那份一定会和真规则
     漂移，而漂移的方向是「看起来能跑」。
+
+    ``module`` 是**将要执行**的那个模块：不传就用分派表点名的那份（没有
+    ``project_dir`` 时是 harness 副本），传了就用它 —— 校验器与执行入口
+    必须来自同一个模块对象，否则两份复制品互相背书。
 
     2026-11-04：``project_dir`` 必须传进去。校验器里「入口引用的路径
     存不存在」这一段的前提就是 ``project_dir`` —— 不传，整段检查被跳过，
@@ -5115,7 +5165,8 @@ def _runner_issues(
     不重写，它仍然要能跑、仍然归确定性 runner 判。形态契约是**规划期**的
     规则（生成时就退回重写），不是执行期的准入条件。
     """
-    module = _runner_module(runner_name, project_dir)
+    if module is None:
+        module = _runner_module(runner_name, project_dir)
     validator = getattr(module, "validate_vp", None)
     if validator is None:
         return [f"{runner_name} 没有提供校验器，无法判定这条验证点"]
@@ -5212,12 +5263,20 @@ def resolve(vp: Any, project_dir: Optional[Path] = None) -> Tuple[str, str]:
 
     2026-11-04：``project_dir`` 传进去，判与被判的都是**被测树那份**
     runner —— 校验用的代码必须和执行的代码来自同一棵树。
+
+    2026-11-14（合并）：解析走的是**同一个** :func:`_runner_for` ——
+    路由这一步与执行那一步必须落在同一个模块上（CI runner 走 loader，
+    其余走被测树的按路径加载），否则路由说「判得了」、执行那一步却用
+    另一份复制品的校验器判「判不了」，两份口径互相打架。
     """
     method = _vp_method(vp)
     runner_name = DETERMINISTIC_RUNNERS.get(method)
     if runner_name is None:
         return (LLM_ROUTE, ESCALATE_PATH_MODE)
-    if _blocking_issues(_runner_issues(runner_name, vp, project_dir)):
+    module, _source = _runner_for(runner_name, project_dir)
+    if _blocking_issues(
+        _runner_issues(runner_name, vp, project_dir=project_dir, module=module)
+    ):
         return (LLM_ROUTE, ESCALATE_PATH_MODE)
     return (runner_name, DETERMINISTIC_MODE)
 
@@ -5253,7 +5312,29 @@ def run_deterministic(
             evidence={"method": method},
         )
 
-    issues = _runner_issues(runner_name, vp, project_dir)
+    # 解析一次，校验器与执行入口都用它 —— 两份复制品互相背书等于没判。
+    module, runner_source = _runner_for(runner_name, project_dir)
+    source_evidence = (
+        {"runner_source": runner_source} if runner_source else {}
+    )
+
+    try:
+        issues = _runner_issues(
+            runner_name, vp, project_dir=project_dir, module=module,
+        )
+    except Exception as exc:  # noqa: BLE001 — 校验器崩了也是「判不了」
+        detail = f"{type(exc).__name__}: {exc}"
+        return DeterministicOutcome(
+            status=OUTCOME_ESCALATE,
+            route=LLM_ROUTE,
+            reasons=(f"runner {runner_name} 的校验器崩溃：{detail}",),
+            evidence={
+                "method": method,
+                "runner": runner_name,
+                "error": detail,
+                **source_evidence,
+            },
+        )
     if _blocking_issues(issues):
         return DeterministicOutcome(
             status=OUTCOME_ESCALATE,
@@ -5266,10 +5347,10 @@ def run_deterministic(
                 "method": method,
                 "runner": runner_name,
                 "issues": _issue_evidence(issues),
+                **source_evidence,
             },
         )
 
-    module = _runner_module(runner_name, project_dir)
     executor_name = _RUNNER_EXECUTORS.get(runner_name)
     executor = getattr(module, executor_name, None) if executor_name else None
     if executor is None:
@@ -5279,7 +5360,11 @@ def run_deterministic(
             reasons=(
                 f"runner {runner_name} 没有提供执行入口，无法确定性判定",
             ),
-            evidence={"method": method, "runner": runner_name},
+            evidence={
+                "method": method,
+                "runner": runner_name,
+                **source_evidence,
+            },
         )
 
     kwargs: Dict[str, Any] = {}
@@ -5293,7 +5378,11 @@ def run_deterministic(
                 reasons=(
                     "整仓门禁要知道仓库在哪（project_dir），没有它判不了",
                 ),
-                evidence={"method": method, "runner": runner_name},
+                evidence={
+                    "method": method,
+                    "runner": runner_name,
+                    **source_evidence,
+                },
             )
         kwargs["project_dir"] = Path(project_dir)
 
@@ -5309,6 +5398,7 @@ def run_deterministic(
                 "method": method,
                 "runner": runner_name,
                 "error": detail,
+                **source_evidence,
             },
         )
 
@@ -5323,7 +5413,12 @@ def run_deterministic(
             status=OUTCOME_ESCALATE,
             route=LLM_ROUTE,
             reasons=reasons or (f"runner {runner_name} 没有给出裁决",),
-            evidence={**evidence, "method": method, "runner": runner_name},
+            evidence={
+                **evidence,
+                "method": method,
+                "runner": runner_name,
+                **source_evidence,
+            },
         )
 
     return DeterministicOutcome(
@@ -5333,7 +5428,12 @@ def run_deterministic(
         stdout=_evidence_text(evidence, "stdout", "stdout_tail"),
         stderr=_evidence_text(evidence, "stderr", "stderr_tail"),
         exit_code=evidence.get("exit_code"),
-        evidence={**evidence, "method": method, "runner": runner_name},
+        evidence={
+            **evidence,
+            "method": method,
+            "runner": runner_name,
+            **source_evidence,
+        },
         verdict=verdict,
     )
 # DETERMINISTIC-DISPATCH-END

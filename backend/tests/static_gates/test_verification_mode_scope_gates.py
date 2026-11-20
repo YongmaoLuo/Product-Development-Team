@@ -135,11 +135,11 @@ EXCLUDED_SEGMENTS: frozenset[str] = frozenset({
 #: the process boundary. A change made for the feature's convenience
 #: lands on everyone else, and the feature's own tests cannot see it.
 #:
-#: The state machine's **test** tree is excluded on purpose. This gate
-#: measures production behaviour; those tests pin the HTTP contract the
-#: feature is allowed to extend, so a permitted production change has to
-#: be able to reach its own contract test. The production tree below is
-#: still frozen byte for byte.
+#: The state machine's ``backend/state_machine/tests`` tree is excluded
+#: on purpose. This gate measures production behaviour; those tests pin
+#: the HTTP contract the feature is allowed to extend, so a permitted
+#: production change has to be able to reach its own contract test. The
+#: production tree below is still frozen byte for byte.
 #:
 #: Three files are excluded for the phase merge that renamed the
 #: waiting bucket to ``queued``: ``frontend/app.js``,
@@ -187,6 +187,17 @@ EXCLUDED_SEGMENTS: frozenset[str] = frozenset({
 #: ``backend/state_machine/`` and ``frontend/`` stays frozen inside the
 #: diff.
 #:
+#: One more file is excluded for the base drift round record
+#: (2026-11-14) — the verification round repository:
+#: ``backend/state_machine/repositories/verification_repository.py``.
+#: A round that base drift blocks has to leave one auditable round row
+#: behind (``mark_round_blocked``), and that write path lives on the
+#: verification round repository.  The change is that one method and its
+#: audit fields, and the behaviour is pinned line by line by
+#: ``test_verification_repository_round_blocked.py`` — so this
+#: exclusion is carried by a behavioural pin rather than by the
+#: byte-for-byte freeze the surfaces above use.  Either way the rest of
+#:
 #: One more file is excluded for the round-release work:
 #: ``backend/state_machine/repositories/verification_repository.py``.
 #: A round that measured nothing must give its round number back, and
@@ -199,6 +210,21 @@ EXCLUDED_SEGMENTS: frozenset[str] = frozenset({
 #: ``FROZEN_VERIFICATION_REPOSITORY_SURFACE_SHA256`` (checked by
 #: ``test_verification_repository_surface_is_frozen``), so the rest of
 #: ``backend/state_machine/`` stays frozen inside the diff.
+#:
+#: One more file is excluded for the verification-mirror removal — the
+#: routing repository:
+#: ``backend/state_machine/repositories/routing_repository.py``.
+#: This plan moved the authoritative write of the verification state out
+#: of the routing row's ``verification`` mirror column: ``write_plan_state``
+#: no longer writes that column, and the one thing the column still
+#: records — the frozen baseline — has exactly one writer
+#: (``write_verification_baseline``).  The change is that column's
+#: ownership, and it reaches shared code, so the exclusion is scoped to
+#: that one file; the rest of ``backend/state_machine/`` stays frozen
+#: inside the diff.  Its bytes are frozen by
+#: ``FROZEN_ROUTING_REPOSITORY_SURFACE_SHA256`` (checked by
+#: ``test_routing_repository_surface_is_frozen``), so a later edit to it
+#: fails a gate even though it no longer shows up in the diff.
 #:
 #: The pathspecs are repository-root-relative: the helper runs
 #: ``git -C ..`` from ``backend/``, so the prefix is the repository
@@ -222,6 +248,12 @@ FORBIDDEN_MODULE_PATHS: tuple[str, ...] = (
     ":(exclude)backend/state_machine/repositories/verification_repository.py",
     ":(exclude)backend/state_machine/db/schema.py",
     ":(exclude)backend/state_machine/repositories/verification_repository.py",
+    # 2026-11-19：本计划把验证状态的权威写从路由行的 `verification` 镜像列上
+    # 移走（`write_plan_state` 不再写该列，该列只剩冻结基线且只有一个写者
+    # `write_verification_baseline`），这条改动落在路由仓库上。改动只有这一列
+    # 的归属，按本 gate 的既定流程给它一条窄排除，并把它逐字节钉在
+    # `FROZEN_ROUTING_REPOSITORY_SURFACE_SHA256` 上。
+    ":(exclude)backend/state_machine/repositories/routing_repository.py",
 )
 
 #: The base ref the change surface is measured against, in preference
@@ -520,6 +552,42 @@ def forbidden_modules_diff(base_ref: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def scoped_exclusion_paths() -> list[str]:
+    """The paths that ``FORBIDDEN_MODULE_PATHS`` excludes narrowly.
+
+    A ``:(exclude)`` pathspec takes one file out of the change-surface
+    diff. The pathspec says *what* is hidden; the prose next to the
+    constant says *why*, and that is the half a reader needs.
+    """
+    return [
+        path.split(":(exclude)", 1)[1]
+        for path in FORBIDDEN_MODULE_PATHS
+        if path.startswith(":(exclude)")
+    ]
+
+
+def exclusion_documentation() -> str:
+    """The prose that documents ``FORBIDDEN_MODULE_PATHS``.
+
+    The run of comment lines that immediately precedes the constant —
+    the block that says why each narrow exclusion is there.
+    """
+    lines = Path(__file__).resolve().read_text(encoding="utf-8").splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("FORBIDDEN_MODULE_PATHS:"):
+            break
+    else:  # pragma: no cover - the constant is in this file by definition
+        raise AssertionError(
+            "FORBIDDEN_MODULE_PATHS is not declared in this file"
+        )
+    start = index
+    while start > 0 and (
+        lines[start - 1].startswith("#") or not lines[start - 1].strip()
+    ):
+        start -= 1
+    return "\n".join(lines[start:index])
+
+
 def _relative(path: Path) -> str:
     """*path* as a repository-root-relative string, for messages."""
     try:
@@ -777,6 +845,15 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 卡片按卡片渲染、默认收起、展开才请求详情」互不覆盖，故两边都保留；文件
     # 内容因此再次变化，按本 gate 的既定流程把冻结基线前移到**合并态**哈希。
     # 表内条目集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
+    # 2026-11-14（本次合并 origin/main@ecc5d9ee，13 个新提交）：本分支自合并基线
+    # `33041be4` 分叉以来**没有改过**这个文件 —— 基线与本分支的副本逐字节相同
+    # （sha256 `51ad1ae1…`），改它的只有 base 侧（调度卡片的详情缓存与轮询）。
+    # 因此合并后本文件的内容与 base 侧逐字节相同，其真实 sha256 是 `5887449c…`
+    # （即 ecc5d9ee 那次合并后所钉的值），按本 gate 的既定流程把冻结基线前移到
+    # **合并态**哈希。
+    # 前移的两端都记在这里：基线由 `51ad1ae1…`（合并前的批准态）移到
+    # `5887449c…`（合并后的批准态）。表内条目集合与断言强度不变：被钉文件的
+    # 范围不变、sha256 仍逐字节比对。
     # 2026-11-15：本计划 PRD（import.json）需求二「内容（与飞书卡片对齐）」与需求一
     # 「交互稳定性」的已批准改动落在本文件：041a1f9c（task-6）「按 sections 渲染详情并
     # 保留 lines 回退」（需求二）、8a6e31d2（task-7）「详情过期只刷新不清空」、
@@ -785,6 +862,15 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 该文件只有上述三处已批准的改动，没有夹带别的改动。
     # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的范围、
     # sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-16（本次合并 origin/main@78ffdddc，7 个新提交）：本分支自合并基线
+    # `67531555` 分叉以来**没有改过**这个文件 —— 基线与本分支的副本逐字节相同
+    # （sha256 `5887449c…`），改它的只有 base 侧（上面 2026-11-15 那三处已批准
+    # 改动）。因此合并后本文件的内容与 base 侧逐字节相同，其真实 sha256 就是
+    # 下方所钉的 `b8c6970f…`，按本 gate 的既定流程把冻结基线前移到**合并态**哈希。
+    # 前移的两端都记在这里：基线由 `5887449c…`（合并前的批准态）移到
+    # `b8c6970f…`（合并后的批准态）。表内条目集合与断言强度不变：被钉文件的
+    # 范围不变、sha256 仍逐字节比对。
+#:
     # 2026-11-17（本次合入 origin/main@78ffdddc）：base 侧的「调度面板卡片原地更新
     # 并展示完整进度分节」（PR #166 —— `schedulerCardFromHtml` /
     # `schedulerUpdateCard` 与进度分节渲染）与本分支的「终态计划走验证面板」
@@ -807,6 +893,16 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 两侧的意图都保留；文件内容因此再次变化，按本 gate 的既定流程把冻结基线前移到
     # **合并态**哈希（`shasum -a 256` 实测值）。表内条目集合与断言强度不变：被钉文件的
     # 范围、sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-17（本次合并 origin/main@b9b9061b，4 个新提交）：本分支自合并基线
+    # `78ffdddc` 分叉以来**没有改过**这个文件 —— 基线与本分支的副本逐字节相同
+    # （sha256 `b8c6970f…`），改它的只有 base 侧（收尾阶段的等待区块与错误渲染：
+    # `renderSchedulerWaiting` / `renderSchedulerError`，+376/-2）。
+    # 因此合并后本文件的内容与 base 侧逐字节相同，其真实 sha256 就是下方所钉的
+    # `86c333a6…`，按本 gate 的既定流程把冻结基线前移到**合并态**哈希。
+    # 前移的两端都记在这里：基线由 `b8c6970f…`（合并前的批准态）移到
+    # `86c333a6…`（合并后的批准态）。表内条目集合与断言强度不变：被钉文件的
+    # 范围不变、sha256 逐字节比对的强度不变。
+#:
     # 2026-11-17（本次合入 origin/main@b9b9061b —— PR #170「验证通过后的收尾阶段」）：
     # base 侧在 78ffdddc 之后又给调度面板接上了收尾阶段的等待区块与要求书编辑入口
     # （`renderSchedulerWaiting` / `schedulerExtendWait` / `schedulerTerminateWait` /
@@ -828,6 +924,28 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     ),
     # 2026-11-01：因「调度卡片容器与收起态样式」（task-11）改动了 `frontend/style.css`，
     # 按本 gate 的既定流程把哈希前移到本分支的批准态；表内条目集合不变。
+    # 2026-11-14（本次合并 origin/main@ecc5d9ee）：本分支自合并基线 `33041be4`
+    # 分叉以来**没有改过**这个文件 —— 基线与本分支的副本逐字节相同（sha256
+    # `0cab7b66…`），改它的只有 base 侧（调度卡片容器的样式）。因此合并后本文件
+    # 的内容与 base 侧逐字节相同，其真实 sha256 是 `2f1a86a3…`（即 ecc5d9ee 那次
+    # 合并后所钉的值），按本 gate 的既定流程把冻结基线前移到**合并态**哈希。
+    # 前移的两端都记在这里：基线由 `0cab7b66…`（合并前的批准态）移到
+    # `2f1a86a3…`（合并后的批准态）。
+    # 表内条目集合不变：被钉文件的范围不变、sha256 仍逐字节比对。
+    # 2026-11-15：本计划 PRD（import.json）需求三「样式」的已批准改动落在本文件：
+    # fb965ed6（task-9）「分区 / 进度条 / 任务行样式」（分区标题、等宽进度条、任务行
+    # 状态图标、次要信息弱化色）。前移之前已核对：自上一版基线（e8b568f4，即 2026-11-14
+    # 钉住的状态）以来，该文件只有这一处已批准的改动，没有夹带别的改动。
+    # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的范围、
+    # sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-16（本次合并 origin/main@78ffdddc，7 个新提交）：本分支自合并基线
+    # `67531555` 分叉以来**没有改过**这个文件 —— 基线与本分支的副本逐字节相同
+    # （sha256 `2f1a86a3…`），改它的只有 base 侧（上面 2026-11-15 那处已批准改动）。
+    # 因此合并后本文件的内容与 base 侧逐字节相同，其真实 sha256 就是下方所钉的
+    # `d77285b4…`，按本 gate 的既定流程把冻结基线前移到**合并态**哈希。
+    # 前移的两端都记在这里：基线由 `2f1a86a3…`（合并前的批准态）移到
+    # `d77285b4…`（合并后的批准态）。
+    # 表内条目集合不变：被钉文件的范围不变、sha256 仍逐字节比对。
     # 2026-11-16：task-23「调度页新增等待区块与要求书编辑入口」（4dc2f275）给该文件
     # 加了等待表格与要求书编辑区的样式，task-repair-01 的合并解冲突（b8a421f1）又
     # 落在同一文件，两侧的意图都保留；按本 gate 的既定流程把冻结基线前移到**合并态**
@@ -839,6 +957,16 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 无冲突，两侧的意图都保留；按本 gate 的既定流程把冻结基线前移到**合并态**哈希
     # （`shasum -a 256` 实测值）。表内条目集合与断言强度不变：被钉文件的范围不变、
     # sha256 逐字节比对的强度不变。
+    # 2026-11-17（本次合并 origin/main@b9b9061b，4 个新提交）：本分支自合并基线
+    # `78ffdddc` 分叉以来**没有改过**这个文件 —— 基线与本分支的副本逐字节相同
+    # （sha256 `d77285b4…`），改它的只有 base 侧（等待表格与要求书编辑区的样式：
+    # `.scheduler-waiting-*` / `.scheduler-spec-*`，+98/-0）。
+    # 因此合并后本文件的内容与 base 侧逐字节相同，其真实 sha256 就是下方所钉的
+    # `7703bc85…`，按本 gate 的既定流程把冻结基线前移到**合并态**哈希。
+    # 前移的两端都记在这里：基线由 `d77285b4…`（合并前的批准态）移到
+    # `7703bc85…`（合并后的批准态）。表内条目集合与断言强度不变：被钉文件的
+    # 范围不变、sha256 逐字节比对的强度不变。
+#:
     # 2026-11-17（本次合入 origin/main@b9b9061b —— PR #170「验证通过后的收尾阶段」）：
     # 该文件只被 base 侧改动（本分支未动它），合并后的内容与 base 侧一致；按本 gate
     # 的既定流程把冻结基线钉在**合并态**哈希（`shasum -a 256` 实测值）。
@@ -947,6 +1075,24 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 合并后保持不变。这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、
     # 被钉文件的范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
     # 任何再编辑照样红。
+    # 2026-11-09：本计划任务 2 删除了 `plan_routing.verification` 的镜像写函数
+    # `_update_plan_state_to_terminal` 及其调用点（镜像列不再是验证状态的生产
+    # 写入点，权威行取代它）。
+    # 前移之前已核对：`git diff main -- backend/verification_loop.py` 只有这
+    # 一处已批准的改动（+2/-169 —— 2 行是注释「Default; the branch inside the
+    # try narrows it to the caller's verdict.」，其余为镜像写函数整段删除），
+    # 没有夹带别的改动。
+    # 前移的两端都记在这里：基线由
+    # 3fa8684b1ed4c2f9bdf0b9a27daf46c0c2df9310e07928bf91210bb84f4ab3e0
+    # （改动前的批准态）移到
+    # 4123ac1df0822c0fcd8f107f1bfefd2da31656bfaf4780009051fc7453f3252e
+    # （改动后的批准态）。前移这一步本身可被复核，不必再回溯 git 历史才能
+    # 确认「移动」是从哪个基线移到了哪个基线。
+    # 按本 gate 的既定流程把冻结基线前移到该批准态的哈希。这是「移动冻结」
+    # 而不是「放松门禁」：断言（mismatched == []）、被钉文件的集合
+    # （frontend/app.js / frontend/style.css / backend/verification_loop.py）
+    # 与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑
+    # 照样红。
     # 2026-11-09：本计划 task-7「修复轮的同步/异步路径也写兜底现场」已批准，
     # 改动本文件——新增 `_repair_stop_reason`（正数退出码写成
     # `repair_non_zero_exit:3`，负数信号写成 `repair_signal:9`），
@@ -1008,6 +1154,18 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的
     # 范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
     # 任何再编辑照样红。
+    # 2026-11-13：合并 origin/main 时 ``backend/verification_loop.py`` 两侧都改过
+    # ——本分支删掉了镜像写函数 ``_update_plan_state_to_terminal`` 及其调用点
+    # （镜像列不再是验证状态的生产写入点，权威行取代它），main 侧则带来了
+    # 2026-11-09 至 2026-11-11 的若干已批准改动。合并后的文件内容与两侧的
+    # 冻结基线都不同，因此按本 gate 的既定流程把冻结基线前移到合并态哈希。
+    # 前移之前已核对：合并后该文件里本分支的镜像写函数与其三个调用点仍然
+    # 一并消失（``server.py`` 的导入、``verification_loop.py`` 的两处调用、
+    # ``routes/verification.py`` 的 ``user_force_terminal`` 一处），改由
+    # ``_persist_verification_terminal`` 写权威行；两侧的改动没有互相抵消。
+    # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的
+    # 范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑
+    # 照样红。
     # 2026-11-13：本分支已批准的「轮次实例身份」改动落在 `verification_loop.py` 上 ——
     #   * 新增按**实例**铸造的 round token `_new_round_instance_token()`：token 形如
     #     `verification_loop-<pid>-<uuid>`（带 pid 是为了让崩溃后遗留的注册表能被认出
@@ -1037,6 +1195,57 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # （仍是 `frontend/app.js` / `frontend/style.css` / `backend/verification_loop.py`
     # 这三个，一个不多一个不少）与 sha256 逐字节比对的强度都不变，该文件此后仍被
     # 逐字节钉住，任何再编辑照样红。
+    # 2026-11-14：再次合并 origin/main（980249a5，PR #154「轮次实例服务所有权改用
+    # 每次实例 UUID」）—— 这一次 ``backend/verification_loop.py`` 两侧仍然都改过：
+    # 本分支继续删镜像写函数，main 侧带来上面那整套「轮次实例身份」改动。
+    # 合并后的文件内容与两侧各自的冻结基线（``a07256be…`` / ``3207acac…``）都不同，
+    # 因此按本 gate 的既定流程把冻结基线再前移到合并态哈希。
+    # 前移之前已核对：合并后两侧的改动都还在，没有互相抵消 ——
+    #   * main 侧：``_new_round_instance_token`` / ``_claim_round_instance_ownership`` /
+    #     ``_release_handover_service_owner`` / ``_end_round_instance`` /
+    #     ``SERVICE_OWNER_CLAIM_REFUSED_STOP_REASON`` / ``_terminal_write_ends_the_chain``
+    #     全部在位（``git diff d66d163f 980249a5 -- backend/verification_loop.py``
+    #     的新增全部落进了合并结果 —— 注意上面那两个 ``a07256be…`` / ``3207acac…``
+    #     是**文件内容**的 sha256、不是 git commit（``git cat-file -t`` 会说
+    #     "Not a valid object name"），所以核对要拿那两个 commit 跑 diff，
+    #     拿内容哈希去跑会直接报错）；
+    #   * 本分支：镜像写函数 ``_update_plan_state_to_terminal`` 仍然整体消失 ——
+    #     ``git diff 980249a5 -- backend/verification_loop.py`` 只剩镜像写代码的删除，
+    #     没有别的，权威行仍由 ``_persist_verification_terminal`` 写；
+    #   * 两处改动落在不同的代码段上（main 侧把 ``_chain_ending`` 的判定提成
+    #     ``_terminal_write_ends_the_chain()``，本分支删的是 step 4 的镜像写段），
+    #     合并结果两者都在。
+    # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的
+    # 范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑
+    # 照样红。
+    # 2026-11-14：本分支（base drift 轮次复用与审计、服务放置复用自家实例）的
+    # 已批准改动同样落在 `verification_loop.py`；与上面「轮次实例身份」的改动
+    # 合并后，冻结基线前移到**合并态**哈希。判定强度不变：仍是逐字节 sha256 比对。
+    # 2026-11-14（本次合并 origin/main@316b360a5，PR #155「base drift 不消耗轮次，
+    # 服务放置复用本 plan 自家实例」）：``backend/verification_loop.py`` 两侧又都改过
+    # —— 本分支继续删镜像写函数 ``_update_plan_state_to_terminal``（权威行取代它），
+    # base 侧带来 base drift 的轮次复用与审计。两侧各自的冻结基线（``1d338d27…`` /
+    # ``1275d125…``）都与合并态内容不同，因此按本 gate 的既定流程把冻结基线前移到
+    # 合并态哈希 ``9b884519…``。
+    # 前移之前已核对：两侧的改动都还在，没有互相抵消 ——
+    #   * base 侧：``_new_round_instance_token`` / ``_claim_round_instance_ownership`` /
+    #     ``_release_handover_service_owner`` / ``_end_round_instance`` /
+    #     ``SERVICE_OWNER_CLAIM_REFUSED_STOP_REASON`` / ``_terminal_write_ends_the_chain``
+    #     / ``mark_round_blocked`` 全部在位；
+    #   * 本分支：镜像写函数 ``_update_plan_state_to_terminal`` 仍然整体消失（该文件里
+    #     0 处引用），权威行仍由 ``_persist_verification_terminal`` 写。
+    # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的范围
+    # 与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-14（本次合并 origin/main@ecc5d9ee）：``backend/verification_loop.py``
+    # 两侧**都没有再改**这个文件 —— 合并基线 ``33041be4`` 的副本与 base 侧的副本
+    # 逐字节相同（sha256 ``1275d125…``）；改它的仍然只有本分支那一侧（镜像写函数
+    # ``_update_plan_state_to_terminal`` 整段删除），所以合并结果取的就是本分支这一
+    # 侧，其真实 sha256 是 ``9b884519…``（即 ecc5d9ee 那次合并后所钉的值），
+    # **本条哈希在 ecc5d9ee 那次合并后保持不变**。核对依据：``git diff ecc5d9ee --
+    # backend/verification_loop.py`` 只剩镜像写代码的删除（+2/-169），没有别的改动。
+    # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的范围
+    # 与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
+#:
     # 2026-11-14：本分支（base drift 轮次复用与审计、服务放置复用自家实例）的
     # 已批准改动同样落在 `verification_loop.py`；与上面「轮次实例身份」的改动
     # 合并后，冻结基线前移到**合并态**哈希。判定强度不变：仍是逐字节 sha256 比对。
@@ -1090,12 +1299,51 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     #     不写终态、不动相位，计划停在 waiting_for_quota，等配额窗口重开后续跑；
     #   * task-5（566ec593「验证轮停放写入行与运行时旁路文件」）：新增
     #     `_park_verification_round_for_quota`，让验证侧的停放有地方落行。
+    # 前移之前已核对：自上一版基线（dbf9a037，2026-11-14 钉住的合并态）以来，
+    # 该文件只有上述两处已批准改动（+294/-0，分别来自 task-4 与 task-5），
+    # 没有夹带别的改动。
     # 两侧改动落在同一文件的**不同位置**，自动合并无冲突，两侧的意图都保留；按本
     # gate 的既定流程把冻结基线前移到**合并态**哈希（`shasum -a 256` 实测值）。
     # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的
     # 范围（仍是 `frontend/app.js` / `frontend/style.css` / `backend/verification_loop.py`
     # 这三个，一个不多一个不少）与 sha256 逐字节比对的强度都不变，该文件此后仍被
     # 逐字节钉住，任何再编辑照样红。
+    # 2026-11-16（本次合并 origin/main@78ffdddc，7 个新提交）：``backend/verification_loop.py``
+    # 两侧**又都改过** —— 本分支继续删镜像写函数 ``_update_plan_state_to_terminal``
+    # （权威行取代它），base 侧带来 2026-11-15 的「停放不等于失败」（PRD R1：
+    # ``_plan_parked_for_quota`` / ``_park_verification_round_for_quota``）。
+    # 合并后的文件内容与两侧各自的冻结基线（``9b884519…`` / ``bda62e8b…``）都不同，
+    # 因此按本 gate 的既定流程把冻结基线再前移到合并态哈希 ``438a0c7c…``。
+    # 前移之前已核对：两侧的改动都还在，没有互相抵消 ——
+    #   * base 侧：``_plan_parked_for_quota`` / ``_park_verification_round_for_quota``
+    #     都在位（该文件里各 2 处引用），``_new_round_instance_token`` /
+    #     ``_claim_round_instance_ownership`` / ``_release_handover_service_owner`` /
+    #     ``_end_round_instance`` / ``mark_round_blocked`` /
+    #     ``_terminal_write_ends_the_chain`` / ``SERVICE_OWNER_CLAIM_REFUSED_STOP_REASON``
+    #     也都在位；
+    #   * 本分支：镜像写函数 ``_update_plan_state_to_terminal`` 仍然整体消失（该文件里
+    #     0 处引用），权威行仍由 ``_persist_verification_terminal`` 写。
+    # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的范围
+    # 与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-17（本次合并 origin/main@b9b9061b，4 个新提交）：``backend/verification_loop.py``
+    # 两侧**又都改过** —— 本分支继续删镜像写函数 ``_update_plan_state_to_terminal``
+    # （权威行取代它），base 侧带来收尾阶段（postprocess）的改动
+    # （``_start_postprocess`` / ``_postprocess_notification_sink`` /
+    # ``_settle_postprocess_phase``，+208/-4）。
+    # 合并后的文件内容与两侧各自的冻结基线（``438a0c7c…`` / ``c3cc3314…``）都不同，
+    # 因此按本 gate 的既定流程把冻结基线再前移到合并态哈希 ``541f6984…``。
+    # 前移之前已核对：两侧的改动都还在，没有互相抵消 ——
+    #   * base 侧：``_plan_parked_for_quota`` / ``_park_verification_round_for_quota``
+    #     都在位（该文件里各 2 处引用），``_new_round_instance_token`` /
+    #     ``_claim_round_instance_ownership`` / ``_release_handover_service_owner`` /
+    #     ``_end_round_instance`` / ``mark_round_blocked`` /
+    #     ``_terminal_write_ends_the_chain`` / ``SERVICE_OWNER_CLAIM_REFUSED_STOP_REASON``
+    #     也都在位，收尾阶段的三个新函数同样在位；
+    #   * 本分支：镜像写函数 ``_update_plan_state_to_terminal`` 仍然整体消失（该文件里
+    #     0 处引用），权威行仍由 ``_persist_verification_terminal`` 写。
+    # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的范围
+    # 与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
+#:
     # 2026-11-17（本次合入 origin/main@78ffdddc）：base 侧的「停放不等于失败」
     # （`_plan_parked_for_quota` / `_park_verification_round_for_quota`）与本分支的
     # 「轮次归还」（`_release_unverified_round` 及其调用点）与「崩溃不盖终局相位」
@@ -1120,8 +1368,34 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 实测值）。这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、
     # 被钉文件的范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
     # 任何再编辑照样红。
+    # 2026-11-19（本次合并 origin/main@021565b9）：``backend/verification_loop.py``
+    # 两侧**又都改过** —— 本分支继续删镜像写函数 ``_update_plan_state_to_terminal``
+    # （权威行取代它），base 侧带来本轮的新改动。合并后的文件内容与两侧各自的冻结
+    # 基线（``541f6984…`` / ``9cba6335…``）都不同，因此按本 gate 的既定流程把冻结
+    # 基线再前移到合并态哈希 ``fadeae92…``。
+    # 前移之前已核对：两侧的改动都还在，没有互相抵消 ——
+    #   * base 侧：``_new_round_instance_token`` / ``_claim_round_instance_ownership`` /
+    #     ``_terminal_write_ends_the_chain`` / ``_start_postprocess`` /
+    #     ``_plan_parked_for_quota`` / ``_park_verification_round_for_quota`` 都在位；
+    #   * 本分支：镜像写函数 ``_update_plan_state_to_terminal`` 仍然整体消失（该文件里
+    #     0 处引用），权威行仍由 ``_persist_verification_terminal`` 写。
+    # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的范围
+    # 与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-20（本次合入 origin/main@2b9efa16 —— 新分支 + 新 PR 重交付）：该文件
+    # 两侧**又都改过** —— base 侧带来「修复完成后的通过出口走回收尾判定点」
+    # （`_handle_passed_round` 取代 `passed` 出口自写终态），本分支带来「删镜像写
+    # 函数」等改动。两侧的改动落在**不同位置**，互不覆盖，故两边都保留
+    # （合并后实测：base 侧的 `_new_round_instance_token` /
+    # `_claim_round_instance_ownership` / `_terminal_write_ends_the_chain` /
+    # `_start_postprocess` / `_plan_parked_for_quota` /
+    # `_park_verification_round_for_quota` 与 `_handle_passed_round` 均在位；本分支的
+    # `_update_plan_state_to_terminal` 仍为 0 处引用，权威行仍由
+    # `_persist_verification_terminal` 写）。文件内容因此再次变化，按本 gate 的既定
+    # 流程把冻结基线再前移到**合并态**哈希（`shasum -a 256` 实测值）。
+    # 表内条目集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节比对，
+    # 该文件此后仍被逐字节钉住，任何再编辑照样红。
     "backend/verification_loop.py": (
-        "ca7721cee7319118a2008968c96b031c72a2e1b2e1d5c1fe70eb9d38d0e2a062"
+        "ac64706c46f08eba85eb02ec7b351592c5446f949e3d7f9cce5dd50341b7e941"
     ),
 }
 
@@ -1183,12 +1457,29 @@ FROZEN_SCHEDULER_SURFACE_SHA256: dict[str, str] = {
     # 互不覆盖，故两边都保留；文件内容因此再次变化，按本 gate 的既定流程把
     # 冻结基线前移到**合并态**哈希。表内条目集合与断言强度不变：被钉文件的
     # 范围不变、sha256 仍逐字节比对。
+    # 2026-11-14（本次合并 origin/main@ecc5d9ee）：本分支自合并基线 `33041be4`
+    # 分叉以来**没有改过**这个文件 —— 基线与本分支的副本逐字节相同（sha256
+    # `d98d19a9…`），改它的只有 base 侧。因此合并后本文件的内容与 base 侧逐字节
+    # 相同，其真实 sha256 就是下方所钉的 `b5472f09…`，按本 gate 的既定流程把冻结
+    # 基线前移到**合并态**哈希。前移的两端都记在这里：基线由 `d98d19a9…`
+    # （合并前的批准态）移到 `b5472f09…`（合并后的批准态）。表内条目集合与断言
+    # 强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
     # 2026-11-16：task-23「调度页新增等待区块与要求书编辑入口」（4dc2f275）在标记里
     # 增加了调度面板的等待区块（`#scheduler-waiting-*`）与要求书编辑区
     # （`#scheduler-spec-editor`），task-repair-01 的合并解冲突（b8a421f1）又落在同一
     # 文件，两侧的意图都保留；按本 gate 的既定流程把冻结基线前移到**合并态**哈希
     # （`shasum -a 256` 实测值）。表内条目集合与断言强度不变：被钉文件的范围不变、
     # sha256 仍逐字节比对。
+    # 2026-11-17（本次合并 origin/main@b9b9061b，4 个新提交）：本分支自合并基线
+    # `78ffdddc` 分叉以来**没有改过**这个文件 —— 基线与本分支的副本逐字节相同
+    # （sha256 `b5472f09…`），改它的只有 base 侧（等待区块与要求书编辑区的标记：
+    # `#scheduler-waiting-*` / `#scheduler-spec-*`，+42/-2）。
+    # 因此合并后本文件的内容与 base 侧逐字节相同，其真实 sha256 就是下方所钉的
+    # `f8c07759…`，按本 gate 的既定流程把冻结基线前移到**合并态**哈希。
+    # 前移的两端都记在这里：基线由 `b5472f09…`（合并前的批准态）移到
+    # `f8c07759…`（合并后的批准态）。表内条目集合与断言强度不变：被钉文件的
+    # 范围不变、sha256 逐字节比对的强度不变。
+#:
     # 2026-11-17（本次合入 origin/main@b9b9061b —— PR #170「验证通过后的收尾阶段」）：
     # 该文件只被 base 侧改动（本分支未动它），合并后的内容与 base 侧一致；按本 gate
     # 的既定流程把冻结基线钉在**合并态**哈希（`shasum -a 256` 实测值）。
@@ -1248,8 +1539,35 @@ FROZEN_VERIFICATION_REPOSITORY_SURFACE_SHA256: dict[str, str] = {
     # 互不覆盖，故两边都保留；文件内容因此再次变化，按本 gate 的既定流程把冻结
     # 基线前移到**合并态**哈希。表内条目集合与断言强度不变：被钉文件的范围不变、
     # sha256 仍逐字节比对。
+    # 2026-11-19（本次合并 origin/main@021565b9）：该文件两侧都改过 —— 本分支的
+    # `release_round` / `_decode_executor_state` 与 base 侧的 `mark_round_blocked` /
+    # `_stop_reason_is_write_once` 落在**不同位置**，互不覆盖，故两边都保留；文件
+    # 内容因此再次变化，按本 gate 的既定流程把冻结基线前移到**合并态**哈希
+    # （`shasum -a 256` 实测值）。表内条目集合与断言强度不变：被钉文件的范围不变、
+    # sha256 仍逐字节比对。
     "backend/state_machine/repositories/verification_repository.py": (
-        "513b800cd7f599f97031638e8eb9348f60a4d20a56a149b9f298d29bd9587d19"
+        "1c005254958ddb3167d6d31936718a82e4183eee95c24f5b4e51c51fbb07057a"
+    ),
+}
+
+#: The routing-mirror surface, frozen the same way.  The routing row's
+#: ``verification`` column used to carry the verification state; this
+#: plan moved the authoritative write of that state to the
+#: ``plan_verification`` table, and the column now carries only the
+#: frozen baseline.  The file is therefore excluded from the
+#: change-surface diff (above) and frozen here instead, byte for byte:
+#: the diff gate stops reporting the one approved change, and this gate
+#: stops reporting any *other* change to the same file.
+FROZEN_ROUTING_REPOSITORY_SURFACE_SHA256: dict[str, str] = {
+    # 2026-11-19（本次合并 origin/main@021565b9 之后）：该文件只有本分支一侧的
+    # 已批准改动 —— ``write_plan_state`` 不再写 ``verification`` 镜像列，
+    # ``write_verification_baseline`` 成为该列唯一的写者（镜像列只剩冻结基线）。
+    # base 侧未改这个文件，故合并后的内容与本分支逐字节相同，其真实 sha256 就是
+    # 下方所钉的值（`shasum -a 256` 实测值），按本 gate 的既定流程把冻结基线
+    # 钉在**合并态**哈希。表内条目集合与断言强度不变：被钉文件的范围不变、
+    # sha256 仍逐字节比对，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    "backend/state_machine/repositories/routing_repository.py": (
+        "bda605564ba0d5bb6e8d78b656e3e2461da77f44f13c9931614865010a9d6396"
     ),
 }
 
@@ -1513,6 +1831,35 @@ def test_forbidden_modules_unchanged() -> None:
     )
 
 
+def test_every_scoped_exclusion_is_documented() -> None:
+    """Every narrow exclusion is justified in prose.
+
+    A ``:(exclude)`` pathspec takes a file out of the change-surface
+    diff. The diff then stops being able to say anything about that
+    file, so the file's exclusion has to be accounted for in words:
+    which approved change it carries, and what holds it still.
+
+    This gate keeps that accounting complete. The block of prose that
+    documents ``FORBIDDEN_MODULE_PATHS`` is the one place a reader
+    looks for it, so every scoped exclusion has to be named there —
+    otherwise a new exclusion arrives as a bare pathspec line and the
+    only trace of the reason is a comment buried inside the tuple.
+
+    The rule does not widen or narrow the change surface; it keeps the
+    file's own description of that surface true.
+    """
+    documentation = exclusion_documentation()
+    undocumented = [
+        path
+        for path in scoped_exclusion_paths()
+        if path not in documentation
+    ]
+    assert undocumented == [], (
+        "a scoped exclusion is not accounted for in the block that "
+        "documents FORBIDDEN_MODULE_PATHS:\n  " + "\n  ".join(undocumented)
+    )
+
+
 def test_r10_waiting_phase_rename_surface_is_frozen() -> None:
     """The phase merge's rename surface is frozen byte for byte.
 
@@ -1622,5 +1969,34 @@ def test_verification_repository_surface_is_frozen() -> None:
     ]
     assert mismatched == [], (
         "a file in the round-release surface changed outside the frozen "
+        "baseline:\n  " + "\n  ".join(mismatched)
+    )
+
+
+def test_routing_repository_surface_is_frozen() -> None:
+    """The routing-mirror surface is frozen byte for byte.
+
+    The routing row's ``verification`` column used to carry the
+    verification state; this plan moved the authoritative write of that
+    state to the ``plan_verification`` table, and the column now
+    carries only the frozen baseline.  That change reaches shared code,
+    so the file is excluded from the change-surface diff — which is
+    only safe if something else holds it still.  This gate pins every
+    byte of the file to the hash of the approved state, so any
+    *further* edit to it fails here even though it no longer shows up
+    in the diff.
+
+    The rule does not weaken the change-surface gate; it moves it from
+    "this file never changes" to "this file changes once, and only
+    that way".
+    """
+    mismatched = [
+        f"{rel}: frozen {expected}, actual "
+        f"{hashlib.sha256((REPO_ROOT / rel).read_bytes()).hexdigest()}"
+        for rel, expected in FROZEN_ROUTING_REPOSITORY_SURFACE_SHA256.items()
+        if hashlib.sha256((REPO_ROOT / rel).read_bytes()).hexdigest() != expected
+    ]
+    assert mismatched == [], (
+        "a file in the routing-mirror surface changed outside the frozen "
         "baseline:\n  " + "\n  ".join(mismatched)
     )

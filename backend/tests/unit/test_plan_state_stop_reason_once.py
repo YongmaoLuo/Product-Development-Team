@@ -51,15 +51,23 @@ def _seed_plan(
     stop_reason: str | None = None,
     status: str = "pending",
 ) -> None:
-    """Seed the ``plan_routing`` row the way the production write path does.
+    """Seed the routing row and the verification row the way production does.
 
-    ``PlanState`` reads its state from that row, so writing it here means
-    the test and production take the same road.
+    ``PlanState`` reads its state from those two rows, so writing them
+    here means the test and production take the same road.
+
+    This plan has already run a round — that is why it carries a stop
+    reason — so the reason lives in the authoritative ``plan_verification``
+    table.  The ``plan_routing.verification`` mirror column no longer
+    carries the lifecycle keys (arch decision points 1 and 3).
     """
     from config_paths import resolve_state_db_path
     from state_machine.db.connection import open as open_db
     from state_machine.db.schema import migrate
     from state_machine.repositories.routing_repository import RoutingRepository
+    from state_machine.repositories.verification_repository import (
+        VerificationRepository,
+    )
 
     conn = open_db(resolve_state_db_path())
     try:
@@ -70,13 +78,14 @@ def _seed_plan(
             completed_phases=["execution"],
             review_rounds={},
             flags={},
-            verification={
-                "status": status,
-                "round": 0,
-                "max_rounds": 3,
-                "stop_reason": stop_reason,
-            },
             last_updated=None,
+        )
+        VerificationRepository(conn).set_state(
+            plan_dir.name,
+            status=status,
+            round_n=0,
+            max_rounds=3,
+            stop_reason=stop_reason,
         )
     finally:
         conn.close()

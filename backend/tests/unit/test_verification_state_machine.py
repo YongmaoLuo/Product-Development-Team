@@ -186,7 +186,6 @@ def test_routing_stage_advances_on_passed(state_db):
         completed_phases=[],
         review_rounds={},
         flags={},
-        verification={},
         last_updated="2026-08-20T00:00:00Z",
     )
     # The fixed auto-loop calls this exact CAS.

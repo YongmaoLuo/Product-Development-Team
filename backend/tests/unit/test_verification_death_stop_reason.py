@@ -116,8 +116,7 @@ def _run_lazy_check() -> Mock:
     ``_mark_verification_failed_dead`` is NOT stubbed: the in-memory
     state and the side-channel file it writes are the subject here.
     """
-    with patch.object(server_mod, "_persist_verification_terminal") as persist, \
-         patch.object(server_mod, "_update_plan_state_to_terminal"):
+    with patch.object(server_mod, "_persist_verification_terminal") as persist:
         server_mod._lazy_check_verification(PLAN)
     return persist
 

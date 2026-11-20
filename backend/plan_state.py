@@ -48,6 +48,17 @@ from verification_plan_review import doc_sha256, prd_is_resolved
 # backend/tests/test_plan_state_filename_constant.py.
 PLAN_STATE_FILENAME: str = "plan_state.json"
 
+#: The default verification round budget.
+#:
+#: It mirrors ``server.DEFAULT_MAX_VERIFICATION_ROUNDS`` — the constant
+#: ``GET /api/verification/{id}/status`` answers with when a plan has no
+#: ``plan_verification`` row.  ``plan_state`` cannot import ``server``
+#: (``server`` imports ``plan_state`` — a circular import), so the value
+#: is repeated here; the two MUST agree, and the test suite pins that
+#: (``backend/tests/unit/test_plan_state_verification_read.py::
+#: test_default_max_rounds_matches_the_server_constant``).
+DEFAULT_MAX_VERIFICATION_ROUNDS: int = 4
+
 #: 模块级 logger。
 #:
 #: 等待相位的弃用日志走它：``source`` 固定为 ``plan_state``，于是「谁在读
@@ -66,6 +77,275 @@ def _state_db_path() -> Path:
     anything failing loudly (see the resolver's docstring).
     """
     return resolve_state_db_path()
+
+
+def _read_verification_row(plan_id: Optional[str]) -> Optional[dict]:
+    """Read the authoritative ``plan_verification`` row for ``plan_id``.
+
+    The verification lifecycle state lives in exactly one place: the
+    ``plan_verification`` table (arch decision point 1).  This is the
+    module-level door to it for the callers that do not already hold a
+    connection.
+
+    Returns ``None`` when the plan has no verification row, when the
+    state store cannot be opened, or when the read fails for any other
+    reason — an unreadable row is "no row", never an exception.  A plan
+    without a row has never run a verification round, and the callers
+    answer that with the documented defaults.
+    """
+    if not plan_id:
+        return None
+    try:
+        from state_machine.db.connection import open as _open_db
+        from state_machine.db.schema import migrate as _migrate
+        from state_machine.repositories.verification_repository import (
+            VerificationRepository,
+        )
+    except ImportError:
+        return None
+    try:
+        conn = _open_db(_state_db_path())
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        _migrate(conn)
+        return VerificationRepository(conn).current(plan_id)
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        conn.close()
+
+
+def _verification_row_exists(
+    plan_id: Optional[str],
+    conn: Optional[Any] = None,
+) -> Optional[bool]:
+    """Probe whether an authoritative ``plan_verification`` row exists.
+
+    This is the **write guard's** existence check, and it must not be
+    :func:`_read_verification_row`.  That helper answers "no row" for a
+    row it cannot decode — the ``plan_verification`` JSON columns
+    (``results`` / ``verdicts`` / …) go through ``json.loads`` and one
+    corrupted blob makes the whole read raise, which the helper
+    swallows.  For a *read* that answer is right (an unreadable row
+    answers with the documented defaults).  For a *guard* it is wrong
+    in the unsafe direction: a row that exists but cannot be decoded is
+    still a row, and overwriting it destroys the authoritative record.
+
+    So the probe is a bare ``SELECT 1`` — the same shape the migration
+    script uses (``scripts/migrate_legacy_verification_stop_reason.py``)
+    — and it never decodes a column.
+
+    Args:
+        plan_id: the plan to probe.
+        conn: an open connection to use.  When ``None`` the default
+            state store is opened (and closed again).
+
+    Returns:
+        ``True`` when the row exists, ``False`` when it does not, and
+        ``None`` when the probe cannot answer (the state store cannot
+        be opened, the schema cannot be created, the query fails).  A
+        caller that guards a write must treat ``None`` as "do not
+        write": overwriting an authoritative row cannot be undone,
+        while a missing seeding can be redone by running the migration
+        again.
+    """
+    if not plan_id:
+        return False
+    try:
+        from state_machine.db.connection import open as _open_db
+        from state_machine.db.schema import migrate as _migrate
+    except ImportError:  # pragma: no cover - 打包环境兜底
+        return None
+    owned_connection = conn is None
+    if owned_connection:
+        try:
+            conn = _open_db(_state_db_path())
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        _migrate(conn)
+        row = conn.execute(
+            "SELECT 1 FROM plan_verification WHERE plan_id = ?",
+            (plan_id,),
+        ).fetchone()
+        return row is not None
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        if owned_connection:
+            conn.close()
+
+
+def _decode_json_column(value: Any, default: Any) -> Any:
+    """Decode a JSON column, tolerating a corrupted blob.
+
+    A corrupted blob means "no value" — never a crash, and never a
+    reason to doubt the authoritative row.
+    """
+    if value is None:
+        return default
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _verification_status_for_phase(phase: Optional[str]) -> Optional[str]:
+    """The verification status a phase implies (``None`` if it implies none).
+
+    The status itself lives in the authoritative ``plan_verification``
+    row (arch decision point 1) — this mapping only says what a
+    transition INTO a phase means.  Two callers need it: the phase
+    machine (:meth:`PlanState._transition_to`) and the legacy migration
+    that reconstructs the status of a plan that stopped its verification
+    loop before the write path moved to the authoritative table.
+    """
+    if phase == "verification":
+        return "pending"
+    if phase in ("verification_running", "verify_first_pass", "verify_recheck"):
+        # Do NOT auto-increment the round here. ``verification_round``
+        # is the number of completed rounds (0-based). It is bumped
+        # by the repair path (``start_repair_execution``) when the
+        # user confirms repair tasks and the orchestrator moves to
+        # the next round. Auto-incrementing on entry would break the
+        # 0-based contract expected by ``VerificationOrchestrator``
+        # tests.
+        return "running"
+    if phase == "verification_passed":
+        return "passed"
+    if phase == "verification_failed":
+        return "failed"
+    if phase == "verification_loop_stopped":
+        return "loop_stopped"
+    return None
+
+
+def migrate_mirror_stop_reason(
+    plan_id: str,
+    routing_row: dict,
+    conn: Optional[Any] = None,
+) -> Optional[dict]:
+    """Carry ONLY the stop reason from the retired routing mirror into
+    the authoritative ``plan_verification`` row.
+
+    Background
+    ----------
+    Before the verification writes moved to ``plan_verification``
+    (arch decision point 1), the only home of the stop reason was the
+    ``plan_routing.verification`` mirror column — the pre-2026-11-04
+    ``backend/verification_loop.py`` wrote it there with a bare
+    ``UPDATE plan_routing SET verification = …``.  A plan that stopped
+    its verification loop back then has no authoritative row, so the
+    reason would be lost the moment the reads stop consulting the
+    column — and the "first reason wins" rule (the reason of the first
+    stop IS the cause) would start overwriting it.
+
+    What it carries
+    ---------------
+    Only the **reason**: it is a one-time record of a past event, like
+    the baseline.  The mirror's status / round / max_rounds are NOT a
+    source (arch decision point 3), so the row is created with the
+    documented defaults — ``status="not_started"``, ``round=0`` and
+    ``max_rounds=DEFAULT_MAX_VERIFICATION_ROUNDS`` — the very values a
+    plan without an authoritative row gets everywhere else.  The reason
+    survives; no lifecycle value is imported from the mirror.
+
+    The plan's **phase** is deliberately NOT consulted either.  It used
+    to be, back when this carry-over ran as a read-path fallback, and
+    that made the routing phase a second source of the verification
+    status — the very thing arch decision point 3 retires.  The one
+    authoritative row is now written from the documented defaults plus
+    the reason, so nothing but the reason crosses over.
+
+    Who calls it
+    ------------
+    **Nobody on a read path.**  This used to be the fallback of
+    :meth:`PlanState._load_state_from_sqlite`, and that made a read a
+    write: the answer depended on the order the readers ran in, and
+    the mirror column was a state source again (VP-015 (c)).  The
+    one-time carry-over is now operator-triggered —
+    ``scripts/migrate_legacy_verification_stop_reason.py``.
+
+    It only ever **seeds**: when the plan already has an authoritative
+    row, that row is the newer record and wins, and nothing is written
+    (VP-019 (a)).  The existence check is a bare ``SELECT 1`` — see
+    :func:`_verification_row_exists` — so a row that exists but cannot
+    be decoded still counts as existing.
+
+    Args:
+        plan_id: the plan the reason belongs to.
+        routing_row: the ``plan_routing`` row carrying the mirror column.
+        conn: an open connection to use.  When ``None`` the default
+            state store is opened (and closed again).  The migration
+            script passes its own connection so it controls the
+            transaction.
+
+    Returns:
+        The authoritative row after the migration, or ``None`` when
+        there was nothing to carry — including when the plan already
+        had an authoritative row that could not be read back.
+    """
+    mirror = _decode_json_column(routing_row.get("verification"), {})
+    if not isinstance(mirror, dict):
+        return None
+    stop_reason = mirror.get("stop_reason")
+    if not stop_reason:
+        return None
+    owned_connection = conn is None
+    if owned_connection:
+        try:
+            from state_machine.db.connection import open as _open_db
+            conn = _open_db(_state_db_path())
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        from state_machine.db.schema import migrate as _migrate
+        from state_machine.repositories.verification_repository import (
+            VerificationRepository,
+        )
+        _migrate(conn)
+        repo = VerificationRepository(conn)
+        if _verification_row_exists(plan_id, conn=conn) is not False:
+            # The authoritative row already exists: it is the newer
+            # record and wins.  The carry-over only ever *seeds* a plan
+            # that has no row yet — it must never overwrite one
+            # (VP-019 (a)).  The guard lives HERE, in the migration
+            # itself, not only in the caller: the script's
+            # classification skips plans that already have a row, but
+            # every other caller (a test, a future migration) would
+            # otherwise walk straight past it.
+            #
+            # A probe that cannot answer fails closed for the same
+            # reason: overwriting an authoritative row cannot be undone,
+            # while a missing seeding can be redone by running the
+            # migration again.
+            try:
+                return repo.current(plan_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "verification_state_migration_skipped plan=%s reason=%s",
+                    plan_id, exc,
+                )
+                return None
+        repo.set_state(
+            plan_id,
+            status="not_started",
+            round_n=0,
+            max_rounds=DEFAULT_MAX_VERIFICATION_ROUNDS,
+            stop_reason=str(stop_reason),
+        )
+        return repo.current(plan_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "verification_state_migration_failed plan=%s reason=%s",
+            plan_id, exc,
+        )
+        return None
+    finally:
+        if owned_connection:
+            conn.close()
+
 
 # Module-level singleton pointing at the project's ``plans/`` directory.
 # Mirrors the ``PLANS_DIR`` constant in ``backend/server.py``. Defined
@@ -543,9 +823,65 @@ class PlanState:
         if sqlite_row is not None:
             return sqlite_row
         legacy_row = self._load_state_from_legacy_file()
+        migrated_from_file = legacy_row is not None
         if legacy_row is None:
             legacy_row = self._default_state()
+        # The one-shot migration into ``plan_routing`` that used to
+        # live here is gone (2026-11-11): constructing a ``PlanState``
+        # must write nothing, or every read-only use of this class
+        # becomes a write — e.g. ``VerificationOrchestrator.__init__``
+        # builds a ``PlanState``, so every probe registered a plan.
+        # The row is created by the first real write, or on demand via
+        # ``ensure_row()`` below.
+        #
+        # What survives from this branch is the *verification* half of
+        # the migration.  The legacy file also carried the verification
+        # state, and the authoritative table has to receive it too, or
+        # the plan loses its round / stop reason once the reads stop
+        # consulting the mirror column.  It is guarded twice: it runs
+        # only when a legacy file actually existed, and only when the
+        # authoritative row does not exist yet.
+        if migrated_from_file:
+            self._migrate_legacy_verification_state(legacy_row)
         return legacy_row
+
+    def _migrate_legacy_verification_state(self, legacy_row: dict) -> None:
+        """Carry the legacy file's verification state into the authoritative row.
+
+        Before the SQLite tables existed, ``plan_state.json`` was the only
+        home of the verification state.  The migration copies it into
+        ``plan_routing`` (the mirror column), but the mirror column is
+        being retired as the source — the authoritative
+        ``plan_verification`` row has to be seeded as well, or the plan
+        would report ``not_started`` / round 0 the moment the reads stop
+        consulting the column.
+
+        Only when the authoritative row **does not exist**: an existing
+        ``plan_verification`` row is the newer record and wins.  "Does
+        not exist" is answered by :func:`_verification_row_exists` — a
+        bare ``SELECT 1`` — and NOT by :func:`_read_verification_row`,
+        whose contract is "unreadable = no row".  A row that exists but
+        cannot be decoded (one corrupted JSON column) is still an
+        existing row, and overwriting it would destroy the
+        authoritative record irrecoverably.
+
+        The guard fails closed: when the existence probe cannot answer,
+        nothing is migrated.  Overwriting an authoritative row cannot be
+        undone; a missing seeding can be redone by running the migration
+        again.
+        """
+        if _verification_row_exists(self.plan_dir.name) is not False:
+            return
+        verification = legacy_row.get("verification")
+        if not isinstance(verification, dict):
+            return
+        self._write_verification_state(
+            status=verification.get("status"),
+            round_n=verification.get("round"),
+            max_rounds=verification.get("max_rounds"),
+            stop_reason=verification.get("stop_reason"),
+        )
+
 
     def ensure_row(self) -> None:
         """Create the ``plan_routing`` row for this plan if it is missing.
@@ -565,6 +901,7 @@ class PlanState:
         :meth:`_save_state_to_sqlite`).
         """
         self._save_state()
+
 
     def reload(self) -> None:
         """Re-read the plan state from the authoritative SQLite store.
@@ -598,12 +935,29 @@ class PlanState:
         Returns ``None`` when SQLite is unavailable, the table is
         missing, or no row exists for this plan (e.g. fresh plan
         created before the row was seeded by ``begin_*`` callers).
+
+        The authoritative verification row (``plan_verification``) is
+        read from the **same connection** — one snapshot, one close —
+        and handed to :meth:`_sqlite_row_to_state`, which is where the
+        verification lifecycle keys come from (arch decision point 2).
+
+        This is a **pure read** (VP-015 (c)).  It writes nothing: the
+        mirror column is not the source of the verification state, and a
+        plan without an authoritative row answers with the documented
+        defaults — the same ones ``GET /api/verification/{id}/status``
+        gives.  A read that writes made the answer depend on the order
+        the readers ran in; the one-time carry-over of a legacy mirror
+        stop reason is operator-triggered instead
+        (``scripts/migrate_legacy_verification_stop_reason.py``).
         """
         try:
             from state_machine.db.connection import open as _open_db
             from state_machine.db.schema import migrate as _migrate
             from state_machine.repositories.routing_repository import (
                 RoutingRepository,
+            )
+            from state_machine.repositories.verification_repository import (
+                VerificationRepository,
             )
         except ImportError:
             return None
@@ -621,27 +975,117 @@ class PlanState:
             row = repo.current(self.plan_dir.name)
         except Exception:  # noqa: BLE001
             row = None
+        # The verification row is authoritative for the verification
+        # lifecycle keys.  A plan without one has never run a round;
+        # an unreadable table is treated the same way (no row) rather
+        # than as an error — the state read must not break on it.
+        try:
+            verification_row = VerificationRepository(conn).current(
+                self.plan_dir.name
+            )
+        except Exception:  # noqa: BLE001
+            verification_row = None
         finally:
             conn.close()
         if row is None:
             return None
         # Map SQLite columns back to the legacy ``_state`` shape.
-        return self._sqlite_row_to_state(row)
+        return self._sqlite_row_to_state(row, verification_row)
+
+    def _migrate_mirror_stop_reason(self, row: dict) -> Optional[dict]:
+        """Carry a legacy mirror-column stop reason into the authoritative row.
+
+        Only the **reason** is carried: it is a one-time record of a
+        past event, like the baseline.  The mirror's status / round /
+        max_rounds are NOT a source (arch decision point 3), so the row
+        is created with the documented defaults — ``status="not_started"``,
+        ``round=0``, ``max_rounds=DEFAULT_MAX_VERIFICATION_ROUNDS``.  The
+        row lands in ``plan_verification`` — the authoritative table.
+
+        **Not reachable from any read path** (VP-015 (c)).  This used
+        to be the fallback of :meth:`_load_state_from_sqlite`, which
+        made a read a write: the same plan answered differently
+        depending on the order the readers ran in, and the mirror
+        column was a state source again.  The one-time carry-over is
+        operator-triggered now —
+        ``scripts/migrate_legacy_verification_stop_reason.py`` — and
+        this method is the ``PlanState``-scoped door onto it.
+
+        Returns the authoritative row after the migration, or ``None``
+        when there was nothing to carry.
+        """
+        return migrate_mirror_stop_reason(self.plan_dir.name, row)
 
     @staticmethod
-    def _sqlite_row_to_state(row: dict) -> dict:
+    def _sqlite_row_to_state(row: dict, verification_row: Optional[dict] = None) -> dict:
         """Translate a ``plan_routing`` row into the legacy
         ``PlanState._state`` dict shape so getters/setters keep
         working unchanged.
+
+        The verification lifecycle keys — ``status`` / ``round`` /
+        ``max_rounds`` / ``stop_reason`` — come from the **authoritative**
+        ``plan_verification`` row (``verification_row``), not from the
+        ``plan_routing.verification`` mirror column (arch decision
+        point 2: the value a consumer reads is the authoritative one;
+        arch decision point 3: the mirror column is no longer the source
+        of the verification state).
+
+        The mirror column keeps ONE job: it is where the frozen
+        ``baseline`` / ``baseline_doc_sha256`` are recorded.  They are
+        not verification state — ``plan_verification`` has no such
+        columns — so they are decoded from the column and nothing else.
+
+        ``verification_row`` is optional so the single-argument call
+        (:meth:`_sqlite_row_to_state(row)`, used by several test
+        helpers) keeps working: it then reads the authoritative row for
+        the plan itself, and falls back to the documented defaults — the
+        same ones ``GET /api/verification/{id}/status`` gives for a plan
+        without a verification row — when there is none.
         """
-        def _decode_json(value, default):
-            if value is None:
-                return default
-            try:
-                import json as _json
-                return _json.loads(value)
-            except (TypeError, ValueError):
-                return default
+        # The mirror column: only the baseline keys are read from it.
+        # A corrupted JSON blob means "no baseline" — never a crash,
+        # and never a reason to doubt the authoritative row.
+        mirror = _decode_json_column(row.get("verification"), {})
+        if not isinstance(mirror, dict):
+            mirror = {}
+
+        if verification_row is None:
+            # No row was handed in: read the authoritative one for this
+            # plan.  The mirror column is NEVER a fallback — it is not
+            # the source of the verification state.
+            verification_row = _read_verification_row(row.get("plan_id"))
+
+        if verification_row is None:
+            status = "not_started"
+            round_n = 0
+            max_rounds = DEFAULT_MAX_VERIFICATION_ROUNDS
+            stop_reason: Optional[str] = None
+        else:
+            status = verification_row.get("verification_status") or "not_started"
+            round_n = verification_row.get("round") or 0
+            # ``0`` / ``None`` means "unset" — a row created by a narrow
+            # write carries no budget.  The /status endpoint answers
+            # the same way (``row.get("max_rounds") or DEFAULT``).
+            max_rounds = (
+                verification_row.get("max_rounds")
+                or DEFAULT_MAX_VERIFICATION_ROUNDS
+            )
+            stop_reason = verification_row.get("verification_stop_reason")
+
+        verification = {
+            "status": status,
+            "round": round_n,
+            "max_rounds": max_rounds,
+            "stop_reason": stop_reason,
+        }
+        # The baseline is NOT verification state: it is a frozen fact
+        # about the document that was reviewed, recorded in the mirror
+        # column (the only place it lives).  Carry it over untouched.
+        if "baseline" in mirror:
+            verification["baseline"] = mirror["baseline"]
+        if "baseline_doc_sha256" in mirror:
+            verification["baseline_doc_sha256"] = mirror["baseline_doc_sha256"]
+
         return {
             "plan_id": row.get("plan_id"),
             # 2026-10-22: the read path maps the historical
@@ -652,12 +1096,10 @@ class PlanState:
             "current_phase": normalize_phase(
                 row.get("current_phase") or "interview"
             ),
-            "completed_phases": _decode_json(row.get("completed_phases"), []),
-            "review_rounds": _decode_json(row.get("review_rounds"), {"prd": 0, "arch": 0, "test": 0}),
-            "flags": _decode_json(row.get("flags"), {}),
-            "verification": _decode_json(row.get("verification"), {
-                "status": "pending", "round": 0, "max_rounds": 3, "stop_reason": None,
-            }),
+            "completed_phases": _decode_json_column(row.get("completed_phases"), []),
+            "review_rounds": _decode_json_column(row.get("review_rounds"), {"prd": 0, "arch": 0, "test": 0}),
+            "flags": _decode_json_column(row.get("flags"), {}),
+            "verification": verification,
             "last_updated": row.get("last_updated") or row.get("updated_at"),
         }
 
@@ -716,9 +1158,15 @@ class PlanState:
                 "mode": MODE_PRODUCTION,
             },
             "verification": {
-                "status": "pending",
+                # A plan without a ``plan_verification`` row has not
+                # started verifying — the same defaults
+                # ``GET /api/verification/{id}/status`` answers with.
+                # The mirror column used to say ``pending`` here, which
+                # made the first read of a fresh plan disagree with
+                # every later read (arch decision point 2).
+                "status": "not_started",
                 "round": 0,
-                "max_rounds": 3,
+                "max_rounds": DEFAULT_MAX_VERIFICATION_ROUNDS,
                 "stop_reason": None,
             },
             "last_updated": datetime.utcnow().isoformat() + "Z",
@@ -852,6 +1300,12 @@ class PlanState:
         the ``PlanState``-owned columns and leaves the CAS's
         ``version`` / ``substage`` alone.
 
+        The ``verification`` column is **not** among them: it is the
+        mirror of the verification state, and the mirror no longer
+        carries that state (arch decision point 3).  The frozen
+        baseline is the only thing left in it, and it has its own
+        narrow writer — :meth:`_write_verification_baseline`.
+
         The phase column is written **only when this instance actually
         moved it** — i.e. when the in-memory value differs from the one
         we last saw on disk (:attr:`_persisted_phase`).  That guard is
@@ -949,7 +1403,6 @@ class PlanState:
                 completed_phases=state.get("completed_phases", []),
                 review_rounds=state.get("review_rounds", {}),
                 flags=state.get("flags", {}),
-                verification=state.get("verification", {}),
                 last_updated=state.get("last_updated"),
                 completed_phases_mode=completed_phases_mode,
             )
@@ -1184,27 +1637,18 @@ class PlanState:
             self._state["completed_phases"].append("execution")
 
         # Update verification status when transitioning to verification phases
-        if phase == "verification":
-            self._state["verification"]["status"] = "pending"
-        elif phase == "verification_running":
-            self._state["verification"]["status"] = "running"
-            # Do NOT auto-increment the round here. ``verification_round``
-            # is the number of completed rounds (0-based). It is bumped
-            # by the repair path (``start_repair_execution``) when the
-            # user confirms repair tasks and the orchestrator moves to
-            # the next round. Auto-incrementing on entry would break the
-            # 0-based contract expected by ``VerificationOrchestrator``
-            # tests.
-        elif phase == "verify_first_pass":
-            self._state["verification"]["status"] = "running"
-        elif phase == "verify_recheck":
-            self._state["verification"]["status"] = "running"
-        elif phase == "verification_passed":
-            self._state["verification"]["status"] = "passed"
-        elif phase == "verification_failed":
-            self._state["verification"]["status"] = "failed"
-        elif phase == "verification_loop_stopped":
-            self._state["verification"]["status"] = "loop_stopped"
+        verification_status = _verification_status_for_phase(phase)
+
+        if verification_status is not None:
+            self._state["verification"]["status"] = verification_status
+            # 2026-11-04: the status belongs to the authoritative
+            # ``plan_verification`` row (arch decision point 1) — the
+            # read path answers from that row (arch decision point 2),
+            # so a phase transition that only touched the in-memory copy
+            # would leave the getter reporting a status nobody
+            # recorded.  The write is best-effort: an unreachable state
+            # store must not break the phase machine.
+            self._write_verification_state(status=verification_status)
 
         self._save_state()
 
@@ -1352,10 +1796,16 @@ class PlanState:
         )
 
     # --- Verification Phase Methods ---
+    #
+    # 2026-11-04: the four lifecycle values are the authoritative
+    # ``plan_verification`` row's, read by :meth:`_sqlite_row_to_state`
+    # (arch decision point 2).  The fallbacks below are the documented
+    # defaults for a plan that has no verification row — the same ones
+    # ``GET /api/verification/{id}/status`` answers with.
 
     def get_verification_status(self) -> str:
-        """Get current verification status (pending/running/passed/failed/loop_stopped)."""
-        return self._state.get("verification", {}).get("status", "pending")
+        """Get current verification status (not_started/running/passed/failed/loop_stopped)."""
+        return self._state.get("verification", {}).get("status", "not_started")
 
     def get_verification_round(self) -> int:
         """Get current verification round number."""
@@ -1363,7 +1813,9 @@ class PlanState:
 
     def get_verification_max_rounds(self) -> int:
         """Get maximum verification rounds allowed."""
-        return self._state.get("verification", {}).get("max_rounds", 3)
+        return self._state.get("verification", {}).get(
+            "max_rounds", DEFAULT_MAX_VERIFICATION_ROUNDS,
+        )
 
     def get_verification_stop_reason(self) -> Optional[str]:
         """Get the reason why verification stopped."""
@@ -1441,9 +1893,17 @@ class PlanState:
         self.transition_to("verification_failed")
 
     def increment_verification_round(self):
-        """Increment verification round counter."""
-        self._state["verification"]["round"] = self.get_verification_round() + 1
-        self._save_state()
+        """Increment verification round counter.
+
+        The counter is written to the authoritative ``plan_verification``
+        row (arch decision point 1); the in-memory copy follows so the
+        next increment reads the value that was just persisted. No
+        :meth:`_save_state` — the phase columns are none of this
+        method's business.
+        """
+        round_n = self.get_verification_round() + 1
+        self._state.setdefault("verification", {})["round"] = round_n
+        self._write_verification_state(round_n=round_n)
 
     def start_verification_repair(self):
         """Transition to repair tasks phase after verification failure."""
@@ -1574,6 +2034,17 @@ class PlanState:
 
         self._state["verification"]["stop_reason"] = reason
         self.transition_to("verification_loop_stopped")
+        # The reason and the loop-stopped status belong to the
+        # authoritative ``plan_verification`` row (arch decision point 1);
+        # the ``plan_routing.verification`` mirror no longer carries
+        # verification writes (arch decision point 3). The in-memory copy
+        # is updated first, so a transition that refuses the move still
+        # leaves the reason visible to the caller — but the row is
+        # written only after the move succeeded, so the authoritative row
+        # never claims a stop the plan did not make.
+        self._write_verification_state(
+            status="loop_stopped", stop_reason=reason,
+        )
 
     def can_rerun_verification(self) -> bool:
         """Check if verification can be rerun (round < max_rounds)."""
@@ -1588,9 +2059,29 @@ class PlanState:
         return self.get_verification_status() == "loop_stopped"
 
     def set_verification_max_rounds(self, max_rounds: int):
-        """Set maximum verification rounds allowed."""
-        self._state["verification"]["max_rounds"] = max_rounds
-        self._save_state()
+        """Set maximum verification rounds allowed.
+
+        The budget is the plan's own; it lives in the authoritative
+        ``plan_verification`` row (arch decision point 1). The
+        ``plan_routing.verification`` mirror is NOT rewritten: this
+        method used to end in :meth:`_save_state`, which re-stated the
+        routing row from this instance's cached snapshot — the
+        ``POST /api/verification/{id}/reset_rounds`` → next ``/start``
+        answers ``409 stage_mismatch`` incident.
+
+        The routing ROW, though, is created when it does not exist yet:
+        the first real write is what puts the plan on the routing
+        table, and the row carries the phase this instance holds (the
+        upstream ``aabce578`` contract — a legacy plan's fresh row must
+        not fall back to the column DEFAULT ``interview``).  The
+        creation is create-only, so an existing row is not touched: no
+        mirror column is rewritten, no already-recorded phase is
+        restated, and ``completed_phases`` / ``flags`` /
+        ``review_rounds`` are left alone.
+        """
+        self._state.setdefault("verification", {})["max_rounds"] = max_rounds
+        self._ensure_routing_row_exists()
+        self._write_verification_state(max_rounds=max_rounds)
 
     # --- 基线（verification.baseline）---
     #
@@ -1632,6 +2123,18 @@ class PlanState:
     ) -> None:
         """把冻结的基线写进计划状态。
 
+        基线只落在 ``plan_routing.verification`` 这一列的两个键上
+        （``baseline`` / ``baseline_doc_sha256``）—— 那是它唯一的存放处
+        （``plan_verification`` 没有这两列，而验证状态早已搬去权威表）。
+        写入走 :meth:`RoutingRepository.write_verification_baseline` 这一个
+        窄入口：它在同一个事务里读-改-写，只覆盖那两个键，列里其它键原样
+        保留。
+
+        它**不**调用 :meth:`_save_state`：基线不是 ``current_phase`` /
+        ``completed_phases`` 的业务，用本实例缓存的快照去重写那些列，正是
+        ``POST /api/verification/{id}/reset_rounds`` 之后紧跟一个 ``409
+        stage_mismatch`` 的成因（见 :meth:`_save_state_to_sqlite` 的注释）。
+
         Args:
             baseline: 基线的四个字段（``repo_dir`` / ``ref`` / ``commit_sha`` /
                 ``pr_number``）。
@@ -1642,7 +2145,54 @@ class PlanState:
         verification = self._state.setdefault("verification", {})
         verification["baseline"] = dict(baseline)
         verification["baseline_doc_sha256"] = str(doc_sha256 or "")
-        self._save_state()
+        self._write_verification_baseline(baseline, doc_sha256)
+
+    def _write_verification_baseline(
+        self, baseline: Dict[str, Any], doc_sha256: str
+    ) -> bool:
+        """把冻结的基线写进镜像列（窄写）。
+
+        与 :meth:`_write_verification_state` 同一套失败语义：状态库打不开
+        或写不进去时记 warning、返回 ``False``，不抛 —— 一次记账写不进去，
+        不该让计划的相位机死掉。
+
+        Returns:
+            写成功返回 ``True``；状态库打不开或写失败返回 ``False``。
+        """
+        try:
+            from state_machine.db.connection import open as _open_db
+            from state_machine.db.schema import migrate as _migrate
+            from state_machine.repositories.routing_repository import (
+                RoutingRepository,
+            )
+        except ImportError as exc:  # pragma: no cover - 打包环境兜底
+            logger.warning(
+                "verification_baseline_write_skipped plan=%s reason=%s",
+                self.plan_dir.name, exc,
+            )
+            return False
+        try:
+            conn = _open_db(_state_db_path())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "verification_baseline_write_skipped plan=%s reason=%s",
+                self.plan_dir.name, exc,
+            )
+            return False
+        try:
+            _migrate(conn)
+            RoutingRepository(conn).write_verification_baseline(
+                self.plan_dir.name, baseline, doc_sha256,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "verification_baseline_write_failed plan=%s reason=%s",
+                self.plan_dir.name, exc,
+            )
+            return False
+        finally:
+            conn.close()
+        return True
 
     def _verification_baseline_is_current(
         self, verification: Dict[str, Any]
@@ -1665,6 +2215,133 @@ class PlanState:
         except OSError:
             return ""
 
+    # ------------------------------------------------------------------
+    # 验证状态的权威写入口
+    # ------------------------------------------------------------------
+    #
+    # 验证状态只有一个权威存储：``plan_verification`` 表（arch 决策点 1）。
+    # ``plan_routing.verification`` 是镜像列，不再承担写入（arch 决策点 3）。
+    # 下面这些写入方法因此走 :class:`VerificationRepository`，并同步更新内存里的
+    # ``_state["verification"]`` —— 写完立刻读到的必须是刚写下去的那份。
+    #
+    # 它们**不**再调用 :meth:`_save_state`：改一次验证状态不该顺手用本实例缓存的
+    # 快照去重写 ``current_phase`` / ``completed_phases``。那正是
+    # ``POST /api/verification/{id}/reset_rounds`` 之后紧跟一个 ``409
+    # stage_mismatch`` 的成因（见 :meth:`_save_state_to_sqlite` 的注释）。
+
+    def _ensure_routing_row_exists(self) -> bool:
+        """Create the ``plan_routing`` row for this plan if it is missing.
+
+        The row is created by the FIRST real write, and it must carry
+        the phase this instance holds: a plan whose state says
+        ``prd_review`` (read from the legacy ``plan_state.json``) must
+        not get a row saying ``interview`` — the column DEFAULT — or
+        the routing row contradicts the state it was created from.
+
+        **Create-only, on purpose.**  The write goes through
+        :meth:`RoutingRepository.insert_if_missing`, which is a no-op
+        when the row is already there: not one column is touched.  That
+        is what keeps the 2026-09-15 incident dead — a phase another
+        writer CAS'd in (``reset_rounds`` → next ``/start`` answering
+        ``409 stage_mismatch``) must not be dragged back by a metadata
+        write.  This method deliberately does NOT go through
+        :meth:`_save_state`: that one re-states the whole
+        ``PlanState``-owned row from this instance's cached snapshot.
+
+        Best-effort, like :meth:`_write_verification_state`: a state
+        database that cannot be opened must not raise — a bookkeeping
+        write that does not make it must not freeze the plan's phase
+        machine.  The failure is logged and swallowed.
+
+        Returns:
+            ``True`` when the row exists afterwards (it was created, or
+            it was already there); ``False`` when the state database
+            could not be reached.
+        """
+        try:
+            from state_machine.db.connection import open as _open_db
+            from state_machine.db.schema import migrate as _migrate
+            from state_machine.repositories.routing_repository import (
+                RoutingRepository,
+            )
+        except ImportError as exc:  # pragma: no cover - 打包环境兜底
+            logger.warning(
+                "routing_row_create_skipped plan=%s reason=%s",
+                self.plan_dir.name, exc,
+            )
+            return False
+        try:
+            conn = _open_db(_state_db_path())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "routing_row_create_skipped plan=%s reason=%s",
+                self.plan_dir.name, exc,
+            )
+            return False
+        try:
+            _migrate(conn)
+            RoutingRepository(conn).insert_if_missing(
+                self.plan_dir.name,
+                self._state.get("current_phase") or "interview",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "routing_row_create_failed plan=%s reason=%s",
+                self.plan_dir.name, exc,
+            )
+            return False
+        finally:
+            conn.close()
+        return True
+
+    def _write_verification_state(self, **fields: Any) -> bool:
+        """把验证状态字段写进权威行。
+
+        Args:
+            **fields: :meth:`VerificationRepository.set_state` 的窄写参数 ——
+                ``status`` / ``round_n`` / ``max_rounds`` / ``stop_reason``。
+                值为 ``None`` 表示「这一列别动」，绝不是「清空」。
+
+        Returns:
+            写成功返回 ``True``；状态库打不开返回 ``False``。失败是 best-effort：
+            调用方保留内存副本、流程继续 —— 一次记账写不进去，不该让计划的相位
+            机死掉。
+        """
+        try:
+            from state_machine.db.connection import open as _open_db
+            from state_machine.db.schema import migrate as _migrate
+            from state_machine.repositories.verification_repository import (
+                VerificationRepository,
+            )
+        except ImportError as exc:  # pragma: no cover - 打包环境兜底
+            logger.warning(
+                "verification_state_write_skipped plan=%s reason=%s",
+                self.plan_dir.name, exc,
+            )
+            return False
+        try:
+            conn = _open_db(_state_db_path())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "verification_state_write_skipped plan=%s reason=%s",
+                self.plan_dir.name, exc,
+            )
+            return False
+        try:
+            _migrate(conn)
+            VerificationRepository(conn).set_state(
+                self.plan_dir.name, **fields
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "verification_state_write_failed plan=%s reason=%s",
+                self.plan_dir.name, exc,
+            )
+            return False
+        finally:
+            conn.close()
+        return True
+
     def set_verification_status(
         self,
         status: str,
@@ -1673,11 +2350,17 @@ class PlanState:
     ) -> None:
         """Update verification sub-state (status / stop_reason / round).
 
-        Single source of truth for the ``verification`` JSON column on
-        ``plan_routing``. Replaces the previous direct-SQL writer
-        ``_update_plan_state_to_terminal`` so every ``verification``
-        mutation goes through :meth:`_save_state` (atomic with the
-        ``current_phase`` update).
+        The authoritative home of the verification state is the
+        ``plan_verification`` table (arch decision point 1); the
+        ``plan_routing.verification`` mirror no longer carries writes
+        (arch decision point 3). This method therefore writes through
+        :class:`VerificationRepository` and keeps the in-memory copy in
+        sync, so a read right after the write agrees with the row.
+
+        It does NOT call :meth:`_save_state`: changing the verification
+        status is none of ``current_phase`` / ``completed_phases``'s
+        business, and re-stating them from this instance's cached
+        snapshot can undo a phase another writer has moved meanwhile.
 
         Args:
             status: One of ``"pending"``, ``"running"``, ``"passed"``,
@@ -1690,15 +2373,14 @@ class PlanState:
             round_n: Optional round number to stamp. Pass ``None`` to
                 leave the existing value alone.
 
-        Why this exists (2026-09-07 plan): the previous
-        ``_update_plan_state_to_terminal`` helper wrote the
-        ``verification`` column directly via a side SQLite UPDATE, in
-        parallel with ``PlanState.transition_to`` writing
-        ``current_phase`` to the same row. Last-writer-wins ordering
-        meant the verification_status could race against phase
-        transitions; this method funnels both writes through the
-        single ``_save_state`` call, with the same atomicity guarantee
-        as a phase transition.
+        Why this exists (2026-09-07 plan): the previous direct-SQL
+        writer wrote the ``verification`` column directly via a side
+        SQLite UPDATE, in parallel with ``PlanState.transition_to``
+        writing ``current_phase`` to the same row. Last-writer-wins
+        ordering meant the verification_status could race against phase
+        transitions. 2026-11-04: the mirror column itself is gone from
+        the write path — the state lives in ``plan_verification`` and
+        nowhere else.
         """
         v = self._state.setdefault("verification", {})
         v["status"] = status
@@ -1706,7 +2388,31 @@ class PlanState:
             v["stop_reason"] = stop_reason
         if round_n is not None:
             v["round"] = round_n
-        self._save_state()
+        self._write_verification_state(
+            status=status, round_n=round_n, stop_reason=stop_reason,
+        )
+
+    def set_verification_round(self, round_n: int) -> None:
+        """Stamp the verification round counter.
+
+        The narrow door for "this plan is now on round N". The counter
+        is written to the authoritative ``plan_verification`` row (arch
+        decision point 1) and the in-memory copy follows, so the next
+        increment reads the value that was just persisted.
+        """
+        self._state.setdefault("verification", {})["round"] = round_n
+        self._write_verification_state(round_n=round_n)
+
+    def set_verification_stop_reason(self, reason: str) -> None:
+        """Record why the verification loop stopped.
+
+        ``reason`` is the same vocabulary :meth:`stop_verification_loop`
+        accepts. The reason lands in the authoritative row; the
+        in-memory copy follows so a read right after the write agrees
+        with it.
+        """
+        self._state.setdefault("verification", {})["stop_reason"] = reason
+        self._write_verification_state(stop_reason=reason)
 
     def begin_verification(self, round_n: Optional[int] = None) -> None:
         """Route the plan into the verification phase from any source.
@@ -1760,12 +2466,24 @@ class PlanState:
         # would be followed by a verification round that thinks it is
         # round 0 — destroying the round counter's monotonic
         # invariant.
+        round_value = round_n if round_n is not None else 0
         self._state["verification"]["status"] = "pending"
-        self._state["verification"]["round"] = (
-            round_n if round_n is not None else 0
-        )
+        self._state["verification"]["round"] = round_value
         self._state["verification"]["stop_reason"] = None
+        # The verification state itself belongs to the authoritative
+        # ``plan_verification`` row (arch decision point 1); the
+        # ``plan_routing.verification`` mirror no longer carries
+        # writes (arch decision point 3). The stop reason is cleared
+        # with the explicit empty string — ``set_state`` reads
+        # ``None`` as "leave this column alone", so a clear has to be
+        # spelled out: a fresh cycle must not inherit the previous
+        # cycle's reason.
+        self._write_verification_state(
+            status="pending", round_n=round_value, stop_reason="",
+        )
         self._state["last_updated"] = datetime.utcnow().isoformat() + "Z"
+        # The phase move itself still goes through ``_save_state`` —
+        # that is the point of this method, not an incidental rewrite.
         self._save_state()
 
 

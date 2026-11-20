@@ -164,10 +164,9 @@ def _seed_plan(
     ``failed`` verdict — the state a plan is in after a round failed
     and produced repair tasks.
 
-    The routing row's ``verification`` JSON carries the same round:
-    that is the mirror the repair path bumps (``start_repair_execution``
-    increments it), so the resume path can report the round it is
-    running.
+    That row is the ONLY store of the round (architecture decision 1):
+    the repair path bumps it (``start_repair_execution`` increments
+    it), and the resume path reports the round it is running from it.
 
     Returns ``(plan_dir, project_dir)``.
     """
@@ -206,7 +205,10 @@ def _seed_plan(
     finally:
         conn.close()
 
-    # The routing mirror of the round — the repair path bumps this one.
+    # The authoritative row again: ``set_verification_status`` writes
+    # through the verification repository, so this re-stamps the SAME
+    # row the DB insert above wrote (idempotent) — it re-states the
+    # terminal ``failed`` verdict and the round.
     ps = server.PlanState(plan_dir)
     ps.set_verification_status("failed", round_n=round_n)
     return plan_dir, project_dir
@@ -276,12 +278,15 @@ def test_start_at_repairing_phase_resumes_the_repair(
         f"executor runs there: {_read_phase(db_path)!r}"
     )
 
-    # The round is counted ONCE. ``init_round`` writes the round to
-    # ``plan_verification``; the repair path bumps the routing mirror
-    # instead. If both ran, the plan's round would be counted twice.
-    assert _read_verification_round(db_path) == 2, (
+    # The round is counted ONCE. ``plan_verification`` is the only
+    # store of the round (architecture decision 1): the repair path
+    # bumps it (2 → 3), and the ordinary ``init_round`` of a new
+    # verification round must NOT run on top of that. If both ran,
+    # the plan's round would land on 4 instead of 3.
+    assert _read_verification_round(db_path) == 3, (
         "the resume started a verification round as well — the round was "
-        f"counted twice: {_read_verification_round(db_path)}"
+        "counted twice (the repair path bumps it to 3; a second "
+        f"increment would land on 4): {_read_verification_round(db_path)}"
     )
 
 

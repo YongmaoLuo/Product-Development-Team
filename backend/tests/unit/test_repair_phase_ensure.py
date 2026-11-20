@@ -61,15 +61,30 @@ def _seed_plan(
     stop_reason: str | None = None,
     status: str = "pending",
 ) -> None:
-    """Seed the ``plan_routing`` row the way the production write path does.
+    """Seed the plan the way the production write path does.
 
-    ``PlanState`` reads its state from that row, so writing it here means
-    the test and production take the same road.
+    Two rows, because that is what a plan is:
+
+    * ``plan_routing`` — the phase and the phase history.  ``PlanState``
+      reads its state from that row, so writing it here means the test
+      and production take the same road.
+    * ``plan_verification`` — the verification state (status / round /
+      max_rounds / stop_reason).  This is the **authoritative** row
+      (architecture decision point 1): the mirror column of
+      ``plan_routing`` no longer carries the verification state
+      (architecture decision point 3), so seeding the mirror alone would
+      leave the plan reporting "no verification row" to every reader.
+
+    The seed therefore writes each state where its owner keeps it, and
+    the assertions below keep their original meaning.
     """
     from config_paths import resolve_state_db_path
     from state_machine.db.connection import open as open_db
     from state_machine.db.schema import migrate
     from state_machine.repositories.routing_repository import RoutingRepository
+    from state_machine.repositories.verification_repository import (
+        VerificationRepository,
+    )
 
     conn = open_db(resolve_state_db_path())
     try:
@@ -80,13 +95,14 @@ def _seed_plan(
             completed_phases=["execution"],
             review_rounds={},
             flags={},
-            verification={
-                "status": status,
-                "round": 0,
-                "max_rounds": 3,
-                "stop_reason": stop_reason,
-            },
             last_updated=None,
+        )
+        VerificationRepository(conn).insert(
+            plan_dir.name,
+            status,
+            round=0,
+            max_rounds=3,
+            verification_stop_reason=stop_reason,
         )
     finally:
         conn.close()
