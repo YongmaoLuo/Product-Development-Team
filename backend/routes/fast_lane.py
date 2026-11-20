@@ -64,6 +64,7 @@ import json
 from pydantic import BaseModel
 
 from fast_lane import (
+    find_duplicate_import,
     import_payload_summary,
     read_import_session,
     store_import_payload,
@@ -146,6 +147,9 @@ class ImportPlanRequest(BaseModel):
     #: says so in the log, so the caller is told what the plan actually
     #: is instead of finding out later that its mode was ignored.
     mode: str = MODE_PRODUCTION
+    #: 明确要求「即使内容与项目都相同也再导入一份」时才置 True。
+    #: 默认 False：重复导入被 409 拒绝，避免同一需求跑两遍。
+    allow_duplicate: bool = False
 
 
 class RevisePlanRequest(BaseModel):
@@ -618,6 +622,30 @@ def import_plan(req: ImportPlanRequest, request: Request):
                 ],
             },
         )
+
+    # The same material for the same checkout, imported twice, is one
+    # requirement run twice -- and the second run costs a full model's
+    # worth of tokens to arrive at the same plan.  So the second import
+    # is refused *before* anything is created: no plan directory, no
+    # file, no model call.  The caller who really means two plans says so
+    # with ``allow_duplicate``.
+    if not req.allow_duplicate:
+        duplicate = find_duplicate_import(_server.PLANS_DIR, project_dir, payload)
+        if duplicate:
+            raise HTTPException(
+                409,
+                {
+                    "error": "duplicate_import",
+                    "detail": (
+                        f"this exact material was already imported for {project_dir} "
+                        f"as plan {duplicate}; importing it again would run the same "
+                        "work twice. Reset/revise that plan instead, or pass "
+                        "allow_duplicate=true if a second plan is really intended."
+                    ),
+                    "existing_plan_id": duplicate,
+                    "allow_duplicate": False,
+                },
+            )
 
     seed = _seed_text(req.title, payload)
     if not seed:
