@@ -265,6 +265,11 @@
       "ImportPlanRequest": {
         "description": "Body of ``POST /api/plan/import``.\n\n``project_dir`` is required and ``content`` is declared as ``Any`` on\npurpose. The imported material is an upstream input the caller owns, so\nnothing about its shape is this route's business: a string, a bare\narray, an object with keys nobody here has heard of \u2014 all three are\naccepted and all three are stored verbatim. The three aliases are the\nsame slot under different names, because which one a caller reaches for\nis a habit, not a requirement; exactly one of them must be present.",
         "properties": {
+          "allow_duplicate": {
+            "default": false,
+            "title": "Allow Duplicate",
+            "type": "boolean"
+          },
           "content": {
             "title": "Content"
           },

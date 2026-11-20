@@ -15,7 +15,7 @@ named ``name`` is ``title`` and a field named ``files`` is
 silently drops whatever it does not know. Instead the material is written
 to ``plans/<plan_id>/import.json`` verbatim and handed to the same high-tier
 model that ``tasks_generation`` uses, which produces a task list that
-already obeys every PDT constraint. This module keeps only the two things
+already obeys every PDT constraint. This module keeps only the three things
 that survive that change:
 
 1. :func:`store_import_payload` - write any JSON value to ``import.json``
@@ -23,7 +23,11 @@ that survive that change:
    mid-write cannot leave it half a document;
 2. :func:`validate_tasks` - the mechanical audit run **after** generation,
    refusing lists the executor would later choke on, one readable sentence
-   per problem.
+   per problem;
+3. :func:`find_duplicate_import` - recognise the material that has already
+   been imported for the same checkout, so the same requirement is not run
+   twice (see :func:`canonical_payload_digest` for what "the same" means
+   here).
 
 Invariants this module keeps, because both have a failure mode invisible in
 a passing test run:
@@ -41,6 +45,7 @@ a passing test run:
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
@@ -57,6 +62,9 @@ from utils.atomic_io import atomic_write_json
 __all__ = [
     "IMPORT_PAYLOAD_FILENAME",
     "IMPORT_SESSION_FILENAME",
+    "TASKS_FILENAME",
+    "canonical_payload_digest",
+    "find_duplicate_import",
     "import_payload_summary",
     "read_import_session",
     "store_import_payload",
@@ -69,6 +77,12 @@ __all__ = [
 #: only path the import prompt names. Same "path-only" contract the other
 #: generators use for ``interview.json`` -- the model reads it itself.
 IMPORT_PAYLOAD_FILENAME = "import.json"
+
+#: The plan-directory member holding the generated task list.  It is the
+#: only place a stored plan records **which checkout** its tasks work in,
+#: so it is what a duplicate check reads to answer "same material, same
+#: project?".
+TASKS_FILENAME = "tasks.json"
 
 #: The plan-directory member that remembers the model conversation the
 #: import ran in: one line, the session id.
@@ -114,6 +128,114 @@ def store_import_payload(plan_dir: Path, payload: Any) -> Path:
     json.dumps(payload, ensure_ascii=False)
     atomic_write_json(target, payload, reraise=True)
     return target
+
+
+def canonical_payload_digest(payload: Any) -> str:
+    """A content fingerprint for one imported payload.
+
+    The value hashed is the one ``import.json`` holds: the payload as
+    JSON, canonically serialised — keys sorted, no insignificant
+    whitespace, non-ASCII kept as itself — and then hashed with sha256.
+    Two payloads that mean the same document therefore get the same
+    digest, and two that differ in any key, order-insensitively or not,
+    get different ones.
+
+    ``sort_keys=True`` is what makes the digest insensitive to the order
+    the caller happened to send its keys in; ``ensure_ascii=False`` keeps
+    a Chinese payload byte-identical to what was written, so the digest
+    describes the material rather than an escaping accident of it.
+    """
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _stored_project_dir(plan_dir: Path) -> Optional[str]:
+    """The checkout a stored plan works in, or ``None`` when unknown.
+
+    Read from ``tasks.json``: the top-level ``project_dir`` if the writer
+    put one there, otherwise the first task's own ``project_dir``.  Both
+    spellings exist in this repository -- the generated path stamps the
+    directory on every task, and some writers keep a copy at the top of
+    the envelope -- and a plan that carries neither cannot be compared,
+    so it is reported as unknown rather than guessed at.
+    """
+    tasks_file = Path(plan_dir) / TASKS_FILENAME
+    try:
+        data = json.loads(tasks_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get("project_dir")
+    if isinstance(value, str) and value.strip():
+        return value
+    tasks = data.get("tasks")
+    if isinstance(tasks, list):
+        for task in tasks:
+            if isinstance(task, dict):
+                value = task.get("project_dir")
+                if isinstance(value, str) and value.strip():
+                    return value
+    return None
+
+
+def find_duplicate_import(
+    plans_root: Path, project_dir: str, payload: Any
+) -> Optional[str]:
+    """The id of an existing plan that is *this exact material, this project*.
+
+    Returns the plan id (the directory name) of the first stored plan
+    whose ``import.json`` has the same content digest **and** whose
+    ``tasks.json`` names the same checkout; ``None`` when there is none.
+
+    Read-only by construction: it looks, it never creates.  A candidate
+    that cannot be read, cannot be parsed, or does not say which project
+    it belongs to is **skipped, not refused** -- a duplicate check that
+    blocks an import because it could not read an unrelated plan would be
+    a worse failure than the one it prevents.
+    """
+    try:
+        digest = canonical_payload_digest(payload)
+    except (TypeError, ValueError):
+        # A payload that cannot even be canonicalised cannot have been
+        # stored either, so it can have no stored twin.
+        return None
+
+    root = Path(plans_root)
+    if not root.is_dir():
+        return None
+
+    try:
+        target = Path(project_dir).resolve()
+    except OSError:
+        target = Path(project_dir)
+
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        import_file = child / IMPORT_PAYLOAD_FILENAME
+        if not import_file.is_file():
+            continue
+        try:
+            stored = json.loads(import_file.read_text(encoding="utf-8"))
+            stored_digest = canonical_payload_digest(stored)
+        except (OSError, TypeError, ValueError):
+            continue
+        if stored_digest != digest:
+            continue
+        candidate = _stored_project_dir(child)
+        if candidate is None:
+            continue
+        try:
+            candidate_path = Path(candidate).resolve()
+        except OSError:
+            candidate_path = Path(candidate)
+        if candidate_path != target:
+            continue
+        return child.name
+    return None
 
 
 def store_import_session(plan_dir: Path, session_id: Optional[str]) -> Optional[Path]:
