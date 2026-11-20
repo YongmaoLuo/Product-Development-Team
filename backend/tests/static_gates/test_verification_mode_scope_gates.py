@@ -1110,8 +1110,18 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 位置**，互不覆盖，故两边都保留；文件内容因此再次变化，按本 gate 的既定流程把
     # 冻结基线前移到**合并态**哈希（`shasum -a 256` 实测值）。
     # 表内条目集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
+    # 2026-11-19：因「修复完成后的通过出口走回收尾判定点」这条已批准改动落在
+    # `verification_loop.py` 上 —— 修复执行完成后的 `passed` 出口不再自己写终态，
+    # 改为调用唯一的收尾判定点 `_handle_passed_round`（有要求书的计划因此进入
+    # `post_processing`，不再被直接写成 `completed`）。改动只落在
+    # `_make_repair_on_complete` 的 `passed` 分支一处，其它分支
+    # （failed / loop_stopped / split）与 `_handle_passed_round` 内部逻辑一字未动。
+    # 按本 gate 的既定流程把冻结基线前移到本分支的批准态哈希（`shasum -a 256`
+    # 实测值）。这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、
+    # 被钉文件的范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
+    # 任何再编辑照样红。
     "backend/verification_loop.py": (
-        "9cba633536391e6d4cbb43d329693f77b39fe7ad76f9813c8eee1b4893654458"
+        "ca7721cee7319118a2008968c96b031c72a2e1b2e1d5c1fe70eb9d38d0e2a062"
     ),
 }
 
