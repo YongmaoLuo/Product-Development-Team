@@ -55,12 +55,19 @@ says ``running`` even though the worker is a shell.
 Going down again
 ----------------
 ``used`` has to come back down when the round is over.  The round ends
-the way production ends it: ``POST /api/verification/{id}/stop`` marks
-the in-memory record ``loop_stopped`` and parks the persistent rows.
-``loop_stopped`` is not in ``_VERIFICATION_IN_FLIGHT_STATUSES``, so the
-live set no longer names the plan — the record itself stays, it is the
-predicate that leaves it out — and the number the panel shows returns to
-where it was before the start.
+the way production ends it: ``POST /api/verification/{id}/stop`` parks
+the plan at the plan-level stopping phase and answers ``stopping``, and
+the background layer marks the in-memory record ``loop_stopped`` and
+parks the persistent rows once the plan is quiet.  ``loop_stopped`` is
+not in ``_VERIFICATION_IN_FLIGHT_STATUSES``, so the live set no longer
+names the plan — the record itself stays, it is the predicate that
+leaves it out — and the number the panel shows returns to where it was
+before the start.
+
+(2026-11-20: the stop became a process.  The release below is
+therefore *waited for* — the request answers ``stopping`` in
+milliseconds, and the count comes down when the background layer has
+written the verdict, not before.)
 
 Every case here ends its round through that route.  Nothing reaches
 into the process's own tables to make the count come down: a case that
@@ -73,6 +80,7 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Iterator, List
@@ -86,6 +94,10 @@ if str(_BACKEND_DIR) not in sys.path:
 from fastapi.testclient import TestClient  # noqa: E402
 
 import server  # noqa: E402
+
+import stop_state  # noqa: E402
+import stop_supervisor  # noqa: E402
+import verification_cancel  # noqa: E402
 
 from plan_scheduler.facts import VERIFICATION_STALE_SECONDS  # noqa: E402
 
@@ -102,6 +114,15 @@ from backend.tests.api.test_start_verification_cas import (  # noqa: E402
 )
 
 client = TestClient(server.app)
+
+#: The real ``threading.Thread``, captured while this module is imported
+#: -- i.e. before any fixture patches it away.  The borrowed
+#: ``no_worker_thread`` fixture replaces ``threading.Thread``
+#: **globally**, and the stop's supervisor is a thread too (see
+#: :func:`stop_supervisor.start`): a stub that never starts a thread
+#: would swallow the release path this file is about.  The same
+#: capture-and-honour shape is used by ``backend/tests/test_verification_api.py``.
+_REAL_THREAD = threading.Thread
 
 #: The endpoint the operator's panel reads.
 STATE_PATH = "/api/scheduler/state"
@@ -218,6 +239,25 @@ def scheduler_engine(
         conn.close()
 
 
+@pytest.fixture(autouse=True)
+def _clean_stop_state():
+    """The stop's process-local state is global — do not leak it.
+
+    ``stop_state`` (the stop record), ``stop_supervisor`` (the
+    supervisor threads) and ``verification_cancel`` (the cancel flag)
+    are process-wide, so a test that leaves one behind decides the next
+    test's outcome — and the plans of two cases in this file share
+    their plan id.
+    """
+    stop_state._reset_for_tests()
+    stop_supervisor._reset_for_tests()
+    verification_cancel._reset_for_tests()
+    yield
+    stop_supervisor._reset_for_tests()
+    stop_state._reset_for_tests()
+    verification_cancel._reset_for_tests()
+
+
 def _used(client: TestClient) -> int:
     """The number of plans holding compute, as the panel reads it."""
     response = client.get(STATE_PATH)
@@ -267,6 +307,24 @@ def _stop_through_the_route(plan_id: str) -> dict:
     response = client.post(f"/api/verification/{plan_id}/stop")
     assert response.status_code == 200, response.text
     return response.json()
+
+
+def _wait_for_the_release(plan_id: str, *, timeout: float = 30.0) -> bool:
+    """Wait for the stop's verdict; True when the round was released.
+
+    The stop is a process (2026-11-20): the request answers
+    ``stopping`` and the background layer writes the terminal verdict
+    once the plan is quiet.  The in-memory status is the LAST of those
+    writes, so waiting for it is waiting for the whole release.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = server._verification_state.get(plan_id) or {}
+        if state.get("verification_status") == "loop_stopped":
+            return True
+        time.sleep(0.05)
+    state = server._verification_state.get(plan_id) or {}
+    return state.get("verification_status") == "loop_stopped"
 
 
 def _verification_row(plan_id: str) -> dict:
@@ -358,20 +416,27 @@ def test_stopping_verification_decrements_used(
     scheduler_engine,
     make_verification_plan,
     no_worker_thread,
+    monkeypatch,
 ) -> None:
     """A started verification → ``used`` goes up; a stopped one → back down.
 
     The round is stopped the way production stops it — through
-    ``POST /api/verification/{id}/stop``.  That route marks the
-    in-memory record ``loop_stopped`` and parks the persistent rows;
-    ``loop_stopped`` is not in ``_VERIFICATION_IN_FLIGHT_STATUSES``, so
-    the live set no longer names the plan, and the number the panel
-    shows returns to where it was before the start.
+    ``POST /api/verification/{id}/stop``.  That route closes the gate
+    and answers ``stopping``; the background layer marks the in-memory
+    record ``loop_stopped`` and parks the persistent rows once the plan
+    is quiet.  ``loop_stopped`` is not in
+    ``_VERIFICATION_IN_FLIGHT_STATUSES``, so the live set no longer names
+    the plan, and the number the panel shows returns to where it was
+    before the start.
 
     Every step of that release is asserted here, because each of them is
     a place where the count could stay up: the answer the operator got,
     the record the process kept, the persistent verification row, the
     routing row, and the panel's own reading.
+
+    (2026-11-20: the release is the background layer's verdict, so it
+    is *waited for* — the request alone no longer demotes the record,
+    because the round may still be running behind it.)
     """
     plan = make_verification_plan()
 
@@ -385,12 +450,44 @@ def test_stopping_verification_decrements_used(
     assert _used(client) == before + 1
     assert plan.plan_id in server._live_plan_ids()
 
+    # The borrowed ``no_worker_thread`` fixture replaced
+    # ``threading.Thread`` **globally** with a stub that never starts a
+    # thread -- and the stop's supervisor is a thread too
+    # (:func:`stop_supervisor.start` spawns it).  Left in place, the stub
+    # would swallow the release path this case is about: the supervisor
+    # would never run, the round would never get its verdict, and the
+    # case would be pinning a release that cannot happen.
+    #
+    # Handing the thread class back now is safe for the round: the
+    # ``/start`` above already spawned the round's own worker, and it
+    # was spawned *as the stub* -- so the round still does not run, and
+    # only the supervisor's thread is real from here on.
+    monkeypatch.setattr(threading, "Thread", _REAL_THREAD)
+
+    # The quiet window is the deployment's policy; the test shortens it
+    # through the same entry point the route uses, so the release does
+    # not cost the suite five seconds.
+    real_start = stop_supervisor.start
+
+    def _fast_start(started_plan_id, **kwargs):
+        kwargs.setdefault("quiet_seconds", 0.2)
+        return real_start(started_plan_id, **kwargs)
+
+    monkeypatch.setattr(stop_supervisor, "start", _fast_start)
+
     body = _stop_through_the_route(plan.plan_id)
 
-    # a) The answer the operator got.
-    assert body["status"] == "stopped"
+    # a) The answer the operator got: the stop is still in progress.
+    assert body["status"] == "stopping"
     assert body["paused"] is True
     assert body["reason"] == "user_stopped"
+
+    # The release happens in the background layer, once the plan is
+    # quiet — so it is waited for before the count is read.
+    assert _wait_for_the_release(plan.plan_id), (
+        "the background layer never wrote the terminal verdict — the "
+        "round is still holding compute"
+    )
 
     # b) The record the process kept: the route demotes it, it does not
     #    delete it.

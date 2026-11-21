@@ -23,12 +23,19 @@ What is pinned here:
 
   1. **the ledger is the authority** — with no handle in memory, the
      stop still kills what the ledger records.
-  2. **"stopped" means dead** — a survivor turns the answer into
-     ``kill_incomplete`` plus the surviving pids.
+  2. **a survivor keeps the plan stopping** — ``kill_incomplete`` is
+     not a field of the answer any more: the stop answers
+     ``stopping`` and names the surviving pid, and the BACKGROUND layer
+     refuses to park a plan that is still working.
   3. **an incomplete stop keeps the pid** — the row must not claim the
      plan is stopped while its process is still alive.
   4. **no ledger, no handle, no kill** — the idle semantics stay
      exactly as they were, and nothing pretends to have been killed.
+
+The stop is a process, not an instant: the request closes the gate and
+answers, and the kill happens on the background worker.  So every case
+below waits for that worker before it reads a side effect of the
+shutdown.
 """
 
 from __future__ import annotations
@@ -49,13 +56,22 @@ import process_identity
 import process_ledger as ledger
 import process_reaper
 import server
+import stop_state
+import stop_supervisor
+import verification_cancel
 from state_machine.db.connection import open as open_db
 from state_machine.db.schema import migrate
 from state_machine.repositories.execution_repository import ExecutionRepository
 from state_machine.repositories.routing_repository import RoutingRepository
+from verification_quiesce import Survivor
 
 
 PLAN_ID = "20261030-stop-uses-ledger"
+
+#: The quiet window the background layer waits for before it may park
+#: the plan.  Short here on purpose: the window is a policy of the
+#: deployment, not a contract of the stop.
+QUIET_SECONDS = 0.2
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +252,37 @@ def _killed_pids(plan_dir: Path) -> List[int]:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _clean_stop_state(monkeypatch):
+    """The stop's process-local state is global — do not leak it.
+
+    ``stop_state`` (the stop record), ``stop_supervisor`` (the
+    supervisor threads) and ``verification_cancel`` (the cancel flag)
+    are process-wide and indexed by plan id, and this suite reuses ONE
+    plan id — so a record or a supervisor left behind by one case
+    decides the next case's stop behaviour.
+
+    The quiet window is shortened for the same reason the deployment
+    may choose it: the window is a policy, not a contract, and the
+    cases below must not pay five seconds per stop.
+    """
+    real_start = stop_supervisor.start
+
+    def _start(plan_id, **kwargs):
+        kwargs["quiet_seconds"] = QUIET_SECONDS
+        return real_start(plan_id, **kwargs)
+
+    monkeypatch.setattr(stop_supervisor, "start", _start)
+
+    stop_state._reset_for_tests()
+    stop_supervisor._reset_for_tests()
+    verification_cancel._reset_for_tests()
+    yield
+    stop_supervisor._reset_for_tests()
+    stop_state._reset_for_tests()
+    verification_cancel._reset_for_tests()
+
+
 @pytest.fixture
 def env(monkeypatch, tmp_path):
     """Per-test PLANS_DIR + state.db isolation."""
@@ -256,6 +303,54 @@ def env(monkeypatch, tmp_path):
 @pytest.fixture
 def client():
     return TestClient(server.app)
+
+
+@pytest.fixture
+def captured_supervisor(monkeypatch):
+    """Capture the finalize callback the route hands to the supervisor.
+
+    The background layer's verdict is what decides whether a plan that
+    is still working may be parked — and that verdict is made on the
+    supervisor's own thread, minutes away when the plan stays busy.
+    So the callback is captured here and driven by the case, which is
+    exactly the shape the supervisor uses when it hands live work over.
+    """
+    calls: List[Dict[str, Any]] = []
+
+    def _record_start(plan_id, *, finalize, scan=None, **kwargs):
+        calls.append({"plan_id": plan_id, "finalize": finalize, "scan": scan})
+        return None
+
+    monkeypatch.setattr(stop_supervisor, "start", _record_start)
+    return calls
+
+
+def _wait_for_stop_worker(plan_id: str = PLAN_ID, timeout: float = 60.0) -> None:
+    """Wait for the background worker that shuts the plan's tree down.
+
+    The stop answers as soon as the gate is closed; the kill and the
+    checkpoint happen on the worker's own thread.  So every side effect
+    of the shutdown — the kill, the checkpoint, the row, the ledger
+    events — is read AFTER this wait, never before it.
+    """
+    deadline = time.monotonic() + timeout
+    while server._routes_execution._stop_worker_running(plan_id):
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"the stop's background worker is still running after "
+                f"{timeout:.0f}s"
+            )
+        time.sleep(0.05)
+
+
+def _read_phase(db_path: Path, plan_id: str = PLAN_ID) -> str:
+    """The routing row's ``current_phase``, read back on its own connection."""
+    conn = open_db(db_path)
+    try:
+        row = RoutingRepository(conn).current(plan_id)
+    finally:
+        conn.close()
+    return (row or {}).get("current_phase")
 
 
 # ---------------------------------------------------------------------------
@@ -280,11 +375,15 @@ def test_stop_without_handle_kills_from_ledger(env, client):
         resp = client.post(f"/api/execution/{PLAN_ID}/stop")
 
         assert resp.status_code == 200, resp.text
-        assert resp.json()["status"] == "stopped", resp.json()
+        # The stop is a process: the request closes the gate and answers
+        # "stopping" — the shutdown happens on the background worker.
+        assert resp.json()["status"] == "stopping", resp.json()
+
+        _wait_for_stop_worker(PLAN_ID)
 
         child.wait(timeout=15)
         assert child.poll() is not None, (
-            "the stop answered 'stopped' but the process the ledger "
+            "the stop answered 'stopping' but the process the ledger "
             "records for this plan is still running"
         )
         assert _killed_pids(plan_dir) == [child.pid], (
@@ -312,11 +411,14 @@ def test_stop_without_any_state_still_kills_from_the_ledger(env, client):
         resp = client.post(f"/api/execution/{PLAN_ID}/stop")
 
         assert resp.status_code == 200, resp.text
-        assert resp.json()["status"] == "stopped", resp.json()
+        assert resp.json()["status"] == "stopping", resp.json()
+
+        _wait_for_stop_worker(PLAN_ID)
+
         child.wait(timeout=15)
         assert child.poll() is not None, (
             "the plan was not in memory, so the stop killed nothing — "
-            "and said 'stopped' anyway"
+            "and said 'stopping' anyway"
         )
     finally:
         _cleanup(child)
@@ -328,13 +430,17 @@ def test_stop_without_any_state_still_kills_from_the_ledger(env, client):
 
 
 def test_stop_returns_kill_incomplete_when_survivor_remains(
-    env, client, monkeypatch
+    env, client, monkeypatch, captured_supervisor
 ):
-    """A process that survived turns the answer into ``kill_incomplete``.
+    """A process that survived keeps the plan in the stopping phase.
 
-    The answer has to name what is still running: an operator who sees
-    "stopped" stops looking, and the process that is still burning
-    tokens is then nobody's problem.
+    ``kill_incomplete`` is not a field of the answer any more: the stop
+    answers ``stopping`` and the BACKGROUND layer makes the verdict.  A
+    plan that is still working is not a stopped plan, so the phase
+    stays at ``user_stopping`` — and the answer names the process that
+    is still running, because an operator who sees "stopped" stops
+    looking, and the process that is still burning tokens is then
+    nobody's problem.
     """
     plans_dir, db_path = env
     plan_dir, project_dir = _seed_plan(plans_dir, db_path)
@@ -348,13 +454,31 @@ def test_stop_returns_kill_incomplete_when_survivor_remains(
 
         assert resp.status_code == 200, resp.text
         body = resp.json()
-        assert body["status"] == "kill_incomplete", body
-        assert body["surviving_pids"] == [child.pid], body
+        assert body["status"] == "stopping", body
+        assert [s["pid"] for s in body["survivors"]] == [child.pid], body
+
+        _wait_for_stop_worker(PLAN_ID)
+
+        # The background layer's verdict: the plan is still busy, so it
+        # must NOT be parked at "stopped".
+        finalize = stop_supervisor._bind_finalize(
+            captured_supervisor[0]["finalize"], PLAN_ID,
+        )
+        finalize([
+            Survivor(pid=child.pid, kind="execution_executor", detail=""),
+        ])
+        assert _read_phase(db_path) == "user_stopping", (
+            "the stop parked a plan that is still working — the phase "
+            f"claims the work stopped while it is still running: "
+            f"{_read_phase(db_path)!r}"
+        )
     finally:
         _cleanup(child)
 
 
-def test_stop_keeps_exec_pid_when_incomplete(env, client, monkeypatch):
+def test_stop_keeps_exec_pid_when_incomplete(
+    env, client, monkeypatch, captured_supervisor
+):
     """An incomplete stop must not clear the pid.
 
     The row is marked "stopped" *before* the kill — the executor's
@@ -382,13 +506,29 @@ def test_stop_keeps_exec_pid_when_incomplete(env, client, monkeypatch):
         resp = client.post(f"/api/execution/{PLAN_ID}/stop")
 
         assert resp.status_code == 200, resp.text
-        assert resp.json()["status"] == "kill_incomplete", resp.json()
+        assert resp.json()["status"] == "stopping", resp.json()
+
+        _wait_for_stop_worker(PLAN_ID)
+
         row = _read_exec_row(PLAN_ID, db_path)
         assert row["exec_pid"] == child.pid, (
             f"the incomplete stop cleared exec_pid; row={row!r}"
         )
         assert row["exec_status"] != "stopped", (
             f"the incomplete stop marked the plan stopped; row={row!r}"
+        )
+
+        # And the plan is not a stopped plan either — the phase stays
+        # at the stopping phase while the work is still running.
+        finalize = stop_supervisor._bind_finalize(
+            captured_supervisor[0]["finalize"], PLAN_ID,
+        )
+        finalize([
+            Survivor(pid=child.pid, kind="execution_executor", detail=""),
+        ])
+        assert _read_phase(db_path) == "user_stopping", (
+            f"the stop parked a plan that is still running: "
+            f"{_read_phase(db_path)!r}"
         )
     finally:
         _cleanup(child)

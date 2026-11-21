@@ -24,15 +24,25 @@ The stop path now does three things:
 The registry is intentionally process-local and tiny: one deployment,
 one server process, and the flag's lifetime is a single round (cleared
 by ``/start`` and by the post-repair re-entry).
+
+2026-11-20. Alongside the flag it now keeps a per-plan *dispatch
+ledger* (``_dispatch_totals``). The flag alone cannot answer the
+question the silent phase asks — "was anything new dispatched after
+the stop?" — because it only records that a round *was* cancelled. The
+ledger is monotonic and outlives the round: ``clear()`` drops the flag
+but never the count, because zeroing the count inside the quiet window
+would make a fresh dispatch indistinguishable from "nothing was
+dispatched".
 """
 
 from __future__ import annotations
 
 import threading
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 _lock = threading.Lock()
 _cancelled: Set[str] = set()
+_dispatch_totals: Dict[str, int] = {}
 
 
 class VerificationCancelled(RuntimeError):
@@ -88,7 +98,19 @@ def request_cancel(plan_id: str) -> None:
 
 
 def clear(plan_id: str) -> None:
-    """Drop the cancel flag — called when a fresh round starts."""
+    """Drop the cancel flag — called when a fresh round starts.
+
+    2026-11-20. This deliberately does NOT touch ``_dispatch_totals``.
+    The dispatch counter answers "was anything new dispatched inside the
+    quiet window?", and ``clear()`` is what the next ``/start`` calls.
+    Zeroing the counter here would erase the very evidence the quiet
+    judgement reads: a dispatch that happened after the clear would
+    look identical to "no dispatch ever happened", and a stop would
+    report itself quiet while a new VP was still running.
+
+    The counter is process-global and monotonic on purpose — it is a
+    ledger, not a per-round gauge. Only ``_reset_for_tests()`` clears it.
+    """
     if not plan_id:
         return
     with _lock:
@@ -109,7 +131,46 @@ def cancelled_plans() -> List[str]:
         return sorted(_cancelled)
 
 
+def note_dispatch(plan_id: str) -> int:
+    """Record one verification-point dispatch for ``plan_id``.
+
+    2026-11-20. The silent ("quiesce") phase of a stop has to answer
+    "did the round dispatch anything new after the stop?". A boolean
+    cancel flag cannot answer that — it only says the round *was*
+    cancelled. So the registry keeps a per-plan dispatch ledger next to
+    the flag: the caller takes a baseline with ``dispatch_total()``
+    before the window opens and compares it with the value after the
+    window closes.
+
+    The return value is the running total *after* this dispatch, so the
+    caller can record a baseline in the same call that counts the
+    dispatch (no lost-update window between the two reads).
+
+    The counter is monotonic and process-local; an empty ``plan_id`` is
+    a no-op and returns 0 without touching the ledger.
+    """
+    if not plan_id:
+        return 0
+    with _lock:
+        total = _dispatch_totals.get(plan_id, 0) + 1
+        _dispatch_totals[plan_id] = total
+        return total
+
+
+def dispatch_total(plan_id: str) -> int:
+    """How many verification points have been dispatched for ``plan_id``.
+
+    2026-11-20. Read-only view of the dispatch ledger; 0 for a plan
+    that never dispatched anything (and for an empty ``plan_id``).
+    """
+    if not plan_id:
+        return 0
+    with _lock:
+        return _dispatch_totals.get(plan_id, 0)
+
+
 def _reset_for_tests() -> None:
-    """Test hook — clears every flag."""
+    """Test hook — clears every flag and the dispatch ledger."""
     with _lock:
         _cancelled.clear()
+        _dispatch_totals.clear()

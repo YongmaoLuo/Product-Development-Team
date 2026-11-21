@@ -278,11 +278,20 @@ def test_the_stored_payload_is_exactly_what_the_caller_sent(
 
 def test_every_content_alias_is_the_same_slot(plans_root, checkout, monkeypatch):
     """``content`` is documented; the other three are habits. Which one a
-    caller reaches for is not a requirement, so none of them is refused."""
+    caller reaches for is not a requirement, so none of them is refused.
+
+    The same material is sent under each alias on purpose -- that is what
+    "the same slot" means -- so the requests carry ``allow_duplicate``:
+    without it the *second* of them would be refused as a repeat import,
+    which is a different rule and is tested on its own.
+    """
     for field in ("content", "tasks", "raw", "requirement"):
         _install(monkeypatch, _tasks_payload())
 
-        response = _post({"project_dir": str(checkout), field: "do the thing"})
+        response = _post(
+            {"project_dir": str(checkout), field: "do the thing"},
+            allow_duplicate=True,
+        )
 
         assert response.status_code == 200, (field, response.text)
         assert response.json()["source_field"] == field
@@ -392,6 +401,98 @@ def test_a_second_import_of_the_same_title_does_not_overwrite_the_first(
     assert any(
         "already exists" in warning for warning in second.json()["warnings"]
     )
+
+
+def test_a_second_import_of_the_same_content_and_project_is_refused(
+    plans_root, checkout, monkeypatch
+):
+    """The same material for the same checkout is one requirement, once.
+
+    Importing it twice made two plans that ran the same work twice, at
+    twice the token cost.  The second import is now refused with a 409
+    that names the plan already holding the material -- and the refusal
+    happens before anything is created: no second directory, no file, no
+    model call.
+    """
+    _install(monkeypatch, _tasks_payload())
+    first = _post({"project_dir": str(checkout), "content": "the same material"})
+
+    assert first.status_code == 200, first.text
+    first_plan_id = first.json()["plan_id"]
+
+    _install(monkeypatch, _tasks_payload())
+    second = _post({"project_dir": str(checkout), "content": "the same material"})
+
+    assert second.status_code == 409, second.text
+    body = second.json()
+    assert body["error"] == "duplicate_import"
+    assert body["existing_plan_id"] == first_plan_id
+    assert body["allow_duplicate"] is False
+
+    # Nothing was created for the refused import.
+    assert sorted(p.name for p in plans_root.iterdir()) == [first_plan_id]
+    assert (plans_root / first_plan_id / "tasks.json").exists()
+
+
+def test_allow_duplicate_imports_anyway(plans_root, checkout, monkeypatch):
+    """A caller who really means two plans says so, and gets them."""
+    _install(monkeypatch, _tasks_payload())
+    first = _post({"project_dir": str(checkout), "content": "the same material"})
+
+    assert first.status_code == 200, first.text
+    first_plan_id = first.json()["plan_id"]
+
+    _install(monkeypatch, _tasks_payload())
+    second = _post(
+        {"project_dir": str(checkout), "content": "the same material"},
+        allow_duplicate=True,
+    )
+
+    assert second.status_code == 200, second.text
+    second_plan_id = second.json()["plan_id"]
+    assert second_plan_id != first_plan_id
+    assert (plans_root / second_plan_id / "tasks.json").exists()
+
+
+def test_same_content_different_project_is_not_a_duplicate(
+    plans_root, checkout, monkeypatch, tmp_path
+):
+    """Same material, another checkout: another plan, not a repeat.
+
+    The refusal is about *the same work in the same place*.  The same
+    material aimed at a different project is a different piece of work,
+    and blocking it would be the guard misfiring.
+    """
+    other = tmp_path / "other-checkout"
+    other.mkdir()
+
+    # A read-only task: the second checkout is empty, and a task naming
+    # files to change would (rightly) be refused for naming files that
+    # are not there.  What is being tested here is the duplicate rule,
+    # not the workspace gate.
+    def report_payload():
+        # A fresh object each time: the generator mutates the reply in
+        # place, and a task still carrying the *first* checkout's
+        # directory would be refused by the audit.
+        return _tasks_payload(tasks=[{
+            "id": "R1",
+            "title": "assemble the evidence",
+            "description": "read-only investigation",
+            "deliverable": "report",
+            "report_path": "/tmp/fast-lane-evidence.md",
+        }])
+
+    _install(monkeypatch, report_payload())
+    first = _post({"project_dir": str(checkout), "content": "the same material"})
+
+    assert first.status_code == 200, first.text
+
+    _install(monkeypatch, report_payload())
+    second = _post({"project_dir": str(other), "content": "the same material"})
+
+    assert second.status_code == 200, second.text
+    assert second.json()["plan_id"] != first.json()["plan_id"]
+    assert (plans_root / second.json()["plan_id"] / "tasks.json").exists()
 
 
 # ---------------------------------------------------------------------------

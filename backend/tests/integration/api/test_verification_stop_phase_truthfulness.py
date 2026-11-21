@@ -3,9 +3,11 @@
 What is pinned here
 -------------------
 ``POST /api/verification/{id}/stop`` parks the routing row at
-``verification`` — the phase that means "a verification round was
-interrupted, the plan is waiting".  That is only true when the work
-actually stopped.
+``user_stopping`` — the phase that means "a stop is in progress" — and
+hands the shutdown to the background layer.  The park at
+``verification`` (the phase that means "a verification round was
+interrupted, the plan is waiting") is that layer's verdict, and it is
+only true when the work actually stopped.
 
 The stop's hard kill is best-effort.  A sub-agent whose process the
 kill could not reach keeps running, and its verdict lands minutes
@@ -19,16 +21,18 @@ was free to hand it to somebody else.
 So the phase has to be true:
 
 1. **a stop whose work survived does not park the plan** — the phase
-   stays ``verification_running``, because the round is still running;
+   stays ``user_stopping``: the stop is still in progress, and so is the
+   round;
 2. **a stop whose work really stopped does park the plan** — the phase
-   is ``verification``, which is what makes the next ``/start`` a
+   becomes ``verification``, which is what makes the next ``/start`` a
    resume;
 3. **stop then start ends at ``verification_running``** — the chain the
    operator actually drives.
 
 The chain is driven through the HTTP handlers, not through an internal
 helper: the phase is the routing row's, and the only thing that decides
-it is the endpoint.
+it is the endpoint — plus, for the park, the background layer the
+endpoint hands the stop to.
 """
 
 from __future__ import annotations
@@ -37,12 +41,15 @@ import json
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 import server
+import stop_state
+import stop_supervisor
 import verification_cancel
 from server import app
 from state_machine.db.connection import open as open_db
@@ -70,10 +77,19 @@ ROUND_VERDICTS = [
 
 
 @pytest.fixture(autouse=True)
-def _clean_cancel_flags():
-    """The stop's cancel flag is process-global — do not leak it."""
+def _clean_process_state():
+    """The stop's process-local state is global — do not leak it.
+
+    The cancel flag, the stop record and the supervisor threads are all
+    process-wide, so a test that leaves one behind decides the next
+    test's outcome.
+    """
     verification_cancel._reset_for_tests()
+    stop_state._reset_for_tests()
+    stop_supervisor._reset_for_tests()
     yield
+    stop_supervisor._reset_for_tests()
+    stop_state._reset_for_tests()
     verification_cancel._reset_for_tests()
 
 
@@ -216,12 +232,34 @@ def _read_phase(db_path: Path, plan_id: str) -> str:
     return (row or {}).get("current_phase")
 
 
+def _wait_for_parked_phase(
+    db_path: Path, plan_id: str, timeout: float = 60.0,
+) -> str:
+    """Wait for the background layer to park the plan, and read it back.
+
+    The park is the supervisor's verdict on the plan's silence, so it
+    happens on the supervisor's thread: the phase is polled, never
+    assumed.  The plan leaves ``user_stopping`` when the stop has been
+    dealt with.
+    """
+    deadline = time.monotonic() + timeout
+    phase = _read_phase(db_path, plan_id)
+    while phase == "user_stopping" and time.monotonic() < deadline:
+        time.sleep(0.2)
+        phase = _read_phase(db_path, plan_id)
+    assert phase != "user_stopping", (
+        f"the stop never finalized — the plan is still parked at the "
+        f"stopping phase after {timeout:.0f}s"
+    )
+    return phase
+
+
 # ---------------------------------------------------------------------------
 # the tests
 # ---------------------------------------------------------------------------
 
 
-def test_stop_leaves_a_running_round_on_its_running_phase(
+def test_stop_leaves_a_running_round_at_the_stopping_phase(
     env, client, live_sub_agent,
 ):
     """A stop whose work survived must not park the plan.
@@ -231,8 +269,11 @@ def test_stop_leaves_a_running_round_on_its_running_phase(
     ``/api/system/active``, capacity sees a free slot, and the round
     keeps spending — the split the phase is supposed to prevent.
 
-    So the phase has to keep saying that a round is running until the
-    work really stops.
+    So the phase has to keep saying that a stop is in progress until the
+    work really stops.  ``user_stopping`` is that phase: it is not
+    ``verification`` (the round is not parked — it is still running) and
+    it is not ``verification_running`` either (the gate is closed, so no
+    new work starts for this plan).
     """
     plans_dir, db_path = env
     _seed_plan(plans_dir, db_path)
@@ -240,14 +281,15 @@ def test_stop_leaves_a_running_round_on_its_running_phase(
     stop = client.post(f"/api/verification/{PLAN_ID}/stop")
     assert stop.status_code == 200, stop.text
     body = stop.json()
-    assert body["status"] == "stopped", body
+    assert body["status"] == "stopping", body
 
     # The work is still alive (the fixture's process never exits on its
     # own), so the phase must not claim the plan is parked.
-    assert _read_phase(db_path, PLAN_ID) == "verification_running", (
-        "the plan was parked at 'verification' while its round was "
-        "still running — it drops out of /api/system/active and the "
-        "scheduler thinks the slot is free"
+    phase = _read_phase(db_path, PLAN_ID)
+    assert phase == "user_stopping", (
+        f"the phase is {phase!r} while the round is still running — it "
+        "must stay at 'user_stopping' until the background layer has "
+        "seen the work stop"
     )
     assert body["still_running"] is True, body
 
@@ -258,13 +300,19 @@ def test_stop_parks_the_plan_when_the_round_really_stopped(env, client):
     The parked phase (``verification``) is what the next ``/start``
     reads as a resumable source, so a stop that refuses to park a plan
     whose work is gone would break the pause contract.
+
+    The park is the background layer's verdict and not the request's:
+    the answer comes back with the plan at ``user_stopping``, and the
+    phase moves when the supervisor has seen the plan fall silent.
     """
     plans_dir, db_path = env
     _seed_plan(plans_dir, db_path)
 
     stop = client.post(f"/api/verification/{PLAN_ID}/stop")
     assert stop.status_code == 200, stop.text
-    assert _read_phase(db_path, PLAN_ID) == "verification"
+    assert _read_phase(db_path, PLAN_ID) == "user_stopping"
+
+    assert _wait_for_parked_phase(db_path, PLAN_ID) == "verification"
 
 
 def test_stop_then_start_ends_on_the_running_phase(
@@ -282,6 +330,9 @@ def test_stop_then_start_ends_on_the_running_phase(
 
     stop = client.post(f"/api/verification/{PLAN_ID}/stop")
     assert stop.status_code == 200, stop.text
+
+    # The start reads the parked phase, so the chain waits for the park.
+    assert _wait_for_parked_phase(db_path, PLAN_ID) == "verification"
 
     start = client.post(
         f"/api/verification/{PLAN_ID}/start", json={"auto_fix": True},

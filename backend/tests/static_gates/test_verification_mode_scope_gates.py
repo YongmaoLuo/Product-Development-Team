@@ -919,8 +919,18 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 冻结基线前移到本分支的批准态。哈希取自工作区文件的 `shasum -a 256` 实测值，
     # 不是抄来的。表内条目集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节
     # 比对，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-21：因已批准的「停止链的徽章跟随后端状态机」改动了 `frontend/app.js`
+    # —— `setExecBadge` / `setVerificationBadge` 的词表补上 `stopping`（正在停止），
+    # `execBadgeState` 让 `stopping` 先于 `paused`，`stopExecution()` 读停止应答：
+    # 应答是 `stopping` 就显示「正在停止」并继续轮询，只有轮询到终态才停轮询并显示
+    # 「已停止」，`startExecutionPolling()` 在停止窗口内不把徽章刷回「执行中」，
+    # `resumePlan()` 的相位分派补上 `user_stopping`（正在停止的计划仍能打开任务视图）。
+    # 按本 gate 的既定流程把冻结基线前移到本分支的批准态。哈希取自工作区文件的
+    # `hashlib.sha256(Path("frontend/app.js").read_bytes()).hexdigest()` 实测值，
+    # 不是抄来的。表内条目集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节
+    # 比对，该文件此后仍被逐字节钉住，任何再编辑照样红。
     "frontend/app.js": (
-        "da10420303c8d7537d448d1664cfa773633345ee8cb7b265bf134464182ff041"
+        "73c095694ff5b925dfe6ae956c2e4cad0d3c540f2fe1f2f1a76481f8ac8bdad6"
     ),
     # 2026-11-01：因「调度卡片容器与收起态样式」（task-11）改动了 `frontend/style.css`，
     # 按本 gate 的既定流程把哈希前移到本分支的批准态；表内条目集合不变。
@@ -1368,34 +1378,21 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 实测值）。这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、
     # 被钉文件的范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
     # 任何再编辑照样红。
-    # 2026-11-19（本次合并 origin/main@021565b9）：``backend/verification_loop.py``
-    # 两侧**又都改过** —— 本分支继续删镜像写函数 ``_update_plan_state_to_terminal``
-    # （权威行取代它），base 侧带来本轮的新改动。合并后的文件内容与两侧各自的冻结
-    # 基线（``541f6984…`` / ``9cba6335…``）都不同，因此按本 gate 的既定流程把冻结
-    # 基线再前移到合并态哈希 ``fadeae92…``。
-    # 前移之前已核对：两侧的改动都还在，没有互相抵消 ——
-    #   * base 侧：``_new_round_instance_token`` / ``_claim_round_instance_ownership`` /
-    #     ``_terminal_write_ends_the_chain`` / ``_start_postprocess`` /
-    #     ``_plan_parked_for_quota`` / ``_park_verification_round_for_quota`` 都在位；
-    #   * 本分支：镜像写函数 ``_update_plan_state_to_terminal`` 仍然整体消失（该文件里
-    #     0 处引用），权威行仍由 ``_persist_verification_terminal`` 写。
-    # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的范围
-    # 与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
-    # 2026-11-20（本次合入 origin/main@2b9efa16 —— 新分支 + 新 PR 重交付）：该文件
-    # 两侧**又都改过** —— base 侧带来「修复完成后的通过出口走回收尾判定点」
-    # （`_handle_passed_round` 取代 `passed` 出口自写终态），本分支带来「删镜像写
-    # 函数」等改动。两侧的改动落在**不同位置**，互不覆盖，故两边都保留
-    # （合并后实测：base 侧的 `_new_round_instance_token` /
-    # `_claim_round_instance_ownership` / `_terminal_write_ends_the_chain` /
-    # `_start_postprocess` / `_plan_parked_for_quota` /
-    # `_park_verification_round_for_quota` 与 `_handle_passed_round` 均在位；本分支的
-    # `_update_plan_state_to_terminal` 仍为 0 处引用，权威行仍由
-    # `_persist_verification_terminal` 写）。文件内容因此再次变化，按本 gate 的既定
-    # 流程把冻结基线再前移到**合并态**哈希（`shasum -a 256` 实测值）。
-    # 表内条目集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节比对，
-    # 该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-21（本次合并 origin/main@daf1168c）：两侧都改过该文件 ——
+    # base 侧带来「修复执行器派发前加闸门」与停止语义重构（`_run_repair_execution_async`
+    # 在 spawn 前读 plan 级停止记录；停止流程改为先关闸门、逐层协作停止、静默后翻相位）；
+    # 本分支带来「删镜像写函数」等改动。两侧改动落在不同位置，合并后实测两侧都在位：
+    #   * base 侧：`_run_repair_execution_async` 的停止闸门、`_handle_passed_round`、
+    #     `_new_round_instance_token` / `_claim_round_instance_ownership` /
+    #     `_terminal_write_ends_the_chain` / `_start_postprocess` /
+    #     `_plan_parked_for_quota` / `_park_verification_round_for_quota` 均在位；
+    #   * 本分支：镜像写函数 `_update_plan_state_to_terminal` 仍为 0 处引用，
+    #     权威行仍由 `_persist_verification_terminal` 写。
+    # 文件内容因此变化，按本 gate 的既定流程把冻结基线前移到合并态哈希
+    # （`shasum -a 256` 实测值）。表内条目集合与断言强度不变：被钉文件的范围不变、
+    # sha256 仍逐字节比对，该文件此后仍被逐字节钉住，任何再编辑照样红。
     "backend/verification_loop.py": (
-        "ac64706c46f08eba85eb02ec7b351592c5446f949e3d7f9cce5dd50341b7e941"
+        "2e82f87a3c0db6d251537cfc254fce45a2b39bf538aa2efe84d41f49eac6277b"
     ),
 }
 
@@ -1883,6 +1880,42 @@ def test_r10_waiting_phase_rename_surface_is_frozen() -> None:
     assert mismatched == [], (
         "a file in R10's waiting-phase rename surface changed outside "
         "the frozen baseline:\n  " + "\n  ".join(mismatched)
+    )
+
+
+def test_frozen_hash_matches_verification_loop() -> None:
+    """The pin on ``backend/verification_loop.py`` is a measurement.
+
+    The gate above compares the table against the disk, but it compares
+    the table as it was IMPORTED — and an imported constant is whatever
+    the source says it is, including a value that was typed by hand or
+    left behind by an earlier refresh.  This one reads the literal out
+    of THIS file's own source text and compares it with the bytes on
+    disk, so the value that is checked is the value that is actually
+    written down.
+
+    It is the same rule the sibling contract gate applies to the three
+    frontend files it refreshed (``test_frozen_hash_refresh_contract``),
+    applied to the one pin this round moved: the repair dispatch's spawn
+    gate lives in ``backend/verification_loop.py``, so that file's
+    content changed and its pin had to move with it.
+    """
+    source = Path(__file__).resolve().read_text(encoding="utf-8")
+    match = re.search(
+        r'"backend/verification_loop\.py":\s*\(\s*"([0-9a-f]{64})"\s*\)',
+        source,
+    )
+    assert match is not None, (
+        "the frozen hash of backend/verification_loop.py is no longer "
+        "written down in this file — the pin was dropped, not moved"
+    )
+    frozen = match.group(1)
+    actual = hashlib.sha256(
+        (REPO_ROOT / "backend/verification_loop.py").read_bytes()
+    ).hexdigest()
+    assert frozen == actual, (
+        "the frozen hash of backend/verification_loop.py does not match "
+        f"the file on disk:\n  frozen: {frozen}\n  actual: {actual}"
     )
 
 

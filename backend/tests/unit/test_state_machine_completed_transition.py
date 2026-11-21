@@ -20,6 +20,11 @@ Contract pinned here
    plus the legacy in-progress phases) is rejected with ``ValueError``.
 3. Every other row of the table is untouched by this change.
 
+(2026-11-20: the stop contract later added the plan-level
+``user_stopping`` phase and the edges into it.  The snapshot below was
+re-pinned for those rows; the guarantee — "every row is pinned exactly" —
+did not change.)
+
 The tests reach the shared bug-fix plan fixtures from task 1
 (``mock_plan_state_factory`` / ``plan_dir_writer``, registered in
 ``backend/tests/conftest.py``) rather than hand-rolling a
@@ -221,7 +226,16 @@ def test_completed_self_loop_is_not_a_legal_declared_target():
 
 
 def test_other_phase_transitions_unchanged():
-    """The rest of the verification table keeps its existing definition."""
+    """The rest of the verification table keeps its existing definition.
+
+    The guarantee is unchanged — every row is pinned **exactly**, so a row
+    that grows an edge or loses one fails here.  What moved is the
+    snapshot: on 2026-11-20 the stop contract added the plan-level
+    ``user_stopping`` phase, and with it three new edges into it
+    (``executing``, ``verification_running``, ``verification_repairing``)
+    plus the row of the stopping phase itself.  Those four rows are
+    re-pinned below; every other row is spelled out exactly as it was.
+    """
     expected_rows = {
         "ready": ["verification", "verification_running"],
         # 2026-10-25 (R10): ``queued`` is the one and only waiting phase —
@@ -236,6 +250,13 @@ def test_other_phase_transitions_unchanged():
             "stopped",
             "ready",
             "queued",
+            # 2026-11-20: the stop contract made "a stop is in progress" a
+            # phase of its own (``user_stopping``, plan-level and shared by
+            # the execution and the verification stop).  The execution stop
+            # parks the plan there first and only lands the terminal phase
+            # once the background layer has seen the plan fall silent, so
+            # the edge out of ``executing`` has to exist.
+            "user_stopping",
         ],
         # 2026-10-23: every verification phase gained a ``stopped``
         # edge. A stop has to be able to park the plan it stopped —
@@ -253,6 +274,10 @@ def test_other_phase_transitions_unchanged():
             "verify_first_pass",
             "verification_passed",
             "verification_failed",
+            # 2026-11-20: the verification stop parks the plan at the
+            # plan-level ``user_stopping`` phase first — the stop's *action*
+            # and the stop's *result* are two different moments now.
+            "user_stopping",
             "stopped",
         ],
         "verify_first_pass": [
@@ -294,8 +319,18 @@ def test_other_phase_transitions_unchanged():
             "verification_loop_stopped",
             "verification_failed",
             "executing",
+            # 2026-11-20: a repair round is a running verification chain —
+            # stopping it goes through the same plan-level stopping phase.
+            "user_stopping",
             "stopped",
         ],
+        # 2026-11-20: the stopping phase's own outgoing edges.  Three
+        # landing places: ``stopped`` (the stop's *result*), ``verification``
+        # (the round was collected cleanly) and ``verification_repairing``
+        # (a repair is still outstanding).  Nothing else is reachable from
+        # here — in particular not ``verification_running``: a stopped plan
+        # that could resume on its own would never really have stopped.
+        "user_stopping": ["stopped", "verification", "verification_repairing"],
         # 2026-09-13: production added the ``verification_passed``
         # recovery edge (operator force-pass after the loop stopped;
         # plan_state.py:179). Kept in sync here so the table-pinning

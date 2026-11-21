@@ -24,6 +24,7 @@ layer rather than the orchestrator unit-test layer.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -31,6 +32,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from server import app, _verification_state
+
+import stop_state
+import stop_supervisor
+import verification_cancel
 
 
 client = TestClient(app)
@@ -43,11 +48,23 @@ client = TestClient(app)
 
 @pytest.fixture(autouse=True)
 def _clean_state(monkeypatch, tmp_path):
-    """Reset in-memory verification state and redirect PLANS_DIR."""
+    """Reset in-memory verification state and redirect PLANS_DIR.
+
+    The stop's process-local state is global too — ``stop_state`` (the
+    stop record), ``stop_supervisor`` (the supervisor threads) and
+    ``verification_cancel`` (the cancel flag) — so a test that leaves
+    one behind decides the next test's outcome.
+    """
     _verification_state.clear()
+    stop_state._reset_for_tests()
+    stop_supervisor._reset_for_tests()
+    verification_cancel._reset_for_tests()
     monkeypatch.setattr("server.PLANS_DIR", tmp_path / "plans")
     yield
     _verification_state.clear()
+    stop_supervisor._reset_for_tests()
+    stop_state._reset_for_tests()
+    verification_cancel._reset_for_tests()
 
 
 @pytest.fixture
@@ -293,8 +310,35 @@ def _read_verification_row(plan_id: str) -> dict | None:
         conn.close()
 
 
-def test_user_stop(make_plan, plan_sqlite_seeder):
-    """POST /stop on a running cycle returns reason='user_stopped'."""
+def _wait_for_verification_status(
+    plan_id: str, status: str, *, timeout: float = 30.0,
+) -> bool:
+    """Wait for the in-memory verification status; True when it got there.
+
+    The stop is a process (2026-11-20): the request answers
+    ``stopping`` and the background layer writes the terminal verdict
+    once the plan is quiet.  The in-memory status is the LAST of those
+    writes, so waiting for it is waiting for the whole verdict.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = _verification_state.get(plan_id) or {}
+        if state.get("verification_status") == status:
+            return True
+        time.sleep(0.05)
+    state = _verification_state.get(plan_id) or {}
+    return state.get("verification_status") == status
+
+
+def test_user_stop(make_plan, plan_sqlite_seeder, monkeypatch):
+    """POST /stop on a running cycle returns reason='user_stopped'.
+
+    (2026-11-20: the stop is a process.  The request closes the gate
+    and answers ``stopping`` in milliseconds; the background layer does
+    the killing and writes the terminal verdict once the plan is quiet.
+    So the verdict is *waited for* — the request alone no longer says
+    ``loop_stopped``, because the round may still be running behind it.)
+    """
     make_plan("vp014-us")
 
     _verification_state["vp014-us"] = {
@@ -332,6 +376,17 @@ def test_user_stop(make_plan, plan_sqlite_seeder):
         verification_round=1,
     )
 
+    # The quiet window is the deployment's policy; the test shortens it
+    # through the same entry point the route uses, so the verdict does
+    # not cost the suite five seconds.
+    real_start = stop_supervisor.start
+
+    def _fast_start(started_plan_id, **kwargs):
+        kwargs.setdefault("quiet_seconds", 0.2)
+        return real_start(started_plan_id, **kwargs)
+
+    monkeypatch.setattr(stop_supervisor, "start", _fast_start)
+
     resp = client.post("/api/verification/vp014-us/stop")
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -341,6 +396,16 @@ def test_user_stop(make_plan, plan_sqlite_seeder):
     assert body["current_round"] == 1
     # The required schema fields are present.
     assert "stopped_at" in body and body["stopped_at"]
+    # And the answer says the stop is still in progress — the round may
+    # still be running behind it.
+    assert body["status"] == "stopping", body
+
+    # The background layer's verdict: the round is stopped now.
+    assert _wait_for_verification_status("vp014-us", "loop_stopped"), (
+        "the background layer never wrote the terminal verdict — the "
+        f"in-memory status is "
+        f"{(_verification_state.get('vp014-us') or {}).get('verification_status')!r}"
+    )
 
     # In-memory state is updated to loop_stopped with user_stopped —
     # this is what the Verification Card reads on its next status poll.

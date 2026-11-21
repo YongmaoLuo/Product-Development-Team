@@ -14,14 +14,28 @@ Three layers are pinned here:
      are SKIPPED without invoking the runner, and an attempt interrupted
      by the stop's hard kill is reported SKIPPED (not FAILED: a stopped
      round must not manufacture failures for the operator to triage);
-  3. ``POST /stop`` — sets the flag AND hard-kills the in-flight
-     sub-agents via ``_cleanup_dead_verification_processes``.
+  3. ``POST /stop`` — sets the flag, and hands the hard kill to the
+     background layer.
+
+(2026-11-20: layer 3 changed shape.  The stop is a process now, not an
+instant: the request closes the gate — the cooperative cancel flag — and
+answers in milliseconds, and the background supervisor does the killing.
+The entry point the background layer calls is
+``coding_tool.stop_live_dispatches_for_plan``, reached through the
+supervisor's escalated sweep (``stop_supervisor._default_sweep`` →
+``_cooperative_stop``).  ``server._cleanup_dead_verification_processes``
+is **not** on the stop path: its only production call site is the
+watchdog, which is a different job.)
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict
 from unittest.mock import Mock
@@ -159,8 +173,29 @@ def _seed_running_plan(db_path: Path, plan_id: str) -> None:
 
 
 def test_stop_sets_the_cancel_flag_and_kills_inflight_work(tmp_path, monkeypatch):
+    """The request flips the flag; the background layer does the killing.
+
+    **The contract changed on 2026-11-20.**  The stop is a *process*:
+    the request closes the gate — the cooperative cancel flag — and
+    answers in milliseconds, while the work that is still running is shut
+    down by the background supervisor.  The entry point the background
+    layer calls is ``coding_tool.stop_live_dispatches_for_plan`` (the
+    per-plan cooperative stop, reached through the supervisor's escalated
+    sweep), so that is what this test stubs.
+
+    The guarantee is pinned from both sides:
+
+    * the request sets the cancel flag — the gate is closed the moment
+      the operator asks;
+    * the request does **not** run the cooperative stop itself (the
+      background layer owns that job), and the background layer does run
+      it — within a bounded wait, on its own thread.
+    """
     from fastapi.testclient import TestClient
+    import coding_tool
     import server
+    import stop_state
+    import stop_supervisor
 
     plan_id = "plan-stop-endpoint"
     plan_dir = tmp_path / "plans" / plan_id
@@ -170,31 +205,83 @@ def test_stop_sets_the_cancel_flag_and_kills_inflight_work(tmp_path, monkeypatch
     monkeypatch.setattr("server._state_db_path", lambda *_: str(db))
     _seed_running_plan(db, plan_id)
 
-    killed: list = []
-    # The stop names the round it kills (the token is how the round's
-    # own coding-tool subprocesses are reached), so the stub takes it.
-    monkeypatch.setattr(
-        server, "_cleanup_dead_verification_processes",
-        lambda pid, vps, round_token="": killed.append(
-            (pid, sorted(vps), round_token),
-        ),
+    # A registered sub-agent whose process is still running.  Without it
+    # the plan is quiet, the quiet verdict comes first and the escalated
+    # sweep — the pass that stops the work — never runs.
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
-    # One registered sub-agent so the kill list is non-empty.
-    handle = Mock()
-    handle.vp_id = "VP-023"
-    monkeypatch.setattr(
-        server.sub_agent_registry, "all_handles", lambda pid: [handle],
+    handle = server.sub_agent_registry.register_sub_agent(
+        plan_id, "VP-023", 1, scoped_tool=None, pid=proc.pid,
     )
 
-    resp = TestClient(server.app).post(f"/api/verification/{plan_id}/stop")
+    # The supervisor's own knobs are a deployment's business, not a
+    # test's: the escalated sweep runs when the quiet attempt runs out,
+    # and that attempt is two minutes long by default.  The route asks
+    # the supervisor to start, so the test shortens the attempt through
+    # the same entry point the route uses.
+    real_start = stop_supervisor.start
 
-    assert resp.status_code == 200, resp.text
-    assert verification_cancel.is_cancelled(plan_id), (
-        "the stop must flip the cooperative cancel flag"
+    def _fast_start(started_plan_id, *, finalize, scan=None, **kwargs):
+        kwargs.setdefault("max_seconds", 0.2)
+        kwargs.setdefault("hard_max_seconds", 30.0)
+        return real_start(
+            started_plan_id, finalize=finalize, scan=scan, **kwargs
+        )
+
+    monkeypatch.setattr(stop_supervisor, "start", _fast_start)
+
+    cooperative: list = []
+
+    def _record_cooperative(stopped_plan_id, *args, **kwargs):
+        cooperative.append(
+            (stopped_plan_id, threading.current_thread().name)
+        )
+        return []
+
+    monkeypatch.setattr(
+        coding_tool, "stop_live_dispatches_for_plan", _record_cooperative,
     )
-    assert killed == [(plan_id, ["VP-023"], "")], (
-        f"the in-flight sub-agent must be hard-killed; got {killed}"
-    )
+
+    try:
+        resp = TestClient(server.app).post(f"/api/verification/{plan_id}/stop")
+
+        assert resp.status_code == 200, resp.text
+        assert verification_cancel.is_cancelled(plan_id), (
+            "the stop must flip the cooperative cancel flag"
+        )
+        assert not cooperative, (
+            "the request thread ran the cooperative stop itself — the "
+            "work must be shut down by the background layer, not by the "
+            "request that has to answer in milliseconds"
+        )
+
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline and not cooperative:
+            time.sleep(0.05)
+
+        assert cooperative, (
+            "the background layer never ran the cooperative stop — the "
+            "in-flight work is still running behind the operator's back"
+        )
+        assert cooperative[0][0] == plan_id, (
+            f"the cooperative stop named another plan: {cooperative}"
+        )
+    finally:
+        stop_supervisor._reset_for_tests()
+        stop_state._reset_for_tests()
+        try:
+            server.sub_agent_registry.unregister(plan_id, handle)
+        except Exception:  # noqa: BLE001 — the registry is not the test's job
+            pass
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
 
     # A later /start clears the flag so the fresh round is not born
     # cancelled.

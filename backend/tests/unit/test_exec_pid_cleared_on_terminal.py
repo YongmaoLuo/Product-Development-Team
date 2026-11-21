@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from collections import deque
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -251,6 +252,29 @@ def _seed_running_plan(plans_dir: Path, db_path: Path) -> Path:
     return plan_dir
 
 
+def _wait_for_exec_status(
+    db_path: Path, status: str, *, plan_id: str = PLAN_ID, timeout: float = 30.0,
+) -> bool:
+    """Wait for the execution row to reach ``status``; True when it did.
+
+    The stop is asynchronous (2026-11-20): the request answers
+    ``stopping`` in milliseconds and the background worker does the
+    killing and the writing.  So the terminal status is *waited for*,
+    not read straight after the answer.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        conn = open_db(db_path)
+        try:
+            row = _read_exec_row(conn, plan_id)
+        finally:
+            conn.close()
+        if row["exec_status"] == status:
+            return True
+        time.sleep(0.05)
+    return False
+
+
 def test_stop_path_clears_the_pid(monkeypatch, tmp_path, db_path):
     """``POST /api/execution/{id}/stop`` must not leave a dead pid.
 
@@ -258,7 +282,15 @@ def test_stop_path_clears_the_pid(monkeypatch, tmp_path, db_path):
     ``update_fields`` — not through ``update_status`` — so the
     repository's terminal-status rule does not fire for it.  It has to
     clear the pid itself.
+
+    (2026-11-20: the stop became a process — the request closes the
+    gate and answers ``stopping``, the background worker does the
+    killing and the writing.  The terminal status is therefore waited
+    for, not read straight after the answer.)
     """
+    import stop_state
+    import stop_supervisor
+
     plans_dir = tmp_path / "plans"
     plans_dir.mkdir()
     plan_dir = _seed_running_plan(plans_dir, db_path)
@@ -281,8 +313,14 @@ def test_stop_path_clears_the_pid(monkeypatch, tmp_path, db_path):
         client = TestClient(server.app)
         resp = client.post(f"/api/execution/{PLAN_ID}/stop")
         assert resp.status_code == 200, resp.text
+        assert _wait_for_exec_status(db_path, "stopped"), (
+            "the stop never reached the terminal status — the execution "
+            "row still claims the plan is running"
+        )
     finally:
         server._execution_state.pop(PLAN_ID, None)
+        stop_supervisor._reset_for_tests()
+        stop_state._reset_for_tests()
 
     conn = open_db(db_path)
     try:

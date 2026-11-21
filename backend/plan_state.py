@@ -434,6 +434,33 @@ VALID_PHASES = [
     "verification_passed",
     "verification_failed",
     "verification_repairing",
+    # 2026-11-20: ``user_stopping`` —— 「正在停止」（**plan 级**）。
+    #
+    # 过去 stop 只有一条边：从 ``verification_running`` /
+    # ``verification_repairing`` 直接落到 ``verification`` + ``stopped``。
+    # 一条边同时表达了「停的动作已经发生」与「停的结果已经落地」，中间那段
+    # 没有名字 —— 于是事故里出现了「显示已停、后台仍在派发」：相位说停了，
+    # 验证链还在跑。
+    #
+    # 它是**中间相位**：不是终态（停了还要能落到 ``stopped`` 等终态出口），
+    # 也不是「已经停了」的结论。
+    #
+    # 名字是 **plan 级**的（架构决策 1）：execution / verification / repair
+    # 三处的停止共用这一个相位，不按阶段各起一个名字 —— 否则「停」在词表里
+    # 就有三个名字，读路径要各判一次，判漏一处就是一个「显示已停、后台仍在
+    # 派发」的计划。
+    #
+    # 正因为是 plan 级，它**不**带 ``verification`` 前缀，于是执行门禁
+    # （``_is_gated_verification_phase``）不再管着它 —— 执行到一半被喊停的
+    # 计划本来就没有「执行已完成」这条记录，让它落在门禁之后等于把这条路
+    # 堵死。同一处判定还有第二个后果：门禁后的相位会**自动**给
+    # ``completed_phases`` 补一条 ``execution``，停到一半的计划补上这条等于
+    # 在相位历史里记下一件它没做过的事。
+    #
+    # 旧名 ``verification_stopping``（按阶段命名）已从词表里移除，但既有
+    # ``plan_routing`` 行里还存着它 —— 读路径把它归一化成新名（见
+    # :data:`LEGACY_PHASE_ALIASES`）。
+    "user_stopping",
     # 2026-10-22: ``verification_rerunning`` was removed from the
     # vocabulary. It was a DEAD state — its only writer,
     # ``start_verification_rerun``, had no callers anywhere — so no
@@ -507,6 +534,11 @@ PHASE_LABELS: Dict[str, str] = {
     "queued": "排队中",
     # 2026-11-09: ``archived``（已归档）—— 主动归档、永远别再跑的计划。
     "archived": "已归档",
+    # 2026-11-20: ``user_stopping``（正在停止）—— plan 级的「正在停止」。
+    #
+    # 未命中时回退为阶段名本身，于是这个相位会以裸英文 ``user_stopping``
+    # 的样子出现在卡片与页面上 —— 那是**词表内部**的名词，读者认不出来。
+    "user_stopping": "正在停止",
 }
 
 #: Historical phase values that are no longer written anywhere, mapped
@@ -522,6 +554,13 @@ PHASE_LABELS: Dict[str, str] = {
 #: stranded in a phase nothing can move it out of.
 LEGACY_PHASE_ALIASES: Dict[str, str] = {
     "verification_rerunning": "verification_repairing",
+    # 2026-11-20: ``verification_stopping``（按阶段命名）→
+    # ``user_stopping``（plan 级，架构决策 1）。
+    #
+    # 旧值只出现在既有 ``plan_routing`` 行里。读路径把它归一化成新相位，
+    # 那些计划因此不会停在一个词表里已经没有的相位上 —— 没人能推进它，
+    # 也没人认领它。
+    "verification_stopping": "user_stopping",
 }
 
 
@@ -693,7 +732,14 @@ VERIFICATION_PHASE_TRANSITIONS = {
     # ``executing`` / ``failed`` / ``stopped`` 同样要能回到它。表里的
     # ``ready`` 保留（磁盘上的历史状态照旧可读），而 ``transition_to`` 会把
     # 目标归一化成 ``queued``。
-    "executing": ["verification", "completed", "failed", "stopped", "ready", "queued"],
+    # 2026-11-20: 加上 ``user_stopping`` —— 执行刚结束、验证链还没
+    # 起跑的时候，操作者也可能喊停。那种计划没有「跑着的验证」要等，但它
+    # 仍然要经过「正在停止」这一档，否则「停」在这条路径上又是一次没有名字
+    # 的动作。
+    #
+    # 这一条边是「执行停止与验证停止共用同一状态」的落点（G1）：执行侧与
+    # 验证侧指向**同一个**相位，而不是两个按阶段命名的相位。
+    "executing": ["verification", "completed", "failed", "stopped", "ready", "queued", "user_stopping"],
     # 2026-10-23: ``stopped`` is reachable from every verification
     # phase. A plan stopped in the middle of a round (or in the middle
     # of a repair) has to be able to park — otherwise the stop leaves
@@ -704,7 +750,11 @@ VERIFICATION_PHASE_TRANSITIONS = {
     # a passing verdict may not be laundered into a terminal phase),
     # and ``verification_loop_stopped`` is untouched.
     "verification": ["verification_running", "verification_passed", "verification_failed", "verification_loop_stopped", "stopped"],
-    "verification_running": ["verify_first_pass", "verification_passed", "verification_failed", "stopped"],
+    # 2026-11-20: ``verification_running`` 多了 ``user_stopping`` 这条边。
+    # 停的动作发生在这里（验证链正在跑），停的结果落在 ``user_stopping``
+    # 之后 —— 两者之间那一段必须有名字，否则停就又是一次「显示已停、后台仍在
+    # 派发」。
+    "verification_running": ["verify_first_pass", "verification_passed", "verification_failed", "user_stopping", "stopped"],
     "verify_first_pass": ["verify_recheck", "verification_passed", "verification_failed", "verification_loop_stopped", "stopped"],
     "verify_recheck": ["verification_passed", "verification_failed", "verification_loop_stopped", "stopped"],
     "verification_passed": [],  # terminal: security boundary — no forward edge to ``completed``
@@ -713,7 +763,24 @@ VERIFICATION_PHASE_TRANSITIONS = {
     # historical value is read as ``verification_repairing`` — see
     # :data:`LEGACY_PHASE_ALIASES`.
     "verification_failed": ["verification_repairing", "verification_passed", "verification_loop_stopped", "stopped"],
-    "verification_repairing": ["verification", "verification_passed", "verification_loop_stopped", "verification_failed", "executing", "stopped"],
+    # 2026-11-20: ``verification_repairing`` 同样有 ``user_stopping``
+    # 这条边 —— 修复轮里跑的验证链也是「跑着的验证」，停它也要先经过「正在
+    # 停止」这一档。
+    "verification_repairing": ["verification", "verification_passed", "verification_loop_stopped", "verification_failed", "executing", "user_stopping", "stopped"],
+    # 2026-11-20: ``user_stopping`` —— 「正在停止」这一档自己的出边。
+    #
+    # 落点有三个：``stopped``（停的**结果**：计划停住了）、``verification``
+    # （这一轮验证已经收干净，停在待验证状态）与 ``verification_repairing``
+    # （修复轮还在外面，要回修复路径）。任何**未列出**的相位一律拒绝 ——
+    # 尤其是 ``verification_running``：停了还能重新开跑，停就没停。
+    #
+    # ``stopped`` 必须在列表里：执行停止这条路**永远**过不了执行门禁（执行
+    # 没完成才需要停），所以验证侧那两个落点在执行停止路径上是死路 ——
+    # 没有这条边，「执行到一半被喊停」会把计划关在这个相位里出不来。
+    #
+    # 这一行是**验证子表**的，不是主表的：``transition_to`` 取两张表的并集，
+    # 所以放哪张表都不影响可走性；放子表是因为这个相位属于验证子机器。
+    "user_stopping": ["stopped", "verification", "verification_repairing"],
     "verification_loop_stopped": ["failed", "verification_passed"],
 
     # ``completed`` is NOT a dead end for the verification sub-machine.
@@ -1115,7 +1182,15 @@ class PlanState:
         completed_phases = data.get("completed_phases") or []
         review_rounds = data.get("review_rounds") or {"prd": 0, "arch": 0, "test": 0}
         flags = data.get("flags") or {}
-        current_phase = data.get("current_phase")
+        # 2026-11-20: 历史别名先归一化再判合法性 —— 旧文件里存着
+        # ``verification_stopping``（旧名），归一化成 ``user_stopping`` 之后
+        # 它是合法相位；不归一化的话这份文件会掉回 ``interview``，一条停到
+        # 一半的计划就被重置掉了。
+        #
+        # SQLite 那条读路径（:meth:`_sqlite_row_to_state`）同样做归一化 ——
+        # 两条读路径必须给出同一个答案，同一个计划落在哪种存储上不该决定
+        # 它被读成什么。
+        current_phase = normalize_phase(data.get("current_phase"))
         if current_phase is None or current_phase not in VALID_PHASES:
             current_phase = "interview"
         verification = data.get("verification", {}) or {}
