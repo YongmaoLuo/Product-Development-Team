@@ -158,6 +158,20 @@ def clean_state():
     server._verification_state.update(verification_before)
 
 
+@pytest.fixture(autouse=True)
+def clean_stop_state():
+    """每个用例前后清空进程内的停止记录与 requeue 意图。
+
+    两者都是**进程内**的登记处：一个用例留下的意图会让下一个用例读到
+    一个不属于它的计划还等着被迁回队列。
+    """
+    import stop_state
+
+    stop_state._reset_for_tests()
+    yield
+    stop_state._reset_for_tests()
+
+
 @pytest.fixture
 def stop_handlers(monkeypatch, plans_dir):
     """把既有 stop 端点换成记录器，返回调用记录列表。
@@ -368,3 +382,108 @@ def test_requeue_clears_the_terminal_execution_verdict(
         f"the requeued plan still carries a stop reason: "
         f"{row.get('stop_reason')!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 异步停止：迁移必须发生在静默之后
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def async_stop_handler(monkeypatch, plans_dir):
+    """把 stop 端点换成「异步停止」的形状，返回调用记录列表。
+
+    真实的异步 stop（``routes/execution.py`` 的
+    ``_stop_execution_asynchronously``）把路由行 CAS 到 ``user_stopping``，
+    然后答 ``{'status': 'stopping'}`` —— 相位什么时候翻到 ``stopped``
+    由后台监督者说了算（静默窗口之后）。
+
+    这里照那个形状摆：相位停在 ``user_stopping``，答案说 ``stopping``。
+    """
+    import server  # noqa: F401  (import 顺序是承重墙)
+
+    from plan_state import PlanState
+    from routes import execution as routes_execution
+
+    calls = []
+
+    def fake_stop_execution(plan_id, discard=False):
+        calls.append(("execution", plan_id, discard))
+        plan_dir = plans_dir / plan_id
+        ps = PlanState(plan_dir)
+        ps.reload()
+        ps.transition_to("user_stopping")
+        return {"status": "stopping", "plan_id": plan_id}
+
+    monkeypatch.setattr(routes_execution, "stop_execution", fake_stop_execution)
+    return calls
+
+
+def test_requeue_waits_for_the_quiet_window_and_lands_queued(
+    plans_dir, clean_state, async_stop_handler,
+):
+    """停止还在进行 → 门面不发起迁移；后台 finalize 之后计划真的回到队列。
+
+    异步契约下「停」是一个**过程**：处理器把相位停在 ``user_stopping``
+    （停止仍在进行），后台监督者清扫完进程树之后才把它翻到 ``stopped``。
+
+    ``user_stopping`` 没有指向 ``queued`` 的边（``plan_state`` 的
+    ``PHASE_TRANSITIONS``），门面在那一刻硬发迁移只会撞上一条**被吞掉的**
+    ``ValueError``：意图静默消失，计划再也回不了队列 —— 用户点了「重新
+    排队」，卡片却从页面上消失了。
+
+    所以门面此时**不发起**迁移：它把意图留给后台层（``final_phase`` 报的是
+    要交付的目标相位）。随后后台 finalize 交付它：相位落到 ``queued``、
+    执行行上的终态裁决被清掉、计划重新出现在列表里。
+    """
+    import stop_state
+
+    from plan_lifecycle_service import PlanLifecycleService
+    from routes.plans import _plan_is_terminal
+
+    plan_id = "requeue-async-p1"
+    _make_plan_dir(plans_dir, plan_id, phase="executing")
+    _mark_execution_alive(plan_id)
+    # stop 留在执行行上的终态裁决。
+    _write_exec_verdict(
+        plan_id,
+        exec_status="stopped",
+        exec_pid=None,
+        stop_reason="user_requested",
+    )
+
+    result = PlanLifecycleService().stop_plan(plan_id, requeue=True)
+
+    assert async_stop_handler == [("execution", plan_id, False)]
+    assert result.dispatched == "execution"
+    assert result.berth_phase == "stopped"
+    # 这一轮交付不了，但意图已经记下 —— final_phase 报的是目标相位。
+    assert result.final_phase == "queued"
+    assert result.detail == "stop_execution+requeue"
+    # 门面**没有**发起迁移：相位还停在 user_stopping。
+    assert _persisted_phase(plans_dir / plan_id) == "user_stopping", (
+        f"the facade moved the phase to "
+        f"{_persisted_phase(plans_dir / plan_id)!r} while the stop was "
+        f"still running"
+    )
+    # 意图记下了 —— 后台层拿它交付。
+    assert stop_state.requeue_requested(plan_id) is True
+
+    # --- 后台层：静默窗口之后才交付 ----------------------------------
+    from routes import execution as routes_execution
+
+    routes_execution._finalize_execution_stop(plan_id)
+
+    # 相位真的落到 queued（不是只在返回值里说说）。
+    assert _persisted_phase(plans_dir / plan_id) == "queued", (
+        f"the requeued plan is parked at "
+        f"{_persisted_phase(plans_dir / plan_id)!r}"
+    )
+    # 执行行上的终态裁决被清掉 —— 否则计划仍被列表过滤掉。
+    row = _exec_row(plan_id)
+    assert not _plan_is_terminal("queued", row.get("exec_status")), (
+        f"the requeued plan is still terminal: exec_status="
+        f"{row.get('exec_status')!r}"
+    )
+    # 意图用掉了 —— 不许留着，让下一次停止再交付一遍。
+    assert stop_state.requeue_requested(plan_id) is False

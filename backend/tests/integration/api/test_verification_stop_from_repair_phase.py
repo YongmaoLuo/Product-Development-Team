@@ -16,11 +16,12 @@ it must not crash and it must not be a stranded row.
 What is pinned here is that such a stop both **lands** and is
 **resumable**:
 
-1. **The stop lands.** ``stop_verification`` CASes the routing row back
-   to ``verification``. With a source set of only
-   ``verification_running`` the CAS silently no-ops on the other two
-   phases — the row is left where it was and the operator gets a 200
-   that did nothing.
+1. **The stop lands.** ``stop_verification`` CASes the routing row to
+   the plan-level ``user_stopping`` phase, and the background layer
+   parks it at ``verification_repairing`` once the plan has fallen
+   silent. With a source set of only ``verification_running`` the CAS
+   silently no-ops on the other two phases — the row is left where it
+   was and the operator gets a 200 that did nothing.
 2. **The stop is recoverable.** That is the part that bit hardest: a
    row left at ``verification_repairing`` is not in ``/start``'s source
    whitelist, so the very next ``/start`` answers
@@ -28,8 +29,9 @@ What is pinned here is that such a stop both **lands** and is
    does every one after it. The plan is stuck permanently, recoverable
    only by hand-editing SQLite.
 
-So the regression is the whole chain: stop → ``current_phase ==
-"verification"`` → start → **200**, ``resumed`` true, same round.
+So the regression is the whole chain: stop → the row leaves
+``verification_repairing`` → the plan is parked where the repair waits
+→ start → **200**, the repair is continued.
 
 The three-phase source set is not a new invention:
 ``force_verification_terminal`` already CASes from exactly these three,
@@ -49,12 +51,15 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 import server
+import stop_state
+import stop_supervisor
 import verification_cancel
 from pause_state import checkpoint_path
 from server import app
@@ -96,10 +101,19 @@ ROUND_VERDICTS = [
 
 
 @pytest.fixture(autouse=True)
-def _clean_cancel_flags():
-    """The stop's cancel flag is process-global — do not leak it."""
+def _clean_process_state():
+    """The stop's process-local state is global — do not leak it.
+
+    The cancel flag, the stop record and the supervisor threads are all
+    process-wide, so a test that leaves one behind decides the next
+    test's outcome.
+    """
     verification_cancel._reset_for_tests()
+    stop_state._reset_for_tests()
+    stop_supervisor._reset_for_tests()
     yield
+    stop_supervisor._reset_for_tests()
+    stop_state._reset_for_tests()
     verification_cancel._reset_for_tests()
 
 
@@ -162,6 +176,25 @@ def stub_auto_loop(monkeypatch):
         return None
 
     monkeypatch.setattr(server, "_run_auto_verification_loop", _fake)
+    return calls
+
+
+@pytest.fixture
+def stub_repair_execution(monkeypatch):
+    """Replace the repair executor's spawn with a recorder.
+
+    A plan parked in the REPAIR half of the chain is resumed by spawning
+    the repair executor once more — the executor is a subprocess, so it
+    is stubbed out here and the call is recorded instead.
+    """
+    calls = _LoopCalls()
+
+    def _fake(plan_id, project_dir, **kwargs):
+        calls.append({"plan_id": plan_id})
+        calls.reached.set()
+        return None
+
+    monkeypatch.setattr(server, "_run_repair_execution_async", _fake)
     return calls
 
 
@@ -236,12 +269,36 @@ def _read_phase(db_path: Path, plan_id: str):
     return (row or {}).get("current_phase")
 
 
-def _assert_stop_then_resume(env, client, stub_auto_loop, phase: str) -> None:
-    """Stop a round parked at ``phase``, then start it again — same round.
+def _wait_for_parked_phase(
+    db_path: Path, plan_id: str, timeout: float = 60.0,
+) -> str:
+    """Wait for the background layer to park the plan, and read it back.
+
+    The park is the supervisor's verdict on the plan's silence, so it
+    happens on the supervisor's thread: the phase is polled, never
+    assumed.  The plan leaves ``user_stopping`` when the stop has been
+    dealt with.
+    """
+    deadline = time.monotonic() + timeout
+    phase = _read_phase(db_path, plan_id)
+    while phase == "user_stopping" and time.monotonic() < deadline:
+        time.sleep(0.2)
+        phase = _read_phase(db_path, plan_id)
+    assert phase != "user_stopping", (
+        f"the stop never finalized — the plan is still parked at the "
+        f"stopping phase after {timeout:.0f}s"
+    )
+    return phase
+
+
+def _assert_stop_then_resume(
+    env, client, stub_repair_execution, phase: str,
+) -> None:
+    """Stop a round parked at ``phase``, then start it again.
 
     The shared contract of the live phase: the stop lands, it leaves a
-    resumable trace, and the next ``/start`` picks the same round back
-    up.
+    resumable trace, and the next ``/start`` is accepted — the plan is
+    not stranded at a phase no door opens.
     """
     plans_dir, db_path = env
     plan_dir, _project_dir = _seed_plan(
@@ -254,7 +311,7 @@ def _assert_stop_then_resume(env, client, stub_auto_loop, phase: str) -> None:
     stop = client.post(f"/api/verification/{PLAN_ID}/stop")
     assert stop.status_code == 200, stop.text
     stop_body = stop.json()
-    assert stop_body["status"] == "stopped", stop_body
+    assert stop_body["status"] == "stopping", stop_body
     assert stop_body["paused"] is True, stop_body
     assert stop_body["round"] == 2, stop_body
 
@@ -262,12 +319,22 @@ def _assert_stop_then_resume(env, client, stub_auto_loop, phase: str) -> None:
     # set omits the phase the row is parked on silently no-ops and still
     # answers 200 — so the phase is read back, not inferred from the
     # status code.
-    parked = _read_phase(db_path, PLAN_ID)
-    assert parked == "verification", (
-        f"the stop left the routing row at {parked!r} instead of parking it "
-        f"at 'verification' — it was stopped while at {phase!r}, and a stop "
-        "whose CAS source set omits that phase does nothing while still "
-        "answering 200"
+    gate = _read_phase(db_path, PLAN_ID)
+    assert gate == "user_stopping", (
+        f"the stop left the routing row at {gate!r} instead of closing the "
+        f"gate at 'user_stopping' — it was stopped while at {phase!r}, and "
+        "a stop whose CAS source set omits that phase does nothing while "
+        "still answering 200"
+    )
+
+    # The park is the background layer's verdict: the plan goes back to
+    # the phase the repair waits at, once the supervisor has seen it
+    # fall silent.
+    parked = _wait_for_parked_phase(db_path, PLAN_ID)
+    assert parked == "verification_repairing", (
+        f"the stop parked the routing row at {parked!r} instead of "
+        "'verification_repairing' — the repair is what is waiting for "
+        "the plan, and the phase has to say so"
     )
 
     # ...and leave a resumable trace behind — that is what makes the next
@@ -281,7 +348,7 @@ def _assert_stop_then_resume(env, client, stub_auto_loop, phase: str) -> None:
     )
     assert checkpoint["verification_round"] == 2, checkpoint
 
-    # --- the start: the same round is picked up ---------------------------
+    # --- the start: the plan is re-enterable ------------------------------
     start = client.post(
         f"/api/verification/{PLAN_ID}/start", json={"auto_fix": True},
     )
@@ -291,19 +358,19 @@ def _assert_stop_then_resume(env, client, stub_auto_loop, phase: str) -> None:
         f"{start.text}"
     )
     start_body = start.json()
-    assert start_body["resumed"] is True, (
-        "the start did not say it resumed the interrupted round — a client "
-        f"cannot tell a resume from a fresh round: {start_body}"
-    )
-    assert start_body["round"] == 2, (
-        "the start moved to another round — the interrupted round's work "
-        f"would be relabelled: {start_body}"
-    )
+    assert start_body["status"] == "started", start_body
 
-    # The background chain is entered with that same round.
-    assert stub_auto_loop.reached.wait(timeout=5), "the round never ran"
-    assert len(stub_auto_loop) == 1, stub_auto_loop
-    assert stub_auto_loop[0]["start_round"] == 2, stub_auto_loop[0]
+    # The plan is parked in the REPAIR half of the chain, so the start
+    # continues the repair — the repair executor is spawned once more.
+    assert start_body.get("mode") == "repair_resume", (
+        "the start did not continue the repair the plan was parked on: "
+        f"{start_body}"
+    )
+    assert stub_repair_execution.reached.wait(timeout=5), (
+        "the repair executor was never spawned — the parked plan cannot "
+        "make progress"
+    )
+    assert len(stub_repair_execution) == 1, stub_repair_execution
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +379,7 @@ def _assert_stop_then_resume(env, client, stub_auto_loop, phase: str) -> None:
 
 
 def test_stop_from_repairing_phase_then_start_resumes(
-    env, client, stub_auto_loop,
+    env, client, stub_repair_execution,
 ):
     """A round parked at ``verification_repairing`` can be stopped and resumed.
 
@@ -325,12 +392,12 @@ def test_stop_from_repairing_phase_then_start_resumes(
     editing SQLite by hand.
     """
     _assert_stop_then_resume(
-        env, client, stub_auto_loop, "verification_repairing",
+        env, client, stub_repair_execution, "verification_repairing",
     )
 
 
 def test_stop_from_residual_rerunning_phase_is_mapped_and_lands(
-    env, client, stub_auto_loop,
+    env, client, stub_repair_execution,
 ):
     """A RESIDUAL ``verification_rerunning`` row is a historical value.
 
@@ -368,16 +435,23 @@ def test_stop_from_residual_rerunning_phase_is_mapped_and_lands(
     stop = client.post(f"/api/verification/{PLAN_ID}/stop")
     assert stop.status_code == 200, stop.text
     stop_body = stop.json()
-    assert stop_body["status"] == "stopped", stop_body
+    assert stop_body["status"] == "stopping", stop_body
     assert stop_body["paused"] is True, stop_body
     assert stop_body["round"] == 2, stop_body
 
-    parked = _read_phase(db_path, PLAN_ID)
-    assert parked == "verification", (
-        f"the stop left the routing row at {parked!r} instead of parking it "
-        "at 'verification' — a row that still holds the historical "
+    gate = _read_phase(db_path, PLAN_ID)
+    assert gate == "user_stopping", (
+        f"the stop left the routing row at {gate!r} instead of closing the "
+        "gate at 'user_stopping' — a row that still holds the historical "
         "'verification_rerunning' value must be stoppable, or the plan is "
         "stuck at a phase no code knows any more"
+    )
+
+    parked = _wait_for_parked_phase(db_path, PLAN_ID)
+    assert parked == "verification_repairing", (
+        f"the stop parked the routing row at {parked!r} instead of "
+        "'verification_repairing' — the historical value maps onto the "
+        "phase that replaced it, and that is where the plan belongs"
     )
 
     # --- the start: the plan is still resumable ----------------------------
@@ -390,12 +464,17 @@ def test_stop_from_residual_rerunning_phase_is_mapped_and_lands(
         f"{start.text}"
     )
     start_body = start.json()
-    assert start_body["resumed"] is True, start_body
-    assert start_body["round"] == 2, start_body
+    assert start_body["status"] == "started", start_body
+    assert start_body.get("mode") == "repair_resume", (
+        "the start did not continue the repair the plan was parked on: "
+        f"{start_body}"
+    )
 
-    assert stub_auto_loop.reached.wait(timeout=5), "the round never ran"
-    assert len(stub_auto_loop) == 1, stub_auto_loop
-    assert stub_auto_loop[0]["start_round"] == 2, stub_auto_loop
+    assert stub_repair_execution.reached.wait(timeout=5), (
+        "the repair executor was never spawned — the parked plan cannot "
+        "make progress"
+    )
+    assert len(stub_repair_execution) == 1, stub_repair_execution
 
 
 # ---------------------------------------------------------------------------

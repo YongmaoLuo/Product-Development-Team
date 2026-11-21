@@ -114,6 +114,11 @@ _PHASES_BEFORE = [
     "verification_passed",
     "verification_failed",
     "verification_repairing",
+    # 2026-11-20: 新增——plan 级「正在停止」相位。执行停止与验证停止共用它：
+    # 停的**动作**与停的**结果**之间必须有一个有名字的相位，否则就会出现
+    # 「显示已停、后台仍在派发」。它插在 ``verification_repairing`` 与
+    # ``verification_loop_stopped`` 之间 —— 快照跟着涨，涨在哪儿写在这儿。
+    "user_stopping",
     "verification_loop_stopped",
     # 2026-11-05: 新增——快速通道 import 校验失败时把计划注册成这个相位，
     # 而不是留下「有任务、无注册」的孤儿目录（见 plan_state.py 的同日期说明）。
@@ -210,6 +215,11 @@ _MAIN_EDGES_BEFORE = {
 # 2026-11-17: 这张表**没有**跟着涨 —— 收尾阶段是工作流层的相位，它的边
 # 落在主表里，验证子表一个字节都没动（``verification_passed`` 仍然是空的
 # 安全边界：验证通过不得被顺手洗成终态）。
+#
+# 2026-11-20: 这张表**跟着涨了** —— plan 级 ``user_stopping`` 相位是验证
+# 子机器的相位（执行停止与验证停止共用它），所以它的行落在子表里。三条
+# 「走进停止中」的边（``executing`` / ``verification_running`` /
+# ``verification_repairing``）与「停止中」这一行自己的出边，逐项写在下面。
 _VERIFICATION_EDGES_BEFORE = {
     "ready": ["verification", "verification_running"],
     "executing": [
@@ -219,6 +229,8 @@ _VERIFICATION_EDGES_BEFORE = {
         "stopped",
         "ready",
         "queued",
+        # 2026-11-20: 执行刚结束、验证链还没起跑时也可能被喊停。
+        "user_stopping",
     ],
     "verification": [
         "verification_running",
@@ -231,6 +243,8 @@ _VERIFICATION_EDGES_BEFORE = {
         "verify_first_pass",
         "verification_passed",
         "verification_failed",
+        # 2026-11-20: 停的动作发生在这里，结果落在「停止中」之后。
+        "user_stopping",
         "stopped",
     ],
     "verify_first_pass": [
@@ -259,8 +273,14 @@ _VERIFICATION_EDGES_BEFORE = {
         "verification_loop_stopped",
         "verification_failed",
         "executing",
+        # 2026-11-20: 修复轮里跑的验证链也是「跑着的验证」。
+        "user_stopping",
         "stopped",
     ],
+    # 2026-11-20: 「正在停止」这一行自己的出边 —— 三个落点：停住了
+    # (``stopped``)、这一轮收干净了 (``verification``)、修复轮还在外面
+    # (``verification_repairing``)。其余相位一律拒绝。
+    "user_stopping": ["stopped", "verification", "verification_repairing"],
     "verification_loop_stopped": ["failed", "verification_passed"],
     "completed": ["verification_passed", "verification_failed"],
     "failed": ["executing", "ready", "queued"],

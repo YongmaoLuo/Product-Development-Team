@@ -58,6 +58,8 @@ from fastapi.testclient import TestClient
 
 import plan_state
 import server
+import stop_state
+import stop_supervisor
 import verification_cancel
 import verification_loop
 from state_machine.db.connection import open as open_db
@@ -167,9 +169,15 @@ def env(monkeypatch, tmp_path):
 
     monkeypatch.setattr(server, "PLANS_DIR", plans_dir)
     monkeypatch.setattr(server, "_state_db_path", lambda *a, **k: db_path)
+    # The quiet window the background layer waits for before it may
+    # park the plan.  It is a deployment's to choose; the tests choose a
+    # short one so they do not have to wait for it.
+    monkeypatch.setenv("PDT_STOP_QUIET_SECONDS", "0.2")
     server._execution_state.clear()
     yield plans_dir, db_path
     server._execution_state.clear()
+    stop_supervisor._reset_for_tests()
+    stop_state._reset_for_tests()
 
 
 @pytest.fixture
@@ -228,6 +236,35 @@ def _mark_running(plan_id: str, project_dir: Path) -> None:
         "pid": 4242,
         "stop_reason": None,
     }
+
+
+def _read_phase(db_path: Path, plan_id: str = PLAN_ID) -> str:
+    """The routing row's phase — the phase's one source of truth."""
+    conn = open_db(db_path)
+    try:
+        row = RoutingRepository(conn).current(plan_id)
+    finally:
+        conn.close()
+    return (row or {}).get("current_phase")
+
+
+def _wait_for_phase(
+    db_path: Path, phase: str, *, plan_id: str = PLAN_ID, timeout: float = 30.0,
+) -> bool:
+    """Wait for the plan's phase to reach ``phase``; True when it did.
+
+    The stop is a process (2026-11-20): the request parks the plan at
+    the plan-level stopping phase and answers, and the background layer
+    lands the terminal phase once the plan has really fallen silent.
+    So the terminal phase is *waited for*, not read straight after the
+    answer.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _read_phase(db_path, plan_id) == phase:
+            return True
+        time.sleep(0.05)
+    return _read_phase(db_path, plan_id) == phase
 
 
 @pytest.fixture
@@ -360,6 +397,11 @@ def test_the_flag_is_set_before_the_executor_is_killed(env, client, monkeypatch)
     with ``rc=-15``. If the flag were set after the kill, the
     callback could win the race and re-enter verification before the
     flag exists.
+
+    (2026-11-20: the kill moved to the background layer — the request
+    closes the gate and answers in milliseconds.  The kill is therefore
+    *waited for*; what is pinned is unchanged: the flag is already in
+    place when the kill happens.)
     """
     plans_dir, db_path = env
     plan_dir, project_dir = _seed_plan(plans_dir, db_path)
@@ -377,6 +419,11 @@ def test_the_flag_is_set_before_the_executor_is_killed(env, client, monkeypatch)
     resp = client.post(f"/api/execution/{PLAN_ID}/stop")
 
     assert resp.status_code == 200, resp.text
+
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline and not seen_at_kill:
+        time.sleep(0.02)
+
     assert seen_at_kill == [True], (
         "the cancel flag must be set before the executor is killed; "
         f"at kill time it was {seen_at_kill!r}"
@@ -485,6 +532,11 @@ def test_start_clears_the_verification_cancel_flag(
     the flag would be permanent: every later start of this plan would
     be born cancelled and the verification chain would exit at its
     first check. P1 and P2 are two halves of one contract.
+
+    (2026-11-20: the stop is asynchronous — the plan sits at the
+    plan-level stopping phase until the background layer has seen it
+    fall silent, and a start is refused while the stop is still in
+    progress.  So the resume waits for the stop to land first.)
     """
     plans_dir, db_path = env
     plan_dir, project_dir = _seed_plan(plans_dir, db_path)
@@ -494,6 +546,11 @@ def test_start_clears_the_verification_cancel_flag(
     resp = client.post(f"/api/execution/{PLAN_ID}/stop")
     assert resp.status_code == 200, resp.text
     assert verification_cancel.is_cancelled(PLAN_ID) is True
+
+    assert _wait_for_phase(db_path, "stopped"), (
+        "the stop never landed — the plan is still "
+        f"{_read_phase(db_path)!r}, so the resume below would be refused"
+    )
 
     resp = client.post(
         f"/api/execution/{PLAN_ID}/start",
@@ -527,6 +584,9 @@ def test_stop_then_start_lets_the_verification_chain_run_again(
     Without step 2 the plan would be permanently wedged: the operator
     could not resume at all. Without step 1 the operator could not
     stop at all.
+
+    (2026-11-20: the resume waits for the stop to land — while the plan
+    is parked at the plan-level stopping phase, a start is refused.)
     """
     plans_dir, db_path = env
     plan_dir, project_dir = _seed_plan(plans_dir, db_path)
@@ -542,6 +602,11 @@ def test_stop_then_start_lets_the_verification_chain_run_again(
     assert begin_verification_recorder == [], begin_verification_recorder
     assert orchestrator_recorder == [], orchestrator_recorder
     assert spawn_recorder == [], spawn_recorder
+
+    assert _wait_for_phase(db_path, "stopped"), (
+        "the stop never landed — the plan is still "
+        f"{_read_phase(db_path)!r}, so the resume below would be refused"
+    )
 
     # --- 2. the resume works -----------------------------------------
     resp = client.post(
@@ -609,7 +674,15 @@ def test_stop_reports_a_refused_phase_transition(
 def test_a_clean_stop_does_not_report_a_phase_transition_error(
     env, client, monkeypatch
 ):
-    """The key is only there when the stop did not hold."""
+    """The key is only there when the stop did not hold.
+
+    (2026-11-20: the answer is the *stopping* answer — the request
+    parks the plan at the plan-level stopping phase and the background
+    layer lands the terminal phase once the plan has fallen silent.
+    The guarantee is unchanged: a stop that held says nothing about a
+    phase it could not park, and the phase it parks is the stopped
+    one.)
+    """
     plans_dir, db_path = env
     plan_dir, project_dir = _seed_plan(plans_dir, db_path)
     _mark_running(PLAN_ID, project_dir)
@@ -618,10 +691,24 @@ def test_a_clean_stop_does_not_report_a_phase_transition_error(
     resp = client.post(f"/api/execution/{PLAN_ID}/stop")
 
     assert resp.status_code == 200, resp.text
-    assert "phase_transition_error" not in resp.json(), resp.json()
-    assert set(resp.json()) == {
-        "status", "paused", "paused_at", "interrupted_task_count",
-    }, resp.json()
+    body = resp.json()
+    assert "phase_transition_error" not in body, body
+    assert body["status"] == "stopping", body
+    assert set(body) == {
+        "status", "plan_id", "stop_scope", "previous_phase", "survivors",
+        "stopped_at", "reason", "paused", "still_running",
+    }, body
+
+    # The plan is parked at the stopping phase while the stop is in
+    # progress: "stopping" and "stopped" are two different moments.
+    assert _read_phase(db_path) == "user_stopping", (
+        f"the phase is {_read_phase(db_path)!r} — the stop did not park "
+        "the plan at the plan-level stopping phase"
+    )
+    assert _wait_for_phase(db_path, "stopped"), (
+        f"the plan never reached the stopped phase — it is "
+        f"{_read_phase(db_path)!r}"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -2,9 +2,12 @@
 
 The two halves of the pause contract live in two different suites:
 
-* ``test_verification_stop_is_pause.py`` pins the **stop** — it parks
-  the routing row, writes the ``pause_state.json`` checkpoint and
-  answers ``{"status": "stopped", "paused": true, "round": N}``.
+* ``test_verification_stop_is_pause.py`` pins the **stop** — it closes
+  the gate at the plan-level ``user_stopping`` phase, writes the
+  ``pause_state.json`` checkpoint and answers
+  ``{"status": "stopping", "paused": true, "round": N}``.  The park
+  itself is the background layer's verdict, so the plan leaves
+  ``user_stopping`` a moment later.
 * ``test_verification_resume_same_round.py`` pins the **start** — but it
   hand-writes the checkpoint, so it never exercises the one path an
   operator actually takes.
@@ -45,12 +48,15 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 import server
+import stop_state
+import stop_supervisor
 import verification_cancel
 from pause_state import checkpoint_path
 from server import app
@@ -63,6 +69,12 @@ from state_machine.repositories.verification_repository import (
 )
 
 PLAN_ID = "20261021-stop-then-start"
+
+#: The quiet window the background layer waits for before it may park
+#: the plan.  Short here on purpose: the window is a policy of the
+#: deployment, not a contract of the stop, and a test that waits five
+#: seconds per stop is a test nobody runs.
+QUIET_SECONDS = 0.2
 
 #: The VPs the round was working on. ``VP-003`` never reached a verdict
 #: — it is the VP the stop cut short, and the one a resume still owes.
@@ -92,10 +104,33 @@ ROUND_VERDICTS = [
 
 
 @pytest.fixture(autouse=True)
-def _clean_cancel_flags():
-    """The stop's cancel flag is process-global — do not leak it."""
+def _clean_stop_state(monkeypatch):
+    """The stop's process-local state is global — do not leak it.
+
+    ``stop_state`` (the stop record), ``stop_supervisor`` (the
+    supervisor threads) and ``verification_cancel`` (the cancel flag)
+    are process-wide and indexed by plan id, and this suite reuses ONE
+    plan id — so a record or a supervisor left behind by one case
+    decides the next case's stop behaviour.
+
+    The quiet window is shortened for the same reason the deployment
+    may choose it: the window is a policy, not a contract, and the
+    cases below must not pay five seconds per stop.
+    """
+    real_start = stop_supervisor.start
+
+    def _start(plan_id, **kwargs):
+        kwargs["quiet_seconds"] = QUIET_SECONDS
+        return real_start(plan_id, **kwargs)
+
+    monkeypatch.setattr(stop_supervisor, "start", _start)
+
+    stop_state._reset_for_tests()
+    stop_supervisor._reset_for_tests()
     verification_cancel._reset_for_tests()
     yield
+    stop_supervisor._reset_for_tests()
+    stop_state._reset_for_tests()
     verification_cancel._reset_for_tests()
 
 
@@ -231,6 +266,43 @@ def _read_verification_row(db_path: Path, plan_id: str) -> dict:
     return row or {}
 
 
+def _read_phase(db_path: Path, plan_id: str) -> str:
+    """The plan's routing ``current_phase``, read back on its own connection."""
+    conn = open_db(db_path)
+    try:
+        row = RoutingRepository(conn).current(plan_id)
+    finally:
+        conn.close()
+    return (row or {}).get("current_phase")
+
+
+def _wait_for_stop_to_settle(
+    db_path: Path, plan_id: str = PLAN_ID, timeout: float = 60.0,
+) -> str:
+    """Wait for the background layer's verdict, and read the phase back.
+
+    The stop is a *process*: the request closes the gate and answers
+    ``stopping``, and the background layer parks the plan once the plan
+    has really fallen silent.  So the phase is polled, never assumed.
+
+    The stop record is waited for too, because it is what ``/start``
+    refuses on while the stop is still in progress — a plan whose phase
+    has been parked but whose record is still there would answer 409
+    for a start that is supposed to work.
+    """
+    deadline = time.monotonic() + timeout
+    phase = _read_phase(db_path, plan_id)
+    while time.monotonic() < deadline:
+        if phase != "user_stopping" and stop_state.get(plan_id) is None:
+            return phase
+        time.sleep(0.05)
+        phase = _read_phase(db_path, plan_id)
+    raise AssertionError(
+        f"the stop never finalized — the plan is still parked at "
+        f"{phase!r} after {timeout:.0f}s"
+    )
+
+
 # ---------------------------------------------------------------------------
 # the chain
 # ---------------------------------------------------------------------------
@@ -256,9 +328,22 @@ def test_stop_then_start_keeps_the_same_round(env, client, stub_auto_loop):
     stop = client.post(f"/api/verification/{PLAN_ID}/stop")
     assert stop.status_code == 200, stop.text
     stop_body = stop.json()
-    assert stop_body["status"] == "stopped", stop_body
+    # The stop is a PROCESS, not an instant: the request closes the
+    # gate and answers "stopping" — the background layer parks the plan
+    # once the plan has really fallen silent.  An answer of "stopped"
+    # would claim a terminal state the plan has not reached yet.
+    assert stop_body["status"] == "stopping", stop_body
     assert stop_body["paused"] is True, stop_body
     assert stop_body["round"] == 2, stop_body
+
+    # The park is the background layer's verdict, so the phase is
+    # polled — never assumed.
+    parked = _wait_for_stop_to_settle(db_path)
+    assert parked == "verification", (
+        f"the stop parked the routing row at {parked!r} instead of "
+        "'verification' — a paused round waits at the phase it was "
+        "interrupted in, and the next /start has to find it there"
+    )
 
     # The stop left a resumable trace behind — that is what makes the
     # next start a resume rather than a fresh round.
@@ -314,7 +399,13 @@ def test_stop_then_start_reports_resumed(env, client, stub_auto_loop):
     # --- the stop: the operator interrupts round 2 ------------------------
     stop = client.post(f"/api/verification/{PLAN_ID}/stop")
     assert stop.status_code == 200, stop.text
+    assert stop.json()["status"] == "stopping", stop.json()
     assert stop.json()["paused"] is True, stop.json()
+
+    # The plan has to leave the stopping phase before it can be started
+    # again: a start issued while the stop is still in progress races
+    # the shutdown the stop is doing.
+    _wait_for_stop_to_settle(db_path)
 
     # --- the start: it must name the resume -------------------------------
     start = client.post(
@@ -360,6 +451,11 @@ def test_stop_then_start_preserves_verdicts(env, client, stub_auto_loop):
     # --- the stop ---------------------------------------------------------
     stop = client.post(f"/api/verification/{PLAN_ID}/stop")
     assert stop.status_code == 200, stop.text
+    assert stop.json()["status"] == "stopping", stop.json()
+
+    # The park is the background layer's verdict — the plan has to be
+    # parked before it can be started again.
+    _wait_for_stop_to_settle(db_path)
 
     # --- the start --------------------------------------------------------
     start = client.post(

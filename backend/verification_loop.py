@@ -55,6 +55,13 @@ import process_ledger
 # round declared dead?".  Stdlib-only and without import-time side
 # effects, so a top-level import carries no cycle risk.
 import zombie_rounds
+# 2026-11-20: the plan-level stop record.  The repair executor is
+# spawned by this module directly, so it never passes through the
+# dispatch channel that the stop watches — the stop has to be
+# consulted here, at the place that would otherwise spawn anyway.
+# ``stop_state`` imports nothing from ``server`` / this module (stdlib
+# only), so a top-level import carries no cycle risk.
+import stop_state
 # Late binding into the application module: ``server`` owns the shared
 # helpers, request models and module globals, and the suite monkeypatches
 # them as ``server.<name>``. Reaching them through the module object —
@@ -5100,7 +5107,51 @@ def _run_repair_execution_async(
     ``test_repair_generation_failure_handling`` pins the call sites'
     shape (``return`` immediately after the call) for a reason worth
     keeping.
+
+    2026-11-20: a plan that is being **stopped** gets no repair
+    executor.  This dispatch is spawned by the auto-loop directly, so
+    it never passed through the dispatch channel the stop watches — and
+    a dispatch the stop cannot see is a dispatch the stop cannot kill:
+    the operator asks for the plan to stop and the round answers by
+    starting a fresh subprocess for that very plan.  The gate reads the
+    plan-level stop record (:mod:`stop_state`) and refuses, raising
+    :class:`verification_cancel.VerificationCancelled` — the type the
+    auto-loop already treats as "the operator stopped this" rather than
+    "this broke", so no terminal verdict is written down.  See the gate
+    itself below for where it sits and what it leaves behind.
     """
+    # 2026-11-20 — the spawn gate, and it is **fail-closed**.
+    #
+    # The order is the whole point.  The gate sits BEFORE every
+    # observable effect of this dispatch: before the ``project_dir``
+    # validation (which writes a failure record), before the
+    # ``_execution_state`` seeding (which the watchdog reads as "this
+    # plan is running"), before the phase stamp, and before the spawn.
+    # A refused dispatch therefore leaves NO trace at all — no
+    # execution record, no phase, no subprocess.  A gate that ran after
+    # the seeding would hand the watchdog an entry for a process that
+    # was never started, which is the same ghost state the
+    # ``project_dir`` check below exists to prevent.
+    #
+    # The refusal is raised, not returned: the caller of this dispatch
+    # is the auto-loop, and its ``except VerificationCancelled`` arm
+    # records no terminal verdict, so a plan the operator stopped on
+    # purpose is not written down as a failed one.
+    #
+    # A dispatch with no plan is not a plan's work and is not gated:
+    # ``stop_state`` refuses to register an empty plan id at all, so
+    # there is nothing for the gate to find.
+    if plan_id and stop_state.is_stopping(plan_id):
+        _server.logger.warning(
+            "[repair_async] plan is stopping — not spawning the repair "
+            "executor plan=%s", plan_id,
+        )
+        raise VerificationCancelled(
+            plan_id,
+            f"verification cancelled for plan {plan_id!r} while spawning "
+            "the repair executor",
+        )
+
     backend_dir = _server._BACKEND_DIR
     plan_dir = _server._plan_dir(plan_id)
     tasks_file = plan_dir / "tasks.json"

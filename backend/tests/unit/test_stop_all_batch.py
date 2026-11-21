@@ -262,6 +262,46 @@ def test_stop_all_writes_the_batch_of_the_plans_it_stopped(
     assert parsed.utcoffset().total_seconds() == 0, batch
 
 
+def test_stop_all_counts_a_stopping_answer_as_handled(env, client, monkeypatch):
+    """A plan whose stop answered ``stopping`` is a handled plan.
+
+    2026-11-20 — the execution stop answers ``{"status": "stopping"}``
+    now: the work is being shut down and the plan's phase is not final
+    yet.  The global stop reads that answer to decide two things —
+    whether the plan counts as stopped (``ok``) and whether it belongs
+    to the batch the next global start resumes.
+
+    A plan that is being stopped has been reached and has been asked:
+    the stop held, the work is only winding down.  Reporting it as a
+    failure would tell the operator the stop did not hold when it did,
+    and dropping it from the batch would throw away the resume point of
+    a plan that is being paused.
+    """
+    plans_dir, root = env
+    _mark_execution_running(plans_dir, EXEC_OK)
+
+    def _stopping(plan_id, *args, **kwargs):
+        return {
+            "status": "stopping",
+            "plan_id": plan_id,
+            "stop_scope": "execution",
+        }
+
+    monkeypatch.setattr(routes_execution, "stop_execution", _stopping)
+
+    resp = client.post("/api/system/stop_all")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    results = {row["plan_id"]: row for row in body["results"]}
+    assert results[EXEC_OK] == {
+        "plan_id": EXEC_OK, "type": "execution", "ok": True,
+    }, body
+
+    batch = _read_batch(root)
+    assert EXEC_OK in batch["plan_ids"], batch
+
+
 def test_stop_all_with_nothing_running_writes_an_empty_batch(
     env, client, monkeypatch
 ):

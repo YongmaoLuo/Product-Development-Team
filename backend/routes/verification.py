@@ -118,6 +118,31 @@ def _conflict_reason(exc: Exception) -> str:
     return "stage_mismatch" if "predicate mismatch" in str(exc) else "version_mismatch"
 
 
+def _plan_stop_record(plan_id: str) -> Optional[Any]:
+    """The plan's stop record, or ``None`` when it is not stopping.
+
+    The record is written when the stop closes its gate and cleared when
+    the stop's finalize parks the plan.  It is the one piece of state
+    that says "a stop is in progress for this plan", and it says *which*
+    work is stopping — the scope — which the phase alone does not.
+
+    The record is process-local, so a backend that restarted in the
+    middle of a stop has lost it.  A record that cannot be read is not
+    a stop: a start that is refused by a record nobody can read would
+    be a plan nobody can start.
+    """
+    import stop_state
+
+    try:
+        return stop_state.get(plan_id)
+    except Exception:  # noqa: BLE001 — an unreadable record is not a stop
+        _server.logger.exception(
+            "[verification_stopping] could not read the stop record plan=%s",
+            plan_id,
+        )
+        return None
+
+
 def _read_verification_checkpoint(plan_dir: Path) -> Optional[dict]:
     """The plan's pause checkpoint, when it is a *verification* one.
 
@@ -1184,6 +1209,39 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
     plan_dir = _server._plan_dir(plan_id)
     if not plan_dir.exists():
         raise HTTPException(404, {"error": "Plan not found", "detail": "The requested plan does not exist."})
+
+    # --- The stopping gate ---------------------------------------------
+    # A plan that is being stopped cannot be started.  The stop is a
+    # process: its own background layer is shutting the plan's work down
+    # right now, and a start would race it — a second round on a plan
+    # that is being torn down, and a resume point written from under the
+    # running one.
+    #
+    # The gate is the FIRST thing this endpoint does to the plan, on
+    # purpose: a refusal must not touch the plan's work — the branch
+    # pipeline further down materialises a worktree, and a worktree
+    # built on the way to the refusal is a worktree written over a plan
+    # that is being shut down.
+    #
+    # The refusal names the reason.  "conflict" sends the operator to
+    # look at the phase; "plan_user_stopping" says a stop is in progress
+    # and that the start will work once the stop is over.  The phase the
+    # stop came from is in the answer too: the operator has to be able
+    # to tell a stopped round from a stopped repair without reading the
+    # plan's row.
+    _stop_record = _plan_stop_record(plan_id)
+    if _stop_record is not None:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": {
+                    "error": "plan_user_stopping",
+                    "previous_phase": str(
+                        getattr(_stop_record, "previous_phase", "") or ""
+                    ),
+                },
+            },
+        )
 
     try:
         _ensure_verification_plan(plan_id)
@@ -2572,11 +2630,22 @@ def reset_rounds(plan_id: str, req: _server.ResetRoundsRequest):
 @router.get("/api/verification/{plan_id}/status")
 def get_verification_status(plan_id: str):
     """Return verification status sourced from the SQLite state machine."""
+    # A plan that is stopping gets the stopping half of the answer on
+    # top of it — the status says ``stopping``, the scope says which
+    # work is shutting down, the previous phase says where it came from
+    # and the survivors say what was still running.  A plan that is not
+    # stopping keeps the answer it always published.
+    #
+    # The docstring above is the route's published description, and the
+    # OpenAPI baseline is frozen: the explanation lives here so the
+    # description stays byte-identical.
     plan_dir = _server._plan_dir(plan_id)
     if not plan_dir.exists():
         raise HTTPException(404, {"error": "Plan not found", "detail": "The requested plan does not exist."})
     try:
-        return _verification_status_from_db(plan_id)
+        return _stopping_status_answer(
+            plan_id, _verification_status_from_db(plan_id),
+        )
     except HTTPException:
         raise
     except (sqlite3.OperationalError, OSError) as exc:
@@ -4377,24 +4446,347 @@ def _surviving_vp_ids(handles: List[Any]) -> List[str]:
     return survivors
 
 
+#: The plan-level phase a stop parks the plan at while the stop is in
+#: progress.  ``plan_state`` owns the vocabulary; this is the one name
+#: this module writes (G1 — one plan-level stopping phase, shared by
+#: execution / verification / repair).
+_USER_STOPPING_PHASE = "user_stopping"
+
+
+def _stop_survivors(plan_id: str) -> List[Dict[str, Any]]:
+    """The live processes this plan's verification work still has.
+
+    A snapshot of the plan's own process tree — the registered
+    verification sub-agents and the repair executor — taken while the
+    stop is being issued.  It is what the operator is told is still
+    running, and it is the evidence the background layer works from.
+    """
+    import verification_quiesce
+
+    try:
+        return list(verification_quiesce.survivors_snapshot(plan_id))
+    except Exception:  # noqa: BLE001 — a scan that fails is an empty scan
+        _server.logger.exception(
+            "[stop_verification] survivor scan failed plan=%s", plan_id,
+        )
+        return []
+
+
+def _stopping_answer(
+    plan_id: str,
+    *,
+    previous_phase: str,
+    survivors: List[Dict[str, Any]],
+    round_n: int = 0,
+    interrupted_vp_count: int = 0,
+    reason: str = "user_stopped",
+) -> Dict[str, Any]:
+    """The answer a stop gives while the stop is still in progress.
+
+    ``status`` is ``stopping`` — not ``stopped``: the plan is on its
+    way down and the answer says so.  ``survivors`` says what was
+    still running when the stop was asked for, and ``previous_phase``
+    says which half of the verification chain the stop came from, so a
+    caller can tell a stopped round from a stopped repair.
+
+    The pause contract is unchanged (G6): the stop is a pause, the
+    round and its verdicts are on disk, and a later ``/start`` resumes
+    this round.
+    """
+    import stop_state
+
+    return {
+        "status": "stopping",
+        "plan_id": plan_id,
+        "stop_scope": stop_state.SCOPE_VERIFICATION,
+        "previous_phase": previous_phase,
+        "survivors": list(survivors or []),
+        "stopped_at": datetime.now().isoformat(),
+        "reason": reason,
+        "current_round": round_n,
+        "paused": True,
+        "round": round_n,
+        "interrupted_vp_count": interrupted_vp_count,
+        # Whether the plan still had work running when the stop was
+        # asked for.  A stop that is still in progress is a stop of a
+        # plan that is still busy — the answer says both.
+        "still_running": bool(survivors),
+    }
+
+
+def _stopping_status_answer(
+    plan_id: str, payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """The status answer, with the stopping half when the plan is stopping.
+
+    A plan that is stopping is not a plan with a status: it is a plan on
+    its way down.  The answer has to say so — ``verification_status`` is
+    ``stopping`` (not ``running``: the work is being taken down; not
+    ``stopped``: the stop has not finished), ``stop_scope`` names the
+    work that is shutting down, ``previous_phase`` says which phase the
+    stop came from, and ``survivors`` names what was still running when
+    the reader asked.
+
+    A plan that is NOT stopping keeps the answer it always published —
+    the same keys, the same values — so a reader never has to wonder
+    whether a missing field means "no stop" or "this build does not
+    report it".  The stopping fields are **absent** on such a plan, not
+    null: a reader that sees ``survivors: null`` on every plan learns to
+    ignore them.
+    """
+    record = _plan_stop_record(plan_id)
+    if record is None:
+        return payload
+
+    answer = dict(payload)
+    answer["verification_status"] = "stopping"
+    answer["stopping"] = True
+    answer["stop_scope"] = str(getattr(record, "scope", "") or "")
+    answer["previous_phase"] = str(getattr(record, "previous_phase", "") or "")
+    answer["survivors"] = _stop_survivors(plan_id)
+    return answer
+
+
+def _start_stop_supervisor(plan_id: str) -> None:
+    """Hand the stop over to the background supervisor.
+
+    The supervisor owns the quiet window: it waits for the plan to fall
+    silent, sweeps what is left (the cooperative dispatch stop first,
+    signals only for what ignores that), and calls the finalize
+    callback with the verdict.
+
+    One supervisor per plan: the module reuses a running one instead of
+    starting a second judge of the same silence, so a stop that is
+    asked for twice stays one stop.
+    """
+    import stop_supervisor
+
+    try:
+        stop_supervisor.start(plan_id, finalize=_finalize_verification_stop)
+    except Exception:  # noqa: BLE001 — a stop without a supervisor is still a stop
+        _server.logger.exception(
+            "[stop_verification] could not start the stop supervisor "
+            "plan=%s", plan_id,
+        )
+
+
+#: The finalize callback re-checks for silence before it believes the
+#: plan is quiet.  The supervisor already waited for its own quiet
+#: window; this is the net for the gap between that verdict and the
+#: write that follows it — a plan that starts new work in that gap is
+#: not quiet, and the phase must not claim that it stopped.
+_FINALIZE_QUIET_SECONDS = 0.5
+_FINALIZE_MIN_SCANS = 1
+_FINALIZE_MAX_SECONDS = 3.0
+_FINALIZE_POLL_SECONDS = 0.1
+
+
+def _finalize_quiet_check(plan_id: str) -> Tuple[bool, List[Any]]:
+    """Is the plan really quiet right now?  ``(quiet, survivors)``.
+
+    Two steps, cheapest first:
+
+    1. **a scan** — a plan that still has work running must not make
+       the callback sit in a wait window before it says so;
+    2. **the wait** — the supervisor's quiet window closed a moment
+       before this callback ran, and a plan that starts new work in that
+       gap is not quiet.
+
+    A check that fails is not a verdict: the plan is reported as busy,
+    because "I could not tell" is not "it stopped".
+    """
+    import verification_quiesce
+
+    try:
+        survivors = list(verification_quiesce.survivors_snapshot(plan_id))
+    except Exception:  # noqa: BLE001 — a failed scan is not a quiet verdict
+        _server.logger.exception(
+            "[stop_verification] the survivor scan failed plan=%s", plan_id,
+        )
+        return False, []
+    if survivors:
+        return False, survivors
+
+    try:
+        result = verification_quiesce.wait_for_quiescence(
+            plan_id,
+            quiet_seconds=_FINALIZE_QUIET_SECONDS,
+            min_scans=_FINALIZE_MIN_SCANS,
+            max_seconds=_FINALIZE_MAX_SECONDS,
+            poll_interval=_FINALIZE_POLL_SECONDS,
+        )
+    except Exception:  # noqa: BLE001 — a failed wait is not a quiet verdict
+        _server.logger.exception(
+            "[stop_verification] the silence re-check failed plan=%s", plan_id,
+        )
+        return False, []
+
+    if result.quiet:
+        return True, []
+    return False, list(result.survivors)
+
+
+def _finalize_verification_stop(plan_id: str) -> None:
+    """The background layer's verdict on a stop.
+
+    Called by the supervisor once the plan has fallen silent (or once
+    the hard limit was reached).  Two cases, and the difference is the
+    whole point of the phase:
+
+    * **the plan is quiet** — it is parked at the phase it came from (a
+      paused round at ``verification``, a stopped repair at
+      ``verification_repairing``), the verification row is written
+      terminal, the services the round started are reaped, and the stop
+      record is cleared;
+    * **the plan is not quiet** — the phase stays ``user_stopping``,
+      because a plan that is still working is not a stopped plan, and
+      the stop record stays too, because the stop is still in progress.
+
+    The phase write is a CAS on ``user_stopping``: a plan another path
+    has already moved is not overwritten — that row is no longer the
+    stop's to write.  The stop record is cleared anyway: the stop is
+    over, whatever the plan did afterwards.
+
+    The callback is handed the plan id alone, and the supervisor's
+    survivors ride on it (see ``stop_supervisor._bind_finalize``).  A
+    non-empty handover is a verdict of its own — the plan was not quiet
+    — so it is honoured without a second look: the phase stays
+    ``user_stopping`` and nothing is written terminal.  An empty handover
+    is not a verdict, so the survivors are looked up here
+    (:func:`_finalize_quiet_check`) before anything is parked.
+    """
+    import stop_state
+
+    # The survivors the supervisor hands over ride on the plan id when
+    # the callback takes the plan id alone (see ``stop_supervisor``).
+    # They are read BEFORE the id is flattened to a plain string.
+    survivors = list(getattr(plan_id, "survivors", []) or [])
+    plan_id = str(plan_id)
+
+    if survivors:
+        # The supervisor could not stop this work — at the hard limit
+        # that is exactly what it hands over.  A plan that is still
+        # working is not a stopped plan: the phase stays put, the stop
+        # record stays (the stop is still in progress), and nothing is
+        # written terminal.
+        _server.logger.warning(
+            "[stop_verification] the supervisor handed over live work — "
+            "the phase stays '%s' plan=%s survivors=%s",
+            _USER_STOPPING_PHASE, plan_id, len(survivors),
+        )
+        return
+
+    quiet, survivors = _finalize_quiet_check(plan_id)
+    if not quiet:
+        _server.logger.warning(
+            "[stop_verification] the plan is still busy — the phase "
+            "stays '%s' plan=%s survivors=%s",
+            _USER_STOPPING_PHASE, plan_id, len(survivors),
+        )
+        return
+
+    record = stop_state.get(plan_id)
+    previous_phase = record.previous_phase if record is not None else ""
+    target_phase = (
+        "verification_repairing"
+        if previous_phase == "verification_repairing"
+        else "verification"
+    )
+
+    try:
+        conn, routing, verification = _open_verification_state()
+    except (sqlite3.OperationalError, OSError):
+        _server.logger.exception(
+            "[stop_verification] could not open the state db plan=%s",
+            plan_id,
+        )
+        return
+
+    try:
+        try:
+            routing.try_mark_phase(
+                plan_id, (_USER_STOPPING_PHASE,), target_phase,
+            )
+        except Exception:  # noqa: BLE001 — another path owns the row now
+            _server.logger.warning(
+                "[stop_verification] the plan was moved by another path — "
+                "the stop does not overwrite it plan=%s", plan_id,
+            )
+            # The stop is over: the row is not ours to write any more,
+            # but the record must not gate the next run.
+            stop_state.clear(plan_id)
+            return
+        try:
+            verification.mark_stopped(plan_id, "user_stopped")
+        except Exception:  # noqa: BLE001 — the phase is the important write
+            _server.logger.exception(
+                "[stop_verification] could not write the verification row "
+                "plan=%s", plan_id,
+            )
+        state = _server._verification_state.get(plan_id)
+        if state:
+            state.update({
+                "verification_status": "loop_stopped",
+                "stop_reason": "user_stopped",
+                "updated_at": datetime.now().isoformat(),
+            })
+    finally:
+        conn.close()
+
+    # The services the round started are reaped now and not before: the
+    # round owned them, and the round is really over now.
+    try:
+        _server._reap_managed_services(
+            plan_id, _server._plan_dir(plan_id), "verification_stopped",
+        )
+    except Exception:  # noqa: BLE001 — the reap never raises by design
+        _server.logger.exception(
+            "[stop_verification] could not reap the managed services "
+            "plan=%s", plan_id,
+        )
+
+    # The stop is over: the record must not gate the next run.
+    stop_state.clear(plan_id)
+
+
 @router.post("/api/verification/{plan_id}/stop")
 def stop_verification(plan_id: str):
-    """Stop the running verification round and leave a resumable pause behind.
+    """Ask for the plan's verification work to stop — and answer fast.
 
-    The order is load-bearing:
+    2026-11-20 — this endpoint used to do its killing on the request
+    thread and then answer ``{"status": "stopped"}``: the routing row
+    was CASed back to ``verification`` (or back to ``verification_running``
+    when a sub-agent survived the kill) and the verification row was
+    written ``loop_stopped`` — while the round was still burning
+    tokens.  The answer and the plan's truth were two different things.
 
-    1. mark the routing row (verification_running -> verification) and the
-       plan_verification row (loop_stopped / user_stopped);
-    2. read the round's verdicts before the connection is released -- they
-       live only in that row;
-    3. snapshot the interrupted round (_persist_round_snapshot);
-    4. write the pause checkpoint: _write_verification_checkpoint records
-       the round, its verdicts and the interrupted VPs in pause_state.json;
-    5. cancel and kill the in-flight VP sub-agents, then reap their services.
+    A stop is a process, not an instant, and the process has an order
+    (G2 — close the gate first, then issue the stop layer by layer):
 
-    The response is a pause, not a discard: it reports paused, round and
-    interrupted_vp_count, and a later /start reads that checkpoint through
-    _resolve_start_round and resumes this round. The plan is left stopped.
+    1. **close the gate** — the routing row is CASed to the plan-level
+       ``user_stopping`` phase and the stop record is written.  From
+       here the plan says "a stop is in progress", and the spawn gate
+       refuses to start new work for it;
+    2. **issue the stop, layer by layer** — the cancel flag goes up
+       first (the executor skips every VP it has not started), then the
+       repair executor gets its SIGTERM (its own handler stops its
+       sub-agents cooperatively), and the background supervisor takes
+       the rest: it stops this plan's live dispatches cooperatively and
+       escalates to signals only for what ignores that;
+    3. **answer ``stopping``** — the request comes back in milliseconds,
+       with the work that was still running.
+
+    The phase is NOT flipped to a stopped phase here (G3): that
+    decision belongs to the background layer, once the plan is really
+    quiet.  A phase that claims the work stopped while it is still
+    running is the bug this endpoint used to have.
+
+    The response is still a pause, not a discard: it reports paused,
+    round and interrupted_vp_count, and a later /start reads the
+    checkpoint through _resolve_start_round and resumes this round.
+    The round's verdicts are not lost either: before the request
+    returns, _write_verification_checkpoint records the round, those
+    verdicts and the interrupted VPs in pause_state.json.
     """
     plan_dir = _server._plan_dir(plan_id)
     if not plan_dir.exists():
@@ -4408,6 +4800,7 @@ def stop_verification(plan_id: str):
     if archived is not None:
         return archived
 
+    import stop_state
     from state_machine.repositories.routing_repository import ConflictError, PlanNotFoundError
     from state_machine.repositories.verification_repository import VerificationRepository
 
@@ -4472,11 +4865,61 @@ def stop_verification(plan_id: str):
         # value is matched through the alias table, so a stop on such a
         # row still lands; the literal itself is not in the source set
         # any more.
-        from plan_state import LEGACY_PHASE_ALIASES
+        from plan_state import LEGACY_PHASE_ALIASES, normalize_phase
 
-        _source_phases = ("verification_running", "verification_repairing")
         _row = routing.current(plan_id) or {}
         _row_phase = _row.get("current_phase")
+        # A row may still carry a historical phase; the read path
+        # normalizes it onto the phase that replaced it.
+        _phase = normalize_phase(_row_phase)
+
+        # --- the stop is already in progress -------------------------
+        # A stop that is asked for twice is ONE stop (G1): the second
+        # request says so again, and it does not start a second
+        # supervisor — the module reuses the running one.
+        if _phase == _USER_STOPPING_PHASE:
+            _record = stop_state.get(plan_id)
+            _row_v = verification.current(plan_id) or {}
+            _round = int(_row_v.get("round") or 0)
+            if not owned_conn:
+                conn.close()
+            _start_stop_supervisor(plan_id)
+            return _stopping_answer(
+                plan_id,
+                previous_phase=(
+                    _record.previous_phase if _record is not None else ""
+                ),
+                survivors=_stop_survivors(plan_id),
+                round_n=_round,
+            )
+
+        # 2026-10-21: the source set is the phases a verification
+        # round can actually be *in flight* at — not just
+        # ``verification_running``. A round that reached
+        # ``verification_repairing`` still has a running
+        # ``plan_verification`` row, and the operator's stop is
+        # exactly as legitimate there. With only
+        # ``verification_running`` the CAS raises ``ConflictError`` on
+        # that phase and the endpoint answers 409, leaving the
+        # routing row parked where it was; ``/start`` (:597-614) does
+        # not accept it as a source either, so it answers 409
+        # ``stage_mismatch`` too. Both doors refuse, so the plan was
+        # stuck forever — unrecoverable through the API. (Measured, not
+        # inferred: ``tests/integration/api/
+        # test_verification_stop_from_repair_phase.py`` pins both.) The
+        # same set is already used by ``force_verification_terminal``
+        # (:3070) and by the dead-end rollback in
+        # ``verification_loop.py`` (:2993), so this is the recognised
+        # vocabulary for "verification work stopped halfway", not a new
+        # one.
+        #
+        # 2026-10-22: the source set no longer spells out
+        # ``verification_rerunning`` — that phase left the vocabulary
+        # (it was a dead state). A row that still holds the historical
+        # value is matched through the alias table, so a stop on such a
+        # row still lands; the literal itself is not in the source set
+        # any more.
+        _source_phases = ("verification_running", "verification_repairing")
         if (
             isinstance(_row_phase, str)
             and _row_phase in LEGACY_PHASE_ALIASES
@@ -4503,21 +4946,28 @@ def stop_verification(plan_id: str):
             and _exec_state.get("_source") == "repair_execution"
         )
         if _repair_execution_stop:
-            # The plan is parked in the REPAIR half of the loop, not
-            # in the verification half: the target phase is
-            # ``verification_repairing`` (the repair tasks are waiting
-            # to be confirmed / resumed), NOT ``verification`` (which
-            # means "a verification round was paused").
-            routing.try_mark_phase(
-                plan_id, ("executing",), "verification_repairing",
-            )
+            # The repair executor runs in the ``executing`` phase, but
+            # the verification chain's name for that half is
+            # ``verification_repairing`` — the phase the plan is parked
+            # at when the repair is stopped, and the phase it goes back
+            # to when it falls silent.  So that is the phase this stop
+            # comes from.
+            _source_phases = ("executing",)
+            _previous_phase = "verification_repairing"
         else:
-            routing.try_mark_phase(
-                plan_id,
-                _source_phases,
-                "verification",
-            )
-            verification.mark_stopped(plan_id, "user_stopped")
+            _previous_phase = _phase if isinstance(_phase, str) else ""
+
+        # --- close the gate -------------------------------------------
+        # The routing row is parked at the plan-level stopping phase:
+        # from here the plan says "a stop is in progress", and the
+        # spawn gate refuses to start new work for it.  The phase is
+        # NOT flipped to a stopped phase here — that is the background
+        # layer's decision (G3), made when the plan is really quiet.
+        routing.try_mark_phase(
+            plan_id,
+            _source_phases,
+            _USER_STOPPING_PHASE,
+        )
     except ConflictError as exc:
         try:
             conn.rollback()
@@ -4531,48 +4981,47 @@ def stop_verification(plan_id: str):
             conn.close()
         return JSONResponse(status_code=404, content={"error": "Plan not found", "detail": "The requested plan does not exist."})
 
-    if _repair_execution_stop:
-        # 2026-10-22: what is being stopped here is the REPAIR
-        # EXECUTOR, not a verification round. The round already ended
-        # (it failed and produced the repair tasks); the executor
-        # subprocess is what is still running.
-        #
-        # So this branch does NOT write a verification checkpoint: a
-        # checkpoint says "this verification round was interrupted,
-        # resume it", and no round was interrupted here. A stale
-        # checkpoint would make the NEXT ordinary ``/start`` resume
-        # that old round instead of starting a new one.
-        #
-        # The cancel flag is requested BEFORE the kill: the killed
-        # executor fires ``on_complete`` immediately, and that
-        # callback re-enters verification unless the flag is already
-        # set.
+    # --- the stop record: what the background layer works from -------
+    # The record is written once per plan: a second stop returns the
+    # FIRST record instead of replacing it, so the dispatch baseline
+    # stays the one that was taken when the stop really began (G1).
+    import verification_cancel
+    try:
+        stop_state.begin(
+            plan_id,
+            stop_state.SCOPE_VERIFICATION,
+            previous_phase=_previous_phase,
+            dispatch_baseline=verification_cancel.dispatch_total(plan_id),
+        )
+    except Exception:  # noqa: BLE001
+        _server.logger.exception(
+            "[stop_verification] could not write the stop record plan=%s",
+            plan_id,
+        )
+
+    # --- layer 1: the cancel flag -------------------------------------
+    # The flag goes up BEFORE anything is killed: a killed executor
+    # fires ``on_complete`` immediately, and that callback re-enters
+    # verification unless the flag is already set.
+    try:
+        verification_cancel.request_cancel(plan_id)
+    except Exception:  # noqa: BLE001
+        _server.logger.exception(
+            "[stop_verification] cancel flag failed plan=%s", plan_id,
+        )
+
+    # --- layer 2: the repair executor gets its SIGTERM ----------------
+    # SIGTERM and nothing else (G2c): the executor has its own signal
+    # handler, and it stops its sub-agents cooperatively — a SIGKILL
+    # would take that chance away.
+    if _previous_phase == "verification_repairing":
         try:
-            import verification_cancel
-            verification_cancel.request_cancel(plan_id)
+            _sigterm_repair_executor(plan_id)
         except Exception:  # noqa: BLE001
             _server.logger.exception(
-                "[stop_verification] cancel flag failed plan=%s", plan_id,
+                "[stop_verification] could not SIGTERM the repair executor "
+                "plan=%s", plan_id,
             )
-        killed_pid = _sigterm_repair_executor(plan_id)
-        _server.logger.warning(
-            "[stop_verification] stopped the repair executor plan=%s "
-            "pid=%s", plan_id, killed_pid,
-        )
-        _repair_row = verification.current(plan_id) or {}
-        round_n = int(_repair_row.get("round") or 0)
-        if not owned_conn:
-            conn.close()
-        _server._reap_managed_services(plan_id, plan_dir, "verification_stopped")
-        return {
-            "stopped_at": datetime.now().isoformat(),
-            "reason": "user_stopped_at_repair_execution",
-            "current_round": round_n,
-            "status": "stopped",
-            "paused": True,
-            "round": round_n,
-            "interrupted_vp_count": 0,
-        }
 
     # 2026-10-20 — read the round BEFORE the connection is closed.
     # The row is the only place the round's verdicts live: the executor
@@ -4591,9 +5040,10 @@ def stop_verification(plan_id: str):
     if not owned_conn:
         conn.close()
 
+    # The in-memory state is read for the round number; the terminal
+    # write (``loop_stopped``) belongs to the finalize — the round is
+    # not over yet while the answer goes out.
     state = _server._verification_state.get(plan_id)
-    if state:
-        state.update({"verification_status": "loop_stopped", "stop_reason": "user_stopped", "updated_at": datetime.now().isoformat()})
 
     # The round the stop interrupted. The DB row is authoritative (it
     # survives a backend restart); the in-memory state is the fallback
@@ -4602,13 +5052,13 @@ def stop_verification(plan_id: str):
         (state or {}).get("verification_round") or 0
     )
 
-    # The in-flight VPs are read BEFORE the snapshot: the stop's own
-    # hard kill removes them, and the snapshot must describe the round
-    # as it was when the operator pressed stop.
+    # The in-flight VPs are read BEFORE the snapshot: the background
+    # layer stops them, and the snapshot must describe the round as it
+    # was when the operator pressed stop.
     #
     # The HANDLES are kept, not just their ids: the stop has to be able
-    # to say afterwards whether the work it claimed to kill really
-    # stopped (see ``_surviving_vp_ids``).
+    # to say afterwards whether the work it claimed to stop really
+    # stopped (see ``_stop_survivors``).
     try:
         _stop_handles = list(_server.sub_agent_registry.all_handles(plan_id))
     except Exception:  # noqa: BLE001
@@ -4626,157 +5076,81 @@ def stop_verification(plan_id: str):
         if vp_id not in _judged_vp_ids
     ]
 
-    # 2026-10-20 — the snapshot is written BEFORE the process cleanup
-    # below. The cleanup kills the in-flight sub-agents, and a verdict
-    # that lands after this point would never reach the report; a
-    # snapshot taken after the kill would describe a round that no
-    # longer exists.
-    _persist_round_snapshot(plan_id, plan_dir, round_n, verdicts)
+    # The work that is still running — the answer's ``survivors``.
+    # Read BEFORE the background layer starts stopping anything, so it
+    # describes the plan as it was when the operator pressed stop.
+    _survivors = _stop_survivors(plan_id)
 
-    # Where the round was verifying. Best-effort: the checkpoint is
-    # still a valid checkpoint without it, and a project_dir lookup
-    # that fails (a state.db that cannot be opened) must not take the
-    # stop down with it.
-    _project_dir: Optional[str] = None
-    try:
-        _resolved_project_dir = _server._get_project_dir(plan_id)
-    except Exception:  # noqa: BLE001
-        _resolved_project_dir = None
-    if _resolved_project_dir:
-        _project_dir = str(_resolved_project_dir)
+    if not _repair_execution_stop:
+        # 2026-10-22: in the repair case what is being stopped is the
+        # REPAIR EXECUTOR, not a verification round. The round already
+        # ended (it failed and produced the repair tasks); the executor
+        # subprocess is what is still running.
+        #
+        # So that case does NOT write a verification checkpoint: a
+        # checkpoint says "this verification round was interrupted,
+        # resume it", and no round was interrupted here. A stale
+        # checkpoint would make the NEXT ordinary ``/start`` resume
+        # that old round instead of starting a new one.
+        #
+        # 2026-10-20 — the snapshot is written BEFORE the background
+        # layer stops the work. A verdict that lands after this point
+        # would never reach the report; a snapshot taken after the stop
+        # would describe a round that no longer exists.
+        _persist_round_snapshot(plan_id, plan_dir, round_n, verdicts)
 
-    _write_verification_checkpoint(
-        plan_dir,
-        project_dir=_project_dir,
-        round_n=round_n,
-        verdicts=verdicts,
-        # The operator pressed stop — that is the caller's truth about
-        # why this round was interrupted, and the checkpoint says so.
-        reason="user_stopped",
-        interrupted_tasks=[
-            {
-                "task_id": vp_id,
-                "status": "interrupted",
-                "phase": "verification",
-                "session_id": None,
-                "strategy": "verification_round_resume",
-                "reason": "user_stopped",
-            }
-            for vp_id in _interrupted_vp_ids
-        ],
-    )
-
-    # 2026-09-15 — a stop must actually STOP the work.
-    #
-    # The CAS above only parks the routing row; the verification thread
-    # kept running: the in-flight VP sub-agent stayed alive (tokens + CPU)
-    # and the thread carried on into the next round, re-stamping the stage
-    # the operator had just parked (which then blocked the next ``/start``
-    # with ``409 stage_mismatch``). Two layers close that gap:
-    #
-    #   1. hard kill — SIGTERM the registered sub-agent subprocesses and
-    #      sweep the orphaned pytest/bash children they disowned;
-    #   2. cooperative cancel — the executor skips every not-yet-started
-    #      VP (and reports an interrupted attempt as SKIPPED), and the
-    #      auto-loop exits instead of running judgment → repair → next
-    #      round. ``/start`` clears the flag.
-    try:
-        import verification_cancel
-        verification_cancel.request_cancel(plan_id)
-    except Exception:  # noqa: BLE001
-        _server.logger.exception(
-            "[stop_verification] cancel flag failed plan=%s", plan_id,
-        )
-    # 2026-11-08 — the round's OWN processes are killed as well.  The
-    # cleanup takes the round's token, exactly as the watchdog does:
-    # the round's coding-tool subprocesses are the population that keeps
-    # spending while a round is being stopped, and an unnamed round
-    # kills nothing (``_cleanup_dead_verification_processes``: "An
-    # unnamed round kills nothing").  The token is the one the running
-    # round stamped onto the plan's in-memory state.
-    _round_token = ""
-    try:
-        _round_state = _server._verification_state.get(plan_id) or {}
-        _round_token = str(
-            _round_state.get("round_token") or ""
-        ).strip()
-    except Exception:  # noqa: BLE001
-        _round_token = ""
-    try:
-        _server._cleanup_dead_verification_processes(
-            plan_id, [vp for vp in _running_vp_ids if vp],
-            round_token=_round_token,
-        )
-        _server.logger.warning(
-            "[stop_verification] killed in-flight verification work "
-            "plan=%s vps=%s round=%s", plan_id, _running_vp_ids,
-            _round_token or "-",
-        )
-    except Exception:  # noqa: BLE001
-        _server.logger.exception(
-            "[stop_verification] process kill failed plan=%s", plan_id,
-        )
-
-    # 2026-11-08 — the phase has to be TRUE when the stop answers.
-    #
-    # The kill above is best-effort: a sub-agent whose process the kill
-    # could not reach keeps running, and its verdict lands minutes
-    # later.  Parking the routing row at ``verification`` in that case
-    # tells the rest of the system the plan is parked when it is not:
-    # ``/api/system/active`` drops it, capacity sees a free slot, and
-    # the scheduler may hand that slot to somebody else while the
-    # round keeps spending.  A round that is still running therefore
-    # keeps the phase that says so — and the write is conditional, so
-    # it only ever moves the row the stop itself parked.
-    _surviving_vps = _surviving_vp_ids(_stop_handles)
-    _round_still_running = bool(_surviving_vps)
-    if _round_still_running:
-        _server.logger.warning(
-            "[stop_verification] the round is still running plan=%s "
-            "survivors=%s — the phase stays 'verification_running'",
-            plan_id, _surviving_vps,
-        )
+        # Where the round was verifying. Best-effort: the checkpoint is
+        # still a valid checkpoint without it, and a project_dir lookup
+        # that fails (a state.db that cannot be opened) must not take the
+        # stop down with it.
+        _project_dir: Optional[str] = None
         try:
-            _conn2, _routing2, _ = _open_verification_state()
-            try:
-                _routing2.try_mark_phase(
-                    plan_id, ("verification",), "verification_running",
-                )
-            finally:
-                _conn2.close()
+            _resolved_project_dir = _server._get_project_dir(plan_id)
         except Exception:  # noqa: BLE001
-            _server.logger.exception(
-                "[stop_verification] could not restore the running phase "
-                "plan=%s", plan_id,
-            )
+            _resolved_project_dir = None
+        if _resolved_project_dir:
+            _project_dir = str(_resolved_project_dir)
 
-    # 2026-09-18 C3: the round is over, so the services it started are
-    # no longer needed. This is an operator-initiated exit that does
-    # NOT go through ``_run_auto_verification_loop`` (which joins the
-    # loop only after the next checkpoint), so it needs its own reap.
-    _server._reap_managed_services(plan_id, plan_dir, "verification_stopped")
+        _write_verification_checkpoint(
+            plan_dir,
+            project_dir=_project_dir,
+            round_n=round_n,
+            verdicts=verdicts,
+            # The operator pressed stop — that is the caller's truth about
+            # why this round was interrupted, and the checkpoint says so.
+            reason="user_stopped",
+            interrupted_tasks=[
+                {
+                    "task_id": vp_id,
+                    "status": "interrupted",
+                    "phase": "verification",
+                    "session_id": None,
+                    "strategy": "verification_round_resume",
+                    "reason": "user_stopped",
+                }
+                for vp_id in _interrupted_vp_ids
+            ],
+        )
 
-    return {
-        "stopped_at": datetime.now().isoformat(),
-        "reason": "user_stopped",
-        "current_round": round_n,
-        # 2026-10-20 — the stop is a PAUSE: the round, the verdicts it
-        # reached and the VPs it cut short are on disk (see
-        # ``_persist_round_snapshot`` / ``_write_verification_checkpoint``),
-        # so the response says so. ``paused`` is the flag a caller
-        # polls for; ``round`` and ``interrupted_vp_count`` say what
-        # the resume would pick up.
-        "status": "stopped",
-        "paused": True,
-        "round": round_n,
-        "interrupted_vp_count": len(_interrupted_vp_ids),
-        # 2026-11-08 — whether the round really stopped.  ``False``
-        # means the work is gone and the plan is parked at
-        # ``verification``; ``True`` means some of the round's
-        # sub-agents survived the kill, so the plan is still running
-        # and its phase says so (``verification_running``).
-        "still_running": _round_still_running,
-    }
+    # --- the background layer takes the rest --------------------------
+    # The supervisor owns the quiet window: it waits for the plan to
+    # fall silent, stops this plan's live dispatches cooperatively,
+    # escalates to signals for whatever ignores that, and finally calls
+    # ``_finalize_verification_stop`` — which is where the phase is
+    # flipped (G3).  Nothing on this request waits for any of it.
+    _start_stop_supervisor(plan_id)
+
+    return _stopping_answer(
+        plan_id,
+        previous_phase=_previous_phase,
+        survivors=_survivors,
+        round_n=round_n,
+        interrupted_vp_count=len(_interrupted_vp_ids),
+        reason=(
+            "user_stopped_at_repair_execution"
+            if _repair_execution_stop else "user_stopped"
+        ),
+    )
 
 
 @router.post("/api/verification/{plan_id}/force_terminal")

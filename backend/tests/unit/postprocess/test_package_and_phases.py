@@ -10,7 +10,7 @@ does three things and nothing else:
 2. it proves the two new phase names are constants the rest of the
    subsystem imports instead of re-spelling the strings;
 3. it proves the phase vocabulary grew by exactly those two names and by
-   nothing else — the pre-existing members keep their order.
+   nothing else — the pre-existing members keep their relative order.
 
 Why the vocabulary check is a *snapshot*
 ----------------------------------------
@@ -20,6 +20,13 @@ assertion vacuous (a list trivially contains itself), so the
 pre-existing vocabulary is spelled out member by member in
 :data:`PHASES_BEFORE`.  A phase that disappears, a phase that moves, or a
 third phase that sneaks in all fail here.
+
+The plan-level stopping phase (``user_stopping``, introduced by the stop
+contract) is inserted **between** two pre-existing phases, so "the old
+vocabulary sits at the head of the live one" stopped being true.  What
+is true — and what this file now pins — is that the old vocabulary is an
+**ordered subsequence** of the live one, and that the live vocabulary is
+the old one plus exactly the three names in :data:`PHASES_AFTER`.
 
 The transition case pins the **entry** into the new phase.  The approved
 architecture extends the phase model with::
@@ -100,21 +107,46 @@ def test_phase_constants_exist():
     assert set(PHASE_ADDITIONS) == {POST_PROCESSING, POSTPROCESS_FAILED}
 
 
+#: The phases that joined the vocabulary **after** this task's two
+#: post-processing phases were registered.  ``user_stopping`` is the
+#: plan-level stopping phase the stop contract introduced: a stop is a
+#: process with an order, and the phase that says "a stop is in progress"
+#: is part of the vocabulary like any other.
+PHASES_AFTER = ("post_processing", "postprocess_failed", "user_stopping")
+
+
 def test_new_phases_are_additive():
-    """The vocabulary grew by exactly two names and kept the old order."""
+    """The vocabulary grew by exactly three names and kept the old order.
+
+    The old invariant — "the pre-existing phases sit at the head of the
+    vocabulary, in order" — died with the plan-level stopping phase:
+    ``user_stopping`` was inserted **between** two pre-existing phases
+    (before ``verification_loop_stopped``), so the head-of-the-vocabulary
+    assertion is no longer true and is not the guarantee any more.
+
+    The guarantee that survives is the stronger one: the pre-existing
+    vocabulary is an **ordered subsequence** of the live one — every old
+    phase survives, and the old phases keep their relative order, no
+    matter what was inserted between them.
+    """
     assert set(PHASES_BEFORE) <= set(VALID_PHASES), (
         f"the pre-existing phases must survive; missing: "
         f"{sorted(set(PHASES_BEFORE) - set(VALID_PHASES))}"
     )
-    assert VALID_PHASES[: len(PHASES_BEFORE)] == PHASES_BEFORE, (
-        "the pre-existing phases must keep their order and their place at "
-        "the head of the vocabulary"
+    kept_in_order = [p for p in VALID_PHASES if p in set(PHASES_BEFORE)]
+    assert kept_in_order == PHASES_BEFORE, (
+        "the pre-existing phases must keep their relative order; got "
+        f"{kept_in_order}"
     )
-    assert len(VALID_PHASES) == len(PHASES_BEFORE) + 2, (
-        f"expected exactly two new phases; got "
+    assert len(VALID_PHASES) == len(PHASES_BEFORE) + len(PHASES_AFTER), (
+        f"expected exactly {len(PHASES_AFTER)} new phases; got "
         f"{sorted(set(VALID_PHASES) - set(PHASES_BEFORE))}"
     )
-    assert set(VALID_PHASES) == set(PHASES_BEFORE) | set(PHASE_ADDITIONS)
+    assert set(VALID_PHASES) == set(PHASES_BEFORE) | set(PHASES_AFTER), (
+        f"unexpected vocabulary: {sorted(set(VALID_PHASES) - set(PHASES_BEFORE))}"
+    )
+    # The post-processing phases are still exactly this task's two.
+    assert set(PHASE_ADDITIONS) <= set(PHASES_AFTER)
 
 
 def test_new_phases_transition_allowed(sample_plan_factory):

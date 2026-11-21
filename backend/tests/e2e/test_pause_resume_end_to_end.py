@@ -30,6 +30,12 @@ So this file drives the whole chain in one go:
 
 What is pinned here, and why each one would be a real defect:
 
+* **The stop is a process, and the test waits for it.** The stop
+  answers ``stopping`` at once and the plan reaches ``stopped`` only
+  once the background layer has seen it fall silent; a test that read
+  the plan's status right after the request would be reading it mid-
+  stop, and a test that never waited would be asserting against a
+  plan that is still going down.
 * **The pause survives the restart.** The recovery scan rebuilds the
   runtime state from SQLite; the pause comes from the plan directory.
   If either half were read from the wrong place, this is the test that
@@ -51,13 +57,15 @@ What is pinned here, and why each one would be a real defect:
 
 No real executor and no real model: ``_spawn_executor_subprocess`` is
 replaced with a recorder and the process-group kill with a cooperative
-stub, so the test runs in-process in under a second and calls nothing.
+stub, so the test runs in-process, calls nothing, and waits only for
+the stop's own quiet window.
 """
 
 from __future__ import annotations
 
 import json
 import threading
+import time
 from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -90,6 +98,12 @@ INTERRUPTED_TASKS = ("3", "4")
 #: short. This is what makes the interruption resumable rather than a
 #: re-run, so it is the highest-value thing on disk.
 TASK_SESSIONS = {"3": "sess-3", "4": "sess-4"}
+
+#: How long the status poll waits for the plan to really fall silent.
+#: The stop is asynchronous: the background layer owns a quiet window
+#: (five seconds by default) before it may call the plan stopped, so
+#: the poll has to outlast that window.
+STOP_QUIET_TIMEOUT = 30.0
 
 
 class FakeProc:
@@ -357,6 +371,48 @@ def _restart(plans_dir: Path) -> None:
     server._recover_execution_states(plans_dir)
 
 
+def _wait_for_execution_status(
+    client: TestClient,
+    plan_id: str,
+    expected: str,
+    timeout: float = STOP_QUIET_TIMEOUT,
+) -> Dict[str, Any]:
+    """Poll the status endpoint until it says ``expected``.
+
+    A stop is a *process*, not an instant.  The answer to
+    ``POST /api/execution/<id>/stop`` is ``stopping`` — the plan is on
+    its way down — and the plan reaches ``stopped`` only once the
+    background layer has seen it fall silent.  The stop's own answer
+    therefore never says the stop is done; a reader that wants to know
+    has to ask again.
+
+    While the stop is in progress the status endpoint answers
+    ``stopping`` (the stop record is still there), and it answers
+    ``stopped`` only after that record is cleared — the same moment the
+    plan is parked in the ``stopped`` phase and the resume point is on
+    disk.  So this poll is also what makes the checkpoint readable:
+    reading it before the poll returns is a race with the worker that
+    writes it.
+
+    The failure carries the last answer: "the status never reached
+    ``stopped``" is not actionable on its own.
+    """
+    deadline = time.monotonic() + timeout
+    last: Any = None
+    while True:
+        response = client.get(f"/api/execution/{plan_id}/status")
+        body = response.json()
+        if response.status_code == 200 and body.get("status") == expected:
+            return body
+        last = {"status_code": response.status_code, "body": body}
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"the execution status never reached {expected!r} within "
+                f"{timeout}s; the last answer was {last!r}"
+            )
+        time.sleep(0.2)
+
+
 # ---------------------------------------------------------------------------
 # 1) stop → restart → resume, end to end
 # ---------------------------------------------------------------------------
@@ -383,14 +439,23 @@ def test_pause_restart_resume_e2e(env, client, spawn):
     )
 
     # --- stop: a pause, not a failure and not a discard ---------------
-    stopped = client.post(f"/api/execution/{PLAN_ID}/stop")
-    assert stopped.status_code == 200, stopped.text
-    assert stopped.json()["paused"] is True, stopped.text
-    assert stopped.json()["interrupted_task_count"] == len(INTERRUPTED_TASKS)
+    # The stop is a process, not an instant: the answer says the plan
+    # is on its way down, and the plan reaches ``stopped`` only once
+    # the background layer has seen it fall silent.
+    stopping = client.post(f"/api/execution/{PLAN_ID}/stop")
+    assert stopping.status_code == 200, stopping.text
+    stop_body = stopping.json()
+    assert stop_body["status"] == "stopping", stop_body
+    assert stop_body["stop_scope"] == "execution", stop_body
+    assert stop_body["paused"] is True, stop_body
+    assert isinstance(stop_body["survivors"], list), stop_body
 
-    paused = client.get(f"/api/execution/{PLAN_ID}/status").json()
+    # The plan really goes down — and the answer that says so is a
+    # later one, not the stop's own.
+    paused = _wait_for_execution_status(client, PLAN_ID, "stopped")
     assert paused["status"] == "stopped", paused
     assert paused["paused"] is True, paused
+    assert paused["interrupted_task_count"] == len(INTERRUPTED_TASKS), paused
     assert pause_state.read_pause_checkpoint(plan_dir) is not None
 
     # The two finished tasks were not counted as owed work, and the two

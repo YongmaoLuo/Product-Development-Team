@@ -98,6 +98,12 @@ from file_lock_protocol import socket_path
 # 2026-10-22: the type a cancelled dispatch raises. Dependency-free
 # (stdlib only), so a top-level import carries no cycle risk.
 from verification_cancel import VerificationCancelled
+# 2026-11-20: the plan-level stop record — "this plan is being
+# stopped, from here, with this baseline". Dependency-free (stdlib
+# only) like the flag next door, so a top-level import carries no
+# cycle risk either.  See ``_assert_spawn_allowed`` for what the
+# dispatch does with it.
+import stop_state
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +179,16 @@ def _dispatch_cancelled(plan_id: Optional[str]) -> bool:
         return False
 
 
+def _cancellation_message(plan_id: str, what: str) -> str:
+    """The wording a cancellation of a plan dispatch carries.
+
+    One place, so that "the operator stopped this" reads the same way
+    whether the round was already stopped when the dispatch started, or
+    the dispatch could not register itself and therefore refuses to run.
+    """
+    return f"verification cancelled for plan {plan_id!r} while {what}"
+
+
 def _raise_if_cancelled(plan_id: Optional[str], what: str) -> None:
     """Raise :class:`VerificationCancelled` when the round was stopped.
 
@@ -182,19 +198,99 @@ def _raise_if_cancelled(plan_id: Optional[str], what: str) -> None:
     """
     if not plan_id or not _dispatch_cancelled(plan_id):
         return
-    raise VerificationCancelled(
-        plan_id,
-        f"verification cancelled for plan {plan_id!r} while {what}",
+    raise VerificationCancelled(plan_id, _cancellation_message(plan_id, what))
+
+
+def _assert_spawn_allowed(plan_id: Optional[str], what: str) -> None:
+    """Refuse to spawn a process for a plan that is being stopped.
+
+    2026-11-20. The cancellation flag was read at three call sites,
+    and the one that mattered most — the dispatch registration — was
+    read *after* ``subprocess.Popen`` had already created the child.
+    There is nothing to kill before the child exists, so that check
+    could only ever refuse a dispatch whose process was already
+    running: the gate was open at exactly the moment it could have
+    been closed, and a process the operator had asked to stop kept
+    running.
+
+    So the gate is closed **before** the spawn.  A dispatch for a plan
+    that is stopping raises
+    :class:`verification_cancel.VerificationCancelled` and **no
+    process is created at all** — there is nothing to reap, nothing to
+    watch, and nothing left over for a later stop to count.
+
+    Two independent facts can say "this plan is stopping", and this
+    gate reads both:
+
+    * ``stop_state.is_stopping(plan_id)`` — the plan-level record.  It
+      names the plan, so a stop of one plan never reaches sideways
+      into another plan's work;
+    * ``verification_cancel.is_cancelled(plan_id)`` — the round-level
+      cancel flag, which is what the dispatch path already consulted.
+
+    An unreadable registry is not a stop: both predicates are
+    documented never to raise, and a flag that cannot be read must not
+    turn every dispatch into a refusal (the same rule
+    :func:`_dispatch_cancelled` already follows).
+
+    A dispatch with **no plan** attached is not gated at all.  There
+    is no plan to stop, and the CLI without a plan — plus the unit
+    tests and the vendor tools — must keep working exactly as before.
+    """
+    if not plan_id:
+        return
+
+    try:
+        stopping = bool(stop_state.is_stopping(plan_id))
+    except Exception:  # noqa: BLE001 — an unreadable registry is not a stop
+        stopping = False
+
+    if not stopping and not _dispatch_cancelled(plan_id):
+        return
+
+    # The audit line: which plan was refused, and what it was refused
+    # for.  A refusal that leaves no trace is indistinguishable from a
+    # dispatch that never happened.
+    logger.warning(
+        "[spawn_gate] rejected plan=%s what=%s", plan_id, what,
     )
+    raise VerificationCancelled(plan_id, _cancellation_message(plan_id, what))
 
 
 def _register_dispatch(scoped_tool, plan_id: Optional[str]):
     """Register ``scoped_tool``'s in-flight subprocess under ``plan_id``.
 
     Returns ``(registry, handle)`` — ``(None, None)`` when there is
-    nothing to register (no plan) or when the registration failed.
-    Registration is best-effort by construction: the registry is a
-    watchdog aid, and a dispatch that cannot be watched must still run.
+    nothing to register (no plan, or another owner already holds this
+    tool's handle).
+
+    **Fail-closed (2026-11-20).** Registration used to be best-effort:
+    every failure was swallowed and the dispatch carried on without a
+    watchdog handle, on the reasoning that "the registry is a watchdog
+    aid and a dispatch that cannot be watched must still run". That
+    reasoning is what the incident was made of — the dispatch registered
+    nothing, so the operator's ``/stop`` had no handle to reach, so the
+    stop could not kill the process the dispatch had just started, and
+    that process ran on after the operator had asked for it to stop.
+
+    So a **plan** dispatch now refuses to run unwatched:
+
+    * a round that has already been cancelled raises *before* the
+      registry is touched at all — there is nothing to register and
+      nothing to run;
+    * a registration that fails raises instead of returning an empty
+      pair.
+
+    Both raise :class:`verification_cancel.VerificationCancelled`, the
+    type every layer above the dispatch already treats as "the operator
+    stopped this" rather than "this broke" — so the failure is not
+    recorded as a failed round, and no repair task is manufactured out
+    of a round the operator has stopped.
+
+    A dispatch with **no plan** attached is unchanged: it still returns
+    ``(None, None)`` and still runs, exactly as before. The fail-closed
+    rule is scoped to the plan dispatches — the ones the watchdog is
+    responsible for.
 
     **The process is recorded too.** The dispatch has just started a
     subprocess, and the facts that identify it — the pid, the process
@@ -239,6 +335,10 @@ def _register_dispatch(scoped_tool, plan_id: Optional[str]):
     """
     if not plan_id:
         return None, None
+    # 2026-11-20 — fail-closed. The cancellation is read *before* the
+    # registry is touched: a round the operator has already stopped has
+    # nothing to register, and nothing that may run.
+    _raise_if_cancelled(plan_id, "registering the dispatch")
     try:
         from sub_agent_registry import sub_agent_registry
 
@@ -269,13 +369,25 @@ def _register_dispatch(scoped_tool, plan_id: Optional[str]):
         if not owned:
             return None, None
         return sub_agent_registry, handle
-    except Exception:  # noqa: BLE001 — a watchdog aid must never break a call
-        logger.warning(
+    except VerificationCancelled:
+        # A cancellation raised from inside the registry calls is the
+        # operator's stop, not a broken registry — it has to reach the
+        # caller as itself, never converted into a registration failure.
+        raise
+    except Exception as exc:  # noqa: BLE001 — fail-closed (2026-11-20)
+        # The dispatch cannot be watched, so it must not run: the
+        # operator's stop would have nothing to reach, which is exactly
+        # how the incident happened. Log it as an error (it is a
+        # failure, not a note) and refuse the dispatch.
+        logger.error(
             "[dispatch-register] could not register the dispatch for plan "
-            "%s; continuing without a watchdog handle",
+            "%s; failing closed — the dispatch will not run",
             plan_id, exc_info=True,
         )
-        return None, None
+        raise VerificationCancelled(
+            plan_id,
+            _cancellation_message(plan_id, "registering the dispatch"),
+        ) from exc
 
 
 def _dispatch_process_facts(scoped_tool) -> Optional[Dict[str, Any]]:
@@ -428,6 +540,21 @@ def _unregister_dispatch(registry, plan_id: Optional[str], handle) -> None:
 #: never unregister a *different* tool that happens to reuse it.
 _LIVE_DISPATCH_TOOLS: Dict[int, Any] = {}
 
+#: Which plan each registered live dispatch belongs to (2026-11-20).
+#:
+#: Keyed by ``id(tool)`` exactly like :data:`_LIVE_DISPATCH_TOOLS`, and
+#: it only ever holds an entry for a tool that was registered **with** a
+#: plan.  A dispatch registered without one — the CLI without a plan,
+#: the vendor tools — has no entry here at all, and that is what keeps
+#: it out of every plan-scoped stop: "belongs to no plan" is not
+#: "belongs to every plan".
+#:
+#: It is a separate map rather than a second value in the tool table
+#: because the tool table is read by the global stop and by the
+#: existing tests as a plain ``id -> tool`` mapping; changing its shape
+#: would reach code that has no use for the attribution.
+_LIVE_DISPATCH_PLANS: Dict[int, str] = {}
+
 #: Guards :data:`_LIVE_DISPATCH_TOOLS`. Registration happens on the
 #: dispatch thread and the stop path runs on the signal-handling
 #: thread, so the two genuinely race.
@@ -452,18 +579,49 @@ _STOP_STAGE_CLOSE_FRACTION = 0.35
 _STOP_STAGE_TERM_FRACTION = 0.25
 _STOP_STAGE_KILL_FRACTION = 0.10
 
+#: Bounds for the **plan-scoped** stop budget (2026-11-20).  They are
+#: not the global stop's bounds: a plan-scoped stop runs as part of a
+#: stop request for one plan, and the other plans' work has to keep
+#: running while it does.  The lower bound is therefore generous — a
+#: budget that is too short turns a cooperative exit into a SIGKILL —
+#: and the upper bound keeps a fat-fingered caller from parking the
+#: stop path for minutes.
+_PLAN_STOP_BUDGET_DEFAULT_SECONDS = 45.0
+_PLAN_STOP_BUDGET_MIN_SECONDS = 30.0
+_PLAN_STOP_BUDGET_MAX_SECONDS = 60.0
 
-def register_live_dispatch(tool) -> None:
+
+def register_live_dispatch(tool, plan_id: str = "") -> None:
     """Record ``tool`` as the owner of a live dispatch subprocess.
 
     Registration is best-effort by construction: the registry is a
     watchdog aid, and a dispatch that cannot be watched must still run.
     Registering the same tool twice is idempotent — one tool owns one
     child, so it gets one entry.
+
+    ``plan_id`` names the plan the dispatch belongs to, and it is what
+    makes a **plan-scoped** stop possible: with it, the registry can
+    answer "which dispatches belong to this plan" instead of only
+    "which dispatches exist".  An empty ``plan_id`` means the dispatch
+    belongs to no plan, and such a dispatch is in nobody's scope — a
+    plan-scoped stop must never reach it.
+
+    The attribution follows the tool: re-registering a tool under
+    another plan moves it, and re-registering it without a plan takes
+    it out of every plan's scope.
     """
     try:
         with _LIVE_DISPATCH_LOCK:
-            _LIVE_DISPATCH_TOOLS[id(tool)] = tool
+            key = id(tool)
+            _LIVE_DISPATCH_TOOLS[key] = tool
+            if plan_id:
+                _LIVE_DISPATCH_PLANS[key] = plan_id
+            else:
+                # A registration without a plan is a registration into
+                # no plan: the attribution is dropped rather than left
+                # behind, so the dispatch cannot be reached by a
+                # plan-scoped stop any more.
+                _LIVE_DISPATCH_PLANS.pop(key, None)
     except Exception:  # noqa: BLE001 — a watchdog aid must never break a call
         logger.warning(
             "[live-dispatch] could not register a live dispatch; continuing",
@@ -477,6 +635,11 @@ def unregister_live_dispatch(tool) -> None:
     Best-effort and idempotent: unregistering a tool that is not (or no
     longer) registered is a no-op, so the clean path, the timeout path
     and ``cleanup()`` can all call it without coordinating.
+
+    The plan attribution goes with the tool.  An attribution that
+    outlived its tool would name a plan whose dispatch is already gone,
+    and a plan-scoped stop would keep taking on a child that no longer
+    exists.
     """
     try:
         with _LIVE_DISPATCH_LOCK:
@@ -485,6 +648,11 @@ def unregister_live_dispatch(tool) -> None:
             # caller unregister the tool that owns the id now.
             if _LIVE_DISPATCH_TOOLS.get(key) is tool:
                 _LIVE_DISPATCH_TOOLS.pop(key, None)
+                # The attribution is dropped together with the tool it
+                # belongs to — and only then: a recycled id means the
+                # tool table holds somebody else's tool now, and that
+                # tool's attribution has to stay.
+                _LIVE_DISPATCH_PLANS.pop(key, None)
     except Exception:  # noqa: BLE001 — cleanup must never break a call
         logger.warning(
             "[live-dispatch] could not unregister a live dispatch; continuing",
@@ -509,6 +677,31 @@ def _normalize_stop_budget(total_seconds) -> float:
     if not math.isfinite(budget) or budget <= 0:
         budget = _STOP_BUDGET_DEFAULT_SECONDS
     return min(max(budget, _STOP_BUDGET_MIN_SECONDS), _STOP_BUDGET_MAX_SECONDS)
+
+
+def _normalize_plan_stop_budget(total_seconds) -> float:
+    """Return the plan-scoped stop budget in seconds.
+
+    Clamped into ``[30, 60]``.  A value that is not a number, not
+    finite, or not positive falls back to the default (45 s), which is
+    inside the range.
+
+    The clamping is deliberately not the global stop's ``[2, 60]``: a
+    plan-scoped stop has to give the child a real chance to leave on
+    its own terms, and the other plans' work keeps running beside it.
+    A budget that is too short does not shorten the stop, it changes
+    what the stop does — a cooperative exit becomes a SIGKILL.
+    """
+    try:
+        budget = float(total_seconds)
+    except (TypeError, ValueError):
+        budget = _PLAN_STOP_BUDGET_DEFAULT_SECONDS
+    if not math.isfinite(budget) or budget <= 0:
+        budget = _PLAN_STOP_BUDGET_DEFAULT_SECONDS
+    return min(
+        max(budget, _PLAN_STOP_BUDGET_MIN_SECONDS),
+        _PLAN_STOP_BUDGET_MAX_SECONDS,
+    )
 
 
 def _wait_for_exit(process, timeout: float) -> bool:
@@ -587,22 +780,55 @@ def _cooperative_stop_process(
     return True
 
 
-def stop_all_live_dispatches(
-    total_seconds: float = _STOP_BUDGET_DEFAULT_SECONDS,
-) -> int:
-    """Stop every live dispatch's subprocess; return how many were handled.
+def _process_still_running(process) -> bool:
+    """True when ``process`` is still running.
 
-    This is the entry point a signal handler calls: it walks the
-    registry, stops each registered tool's ``_current_process``
-    cooperatively, and reports how many processes it took on. It never
-    raises — a stop path that crashes leaves the child running, which
-    is the failure mode this whole mechanism exists to prevent.
+    ``poll()`` is the kernel's own answer, and after a stop attempt it
+    is the only one that counts: the stop sequence's return value says
+    whether the child had to be *killed*, not whether it *died*.
+
+    A process that cannot be asked is reported as still running.  The
+    two mistakes are not symmetric — calling a dead child a survivor
+    costs the caller a warning, while calling a live child a dead one
+    hides a subprocess that outlived the stop.
     """
-    budget = _normalize_stop_budget(total_seconds)
-    with _LIVE_DISPATCH_LOCK:
-        tools = list(_LIVE_DISPATCH_TOOLS.values())
+    try:
+        poll = getattr(process, "poll", None)
+        if callable(poll):
+            return poll() is None
+    except Exception:  # noqa: BLE001 — best-effort, never raises
+        return True
+    return True
 
-    stopped = 0
+
+def _stop_live_dispatches(
+    budget: float,
+    plan_id: Optional[str] = None,
+) -> Tuple[int, List[Any]]:
+    """Stop live dispatches; return ``(handled, survivors)``.
+
+    ``plan_id=None`` is the **global** stop: every registered dispatch
+    is taken on.  A plan id restricts the walk to the dispatches
+    registered under that plan — and to those alone: a dispatch that
+    belongs to no plan is in nobody's scope.
+
+    ``handled`` counts the dispatches whose process the stop actually
+    took on; ``survivors`` are the tools whose process was still
+    running when it finished.  The two answer different questions: "how
+    many did I take on" and "what is still out there".
+    """
+    with _LIVE_DISPATCH_LOCK:
+        if plan_id is None:
+            tools = list(_LIVE_DISPATCH_TOOLS.values())
+        else:
+            tools = [
+                tool
+                for key, tool in _LIVE_DISPATCH_TOOLS.items()
+                if _LIVE_DISPATCH_PLANS.get(key) == plan_id
+            ]
+
+    handled = 0
+    survivors: List[Any] = []
     for tool in tools:
         try:
             with tool._process_lock:
@@ -614,9 +840,67 @@ def stop_all_live_dispatches(
         try:
             _cooperative_stop_process(process, budget)
         except Exception:  # noqa: BLE001 — one bad process must not stop the rest
+            # The stop itself blew up, so nothing is known about the
+            # child: it is reported as a survivor, because a survivor
+            # is the answer that keeps it visible.
+            survivors.append(tool)
             continue
-        stopped += 1
-    return stopped
+        handled += 1
+        if _process_still_running(process):
+            survivors.append(tool)
+    return handled, survivors
+
+
+def stop_all_live_dispatches(
+    total_seconds: float = _STOP_BUDGET_DEFAULT_SECONDS,
+) -> int:
+    """Stop every live dispatch's subprocess; return how many were handled.
+
+    This is the entry point a signal handler calls: it walks the
+    registry, stops each registered tool's ``_current_process``
+    cooperatively, and reports how many processes it took on. It never
+    raises — a stop path that crashes leaves the child running, which
+    is the failure mode this whole mechanism exists to prevent.
+
+    It stops **every** plan's dispatches: this is the executor's own
+    signal handler, which has to take down whatever it started.  A stop
+    that is scoped to one plan is
+    :func:`stop_live_dispatches_for_plan`.
+    """
+    budget = _normalize_stop_budget(total_seconds)
+    handled, _survivors = _stop_live_dispatches(budget, plan_id=None)
+    return handled
+
+
+def stop_live_dispatches_for_plan(
+    plan_id: str,
+    total_seconds: float = _PLAN_STOP_BUDGET_DEFAULT_SECONDS,
+) -> List[Any]:
+    """Stop the live dispatches of ``plan_id``; return the survivors.
+
+    The plan-scoped counterpart of :func:`stop_all_live_dispatches`:
+    it walks the registry, picks the dispatches registered under
+    ``plan_id`` and stops those cooperatively — the same sequence, the
+    same "stdout first, signals only if the child does not leave"
+    order — so a child that can leave on its own is never signalled.
+
+    What it does **not** do is touch another plan's dispatches.  A
+    dispatch registered without a plan belongs to no plan and is
+    therefore out of scope here as well.
+
+    Returns the tools whose process was still running when the stop
+    finished: the empty list means every dispatch of the plan is gone.
+    The list is the answer to "what is still out there for this plan",
+    which is what a stop request has to report back.
+
+    An unknown plan is a no-op — nothing is registered under it, so
+    nothing is stopped and the empty list is returned.
+    """
+    if not plan_id:
+        return []
+    budget = _normalize_plan_stop_budget(total_seconds)
+    _handled, survivors = _stop_live_dispatches(budget, plan_id=plan_id)
+    return survivors
 
 
 # ---------------------------------------------------------------------------
@@ -4633,6 +4917,20 @@ class ClaudeCodingTool(CodingTool):
         # are talking about.
         dispatch_plan_id = _dispatch_plan_id()
 
+        # 2026-11-20 — the spawn gate, closed BEFORE anything is
+        # created.  The dispatch registration below reads the same
+        # cancellation, but it runs *after* the ``Popen`` — there is
+        # nothing to kill before the child exists — so it could only
+        # ever refuse a dispatch whose process was already running.
+        # That is the window this gate closes: a plan that is being
+        # stopped gets no process at all, so there is nothing to reap
+        # and nothing for a later stop to count.
+        #
+        # The dispatch kind is what the refusal is logged as: this is
+        # the Claude CLI dispatch the verification round runs its
+        # verification points through.
+        _assert_spawn_allowed(dispatch_plan_id, "vp_dispatch")
+
         # Sub-agent authorization: same iron rule as _run_claude_interactive.
         if self.hook_stdin:
             pdt_authorization = (
@@ -6395,9 +6693,30 @@ class ClaudeCodingTool(CodingTool):
             # ``handle.scoped_tool._current_process``, under the tool's
             # own ``_process_lock``.
             #
-            # Every failure here is swallowed: the registry is a
-            # watchdog aid, and a dispatch that cannot be watched must
-            # still run. The same is true of the unregister below.
+            # 2026-11-20 — this registration is FAIL-CLOSED for a plan
+            # dispatch, and the decision reverses what used to be said
+            # right here. It used to read: "Every failure here is
+            # swallowed: the registry is a watchdog aid, and a dispatch
+            # that cannot be watched must still run." That is what the
+            # incident was made of — a dispatch that registered nothing
+            # left the operator's ``/stop`` with no handle to reach, so
+            # the stop could not kill the process the dispatch had just
+            # started, and the process ran on after the operator had
+            # asked for it to stop.
+            #
+            # So a plan dispatch that cannot register itself (or whose
+            # round was already cancelled) now raises
+            # ``VerificationCancelled`` here instead of running
+            # unwatched. The raise is caught by the ``except
+            # BaseException`` arm further down, which reaps the child
+            # (``_graceful_shutdown``), drops the handle and
+            # unregisters the live dispatch, and then re-raises the
+            # cancellation untouched — so the round reads as "the
+            # operator stopped this", not as a failed round.
+            #
+            # A dispatch with no plan attached is unchanged: it still
+            # returns ``(None, None)`` and still runs. The unregister
+            # below is still best-effort.
             #
             # 2026-11-09 — this registration now runs AFTER the prompt
             # has been fed (see above): it is the step that can block,

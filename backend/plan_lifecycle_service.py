@@ -41,20 +41,37 @@
 requeue 下会分叉：
 
 * **停泊相位（``berth_phase``）** —— 停完之后计划停在哪儿。派发了处理器
-  就是 ``'stopped'``（把相位停到那儿是处理器的事，门面不自己改相位）；
-  idle 时是当前相位 —— 没有东西可停，相位原样不动。
+  就是 ``'stopped'``（把相位停到那儿是处理器与后台层的事，门面不自己改
+  相位）；idle 时是当前相位 —— 没有东西可停，相位原样不动。
 * **最终相位（``final_phase``）** —— 调用方最终看到的相位。停了不迁回
-  就是 ``'stopped'``；迁回成功是 ``'queued'``；迁移失败回落 ``'stopped'``。
+  就是 ``'stopped'``；迁回成功是 ``'queued'``；迁移失败回落 ``'stopped'``；
+  停止仍在进行（相位 ``user_stopping``）而 requeue 已经请求时，报的是
+  **要交付的目标相位** ``'queued'`` —— 迁移由后台层在静默之后完成。
 
 requeue
 -------
-``requeue=True`` 时，门面在停完之后把计划迁回等待相位 ``queued``。那条
+``requeue=True`` 时，计划在停完之后要回到等待相位 ``queued``。那条
 ``stopped → queued`` 的边由状态机承担，门面只发起迁移。
 
-三条边界：
+**迁移发生在静默之后**（PRD G3 / T3）。停是一个过程：处理器把相位停在
+``user_stopping``（停止仍在进行），后台监督者清扫完进程树之后才把它翻到
+``stopped``。``user_stopping`` 没有指向 ``queued`` 的边，硬发只会撞上一条
+**被吞掉**的 ``ValueError`` —— 意图静默消失，计划再也回不了队列。所以：
+
+* 门面在**派发之前**把 requeue 意图记下（``stop_state.arm_requeue``），
+  停完之后读一次相位：相位还在 ``user_stopping`` 时**不发起**迁移，把
+  意图留给后台层（``routes/execution.py`` 的 ``_finalize_execution_stop``
+  在静默窗口之后交付它），``final_phase`` 报的是**要交付的目标相位**；
+* 相位已经是 ``stopped`` / ``failed``（旧路径：处理器同步把相位停好了）
+  → 当场迁回，行为一字不变。
+
+五条边界：
 
 * **idle 忽略 requeue** —— 没有在跑的东西就没有可停的。把一个 idle 的
   计划塞进队列等于凭空多出一个待执行的计划。
+* **只停验证时这一轮不交付** —— 验证侧的相位表里没有指向 ``queued`` 的
+  边。记一条 WARNING 点名计划说没交付，``detail`` 里也不许出现
+  ``'+requeue'``：迁移没发生却宣称迁回，是谎报。
 * **迁移失败不外抛** —— ``transition_to`` 抛 ``ValueError`` 时记一条
   warning，最终相位回落 ``'stopped'``。stop 本身是成功的，「没进队列」
   不是 stop 的失败：让它冒泡会把一次成功的停变成 500。
@@ -66,10 +83,7 @@ requeue
   ``stopped``（终态）—— 计划被列表过滤掉，用户点了「重新排队」，卡片却
   从页面上消失了。见 ``_clear_terminal_exec_verdict``。
 
-requeue 的前提是**处理器把计划停在了 ``'stopped'``**（执行 stop 是这样
-的）。处理器停在别处时（验证 stop 把相位停在 ``'verification'``），迁移
-就是非法的 —— 于是走上面那条「迁移失败不外抛」的边界：记 warning，最终
-相位回落 ``'stopped'``。门面不替处理器改相位：停到哪儿是处理器的事。
+门面不替处理器改相位：停到哪儿是处理器的事。
 
 裁决：停到底有没有停成
 ----------------------
@@ -359,6 +373,7 @@ class PlanLifecycleService:
         :raises fastapi.HTTPException: 处理器抛出的异常原样透传。
         """
         import server as _server
+        import stop_state
 
         plan_dir = _server._plan_dir(plan_id)
         if not plan_dir.exists():
@@ -377,9 +392,16 @@ class PlanLifecycleService:
             if execution_alive:
                 # 异常态：两边都在飞。验证是外层循环，它不停就会在执行
                 # 被停之后又拉起新一轮 —— 所以先停验证，再停执行。
+                #
+                # requeue 意图在**派发之前**记下：停是一个过程，迁移要
+                # 等它真的结束（见下面那段）。
+                if requeue:
+                    stop_state.arm_requeue(plan_id)
                 verdict = self._stop_execution(plan_id)
                 detail = "both"
         elif execution_alive:
+            if requeue:
+                stop_state.arm_requeue(plan_id)
             verdict = self._stop_execution(plan_id)
             dispatched = "execution"
             detail = "stop_execution"
@@ -405,11 +427,15 @@ class PlanLifecycleService:
         if self._kill_incomplete(verdict):
             # 进程还活着 → 不算停。相位原样不动，不写 checkpoint，也不
             # 迁回队列：迁回队列等于把这个还在跑的计划排进下一次执行。
+            # 记下的意图一并丢掉 —— 停没停成，就没有「停完之后」。
+            stop_state.clear_requeue(plan_id)
             return self._kill_incomplete_result(plan_id, plan_dir, verdict,
                                                 dispatched)
 
-        # 停完了。停泊相位恒为 'stopped'：把相位停到那儿是处理器的事，
-        # 门面不自己改相位。
+        # 停完了。**停泊是后台层的动作**：异步契约下处理器只把相位停在
+        # ``user_stopping``（停止仍在进行），后台监督者清扫完进程树之后
+        # 才把它翻到 ``stopped``（PRD G3）。门面不自己改相位 —— 它把
+        # **要交付的目标相位**报出来。
         berth_phase = "stopped"
         final_phase = berth_phase
         # checkpoint 只读回显：处理器刚写下的那一份。恢复是恢复路径的事，
@@ -417,15 +443,40 @@ class PlanLifecycleService:
         checkpoint = read_pause_checkpoint(plan_dir)
 
         if requeue:
-            # detail 说的是**动作**（停了，并请求了迁回）；迁回成没成功
-            # 看 final_phase。
-            detail = f"{detail}+requeue"
-            if self._requeue_to_queued(plan_dir):
-                final_phase = "queued"
-                # 迁回队列之后，执行行上那条终态裁决必须一起清掉 ——
-                # 否则两个裁决互相矛盾，计划会从列表里消失（见
-                # ``_clear_terminal_exec_verdict``）。
-                self._clear_terminal_exec_verdict(plan_id)
+            if dispatched == "verification":
+                # 只停到了验证：验证侧的相位表里没有指向 ``queued`` 的边，
+                # 这一轮**不交付** queued。detail 里也不许出现 '+requeue'
+                # —— 迁移根本没发生，宣称迁回是谎报。
+                logger.warning(
+                    "plan_lifecycle_requeue_not_delivered: plan=%s the stop "
+                    "only reached the verification round and the "
+                    "verification phases have no edge to the 'queued' "
+                    "phase; the plan is not requeued",
+                    plan_id,
+                )
+            else:
+                # detail 说的是**动作**（停了，并请求了迁回）；迁回成没
+                # 成功看 final_phase。
+                detail = f"{detail}+requeue"
+                phase = self._current_phase(plan_dir)
+                if phase == "user_stopping":
+                    # 停止仍在进行。``user_stopping`` 没有指向 ``queued``
+                    # 的边（``plan_state.PHASE_TRANSITIONS``），硬发只会
+                    # 撞上一条**被吞掉**的 ``ValueError``：意图静默消失，
+                    # 计划再也回不了队列（用户点了「重新排队」，卡片却从
+                    # 页面上消失）。所以这一轮**不发起**迁移 —— 意图留给
+                    # 后台层，它在静默窗口之后交付。
+                    final_phase = "queued"
+                else:
+                    # 旧路径：处理器同步把相位停好了 → 当场迁回。
+                    if self._requeue_to_queued(plan_dir):
+                        final_phase = "queued"
+                        # 迁回队列之后，执行行上那条终态裁决必须一起清掉
+                        # —— 否则两个裁决互相矛盾，计划会从列表里消失（见
+                        # ``_clear_terminal_exec_verdict``）。
+                        self._clear_terminal_exec_verdict(plan_id)
+                        # 意图交付掉了 —— 不许留着让下一次停止再交付一遍。
+                        stop_state.clear_requeue(plan_id)
 
         return LifecycleResult(
             plan_id=plan_id,
