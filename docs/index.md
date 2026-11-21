@@ -54,6 +54,8 @@ That has three consequences you can observe:
 - [Running it](operations/running.md) — local-only scope, the request
   guard, and the UI's fetch contract.
 - [Security](security.md) — the trust model and how to report a problem.
+- [Project rules](development/project-rules.md) — the rules learned from real
+  failures, and the failure each one prevents.
 
 ## Requirements
 
