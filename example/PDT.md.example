@@ -23,3 +23,11 @@
 # * 本文件永远在 base 位、排在最前，且不能覆盖框架写死的红线。
 # * 单文件上限 8192 字节，超限截断并记一条 WARNING（不报错）。
 # * 改完按 mtime 判失效，下一次调用即生效，不需要重启任何进程。
+
+#
+# 例：项目规则（替换或删掉）
+# * 动测试、CI 或开 PR 前先读 docs/development/project-rules.md
+#   （中文镜像 project-rules.zh.md），每条都写明它防的故障。
+# * 承重：改契约同步改旧测试；异步测试等终态；测试不依赖模块身份；一份
+#   工作一个 PR，修复走 force-with-lease；每个 commit 要 CI 绿；合入后
+#   核对 git diff --stat <旧main>..main 只含该 PR 的文件。
