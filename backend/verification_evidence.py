@@ -132,6 +132,12 @@ _LINE_TOLERANCE = 2
 #: :func:`_uses_ci_output_contract`).
 EVIDENCE_REQUIRED_METHODS = ("code_review", "ui_validation", "e2e")
 
+#: The fields a point uses to declare an executable entry: ``full_ci``
+#: points declare ``ci_entry``, command-kind ``e2e`` points declare
+#: ``entry_command``.  Both name a command the framework runs and
+#: grades on its exit code.
+_ENTRY_FIELDS = ("ci_entry", "entry_command")
+
 
 @dataclass
 class EvidenceIssue:
@@ -854,6 +860,131 @@ def read_citation_files(plan_dir: Path, vp_id: str) -> List[str]:
     return files
 
 
+def _declared_entry(vp: Dict[str, Any]) -> str:
+    """The command this point declares it is run by."""
+    for field in _ENTRY_FIELDS:
+        value = str((vp or {}).get(field) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _same_command(one: str, other: str) -> bool:
+    """Are two command lines the same command?  Whitespace is noise."""
+    return " ".join(str(one).split()) == " ".join(str(other).split())
+
+
+def _projected_records(evidence: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The records a projected verdict kept of the runner's evidence.
+
+    ``_verdict_to_result`` (in :mod:`verification_agent`) flattens a
+    verdict's evidence into ``{"details": str, "raw": list[str]}`` — and
+    the deterministic runner's evidence dict survives inside ``raw`` as
+    one JSON string (``_verdict_from_outcome`` in
+    :mod:`verification_subagent` dumps it there).
+
+    So a line of ``raw`` that parses back into an object *is* a record;
+    a prose line, a stream excerpt or a truncated tail is not.  Nothing
+    else about a line makes it a record.
+    """
+    raw = evidence.get("raw")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    records: List[Dict[str, Any]] = []
+    for item in raw:
+        if isinstance(item, dict):
+            records.append(item)
+            continue
+        if not isinstance(item, str):
+            continue
+        try:
+            parsed = json.loads(item)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(parsed, dict):
+            records.append(parsed)
+    return records
+
+
+def _projected_ran_the_declared_entry(
+    vp: Dict[str, Any], evidence: Dict[str, Any], declared: str,
+) -> bool:
+    """Did the projected verdict carry the runner's record of the entry?
+
+    This is the same question the flat branch asks, asked of the shape
+    the verdict really has by the time it reaches the gate.
+
+    It is deliberately narrowed to the points the **framework** judges
+    itself (:func:`e2e_kind` is the runner's own reading — the same one
+    :func:`_uses_ci_output_contract` uses): only those points' raw
+    lines are machine-written by the deterministic runner, so a record
+    of the declared entry together with the exit code the framework
+    read is a proof that the question was answered.  A browser point's
+    evidence is the sub-agent's prose, and prose is not a runner
+    artifact — it buys no exemption.
+
+    The record has to carry **both** halves: the entry it ran and the
+    exit code that came back.  A record of another command, a command
+    without an exit code, or an exit code without a command, proves
+    nothing and does not qualify.
+    """
+    if e2e_kind(vp) != E2E_KIND_COMMAND:
+        return False
+    for record in _projected_records(evidence):
+        if record.get("exit_code") is None:
+            continue
+        if any(
+            _same_command(str(record.get(field) or ""), declared)
+            for field in _ENTRY_FIELDS
+        ):
+            return True
+    return False
+
+
+def _ran_the_declared_entry(
+    vp: Dict[str, Any], verdict: Dict[str, Any],
+) -> bool:
+    """Did this verdict run the very command the point declared?
+
+    A command-kind point asks one question — does *this* command exit
+    0 — and a verdict that records the same command together with the
+    exit code the framework read has answered it by construction.  The
+    file names in its output are the log of what ran, not the subject
+    of the question.
+
+    The rule is deliberately narrow: the point must have declared an
+    entry, the verdict must record an exit code, and the command it
+    records must be that entry — one and the same command line.  A
+    verdict that ran something else, or that recorded no exit code,
+    does not qualify.
+
+    Two shapes carry that proof, and both are read here:
+
+    * the **flat** one — the runner's evidence dict as it is
+      (``{"entry_command": ..., "exit_code": 0}``);
+    * the **projected** one — what the agent's projection leaves of it
+      (``{"details": ..., "raw": [...]}``, the runner's dict surviving
+      as one JSON string inside ``raw``).  2026-11-18: the flat shape
+      is not the one that reaches the gate, so reading only the flat
+      shape made this rule dead code on the real path — a command
+      point whose declared entry had just exited 0 was downgraded for
+      "answering another question", because the log of what ran names
+      the test files and never names the referenced script.
+    """
+    declared = _declared_entry(vp)
+    if not declared:
+        return False
+    evidence = verdict.get("evidence")
+    if not isinstance(evidence, dict):
+        return False
+    if evidence.get("exit_code") is not None and any(
+        _same_command(str(evidence.get(field) or ""), declared)
+        for field in _ENTRY_FIELDS
+    ):
+        return True
+    return _projected_ran_the_declared_entry(vp, evidence, declared)
+
+
 def verdict_subject_mismatch(
     vp: Dict[str, Any],
     verdict: Dict[str, Any],
@@ -872,6 +1003,12 @@ def verdict_subject_mismatch(
         vp.get("verification_method") or vp.get("method") or ""
     ).strip()
     if method not in EVIDENCE_REQUIRED_METHODS:
+        return None
+    if _ran_the_declared_entry(vp, verdict):
+        # 2026-11-14（VP-022）：command 类验证点问的是「这条命令退出码
+        # 是不是 0」。裁决记录着同一条命令与它的退出码，就已经回答了
+        # 这道题；输出里的文件名是这次运行的日志，不是这道题的主语 ——
+        # 不能拿它去和 expected_result 里提到的参考路径比对。
         return None
     root = _project_root(project_dir, vp)
     if root is None:

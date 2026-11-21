@@ -264,6 +264,21 @@ def _wait_for_phase(
     return _read_phase(db_path, plan_id) == phase
 
 
+def _wait_for_stop_record_cleared(*, timeout: float = 30.0) -> bool:
+    """Wait for the stop's finalize to clear the record; True when it did.
+
+    The finalize parks the phase first and clears the record last — the
+    reap and the requeue sit between them — so the phase reaching
+    ``stopped`` is not yet the end of the stop.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if stop_state.get(PLAN_ID) is None:
+            return True
+        time.sleep(0.05)
+    return stop_state.get(PLAN_ID) is None
+
+
 def _survivor_pids(survivors: List[Dict[str, Any]]) -> List[int]:
     return [int(s.get("pid") or 0) for s in survivors]
 
@@ -407,7 +422,7 @@ def test_execution_start_works_after_the_stop_is_finalized(env, client, monkeypa
         f"the plan never reached the stopped phase — it is "
         f"{_read_phase(db_path)!r}"
     )
-    assert stop_state.get(PLAN_ID) is None, (
+    assert _wait_for_stop_record_cleared(), (
         "the finalize did not clear the stop record — the start would "
         "stay refused forever"
     )

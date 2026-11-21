@@ -6005,7 +6005,6 @@ from verification_loop import (  # noqa: E402,F401
     _recover_verification_states,
     _reconcile_orphaned_verification_stages,
     _mark_failed_dead,
-    _update_plan_state_to_terminal,
     _mark_verification_failed_dead,
     _lazy_check_execution,
     _normalized_vp_token,

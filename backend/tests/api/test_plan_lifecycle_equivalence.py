@@ -656,7 +656,7 @@ def test_start_equivalence_for_both_checkpoint_kinds(
 
 
 def test_concurrent_stop_converges_to_stopped(
-    tmp_path, fake_executor,
+    tmp_path, fake_executor, monkeypatch,
 ):
     """两个线程同时 POST stop → 相位收敛到 ``stopped``，且只停了一次。
 
@@ -681,6 +681,16 @@ def test_concurrent_stop_converges_to_stopped(
     计数器必须从 1 变成 2。没有它，「计数器其实是死的」和「真的只停了一次」
     这两种情况在断言里长得一模一样。
     """
+    # 静默窗口是部署的策略，用例把它缩短；后台层等计划安静后才落终态。
+    monkeypatch.setenv("PDT_STOP_QUIET_SECONDS", QUIET_SECONDS)
+    real_start = stop_supervisor.start
+
+    def _fast_start(started_plan_id, **kwargs):
+        kwargs.setdefault("quiet_seconds", float(QUIET_SECONDS))
+        return real_start(started_plan_id, **kwargs)
+
+    monkeypatch.setattr(stop_supervisor, "start", _fast_start)
+
     project_dir = tmp_path / "project"
     project_dir.mkdir(parents=True, exist_ok=True)
 
@@ -704,7 +714,7 @@ def test_concurrent_stop_converges_to_stopped(
     )
 
     # 收敛：相位停在 stopped。
-    assert _routing_phase(plan_id) == "stopped", (
+    assert _wait_for_phase(plan_id, "stopped"), (
         f"并发 stop 之后相位是 {_routing_phase(plan_id)!r}"
     )
 

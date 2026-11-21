@@ -19,10 +19,10 @@ These tests pin the contract:
      by deriving ``verification_status`` from ``results.status``.
   3. ``repair_stale_terminal_state`` is a no-op when the row is
      already consistent.
-  4. ``repair_stale_terminal_state`` mirrors the repaired
-     ``verification_status`` to ``plan_routing.verification`` JSON
-     column, so the ``/api/verification/{id}/progress`` endpoint
-     (which reads via PlanState) sees the same verdict.
+  4. ``repair_stale_terminal_state`` no longer touches the routing
+     row: the routing-row mirror of the verification state was
+     removed (arch decision point 3) and the authoritative
+     ``plan_verification`` row is the only home of that state.
   5. ``complete_round`` succeeds and ``verification_status`` ends up
      matching ``status`` (the happy-path regression).
 """
@@ -255,45 +255,6 @@ def test_repair_is_noop_when_consistent(tmp_path):
     )
 
 
-def test_repair_mirrors_to_plan_routing_verification_column(tmp_path):
-    """``/api/verification/{id}/progress`` reads from
-    ``plan_routing.verification`` JSON column via ``PlanState``. The
-    repair must mirror the verdict there so the card layer sees the
-    same status as ``plan_verification.verification_status``.
-    """
-    from state_machine.repositories.verification_repository import (
-        VerificationRepository,
-    )
-    conn = _open_state_machine_db(tmp_path)
-    repo = VerificationRepository(conn)
-    plan_id = "test-mirror"
-    _seed_plan_row(
-        conn,
-        plan_id,
-        verification_status="pending",
-        routing_verification={"status": "pending", "round": 0,
-                              "max_rounds": 3, "stop_reason": None},
-        results={
-            "status": "failed",
-            "stop_reason": "vp_034_timeout",
-            "recorded_by": "_persist_verification_terminal",
-        },
-    )
-
-    repo.repair_stale_terminal_state(plan_id)
-
-    rrow = conn.execute(
-        "SELECT verification FROM plan_routing WHERE plan_id = ?", (plan_id,)
-    ).fetchone()
-    routing_v = json.loads(rrow[0])
-    assert routing_v["status"] == "failed", (
-        f"plan_routing.verification.status not mirrored: {routing_v!r}"
-    )
-    assert routing_v.get("stop_reason") == "vp_034_timeout", (
-        f"plan_routing.verification.stop_reason not mirrored: {routing_v!r}"
-    )
-
-
 def test_repair_skips_non_persist_terminal_records(tmp_path):
     """``results.recorded_by`` not equal to
     ``_persist_verification_terminal`` means the terminal write came
@@ -440,14 +401,16 @@ def test_init_round_clears_stale_results_but_keeps_verdicts(tmp_path):
     )
 
 
-def test_reset_round_counter_clears_envelope_and_mirror_and_reset_sticks(tmp_path):
+def test_reset_round_counter_clears_envelope_and_reset_sticks(tmp_path):
     """The 2026-09-15 wedge: ``reset_rounds`` wrote
     ``verification_status='pending'`` but left the old terminal
     ``results`` envelope in place — so the next /progress read's
     auto-repair re-stamped the row to ``failed`` and the reset was
-    undone within seconds. The reset must clear the envelope AND
-    re-sync the ``plan_routing.verification`` mirror, after which a
-    repair pass must be a no-op ("the reset sticks").
+    undone within seconds. The reset must clear the envelope, after
+    which a repair pass must be a no-op ("the reset sticks").
+
+    2026-11-04 (arch decision point 3): the routing-row mirror of the
+    verification state is gone, so the reset no longer re-syncs it.
     """
     from state_machine.repositories.verification_repository import (
         VerificationRepository,
@@ -480,16 +443,6 @@ def test_reset_round_counter_clears_envelope_and_mirror_and_reset_sticks(tmp_pat
     )
     assert row["round"] == 0
     assert row["max_rounds"] == 3
-
-    mirror = json.loads(
-        conn.execute(
-            "SELECT verification FROM plan_routing WHERE plan_id = ?",
-            (plan_id,),
-        ).fetchone()[0]
-    )
-    assert mirror["status"] == "pending", f"routing mirror not re-synced: {mirror}"
-    assert mirror["stop_reason"] is None, mirror
-    assert mirror["round"] == 0
 
     # The exact /progress read path that used to un-reset the row.
     assert repo.repair_stale_terminal_state(plan_id) is None, (

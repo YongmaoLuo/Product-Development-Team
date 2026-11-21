@@ -127,12 +127,20 @@ def _write_progress(
     skipped_vps: List[str] = (),
     layer_summaries: Dict[str, Dict[str, int]] = None,
     updated_at: str = "2026-06-07T10:05:00.000000Z",
+    verification_round: int = 0,
 ) -> Path:
     """Write a complete ``verification_progress_state.json`` to ``plan_dir``.
 
     Mirrors the on-disk layout :class:`VerificationExecutor`
     produces — every field the endpoint reads is set explicitly so
     the tests pin the full schema.
+
+    ``verification_round`` is the round stamped on the AUTHORITATIVE
+    ``plan_verification`` row (architecture decision 1): it is the only
+    store of the round the ``/progress`` endpoint reports. The default
+    is 0 — the column's default — so callers that do not care about
+    the round keep the behaviour they had before the parameter
+    existed.
     """
     progress_payload = {
         "plan_id": plan_id,
@@ -172,10 +180,17 @@ def _write_progress(
     if existing is not None:
         # Use a quick UPDATE on the progress_state column instead of
         # delete+insert so the row's started_at is preserved across
-        # helper invocations within the same test.
+        # helper invocations within the same test. The round is
+        # re-stamped here too — it is part of the same authoritative
+        # row.
+        encoded = repo._encode_fields({
+            "progress_state": progress_payload,
+            "round": verification_round,
+        })
         repo._conn.execute(
-            "UPDATE plan_verification SET progress_state = ? WHERE plan_id = ?",
-            (repo._encode_fields({"progress_state": progress_payload})["progress_state"], plan_id),
+            "UPDATE plan_verification SET progress_state = ?, round = ? "
+            "WHERE plan_id = ?",
+            (encoded["progress_state"], encoded["round"], plan_id),
         )
         repo._conn.commit()
     else:
@@ -183,6 +198,7 @@ def _write_progress(
             plan_id,
             verification_status="running",
             progress_state=progress_payload,
+            round=verification_round,
         )
     conn.close()
     return db_path
@@ -266,11 +282,13 @@ def _write_plan_state(
 ) -> None:
     """Write a minimal ``plan_state.json`` to ``plan_dir``.
 
-    The ``/progress`` endpoint falls back to this file for
-    ``verification_status`` / ``verification_round`` when the
-    in-memory ``_verification_state`` dict is empty (e.g. after a
-    server restart). The endpoint should still return the right
-    answer in that case.
+    The authoritative ``plan_verification`` row is the ONLY source of
+    the lifecycle fields (``verification_status`` / ``verification_round``)
+    — architecture decision 1. ``plan_state.json`` is a fallback the
+    ``/progress`` endpoint only reaches when there is NO state database
+    at all; with a state database present it must not be read for the
+    round. The file is still written here because it is part of a real
+    plan's on-disk layout.
     """
     (plan_dir / "plan_state.json").write_text(
         json.dumps(
@@ -312,8 +330,8 @@ def test_progress_returns_schema(
     Specifically:
 
       * ``plan_id`` / ``verification_status`` / ``verification_round``
-        are read from the in-memory ``_verification_state`` dict
-        (or the ``plan_state.json`` fallback).
+        are read from the AUTHORITATIVE ``plan_verification`` row —
+        the only source of the lifecycle fields.
       * ``current_vp`` is a dict with the in-flight VP's id /
         title / layer / started_at (started_at recovered from the
         JSON-lines log).
@@ -371,6 +389,7 @@ def test_progress_returns_schema(
             "L2": {"total": 1, "completed": 0, "failed": 0, "skipped": 0},
             "L3": {"total": 1, "completed": 0, "failed": 0, "skipped": 0},
         },
+        verification_round=1,
     )
     _write_vp_start_log(
         plan_dir,
@@ -386,10 +405,11 @@ def test_progress_returns_schema(
         verification_round=1,
     )
 
-    # The /progress endpoint falls back to plan_state.json when the
-    # in-memory _verification_state dict is empty (which it is in
-    # unit tests — no live orchestrator). Seed the plan_state.json
-    # so the response picks up the right status / round.
+    # The lifecycle fields come from the AUTHORITATIVE
+    # ``plan_verification`` row — written by ``_write_progress`` above
+    # (``verification_round=1``). plan_state.json is still seeded: it
+    # is part of a real plan's on-disk layout, but the endpoint must
+    # not read the round from it.
     resp = client.get(f"/api/verification/{plan_id}/progress")
     assert resp.status_code == 200, resp.text
 

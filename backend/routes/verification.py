@@ -2256,10 +2256,12 @@ def reset_verification(
             )
 
         # ``reset_round_counter`` already does the transition-free write of
-        # the counter + status + results + the plan_routing.verification
-        # mirror (2026-09-15 fix: without the envelope clear,
-        # ``repair_stale_terminal_state`` re-derives the old terminal from
-        # it on the very next /progress read and un-resets the row).
+        # the counter + status + results.  The authoritative row
+        # (``plan_verification``) is the only place the verification state
+        # lives (architecture decision point 1); the
+        # ``plan_routing.verification`` column is not a state source any
+        # more (architecture decision point 3) — it holds the frozen
+        # baseline, and a reset does not touch it.
         verification.reset_round_counter(
             plan_id,
             round_n=req.restart_at_round - 1,
@@ -2291,9 +2293,18 @@ def reset_verification(
             # at ``verification_repairing`` — so a reset plan read as
             # "repairing" to the API and "idle" to the scheduler. One
             # column, one value now.
+            #
+            # 2026-11-04: this statement used to clear the
+            # ``verification`` column as well.  It must not: that column
+            # is not a state source any more (architecture decision
+            # point 3) — it holds the frozen baseline and the hash of the
+            # document it was frozen from, and a whole-column clear took
+            # the baseline with it.  The reset's verdict semantics live
+            # in the authoritative ``plan_verification`` row, which
+            # ``reset_round_counter`` above already rewrote.
             conn.execute(
                 "UPDATE plan_routing SET current_phase = ?, substage = NULL, "
-                "verification = NULL, version = version + 1, updated_at = ? "
+                "version = version + 1, updated_at = ? "
                 "WHERE plan_id = ?",
                 ("verification", now, plan_id),
             )
@@ -3352,13 +3363,15 @@ def _verification_progress_body(
     carries ``current_layer: None`` and ``layer_summaries: {}``;
     the per-VP ``current_vp.layer`` field is removed entirely.
 
-    In-memory ``_verification_state`` is consulted only for the
-    cheap summary fields (``verification_status``,
-    ``verification_round``); the per-VP scheduler state lives in
-    the state-machine SQLite row's ``progress_state`` column
-    (parsed JSON via VerificationRepository.summary) so the
-    response is identical whether the in-memory dict is populated
-    or the server was just restarted.
+    The three lifecycle fields (``verification_status`` /
+    ``verification_round`` / ``stop_reason``) come from the
+    ``plan_verification`` row — the same authoritative record
+    ``GET /api/verification/{id}/status`` reads — so the two
+    endpoints cannot answer the same question two ways.  The per-VP
+    scheduler state lives in that row's ``progress_state`` column
+    (parsed JSON via VerificationRepository.summary), so the response
+    is identical whether the in-memory dict is populated or the server
+    was just restarted.
     """
     plan_dir = _server._plan_dir(plan_id)
 
@@ -3674,42 +3687,68 @@ def _verification_progress_body(
         "pending": len(pending_vps),
     }
 
-    # Cheap summary fields from the in-memory dict first (matches
-    # /status), then fall back to plan_state.json so the endpoint
-    # returns the right answer after a server restart.
-    mem_state = _server._verification_state.get(plan_id, {}) or {}
-    verification_status = mem_state.get("verification_status")
-    verification_round = mem_state.get("verification_round")
-    # 2026-09-19: ``stop_reason`` joined the payload so clients can tell
-    # *why* a loop ended. The notifier's header resolver has a dedicated
-    # "⏹ 循环停止(round 已达上限)" branch keyed on
-    # ``stop_reason == "max_rounds_reached"``, but it read this field off
-    # ``/progress`` — which never carried it — and off
-    # ``summary.state.verification.stop_reason``, which is a third stale
-    # copy. The authoritative value is the
+    # The three lifecycle fields — status, round and stop reason — are
+    # owned by ``plan_verification``: the row
+    # ``GET /api/verification/{id}/status`` reads (architecture decision
+    # point 2 — consumers read only authoritative values).
+    #
+    # Until 2026-11-04 this read the in-memory dict first and fell back
+    # to ``PlanState.get_state()["verification"]`` — the
+    # ``plan_routing.verification`` MIRROR column: a copy the
+    # verification loop used to write on its way past.  The mirror
+    # stopped receiving writes (architecture decision point 3), so that
+    # fallback could only answer with a stale value — a plan whose
+    # authoritative row said "passed / round 2" reported whatever the
+    # mirror last held.  This was the mirror's last reader.
+    #
+    # ``sm is None`` — no state database at all — keeps the PlanState
+    # fallback: there is no authoritative row to read, and the plan
+    # state is then the only thing that knows anything.
+    #
+    # ``stop_reason`` in particular: 2026-09-19 added it to the payload
+    # so clients can tell *why* a loop ended (the notifier's header
+    # resolver keys on ``stop_reason == "max_rounds_reached"``), and
+    # the authoritative value has always been the
     # ``plan_verification.verification_stop_reason`` column.
-    stop_reason: Optional[str] = mem_state.get("stop_reason")
-    if verification_status is None or verification_round is None or stop_reason is None:
+    verification_status: Optional[str] = None
+    verification_round: Optional[int] = None
+    stop_reason: Optional[str] = None
+    if sm is not None:
+        _conn, routing_repo, _execution, _verification_repo, _artifact = sm
+        record = verification_row if isinstance(verification_row, dict) else {}
+        # /status reads the same row and normalizes the same way: the
+        # two endpoints must not answer the same question two ways.
+        verification_status = _normalize_verification_status(
+            record.get("verification_status") or "not_started"
+        )
+        verification_round = record.get("round", 0)
+        stop_reason = record.get("verification_stop_reason")
+        # A plan whose phase says "verification is running" IS running:
+        # the round row is stamped when the round *ends*, the phase is
+        # what says one is in flight.  Same rule as /status.
+        try:
+            route = (
+                routing_repo.current(plan_id)
+                if routing_repo is not None
+                else None
+            )
+        except Exception:
+            route = None
+        if (
+            isinstance(route, dict)
+            and route.get("current_phase") == "verification_running"
+        ):
+            verification_status = "running"
+    else:
         try:
             ps = _server.PlanState(plan_dir)
             v = ps.get_state().get("verification", {}) or {}
-            if verification_status is None:
-                verification_status = v.get("status", "not_started")
-            if verification_round is None:
-                verification_round = v.get("round", 0)
-            if stop_reason is None:
-                stop_reason = v.get("stop_reason")
+            verification_status = v.get("status", "not_started")
+            verification_round = v.get("round", 0)
+            stop_reason = v.get("stop_reason")
         except Exception:
-            verification_status = verification_status or "not_started"
-            verification_round = verification_round if verification_round is not None else 0
-    if stop_reason is None and sm is not None:
-        try:
-            _, _rr, _ee, _vr, _aa = sm
-            stop_reason = (_vr.summary(plan_id) or {}).get(
-                "verification_stop_reason"
-            )
-        except Exception:
-            stop_reason = None
+            verification_status = "not_started"
+            verification_round = 0
 
     # ``current_vp`` above answers "which VP is executing". This answers
     # "what is the round doing when none is" — planning, judging,
@@ -5269,17 +5308,6 @@ def force_verification_terminal(plan_id: str):
         state["stop_reason"] = "user_force_terminal"
         state["updated_at"] = forced_at
         state["ended_at"] = forced_at
-
-    # Update the ``plan_routing.verification`` JSON column that
-    # ``/api/plan/{id}/summary`` reads via ``PlanState._sqlite_row_to_state``.
-    # Without this, ``state.verification.status`` would still show
-    # ``running`` even though ``plan_routing.stage`` is now
-    # ``failed`` — the Feishu notifier (which reads via
-    # ``/api/plan/{id}/summary``) would then render a stale "still
-    # verifying" card despite the CAS having succeeded. See the helper's
-    # docstring for why we use a raw SQL UPDATE instead of
-    # ``PlanState._save_state`` (the latter would clobber ``stage``).
-    _server._update_plan_state_to_terminal(plan_id, "user_force_terminal")
 
     # Record in watchdog stats so the operator can see this was a
     # user-driven force-terminal, distinct from the three automatic
