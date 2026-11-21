@@ -87,14 +87,22 @@ def _write_plan_state(
     plan_dir: Path,
     phase: str,
     completed_phases: Optional[List[str]] = None,
-    verification: Optional[Dict[str, object]] = None,
+    baseline: Optional[Dict[str, object]] = None,
 ) -> None:
     """把计划直接放在某个阶段上。
 
-    写的是 ``plan_routing`` 那一行：阶段、已完成阶段、审核轮次、标志位与
-    ``verification`` 段（基线就冻在这里）。读侧
-    :meth:`PlanState._load_state_from_sqlite` 读的也是这一行 —— 测试与生产
-    走同一条路。
+    写的是 ``plan_routing`` 那一行：阶段、已完成阶段、审核轮次与标志位。
+    读侧 :meth:`PlanState._load_state_from_sqlite` 读的也是这一行 —— 测试与
+    生产走同一条路。
+
+    ``baseline`` 是可选的：基线经
+    :meth:`RoutingRepository.write_verification_baseline` 落到该列的
+    ``baseline`` 栏 —— 那是这一列唯一的写入口，写的也只有基线。
+
+    四个生命周期键（``status`` / ``round`` / ``max_rounds`` /
+    ``stop_reason``）不在这里：它们属于权威表 ``plan_verification``，而
+    ``plan_routing.verification`` 这一列已经不再承载验证状态（镜像列只保留
+    基线）。所以这个 helper 一个生命周期键都不写 —— 测试不充当第二个写者。
     """
     from config_paths import resolve_state_db_path
     from state_machine.db.connection import open as open_db
@@ -104,22 +112,19 @@ def _write_plan_state(
     conn = open_db(resolve_state_db_path())
     try:
         migrate(conn)
-        RoutingRepository(conn).write_plan_state(
+        repo = RoutingRepository(conn)
+        repo.write_plan_state(
             plan_dir.name,
             phase=phase,
             completed_phases=list(completed_phases or []),
             review_rounds={},
             flags={},
-            verification=verification
-            if verification is not None
-            else {
-                "status": "pending",
-                "round": 0,
-                "max_rounds": 3,
-                "stop_reason": None,
-            },
             last_updated=None,
         )
+        if baseline is not None:
+            # 顺序要紧：先写路由行（``write_verification_baseline`` 在行不
+            # 存在时会用默认相位 ``interview`` 另建一行），再落基线。
+            repo.write_verification_baseline(plan_dir.name, baseline)
     finally:
         conn.close()
 
@@ -227,13 +232,7 @@ def test_verification_branch_without_execution_is_allowed(
         plan_dir,
         "verification",
         completed_phases=[],
-        verification={
-            "status": "pending",
-            "round": 0,
-            "max_rounds": 3,
-            "stop_reason": None,
-            "baseline": _frozen_baseline(upstream),
-        },
+        baseline=_frozen_baseline(upstream),
     )
 
     state = PlanState(plan_dir)

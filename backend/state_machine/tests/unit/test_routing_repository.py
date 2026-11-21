@@ -540,7 +540,6 @@ def test_try_mark_phase_completed_phases_dedup(
         completed_phases=["executing"],
         review_rounds={},
         flags={},
-        verification={},
         last_updated=None,
     )
 
@@ -622,7 +621,6 @@ def _write_metadata(
         completed_phases=completed_phases,
         review_rounds={},
         flags={},
-        verification={},
         last_updated=None,
         completed_phases_mode=mode,
     )

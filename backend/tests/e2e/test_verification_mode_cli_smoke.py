@@ -493,7 +493,8 @@ def _record_baseline(plan_id: str, repo_dir: Path, head_sha: str) -> None:
     """把基线与起始阶段记进状态库（阶段 ``prd_review``）。
 
     走 repository 层而不是手搓文件：读侧找的是冻结那一步放进去的那一份，
-    手搓一份就是第二个来源。
+    手搓一份就是第二个来源。基线落在 ``plan_routing.verification`` 列里，
+    而那一段唯一的写者是 ``RoutingRepository.write_verification_baseline``。
     """
     from config_paths import resolve_state_db_path
     from state_machine.db.connection import open as open_db
@@ -503,25 +504,23 @@ def _record_baseline(plan_id: str, repo_dir: Path, head_sha: str) -> None:
     conn = open_db(resolve_state_db_path())
     try:
         migrate(conn)
-        RoutingRepository(conn).write_plan_state(
+        repo = RoutingRepository(conn)
+        repo.write_plan_state(
             plan_id,
             phase="prd_review",
             completed_phases=[],
             review_rounds={},
             flags={},
-            verification={
-                "status": "pending",
-                "round": 0,
-                "max_rounds": 1,
-                "stop_reason": None,
-                "baseline": {
-                    "repo_dir": str(repo_dir),
-                    "ref": PR_REF,
-                    "commit_sha": head_sha,
-                    "pr_number": PR_NUMBER,
-                },
-            },
             last_updated=None,
+        )
+        repo.write_verification_baseline(
+            plan_id,
+            {
+                "repo_dir": str(repo_dir),
+                "ref": PR_REF,
+                "commit_sha": head_sha,
+                "pr_number": PR_NUMBER,
+            },
         )
     finally:
         conn.close()

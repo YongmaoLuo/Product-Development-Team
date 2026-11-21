@@ -187,7 +187,8 @@ def _record_routing_row(
     """写 ``plan_routing`` 行：阶段 + 记录下来的基线。
 
     基线住在 routing 行的 ``verification`` 段里，所以这里走 repository 层，
-    而不是手搓一个文件 —— 读侧找到的必须是冻结那一步放进去的那一份。
+    而不是手搓一个文件 —— 读侧找到的必须是冻结那一步放进去的那一份；
+    那一段如今唯一的写者是 ``RoutingRepository.write_verification_baseline``。
     """
     from config_paths import resolve_state_db_path
     from state_machine.db.connection import open as open_db
@@ -197,15 +198,22 @@ def _record_routing_row(
     conn = open_db(resolve_state_db_path())
     try:
         migrate(conn)
-        RoutingRepository(conn).write_plan_state(
+        repo = RoutingRepository(conn)
+        repo.write_plan_state(
             plan_id,
             phase=phase,
             completed_phases=[],
             review_rounds={},
             flags={},
-            verification=verification,
             last_updated=None,
         )
+        baseline = verification.get("baseline")
+        if baseline is not None:
+            repo.write_verification_baseline(
+                plan_id,
+                baseline,
+                verification.get("baseline_doc_sha256", ""),
+            )
     finally:
         conn.close()
 

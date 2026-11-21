@@ -26,6 +26,13 @@ they had simply been written by different code paths at different
 moments, and the card assembled its verdict by fetching three endpoints
 at three instants and then re-deriving an answer from loose fields.
 
+That table is the 2026-09-23 incident, not the map of today's stores.
+``plan_routing.verification`` has since been retired as a source (arch
+decision point 3): the four verification fields come from
+``plan_verification`` alone, and the mirror column keeps only the frozen
+baseline it was written for. A table of "store → answer" read as a map
+of the current stores is how the mirror gets treated as a source again.
+
 What this module changes
 ------------------------
 
@@ -650,9 +657,19 @@ def find_divergences(status: PlanStatus) -> Tuple[Divergence, ...]:
 
     # Rule 2 — a phase that names the verification sub-machine must agree
     # with its verdict. ``phase == verification_running`` is what the
-    # status endpoint keys off to force ``status=running``; when the
+    # verification status endpoint keys off to force ``status=running``
+    # (``routes.verification._verification_status_from_db``), and what
+    # the summary body's verification block keys off to
+    # (``routes.plans._authoritative_verification_block``); when the
     # verdict has already landed, the phase is the stale half. This one
     # is DB-vs-DB, so it is meaningful from any process.
+    #
+    # The PLAN-STATUS snapshot is deliberately not one of those readers,
+    # and must not become one: its four verification fields come from the
+    # ``plan_verification`` row (Rule 3 below), and a phase that says
+    # "running" over a terminal verdict is exactly the disagreement this
+    # rule exists to report.  Forcing ``running`` in the snapshot would
+    # silence the detector that says the phase is the stale half.
     v_status = _norm(status.verification_status)
     if (
         _norm(status.phase).startswith("verification")
@@ -666,24 +683,29 @@ def find_divergences(status: PlanStatus) -> Tuple[Divergence, ...]:
             f"{status.verification_status!r}",
         ))
 
-    # Rule 3 — the two verification stores, one round behind.
-    # ``plan_routing.verification`` is CAS-advanced at every round
-    # boundary; ``plan_verification.verification_status`` is written by a
-    # separate best-effort path. When the second write does not land, the
+    # Rule 3 — the verification row, claiming a round is LIVE when none is.
+    # ``plan_verification.verification_status`` is written by a
+    # best-effort path. When the round-close write does not land, the
     # row keeps the ``running`` value stamped at round start, and since
     # ``/api/plan/{id}/status`` takes its top-level
     # ``verification_status`` from that row, the card header renders
     # "🔄 验证中" above a body naming the repair task that is actually
     # running, with ``verification_in_flight`` already False.
     #
-    # Both writers are best-effort by design (every state write in this
-    # codebase swallows its exception so a failed write never breaks the
-    # workflow), which is exactly why the drift is silent. The
-    # reconciliation at the read site fixes the card; this rule is what
-    # makes the underlying miss visible instead.
+    # There is only ONE verification store now: the ``plan_verification``
+    # row — it is where the snapshot's four verification fields come
+    # from.  The mirror column the state machine used to advance at
+    # every round boundary carries no verdict of its own any more (its
+    # one remaining writer freezes the reviewed baseline into it), so it
+    # is not a second store to reconcile against — and the read-side
+    # overlay that used to paper over this miss is gone.
     #
-    # ``pending`` is deliberately NOT in the trigger set, though the
-    # read-side reconciliation does override it. ``reset`` writes
+    # The write is best-effort by design (every state write in this
+    # codebase swallows its exception so a failed write never breaks the
+    # workflow), which is exactly why the drift is silent. This rule is
+    # what makes the underlying miss visible instead.
+    #
+    # ``pending`` is deliberately NOT in the trigger set. ``reset`` writes
     # ``pending`` into this column while a plan can legitimately be
     # executing repair work, and a column that says "not started" is not
     # a stale *claim* about anything — alarming on it would fire on every

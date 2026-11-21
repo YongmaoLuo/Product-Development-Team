@@ -159,11 +159,25 @@ lane 的进度条，而**已经跑完**的第一条 lane 的汇总（``1 failed,
 
 * ``stdout_head`` / ``stderr_head`` —— 开头 4000 字符；
 * ``lane_summaries`` —— 承载各 lane 结论的行（pytest 汇总、``phase N/3``、
-  ``gate:``、``host timing probe:``、``host measurability:``、失败的用例）；
+  ``gate:``、``host timing probe:``、``host measurability:``、失败的用例），
+  外加框架自己写的那一行 lane 出处（见下）；
 * ``timeout_seconds`` / ``budget_exceeded`` —— 实际生效的预算，以及它是否
   被这个预算杀掉。
 
 被杀的运行因此仍然能回答「哪几条 lane 跑完了、结论是什么」。
+
+lane 出处（2026-11-18，VP-022）
+--------------------------------
+命令类 e2e 的机器裁决以前只说「某条命令退出码 0」—— 没说**自己跑的是哪条
+lane**，也没说那条 lane 的 marker 选择**由谁声明**。于是「跑的就是被问的那条
+lane 吗」只能靠猜：读者无从核对，框架的主语门禁也只会看到一句与 lane 无关的
+话，于是把一条真绿的裁决改判成「答非所问」。
+
+所以裁决现在带一句出处：入口命令里声明的 marker 选择（``-m "<expr>"``）在
+项目树里被逐行比对，找到**逐字声明同一个选择**的脚本，就把它连同**声明行的
+行号**一起点名（``scripts/run_tests.sh:519`` —— 路径与行号之间不留空格，免得
+路径被截断）。出处是**算出来**的：不得写死某个 VP、某个脚本名或某个行号；
+树里没人声明这个选择时，**一个字都不加** —— 猜一个声明者比不声明更糟。
 
 per-phase junit（2026-10-31）
 --------------------------------
@@ -621,6 +635,37 @@ _LANE_SUMMARY_RE = re.compile(
     r"|(?:FAILED|ERROR)\s+\S+"               # a failing case (short summary)
     r"|\S+::\S+.*\b(?:FAILED|ERROR)\b)"      # a failing case (verbose mode)
 )
+
+#: How an entry command declares the **marker selection** it runs: a
+#: quoted expression behind the ``-m`` flag.
+#:
+#: The quotes are what tells a selection from the interpreter's own
+#: ``-m module`` flag: ``python3 -m pytest … -m "e2e or integration"``
+#: uses both, and only the quoted one says **which** tests the command
+#: chose.  A selection nobody can read is not a selection.
+_MARKER_SELECTION_RE = re.compile(r"-m\s+([\"'])(.+?)\1")
+
+#: Directories the lane scan never walks: version control's own, the
+#: vendored trees, the virtualenvs, the build output.  They are big,
+#: they are not the project's own scripts, and a scan that reads them
+#: buys nothing.
+_LANE_SCAN_SKIP_DIRS = frozenset({
+    ".git", ".hg", ".svn", ".bzr",
+    ".venv", "venv", "env", ".env",
+    "node_modules", "bower_components", "vendor",
+    "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    ".tox", ".nox", ".idea", ".vscode",
+    "dist", "build", "site-packages", ".eggs",
+})
+
+#: The ceiling on how many scripts one lane scan reads, and on how deep
+#: it walks.  Both are here for the same reason: a verdict must not be
+#: able to cost more than the gate it grades.  A scan that hits the
+#: ceiling says **less**, never more — it stops looking, so a declarer
+#: it did not reach is not named (a verdict that says nothing is
+#: harmless; a verdict that names the wrong script is not).
+_LANE_SCAN_MAX_FILES = 4000
+_LANE_SCAN_MAX_DEPTH = 12
 
 #: The environment variable that tells the gate script where to write one
 #: junit report per phase.
@@ -1782,6 +1827,90 @@ def lane_summaries(stdout: str) -> List[str]:
     return out
 
 
+def marker_selection(entry: str) -> Optional[str]:
+    """The marker selection an entry command declares, if it declares one.
+
+    ``-m "<expression>"`` — a **quoted** expression behind the ``-m``
+    flag is a selection: it says which tests the command chose.  The
+    interpreter's own ``-m module`` is not a selection, and an entry
+    that names no selection selects no lane at all — so the answer is
+    ``None`` rather than a guess.
+    """
+    match = _MARKER_SELECTION_RE.search(str(entry or ""))
+    if match is None:
+        return None
+    selection = match.group(2).strip()
+    return selection or None
+
+
+def lane_declarations(project_dir: Path, selection: str) -> List[Tuple[str, int]]:
+    """Every script line in the tree that declares ``selection``.
+
+    A declaration is the **same selection, spelled the same way** — the
+    same quoted expression behind the same ``-m`` flag.  A script that
+    spells it differently declares a different lane, and a lane that
+    only looks like the declared one is exactly what a reader must not
+    be told about.
+
+    Every hit is recorded, with the repo-relative path and the line the
+    declaration is on, so the verdict can be checked by opening the
+    file.  The scan is bounded (see :data:`_LANE_SCAN_MAX_FILES`): it
+    reads a bounded number of scripts, walks a bounded depth, and never
+    enters a vendored tree — and when it hits a ceiling it stops
+    looking, so a declarer it did not reach is simply not named.
+    """
+    if not selection:
+        return []
+    root = Path(project_dir)
+    needles = ('-m "%s"' % selection, "-m '%s'" % selection)
+    found: List[Tuple[str, int]] = []
+    scanned = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(
+            name for name in dirnames if name not in _LANE_SCAN_SKIP_DIRS
+        )
+        relative = os.path.relpath(dirpath, root)
+        depth = 0 if relative == os.curdir else relative.count(os.sep) + 1
+        if depth >= _LANE_SCAN_MAX_DEPTH:
+            dirnames[:] = []
+            continue
+        for name in sorted(filenames):
+            if not name.endswith(".sh"):
+                continue
+            scanned += 1
+            if scanned > _LANE_SCAN_MAX_FILES:
+                return found
+            path = Path(dirpath) / name
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for number, line in enumerate(text.splitlines(), start=1):
+                if not any(needle in line for needle in needles):
+                    continue
+                found.append((path.relative_to(root).as_posix(), number))
+    return found
+
+
+def lane_provenance_note(project_dir: Path, entry: str) -> str:
+    """Where the entry's lane selection was declared — or nothing at all.
+
+    The note names every script that declares **this** selection, with
+    the line it is declared on (``scripts/run_tests.sh:519``).  A
+    selection nobody declares gets an empty note: the framework does
+    not name a declarer it cannot read, and a note that names the wrong
+    script is worse than no note at all.
+    """
+    selection = marker_selection(entry)
+    if not selection:
+        return ""
+    declarations = lane_declarations(project_dir, selection)
+    if not declarations:
+        return ""
+    where = "、".join("%s:%d" % (rel, number) for rel, number in declarations)
+    return "该选择由 %s 声明" % where
+
+
 def ci_subprocess_env() -> Dict[str, str]:
     """The environment a CI gate runs in, without the descriptor addresses.
 
@@ -2818,6 +2947,14 @@ def run_ci_verification(
     label = E2E_METHOD if is_e2e else "full_ci"
     entry_key = ENTRY_COMMAND_FIELD if is_e2e else CI_ENTRY_FIELD
     project_dir = Path(project_dir)
+    # 2026-11-18 (VP-022): "the command exited 0" answers "did it pass",
+    # not "was this the lane the plan asked for" — and the second half of
+    # that fact has an owner: the script in this tree that declares the
+    # marker selection.  The verdict names it, so the answer can be read
+    # against the point's own words.  A tree that declares the selection
+    # nowhere gets no note: the framework does not name a script it
+    # cannot read.
+    lane_note = lane_provenance_note(project_dir, entry)
     timeout = ci_timeout(vp, project_dir=project_dir, entry=entry, contract=contract)
     declared_budget = gate_budget_seconds(project_dir, entry, contract=contract)
     # A contract that does not name a summary format has not promised that
@@ -2853,6 +2990,19 @@ def run_ci_verification(
     shared_venv = shared_venv_for(project_dir)
     if shared_venv:
         gate_env["PDT_SHARED_VENV"] = shared_venv
+
+    # 2026-11-14：入口是人会在项目里敲的命令（python3 -m pytest …），而
+    # 「在项目里跑」的既定含义是 scripts/run_tests.sh 那样先激活
+    # $PROJECT_ROOT/backend/.venv。后端进程的 PATH 指向的是「某个」checkout
+    # 的 venv（本机上另一个项目的，缺 filelock，让整条 e2e lane 变成 68 个
+    # 收集错误），所以这里把 venv 的 bin 放到它前面。
+    venv_bin = Path(shared_venv) / "bin" if shared_venv else None
+    if venv_bin is not None and venv_bin.is_dir():
+        path_entries = [
+            p for p in gate_env.get("PATH", "").split(os.pathsep) if p
+        ]
+        if str(venv_bin) not in path_entries:
+            gate_env["PATH"] = os.pathsep.join([str(venv_bin), *path_entries])
 
     # The junit reports of the phases land next to the audit copy of this
     # verdict — the same directory ``_write_artifact`` uses — so the two
@@ -2950,6 +3100,15 @@ def run_ci_verification(
     if gate_elapsed is None:
         gate_elapsed = int(duration)
 
+    # The lines that carry a lane's conclusion — the gate's own, and
+    # the framework's answer to the question the gate's output cannot
+    # answer: **which** lane ran, and who declared it.  The note is
+    # not a line of stdout, but it is a line about the lane, and it
+    # belongs with the lane's other lines (2026-11-18, VP-022).
+    lane_lines = list(lane_summaries(stdout)) if parse_summary else []
+    if lane_note:
+        lane_lines.append(lane_note)
+
     evidence: Dict[str, Any] = {
         "vp_id": vp_id,
         entry_key: entry,
@@ -2962,7 +3121,7 @@ def run_ci_verification(
         "stdout_tail": stdout_tail,
         "stderr_head": stderr_head,
         "stderr_tail": stderr_tail,
-        "lane_summaries": lane_summaries(stdout) if parse_summary else [],
+        "lane_summaries": lane_lines,
         "ci_timeout_seconds": timeout,
         "gate_budget_seconds": declared_budget,
         "gate_summary": gate_summary,
@@ -3033,8 +3192,15 @@ def run_ci_verification(
 
     if not timed_out and not error and exit_code == 0:
         result.status = STATUS_PASSED
+        # 2026-11-18 (VP-022): the verdict now says **which** lane ran,
+        # and who declared it — "the command exited 0" alone answers a
+        # different question than the one the point asked, and the
+        # framework read the difference as "answered another question".
+        # The clause is added only when somebody declares the selection;
+        # a lane nobody declared gets no clause at all.
         result.reasons = [
             f"[{label}] `{entry}` 退出码 0（用时 {duration:.0f}s）"
+            + (f"；{lane_note}" if lane_note else "")
         ]
     elif could_not_decide and not blocking_failures:
         # The gate could not decide.  That is not a verdict about the

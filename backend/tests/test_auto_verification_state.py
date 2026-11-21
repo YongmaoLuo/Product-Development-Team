@@ -644,7 +644,6 @@ class TestStartVerificationAutoFix:
                 completed_phases=[],
                 review_rounds={},
                 flags={},
-                verification={},
                 last_updated=None,
             )
             # Insert a plan_verification row first; complete_round is an

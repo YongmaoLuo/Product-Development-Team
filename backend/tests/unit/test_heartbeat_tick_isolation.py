@@ -99,11 +99,12 @@ def test_exception_is_logged_with_plan_id(monkeypatch, caplog):
     lazy_check = Mock(side_effect=[RuntimeError("boom"), None])
     monkeypatch.setattr(server, "_lazy_check_verification", lazy_check)
 
-    with caplog.at_level(logging.ERROR, logger="server"):
+    # server.py 会把首个加载它的模块名登记为 ``server``，字面量在同进程加载两份 server 时不可靠。
+    with caplog.at_level(logging.ERROR, logger=server.__name__):
         HeartbeatMonitor(interval=30)._check_once()
 
     error_records = [
-        r for r in caplog.records if r.name == "server" and r.levelno >= logging.ERROR
+        r for r in caplog.records if r.name == server.__name__ and r.levelno >= logging.ERROR
     ]
     assert error_records, (
         "the failing plan must be logged; caplog captured "

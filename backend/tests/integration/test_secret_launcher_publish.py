@@ -65,6 +65,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -230,17 +231,166 @@ def _snapshot_tree(root: Path, exclude: set, *, recursive: bool = True) -> set:
 #: it silently would be worse, so it is named.
 _NOT_THE_MODULES = {".venv", ".git", "__pycache__", "node_modules", ".pytest_cache"}
 
+#: The bookkeeping file a gate run drops into the shared temporary
+#: directory.  ``scripts/run_tests.sh:73`` mints it with
+#: ``mktemp "${TMPDIR:-/tmp}/pdt-spawn-registry.XXXXXX"`` when the run
+#: starts, and nothing else on this machine mints a name like it.
+#:
+#: It belongs to the *gate*, not to the module under test: the launcher
+#: never writes it, and on a host where two gates run at once the file
+#: is the other gate's, not this one's.  The temporary directory is
+#: watched here because that is where a spill goes — which is also
+#: where another gate's bookkeeping lands, so a watch that cannot tell
+#: the two apart charges the delivery for the host's activity.  The
+#: ``.lock`` companion a run may leave beside its registry shares the
+#: prefix and is covered by the same test.
+_GATE_BOOKKEEPING_PREFIX = "pdt-spawn-registry."
+
+
+def _is_gate_bookkeeping(path) -> bool:
+    """Whether ``path`` is a gate's own bookkeeping file."""
+    return Path(path).name.startswith(_GATE_BOOKKEEPING_PREFIX)
+
+
+#: The prefix of the file this suite writes into the working tree to
+#: prove that the watch notices a write there.  Dot-prefixed so it is
+#: obvious in a directory listing if a test dies between creating it
+#: and removing it.
+#:
+#: The rest of the name is the writing process's own identity, because
+#: two sessions can run this suite on one machine at the same time.  A
+#: fixed name would have them write the same path, and then one of them
+#: watches the other's probe — the probe it finds is already in its
+#: baseline, the probe it wrote is not noticed, and the control fails
+#: on a suite that did nothing wrong.
+_PROBE_NAME_PREFIX = ".pdt-launcher-publish-probe"
+
+
+def _is_probe_bookkeeping(path) -> bool:
+    """Whether ``path`` is a canary probe written by this suite.
+
+    The probe is the suite's own business: it exists to be noticed and
+    is removed again right after.  It is never a spill by the module
+    under test, and a probe another session wrote while this launch was
+    running is not this launch's file either.
+    """
+    return Path(path).name.startswith(_PROBE_NAME_PREFIX)
+
+
+def _watched_snapshot(roots, own_dir: Path) -> set:
+    """Every path the watch covers, minus the test's own directory.
+
+    ``roots`` is a list of ``(root, recursive)`` pairs: the directories
+    a spill could land in, and whether each is walked all the way
+    down.  The two that belong to every other process on the machine as
+    well as to this one are watched at their own top level only, where
+    a spill lands.
+
+    Two things are left out, and neither of them is the module's:
+
+    * everything under ``own_dir`` — the test's own directory is
+      expected to grow, and on macOS it sits *inside* the system
+      temporary directory, so without this the temp watch would report
+      the test's own stand-in as a leak;
+
+    * a gate's own bookkeeping — see :data:`_GATE_BOOKKEEPING_PREFIX`.
+    """
+    found = set()
+    for root, recursive in roots:
+        found |= _snapshot_tree(root, _NOT_THE_MODULES, recursive=recursive)
+    kept = {p for p in found if own_dir not in Path(p).parents}
+    return {p for p in kept if not _is_gate_bookkeeping(p)}
+
+
+def _the_walker_notices(snapshot, probe: Path) -> set:
+    """What the watch notices while ``probe`` is written.
+
+    The baseline is read *immediately* before the probe is written, so
+    the difference set is as small as it can be: the probe, and
+    whatever the host wrote while the watch was walking the roots.  A
+    baseline taken before the launch would also carry everything the
+    host wrote in the meantime — another gate's registry file, for one
+    — and the watch would report the host's files as the launch's.
+    """
+    before = snapshot()
+    probe.write_text("probe", encoding="utf-8")
+    try:
+        return snapshot() - before
+    finally:
+        probe.unlink(missing_ok=True)
+
+
+def _the_write_was_noticed(noticed: set, probe: Path) -> bool:
+    """Whether the watch noticed ``probe`` among the paths it saw.
+
+    The watch covers roots the whole machine shares, so a notice may
+    carry another process's file with it.  That file is a fact about
+    the machine and not about the watcher: what this control has to say
+    is that the watcher saw *this* write.  The watcher's own sharpness
+    is pinned by the leak assertion, which fails on anything the launch
+    adds to the roots.
+    """
+    return str(probe) in noticed
+
+
+def _created_at(path) -> float:
+    """When ``path`` came into existence, as far as the filesystem says.
+
+    ``st_birthtime`` is the creation time where the platform reports
+    one (macOS, and Linux since 3.12).  Where it does not, ``st_ctime``
+    is the inode's change time, which for a file nobody has touched
+    since it was written is the moment it was written.
+    """
+    info = os.stat(path)
+    birth = getattr(info, "st_birthtime", None)
+    if birth is not None:
+        return float(birth)
+    return float(info.st_ctime)
+
+
+def _created_between(path, started: float, finished: float) -> bool:
+    """Whether ``path`` came into existence while the launch was running.
+
+    A path whose times cannot be read is counted as a finding: the
+    watch is there for what it cannot see.
+    """
+    try:
+        return started <= _created_at(path) <= finished
+    except OSError:
+        return True
+
+
+def _the_launch_added(before: set, after: set, started: float, finished: float) -> set:
+    """The paths the launch added to the watched roots.
+
+    Two things are kept out of the answer, and neither of them is the
+    launch's:
+
+    * a path that was already among the roots before the launch began
+      is not new, and one that came into existence *before* the launch
+      began cannot be the launch's either — it belongs to whoever
+      wrote it, and a watch that charges the host's writes to the
+      module under test is measuring the machine instead of the
+      delivery;
+
+    * a probe this suite wrote is this suite's own bookkeeping, not a
+      spill — and two sessions can run this suite at once, so the probe
+      carries the writing process's own identity in its name.
+
+    What the launch wrote is still found: a file that came into
+    existence while the launch was running is the launch's, and it is
+    reported.
+    """
+    added = {p for p in after - before if not _is_probe_bookkeeping(p)}
+    return {p for p in added if _created_between(p, started, finished)}
+
+
 #: The real ``$HOME``, captured at import — before any fixture can
 #: redirect it. The ``keychain_double`` fixture points ``$HOME`` inside
 #: ``tmp_path`` precisely so the module never touches the real one, which
 #: makes the real one the directory worth watching: a watch on the
 #: redirected home would be watching the test's own directory.
 _REAL_HOME = Path.home()
-
-#: The name of the file the working-tree watch is proved with. Dot-
-#: prefixed so it is obvious in a directory listing if a test dies
-#: between creating it and removing it.
-_PROBE_NAME = ".pdt-launcher-publish-probe"
 
 
 class KeychainDouble:
@@ -914,17 +1064,17 @@ def test_the_launcher_creates_no_files_outside_tmp_path(
     ]
 
     def snapshot() -> set:
-        found = set()
-        for root, recursive in roots:
-            found |= _snapshot_tree(root, _NOT_THE_MODULES, recursive=recursive)
-        # The test's own directory is expected to grow — and on macOS it
-        # sits *inside* the system temporary directory, so without this
-        # the temp watch would report the test's own stand-in as a leak.
-        return {p for p in found if tmp_path not in Path(p).parents}
+        return _watched_snapshot(roots, tmp_path)
 
     before = snapshot()
 
+    # The window the launch ran in.  The watch walks roots the whole
+    # machine shares, and a file another process writes while the walk
+    # is going is that process's file; what the launch wrote is what
+    # came into existence inside this window.
+    started = time.time()
     launcher_publishes()
+    finished = time.time()
 
     after = snapshot()
 
@@ -937,18 +1087,93 @@ def test_the_launcher_creates_no_files_outside_tmp_path(
     )
 
     # Control two: the walker sees a write in the root it claims to watch.
-    probe = _BACKEND_DIR / _PROBE_NAME
-    try:
-        probe.write_text("probe", encoding="utf-8")
-        assert snapshot() - before == {str(probe)}, (
-            "the working-tree watch did not notice a file being created "
-            "in it, so it cannot be trusted to notice one"
-        )
-    finally:
-        probe.unlink(missing_ok=True)
+    #
+    # The probe carries this process's identity, so a second session
+    # running this suite does not write the same path; and the notice is
+    # looked for by name rather than demanded to be empty, because the
+    # watch covers roots the whole machine shares and a file another
+    # process writes there is that process's, not the watcher's mistake.
+    # A probe this process left behind earlier — the same process id
+    # came round again — goes first, or the baseline would already
+    # hold the very file the watch is supposed to notice.
+    probe = _BACKEND_DIR / (_PROBE_NAME_PREFIX + "-" + str(os.getpid()))
+    probe.unlink(missing_ok=True)
+    noticed = _the_walker_notices(snapshot, probe)
+    assert _the_write_was_noticed(noticed, probe), (
+        "the working-tree watch did not notice a file being created "
+        "in it, so it cannot be trusted to notice one"
+    )
 
-    assert after - before == set(), (
+    added = _the_launch_added(before, after, started, finished)
+    assert added == set(), (
         "the launch created files outside the test's directory:\n{}".format(
-            "\n".join(sorted(after - before))
+            "\n".join(sorted(added))
         )
+    )
+
+
+def test_the_watch_finds_the_probe_among_the_files_the_host_writes(tmp_path):
+    """A file the host writes while the probe is noticed is not the
+    watcher's mistake, and it must not hide the probe.
+
+    The watch covers roots the whole machine shares, so a notice can
+    carry another process's file with it.  A control that demanded an
+    empty notice would be measuring the machine instead of the watcher:
+    what it has to say is that the watcher saw *this* write.
+    """
+    probe = tmp_path / "probe"
+    earlier = str(tmp_path / "written-before-the-probe")
+    later = str(tmp_path / "written-while-the-probe-was-noticed")
+    readings = [
+        {earlier},
+        {earlier, later, str(probe)},
+    ]
+
+    def snapshot() -> set:
+        return readings.pop(0)
+
+    noticed = _the_walker_notices(snapshot, probe)
+    assert _the_write_was_noticed(noticed, probe), (
+        "the watch did not find the probe among the files it noticed:\n{}".format(
+            "\n".join(sorted(noticed))
+        )
+    )
+
+
+def test_a_file_written_before_the_launch_is_not_the_launch_s(tmp_path):
+    """The leak measurement is about the launch, not about the host.
+
+    A file another process wrote while the watch was walking the roots
+    belongs to that process.  Charging it to the launch would make the
+    control a statement about the machine.
+    """
+    host_file = tmp_path / "written-by-someone-else"
+    host_file.write_text("x", encoding="utf-8")
+    started = _created_at(host_file) + 1
+    assert _the_launch_added(set(), {str(host_file)}, started, started + 1) == set(), (
+        "a file written before the launch began was charged to it"
+    )
+
+
+def test_a_file_written_during_the_launch_is_the_launch_s(tmp_path):
+    """What the launch wrote is found by the same measurement."""
+    leaked = tmp_path / "written-by-the-launch"
+    leaked.write_text("x", encoding="utf-8")
+    written_at = _created_at(leaked)
+    assert _the_launch_added(set(), {str(leaked)}, written_at - 1, written_at + 1) == {str(leaked)}, (
+        "a file written during the launch was not charged to it"
+    )
+
+
+def test_another_session_s_probe_is_not_the_launch_s(tmp_path):
+    """Two sessions can run this suite on one machine at the same time.
+
+    One session's probe is that session's own business, and it is not a
+    spill by this session's launch.
+    """
+    probe = tmp_path / (_PROBE_NAME_PREFIX + "-4242")
+    probe.write_text("x", encoding="utf-8")
+    written_at = _created_at(probe)
+    assert _the_launch_added(set(), {str(probe)}, written_at - 1, written_at + 1) == set(), (
+        "another session's probe was charged to this launch"
     )

@@ -8121,7 +8121,11 @@ def _watch_service_process(
 
     The exit is recorded **and** applied to the runtime.  The recording
     is what a reader of the round's log sees; the application is what
-    stops the dead runtime from being handed out as an address.
+    stops the dead runtime from being handed out as an address.  The
+    recording comes first (2026-11-13): a runtime whose ``exit`` is set
+    has already been written to the plan's event stream, so a reader
+    that waits for the death and then reads the log never finds the
+    log empty.
 
     The recording comes **first**.  A reader that sees the runtime say
     the service is dead must be able to read the event that says how it
@@ -8157,6 +8161,13 @@ def _watch_service_process(
             round_token=round_token,
             reason=_describe_exit(code, runtime.stopped),
         )
+        # The runtime is the state machine: the moment the process is
+        # gone, the runtime stops saying the service is ready.  Nothing
+        # else has to be told — every reader of the runtime sees the
+        # same fact.
+        runtime.ready = False
+        if not runtime.failure_reason:
+            runtime.failure_reason = exit_info.reason
         # The death is written down **before** it is published.  The
         # runtime says "this service is gone, and here is why"; the
         # event stream is the durable proof of that.  A reader that
@@ -8165,27 +8176,32 @@ def _watch_service_process(
         # death it cannot point at, and that window is exactly the
         # silence this watcher exists to end (2026-10-26).
         #
-        # A failed write does not change that: ``record_process_event``
-        # never raises and only reports ``False``, so the runtime is
-        # published either way -- a round must not keep pretending a
-        # dead service is alive because its log could not be written.
-        if plan_dir is not None:
-            record_process_event(
-                plan_dir, PROCESS_EVENT_EXITED,
-                pid=exit_info.pid, port=exit_info.port,
-                returncode=exit_info.returncode, exit_signal=exit_info.exit_signal,
-                started_at=exit_info.started_at, exited_at=exit_info.exited_at,
-                uptime_sec=exit_info.uptime_sec, round_token=exit_info.round_token,
-                reason=exit_info.reason,
-            )
-        # The runtime is the state machine: the moment the process is
-        # gone, the runtime stops saying the service is ready.  Nothing
-        # else has to be told — every reader of the runtime sees the
-        # same fact.
-        runtime.exit = exit_info
-        runtime.ready = False
-        if not runtime.failure_reason:
-            runtime.failure_reason = exit_info.reason
+        # The exit is **recorded** before it is **published** (2026-11-13).
+        # A reader that waits for ``runtime.exit`` and then reads the
+        # plan's event stream must not find an empty stream: the
+        # publication used to come first, so a reader could see the
+        # death before it was written down.  The append is the slow half
+        # (it touches the disk), and the load of a CI runner widens that
+        # window from microseconds into milliseconds — wide enough to
+        # fall into, which is how a test that was green on a developer
+        # machine went red on the runner.
+        try:
+            if plan_dir is not None:
+                record_process_event(
+                    plan_dir, PROCESS_EVENT_EXITED,
+                    pid=exit_info.pid, port=exit_info.port,
+                    returncode=exit_info.returncode, exit_signal=exit_info.exit_signal,
+                    started_at=exit_info.started_at, exited_at=exit_info.exited_at,
+                    uptime_sec=exit_info.uptime_sec, round_token=exit_info.round_token,
+                    reason=exit_info.reason,
+                )
+        finally:
+            # Published last, and published even when the append failed:
+            # a death that was never published would keep the runtime
+            # looking alive for the rest of the round.  A failed write
+            # does not change that -- a round must not keep pretending a
+            # dead service is alive because its log could not be written.
+            runtime.exit = exit_info
     finally:
         if done is not None:
             done.set()

@@ -161,7 +161,6 @@ def _run_lazy_check() -> Mock:
     the production decision, not an internal helper."""
     with patch.object(server_mod, "_persist_verification_terminal") as persist, \
          patch.object(server_mod, "_mark_verification_failed_dead"), \
-         patch.object(server_mod, "_update_plan_state_to_terminal"), \
          patch.object(server_mod, "_kill_orphaned_vp_processes",
                       return_value=[]), \
          patch.object(server_mod, "_kill_sub_agent_process"), \

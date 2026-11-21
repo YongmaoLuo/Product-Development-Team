@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -202,7 +203,12 @@ def _record_baseline(plan_dir: Path, baseline: Dict[str, Any]) -> None:
     The baseline lives in the ``verification`` column of the plan's routing
     row, so the test writes it through the repository layer rather than
     through a hand-made file — the reader under test must find it where the
-    freeze step puts it.
+    freeze step puts it.  That column's only writer is
+    ``RoutingRepository.write_verification_baseline``.
+
+    A baseline that is not a mapping is a **corrupt** state: the writer
+    cannot produce one (it stores ``dict(baseline)``), so that case lands
+    in the column the way a broken writer would have left it — raw SQL.
     """
     from config_paths import resolve_state_db_path
     from state_machine.db.connection import open as open_db
@@ -214,21 +220,23 @@ def _record_baseline(plan_dir: Path, baseline: Dict[str, Any]) -> None:
     conn = open_db(resolve_state_db_path())
     try:
         migrate(conn)
-        RoutingRepository(conn).write_plan_state(
+        repo = RoutingRepository(conn)
+        repo.write_plan_state(
             plan_dir.name,
             phase="verification",
             completed_phases=[],
             review_rounds={},
             flags={},
-            verification={
-                "status": "pending",
-                "round": 0,
-                "max_rounds": 3,
-                "stop_reason": None,
-                "baseline": baseline,
-            },
             last_updated=None,
         )
+        if isinstance(baseline, dict):
+            repo.write_verification_baseline(plan_dir.name, baseline)
+        else:
+            conn.execute(
+                "UPDATE plan_routing SET verification = ? WHERE plan_id = ?",
+                (json.dumps({"baseline": baseline}), plan_dir.name),
+            )
+            conn.commit()
     finally:
         conn.close()
 

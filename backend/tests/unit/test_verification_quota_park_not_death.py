@@ -192,9 +192,6 @@ def terminal_writes(monkeypatch):
         server_mod, "_cleanup_dead_verification_processes",
         lambda *a, **k: None,
     )
-    monkeypatch.setattr(
-        server_mod, "_update_plan_state_to_terminal", lambda *a, **k: None,
-    )
     return writes
 
 

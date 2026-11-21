@@ -429,7 +429,8 @@ def _record_baseline(plan_dir: Path, baseline: Dict[str, Any]) -> None:
     The baseline is written through the repository layer rather than
     through a hand-made file: the reader under test looks for it where the
     freeze step puts it, and a file written beside it would be a second
-    source of truth.
+    source of truth.  The mirror column's only writer is
+    ``RoutingRepository.write_verification_baseline``.
     """
     from config_paths import resolve_state_db_path
     from state_machine.db.connection import open as open_db
@@ -439,21 +440,16 @@ def _record_baseline(plan_dir: Path, baseline: Dict[str, Any]) -> None:
     conn = open_db(resolve_state_db_path())
     try:
         migrate(conn)
-        RoutingRepository(conn).write_plan_state(
+        repo = RoutingRepository(conn)
+        repo.write_plan_state(
             plan_dir.name,
             phase="verification",
             completed_phases=[],
             review_rounds={},
             flags={},
-            verification={
-                "status": "pending",
-                "round": 0,
-                "max_rounds": 3,
-                "stop_reason": None,
-                "baseline": baseline,
-            },
             last_updated=None,
         )
+        repo.write_verification_baseline(plan_dir.name, baseline)
     finally:
         conn.close()
 

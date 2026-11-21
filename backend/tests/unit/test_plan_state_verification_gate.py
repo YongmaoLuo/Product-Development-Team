@@ -73,9 +73,14 @@ def _write_plan_state(
 ) -> None:
     """把计划直接放在某个阶段上。
 
-    写的是 ``plan_routing`` 那一行：阶段、已完成阶段、审核轮次、标志位与
-    ``verification`` 段（基线就冻在这里）。读侧
-    :meth:`PlanState._load_state_from_sqlite` 读的也是这一行 —— 测试与生产
+    写的是 ``plan_routing`` 那一行：阶段、已完成阶段、审核轮次、标志位。
+    基线冻在 ``plan_routing.verification`` 镜像列里 —— 那是基线唯一的住处，
+    所以它走列现在唯一的写者
+    :meth:`RoutingRepository.write_verification_baseline`。
+
+    生命周期四键不再有落点：它们住在权威表 ``plan_verification``，而验证
+    还没开始的计划本来就没有那一行。读侧
+    :meth:`PlanState._load_state_from_sqlite` 读的就是这两处 —— 测试与生产
     走同一条路。
     """
     from config_paths import resolve_state_db_path
@@ -83,25 +88,36 @@ def _write_plan_state(
     from state_machine.db.schema import migrate
     from state_machine.repositories.routing_repository import RoutingRepository
 
+    payload = (
+        verification
+        if verification is not None
+        else {
+            "status": "pending",
+            "round": 0,
+            "max_rounds": 3,
+            "stop_reason": None,
+        }
+    )
+
     conn = open_db(resolve_state_db_path())
     try:
         migrate(conn)
-        RoutingRepository(conn).write_plan_state(
+        repo = RoutingRepository(conn)
+        repo.write_plan_state(
             plan_dir.name,
             phase=phase,
             completed_phases=list(completed_phases or []),
             review_rounds={},
             flags={},
-            verification=verification
-            if verification is not None
-            else {
-                "status": "pending",
-                "round": 0,
-                "max_rounds": 3,
-                "stop_reason": None,
-            },
             last_updated=None,
         )
+        baseline = payload.get("baseline")
+        if baseline is not None:
+            repo.write_verification_baseline(
+                plan_dir.name,
+                baseline,
+                payload.get("baseline_doc_sha256", ""),
+            )
     finally:
         conn.close()
 

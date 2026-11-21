@@ -170,7 +170,6 @@ def _seed(state_db: Path, plan_id: str, *, phase: str, exec_status: str) -> str:
                 completed_phases=[],
                 review_rounds={},
                 flags={},
-                verification={},
                 last_updated=None,
             )
         ExecutionRepository(conn).insert(plan_id, exec_status=exec_status)
