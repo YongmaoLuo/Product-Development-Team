@@ -233,6 +233,15 @@ VERIFICATION_PHASES = frozenset(
         "verify_recheck",
         "verification_repairing",
         "verification_rerunning",
+        # 2026-11-20: ``user_stopping`` —— the plan-level "being stopped".
+        #
+        # The phase is not a terminal one: the stop has been asked for and
+        # the worker is still winding down.  A plan in it still holds
+        # compute, so the scheduler has to keep seeing it as busy — a
+        # scheduler that does not know the phase treats the plan as idle
+        # and hands its slot to somebody else while its own worker is
+        # still running.
+        "user_stopping",
     }
 )
 

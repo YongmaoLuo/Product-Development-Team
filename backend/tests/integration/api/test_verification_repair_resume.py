@@ -43,12 +43,15 @@ from __future__ import annotations
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 import server
+import stop_state
+import stop_supervisor
 import verification_cancel
 import verification_loop
 from server import app
@@ -63,6 +66,11 @@ from state_machine.repositories.verification_repository import (
 
 PLAN_ID = "20261022-repair-resume"
 
+#: The quiet window the background layer waits for before it may park
+#: the plan.  Short here on purpose: the window is a policy of the
+#: deployment, not a contract of the stop.
+QUIET_SECONDS = 0.2
+
 #: The repair task the executor still has to run. Its id is repair-
 #: shaped (``RP-*``), which is what ``_get_pending_repair_tasks``
 #: looks for.
@@ -70,10 +78,33 @@ REPAIR_TASK_ID = "RP-001"
 
 
 @pytest.fixture(autouse=True)
-def _clean_cancel_flags():
-    """The cancel flag is process-global — do not leak it."""
+def _clean_stop_state(monkeypatch):
+    """The stop's process-local state is global — do not leak it.
+
+    ``stop_state`` (the stop record), ``stop_supervisor`` (the
+    supervisor threads) and ``verification_cancel`` (the cancel flag)
+    are process-wide and indexed by plan id, and this suite reuses ONE
+    plan id — so a record or a supervisor left behind by one case
+    decides the next case's stop behaviour.
+
+    The quiet window is shortened for the same reason the deployment
+    may choose it: the window is a policy, not a contract, and the
+    cases below must not pay five seconds per stop.
+    """
+    real_start = stop_supervisor.start
+
+    def _start(plan_id, **kwargs):
+        kwargs["quiet_seconds"] = QUIET_SECONDS
+        return real_start(plan_id, **kwargs)
+
+    monkeypatch.setattr(stop_supervisor, "start", _start)
+
+    stop_state._reset_for_tests()
+    stop_supervisor._reset_for_tests()
     verification_cancel._reset_for_tests()
     yield
+    stop_supervisor._reset_for_tests()
+    stop_state._reset_for_tests()
     verification_cancel._reset_for_tests()
 
 
@@ -220,6 +251,31 @@ def _read_phase(db_path: Path, plan_id: str = PLAN_ID):
     finally:
         conn.close()
     return (row or {}).get("current_phase")
+
+
+def _wait_for_stop_to_settle(
+    db_path: Path, plan_id: str = PLAN_ID, timeout: float = 60.0,
+) -> str:
+    """Wait for the background layer's verdict, and read the phase back.
+
+    The stop is a *process*: the request closes the gate and answers
+    ``stopping``, and the background layer parks the plan once the plan
+    has really fallen silent.  So the phase is polled, never assumed.
+
+    The stop record is waited for too, because it is what ``/start``
+    refuses on while the stop is still in progress.
+    """
+    deadline = time.monotonic() + timeout
+    phase = _read_phase(db_path, plan_id)
+    while time.monotonic() < deadline:
+        if phase != "user_stopping" and stop_state.get(plan_id) is None:
+            return phase
+        time.sleep(0.05)
+        phase = _read_phase(db_path, plan_id)
+    raise AssertionError(
+        f"the stop never finalized — the plan is still parked at "
+        f"{phase!r} after {timeout:.0f}s"
+    )
 
 
 def _read_verification_round(db_path: Path, plan_id: str = PLAN_ID):
@@ -412,11 +468,21 @@ def test_stop_at_repair_execution_parks_the_plan_and_sigterms_the_executor(
         assert stop.status_code == 200, stop.text
         body = stop.json()
         assert body["reason"] == "user_stopped_at_repair_execution", body
-        assert body["status"] == "stopped", body
+        # The stop is a process: the request closes the gate and answers
+        # "stopping" — the park is the background layer's verdict.
+        assert body["status"] == "stopping", body
 
-        assert _read_phase(db_path) == "verification_repairing", (
+        assert _read_phase(db_path) == "user_stopping", (
+            "the stop did not close the gate at the plan-level stopping "
+            f"phase: {_read_phase(db_path)!r}"
+        )
+
+        # The park is the background layer's verdict, so the phase is
+        # polled — never assumed.
+        parked = _wait_for_stop_to_settle(db_path)
+        assert parked == "verification_repairing", (
             "the stop did not park the plan in the repair half of the "
-            f"loop: {_read_phase(db_path)!r}"
+            f"loop: {parked!r}"
         )
 
         # The executor really got the signal: the dummy process is

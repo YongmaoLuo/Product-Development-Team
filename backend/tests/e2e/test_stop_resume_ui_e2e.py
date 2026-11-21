@@ -284,6 +284,54 @@ def _wait_for_api(base_url: str, path: str, timeout: float = 60.0) -> int:
     )
 
 
+def _wait_for_execution_status(
+    base_url: str,
+    plan_id: str,
+    expected: str,
+    timeout: float = DISPATCH_TIMEOUT,
+) -> Dict[str, Any]:
+    """Poll ``GET /api/execution/<plan_id>/status`` until it says ``expected``.
+
+    A stop is a *process*, not an instant.  The answer to
+    ``POST /api/execution/<id>/stop`` is ``stopping`` -- the plan is on
+    its way down -- and the plan reaches ``stopped`` only once the
+    background layer has seen it fall silent.  So a reader that wants to
+    know whether the stop is *done* has to ask again: the stop answer
+    alone never says so.
+
+    The resume point the stop writes lands in the same window (the
+    background worker writes it before the plan is parked), so this
+    poll is also what makes the checkpoint readable -- reading it
+    before the poll is a race with the worker that writes it.
+
+    The failure carries the last answer: "the status never reached
+    ``stopped``" is not actionable on its own.
+    """
+    deadline = time.time() + timeout
+    last: Any = None
+    while True:
+        try:
+            status, body = _http(
+                "GET", f"{base_url}/api/execution/{plan_id}/status", timeout=30,
+            )
+        except (urllib.error.URLError, ConnectionResetError, OSError) as exc:
+            last = exc
+        else:
+            if (
+                status == 200
+                and isinstance(body, dict)
+                and body.get("status") == expected
+            ):
+                return body
+            last = (status, body)
+        if time.time() >= deadline:
+            raise AssertionError(
+                f"the execution status never reached {expected!r} within "
+                f"{timeout}s; the last answer was {last!r}"
+            )
+        time.sleep(0.5)
+
+
 # ---------------------------------------------------------------------------
 # The fake ``claude``
 # ---------------------------------------------------------------------------
@@ -1324,7 +1372,10 @@ def test_stop_then_restart_resumes_the_same_session(tmp_path):
 
     What is asserted:
 
-    * the stop answers ``stopped`` and reports the interrupted task;
+    * the stop answers ``stopping`` -- the plan is on its way down --
+      and the plan reaches ``stopped`` only once it has really fallen
+      silent; the interrupted task is reported by the status answer,
+      not by the stop answer;
     * the checkpoint records the task with ``strategy ==
       "session_resume"`` and the session id the dispatch was asked for
       (a hard kill would say ``full_rerun`` instead -- that is the
@@ -1384,11 +1435,31 @@ def test_stop_then_restart_resumes_the_same_session(tmp_path):
         assert stop_status == 200, (
             f"stopping the execution answered {stop_status}: {stop_body!r}"
         )
-        assert stop_body.get("status") == "stopped", (
-            f"the stop did not report a stopped plan: {stop_body!r}"
+        # The stop is asynchronous: the answer says the plan is on its
+        # way down, not that it is down.
+        assert stop_body.get("status") == "stopping", (
+            f"the stop did not report a stopping plan: {stop_body!r}"
         )
-        assert stop_body.get("interrupted_task_count") == 1, (
-            f"the stop reported no interrupted task: {stop_body!r}"
+        assert stop_body.get("stop_scope") == "execution", (
+            f"the stop did not report the execution scope: {stop_body!r}"
+        )
+        assert stop_body.get("paused") is True, (
+            f"the stop did not report the plan as paused: {stop_body!r}"
+        )
+        assert isinstance(stop_body.get("survivors"), list), (
+            f"the stop reported no survivors list: {stop_body!r}"
+        )
+
+        # --- the stop completes ---------------------------------------
+        # The plan reaches ``stopped`` only once it has really fallen
+        # silent, and the resume point the stop writes lands in the
+        # same window -- so the poll is what makes the checkpoint below
+        # readable instead of a race with the worker that writes it.
+        stopped_body = _wait_for_execution_status(
+            base_url, PLAN_ID, "stopped",
+        )
+        assert stopped_body.get("interrupted_task_count") == 1, (
+            f"the stopped plan reported no interrupted task: {stopped_body!r}"
         )
 
         # --- the checkpoint the stop wrote ----------------------------
@@ -1466,11 +1537,12 @@ def _assert_stop_resume_chain_over_http(
     """The same chain without a browser: stop -> checkpoint -> start.
 
     This is the fallback for a machine that has no Playwright driver.
-    It asserts the chain the browser pass asserts -- the checkpoint
-    records ``session_resume``, the next start dispatches ``--resume
-    <the same id>`` (and not ``--session-id``), and the stopped child is
-    gone -- minus the two facts only a page can show: the badge and the
-    screenshots.
+    It asserts the chain the browser pass asserts -- the stop answers
+    ``stopping`` and the plan reaches ``stopped`` only once it has
+    fallen silent, the checkpoint records ``session_resume``, the next
+    start dispatches ``--resume <the same id>`` (and not
+    ``--session-id``), and the stopped child is gone -- minus the two
+    facts only a page can show: the badge and the screenshots.
     """
     status, body = _http(
         "POST",
@@ -1497,9 +1569,23 @@ def _assert_stop_resume_chain_over_http(
         timeout=120,
     )
     assert stop_status == 200, f"stopping the execution answered {stop_status}: {stop_body!r}"
-    assert stop_body.get("status") == "stopped", (
-        f"the stop did not report a stopped plan: {stop_body!r}"
+    assert stop_body.get("status") == "stopping", (
+        f"the stop did not report a stopping plan: {stop_body!r}"
     )
+    assert stop_body.get("stop_scope") == "execution", (
+        f"the stop did not report the execution scope: {stop_body!r}"
+    )
+    assert stop_body.get("paused") is True, (
+        f"the stop did not report the plan as paused: {stop_body!r}"
+    )
+    assert isinstance(stop_body.get("survivors"), list), (
+        f"the stop reported no survivors list: {stop_body!r}"
+    )
+
+    # The stop completes in the background: the plan reaches
+    # ``stopped`` only once it has fallen silent, and the checkpoint
+    # below is written in that same window.
+    _wait_for_execution_status(base_url, PLAN_ID, "stopped")
 
     checkpoint = _checkpoint(work / "plans" / PLAN_ID)
     interrupted = _interrupted(checkpoint, TASK_ID)

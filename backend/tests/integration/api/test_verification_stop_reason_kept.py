@@ -14,10 +14,12 @@
 一次 ``/stop`` 走过三步，三步各有各的职责，混在一起就会互相吃掉：
 
   1. **路由 CAS** —— ``plan_routing.current_phase`` 从
-     ``verification_running`` 挪到 ``verification``。停的是**轮次**，
+     ``verification_running`` 挪到计划级的 ``user_stopping``；计划真的
+     安静下来之后，后台层才把它停到 ``verification``。停的是**轮次**，
      不是计划；计划还在，只是这一轮暂停了。
   2. **仓库层** —— ``mark_stopped()`` 对**已经是终态**的行只写一次：
-     第一次的原因留下，后来的覆盖只被记进日志，不落盘。
+     第一次的原因留下，后来的覆盖只被记进日志，不落盘。这一步现在由
+     后台层做 —— 所以断言行的那几条用例要等停止收尾之后再读盘。
   3. **检查点** —— ``pause_state.json`` 的 ``reason`` 来自**调用方**：
      ``/stop`` 自己说 ``user_stopped``，检查点就写 ``user_stopped``。
 
@@ -49,6 +51,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -56,6 +59,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 import server
+import stop_state
+import stop_supervisor
 import verification_cancel
 from pause_state import checkpoint_path
 from server import app
@@ -69,6 +74,11 @@ from state_machine.repositories.verification_repository import (
 
 
 PLAN_ID = "20261103-stop-reason-kept"
+
+#: The quiet window the background layer waits for before it may park
+#: the plan.  Short here on purpose: the window is a policy of the
+#: deployment, not a contract of the stop.
+QUIET_SECONDS = 0.2
 
 #: 这一轮**已经**结束时的原因 —— 事故里被覆盖掉的那一个。
 TERMINAL_REASON = "base_drift_conflicts"
@@ -103,10 +113,31 @@ ROUND_VERDICTS = [
 
 
 @pytest.fixture(autouse=True)
-def _clean_cancel_flags():
-    """stop 的取消标志是进程级的 —— 不许漏到下一个用例。"""
+def _clean_stop_state(monkeypatch):
+    """stop 的进程级状态是全局的 —— 不许漏到下一个用例。
+
+    ``stop_state``（停止记录）、``stop_supervisor``（监督线程）和
+    ``verification_cancel``（取消标志）都是进程级的、按 plan_id 索引的，
+    而这些用例复用同一个 ``PLAN_ID`` —— 上一个用例留下的记录或监督线程
+    会决定下一个用例的 stop 行为。
+
+    静默窗口是部署的策略、不是 stop 的契约，所以这里把它调短：用例不该
+    为每次 stop 付五秒钟。
+    """
+    real_start = stop_supervisor.start
+
+    def _start(plan_id, **kwargs):
+        kwargs["quiet_seconds"] = QUIET_SECONDS
+        return real_start(plan_id, **kwargs)
+
+    monkeypatch.setattr(stop_supervisor, "start", _start)
+
+    stop_state._reset_for_tests()
+    stop_supervisor._reset_for_tests()
     verification_cancel._reset_for_tests()
     yield
+    stop_supervisor._reset_for_tests()
+    stop_state._reset_for_tests()
     verification_cancel._reset_for_tests()
 
 
@@ -227,6 +258,38 @@ def _read_row(db_path: Path) -> Dict[str, Any]:
         conn.close()
 
 
+def _read_phase(db_path: Path) -> str:
+    """路由行的 ``current_phase`` —— 在自己的连接上读回来。"""
+    conn = open_db(db_path)
+    try:
+        row = RoutingRepository(conn).current(PLAN_ID)
+    finally:
+        conn.close()
+    return (row or {}).get("current_phase")
+
+
+def _wait_for_stop_to_settle(db_path: Path, timeout: float = 60.0) -> str:
+    """等后台层给出裁决，再把相位读回来。
+
+    停止是一个**过程**：请求只关闸门、回答 ``stopping``，把相位停到
+    计划级的 ``user_stopping``；真正把相位停到别处的是后台层 —— 所以
+    相位是轮询出来的，不是假定的。
+
+    停止记录也一起等：``/start`` 在停止还在进行时会拒它，而记录正是在
+    后台层收尾时才清掉的。
+    """
+    deadline = time.monotonic() + timeout
+    phase = _read_phase(db_path)
+    while time.monotonic() < deadline:
+        if phase != "user_stopping" and stop_state.get(PLAN_ID) is None:
+            return phase
+        time.sleep(0.05)
+        phase = _read_phase(db_path)
+    raise AssertionError(
+        f"停止始终没有收尾 —— {timeout:.0f}s 之后计划还停在 {phase!r}"
+    )
+
+
 def _read_checkpoint(plan_dir: Path) -> Dict[str, Any]:
     """检查点读回来 —— 断言的是**盘上的东西**，不是返回值。"""
     return json.loads(checkpoint_path(plan_dir).read_text(encoding="utf-8"))
@@ -255,6 +318,10 @@ def test_stop_does_not_overwrite_terminal_reason(env, client, published):
 
     resp = client.post(f"/api/verification/{PLAN_ID}/stop")
     assert resp.status_code == 200, resp.text
+
+    # 终态写发生在**后台层**了：请求只关闸门。所以行是在停止收尾之后
+    # 读的 —— 否则这条断言跑在它要断言的那次写之前。
+    _wait_for_stop_to_settle(db_path)
 
     row = _read_row(db_path)
     assert row["verification_stop_reason"] == TERMINAL_REASON, (
@@ -293,6 +360,10 @@ def test_stop_on_terminal_row_without_recorded_by_does_not_raise(
         f"results) must not take the endpoint down: {resp.status_code} "
         f"{resp.text}"
     )
+
+    # The background layer's verdict must be reached too — a stop that
+    # could not park the plan is a stop that did not hold.
+    assert _wait_for_stop_to_settle(db_path) == "verification"
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +424,11 @@ def test_stop_on_terminal_row_publishes_no_second_plan_closed(
     resp = client.post(f"/api/verification/{PLAN_ID}/stop")
     assert resp.status_code == 200, resp.text
 
+    # The terminal write is the background layer's now — so the count
+    # is taken after the stop has settled, or it would count nothing
+    # at all.
+    _wait_for_stop_to_settle(db_path)
+
     closed = _plan_closed(published)
     assert closed == [], (
         "the stop announced the plan closed again — this round was "
@@ -367,7 +443,7 @@ def test_stop_on_terminal_row_publishes_no_second_plan_closed(
 
 
 def test_stop_reads_db_row_when_in_memory_state_is_empty(env, client, published):
-    """``_verification_state`` 为空 → 走 DB 行，仍返回 stopped/paused。
+    """``_verification_state`` 为空 → 走 DB 行，仍返回 stopping/paused。
 
     停的依据是**路由行的 CAS**，不是内存里的 ``_verification_state`` ——
     后端重启之后内存是空的，但行还在，stop 必须照样工作。
@@ -383,9 +459,15 @@ def test_stop_reads_db_row_when_in_memory_state_is_empty(env, client, published)
     resp = client.post(f"/api/verification/{PLAN_ID}/stop")
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["status"] == "stopped", body
+    # The stop is a process: the request closes the gate and answers
+    # "stopping" — the park is the background layer's verdict.
+    assert body["status"] == "stopping", body
     assert body["paused"] is True, body
     assert body["round"] == ROUND_N, body
+
+    # And the background layer does park it — the plan leaves the
+    # stopping phase at the phase it was interrupted in.
+    assert _wait_for_stop_to_settle(db_path) == "verification"
 
 
 def test_stop_on_non_verification_phase_still_409(env, client, published):

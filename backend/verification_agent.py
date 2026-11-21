@@ -47,6 +47,18 @@ from coding_tool import (
 from config_paths import resolve_plans_dir, resolve_state_db_path
 import provider_capacity
 from verification_config import TimeoutPolicy
+# 2026-11-20（VP 派发闸门 + 派发台账）：派发是这一轮最贵的一件事 —— 它起
+# 子 agent、占 provider 槽位、花操作员的 token。所以派发前要问一次「这个 plan
+# 还在停吗」，并且每一次真的派出去了都要记进台账（静默判定就靠它回答「停之后
+# 还有没有新派发」）。
+#
+# ``stop_state`` 是 plan 级的停止记录（任务 2），``verification_cancel`` 是它
+# 旁边的派发台账与取消标志。两个模块都只依赖标准库，顶层 import 不带循环
+# 风险 —— 与 ``coding_tool`` / ``verification_loop`` 里的同名 import 同一套
+# 做法。
+import stop_state
+import verification_cancel
+from verification_cancel import VerificationCancelled
 # 2026-11-05（缺陷 B 第 1、3、4 条的生成侧）：成本字段的取值从执行器那边借 ——
 # 生成侧补的 ``cost`` 必须与执行器认的 ``cost`` 是同一个词，否则"生成器说
 # none、执行器按 llm_quota 拦"这种事会以最难查的方式出现。
@@ -10665,7 +10677,19 @@ class Orchestrator:
         The dispatcher is the very closure the executor used, so a
         re-run is graded by the same rules as the first attempt — the
         same gates, the same evidence, the same verdicts.
+
+        **2026-11-20 — the re-dispatch asks the same stop gate.** The
+        re-run is a dispatch with the same money: it starts the same
+        sub-agents, on the same plan.  A plan that is stopping must not
+        get a second round of work through the back door, so the gate is
+        asked **here** — not only inside the runner, which the re-dispatch
+        merely happens to reach.  A refusal leaves the re-run with **no**
+        verdict for the refused point: a refused re-dispatch is not a
+        failed re-dispatch, and writing one would put a refusal into the
+        round's results table, where it reads as "this verification point
+        failed".
         """
+        self._assert_vp_dispatch_allowed(self._vp_dispatch_plan_id())
         runner = getattr(self, "_vp_dispatch_runner", None)
         if runner is None:
             return {}
@@ -10681,6 +10705,13 @@ class Orchestrator:
                 vp_id = str(vp.get("id"))
                 try:
                     verdict = await runner(vp)
+                except VerificationCancelled:
+                    # 2026-11-20: the operator's stop is not a failed
+                    # re-run.  It leaves this re-run with no verdict for
+                    # the refused point, and it travels on as itself — the
+                    # arm below would turn it into a FAILED verdict and
+                    # put it into the round's results table.
+                    raise
                 except Exception as exc:  # noqa: BLE001 — one point's
                     # failure must not take the re-run down
                     logger.warning(
@@ -13019,9 +13050,22 @@ class Orchestrator:
         pulled from the child definition so consumers can roll
         results back up to the original VP without re-parsing the
         plan.
+
+        **2026-11-20 — the children ask the stop gate too.** A split
+        is a second wave of dispatches: every child starts its own
+        sub-agent, on the same plan, with the same money.  The parent's
+        gate was asked *before* the split was decided, so a stop that
+        lands while the split is being decided would still let the
+        children go out — the children ask the gate themselves.  And
+        each child that goes out is counted: a child is a verification
+        point with its own id, and the ledger answers "was anything
+        dispatched while the window was open".
         """
         if not children:
             return []
+
+        plan_id = self._vp_dispatch_plan_id()
+        self._assert_vp_dispatch_allowed(plan_id)
 
         async def _run_one(child: dict) -> dict:
             # ``_run_single_vp_async`` honours the per-VP
@@ -13029,6 +13073,10 @@ class Orchestrator:
             # the original ``verification_method`` through, so each
             # child runs under the same per-method cap as a fresh
             # top-level VP would.
+            # 2026-11-20（派发台账）：子验证点也是一次派发 —— 它有自己
+            # 的 id，是台账该记的一笔。记在**派出去之前**，与父验证点
+            # 同一条规矩。
+            self._note_vp_dispatch(plan_id)
             result = await self._run_single_vp_async(child)
             # Propagate the trace-back metadata onto the result so
             # downstream consumers can correlate child → parent
@@ -14316,6 +14364,83 @@ class Orchestrator:
             return ""
         return str(root)
 
+    # -----------------------------------------------------------------------
+    # The dispatch gate and the dispatch ledger (2026-11-20)
+    # -----------------------------------------------------------------------
+    #
+    # A verification-point dispatch is the most expensive thing this round
+    # does: it starts a sub-agent, it takes a provider slot, it spends the
+    # operator's tokens.  Two facts have to be true before one goes out:
+    #
+    #   * the plan is **not stopping** — a stop was requested, and a
+    #     dispatch that goes out after it is work nobody is going
+    #     to read;
+    #   * the dispatch is **counted** — the quiet window's verdict is
+    #     "nothing new was dispatched", and that is only answerable
+    #     against a number.
+    #
+    # Both facts live in the modules the stop path and the quiet-window
+    # judgement already read (``stop_state`` and ``verification_cancel``),
+    # so there is one answer per question rather than one per layer.
+
+    def _vp_dispatch_plan_id(self) -> str:
+        """The plan a verification-point dispatch belongs to.
+
+        The plan id is the plan directory's name — the same id the stop
+        record and the dispatch ledger are keyed by, so a dispatch and
+        the stop that watches it are about the same plan.
+        """
+        return str(self.plan_dir.name)
+
+    def _assert_vp_dispatch_allowed(self, plan_id: str) -> None:
+        """Refuse a verification-point dispatch while the plan is stopping.
+
+        The refusal is **raised**, not returned: the caller of a dispatch
+        is the round, and the type it raises (:class:`VerificationCancelled`)
+        is the one every layer above already treats as "the operator
+        stopped this" rather than "this broke".  A stopped round must not
+        be written down as a failed one — the operator paused the plan,
+        and a failure record would ask them to triage work they
+        deliberately stopped.
+
+        The gate sits **before** every observable effect of the dispatch:
+        before the sub-agent is spawned, before the dispatch is counted,
+        before a verdict exists.  A refused dispatch therefore leaves no
+        trace at all — no process, no ledger entry, no result row.
+
+        An empty ``plan_id`` is never gated: a dispatch that belongs to
+        nobody in particular must not be refused by some other plan's
+        stop.
+        """
+        if not plan_id:
+            return
+        if stop_state.is_stopping(plan_id):
+            logger.warning(
+                "[vp_dispatch_gate] rejected plan=%s — the plan is stopping",
+                plan_id,
+            )
+            raise VerificationCancelled(
+                plan_id,
+                f"verification cancelled for plan {plan_id!r}: "
+                "the plan is stopping",
+            )
+
+    def _note_vp_dispatch(self, plan_id: str) -> None:
+        """Count one verification-point dispatch in the plan's ledger.
+
+        The ledger is what the quiet window compares against the baseline
+        the stop took: "nothing new was dispatched" is only meaningful
+        against a count.  It is monotonic and process-local
+        (``verification_cancel`` owns it).
+
+        An empty ``plan_id`` records nothing: a dispatch that belongs to
+        no plan cannot be compared with any plan's baseline, so writing
+        it would only make some plan's count a lie.
+        """
+        if not plan_id:
+            return
+        verification_cancel.note_dispatch(plan_id)
+
     def _build_verification_executor(self, plan_data: dict) -> "VerificationExecutor":
         """Build a :class:`VerificationExecutor` wired to this agent.
 
@@ -14348,6 +14473,17 @@ class Orchestrator:
         plan_definitions = self._plan_vp_definitions()
 
         async def _dispatch_vp(vp_node: dict) -> dict:
+            # 2026-11-20（派发闸门）：**最先**问一次「这个 plan 还在停吗」。
+            # 停下来的 plan 不再派发 —— 派出去的那一条没人会读，而它烧的是
+            # 操作员刚要求省下来的 token。被拒的派发以
+            # ``VerificationCancelled`` 的形态离开：不 spawn、不记台账、
+            # 不写进结果表。
+            #
+            # 位置承重：这道门在**任何**可观察的副作用之前 —— 在子 agent
+            # 起来之前、在二进制重建那条路上的子 agent 之前、在任何一次
+            # coding tool 调用之前。
+            plan_id = self._vp_dispatch_plan_id()
+            self._assert_vp_dispatch_allowed(plan_id)
             # 2026-10-25 (repair-r1-32): the round keeps its own
             # dispatcher, so the one automatic re-run of the points the
             # environment blocked is graded by exactly the rules the
@@ -14370,6 +14506,14 @@ class Orchestrator:
                     vp_id, VP_DEFINITION_MISSING_SIGNAL, {"gaps": _gaps},
                 )
                 return self._build_vp_definition_blocked_verdict(vp_id, _gaps)
+
+            # 2026-11-20（派发台账）：从这一行往后，任何一条路都可能 spawn
+            # （子 agent、二进制重建、整仓 CI），所以台账在**第一次可能
+            # spawn 之前**记这一笔 —— 静默判定问的「停之后还有没有新派发」
+            # 才不会被一条漏记的派发骗过去。
+            #
+            # 定义缺失而没派出去的那一条不记：它没有 dispatch 可言。
+            self._note_vp_dispatch(plan_id)
 
             # 2026-10-25 (repair-r1-31): the address this VP is about
             # to use is recorded **before** anything can block it — a

@@ -24,8 +24,11 @@ N3  An executor that is asked to stop has to take its children with it
     and give the plan's lock back.
 
 N4  A stop that has lost its handle — the backend restarted — still has
-    to find the plan's processes in the ledger, and it may only answer
-    "stopped" once they are *confirmed* dead.
+    to find the plan's processes in the ledger.  A stop is a process,
+    not an instant: the request answers "stopping" and parks the plan
+    at the plan-level stopping phase, and only the background layer may
+    park it at "stopped" — once the plan's processes are *confirmed*
+    dead.  A process that survives keeps the plan where it is.
 
 N5  One plan, one executor: a second start is refused, and an executor
     started by hand against a plan that is already running refuses to
@@ -967,6 +970,45 @@ def _mark_running_without_handle(
     }
 
 
+def _read_phase(db_path: Path, plan_id: str) -> Optional[str]:
+    """The routing row's phase, read back on its own connection.
+
+    The phase is where the plan's truth about a stop lives: the request
+    parks it at the plan-level stopping phase, and the background layer
+    flips it to ``stopped`` once the plan is really quiet.  A control
+    that reads it watches the contract itself — not the answer the
+    request happened to give.
+    """
+    conn = open_db(db_path)
+    try:
+        row = RoutingRepository(conn).current(plan_id)
+    finally:
+        conn.close()
+    return (row or {}).get("current_phase")
+
+
+def _wait_for_phase(
+    db_path: Path, plan_id: str, phase: str, timeout: float = 30.0,
+) -> bool:
+    """Wait for the plan's phase to reach ``phase``; True when it did."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _read_phase(db_path, plan_id) == phase:
+            return True
+        time.sleep(0.05)
+    return _read_phase(db_path, plan_id) == phase
+
+
+def _quiet_window_seconds() -> float:
+    """The quiet window this deployment's stop waits for.
+
+    The window is the deployment's policy, so the control reads it the
+    way the stop reads it: a control that hard-coded five seconds would
+    silently judge a window the deployment never promised.
+    """
+    return float(server._routes_execution._resolve_stop_quiet_seconds())
+
+
 class _NoThreads:
     """A stand-in for the ``threading`` module that starts nothing.
 
@@ -1325,10 +1367,16 @@ def test_n4_stop_without_handle_uses_ledger(plan_env, client, monkeypatch):
     marked the plan stopped, wrote a checkpoint, parked the phase — and
     killed nothing.
 
-    And the answer has to mean something: "stopped" is only allowed
-    once every process the plan owns is *confirmed* dead.  A process
-    that survived turns the answer into ``kill_incomplete`` plus the
-    pids that are still running.
+    And the answer has to mean something.  A stop is a *process*, not
+    an instant, and it has an order.  The request closes the gate and
+    answers ``stopping`` — the scope, the phase the stop came from, and
+    the work that was still running — and the plan is parked at the
+    plan-level ``user_stopping`` phase.  Only the background layer may
+    park it at ``stopped``, and only once every process the plan owns
+    is *confirmed* dead.
+
+    A process that survives keeps the plan where it is: the phase stays
+    ``user_stopping``, and the answer names the survivor.
     """
     plans_dir, db_path = plan_env
     plan_id = _plan_id("n4")
@@ -1349,18 +1397,49 @@ def test_n4_stop_without_handle_uses_ledger(plan_env, client, monkeypatch):
         resp = client.post("/api/execution/{}/stop".format(plan_id))
 
         assert resp.status_code == 200, resp.text
-        assert resp.json()["status"] == "stopped", resp.json()
+        body = resp.json()
+        # The answer says "a stop is in progress", not "the work is
+        # over": the executor is still running at this very moment.
+        assert body["status"] == "stopping", body
+        assert body["stop_scope"] == "execution", body
+        assert body["previous_phase"] == "executing", body
+        assert body["still_running"] is True, body
+        assert executor.pid in [s["pid"] for s in body["survivors"]], (
+            "the answer does not name the executor that was still "
+            "running: {}".format(body)
+        )
+
+        # The phase is the truth, and it is not the answer's: the stop
+        # parks the plan at the stopping phase and waits there.
+        assert _read_phase(db_path, plan_id) == "user_stopping", (
+            "the stop did not park the plan at the plan-level stopping "
+            "phase — it is {!r}".format(_read_phase(db_path, plan_id))
+        )
+
         assert _wait_until_gone([executor.pid], 30), (
-            "the stop answered 'stopped' but the process the ledger "
+            "the stop answered 'stopping' but the process the ledger "
             "records for this plan is still running"
         )
         assert ledger_only_pids(plan_dir) == [], (
             "the ledger still calls a dead process live"
         )
+        # The tree is gone, but the plan is not parked yet: the phase is
+        # the background layer's verdict, and the verdict comes after
+        # the silence, not with the request.
+        assert _read_phase(db_path, plan_id) == "user_stopping", (
+            "the plan was parked at the stopped phase while its process "
+            "was still running — it is {!r}".format(
+                _read_phase(db_path, plan_id)
+            )
+        )
+        assert _wait_for_phase(db_path, plan_id, "stopped", 30), (
+            "the plan never reached the stopped phase — it is "
+            "{!r}".format(_read_phase(db_path, plan_id))
+        )
 
-        # --- and "stopped" has to mean dead ---------------------------
-        # A process that cannot be confirmed dead keeps the plan
-        # running: the answer names it.
+        # --- and the phase only moves when the tree is really gone -----
+        # A process that cannot be confirmed dead keeps the plan where
+        # it is: the answer names the survivor, and the phase stays.
         plan_id2 = _plan_id("n4b")
         plan_dir2, project_dir2 = _seed_plan(
             plans_dir, db_path, plan_id=plan_id2, phase="executing",
@@ -1388,9 +1467,32 @@ def test_n4_stop_without_handle_uses_ledger(plan_env, client, monkeypatch):
             resp2 = client.post("/api/execution/{}/stop".format(plan_id2))
 
             assert resp2.status_code == 200, resp2.text
-            body = resp2.json()
-            assert body["status"] == "kill_incomplete", body
-            assert body["surviving_pids"] == [executor2.pid], body
+            body2 = resp2.json()
+            assert body2["status"] == "stopping", body2
+            assert body2["still_running"] is True, body2
+            assert executor2.pid in [s["pid"] for s in body2["survivors"]], (
+                "the answer does not name the survivor: {}".format(body2)
+            )
+
+            # The negative control of the whole contract: a plan that
+            # is still working is not a stopped plan.  The quiet window
+            # is waited out on purpose — the phase must still say "a
+            # stop is in progress" when the window ends.
+            quiet = _quiet_window_seconds()
+            assert not _wait_for_phase(
+                db_path, plan_id2, "stopped", quiet + 3.0,
+            ), (
+                "the plan was parked at the stopped phase while its "
+                "process was still alive — it is {!r}".format(
+                    _read_phase(db_path, plan_id2)
+                )
+            )
+            assert _read_phase(db_path, plan_id2) == "user_stopping", (
+                "the plan left the stopping phase while its process was "
+                "still alive — it is {!r}".format(
+                    _read_phase(db_path, plan_id2)
+                )
+            )
         finally:
             _kill_process(executor2)
             _kill_pid(executor2.pid)

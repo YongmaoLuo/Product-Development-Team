@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,9 +67,17 @@ import pytest
 from fastapi.testclient import TestClient
 
 import server
+import stop_state
+import stop_supervisor
+import verification_cancel
 from server import app
 
 client = TestClient(app)
+
+#: 静默窗口是部署的策略，不是这两个端点的契约：等五秒只为看一次相位
+#: 翻转的测试，没人跑。执行侧从环境变量读它，验证侧不读（它用自己的
+#: 默认值），所以两边都要缩短 —— 见用例里的 ``_fast_start``。
+QUIET_SECONDS = "0.2"
 
 
 # ---------------------------------------------------------------------------
@@ -128,9 +137,16 @@ def process_state_guard():
 
     恢复而不是清空：别的用例（以及应用自己的启动恢复）可能在这些字典里
     放过东西，清空会毁掉不属于本用例的状态。
+
+    停机那套进程内状态（``stop_state`` 的停机记录、``stop_supervisor``
+    的看门线程、``verification_cancel`` 的取消标志）同样是全局的：一个
+    用例留下的记录会替下一个用例决定结果，所以这里也一并复位。
     """
     execution_before = dict(server._execution_state)
     verification_before = dict(server._verification_state)
+    stop_state._reset_for_tests()
+    stop_supervisor._reset_for_tests()
+    verification_cancel._reset_for_tests()
     spawned: list = []
     yield spawned
     for proc in spawned:
@@ -139,6 +155,9 @@ def process_state_guard():
     server._execution_state.update(execution_before)
     server._verification_state.clear()
     server._verification_state.update(verification_before)
+    stop_supervisor._reset_for_tests()
+    stop_state._reset_for_tests()
+    verification_cancel._reset_for_tests()
 
 
 @pytest.fixture
@@ -261,6 +280,22 @@ def _routing_phase(plan_id: str) -> Optional[str]:
     finally:
         conn.close()
     return None if row is None else row.get("current_phase")
+
+
+def _wait_for_phase(plan_id: str, phase: str, timeout: float = 30.0) -> bool:
+    """等这个计划的相位落到 ``phase``；到了返回 True。
+
+    停机是一个**过程**（2026-11-20）：请求把计划停在计划级的
+    ``user_stopping`` 相位上就回答了，后台层等计划安静下来才把它停在
+    终态相位（执行的停是 ``stopped``，验证的停是 ``verification``）。
+    所以相位是**等出来**的 —— 请求本身不再说这个计划最后停在哪。
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _routing_phase(plan_id) == phase:
+            return True
+        time.sleep(0.05)
+    return _routing_phase(plan_id) == phase
 
 
 def _execution_recorded(plan_id: str) -> bool:
@@ -421,7 +456,7 @@ SCENARIOS_BY_NAME = {s.name: s for s in SCENARIOS}
     "scenario", SCENARIOS, ids=[s.name for s in SCENARIOS],
 )
 def test_stop_equivalence_in_six_scenarios(
-    scenario, tmp_path, fake_executor,
+    scenario, tmp_path, fake_executor, monkeypatch,
 ):
     """门面与既有端点在六个场景下给出同一个答案。
 
@@ -430,9 +465,24 @@ def test_stop_equivalence_in_six_scenarios(
 
     断言的是**相等**（两条路一致）**加上绝对值**（两条路都落在同一个
     已知相位上）。只断言相等的话，两条路一起坏掉也看不出来。
+
+    (2026-11-20：停机成了过程。请求把计划停在 ``user_stopping`` 上就回答
+    ``stopping``，终态相位是后台层等计划安静之后落的，所以「在飞」的那两个
+    停机场景要**等**相位落地再比 —— 请求本身不再说这个计划最后停在哪。)
     """
     project_dir = tmp_path / "project"
     project_dir.mkdir(parents=True, exist_ok=True)
+
+    # 静默窗口是部署的策略，用例把它缩短：执行侧从环境变量读它，验证侧
+    # 用自己的默认值，所以两条路都从这里缩短。
+    monkeypatch.setenv("PDT_STOP_QUIET_SECONDS", QUIET_SECONDS)
+    real_start = stop_supervisor.start
+
+    def _fast_start(started_plan_id, **kwargs):
+        kwargs.setdefault("quiet_seconds", float(QUIET_SECONDS))
+        return real_start(started_plan_id, **kwargs)
+
+    monkeypatch.setattr(stop_supervisor, "start", _fast_start)
 
     legacy_id = f"legacy-{scenario.name}"
     unified_id = f"unified-{scenario.name}"
@@ -479,6 +529,21 @@ def test_stop_equivalence_in_six_scenarios(
 
     legacy = client.post(scenario.legacy.format(plan_id=legacy_id), json=body)
     unified = client.post(scenario.unified.format(plan_id=unified_id), json=body)
+
+    # 终态相位是后台层的裁决，所以「在飞」的那两个停机场景要等它落下来：
+    # 执行的停落在 ``stopped``，验证的停落在 ``verification``（验证停机
+    # 自己的落点）。start 的场景相位是同步写下的，不等。
+    if scenario.in_flight is not None:
+        assert _wait_for_phase(legacy_id, scenario.expected_phase), (
+            f"{scenario.name}: 旧端点没有把相位停在 "
+            f"{scenario.expected_phase!r} —— 它停在 "
+            f"{_routing_phase(legacy_id)!r}"
+        )
+        assert _wait_for_phase(unified_id, scenario.expected_phase), (
+            f"{scenario.name}: 门面没有把相位停在 "
+            f"{scenario.expected_phase!r} —— 它停在 "
+            f"{_routing_phase(unified_id)!r}"
+        )
 
     # --- 三元组 -------------------------------------------------------
     assert legacy.status_code == unified.status_code, (

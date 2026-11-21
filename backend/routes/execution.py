@@ -4069,6 +4069,31 @@ def start_execution(
     )
 
     plan_dir = _server._plan_dir(plan_id)
+
+    # --- The stopping gate ---------------------------------------------
+    # A plan that is being stopped cannot be started.  The stop is a
+    # process: its own background layer is shutting the plan's work
+    # down right now, and a start would race it — a second executor on
+    # a plan that is being torn down, and a resume point written from
+    # under the running one.
+    #
+    # The gate is the FIRST thing this endpoint does, on purpose.  A
+    # refusal must not touch the plan's work: the single-instance guard
+    # below can sweep the plan's tree, and a sweep that races the
+    # stop's own shutdown is the very race this gate exists to prevent.
+    # It also must not depend on anything the request carries — a start
+    # that is refused because of the *plan* is refused the same way
+    # whatever the body says.
+    #
+    # The refusal names the reason.  "conflict" sends the operator to
+    # look at the phase; "plan_user_stopping" says a stop is in
+    # progress and that the start will work once the stop is over.
+    if _plan_is_stopping(plan_id, plan_dir):
+        return JSONResponse(
+            status_code=409,
+            content={"detail": {"error": "plan_user_stopping"}},
+        )
+
     tasks_file = plan_dir / "tasks.json"
     if not tasks_file.exists():
         raise HTTPException(404, "Tasks not found — generate tasks first")
@@ -5232,6 +5257,38 @@ def _status_logs(plan_id: str, state: Optional[dict], status: str) -> list[str]:
     )
 
 
+def _status_answer(plan_id: str, payload: Dict[str, Any]) -> Any:
+    """The status answer, with the stopping half when the plan is stopping.
+
+    A plan that is stopping is not a plan with a status: it is a plan on
+    its way down.  The answer has to say so — ``status`` is
+    ``stopping`` (not ``running``: the work is being taken down; not
+    ``stopped``: the stop has not finished), ``stop_scope`` names the
+    work that is shutting down, and ``survivors`` names what was still
+    running when the reader asked.
+
+    The stopping answer is returned as a raw JSON response, on purpose.
+    The published status model constrains ``status`` to a fixed
+    vocabulary that has no ``stopping`` in it, and the OpenAPI baseline
+    is frozen: a plan that is stopping must be able to say so without
+    the published contract of every other plan changing.  A plan that is
+    NOT stopping keeps the answer it always published — the same keys,
+    the same values, the same model — so a reader never has to wonder
+    whether a missing field means "no stop" or "this build does not
+    report it".
+    """
+    record = _plan_stop_record(plan_id)
+    if record is None:
+        return payload
+
+    answer = dict(payload)
+    answer["status"] = "stopping"
+    answer["stopping"] = True
+    answer["stop_scope"] = str(getattr(record, "scope", "") or "")
+    answer["survivors"] = _public_survivors(_execution_stop_survivors(plan_id))
+    return JSONResponse(content=answer)
+
+
 @router.get("/api/execution/{plan_id}/status", response_model=_ExecutionStatusResponse)
 def get_execution_status(plan_id: str):
     """Poll execution status and logs.
@@ -5393,7 +5450,7 @@ def get_execution_status(plan_id: str):
         # outcome.  So the phase is consulted before the verdict is
         # shown — see ``plan_status.normalize_exec_status``.
         status = normalize_exec_status(read.phase, status)
-        return {
+        return _status_answer(plan_id, {
             "plan_id": plan_id,
             "status": status,
             "logs": _status_logs(plan_id, s, status),
@@ -5410,7 +5467,7 @@ def get_execution_status(plan_id: str):
             "data_source": STATUS_DATA_SOURCE_STATE_DB,
             "data_source_detail": source,
             **_pause_fields(plan_id),
-        }
+        })
     if s:
         # No row, but this process holds a view of the run: the answer
         # is that view, and it says so — it was not read from the row.
@@ -5418,7 +5475,7 @@ def get_execution_status(plan_id: str):
         # The same rule as the row branch above: the workflow's phase
         # outranks the last run's verdict when the phase IS a verdict.
         status = normalize_exec_status(read.phase, status)
-        return {
+        return _status_answer(plan_id, {
             "plan_id": plan_id,
             "status": status,
             "logs": _status_logs(plan_id, s, status),
@@ -5433,7 +5490,7 @@ def get_execution_status(plan_id: str):
             "data_source": STATUS_DATA_SOURCE_DEFAULT,
             "data_source_detail": source,
             **_pause_fields(plan_id),
-        }
+        })
     # No execution row at all — and nothing this process holds either.
     # The empty "not started" answer is a CLAIM about the plan's
     # history, so it may only be made when this instance can back it
@@ -5446,7 +5503,7 @@ def get_execution_status(plan_id: str):
     # The library was read and it holds no run for this plan: the plan
     # has never run, and a reader must never be handed a fabricated
     # failure instead.
-    return {
+    return _status_answer(plan_id, {
         "plan_id": plan_id,
         "status": "not_started",
         "logs": [],
@@ -5459,7 +5516,7 @@ def get_execution_status(plan_id: str):
         "data_source": STATUS_DATA_SOURCE_DEFAULT,
         "data_source_detail": source,
         **_pause_fields(plan_id),
-    }
+    })
 
 
 @router.post("/api/execution/{plan_id}/task_delta")
@@ -6536,6 +6593,585 @@ def _stop_idle_execution(
     )
 
 
+# ---------------------------------------------------------------------------
+# The plan-level stopping phase
+# ---------------------------------------------------------------------------
+
+#: The plan-level phase a stop parks the plan at while the stop is in
+#: progress.  ``plan_state`` owns the vocabulary; this is the one name
+#: this module writes (arch decision 1 — the execution stop and the
+#: verification stop share ONE stopping phase, so a plan that is being
+#: stopped says so the same way whoever asks).
+_USER_STOPPING_PHASE = "user_stopping"
+
+#: The phases an execution stop may come from.  A stop that arrives
+#: from any other phase is not this stop's business, and it keeps the
+#: behaviour it always had — the change does not reach sideways into
+#: another kind of work.
+_EXECUTION_STOP_SOURCE_PHASES = ("executing",)
+
+#: The kind a survivor of the execution scope carries when it is the
+#: plan's own executor.  The shared scanner knows the verification
+#: sub-agents and the repair executor; the main executor is this
+#: route's own business.
+_KIND_EXECUTION_EXECUTOR = "execution_executor"
+
+#: The kind the stop's own background worker carries.  It is not a
+#: process — its pid is 0 — so the escalation can never signal it.
+_KIND_STOP_WORKER = "stop_worker"
+
+#: The environment variable that sets the quiet window.
+_STOP_QUIET_ENV = "PDT_STOP_QUIET_SECONDS"
+
+
+#: The background workers that are shutting a plan's execution down.
+#: The plan id is the key: one worker per plan.  The entry is also what
+#: the quiet window watches — while the worker runs, the resume point
+#: is not written yet, so the plan is not quiet yet.
+_stop_workers: Dict[str, threading.Event] = {}
+_stop_workers_lock = threading.Lock()
+
+
+def _stop_worker_started(plan_id: str) -> None:
+    """Record that this plan's stop has a background worker running."""
+    with _stop_workers_lock:
+        _stop_workers[plan_id] = threading.Event()
+
+
+def _stop_worker_running(plan_id: str) -> bool:
+    """True while this plan's stop worker is still running."""
+    with _stop_workers_lock:
+        event = _stop_workers.get(plan_id)
+    return event is not None and not event.is_set()
+
+
+def _stop_worker_finished(plan_id: str) -> None:
+    """Record that this plan's stop worker is done."""
+    with _stop_workers_lock:
+        event = _stop_workers.pop(plan_id, None)
+    if event is not None:
+        event.set()
+
+
+def _resolve_stop_quiet_seconds() -> float:
+    """The quiet window this stop waits for before it may park the plan.
+
+    The deployment's ``PDT_STOP_QUIET_SECONDS`` applies — the window is
+    the deployment's policy, and a stop that hard-coded it would ignore
+    the operator's setting.  A value that is not a number, or a
+    negative one, falls back to the supervisor's default: a window that
+    is not a window must never shorten the wait to nothing.
+    """
+    raw = os.environ.get(_STOP_QUIET_ENV)
+    if raw is not None and raw.strip():
+        try:
+            value = float(raw)
+        except ValueError:
+            value = -1.0
+        if value >= 0:
+            return value
+
+    import stop_supervisor
+
+    return float(stop_supervisor.DEFAULT_QUIET_SECONDS)
+
+
+def _execution_plan_phase(plan_id: str, plan_dir: Path) -> str:
+    """The phase the plan is in right now.
+
+    Read through ``PlanState`` — the same reader the parking helper
+    uses — so the stop and the parking agree on where the plan is.  A
+    plan that cannot be read has no phase this stop may act on, and an
+    empty string says exactly that.
+    """
+    try:
+        ps = _server.PlanState(plan_dir)
+        ps.reload()
+        phase = ps.get_current_phase()
+    except Exception:  # noqa: BLE001 — an unreadable phase is not a phase
+        _server.logger.exception(
+            "stop_execution: could not read the plan's phase plan=%s",
+            plan_id,
+        )
+        return ""
+    return str(phase or "")
+
+
+def _plan_stop_record(plan_id: str) -> Optional[Any]:
+    """The plan's stop record, or ``None`` when it is not stopping.
+
+    The record is written when a stop closes its gate and cleared when
+    the stop's finalize parks the plan.  It is the one piece of state
+    that says "a stop is in progress for this plan", and it says *which*
+    work is stopping — the scope — which the phase alone does not.
+    """
+    import stop_state
+
+    try:
+        return stop_state.get(plan_id)
+    except Exception:  # noqa: BLE001 — an unreadable record is not a stop
+        _server.logger.exception(
+            "[execution_stopping] could not read the stop record plan=%s",
+            plan_id,
+        )
+        return None
+
+
+def _plan_is_stopping(plan_id: str, plan_dir: Path) -> bool:
+    """True while a stop is in progress for this plan.
+
+    Two pieces of evidence, and both of them are needed:
+
+    * the **stop record** — it names the scope of the stop and it is
+      the record the quiet window is judged by;
+    * the **durable phase** — the record is process-local, so a
+      backend that restarted in the middle of a stop still has to know
+      that the plan is stopping.  The phase is what survives the
+      restart.
+    """
+    if _plan_stop_record(plan_id) is not None:
+        return True
+    return _execution_plan_phase(plan_id, plan_dir) == _USER_STOPPING_PHASE
+
+
+def _execution_executor_pid(plan_id: str) -> int:
+    """The pid of the plan's executor, or 0 when it has none.
+
+    The in-memory handle is the first source — it is the process this
+    backend started.  The recorded pid is the second: the handle dies
+    with the backend, the pid outlives it.
+    """
+    state = _server._execution_state.get(plan_id) or {}
+    proc = state.get("process")
+    if proc is not None:
+        try:
+            pid = int(getattr(proc, "pid", 0) or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid > 0:
+            return pid
+    try:
+        return int(state.get("pid") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """True when ``pid`` still names a running process.
+
+    The reaper's own predicate — the same one the stop path uses — so
+    "alive" means one thing in the process.
+    """
+    try:
+        import process_reaper
+
+        return bool(process_reaper._alive(pid))
+    except Exception:  # noqa: BLE001 — an unreadable pid is not a live one
+        _server.logger.exception(
+            "stop_execution: liveness probe failed pid=%s", pid,
+        )
+        return False
+
+
+def _execution_stop_survivors(plan_id: str) -> List[Any]:
+    """The live processes this plan's execution still has.
+
+    The shared scanner knows the verification sub-agents and the repair
+    executor; the main executor is this route's own business, so it is
+    added here.  A stop that could not see the executor would call the
+    plan quiet while the executor was still burning tokens.
+
+    The stop's own worker is reported too: while it runs, the resume
+    point is not written yet, so the plan is not quiet yet.  It is not a
+    process — its pid is 0 — so the escalation can never signal it.
+    """
+    import verification_quiesce
+    from verification_quiesce import Survivor
+
+    try:
+        survivors = list(verification_quiesce.scan_plan_processes(plan_id))
+    except Exception:  # noqa: BLE001 — a scan that fails is an empty scan
+        _server.logger.exception(
+            "stop_execution: survivor scan failed plan=%s", plan_id,
+        )
+        survivors = []
+
+    pid = _execution_executor_pid(plan_id)
+    if pid > 0 and _pid_is_alive(pid):
+        if not any(getattr(s, "pid", 0) == pid for s in survivors):
+            survivors.append(
+                Survivor(pid=pid, kind=_KIND_EXECUTION_EXECUTOR, detail=""),
+            )
+
+    if _stop_worker_running(plan_id):
+        survivors.append(
+            Survivor(pid=0, kind=_KIND_STOP_WORKER, detail=""),
+        )
+
+    return survivors
+
+
+def _public_survivors(survivors: List[Any]) -> List[Dict[str, Any]]:
+    """The survivors as the answer reports them.
+
+    The stop's own worker is not one of them: it is part of the stop,
+    not part of the work the stop is fighting, and its pid is 0.
+    """
+    return [
+        {
+            "pid": int(getattr(s, "pid", 0) or 0),
+            "kind": str(getattr(s, "kind", "") or ""),
+            "detail": str(getattr(s, "detail", "") or ""),
+        }
+        for s in survivors
+        if getattr(s, "kind", "") != _KIND_STOP_WORKER
+    ]
+
+
+def _execution_stopping_answer(
+    plan_id: str, *, previous_phase: str, survivors: List[Any],
+    discard: bool = False,
+) -> Dict[str, Any]:
+    """The answer a stop gives while the stop is still in progress.
+
+    ``status`` is ``stopping`` — not ``stopped``: the plan is on its
+    way down and the answer says so.  ``survivors`` says what was
+    still running when the stop was asked for, and ``previous_phase``
+    says which phase the plan came from, so a caller can tell a
+    stopped execution from a stopped verification round.
+
+    The pause contract is unchanged: the stop is a pause, and the
+    resume point is written by the background layer.  ``paused``
+    answers the REQUEST that was made: ``?discard=true`` means the
+    work is thrown away instead of paused, so the answer says the
+    work was not paused — whether the answer comes from the first
+    stop or from a repeated one.
+    """
+    import stop_state
+
+    public = _public_survivors(survivors)
+    return {
+        "status": "stopping",
+        "plan_id": plan_id,
+        "stop_scope": stop_state.SCOPE_EXECUTION,
+        "previous_phase": previous_phase,
+        "survivors": public,
+        "stopped_at": datetime.now().isoformat(),
+        "reason": "user_stopped",
+        "paused": not discard,
+        # Whether the plan still had work running when the stop was
+        # asked for.  A stop that is still in progress is a stop of a
+        # plan that is still busy — the answer says both.
+        "still_running": bool(public),
+    }
+
+
+def _start_execution_stop_supervisor(plan_id: str) -> None:
+    """Hand the quiet window to the background supervisor.
+
+    The supervisor owns the wait: it watches the plan's process tree,
+    escalates to signals for whatever ignores the cooperative stop, and
+    calls the finalize callback with its verdict.  One supervisor per
+    plan — the module reuses a running one, so a stop that is asked
+    for twice stays one stop.
+    """
+    import stop_supervisor
+
+    try:
+        stop_supervisor.start(
+            plan_id,
+            finalize=_finalize_execution_stop,
+            scan=_execution_stop_survivors,
+            quiet_seconds=_resolve_stop_quiet_seconds(),
+        )
+    except Exception:  # noqa: BLE001 — a stop without a supervisor is still a stop
+        _server.logger.exception(
+            "stop_execution: could not start the stop supervisor plan=%s",
+            plan_id,
+        )
+
+
+def _finalize_execution_stop(plan_id: str) -> None:
+    """The background layer's verdict on an execution stop.
+
+    Called by the supervisor once the plan has fallen silent (or once
+    the hard limit was reached).  Two cases, and the difference is the
+    whole point of the phase:
+
+    * **the plan is quiet** — it is parked in the ``stopped`` phase, the
+      services the run started are reaped, the requeue intent (if there
+      was one) is delivered, and the stop record is cleared;
+    * **the plan is not quiet** — the phase stays ``user_stopping``,
+      because a plan that is still working is not a stopped plan, and
+      the stop record stays too, because the stop is still in progress.
+
+    The parking is the very helper the synchronous stop used, so the
+    phase the stop lands in is the phase the stop always landed in.
+
+    The requeue is delivered **here** and not by the request: the move
+    back to ``queued`` must happen after the plan has fallen silent
+    (PRD G3 / T3) — a plan that is queued while its processes are still
+    alive is a plan that says one thing and is another.
+    """
+    import stop_state
+
+    survivors = list(getattr(plan_id, "survivors", []) or [])
+    plan_id = str(plan_id)
+
+    if survivors:
+        _server.logger.warning(
+            "stop_execution: the plan is still busy — the phase stays "
+            "'%s' plan=%s survivors=%s",
+            _USER_STOPPING_PHASE, plan_id, len(survivors),
+        )
+        if stop_state.requeue_requested(plan_id):
+            # 进程还活着 → 不许排队。一个还在跑的计划排进队列等于让第二个
+            # 执行器接手同一个计划。意图丢掉：这一轮不交付。
+            _server.logger.warning(
+                "stop_execution: the plan is still busy — the requeue is "
+                "not delivered plan=%s survivors=%s",
+                plan_id, len(survivors),
+            )
+            stop_state.clear_requeue(plan_id)
+        return
+
+    plan_dir = _server._plan_dir(plan_id)
+    error = _park_plan_in_stopped_phase(plan_id, plan_dir, skip_terminal=True)
+    if error is not None:
+        _server.logger.error(
+            "stop_execution: could not park the plan in the 'stopped' "
+            "phase plan=%s: %s", plan_id, error,
+        )
+        return
+
+    # The services the run started are reaped now and not before: the
+    # run owned them, and the run is really over now.
+    try:
+        _server._reap_managed_services(
+            plan_id, plan_dir, "execution_stopped",
+        )
+    except Exception:  # noqa: BLE001 — the reap never raises by design
+        _server.logger.exception(
+            "stop_execution: could not reap the managed services "
+            "plan=%s", plan_id,
+        )
+
+    # The requeue is delivered here: the plan is quiet now, so the move
+    # back to the waiting phase is legal ('stopped' → 'queued') and true.
+    if stop_state.requeue_requested(plan_id):
+        _deliver_requeue_after_stop(plan_id, plan_dir)
+
+    # The stop is over: the record must not gate the next run.
+    stop_state.clear(plan_id)
+
+
+def _deliver_requeue_after_stop(plan_id: str, plan_dir: Path) -> None:
+    """Put a stopped plan back into the waiting phase (``queued``).
+
+    The intent was armed by the caller that asked for the requeue
+    (``plan_lifecycle_service``); this is where it is paid out — after
+    the quiet window, when the plan really fell silent.
+
+    Two writes, and both are needed:
+
+    * the terminal verdict on the execution row is cleared — the listing
+      reads **two** verdicts, and a queued plan whose row still says
+      ``stopped`` is filtered out of the listing (the card the operator
+      asked for never appears);
+    * the phase moves ``stopped → queued`` (that edge already exists —
+      the state machine's, not a new one).
+
+    The order is deliberate: the **verdict goes first**.  The phase is
+    the verdict the listing flips on — a plan at ``stopped`` is terminal
+    whatever its row says — so clearing the row first leaves the two
+    verdicts consistent at every instant: the plan enters the listing
+    exactly when the phase says ``queued``, never a moment before.
+    The other order would leave a window in which the phase says
+    ``queued`` and the listing still hides the plan.
+
+    The intent is dropped either way: a requeue that was not delivered
+    must not be delivered by some later, unrelated stop.
+    """
+    import stop_state
+    from plan_lifecycle_service import PlanLifecycleService
+
+    PlanLifecycleService._clear_terminal_exec_verdict(plan_id)
+
+    try:
+        delivered = PlanLifecycleService._requeue_to_queued(plan_dir)
+    except Exception:  # noqa: BLE001 — a requeue never breaks the stop
+        _server.logger.exception(
+            "stop_execution: could not move the plan back to the 'queued' "
+            "phase plan=%s", plan_id,
+        )
+        delivered = False
+
+    if not delivered:
+        _server.logger.warning(
+            "stop_execution: could not move the plan back to the 'queued' "
+            "phase plan=%s; it stays stopped", plan_id,
+        )
+    stop_state.clear_requeue(plan_id)
+
+
+def _stop_execution_worker(
+    plan_id: str,
+    plan_dir: Path,
+    state: Dict[str, Any],
+    proc: Any,
+    *,
+    discard: bool,
+) -> None:
+    """The background half of the stop: kill the tree, write the resume point.
+
+    The phase is NOT flipped here — that is the background layer's
+    verdict, made when the plan is really quiet.  A phase that claims
+    the work stopped while it is still running is the lie this endpoint
+    used to tell.
+    """
+    try:
+        status, survivors = _stop_running_execution(
+            plan_id, plan_dir, state, proc, discard=discard,
+        )
+        if status == STOP_STATUS_KILL_INCOMPLETE:
+            _server.logger.error(
+                "stop_execution: the plan's tree did not die plan=%s "
+                "surviving_pids=%s", plan_id, survivors,
+            )
+    except Exception:  # noqa: BLE001 — the thread ends either way
+        _server.logger.exception(
+            "stop_execution: the stop's background worker failed plan=%s",
+            plan_id,
+        )
+    finally:
+        _stop_worker_finished(plan_id)
+
+
+def _start_execution_stop_worker(
+    plan_id: str,
+    plan_dir: Path,
+    state: Dict[str, Any],
+    proc: Any,
+    *,
+    discard: bool,
+) -> None:
+    """Shut the plan's tree down, off the request thread.
+
+    The kill takes seconds — a SIGTERM grace, then an escalation — and
+    the answer has to come back in milliseconds.  So the shutdown runs
+    on its own thread, and the request only hands it over.
+    """
+    _stop_worker_started(plan_id)
+    thread = threading.Thread(
+        target=_stop_execution_worker,
+        args=(plan_id, plan_dir, state, proc),
+        kwargs={"discard": discard},
+        name=f"execution-stop:{plan_id}",
+        daemon=True,
+    )
+    thread.start()
+
+
+def _stop_execution_asynchronously(
+    plan_id: str,
+    plan_dir: Path,
+    state: Dict[str, Any],
+    proc: Any,
+    *,
+    discard: bool,
+    previous_phase: str,
+) -> Optional[Dict[str, Any]]:
+    """Close the gate, hand the shutdown over, and answer ``stopping``.
+
+    Returns the answer, or ``None`` when the gate could not be closed —
+    another path owns the plan's phase — and the caller then keeps the
+    behaviour it always had.
+    """
+    import stop_state
+    import verification_cancel
+    from state_machine.db.connection import open as open_db
+    from state_machine.db.schema import migrate
+    from state_machine.repositories.routing_repository import (
+        ConflictError,
+        PlanNotFoundError,
+        RoutingRepository,
+    )
+
+    # --- 1. close the gate ---------------------------------------------
+    # The routing row is parked at the plan-level stopping phase: from
+    # here the plan says "a stop is in progress", and the spawn gate
+    # refuses to start new work for it.  The phase is NOT flipped to a
+    # stopped phase here — that is the background layer's decision
+    # (arch decision 3), made when the plan is really quiet.
+    conn = open_db(_server._state_db_path())
+    try:
+        migrate(conn)
+        RoutingRepository(conn).try_mark_phase(
+            plan_id, _EXECUTION_STOP_SOURCE_PHASES, _USER_STOPPING_PHASE,
+        )
+    except (ConflictError, PlanNotFoundError):
+        _server.logger.warning(
+            "stop_execution: the plan was moved by another path — the "
+            "stop does not overwrite it plan=%s", plan_id,
+        )
+        return None
+    except Exception:  # noqa: BLE001 — a failed gate must not 500
+        _server.logger.exception(
+            "stop_execution: could not park the plan at the stopping "
+            "phase plan=%s", plan_id,
+        )
+        return None
+    finally:
+        conn.close()
+
+    # --- 2. the stop record -------------------------------------------
+    # The record is written once per plan: a second stop returns the
+    # FIRST record instead of replacing it, so the dispatch baseline
+    # stays the one that was taken when the stop really began.
+    try:
+        stop_state.begin(
+            plan_id,
+            stop_state.SCOPE_EXECUTION,
+            previous_phase=previous_phase,
+            dispatch_baseline=verification_cancel.dispatch_total(plan_id),
+        )
+    except Exception:  # noqa: BLE001 — the record is not the answer
+        _server.logger.exception(
+            "stop_execution: could not write the stop record plan=%s",
+            plan_id,
+        )
+
+    # --- 3. the work that was still running ---------------------------
+    # Read BEFORE the shutdown starts, so it describes the plan as it
+    # was when the operator pressed stop.
+    survivors = _execution_stop_survivors(plan_id)
+
+    # --- 4. the cancel flag -------------------------------------------
+    # The flag goes up BEFORE anything is killed: a killed executor
+    # fires its callback immediately, and that callback re-enters
+    # verification unless the flag is already set.
+    try:
+        verification_cancel.request_cancel(plan_id)
+    except Exception:  # noqa: BLE001 — a missing flag must not abort the stop
+        _server.logger.exception(
+            "stop_execution: could not request the verification cancel "
+            "plan=%s", plan_id,
+        )
+
+    # --- 5. the shutdown, off the request thread ----------------------
+    _start_execution_stop_worker(
+        plan_id, plan_dir, state, proc, discard=discard,
+    )
+
+    # --- 6. the background layer owns the quiet window ----------------
+    _start_execution_stop_supervisor(plan_id)
+
+    return _execution_stopping_answer(
+        plan_id, previous_phase=previous_phase, survivors=survivors,
+        discard=discard,
+    )
+
+
 @router.post("/api/execution/{plan_id}/stop")
 def stop_execution(plan_id: str, discard: bool = False):
     """Stop a running execution — and leave a resume point behind.
@@ -6544,8 +7180,32 @@ def stop_execution(plan_id: str, discard: bool = False):
     whatever it had achieved, and the next start picks it up instead
     of re-running the whole round.
 
-    The order of the four steps is the contract, not an implementation
-    detail:
+    2026-11-20 — this endpoint used to do its killing on the request
+    thread and then answer ``{"status": "stopped"}``: the plan was
+    parked in the ``stopped`` phase by the very request that asked
+    for the stop, while the executor it had just signalled was still
+    running.  The answer and the plan's truth were two different
+    things — the same disease the verification stop had (task 9), and
+    the same fix applies: **one plan-level stopping phase, shared by
+    execution and verification**.
+
+    A stop is a *process*, not an instant, and the process has an
+    order:
+
+      1. **Close the gate** — the routing row is CASed to the
+         plan-level ``user_stopping`` phase and the stop record is
+         written.  From here the plan says "a stop is in progress".
+      2. **Shut the work down** — off the request thread.  The kill
+         takes seconds (a SIGTERM grace, then an escalation), and the
+         answer has to come back in milliseconds.
+      3. **Answer ``stopping``** — with the scope, the phase the stop
+         came from, and the work that was still running.
+      4. **Flip the phase** — only once the plan has really fallen
+         silent.  That decision belongs to the background layer, not
+         to the request: a phase that claims the work stopped while it
+         is still running is the bug this endpoint used to have.
+
+    The shutdown itself keeps the order it always had:
 
       1. **Mark** — the in-memory state says ``stopped`` /
          ``pausing`` and ``exec_status`` is persisted, *before*
@@ -6562,17 +7222,15 @@ def stop_execution(plan_id: str, discard: bool = False):
       3. **Checkpoint** — the resume point is written *after* the
          termination completed, so it describes the interruption as
          it actually ended.
-      4. **Transition** — the plan state moves to ``stopped``.
 
     ``?discard=true`` is the escape hatch: the work is thrown away
     instead of paused, the checkpoint is removed, and the answer says
     ``paused: false``.
 
-    The answer says ``stopped`` only when the plan's tree is
-    *confirmed* dead. A stop that could not kill everything answers
-    ``kill_incomplete`` and names the pids that survived — a stop
-    that kills nothing and says "stopped" is worse than no stop at
-    all, because the operator stops looking.
+    A stop that could not kill everything answers ``kill_incomplete``
+    and names the pids that survived — a stop that kills nothing and
+    says "stopped" is worse than no stop at all, because the operator
+    stops looking.
     """
     from pause_state import read_pause_checkpoint
 
@@ -6597,9 +7255,36 @@ def stop_execution(plan_id: str, discard: bool = False):
     # knows; it never takes work away from the idle path.
     ledger_live = ledger_live_records(plan_dir)
 
+    # --- the shared stopping phase -------------------------------------
+    # One plan-level stopping phase, shared by the execution stop and
+    # the verification stop (arch decision 1).  A plan that is already
+    # in it is being stopped: this request is the SAME stop, so it
+    # answers the same way and does not start a second shutdown.
+    phase = _execution_plan_phase(plan_id, plan_dir)
+    if phase == _USER_STOPPING_PHASE:
+        import stop_state
+
+        record = stop_state.get(plan_id)
+        _start_execution_stop_supervisor(plan_id)
+        return _execution_stopping_answer(
+            plan_id,
+            previous_phase=(
+                record.previous_phase if record is not None else phase
+            ),
+            survivors=_execution_stop_survivors(plan_id),
+            discard=discard,
+        )
+
     if in_flight or ledger_live:
         if state is None:
             state = _stop_state_without_handle()
+        if phase in _EXECUTION_STOP_SOURCE_PHASES:
+            answer = _stop_execution_asynchronously(
+                plan_id, plan_dir, state, proc,
+                discard=discard, previous_phase=phase,
+            )
+            if answer is not None:
+                return answer
         status, surviving_pids = _stop_running_execution(
             plan_id, plan_dir, state, proc, discard=discard,
         )

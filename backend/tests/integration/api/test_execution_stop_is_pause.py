@@ -26,13 +26,34 @@ What is pinned here:
    stop never writes ``failed`` over a task's runtime state.
 4. **``?discard=true`` is the only way to throw the work away**, and
    it leaves no checkpoint behind.
-5. **A repeated stop is idempotent** — the checkpoint that is already
-   on disk is the answer, returned unchanged.
+5. **A repeated stop is idempotent** — one stop kills once, writes one
+   checkpoint and keeps one stop record.
+
+The stop is a **process**, not an instant
+--------------------------------------------
+2026-11-20: the endpoint used to do its killing on the request thread
+and then answer ``{"status": "stopped"}`` — the plan was parked in the
+``stopped`` phase by the very request that asked for the stop, while
+the executor it had just signalled was still running.  The answer and
+the plan's truth were two different things.
+
+Now the request only closes the gate: it parks the routing row at the
+plan-level ``user_stopping`` phase, writes the stop record and hands
+the shutdown to a background worker.  The answer is ``stopping`` — the
+plan is on its way down — and the phase is flipped by the background
+layer, once the plan has really fallen silent.
+
+So every case below reads its side effects (the kill, the checkpoint,
+the row) AFTER the background worker has finished, and the phase is
+polled rather than assumed.
 """
 
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
+import time
 from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -42,6 +63,9 @@ from fastapi.testclient import TestClient
 
 import pause_state
 import server
+import stop_state
+import stop_supervisor
+import verification_cancel
 from server import app
 from state_machine.db.connection import open as open_db
 from state_machine.db.schema import migrate
@@ -54,6 +78,12 @@ PLAN_ID = "20261020-exec-stop-is-pause"
 #: A second plan, used where one test needs two independent plans.
 OTHER_PLAN_ID = "20261020-exec-stop-hardkill"
 
+#: The quiet window the background layer waits for before it may park
+#: the plan.  Short here on purpose: the window is a policy of the
+#: deployment, not a contract of the stop, and a test that pays five
+#: seconds per stop is a test nobody runs.
+QUIET_SECONDS = "0.2"
+
 
 class FakeProc:
     """A live process handle — the route only ever asks it ``poll()``.
@@ -64,7 +94,7 @@ class FakeProc:
     is still running and kill it again.
     """
 
-    def __init__(self, pid: int = 4242) -> None:
+    def __init__(self, pid: int) -> None:
         self.pid = pid
         self.alive = True
 
@@ -107,6 +137,30 @@ class KillRecorder:
             if (state or {}).get("process") is proc:
                 return plan_id
         return None
+
+
+@pytest.fixture(autouse=True)
+def _clean_stop_state(monkeypatch):
+    """The stop's process-local state is global — do not leak it.
+
+    ``stop_state`` (the stop record), ``stop_supervisor`` (the
+    supervisor threads) and ``verification_cancel`` (the cancel flag)
+    are process-wide and indexed by plan id, and this suite reuses ONE
+    plan id — so a record or a supervisor left behind by one case
+    decides the next case's stop behaviour.
+
+    The quiet window is shortened for the same reason the deployment
+    may choose it: the window is a policy, not a contract.
+    """
+    monkeypatch.setenv("PDT_STOP_QUIET_SECONDS", QUIET_SECONDS)
+
+    stop_state._reset_for_tests()
+    stop_supervisor._reset_for_tests()
+    verification_cancel._reset_for_tests()
+    yield
+    stop_supervisor._reset_for_tests()
+    stop_state._reset_for_tests()
+    verification_cancel._reset_for_tests()
 
 
 @pytest.fixture
@@ -152,6 +206,25 @@ def _read_exec_status(plan_id: str) -> Optional[str]:
     return (row or {}).get("exec_status")
 
 
+def _a_pid_that_is_not_running() -> int:
+    """A pid that is guaranteed not to name a running process.
+
+    The stop asks the machine whether the plan's executor is still
+    alive before it parks the plan — and the executor here is a fake.
+    A hard-coded number could belong to an unrelated process on the
+    machine, which would make the plan look busy and the stop look
+    stuck.  So the pid is taken from a child this test spawns and
+    reaps: it was alive a moment ago, and it is gone now.
+    """
+    child = subprocess.Popen(
+        [sys.executable, "-c", "pass"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    child.wait(timeout=30)
+    return child.pid
+
+
 def _seed_plan(
     plans_dir: Path,
     db_path: Path,
@@ -180,6 +253,8 @@ def _seed_plan(
         json.dumps({"tasks": tasks}, ensure_ascii=False), encoding="utf-8",
     )
 
+    exec_pid = _a_pid_that_is_not_running()
+
     conn = open_db(db_path)
     try:
         migrate(conn)
@@ -188,7 +263,7 @@ def _seed_plan(
             plan_id=plan_id,
             project_dir=str(project_dir),
             exec_status="running",
-            exec_pid=4242,
+            exec_pid=exec_pid,
         )
         repo = PlanTaskRepository(conn)
         for task in tasks:
@@ -222,10 +297,10 @@ def _seed_plan(
         "status": "running",
         "logs": deque(maxlen=100),
         "project_dir": str(project_dir),
-        "process": FakeProc(),
+        "process": FakeProc(exec_pid),
         "started_at": "2026-10-20T11:00:00",
         "ended_at": None,
-        "pid": 4242,
+        "pid": exec_pid,
         "stop_reason": None,
     }
     return plan_dir, project_dir
@@ -233,6 +308,62 @@ def _seed_plan(
 
 def _read_checkpoint(plan_dir: Path) -> Dict[str, Any]:
     return json.loads((plan_dir / "pause_state.json").read_text(encoding="utf-8"))
+
+
+def _read_phase(db_path: Path, plan_id: str = PLAN_ID) -> str:
+    """The routing row's ``current_phase``, read back on its own connection."""
+    conn = open_db(db_path)
+    try:
+        row = RoutingRepository(conn).current(plan_id)
+    finally:
+        conn.close()
+    return (row or {}).get("current_phase")
+
+
+def _wait_for_stop_worker(
+    plan_id: str = PLAN_ID, timeout: float = 60.0,
+) -> None:
+    """Wait for the background worker that shuts the plan's tree down.
+
+    The stop answers as soon as the gate is closed; the kill and the
+    checkpoint happen on the worker's own thread.  So every side effect
+    of the shutdown — the kill, the checkpoint, the row — is read
+    AFTER this wait, never before it.
+    """
+    deadline = time.monotonic() + timeout
+    while server._routes_execution._stop_worker_running(plan_id):
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"the stop's background worker is still running after "
+                f"{timeout:.0f}s"
+            )
+        time.sleep(0.05)
+
+
+def _wait_for_stop_to_settle(
+    db_path: Path, plan_id: str = PLAN_ID, timeout: float = 60.0,
+) -> str:
+    """Wait for the background layer's verdict, and read the phase back.
+
+    The phase is flipped by the background layer, not by the request:
+    the request parks the plan at the stopping phase and hands the
+    shutdown over.  So the phase is polled, never assumed.
+
+    The stop record is waited for too — it is cleared when the stop
+    finalizes, and it is what says "a stop is in progress for this
+    plan".
+    """
+    deadline = time.monotonic() + timeout
+    phase = _read_phase(db_path, plan_id)
+    while time.monotonic() < deadline:
+        if phase != "user_stopping" and stop_state.get(plan_id) is None:
+            return phase
+        time.sleep(0.05)
+        phase = _read_phase(db_path, plan_id)
+    raise AssertionError(
+        f"the stop never finalized — the plan is still parked at "
+        f"{phase!r} after {timeout:.0f}s"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +380,9 @@ def test_stop_signal_order(env, client, kill_recorder, monkeypatch):
     a process that is gone and stamp the plan ``failed`` — the exact
     outcome a pause must never produce. The checkpoint last: it has
     to describe the interruption as it actually ended.
+
+    The order is made on the background worker now, so the case waits
+    for that worker before it reads the order back.
     """
     plans_dir, db_path = env
     _seed_plan(plans_dir, db_path, task_statuses={"2": "in_progress"})
@@ -272,6 +406,9 @@ def test_stop_signal_order(env, client, kill_recorder, monkeypatch):
 
     resp = client.post(f"/api/execution/{PLAN_ID}/stop")
     assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "stopping", resp.json()
+
+    _wait_for_stop_worker(PLAN_ID)
 
     assert order == ["kill", "write_checkpoint"], order
 
@@ -291,6 +428,9 @@ def test_stop_kills_only_its_own_plan(env, client, kill_recorder):
 
     resp = client.post(f"/api/execution/{PLAN_ID}/stop")
     assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "stopping", resp.json()
+
+    _wait_for_stop_worker(PLAN_ID)
 
     assert len(kill_recorder.calls) == 1, kill_recorder.calls
     assert kill_recorder.calls[0]["plan_id"] == PLAN_ID
@@ -313,6 +453,13 @@ def test_stop_writes_checkpoint(env, client, kill_recorder):
 
     resp = client.post(f"/api/execution/{PLAN_ID}/stop")
     assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "stopping", body
+    assert body["paused"] is True, body
+
+    # The resume point is written by the background worker, so it is
+    # read after that worker is done.
+    _wait_for_stop_worker(PLAN_ID)
 
     checkpoint = _read_checkpoint(plan_dir)
     assert checkpoint["kind"] == "execution"
@@ -325,11 +472,9 @@ def test_stop_writes_checkpoint(env, client, kill_recorder):
     assert interrupted["2"]["phase"] == "execution"
     assert interrupted["2"]["paused_at"] == checkpoint["paused_at"]
 
-    body = resp.json()
-    assert body["status"] == "stopped"
-    assert body["paused"] is True
-    assert body["paused_at"] == checkpoint["paused_at"]
-    assert body["interrupted_task_count"] == len(checkpoint["interrupted_tasks"])
+    # The answer is written before the checkpoint exists, so the
+    # checkpoint's own numbers are the ones that are asserted here.
+    assert len(checkpoint["interrupted_tasks"]) == 1, checkpoint
 
 
 def test_stop_marks_tasks_not_failed(env, client, kill_recorder):
@@ -339,6 +484,9 @@ def test_stop_marks_tasks_not_failed(env, client, kill_recorder):
 
     resp = client.post(f"/api/execution/{PLAN_ID}/stop")
     assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "stopping", resp.json()
+
+    _wait_for_stop_worker(PLAN_ID)
 
     conn = open_db(db_path)
     try:
@@ -366,6 +514,9 @@ def test_stop_records_per_task_strategy(env, client, kill_recorder):
 
     resp = client.post(f"/api/execution/{PLAN_ID}/stop")
     assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "stopping", resp.json()
+
+    _wait_for_stop_worker(PLAN_ID)
 
     entry = {t["task_id"]: t for t in _read_checkpoint(plan_dir)["interrupted_tasks"]}["2"]
     assert entry["session_id"] == "sess-2"
@@ -383,6 +534,9 @@ def test_stop_records_per_task_strategy(env, client, kill_recorder):
 
     resp = client.post(f"/api/execution/{OTHER_PLAN_ID}/stop")
     assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "stopping", resp.json()
+
+    _wait_for_stop_worker(OTHER_PLAN_ID)
 
     hard_entry = {
         t["task_id"]: t for t in _read_checkpoint(hard_dir)["interrupted_tasks"]
@@ -405,15 +559,31 @@ def test_stop_discard_skips_checkpoint(env, client, kill_recorder):
 
     resp = client.post(f"/api/execution/{PLAN_ID}/stop?discard=true")
     assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "stopping", body
+    # The answer describes the request that was made: a discard is not
+    # a pause, so the answer says the work was not paused.
+    assert body["paused"] is False, body
+
+    _wait_for_stop_worker(PLAN_ID)
 
     assert not (plan_dir / "pause_state.json").exists()
-    body = resp.json()
-    assert body["status"] == "stopped"
-    assert body["paused"] is False
 
 
 def test_stop_discard_clears_an_existing_checkpoint(env, client, kill_recorder):
-    """A discard after a pause removes the resume point."""
+    """A discard after a pause removes the resume point.
+
+    The discard has to reach the **idle** path to clear the
+    checkpoint, and the idle path is only reached once the plan has
+    been parked: while the stop is still in progress the plan sits at
+    the stopping phase, and a discard issued there is answered by the
+    stopping path — which does not clear anything.
+
+    So the case waits for the background layer's verdict first.  That
+    is the whole point: the two requests are two different stops, and
+    the second one is only allowed to throw the work away once the
+    first one is really over.
+    """
     plans_dir, db_path = env
     plan_dir, _project_dir = _seed_plan(
         plans_dir, db_path, task_statuses={"2": "in_progress"},
@@ -421,32 +591,121 @@ def test_stop_discard_clears_an_existing_checkpoint(env, client, kill_recorder):
 
     first = client.post(f"/api/execution/{PLAN_ID}/stop")
     assert first.status_code == 200, first.text
+    assert first.json()["status"] == "stopping", first.json()
+
+    _wait_for_stop_worker(PLAN_ID)
     assert (plan_dir / "pause_state.json").exists()
+
+    # The plan is still at the stopping phase until the background
+    # layer's quiet window ends.
+    assert _read_phase(db_path, PLAN_ID) == "user_stopping"
+    assert _wait_for_stop_to_settle(db_path, PLAN_ID) == "stopped"
 
     second = client.post(f"/api/execution/{PLAN_ID}/stop?discard=true")
     assert second.status_code == 200, second.text
+    body = second.json()
+    assert body["status"] == "stopped", body
+    assert body["paused"] is False, body
 
     assert not (plan_dir / "pause_state.json").exists()
-    assert second.json()["paused"] is False
 
 
-def test_stop_is_idempotent(env, client, kill_recorder):
-    """Stopping twice answers the same thing and keeps one checkpoint."""
+def test_stop_discard_during_the_stop_answers_not_paused(
+    env, client, kill_recorder, monkeypatch,
+):
+    """A discard asked for DURING the stop says the work was thrown away.
+
+    The repeated stop is answered by the stopping path, and that path
+    has to answer the request it was actually given: ``?discard=true``
+    means "do not keep the work", so the answer says ``paused: false``
+    — the same answer the first stop gives for a discard.
+
+    What the request does NOT do is clear the checkpoint: the stop is
+    still in progress, and the checkpoint is cleared by the idle path
+    once the plan has been parked.
+    """
     plans_dir, db_path = env
     plan_dir, _project_dir = _seed_plan(
         plans_dir, db_path, task_statuses={"2": "in_progress"},
     )
 
+    # The supervisor is not started, so the plan stays at the stopping
+    # phase — which is the state a repeated stop arrives in.
+    monkeypatch.setattr(stop_supervisor, "start", lambda *a, **k: None)
+
     first = client.post(f"/api/execution/{PLAN_ID}/stop")
     assert first.status_code == 200, first.text
+    assert first.json()["status"] == "stopping", first.json()
+
+    _wait_for_stop_worker(PLAN_ID)
+    assert _read_phase(db_path, PLAN_ID) == "user_stopping"
+
+    second = client.post(f"/api/execution/{PLAN_ID}/stop?discard=true")
+    assert second.status_code == 200, second.text
+    body = second.json()
+    assert body["status"] == "stopping", body
+    assert body["paused"] is False, (
+        "the repeated stop answered 'paused: true' for a discard — the "
+        "answer has to describe the request that was made"
+    )
+
+    # And the repeated stop did not start a second shutdown.
+    assert len(kill_recorder.calls) == 1, kill_recorder.calls
+    # The checkpoint is still there: a stop that is still in progress
+    # has not thrown anything away yet.
+    assert (plan_dir / "pause_state.json").exists()
+
+
+def test_stop_is_idempotent(env, client, kill_recorder, monkeypatch):
+    """One stop kills once, writes one checkpoint, keeps one record.
+
+    A second stop issued while the first one is still in progress is
+    the SAME stop: it must not start a second shutdown, it must not
+    rewrite the resume point, and it must not replace the stop record
+    — the record carries the dispatch baseline of the stop that really
+    began, and a second record would lose it.
+
+    The answers are compared on their contract fields only:
+    ``stopped_at`` is a fresh timestamp on every answer, and it is not
+    part of the contract.
+    """
+    plans_dir, db_path = env
+    plan_dir, _project_dir = _seed_plan(
+        plans_dir, db_path, task_statuses={"2": "in_progress"},
+    )
+
+    # The supervisor is not started, so the plan stays at the stopping
+    # phase — which is the state a repeated stop arrives in.
+    monkeypatch.setattr(stop_supervisor, "start", lambda *a, **k: None)
+
+    first = client.post(f"/api/execution/{PLAN_ID}/stop")
+    assert first.status_code == 200, first.text
+    first_body = first.json()
+    assert first_body["status"] == "stopping", first_body
+
+    _wait_for_stop_worker(PLAN_ID)
     checkpoint_after_first = _read_checkpoint(plan_dir)
+    record_after_first = stop_state.get(PLAN_ID)
+    assert record_after_first is not None, "the stop wrote no record"
 
     second = client.post(f"/api/execution/{PLAN_ID}/stop")
     assert second.status_code == 200, second.text
+    second_body = second.json()
 
-    assert first.json() == second.json(), (first.json(), second.json())
-    # The checkpoint was not rewritten — ``paused_at`` still says when
-    # the interruption actually happened.
+    # The two answers agree on the contract...
+    for field in (
+        "status", "plan_id", "stop_scope", "paused", "previous_phase",
+        "reason",
+    ):
+        assert second_body[field] == first_body[field], (
+            f"the repeated stop answered {field}={second_body[field]!r} "
+            f"after a first answer of {first_body[field]!r}"
+        )
+
+    # ... the checkpoint was not rewritten — ``paused_at`` still says
+    # when the interruption actually happened.
     assert _read_checkpoint(plan_dir) == checkpoint_after_first
     # And the executor was not killed twice.
     assert len(kill_recorder.calls) == 1, kill_recorder.calls
+    # And the stop record is still the one the first stop wrote.
+    assert stop_state.get(PLAN_ID) is record_after_first

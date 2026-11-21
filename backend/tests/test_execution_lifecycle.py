@@ -120,6 +120,22 @@ def _wait_for_plan_phase(plan_dir, target_phase, timeout=5):
     return None
 
 
+def _wait_for_stop_reason(plan_id, target_reason, timeout=5):
+    """Poll the run's in-memory ``stop_reason`` until it matches.
+
+    The stop is a process (2026-11-20): the reason says "pausing"
+    while the resume point is being written and "user_requested" once
+    the pause is over, so the two are read at their own times.
+    """
+    for _ in range(int(timeout * 20)):
+        state = _execution_state.get(plan_id) or {}
+        if state.get("stop_reason") == target_reason:
+            return state.get("stop_reason")
+        time.sleep(0.05)
+    state = _execution_state.get(plan_id) or {}
+    return state.get("stop_reason")
+
+
 class TestExecutionLifecycle:
     """TDD tests for execution lifecycle management."""
 
@@ -210,14 +226,36 @@ class TestExecutionLifecycle:
         assert ps.get_current_phase() == "failed"
 
     def test_user_stop(self, monkeypatch, state_db_reader):
-        """POST /stop → status='stopped', stop_reason='user_requested'."""
+        """POST /stop → the answer says 'stopping'; the plan ends 'stopped'.
+
+        (2026-11-20: the stop became a process.  The request closes the
+        gate and answers ``stopping`` in milliseconds; the background
+        layer kills the executor, writes the resume point and parks the
+        plan once it is quiet.  So the verdict is *waited for* — the
+        request alone no longer says the plan is stopped, because the
+        executor may still be running behind it.)
+        """
         plan_id = "test-stop"
         plan_dir = _setup_plan_dir(plan_id)
 
+        # The quiet window is the deployment's policy; the test shortens
+        # it through the environment the stop reads it from, so the
+        # verdict does not cost the suite five seconds.
+        monkeypatch.setenv("PDT_STOP_QUIET_SECONDS", "0.2")
+
         block = threading.Event()
+        # The executor dies **from the stop**: the stop signals the
+        # executor's process group, and a process that is signalled
+        # exits with the signal's number, not with 0.  A fake that
+        # exited 0 would say "the work finished" — the durable-fact
+        # gate reads ``rc == 0`` with nothing pending as a completed
+        # run, and the plan would be stamped ``completed`` instead of
+        # the ``stopped`` this case is about.
         monkeypatch.setattr(
             "server.subprocess.Popen",
-            lambda *args, **kwargs: FakeProcess(returncode=0, block_on_wait=block),
+            lambda *args, **kwargs: FakeProcess(
+                returncode=-15, block_on_wait=block,
+            ),
         )
 
         resp = client.post(
@@ -231,6 +269,31 @@ class TestExecutionLifecycle:
 
         resp_stop = client.post(f"/api/execution/{plan_id}/stop")
         assert resp_stop.status_code == 200
+        # The stop is still in progress: the executor is still running
+        # behind the answer, so the answer must not claim a terminal
+        # state the plan has not reached.
+        assert resp_stop.json()["status"] == "stopping", resp_stop.json()
+
+        # The pause is in progress: the reason says "pausing" while the
+        # resume point is being written, and only says "user_requested"
+        # once the pause is over.  (This is what the request no longer
+        # delivers — the old case read "user_requested" straight after
+        # the request.)
+        assert _wait_for_stop_reason(plan_id, "pausing"), (
+            "the stop never marked the pause as in progress — the reason "
+            f"is {(_execution_state.get(plan_id) or {}).get('stop_reason')!r}"
+        )
+
+        # Let the fake executor exit: the stop's kill is waiting for it,
+        # and the plan is only quiet once it is gone.
+        block.set()
+
+        # The background layer's verdict — the plan is parked in the
+        # 'stopped' phase once it is quiet.
+        assert _wait_for_plan_phase(plan_dir, "stopped"), (
+            f"the plan never reached the stopped phase — it is "
+            f"{PlanState(plan_dir).get_current_phase()!r}"
+        )
 
         row = state_db_reader.execution(plan_id)
         assert row is not None, "plan_execution row missing after stop"
@@ -241,8 +304,6 @@ class TestExecutionLifecycle:
 
         ps = PlanState(plan_dir)
         assert ps.get_current_phase() == "stopped"
-
-        block.set()
 
     def test_run_python_exception(self, monkeypatch, state_db_reader):
         """Popen raises OSError → status='failed', plan_state='failed'."""

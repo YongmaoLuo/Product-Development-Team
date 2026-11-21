@@ -19,11 +19,16 @@ The contracts here:
    and drops it when it is over. The handle's ``scoped_tool`` is the
    tool, which is how the stop's existing kill path reaches the
    ``Popen``.
-2. **A registration failure is not a dispatch failure.** The registry
-   is a watchdog aid; a dispatch that cannot be watched still runs and
-   still answers.
+2. **A registration failure stops the dispatch.** Since 2026-11-20 the
+   registration is **fail-closed**: a plan dispatch that cannot register
+   itself raises ``VerificationCancelled`` instead of running unwatched.
+   (Before that it was best-effort, and that is what the incident was
+   made of — a dispatch nobody could watch kept running after the
+   operator had asked for it to stop.)
 3. **A cancelled dispatch raises ``VerificationCancelled`` and is NOT
-   retried.** "The operator stopped this" is not "this failed".
+   retried.** "The operator stopped this" is not "this failed" — and
+   since 2026-11-20 the refusal happens **before** the spawn, so a
+   cancelled plan gets no process at all.
 4. **The negative control for (3).** With no cancel flag, an abnormal
    subprocess exit still takes the ORIGINAL failure path — the
    empty-response retry and all. (3) is not unconditional.
@@ -63,6 +68,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 import verification_cancel  # noqa: E402
+import coding_tool  # noqa: E402
 from coding_tool import (  # noqa: E402
     ClaudeCodingTool,
     EmptyResponseError,
@@ -99,7 +105,7 @@ def _drop_handles(plan_id: str) -> None:
 
 def _install_fake_claude(
     tmp_path, monkeypatch, *, body: str = "", announce: bool = True,
-    answer: bool = True,
+    answer: bool = True, preamble: str = "",
 ) -> tuple:
     """Put an executable ``claude`` first on ``PATH``.
 
@@ -109,6 +115,12 @@ def _install_fake_claude(
     whatever ``body`` does, and an optional ``result`` event. ``body``
     is the seam the tests use to make the dispatch hang (until a
     release file appears) or to make it die.
+
+    ``preamble`` runs **before** the script's first line — before the
+    ``launch`` record is written.  It is the seam for "the CLI must not
+    get as far as running at all": a preamble that blocks forever keeps
+    the launch record empty for as long as the child lives, so "the
+    child never started" is a fact about the process and not a race.
     """
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
@@ -117,8 +129,10 @@ def _install_fake_claude(
     launches.write_text("", encoding="utf-8")
     args_log.write_text("", encoding="utf-8")
 
-    parts = [
-        "#!/bin/sh",
+    parts = ["#!/bin/sh"]
+    if preamble:
+        parts.append(preamble)
+    parts += [
         f"echo launch >> '{launches}'",
         f"echo \"$@\" >> '{args_log}'",
         'sid=""',
@@ -154,6 +168,11 @@ def _install_fake_claude(
 def _wait_for_release(release: Path) -> str:
     """Shell body that blocks until ``release`` exists."""
     return f"while [ ! -f '{release}' ]; do sleep 0.05; done"
+
+
+def _block_forever() -> str:
+    """Shell body that never ends on its own — only a kill ends it."""
+    return "while true; do sleep 1; done"
 
 
 def _launches(log: Path) -> int:
@@ -322,24 +341,47 @@ def test_no_plan_means_no_registration(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 2. negative control — a registration failure does not affect the call
+# 2. a registration failure stops the dispatch (fail-closed)
 # ---------------------------------------------------------------------------
 
 
 def test_a_registration_failure_does_not_affect_the_dispatch(
     tmp_path, monkeypatch,
 ):
-    """The registry is a watchdog aid; a dispatch that cannot be watched runs.
+    """A registry that cannot answer is a failed registration — fail closed.
 
-    If a broken registry could take the dispatch down with it, the
-    watchdog would be a new way to fail a round.
+    **The contract changed on 2026-11-20.**  The old one — "the registry
+    is a watchdog aid; a dispatch that cannot be watched still runs" —
+    was the incident's own reasoning: a dispatch that registered nothing
+    left the operator's ``/stop`` with no handle to reach, so the stop
+    could not kill the process the dispatch had just started, and that
+    process ran on after the operator had asked for it to stop.
+
+    So a **plan** dispatch that cannot register itself now raises
+    :class:`VerificationCancelled` instead of running unwatched.  The
+    guarantee this test pins is the new one: the registration is
+    attempted, the refusal reaches the caller as itself, and the dispatch
+    does not run the work.
 
     The registration is asserted to have been ATTEMPTED: without that,
     the test would also pass on a build that never registers at all,
     and would say nothing about the behaviour it names.
+
+    The CLI is blocked before its first line, so an empty launch record
+    means the child never got to run — the dispatch was refused, not
+    merely reported afterwards.  The child the dispatch had already
+    spawned (the registration runs *after* the ``Popen``) must be gone
+    when the refusal surfaces: an unwatched subprocess is exactly what
+    the operator's stop could not reach.
     """
     monkeypatch.setenv("PDT_PLAN_ID", PLAN)
-    _install_fake_claude(tmp_path, monkeypatch)
+    launches, _args = _install_fake_claude(
+        tmp_path, monkeypatch, preamble=_block_forever(),
+    )
+    # The graceful shutdown waits for the child before it escalates; a
+    # child that never ends would make the test wait out the whole
+    # grace period.
+    monkeypatch.setattr(ClaudeCodingTool, "GRACEFUL_STOP_TIMEOUT", 1)
 
     attempts = []
 
@@ -350,12 +392,39 @@ def test_a_registration_failure_does_not_affect_the_dispatch(
     monkeypatch.setattr(sub_agent_registry, "register_sub_agent", _boom)
 
     tool = ClaudeCodingTool()
-    assert tool.query_json(prompt="hello", system_instruction="sys") == {
-        "ok": True
-    }
+    try:
+        with pytest.raises(VerificationCancelled) as excinfo:
+            tool.query_json(prompt="hello", system_instruction="sys")
+    finally:
+        process = tool._current_process
+        if process is not None and process.poll() is None:
+            process.kill()
+
     assert attempts, (
         "the dispatch never tried to register — a build that registers "
         "nothing passes this test for the wrong reason"
+    )
+    assert excinfo.value.plan_id == PLAN
+    assert "registering the dispatch" in str(excinfo.value), (
+        "the refusal has to name the step it happened in, so the log says "
+        f"what went wrong; it says {str(excinfo.value)!r}"
+    )
+    assert _launches(launches) == 0, (
+        "the dispatch ran the CLI even though it could not register "
+        "itself — the fail-closed rule is what keeps an unwatched "
+        "subprocess from running"
+    )
+    assert process is not None, (
+        "the dispatch spawned a child, so there is a child to reap"
+    )
+    assert process.poll() is not None, (
+        "the child the dispatch spawned is still running — the call site "
+        "did not reap it, and a subprocess nobody can reach is what the "
+        "operator's stop cannot kill"
+    )
+    assert id(tool) not in coding_tool._LIVE_DISPATCH_TOOLS, (
+        "the live-dispatch entry outlived the dispatch — a later stop "
+        "would count a child that is already dead"
     )
 
 
@@ -390,50 +459,54 @@ def test_an_unregistration_failure_does_not_affect_the_dispatch(
 
 
 def test_a_cancelled_dispatch_raises_and_is_not_retried(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, caplog,
 ):
     """The operator stopped this plan: say so, and do not run it again.
+
+    **The contract changed on 2026-11-20.**  The refusal moved *before*
+    the spawn: a plan that is being stopped gets no process at all —
+    there is nothing to reap, nothing to watch, and nothing left over
+    for a later stop to count.  So the cancelled dispatch does not need
+    a kill to end it: it never starts.  What it still has to do is raise
+    :class:`VerificationCancelled` — "the operator stopped this" and
+    not "this broke" — and it must not be run again.
 
     The retry is the thing that matters. An empty reply is normally
     retried (the provider may have hiccuped), and a timeout is normally
     retried on the next provider — but a stop is a decision, and
     re-running the same work on another provider is exactly what the
-    operator asked not to happen.
+    operator asked not to happen.  The refusal is therefore *counted*:
+    exactly one refusal, and no CLI launch at all.
     """
     monkeypatch.setenv("PDT_PLAN_ID", PLAN)
-    release = tmp_path / "release"
-    launches, _args = _install_fake_claude(
-        tmp_path, monkeypatch, body=_wait_for_release(release),
-    )
+    launches, _args = _install_fake_claude(tmp_path, monkeypatch)
     verification_cancel.request_cancel(PLAN)
 
     tool = ClaudeCodingTool()
-    box: dict = {}
-    thread = _dispatch_in_background(tool, box)
-    try:
-        handles = _wait_for(
-            lambda: sub_agent_registry.all_handles(PLAN) or None
-        )
-        assert handles, "the dispatch never registered a handle"
-        # The handle appears as soon as the spawn succeeds, which is
-        # before the child has run a single line. Wait for the child
-        # itself, so the kill lands on a process that was really
-        # running rather than on one that never started.
-        assert _wait_for(lambda: _launches(launches) >= 1), (
-            "the child never started"
-        )
-        _kill_through_the_registry(handles[0])
-    finally:
-        release.write_text("go", encoding="utf-8")
-        thread.join(timeout=60)
+    with caplog.at_level("WARNING", logger="coding_tool"):
+        with pytest.raises(VerificationCancelled) as excinfo:
+            tool.query_json(prompt="hello", system_instruction="sys")
 
-    assert isinstance(box.get("error"), VerificationCancelled), (
-        f"a cancelled dispatch must raise VerificationCancelled; got "
-        f"{box.get('error')!r}"
+    assert excinfo.value.plan_id == PLAN, (
+        f"the refusal has to name the plan it is about; it names "
+        f"{excinfo.value.plan_id!r}"
     )
-    assert _launches(launches) == 1, (
-        f"the cancelled dispatch ran {_launches(launches)} times — a "
-        "cancelled dispatch must not be retried"
+    assert _launches(launches) == 0, (
+        f"the cancelled dispatch ran the CLI {_launches(launches)} time(s) "
+        "— a plan that is being stopped must not get a process at all"
+    )
+    refusals = [
+        record for record in caplog.records
+        if "[spawn_gate] rejected" in record.getMessage()
+    ]
+    assert len(refusals) == 1, (
+        "the dispatch must be refused exactly once: refused twice means it "
+        "was retried on another provider, refused zero times means it was "
+        f"never gated; got {len(refusals)}"
+    )
+    assert sub_agent_registry.all_handles(PLAN) == [], (
+        "a cancelled dispatch must not register a handle — there is no "
+        "child for a handle to point at"
     )
 
 

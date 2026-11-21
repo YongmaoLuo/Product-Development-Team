@@ -382,6 +382,31 @@ def _wait_in_flight(base_url: str, plan_id: str, timeout: float = 60.0) -> bool:
     return False
 
 
+def _wait_for_phase(
+    base_url: str, plan_id: str, expected: str, timeout: float = 90.0
+) -> Optional[str]:
+    """Wait until the plan's phase is ``expected``; return the phase read.
+
+    A stop is a **process**, not an instant: the facade answers while the
+    plan is still being shut down, and the phase only reaches its final
+    value once the background layer has swept the plan's process tree and
+    the quiet window has passed.  So the phase is read by polling -- read
+    once, the answer is ``user_stopping``, which says "a stop is in
+    progress", not "the plan is stopped".
+
+    The returned value is the phase of the **last** read, so a timeout
+    says what the phase actually was instead of failing blind.
+    """
+    deadline = time.time() + timeout
+    phase: Optional[str] = None
+    while time.time() < deadline:
+        phase = _plan_state(base_url, plan_id).get("current_phase")
+        if phase == expected:
+            return phase
+        time.sleep(0.5)
+    return phase
+
+
 # ---------------------------------------------------------------------------
 # The scripted LLM double
 # ---------------------------------------------------------------------------
@@ -1222,8 +1247,10 @@ def lifecycle_ui_flow(tmp_path_factory) -> Dict[str, Any]:
         )
         observations["facade_stop_status"] = status
         observations["facade_stop_body"] = body
-        observations["phase_after_stop"] = _plan_state(base_url, plan_id).get(
-            "current_phase"
+        # 停是一个过程：门面回答时相位还在 'user_stopping'（停止仍在进行），
+        # 后台监督者清扫完进程树、静默窗口过去之后才翻到 'stopped'。
+        observations["phase_after_stop"] = _wait_for_phase(
+            base_url, plan_id, "stopped",
         )
         observations["exec_verdict_after_stop"] = _persisted_exec_verdict(
             observations["state_db_path"], plan_id
@@ -1258,8 +1285,10 @@ def lifecycle_ui_flow(tmp_path_factory) -> Dict[str, Any]:
         )
         observations["facade_requeue_stop_status"] = status
         observations["facade_requeue_stop_body"] = body
-        observations["phase_after_requeue"] = _plan_state(base_url, plan_id).get(
-            "current_phase"
+        # 迁回队列发生在静默之后：门面把意图留给后台层，后台层在进程树
+        # 清扫完、静默窗口过去之后才把相位落到 'queued'。
+        observations["phase_after_requeue"] = _wait_for_phase(
+            base_url, plan_id, "queued",
         )
         observations["exec_verdict_after_requeue"] = _persisted_exec_verdict(
             observations["state_db_path"], plan_id

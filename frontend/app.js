@@ -768,7 +768,7 @@ async function resumePlan(planId) {
         } else {
             showTestReviewView(planId);
         }
-    } else if (phase === "test_approved" || phase === "tasks_generation" || phase === "queued" || phase === "ready" || phase === "executing" || phase === "failed" || phase === "stopped" || phase.startsWith("verification")) {
+    } else if (phase === "test_approved" || phase === "tasks_generation" || phase === "queued" || phase === "ready" || phase === "executing" || phase === "user_stopping" || phase === "failed" || phase === "stopped" || phase.startsWith("verification")) {
         // `failed` and `stopped` are the EXECUTION terminal phases: the
         // plan ran and the run ended.  Where it ended and why is what the
         // operator opened the plan to see — the verification panel carries
@@ -778,6 +778,12 @@ async function resumePlan(planId) {
         // down, and kept the stop reason in the database where nobody sees
         // it.  The interview fallback below is for the plans that really
         // have no later stage to look at.
+        //
+        // `user_stopping` belongs here too: a plan that is being stopped
+        // has not gone back to the beginning.  The operator who opens it
+        // during the stopping window is watching a stop, not restarting
+        // an interview — and the execution panel is where the stop is
+        // shown.
         showTasksView(planId);
     } else {
         showInterview(planId);
@@ -1149,6 +1155,15 @@ async function refineTestDesign() {
 
 let _executionPoller = null;
 
+// Is a stop in flight?  The flag is what keeps the badge honest while
+// the stop is being carried out: the backend answers `stopping` in
+// milliseconds and does the sweep in the background, so the plan is
+// still coming down long after the request came back.
+//
+// It is cleared by `startExecution()` — a new run is a new stop — and
+// never by the poller: the poller reads it, it does not own it.
+let _executionStopping = false;
+
 function showExecutionPanel() {
     $("#execution-panel").classList.remove("hidden");
     $("#execution-panel").scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -1157,12 +1172,22 @@ function showExecutionPanel() {
 
 function setExecBadge(status) {
     const badge = $("#execution-status-badge");
-    const labels = { running: "执行中", completed: "已完成", failed: "失败", stopped: "已停止", paused: "已暂停", not_started: "未开始" };
+    // `stopping` is a state of its own, not a synonym for `stopped`:
+    // the plan is still coming down when it shows.  Without the entry
+    // the badge renders the raw English word, which reads as a bug
+    // rather than as a state.
+    const labels = { running: "执行中", completed: "已完成", failed: "失败", stopping: "正在停止", stopped: "已停止", paused: "已暂停", not_started: "未开始" };
     badge.textContent = labels[status] || status;
     badge.className = `exec-badge ${status}`;
 }
 
 // What the badge should show for one status payload.
+//
+// `stopping` outranks everything: while the plan is coming down the
+// work is still running, so no other word is true yet.  The stop
+// writes its checkpoint on the way through, so `paused` is already
+// true inside the stopping window — without this rule the badge would
+// say 已暂停 while the plan was still being taken down.
 //
 // `paused` outranks `status` because the two do not agree. A plan that
 // was stopped and left alone reports `status: "stopped"` — the same
@@ -1174,6 +1199,7 @@ function setExecBadge(status) {
 // own rule is how the badge ends up flickering between 已暂停 and
 // 已停止 every two seconds.
 function execBadgeState(data) {
+    if (data.status === "stopping") return "stopping";
     return data.paused ? "paused" : data.status;
 }
 
@@ -1205,6 +1231,8 @@ async function startExecution() {
         $("#execution-setup").classList.add("hidden");
         $("#execution-controls").classList.remove("hidden");
         $("#execution-logs").classList.remove("hidden");
+        // A new run is a new stop: the previous stop's window is over.
+        _executionStopping = false;
         setExecBadge("running");
         startExecutionPolling();
     } catch (err) {
@@ -1216,9 +1244,30 @@ async function startExecution() {
 }
 
 async function stopExecution() {
-    await api(`/execution/${currentPlanId}/stop`, { method: "POST" });
-    stopExecutionPolling();
-    setExecBadge("stopped");
+    try {
+        const result = await api(`/execution/${currentPlanId}/stop`, { method: "POST" });
+        // The answer says which of the two things happened: the plan is
+        // stopping (the sweep is still running), or it is already down.
+        // Saying 「已停止」 while the first is true is the lie this
+        // replaces — the operator stops looking at a plan that is still
+        // spending.
+        if (result && result.status === "stopping") {
+            _executionStopping = true;
+            setExecBadge("stopping");
+            // Keep polling: the plan reaches its terminal state only
+            // after it has really fallen silent, and only the poll
+            // knows when that has happened.
+            startExecutionPolling();
+            return;
+        }
+        stopExecutionPolling();
+        setExecBadge("stopped");
+    } catch (err) {
+        // A stop that could not be asked for is not a stopped plan: the
+        // badge keeps saying what the server says.
+        alert(`停止执行失败：${err.message || "未知错误"}`);
+        console.error(err);
+    }
 }
 
 function startExecutionPolling() {
@@ -1227,6 +1276,21 @@ function startExecutionPolling() {
         try {
             const data = await api(`/execution/${currentPlanId}/status`);
             appendExecLogs(data.logs);
+            if (_executionStopping) {
+                // A stop is in flight.  `running` here is a poll that
+                // was already on its way when the operator clicked the
+                // button — it read the world before the stop began, so
+                // it does not get to repaint the badge.  Only a status
+                // that is neither ends the stop.
+                if (data.status === "stopping" || data.status === "running") {
+                    setExecBadge("stopping");
+                    return;
+                }
+                // The plan is really down: the badge may say so now.
+                setExecBadge("stopped");
+                stopExecutionPolling();
+                return;
+            }
             setExecBadge(execBadgeState(data));
             if (data.paused) {
                 // Nothing moves until the operator continues the plan,
@@ -1287,6 +1351,10 @@ function setVerificationBadge(status) {
         passed: "已通过",
         failed: "验证失败",
         loop_stopped: "循环停止",
+        // The verification chain is being stopped: the round is still
+        // coming down, so this is not yet 循环停止.  Without the entry
+        // the badge renders the raw English word.
+        stopping: "正在停止",
         not_started: "未开始",
         verification_failed: "验证失败",
     };

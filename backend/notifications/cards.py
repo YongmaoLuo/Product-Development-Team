@@ -236,6 +236,11 @@ _PHASE_LABEL = {
     # 2026-10-22: ``verification_rerunning`` is gone (dead state); a
     # residual row reads back as ``verification_repairing``.
     "verify_recheck": "🔁 重跑验证",
+    # 2026-11-20: ``user_stopping`` —— plan 级的「正在停止」。
+    #
+    # 不是终态：停的动作已经发生，停的结果还没落地。卡片上要说得出来，
+    # 否则标题退回相位名本身，读者看到的是裸英文 ``user_stopping``。
+    "user_stopping": "🛑 正在停止",
     # Terminal vocabulary.
     "verification_passed": "✅ 验证通过",
     "verification_failed": "❌ 验证失败",

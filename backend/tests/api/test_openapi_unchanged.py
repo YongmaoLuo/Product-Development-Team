@@ -133,7 +133,20 @@ SNAPSHOT_PATH = _TESTS_DIR / "openapi_snapshot.json"
 #: （`_fingerprint(json.loads(SNAPSHOT_PATH.read_text()))`），再与线上 app
 #: 实际发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零差异、
 #: 指纹相同——才把该值写进本常量（`4802b27e…`）。
-BASELINE_FINGERPRINT = "4802b27ece5250432a9d658550e9203efdd5e3bcbc1cf7e9bfd1d96ed2d6b00b"
+#:
+#: 2026-11-21（停止语义改为「停止是一个过程」/ 本分支）：本次变更把两个
+#: 停止端点的 docstring 改写成新的异步停止契约
+#: （`/api/execution/{plan_id}/stop` 与 `/api/verification/{plan_id}/stop`），
+#: 而 FastAPI 的 OpenAPI `description` 正是从 docstring 生成的，故对外
+#: HTTP 契约的**描述文字**随之改变。按同一条规矩重取基线：
+#: `openapi_snapshot.json` 相对上一版的差异**只落在这两条 description 上**
+#: ——路径集合零增零删（无新增、无删除），`components` 与 `info` 逐项相等，
+#: 两个端点的其余字段（方法、请求体、响应）逐项相等，只有 `description`
+#: 不同。快照与指纹在**同一次变更**里更新：先由重新生成后落盘的快照现算
+#: （`_fingerprint(json.loads(SNAPSHOT_PATH.read_text()))`），再与线上 app
+#: 实际发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零差异、指纹
+#: 相同——才把该值写进本常量（`d1b9ebdb…`）。
+BASELINE_FINGERPRINT = "d1b9ebdb85e6619d06005347daece8c7bbc3e88fe9596ebfec8c1b53a278e217"
 
 #: The capture runs in its own process so the schema is the one a clean
 #: start produces: debug routes off, no schema cache carried over from
