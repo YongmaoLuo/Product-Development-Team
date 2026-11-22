@@ -52,6 +52,43 @@ machine may execute, stops being what grants the read.
   which now means "this machine's keychain holds it" rather than "the
   server will resolve it".
 
+### 判定语义变更
+
+*Judgment semantics changed. The heading is spelled the same in both
+languages on purpose: the CI gate reads one string out of both
+changelogs, and a section that exists in only one of them is a section
+half the readers never see.*
+
+- **`_ran_the_declared_entry` command exemption (`88d898f9`).** A
+  command-kind verification point asks one question — does *this* command
+  exit 0 — and a verdict that records that same command together with the
+  exit code the framework read has answered it by construction. The file
+  names in its output are the log of what ran, not the subject of the
+  question, so `verdict_subject_mismatch` stopped comparing them
+  (`backend/verification_evidence.py`). Before this change, a command
+  point whose declared entry had just exited 0 was downgraded to FAILED
+  for "answering another question" — a false red produced by the
+  framework's own bookkeeping. The exemption landed inside an unrelated
+  pull request and was recorded nowhere; this entry is the backfill.
+
+- **`scripts/ci_judgment_surface.sh` is the one entry point for the three
+  judgment-surface checks, and `.github/workflows/ci.yml` runs it as a
+  gate.** The judgment surface is described by three artifacts that are
+  allowed to drift apart: the manifest of the functions that decide
+  PASS/FAIL, the decision tables that manifest names, and the behavioural
+  goldens frozen from what those functions return today. Each of the three
+  had its own checker, and three separate entry points are three ways for
+  the chain to rot — one link can stop running while the other two keep
+  reporting green, and the reader of a CI log has to know which of the three
+  to believe. The script now runs all three in order and answers with one
+  number: the census check is advisory, because a manifest that no longer
+  matches the code warns; the static gate that says the named tables are
+  really there and the behavioural goldens are the ones that block. The
+  workflow runs the script as its own `judgment-surface-consistency` job,
+  and the merge gate lists that job among the ones it waits for — so the
+  three checks are no longer a step inside a lane whose name says nothing
+  about the judgment surface.
+
 ## [0.1.2] - 2026-10-07
 
 **What a run may touch, and what a green report proves.** Three capabilities
