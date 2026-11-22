@@ -4665,6 +4665,37 @@ def _finalize_quiet_check(plan_id: str) -> Tuple[bool, List[Any]]:
     return False, list(result.survivors)
 
 
+def _record_verification_stopped(verification, plan_id: str) -> None:
+    """Record "the operator stopped this plan" on the verification row.
+
+    The verification row is the **only** durable trace that a plan was
+    stopped by hand: the routing row says where the plan IS, the
+    execution row says how a run ended, and neither of them says
+    "somebody pressed stop".  A stop that loses the race for the
+    routing row must still leave this trace behind — otherwise the plan
+    silently loses the fact that it was ever stopped.
+
+    Two writes, in this order: the row itself (the durable one), then
+    the in-memory mirror (the fast one a reader sees first).  Neither
+    is allowed to raise: a stop that cannot be recorded must not turn
+    into a crash of the background layer.
+    """
+    try:
+        verification.mark_stopped(plan_id, "user_stopped")
+    except Exception:  # noqa: BLE001 — the phase is the important write
+        _server.logger.exception(
+            "[stop_verification] could not write the verification row "
+            "plan=%s", plan_id,
+        )
+    state = _server._verification_state.get(plan_id)
+    if state:
+        state.update({
+            "verification_status": "loop_stopped",
+            "stop_reason": "user_stopped",
+            "updated_at": datetime.now().isoformat(),
+        })
+
+
 def _finalize_verification_stop(plan_id: str) -> None:
     """The background layer's verdict on a stop.
 
@@ -4685,6 +4716,13 @@ def _finalize_verification_stop(plan_id: str) -> None:
     has already moved is not overwritten — that row is no longer the
     stop's to write.  The stop record is cleared anyway: the stop is
     over, whatever the plan did afterwards.
+
+    Losing that race does **not** make the stop a no-op: the
+    verification row is marked stopped either way
+    (:func:`_record_verification_stopped`), because that row is the
+    only durable trace that the operator stopped this plan.  A stop
+    that lost the race for the phase but left no trace at all is how a
+    stopped plan ends up looking like a plan that was merely queued.
 
     The callback is handed the plan id alone, and the supervisor's
     survivors ride on it (see ``stop_supervisor._bind_finalize``).  A
@@ -4749,26 +4787,23 @@ def _finalize_verification_stop(plan_id: str) -> None:
         except Exception:  # noqa: BLE001 — another path owns the row now
             _server.logger.warning(
                 "[stop_verification] the plan was moved by another path — "
-                "the stop does not overwrite it plan=%s", plan_id,
+                "the phase was yielded to it, but the verification row is "
+                "marked stopped plan=%s", plan_id,
             )
+            # 相位让给了另一条路径（这一轮被打断的 verdict 写入把 routing 行
+            # 从 ``user_stopping`` 挪回了它自己的相位），但**操作者停过这条
+            # 计划**这件事必须留下痕迹 —— 验证行是「它被停过」的唯一持久
+            # 证据。没有它，这条计划在列表里就只是一条失败 / 等待的计划，
+            # 「停过」这个事实凭空消失。
+            #
+            # 注意：这里**不动 CAS**。相位仍然不覆盖别人的写（那条路径对
+            # 自己的相位负责）；这次只保证验证行记下「操作者停过」。
+            _record_verification_stopped(verification, plan_id)
             # The stop is over: the row is not ours to write any more,
             # but the record must not gate the next run.
             stop_state.clear(plan_id)
             return
-        try:
-            verification.mark_stopped(plan_id, "user_stopped")
-        except Exception:  # noqa: BLE001 — the phase is the important write
-            _server.logger.exception(
-                "[stop_verification] could not write the verification row "
-                "plan=%s", plan_id,
-            )
-        state = _server._verification_state.get(plan_id)
-        if state:
-            state.update({
-                "verification_status": "loop_stopped",
-                "stop_reason": "user_stopped",
-                "updated_at": datetime.now().isoformat(),
-            })
+        _record_verification_stopped(verification, plan_id)
     finally:
         conn.close()
 

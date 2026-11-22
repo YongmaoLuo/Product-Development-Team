@@ -42,7 +42,10 @@ from plan_artifacts import (  # noqa: E402
 # It is pure, and it lives in ``plan_status`` — the module that owns "one
 # plan, one status" — so this module and ``routes.execution`` cannot
 # answer differently about the same plan.
-from plan_status import normalize_exec_status  # noqa: E402
+from plan_status import (  # noqa: E402
+    listing_status_bucket,
+    normalize_exec_status,
+)
 
 # ``phase_vocabulary`` 是纯词汇模块（只依赖 logging / typing，不 import
 # ``plan_state``），所以这里可以安全地模块级导入：等待相位的历史别名
@@ -3419,7 +3422,46 @@ def _list_plans_body(
             else:
                 exec_pid = None
 
-            if explicit_bucket is not None:
+            # 2026-11-22: 桶由**相位 / 验证行**推出，不再由「目录里有没有
+            # tasks.json」猜。
+            #
+            # 猜出来的桶把**所有**有 ``tasks.json``、执行行又没说 running 的
+            # 计划都报成 ``queued`` —— 包括失败的和停止的。线上实测就是一条
+            # 已经停下的计划在列表里显示「排队中」（前端 ``phaseLabel`` 把它
+            # 翻成中文）。相位列才是「这条计划现在是什么」的权威：桶跟着它走，
+            # 启发式只在**没有相位**（空串 / 没有 routing 行）时兜底。
+            #
+            # 验证行要一起读：修复相位（``verification_repairing``）自己不说是
+            # 死是活 —— 它只说「修复任务在等着跑」，是「操作者停过」还是
+            # 「修复没跑成」只有验证行知道（见
+            # :func:`plan_status.listing_status_bucket`）。
+            #
+            # 读验证行不许把列表搞挂：读不到就按「没有验证行」算，桶退回
+            # 启发式，接口照常 200。
+            verification_status = ""
+            verification_stop_reason = ""
+            try:
+                verification_row = verification_by_plan.get(plan_id) or {}
+                verification_status = str(
+                    verification_row.get("verification_status") or ""
+                )
+                verification_stop_reason = str(
+                    verification_row.get("verification_stop_reason") or ""
+                )
+            except Exception:  # noqa: BLE001 — 一个列表不许因为一行而 500
+                _server.logger.exception(
+                    "[plans.list] could not read the verification row "
+                    "plan=%s", plan_id,
+                )
+
+            phase_bucket = listing_status_bucket(
+                current_phase,
+                verification_status=verification_status,
+                verification_stop_reason=verification_stop_reason,
+            )
+            if phase_bucket is not None:
+                status = phase_bucket
+            elif explicit_bucket is not None:
                 status = explicit_bucket
 
             steps_dict = {
