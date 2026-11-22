@@ -140,6 +140,14 @@ CI_ARTIFACT_FIELDS: FrozenSet[str] = frozenset({
     # key is spelled out literally on both sides so the derivation
     # below can see it.
     "failure_identity",
+    # 2026-11-22: the gate's **structured verdict** (``pdt-gate/v1``) —
+    # the whole object it wrote, whether there was one at all, and why
+    # there was not.  Written only when the plan's contract declared
+    # the format; a plan that did not gets an artifact without these
+    # keys, exactly as it got one before the verdict existed.
+    "gate_result",
+    "gate_result_available",
+    "gate_result_error",
 })
 
 #: The keys every CI artifact carries, on every path.

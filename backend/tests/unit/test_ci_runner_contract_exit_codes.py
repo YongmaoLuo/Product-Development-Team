@@ -480,3 +480,36 @@ def test_the_agent_names_the_contract_after_the_tree_under_test(tmp_path):
     assert verdict["status"] == STATUS_INCONCLUSIVE, (
         "the tree's own contract was not applied: %r" % (verdict,)
     )
+
+# --------------------------------------------------------------------------
+# An explicit empty list: "my gate has no 'could not decide' exit code"
+# --------------------------------------------------------------------------
+
+
+def test_an_empty_inconclusive_list_makes_exit_three_a_failure(tmp_path):
+    """Exit 3 with a contract that declares NO inconclusive code -> FAILED.
+
+    This is the accident, at the level that graded it.  The gate said
+    "I have no exit code that means 'the machine could not decide'",
+    and the framework graded it by its own default 3 anyway — so a real
+    failure was filed as an undecided gate, no repair task was ever
+    generated, and the plan sat there.
+
+    The empty list is a declaration, not a broken field: this gate's
+    every non-zero exit code means "the code really is broken".
+    """
+    project = _project(tmp_path, 3)
+    plan_dir = _plan_dir(tmp_path, _contract_with(inconclusive_exit_codes=[]))
+
+    result = run_ci_verification(
+        _vp("bash scripts/run_tests.sh"),
+        project_dir=project,
+        plan_dir=plan_dir,
+    )
+
+    assert result.status == STATUS_FAILED, (
+        "exit 3 was filed as 'the machine could not decide' even though "
+        "the contract declared no inconclusive exit code: %r"
+        % (result.evidence,)
+    )
+    assert result.evidence["signal"] == ci_runner.SIGNAL_GATE_FAILED

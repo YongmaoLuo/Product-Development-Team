@@ -5511,6 +5511,22 @@ _TERMINAL_VERIFICATION_STATUSES = frozenset({"passed", "failed", "loop_stopped"}
 #: reason is one of them.
 SERVICE_OWNER_CLAIM_REFUSED_STOP_REASON = "service_owner_claim_refused"
 
+#: 2026-11-22: the verdict for a round that had failures and produced no
+#: repair task at all.
+#:
+#: An empty repair queue means two very different things: "there is
+#: nothing to repair" (the round passed, or everything was already
+#: repaired) and "there were failures, and nobody turned them into a
+#: task".  The second one used to be answered by routing the plan back
+#: to ``executing`` — where the executor finds no work, exits, and hands
+#: the chain straight back to verification.  A silent loop that never
+#: converges and never says why.
+#:
+#: So this verdict ends the chain and hands the plan to a human: the
+#: failures are real, the framework could not turn them into work, and
+#: only an operator can say what should happen to them.
+FAILURES_WITHOUT_REPAIR_TASKS_STOP_REASON = "failures_without_repair_tasks"
+
 #: The stop reasons this module adds to the recorder's chain-ending
 #: set.  See :data:`SERVICE_OWNER_CLAIM_REFUSED_STOP_REASON`.
 _ROUND_INSTANCE_TERMINAL_STOP_REASONS = frozenset(
@@ -6174,6 +6190,10 @@ def _dead_end_terminal(
     into a mid-flight verification. A plan that is still being worked on
     must keep its routing row inside the verification family.
     """
+    # 2026-11-22: ``failures_without_repair_tasks`` 走的是 "loop_stopped" ——
+    # 停下来的原因写在 stop_reason 里（"有失败项，却一条修复任务都没有"），
+    # 而这个 reason 只有在「没人把失败变成任务」时才会被写下来。这一行的
+    # 状态跟这一族里其它终态一样：不留 "running"，把判决说清楚。
     final_status = "failed" if reason == "no_repair_tasks" else "loop_stopped"
     # 2026-11-01: the refusal comes FIRST, before the verdict and before
     # the rollback below.  Both of those are the plan's business, and the
@@ -6678,6 +6698,45 @@ def _round_failed_vp_ids(orch: Any, report: Any) -> set:
             "— revival disabled for this round",
         )
         return None
+
+
+def _round_failure_summary(
+    orch: Any, report: Any, result: Dict[str, Any],
+) -> Tuple[bool, str]:
+    """本轮到底有没有失败项，以及这些失败项叫什么。
+
+    空的修复队列有两种完全不同的含义：「没什么要修的」（本轮过了，或者
+    该修的都修完了）和「有失败，却没人把它变成一条任务」。第二种以前
+    被当成第一种处理，于是计划静默地空转。
+
+    这里只信本轮自己的判决：判据层给出的失败点集合
+    （``_extract_failed_ids``，也就是 orchestrator 自己的「失败」定义），
+    以及 —— 判据层给不出集合时 —— orchestrator 自报的 ``status``。
+    自己在这里重新定义一遍「失败」，只会多出一个会漂移的定义。
+
+    Args:
+        orch: 本轮的 orchestrator。
+        report: 本轮的验证报告。
+        result: orchestrator 的返回值。
+
+    Returns:
+        ``(本轮确实有失败项, 这些失败项的描述)``。
+    """
+    failed_ids = _round_failed_vp_ids(orch, report)
+    if failed_ids is None:
+        # 判据层给不出失败集合（orchestrator 不是它自己 / 报告不是
+        # 字典）—— 退回到 orchestrator 自报的判决。
+        has_failures = str(result.get("status") or "") in (
+            "verification_failed", "failed",
+        )
+        return has_failures, (
+            "有失败项（判据层给不出失败清单）" if has_failures else "0 个失败项"
+        )
+    if not failed_ids:
+        return False, "0 个失败项"
+    return True, "%d 个失败项（%s）" % (
+        len(failed_ids), ", ".join(sorted(failed_ids)),
+    )
 
 
 def _reconcile_failure_history(plan_id: str) -> Dict[str, Any]:
@@ -12548,6 +12607,47 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                         # this plan, so the row stays inside the verification
                         # family (see its docstring).
                         continue
+
+                    # 2026-11-22: 本轮确实有失败项、却一条修复任务都没有
+                    # —— 这不是「没什么要修的」，而是「有失败却没人去修」。
+                    #
+                    # 以前这两种情况走的是同一条路：回到 ``executing``，
+                    # 让执行器去排空剩下的工作。执行器发现没活可干，退出来，
+                    # 链子又回到验证 —— 一个静默的空转闭环：计划永远不收敛，
+                    # 也永远不说为什么。实测过一次：VP 判 FAILED，修复队列
+                    # 空的，needs_operator_decision 也是 false —— 于是没有
+                    # 人被叫醒，也没有任何东西被修。
+                    #
+                    # 所以这里把两种情况分开：确实有失败项的，交给人工裁定。
+                    _has_failures, _failure_text = _round_failure_summary(
+                        orch, report, result,
+                    )
+                    if _has_failures:
+                        # orchestrator 自己给的 stop_reason（比如
+                        # ``same_failure_repeated_after_max_attempts``）比这条
+                        # 通用理由具体，但它只写进日志：写进行上的那个理由是
+                        # 「有失败、却没人把它们变成任务」—— 这才是操作者要
+                        # 回答的问题。
+                        _own_reason = result.get("stop_reason")
+                        _server.logger.warning(
+                            "[Auto-Verification] Round %d: %s、0 条修复任务"
+                            " —— 交给人工裁定（orchestrator 自己给的 stop_reason"
+                            "：%s）",
+                            round_num, _failure_text,
+                            _own_reason or "（没有）",
+                        )
+                        _dead_end_terminal(
+                            plan_id,
+                            FAILURES_WITHOUT_REPAIR_TASKS_STOP_REASON,
+                            # 这是一条**终态**：链条到此为止，等人来裁。
+                            # 继续回 executing 只会再空转一圈。
+                            chain_ending=True,
+                            # 不回滚到 queued：计划停在 verification
+                            # 这一族里，等着被重启或被人工接手。
+                            rollback_to_ready=False,
+                            round_token=round_token,
+                        )
+                        return
 
                     # 2026-09-12: even when both the orchestrator
                     # payload AND the DB queue are empty, we still need

@@ -150,6 +150,22 @@ e2e 的两个子类（2026-11-04，arch 决策点 7）
   ``lane_summaries`` 是空的 —— 「什么都不知道」比「按错误的格式读出来的
   东西」诚实。
 
+结构化判决（2026-11-22）
+------------------------------------
+退出码只说一件事：「过没过」。它说不出**哪一段**红了、有几条错、第一条错
+是什么 —— 于是读判决的人只能去翻已经被截断的 stdout。
+
+所以门禁可以写一份结构化判决：框架定的格式 ``pdt-gate/v1``，写在
+:data:`GATE_RESULT_DIR_ENV` 指向的目录里（就是那个 per-VP 的产物目录，
+和 junit 报告放在一起），文件名 :data:`GATE_RESULT_FILENAME`。契约用
+``result_format: "pdt-gate/v1"`` 声明「我的门禁会写这份判决」；不声明就
+**不读** —— 没答应过的文件不是判决。
+
+读到了就按它判，退出码降级为**传输信号**（门禁跑没跑、怎么结束的）；判决
+说没说的、判决和进程对不上的，一律 INCONCLUSIVE。判决读不到、解析不了、
+字段不对 —— 完全走退出码那条老路，证据里记 ``gate_result_available`` 和
+原因。**判决是证据的补充，不是让一个坏文件把门禁带崩的新办法。**
+
 证据（2026-10-31，VP-020）
 --------------------------
 以前只保留 stdout 的**末尾** 4000 字符。被预算杀掉的那一刻，末尾是第二条
@@ -678,6 +694,34 @@ _LANE_SCAN_MAX_DEPTH = 12
 #: report *names* the cases that failed instead of leaving them in a
 #: scrolled-off stream.
 GATE_JUNIT_DIR_ENV = "PDT_GATE_JUNIT_DIR"
+
+#: The environment variable that tells the gate script where to write its
+#: **structured verdict**.
+#:
+#: The exit code of a gate says one thing: "did it pass".  It cannot say
+#: which stage went red, how many things failed, or what the first error
+#: was — so a reader of the verdict has to go and dig through a scrolled
+#: off stdout to find out.  A gate that writes a verdict file says all
+#: three in one machine-readable place, and the framework grades THAT.
+#:
+#: The directory is the same per-VP directory the junit reports go to,
+#: because both are this round's evidence about this round.
+GATE_RESULT_DIR_ENV = "PDT_GATE_RESULT_DIR"
+
+#: The name of the structured verdict file inside that directory.
+GATE_RESULT_FILENAME = "pdt-gate-result.json"
+
+#: The schema the verdict file must declare.  A file that declares
+#: anything else is not a verdict this framework knows how to read.
+GATE_RESULT_SCHEMA = "pdt-gate/v1"
+
+#: The verdicts a gate may declare for the run as a whole.
+GATE_RESULT_STATUSES: Tuple[str, ...] = ("pass", "fail", "inconclusive")
+
+#: The verdicts a single stage may declare.
+GATE_STAGE_STATUSES: Tuple[str, ...] = (
+    "pass", "fail", "skipped", "inconclusive",
+)
 
 #: Ceiling on the number of failures the evidence carries.  A gate that
 #: fails five thousand cases says less with five thousand entries than
@@ -2313,6 +2357,33 @@ def _clear_stale_junit_reports(junit_dir: Optional[Path]) -> List[str]:
     return removed
 
 
+def _clear_stale_gate_result(result_dir: Optional[Path]) -> Optional[str]:
+    """Take the verdict file of an earlier round out of the way.
+
+    The per-VP directory is reused across rounds, so the verdict the last
+    round wrote is still there when the next round starts.  A verdict
+    that belongs to an earlier round is not evidence about this one —
+    grading this round by the last round's news would be exactly the
+    kind of silent wrong answer this whole feature exists to remove.
+
+    Returns the name of the file that was removed, or ``None``.
+    """
+    if result_dir is None:
+        return None
+    path = result_dir / GATE_RESULT_FILENAME
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:  # noqa: BLE001 - a stale verdict is not fatal
+        logger.warning(
+            "[ci_runner] could not remove the stale gate result %s: %s",
+            path, exc,
+        )
+        return None
+    return path.name
+
+
 def _junit_written_since(path: Path, since: float) -> bool:
     """Whether *path* was written after the gate started.
 
@@ -3011,6 +3082,7 @@ def run_ci_verification(
     # registry above; the junit directory joins it on the same dict, so
     # the one subprocess sees both.
     junit_dir: Optional[Path] = None
+    gate_result_dir: Optional[Path] = None
     if artifact_dir is not None:
         candidate = Path(artifact_dir) / vp_id
         try:
@@ -3026,18 +3098,33 @@ def run_ci_verification(
             )
         else:
             junit_dir = candidate
+            gate_result_dir = candidate
             # The directory is named after the verification point, so it
             # is the **same** directory round after round.  What an
             # earlier round wrote into it is not this round's evidence —
             # so it is deleted before the gate is started, below, and
             # the reader sees only what this round wrote.
             gate_env[GATE_JUNIT_DIR_ENV] = str(candidate)
+            # The structured verdict lands in the SAME directory: both
+            # are this round's account of this round, and a reader that
+            # has to look in two places to find the two halves of one
+            # verdict is a reader that will look in only one of them.
+            gate_env[GATE_RESULT_DIR_ENV] = str(candidate)
 
     # The reports of an earlier round are still in that directory -- it
     # is reused across rounds -- and they are not evidence about this
     # run.  They go before the gate starts, so that whatever is in the
     # directory afterwards was written by this run.
     stale_reports = _clear_stale_junit_reports(junit_dir)
+    # Same reasoning for the verdict file: a verdict an earlier round
+    # wrote there says nothing about this round, and reading it would
+    # grade this round by the last round's news.
+    stale_gate_result = _clear_stale_gate_result(gate_result_dir)
+    if stale_gate_result:
+        logger.info(
+            "[ci_runner] removed the gate result %s left by an earlier "
+            "round", stale_gate_result,
+        )
 
     # The instant the gate starts.  A junit report written before it
     # belongs to an earlier round: the directory is reused, so its
@@ -3088,6 +3175,15 @@ def run_ci_verification(
     stderr_tail = stderr[-MAX_OUTPUT_CHARS:]
     if parse_summary and not gate_summary:
         gate_summary = parse_gate_summary(stdout)
+
+    # 2026-11-22: the structured verdict.  It is read ONLY when the
+    # plan's contract declared the format — a gate that never promised
+    # a verdict file is not asked for one, and a file that happens to be
+    # lying around is not read as if it were this round's verdict.
+    gate_result: Optional[Dict[str, Any]] = None
+    gate_result_error: Optional[str] = None
+    if contract.reads_gate_result():
+        gate_result, gate_result_error = _read_gate_result(gate_result_dir)
 
     # The gate's own account of itself, lifted to the top level of the
     # evidence so a reader does not have to dig into ``gate_summary``
@@ -3151,6 +3247,16 @@ def run_ci_verification(
     if error:
         evidence["error"] = error
 
+    # The structured verdict, when the contract asked for one.  The
+    # keys are there either way: a reader has to be able to tell "the
+    # gate wrote no verdict" from "the framework did not look".
+    if contract.reads_gate_result():
+        evidence["gate_result_available"] = gate_result is not None
+        if gate_result is not None:
+            evidence["gate_result"] = gate_result
+        if gate_result_error:
+            evidence["gate_result_error"] = gate_result_error
+
     # The junit evidence is added to the evidence, and it never decides
     # the verdict on its own: the exit code alone decides PASSED /
     # FAILED.  The reports are read after the gate ran, and a report
@@ -3190,7 +3296,32 @@ def run_ci_verification(
         _blocking_failures(junit_evidence) if could_not_decide else []
     )
 
-    if not timed_out and not error and exit_code == 0:
+    # 2026-11-22: the structured verdict decides, when there is one.
+    # ``timed_out`` and ``error`` still come first — a gate that ran out
+    # of time or could not be executed at all has no verdict to give —
+    # and the exit code / junit logic below still decides when the
+    # verdict is absent or unusable.
+    _structured: Optional[Tuple[str, str, str]] = None
+    if not timed_out and not error and gate_result is not None:
+        _structured = _gate_result_verdict(gate_result, exit_code)
+
+    if _structured is not None:
+        _status, _reason, _signal = _structured
+        result.status = _status
+        if _signal:
+            evidence["signal"] = _signal
+        result.reasons = [
+            f"[{label}] `{entry}` {_reason}（用时 {duration:.0f}s）"
+            + (
+                f"；{lane_note}"
+                if (_status == STATUS_PASSED and lane_note)
+                else ""
+            )
+        ]
+        tail = stderr_tail.strip() or stdout_tail.strip()
+        if tail:
+            result.reasons.append(f"输出尾部：{tail[-600:]}")
+    elif not timed_out and not error and exit_code == 0:
         result.status = STATUS_PASSED
         # 2026-11-18 (VP-022): the verdict now says **which** lane ran,
         # and who declared it — "the command exited 0" alone answers a
@@ -3289,6 +3420,222 @@ def run_ci_verification(
         artifact_dir, vp_id, evidence, round_no=round_no,
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# The structured verdict (``pdt-gate/v1``)
+# ---------------------------------------------------------------------------
+#
+# A gate that only exits with a code has told the framework exactly one
+# thing.  The verdict the operator reads needs three more: which stage
+# went red, how many things failed, and what the first error was.  The
+# exit code cannot carry them, so the gate may write them down — in the
+# format the framework defines, so that the framework can read them
+# without guessing what a particular project's "tiers" mean.
+#
+# Everything here is **best-effort by construction**: a verdict that is
+# missing, unparseable or malformed must never break the run and must
+# never change the verdict the exit code would have produced.  The
+# structured verdict is an *addition* to the evidence, not a new way for
+# a broken file to take the gate down.
+
+
+def _read_gate_result(
+    result_dir: Optional[Path],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Read the gate's structured verdict.
+
+    Returns ``(verdict, reason)``: the parsed verdict, or ``None`` plus
+    the reason it could not be used.  Never raises — a verdict that
+    cannot be read is a verdict the framework does not have, and the run
+    continues on the exit code it always had.
+    """
+    if result_dir is None:
+        return None, "no verdict directory was given to the gate"
+
+    path = result_dir / GATE_RESULT_FILENAME
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, f"the gate wrote no verdict file ({path.name})"
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, f"the verdict file could not be read: {exc}"
+    except Exception as exc:  # noqa: BLE001 - a verdict is not a verdict
+        return None, f"the verdict file could not be read: {exc}"
+
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        return None, f"the verdict file is not valid JSON: {exc}"
+    except RecursionError as exc:
+        return None, f"the verdict file is nested too deeply to parse: {exc}"
+    except Exception as exc:  # noqa: BLE001 - a verdict is not a verdict
+        return None, f"the verdict file could not be parsed: {exc}"
+
+    problem = _validate_gate_result(data)
+    if problem:
+        return None, problem
+
+    return data, None
+
+
+def _validate_gate_result(data: Any) -> Optional[str]:
+    """Check that *data* is a verdict this framework can grade.
+
+    Returns the reason it cannot be graded, or ``None`` when it can.  A
+    verdict is graded only when it says what it must say: the schema it
+    follows, the verdict itself, the exit code it observed, and the
+    stages it ran.  Anything else is not a verdict — it is a file — and
+    the framework grades the exit code instead.
+    """
+    if not isinstance(data, dict):
+        return (
+            f"the verdict must be a JSON object, got {type(data).__name__}"
+        )
+
+    schema = data.get("schema")
+    if schema != GATE_RESULT_SCHEMA:
+        return (
+            f"the verdict must declare schema {GATE_RESULT_SCHEMA!r}, "
+            f"got {schema!r}"
+        )
+
+    status = data.get("status")
+    if not isinstance(status, str) or status not in GATE_RESULT_STATUSES:
+        return (
+            f"the verdict's status must be one of "
+            f"{list(GATE_RESULT_STATUSES)}, got {status!r}"
+        )
+
+    exit_code = data.get("exit_code")
+    # ``True`` is an ``int`` in Python, but it is not an exit code.
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        return (
+            f"the verdict's exit_code must be an int, got "
+            f"{type(exit_code).__name__}"
+        )
+
+    stages = data.get("stages")
+    if not isinstance(stages, dict):
+        return (
+            f"the verdict's stages must be an object, got "
+            f"{type(stages).__name__}"
+        )
+    for name, stage in stages.items():
+        if not isinstance(stage, dict):
+            return (
+                f"the verdict's stage {name!r} must be an object, got "
+                f"{type(stage).__name__}"
+            )
+        stage_status = stage.get("status")
+        if (
+            not isinstance(stage_status, str)
+            or stage_status not in GATE_STAGE_STATUSES
+        ):
+            return (
+                f"the verdict's stage {name!r} must have a status of one "
+                f"of {list(GATE_STAGE_STATUSES)}, got {stage_status!r}"
+            )
+        errors = stage.get("errors")
+        if errors is None:
+            continue
+        if not isinstance(errors, list) or not all(
+            isinstance(item, str) for item in errors
+        ):
+            return (
+                f"the verdict's stage {name!r} must carry a list of "
+                f"strings in 'errors'"
+            )
+
+    return None
+
+
+def _gate_result_verdict(
+    verdict: Dict[str, Any],
+    exit_code: Optional[int],
+) -> Optional[Tuple[str, str, str]]:
+    """Grade a gate by the verdict it wrote.
+
+    Returns ``(status, reason, signal)``, or ``None`` when the verdict
+    cannot be graded and the exit code has to decide.
+
+    The exit code is still the **transport signal**: it says the gate
+    ran and how it ended, and a verdict that disagrees with it is
+    self-contradictory — and a self-contradictory verdict is not
+    evidence, it is noise, so it is INCONCLUSIVE rather than a verdict
+    about the code.
+    """
+    reported_exit_code = verdict.get("exit_code")
+    if reported_exit_code != exit_code:
+        return (
+            STATUS_INCONCLUSIVE,
+            (
+                f"判决与进程对不上：报告说退出码 {reported_exit_code}，"
+                f"进程实际退出码 {exit_code}（判决自相矛盾，判不了）"
+            ),
+            SIGNAL_GATE_INCONCLUSIVE,
+        )
+
+    status = str(verdict.get("status") or "")
+
+    if status == "pass":
+        if exit_code == 0:
+            return (
+                STATUS_PASSED,
+                "门禁判决通过（判决 status=pass，退出码 0）",
+                "",
+            )
+        return (
+            STATUS_INCONCLUSIVE,
+            (
+                f"门禁判决 status=pass，但进程退出码是 {exit_code} "
+                f"（判决与进程自相矛盾，判不了）"
+            ),
+            SIGNAL_GATE_INCONCLUSIVE,
+        )
+
+    if status == "fail":
+        return (
+            STATUS_FAILED,
+            _gate_result_failure_reason(verdict),
+            SIGNAL_GATE_FAILED,
+        )
+
+    # ``inconclusive``: the gate itself says it could not decide.
+    return (
+        STATUS_INCONCLUSIVE,
+        (
+            f"门禁判决 status=inconclusive（门禁自报没能判定，"
+            f"退出码 {exit_code}；这不是代码失败）"
+        ),
+        SIGNAL_GATE_INCONCLUSIVE,
+    )
+
+
+def _gate_result_failure_reason(verdict: Dict[str, Any]) -> str:
+    """Say WHICH stage went red, and what its first error was.
+
+    "门禁报告某条 lane 红" is the sentence this feature exists to
+    replace: it names no stage and no error, so the reader has to go
+    and find both.  The verdict already knows them.
+    """
+    stages = verdict.get("stages") or {}
+    failing_stage = verdict.get("failing_stage")
+
+    stage = stages.get(failing_stage) if isinstance(failing_stage, str) else None
+    if not isinstance(stage, dict):
+        # The verdict names no stage (or names one it does not
+        # describe) — say that, rather than inventing a stage.
+        stage_text = f"失败阶段：{failing_stage}" if failing_stage else "失败阶段：未指明"
+        return f"门禁判决 status=fail（{stage_text}）"
+
+    errors = stage.get("errors") or []
+    first_error = errors[0] if errors else ""
+    error_text = f"；第一条错误：{first_error}" if first_error else ""
+    return (
+        f"门禁判决 status=fail（失败阶段：{failing_stage}；"
+        f"该阶段 {len(errors)} 条错误{error_text}）"
+    )
 
 
 def _gate_could_not_decide(
