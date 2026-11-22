@@ -618,6 +618,120 @@ def normalize_exec_status(
     return verdict
 
 
+# ---------------------------------------------------------------------------
+# 列表接口的 status 桶：由相位 / 验证行推出
+# ---------------------------------------------------------------------------
+
+#: 「操作者停的」那两个停止原因。
+#:
+#: 它们说的是「有人按了停止」，而不是「验证循环自己跑完了」—— 桶必须能把
+#: 这两种停法分开：前者是 ``stopped``，后者只是修复没跑成。
+_USER_STOP_REASONS = frozenset({"user_stopped", "user_force_terminal"})
+
+#: 相位 → 列表桶。
+#:
+#: 键是**相位词表**里的值（``plan_routing.current_phase``），值是列表接口
+#: ``status`` 字段的桶。``verification_repairing`` 不在这里 —— 它要问验证行
+#: 才能定桶，见 :func:`listing_status_bucket`。
+_PHASE_STATUS_BUCKETS = {
+    # 「正在跑」的三个相位：执行中、验证轮跑着、等配额（等配额的计划是活的，
+    # 窗口一开就继续 —— 说它是「排队中」是另一回事）。
+    "executing": "running",
+    "verification_running": "running",
+    "waiting_for_quota": "running",
+    # 终局相位：工作流的结论就是桶。
+    "failed": "failed",
+    "verification_failed": "failed",
+    "stopped": "stopped",
+    "verification_loop_stopped": "stopped",
+    "user_stopping": "stopped",
+    "completed": "completed",
+    "verification_passed": "completed",
+    # 等待相位（``ready`` 是它的历史别名，读路径自己归一化）。
+    "queued": "queued",
+    "ready": "queued",
+}
+
+#: 修复相位（含它的历史别名 ``verification_rerunning``）。
+_REPAIRING_PHASES = frozenset({"verification_repairing", "verification_rerunning"})
+
+
+def _repairing_status_bucket(
+    verification_status: Optional[str],
+    verification_stop_reason: Optional[str],
+) -> str:
+    """修复相位（``verification_repairing``）的桶。
+
+    修复相位本身**不**说这条计划是死是活 —— 它只说「修复任务在等着跑」。
+    真正的裁决在**验证行**上：
+
+    * 停止原因是「操作者停的」→ 操作者停过这条计划 → ``stopped``；
+    * 验证行自己写着 ``loop_stopped`` → 验证循环停下来了 → ``stopped``；
+    * 验证行写着 ``failed`` / ``stopped`` → 修复没跑成 → ``failed``；
+    * 其它 → 它正要去跑修复 → ``running``。
+    """
+    reason = _norm(verification_stop_reason)
+    if reason in _USER_STOP_REASONS:
+        return "stopped"
+    status = _norm(verification_status)
+    if status == "loop_stopped":
+        return "stopped"
+    if status in ("failed", "stopped"):
+        return "failed"
+    return "running"
+
+
+def listing_status_bucket(
+    current_phase: Optional[str],
+    verification_status: Optional[str] = None,
+    verification_stop_reason: Optional[str] = None,
+) -> Optional[str]:
+    """The listing's ``status`` bucket for a plan that HAS a routing phase.
+
+    Pure — no I/O, no clock, no environment.  Same split as the rest of
+    this module: the judgement is here, the reading stays with the caller.
+
+    Why this exists
+    ---------------
+    2026-11-22 线上实测：一条**已经停下**的计划在 ``GET /api/plans`` 里显示
+    成 ``status=queued``（前端把它翻成「排队中」），而同一份响应里另一条计划
+    显示 ``status=running``。原因不是相位渲染错了 —— 是列表的桶**猜**出来的：
+    ``_artifact_status`` 只看「目录里有没有 ``tasks.json``」，于是**任何**有
+    ``tasks.json``、执行行又没说 running 的计划都被报成 ``queued``，包括失败
+    的和停止的。
+
+    桶必须由**相位 / 验证行**推出，因为那才是「这条计划现在是什么」的权威。
+    猜出来的桶只会把「失败」「已停止」都染成「排队中」。
+
+    The mapping
+    -----------
+    ==============================  ==========
+    phase                           bucket
+    ==============================  ==========
+    ``executing``                   ``running``
+    ``verification_running``        ``running``
+    ``waiting_for_quota``           ``running``
+    ``verification_repairing``      问验证行（见 :func:`_repairing_status_bucket`）
+    ``failed`` / ``verification_failed``  ``failed``
+    ``stopped`` / ``verification_loop_stopped`` / ``user_stopping``  ``stopped``
+    ``completed`` / ``verification_passed``  ``completed``
+    ``queued``（``ready`` 是旧词）   ``queued``
+    ==============================  ==========
+
+    ``None`` means "this phase says nothing about the bucket" — an empty
+    phase, or a phase outside the table.  The caller then falls back to
+    the artifact heuristic; this function never guesses on its own.
+    """
+    phase = _norm(current_phase)
+    if not phase:
+        return None
+    if phase in _REPAIRING_PHASES:
+        return _repairing_status_bucket(
+            verification_status, verification_stop_reason,
+        )
+    return _PHASE_STATUS_BUCKETS.get(phase)
+
+
 def find_divergences(status: PlanStatus) -> Tuple[Divergence, ...]:
     """Report the ways ``status``'s stores disagree with one another.
 

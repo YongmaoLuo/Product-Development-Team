@@ -456,3 +456,107 @@ def test_finalize_does_not_overwrite_a_plan_moved_by_another_path(
         "the stop record survived a plan that was moved by another path — "
         "the next run is gated by a stop that is already over"
     )
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-22: 停止的痕迹不能整条作废
+# ---------------------------------------------------------------------------
+#
+# 事故：``try_mark_phase`` 的 CAS 失配（另一条路径 —— 被打断那一轮的 verdict
+# 写入 —— 在停止窗口里把 routing 行从 ``user_stopping`` 挪回了
+# ``verification_repairing``），于是 stop 整条提前 return，**验证行一次都没
+# 被写成 stopped**。计划没有任何「被停过」的痕迹，列表于是把它显示成
+# 「排队中」。
+#
+# 下面两条钉住：相位仍然不覆盖别人的写，但**验证行必须记下「操作者停过」**。
+
+
+def test_stop_lost_the_phase_race_still_marks_the_verification_row_stopped(
+    env, client, captured_finalize, monkeypatch,
+):
+    """相位让给了另一条路径 —— 验证行仍然标 stopped。
+
+    CAS 失配时相位**不写**（那条路径对自己的相位负责），但验证行要写：它是
+    「操作者停过这条计划」的唯一持久证据。没有它，「停过」这个事实凭空
+    消失，计划就退化成一条「失败 / 等待的计划」。
+
+    断言四件事：``mark_stopped`` 被调用了一次、参数是 ``"user_stopped"``；
+    相位没有被 stop 覆盖（仍然是另一条路径写的那一个）；停止记录被清空；
+    整条回调没有抛异常。
+    """
+    from state_machine.repositories.routing_repository import (
+        ConflictError,
+        RoutingRepository,
+    )
+    from state_machine.repositories.verification_repository import (
+        VerificationRepository,
+    )
+
+    plans_dir, db_path = env
+    _seed_plan(plans_dir, db_path, phase="verification_running")
+
+    _stop(client)
+    assert _read_phase(db_path, PLAN_ID) == "user_stopping"
+
+    calls: list = []
+    real_try_mark_phase = RoutingRepository.try_mark_phase
+    real_mark_stopped = VerificationRepository.mark_stopped
+
+    def _moved_by_another_path(self, plan_id, expected_phases, new_phase):
+        # 另一条路径（被打断那一轮的 verdict 写入）把行挪走了。
+        real_try_mark_phase(
+            self, plan_id, ("user_stopping",), "verification_repairing",
+        )
+        raise ConflictError("the row was moved by another path")
+
+    def _recording_mark_stopped(self, plan_id, reason, *args, **kwargs):
+        calls.append((plan_id, reason))
+        return real_mark_stopped(self, plan_id, reason, *args, **kwargs)
+
+    monkeypatch.setattr(
+        RoutingRepository, "try_mark_phase", _moved_by_another_path,
+    )
+    monkeypatch.setattr(
+        VerificationRepository, "mark_stopped", _recording_mark_stopped,
+    )
+
+    # 不许抛异常：一次停止不该把后台层搞挂。
+    captured_finalize["finalize"](PLAN_ID)
+
+    assert calls == [(PLAN_ID, "user_stopped")], (
+        "the verification row was not marked stopped after the stop lost "
+        f"the race for the phase: {calls!r}"
+    )
+    row = _read_verification_row(db_path, PLAN_ID)
+    assert row.get("verification_status") == "loop_stopped", row
+    assert row.get("verification_stop_reason") == "user_stopped", row
+    assert _read_phase(db_path, PLAN_ID) == "verification_repairing", (
+        "the stop overwrote the phase another path had already written — "
+        "the CAS must stay a CAS"
+    )
+    assert stop_state.get(PLAN_ID) is None, (
+        "the stop record survived a stop that is already over — the next "
+        "run is gated by a stop that never happened"
+    )
+
+
+def test_stop_that_owns_the_phase_still_marks_the_row_stopped(
+    env, client, captured_finalize,
+):
+    """安静路径（stop 赢得 CAS）同样把验证行标成 stopped。
+
+    这是上一条的对照：两条路径都必须留下「被停过」的痕迹，只是相位归谁
+    写不同。
+    """
+    plans_dir, db_path = env
+    _seed_plan(plans_dir, db_path, phase="verification_running")
+
+    _stop(client)
+    captured_finalize["finalize"](PLAN_ID)
+
+    row = _read_verification_row(db_path, PLAN_ID)
+    assert row.get("verification_status") == "loop_stopped", (
+        f"the quiet stop did not mark the verification row stopped: {row}"
+    )
+    assert row.get("verification_stop_reason") == "user_stopped", row
+    assert _read_phase(db_path, PLAN_ID) == "verification"

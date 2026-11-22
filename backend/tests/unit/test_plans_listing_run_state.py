@@ -388,3 +388,170 @@ def test_a_plan_in_verification_outlives_the_verdict_of_a_dead_executor():
         f"{passed} reached verification_passed, so it is over; it must stay "
         f"out of the default listing; it answered {entries[passed]!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-22: 桶由相位 / 验证行推出，不再由「目录里有没有 tasks.json」猜
+# ---------------------------------------------------------------------------
+#
+# 事故（线上实测）：一条**已经停下**的计划在 ``GET /api/plans`` 里是
+# ``status=queued``（前端翻成「排队中」），同一份响应里还有一条
+# ``status=running``。原因不是相位渲染错了 —— 是桶**猜**出来的：
+# ``_artifact_status`` 只看 ``tasks.json`` 在不在，于是任何有 tasks.json、
+# 执行行又没说 running 的计划都被报成 ``queued``，包括失败的、停止的。
+#
+# 下面钉住：桶跟着**相位 / 验证行**走；没有相位时才回落到既有启发式。
+
+
+def _terminal_entries() -> dict:
+    """Every entry the ``include_terminal=true`` listing answers.
+
+    终局计划（``failed`` / ``stopped``）默认被过滤掉 —— 那套判据是另一条
+    规则（``_plan_is_terminal``），本次不动它。事故现场读的就是带
+    ``include_terminal=true`` 的那份列表，所以这里也用它。
+    """
+    invalidate_plans_cache()
+    response = client.get("/api/plans?include_terminal=true")
+    assert response.status_code == 200, response.text
+    return {e["id"]: e for e in response.json()}
+
+
+def test_the_listing_bucket_is_derived_from_the_phase():
+    """纯函数：相位 → 桶。逐条钉住映射表。"""
+    from plan_status import listing_status_bucket
+
+    # 等待相位（``ready`` 是历史别名）。
+    assert listing_status_bucket("queued") == "queued"
+    assert listing_status_bucket("ready") == "queued"
+    # 「正在跑」的三个相位。
+    assert listing_status_bucket("executing") == "running"
+    assert listing_status_bucket("verification_running") == "running"
+    assert listing_status_bucket("waiting_for_quota") == "running"
+    # 终局相位。
+    assert listing_status_bucket("failed") == "failed"
+    assert listing_status_bucket("verification_failed") == "failed"
+    assert listing_status_bucket("stopped") == "stopped"
+    assert listing_status_bucket("verification_loop_stopped") == "stopped"
+    assert listing_status_bucket("user_stopping") == "stopped"
+    assert listing_status_bucket("completed") == "completed"
+    assert listing_status_bucket("verification_passed") == "completed"
+
+
+def test_the_bucket_for_a_repairing_phase_asks_the_verification_row():
+    """修复相位自己不说是死是活 —— 它问验证行。
+
+    ``verification_repairing`` 只说「修复任务在等着跑」：是操作者停的
+    （``stopped``）、验证循环自己停的（``stopped``）、修复没跑成
+    （``failed``），还是正要去跑（``running``），只有验证行知道。
+    """
+    from plan_status import listing_status_bucket
+
+    assert listing_status_bucket("verification_repairing") == "running"
+    assert listing_status_bucket(
+        "verification_repairing", verification_status="loop_stopped",
+    ) == "stopped"
+    assert listing_status_bucket(
+        "verification_repairing", verification_stop_reason="user_stopped",
+    ) == "stopped"
+    assert listing_status_bucket(
+        "verification_repairing",
+        verification_stop_reason="user_force_terminal",
+    ) == "stopped"
+    assert listing_status_bucket(
+        "verification_repairing", verification_status="failed",
+    ) == "failed"
+    assert listing_status_bucket(
+        "verification_repairing", verification_status="running",
+    ) == "running"
+
+
+def test_the_bucket_says_nothing_for_an_empty_or_unknown_phase():
+    """空相位 / 未知相位 → ``None``：调用方回落既有启发式。
+
+    启发式的桶（``reviewed`` / ``prd`` / ``interviewed`` / ``new``）**不是**
+    相位，纯函数不许替它们说话。
+    """
+    from plan_status import listing_status_bucket
+
+    assert listing_status_bucket("") is None
+    assert listing_status_bucket(None) is None
+    assert listing_status_bucket("reviewed") is None
+    assert listing_status_bucket("verification") is None
+
+
+def test_a_failed_plan_is_not_listed_as_queued():
+    """事故的负控：一条失败的计划（有 ``tasks.json``）不再显示「排队中」。
+
+    这条计划有 ``tasks.json``，所以旧的启发式会说 ``queued``（前端翻成
+    「排队中」）。相位是 ``failed`` —— 权威说是失败，桶就必须是 ``failed``。
+    """
+    plan_id = "bucket-failed-1790215922392"
+    _seed_plan(plan_id, phase="failed")
+    _set_routing_phase(plan_id, "failed")
+
+    entries = _terminal_entries()
+    assert plan_id in entries, (
+        f"{plan_id} is missing from the listing: {sorted(entries)!r}"
+    )
+    entry = entries[plan_id]
+    assert entry["status"] != "queued", (
+        f"a failed plan was listed as queued: {entry!r}"
+    )
+    assert entry["status"] == "failed", entry
+    assert entry["current_phase"] == "failed", entry
+
+
+def test_a_stopped_repair_is_listed_as_stopped():
+    """停在修复相位、验证行写着「操作者停过」→ 桶是 ``stopped``。
+
+    这就是事故那一条计划的形状：停止窗口里另一条路径把相位挪回
+    ``verification_repairing``，而验证行记着「操作者停过」。
+    """
+    from server import _state_db_path
+    from state_machine.db.connection import open as open_db
+    from state_machine.db.schema import migrate
+    from state_machine.repositories.verification_repository import (
+        VerificationRepository,
+    )
+
+    plan_id = "bucket-stopped-1790215922394"
+    _seed_plan(plan_id, phase="verification_repairing")
+    _set_routing_phase(plan_id, "verification_repairing")
+
+    conn = open_db(_state_db_path(None))
+    try:
+        migrate(conn)
+        VerificationRepository(conn).insert(
+            plan_id,
+            verification_status="loop_stopped",
+            verification_stop_reason="user_stopped",
+        )
+    finally:
+        conn.close()
+
+    entry = _terminal_entries()[plan_id]
+    assert entry["status"] == "stopped", entry
+    assert entry["current_phase"] == "verification_repairing", entry
+
+
+def test_a_plan_without_a_phase_keeps_the_artifact_fallback():
+    """没有相位 → 既有启发式回落不变（有 ``tasks.json`` → ``queued``）。
+
+    桶的推导只接管**有相位**的计划；没有记录下来的相位就没有权威可依，
+    启发式原样留着。
+    """
+    plan_id = "bucket-nophase-1790215922396"
+    from server import PLANS_DIR
+
+    # 只有目录、只有 ``tasks.json``：没有 routing 行，也就没有任何相位。
+    plan_dir = PLANS_DIR / plan_id
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    (plan_dir / "tasks.json").write_text(
+        json.dumps({"tasks": []}), encoding="utf-8",
+    )
+
+    entry = _terminal_entries()[plan_id]
+    assert entry["status"] == "queued", (
+        "a plan with no routing row must keep the artifact fallback: "
+        f"{entry!r}"
+    )
