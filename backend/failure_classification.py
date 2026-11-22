@@ -225,8 +225,31 @@ def remedy_for(kind: str) -> str:
 
 #: ``undeclared_write: <path>[, <path>...]`` — the executor's own
 #: spelling, carrying the paths the guard refused.
+#:
+#: FIRST LINE ONLY. The rollback (task 5) appends its evidence to this
+#: text, so the refused paths are followed by lines that say where the
+#: evidence patch is and what was put back. Those lines are facts about
+#: the RUN, not about the failure, and a payload that swallowed them
+#: would carry the attempt's patch path into the refiner's prompt. The
+#: path class therefore stops at the end of the line: a character class
+#: that excludes CR and LF, and no ``DOTALL``. The space between the
+#: colon and the paths may be any horizontal whitespace, but NOT a
+#: newline: a newline there would pull the SECOND line into the paths.
 _UNDECLARED_WRITE_RE = re.compile(
-    r"undeclared_write:\s*(?P<paths>.+)", re.IGNORECASE | re.DOTALL
+    r"undeclared_write:[^\S\r\n]*(?P<paths>[^\r\n]+)", re.IGNORECASE
+)
+
+#: The lines the rollback appends to the failure text: where the
+#: evidence patch was written, what was rolled back, and what could not
+#: be. They are stripped before the failure's IDENTITY is computed —
+#: the patch file is named after the attempt, so an identity that read
+#: them would give the same overstep a new signature and a new
+#: fingerprint on every attempt, and the occurrence counter would never
+#: reach two.
+_EVIDENCE_LINE_RE = re.compile(
+    r"^[^\S\r\n]*(?:rollback_patch|rollback_rolled_back|rollback_failed)"
+    r"[^\S\r\n]*:.*$",
+    re.MULTILINE,
 )
 
 #: The guard's own refusal sentence, used when the message DID survive the
@@ -616,6 +639,23 @@ def _normalize(error):
     return " ".join(masked.split())
 
 
+def _identity_text(text: str) -> str:
+    """The failure text WITHOUT the rollback evidence lines.
+
+    The evidence lines (see ``_EVIDENCE_LINE_RE``) record what the
+    rollback did, not what went wrong, and the patch path among them
+    carries the attempt number. Reading them would give one failure a
+    new identity per attempt, and the occurrence counter — which is
+    what tells the refiner that this failure has happened before —
+    would never see two.
+
+    The label and the payload are deliberately NOT built from this
+    text: a human reading the failure wants to see where the evidence
+    is, and the refiner wants the refused paths.
+    """
+    return _EVIDENCE_LINE_RE.sub("", text or "")
+
+
 def _classify_kind(error):
     """Map an error string onto a kind. Order is significant.
 
@@ -728,9 +768,15 @@ def classify_failure(error, project_dir=None):
         scope_violation = list(detail.get(FOREIGN_PATHS_KEY, []))
         if scope_violation:
             kind = UNKNOWN
-    digest = hashlib.sha256(_normalize(text).encode("utf-8")).hexdigest()[:12]
+    # The IDENTITY is computed over the failure WITHOUT the rollback
+    # evidence lines: the patch path among them is named after the
+    # attempt, so an identity that read it would count one failure as a
+    # first occurrence on every attempt. The label and the payload keep
+    # the original text — a human wants to see where the evidence is.
+    identity = _identity_text(text)
+    digest = hashlib.sha256(_normalize(identity).encode("utf-8")).hexdigest()[:12]
     signature = f"{kind}:{digest}"
-    tokens = _structured_tokens(text, project_dir)
+    tokens = _structured_tokens(identity, project_dir)
     if not any(tokens.values()):
         # Nothing structured to key on: the text signature IS the best
         # available identity, and inventing a hash of five empty strings

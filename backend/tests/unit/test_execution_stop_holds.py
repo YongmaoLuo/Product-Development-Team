@@ -62,6 +62,7 @@ import stop_state
 import stop_supervisor
 import verification_cancel
 import verification_loop
+from routes import execution as execution_routes
 from state_machine.db.connection import open as open_db
 from state_machine.db.schema import migrate
 from state_machine.repositories.routing_repository import RoutingRepository
@@ -290,15 +291,25 @@ def spawn_recorder(monkeypatch):
 
 @pytest.fixture
 def begin_verification_recorder(monkeypatch):
-    """Record every ``PlanState.begin_verification`` call."""
+    """Record every ``PlanState.begin_verification`` call.
+
+    The spy is attached to the class the PRODUCTION code runs on —
+    ``server.PlanState`` — and not to ``plan_state.PlanState``.  The
+    two name the same object until something re-imports ``plan_state``:
+    a module reload rebinds ``plan_state.PlanState`` to a NEW class
+    while every consumer (and ``server``) keeps the original one, and a
+    spy attached to the new class then records NOTHING while the
+    production call happens.  That is a false negative: the assertion
+    reads "the chain never re-entered verification" when it did.
+    """
     calls: List[Optional[int]] = []
-    original = plan_state.PlanState.begin_verification
+    original = server.PlanState.begin_verification
 
     def _spy(self, round_n=None):
         calls.append(round_n)
         return original(self, round_n=round_n)
 
-    monkeypatch.setattr(plan_state.PlanState, "begin_verification", _spy)
+    monkeypatch.setattr(server.PlanState, "begin_verification", _spy)
     return calls
 
 
@@ -798,3 +809,193 @@ def test_idle_stop_with_a_checkpoint_parks_the_phase_too(env, client):
         f"the idle stop must park the plan even with a checkpoint; "
         f"phase is {ps.get_current_phase()!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-21 — one stop is one cancel, and the stop's own ledger
+#
+# The stop became a *process* on 2026-11-21: the request closes the
+# gate and answers, and a background worker does the killing.  Two
+# things came with that and both of them are pinned here.
+#
+# 1. **One stop, one cancel.**  The request thread asks for the
+#    cooperative cancel before it hands the shutdown over.  The
+#    background half used to ask for it AGAIN, on its own thread, and
+#    nothing ordered that against the resume's ``clear()``: a
+#    background half that arrived late re-raised the flag on a plan
+#    that had already been resumed, and the resumed plan was born
+#    cancelled — the verification chain could never run again.
+#
+# 2. **The plan is quiet when the LAST stop is done.**  The ledger
+#    that says "this plan's stop is still running" kept ONE entry per
+#    plan.  Two overlapping stops overwrote each other's entry and the
+#    first one to finish popped the second one's, so the quiet
+#    judgement believed the plan had fallen silent while a stop was
+#    still running: the plan was parked in the ``stopped`` phase and a
+#    resume was let through, while the stop that was still running
+#    could go on to change the plan's state.
+# ---------------------------------------------------------------------------
+
+
+def _wait_for_stop_worker_to_finish(
+    plan_id: str, timeout: float = 30.0,
+) -> None:
+    """Wait until the stop's background worker is done.
+
+    The worker is registered before the stop answers, so "not running"
+    once the answer is in means the background half has finished —
+    which is what makes the cancel count readable: the half that used
+    to ask for a second cancel had to have run by then.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not execution_routes._stop_worker_running(plan_id):
+            return
+        time.sleep(0.02)
+    raise AssertionError(
+        f"the stop's background worker for {plan_id} did not finish"
+    )
+
+
+def test_one_stop_asks_for_one_cancel_on_the_request_thread(
+    env, client, monkeypatch
+):
+    """A stop is ONE request for ONE cancel, asked on the request thread.
+
+    The asynchronous stop asked for the cooperative cancel twice — once
+    on the request thread (before the hand-off) and once on the
+    background stop worker (from inside the shutdown half).  The second
+    request had no ordering guarantee against the resume's ``clear()``.
+    """
+    plans_dir, db_path = env
+    plan_dir, project_dir = _seed_plan(plans_dir, db_path)
+    _mark_running(PLAN_ID, project_dir)
+    monkeypatch.setattr(server, "_kill_process_tree", lambda *a, **k: True)
+
+    asked_on: List[str] = []
+    monkeypatch.setattr(
+        verification_cancel,
+        "request_cancel",
+        lambda plan_id: asked_on.append(threading.current_thread().name),
+    )
+
+    resp = client.post(f"/api/execution/{PLAN_ID}/stop")
+    assert resp.status_code == 200, resp.text
+
+    # The background half has to be done before the count is read: it
+    # is the half that used to ask for a second cancel.
+    _wait_for_stop_worker_to_finish(PLAN_ID)
+
+    assert len(asked_on) == 1, (
+        f"one stop must ask for one cancel; it asked {len(asked_on)} "
+        f"times, on threads {asked_on!r}"
+    )
+    assert asked_on[0] != f"execution-stop:{PLAN_ID}", (
+        "the cancel must be asked for on the request thread, not on the "
+        f"background stop worker; it was asked for on {asked_on[0]!r}"
+    )
+
+
+def test_the_stop_background_half_cannot_re_raise_the_flag_after_a_resume(
+    env, client, monkeypatch,
+    begin_verification_recorder, orchestrator_recorder,
+):
+    """The resume's clear is the last word on the cancel flag.
+
+    The stop's background half used to ask for the cooperative cancel
+    itself, on its own thread.  The resume clears the flag on the
+    request thread and nothing ordered the two, so a background half
+    that arrived after the clear re-raised the flag: the resumed plan
+    was born cancelled and the verification chain could never run
+    again.
+
+    The background half is run here directly — it is the very function
+    the stop hands over to its own thread (``_stop_execution_worker``)
+    — and running it after the resume is what "the half arrived late"
+    means.
+    """
+    plans_dir, db_path = env
+    plan_dir, project_dir = _seed_plan(plans_dir, db_path)
+    _mark_running(PLAN_ID, project_dir)
+    monkeypatch.setattr(server, "_kill_process_tree", lambda *a, **k: True)
+
+    resp = client.post(f"/api/execution/{PLAN_ID}/stop")
+    assert resp.status_code == 200, resp.text
+    assert verification_cancel.is_cancelled(PLAN_ID) is True
+
+    assert _wait_for_phase(db_path, "stopped"), (
+        "the stop never landed — the plan is still "
+        f"{_read_phase(db_path)!r}, so the resume below would be refused"
+    )
+
+    # --- the resume ----------------------------------------------------
+    resp = client.post(
+        f"/api/execution/{PLAN_ID}/start",
+        json={"project_dir": str(project_dir)},
+    )
+    assert resp.status_code == 200, resp.text
+    assert verification_cancel.is_cancelled(PLAN_ID) is False, (
+        "the resume must clear the cancel flag"
+    )
+
+    # --- the stop's background half, arriving late ---------------------
+    execution_routes._stop_execution_worker(
+        PLAN_ID, plan_dir,
+        {"status": "running", "project_dir": str(project_dir)},
+        FakeProc(),
+        discard=False,
+    )
+
+    assert verification_cancel.is_cancelled(PLAN_ID) is False, (
+        "the stop's background half re-raised the cancel flag after the "
+        "resume cleared it — the resumed plan is born cancelled and the "
+        "verification chain can never run again"
+    )
+
+    # --- and the chain is still live -----------------------------------
+    before = {t.ident for t in _worker_threads()}
+    _drive_repair_callback(PLAN_ID, project_dir, 0)
+    _wait_for_new_workers_to_settle(before)
+
+    assert begin_verification_recorder, (
+        "after the resume the chain must be able to re-enter "
+        "verification again — the stop's cancel flag was not cleared"
+    )
+    assert orchestrator_recorder, (
+        "after the resume a new verification round must be possible"
+    )
+
+
+def test_two_overlapping_stops_keep_the_stop_worker_in_the_survivors(env):
+    """Two stops of the same plan: the plan is quiet only when the LAST
+    of them is done.
+
+    The ledger kept ONE entry per plan, so the second stop overwrote
+    the first one's entry and the first stop to finish popped the
+    SECOND's entry.  The quiet judgement then believed the plan had
+    fallen silent while a stop was still running — and parked it in the
+    ``stopped`` phase, which is what let a resume through.
+    """
+    plans_dir, db_path = env
+    plan_dir, _project_dir = _seed_plan(plans_dir, db_path)
+
+    execution_routes._stop_worker_started(PLAN_ID)   # the first stop
+    execution_routes._stop_worker_started(PLAN_ID)   # the second stop
+    try:
+        execution_routes._stop_worker_finished(PLAN_ID)  # the first is done
+
+        assert execution_routes._stop_worker_running(PLAN_ID) is True, (
+            "one of the plan's stops is still running — the plan is not "
+            "quiet yet and must not be parked in the 'stopped' phase"
+        )
+        survivors = execution_routes._execution_stop_survivors(PLAN_ID)
+        assert any(
+            getattr(s, "kind", "") == execution_routes._KIND_STOP_WORKER
+            for s in survivors
+        ), (
+            "the stop that is still running must be reported as a "
+            f"survivor; the survivors were {survivors!r}"
+        )
+    finally:
+        execution_routes._stop_worker_finished(PLAN_ID)
+        execution_routes._stop_worker_finished(PLAN_ID)

@@ -62,6 +62,20 @@ from progress_guard import (
     ZeroProgressGuard,
     task_progress_snapshot,
 )
+# 2026-11-21 — the persistent attempt baseline.  A leaf module (stdlib
+# plus ``utils.atomic_io``): it records a task's baseline commit on disk
+# and hands it back unchanged afterwards.  Importing it here carries no
+# cycle risk — it does not import this module.
+from attempt_baselines import BaselineStore
+# 2026-11-21 — the attempt-level rollback.  A leaf module (stdlib only):
+# it captures a patch of the paths an attempt overstepped and puts the
+# tree back against the attempt's baseline.  Importing it here carries
+# no cycle risk — it does not import this module.
+from attempt_rollback import (
+    RollbackResult,
+    format_rollback_failure,
+    rollback_attempt,
+)
 from usage_registry import plan_usage_context
 from task_manager import TaskManager, CycleInTaskGraph
 from executor import Executor
@@ -7888,8 +7902,30 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                     )
                     if undeclared:
                         tests_passed = False
-                        test_reason = (
-                            "undeclared_write: " + ", ".join(undeclared[:5])
+                        # 2026-11-21 — the overstep is UNDONE, not just
+                        # reported.
+                        #
+                        # Failing the task left the undeclared file in
+                        # the tree.  The next attempt then started from a
+                        # tree that carried the previous attempt's
+                        # overstep, and the change set the attempt is
+                        # judged by was no longer the change set THIS
+                        # attempt produced — the very comparison this
+                        # gate exists for.  So the paths are put back
+                        # against the attempt's baseline, and the content
+                        # that was rolled back is captured as a patch
+                        # FIRST, because a patch is the difference
+                        # between two states and once the tree is put
+                        # back that difference no longer exists.
+                        #
+                        # The task still fails: the write contract was
+                        # violated and the violation is not excused by
+                        # the rollback.
+                        test_reason = self._rollback_undeclared_writes(
+                            task=task,
+                            baseline=baseline_sha,
+                            paths=undeclared,
+                            attempt=attempt + 1,
                         )
                         if self.logger:
                             self.logger.warning(
@@ -8618,8 +8654,22 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                     # verdict at all, and the refused path is a fact
                     # about the code that no verdict has confirmed; the
                     # timeout is the reason the task cannot be judged.
+                    #
+                    # 2026-11-21: the drain does NOT overwrite the
+                    # text the undeclared-write gate built either. The
+                    # two channels are different facts — the guard
+                    # refuses a write the sub-agent attempted through a
+                    # TOOL, the gate catches the ones that arrived by
+                    # SHELL — and the gate's text also names the
+                    # rollback evidence patch. Replacing it with the
+                    # guard's shorter text would throw away the only
+                    # pointer to what was rolled back.
                     refused = self._take_undeclared_writes(task.id)
-                    if refused and not fail_only:
+                    if (
+                        refused
+                        and not fail_only
+                        and not error_msg.startswith("undeclared_write:")
+                    ):
                         error_msg = "undeclared_write: " + ", ".join(
                             refused[:5]
                         )
@@ -10806,6 +10856,51 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
         except Exception:
             return []
 
+    def _pdt_state_root(self, task) -> Path:
+        """The directory this plan's ``.pdt/`` state lives under.
+
+        The plan directory wins: it is where ``tasks.json`` lives, and
+        the plan's runtime state belongs next to it — every attempt of
+        every task of the plan shares one state root, so the baseline
+        document is found again by the next attempt, by a sibling task,
+        and by a resumed run.
+
+        ``tasks_file`` is only a *pointer* here, so the plan directory is
+        derived from its parent rather than from the file itself.  When
+        there is no ``tasks_file`` — a legacy layout, or a test harness
+        that never had one — the project's own directory is the fallback:
+        the baseline still has to be recorded *somewhere* durable.
+
+        The returned path is the directory that *contains* ``.pdt``; the
+        store itself adds the ``.pdt/`` part (see
+        :meth:`_attempt_baseline_store`).
+        """
+        tasks_file = getattr(
+            getattr(self, "task_manager", None), "tasks_file", None
+        )
+        if isinstance(tasks_file, (str, Path)) and str(tasks_file):
+            return Path(tasks_file).parent
+        project_dir = (
+            getattr(task, "project_dir", None)
+            or getattr(self, "project_dir", None)
+        )
+        if project_dir:
+            return Path(project_dir)
+        return Path.cwd()
+
+    def _attempt_baseline_store(self, task) -> BaselineStore:
+        """The durable store of this plan's attempt baselines.
+
+        ``<state root>/.pdt/attempt_baselines.json`` — under ``.pdt/``
+        because that is where this repository keeps the runtime state it
+        generates (state.db, locks, vp quota), and because ``.pdt/`` is
+        gitignored: a baseline document is machine-local state, never
+        something to commit.
+        """
+        return BaselineStore(
+            self._pdt_state_root(task) / ".pdt" / "attempt_baselines.json"
+        )
+
     def _capture_attempt_baseline(self, task) -> str:
         """The commit this attempt started from, or ``""`` when unknown.
 
@@ -10815,21 +10910,64 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
         before this task ran. It is taken from the checkpoint mechanism
         that already exists; this gate adds no state of its own.
 
+        **Recorded once, reused afterwards.**  Reading the HEAD afresh on
+        every attempt loses the baseline: the sub-agent commits its work,
+        HEAD moves on, and the next attempt's baseline is the commit that
+        *contains* the previous attempt's work.  The change set the
+        attempt is judged by then disappears — and a partial rollback
+        would roll back the wrong thing.  So the first attempt records
+        the HEAD (see :mod:`attempt_baselines`) and every later attempt of
+        the same task is handed that same commit back, however far HEAD
+        has moved since.
+
+        The record is per *task*, not per lineage: two siblings of one
+        lineage are two tasks, and the sibling that finished first must
+        not be folded into the baseline of the sibling that runs later.
+
         ``""`` means "there is no baseline": a directory that is not a
         git repository, or a repository whose HEAD cannot be read as a
         commit id. Every caller reads that as "the comparison cannot be
         made" and lets the task through — a gate that cannot answer must
-        not become a gate that blocks everything.
+        not become a gate that blocks everything.  Nothing is recorded in
+        that case either: "no baseline" must stay a reachable answer,
+        and a task with no repository must not leave a stale entry
+        behind for the next attempt to inherit.
+
+        A store that cannot be used (unwritable directory, unreadable
+        document) falls back to the HEAD: losing the baseline is bad,
+        killing the attempt that was otherwise fine is worse.
 
         The HEAD is read in pure Python — see :func:`_read_git_head_sha`.
         It used to be read with ``git rev-parse HEAD``, but that starts a
         subprocess, and this baseline is taken on the quota-park path,
-        which must start none.
+        which must start none.  The store is plain file IO, so the whole
+        path stays process-free.
         """
-        project_dir = getattr(task, "project_dir", None) or self.project_dir
+        project_dir = (
+            getattr(task, "project_dir", None)
+            or getattr(self, "project_dir", None)
+        )
         if not project_dir:
             return ""
-        return _read_git_head_sha(project_dir)
+        head = _read_git_head_sha(project_dir)
+        if not head:
+            # Not a repository, or an unreadable HEAD.  No baseline, and
+            # nothing recorded — see the docstring.
+            return ""
+        try:
+            store = self._attempt_baseline_store(task)
+            task_id = getattr(task, "id", "") or ""
+            recorded = store.put_if_absent(
+                self._lineage_id(task_id), task_id, head
+            )
+        except Exception as exc:  # noqa: BLE001 - a store failure is not fatal
+            log.warning(
+                "attempt_baseline_store_unusable: cannot record the attempt "
+                "baseline for task %r (%s); falling back to HEAD",
+                getattr(task, "id", ""), type(exc).__name__,
+            )
+            return head
+        return recorded or head
 
     def _changed_paths_since(self, task, baseline) -> list[str]:
         """The repo-relative paths that changed since ``baseline``.
@@ -11026,6 +11164,96 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
             [p for p in changed if _normalise_repo_path(p) not in other],
             _declared_modification_files(task),
         )
+
+    def _rollback_undeclared_writes(
+        self,
+        task,
+        baseline: str,
+        paths: list[str],
+        attempt: int,
+    ) -> str:
+        """Undo an attempt's undeclared writes and describe what happened.
+
+        The overstep is not only a *verdict* — it is a file sitting in
+        the tree.  Failing the task leaves that file behind, so the next
+        attempt starts from a tree that carries the previous attempt's
+        overstep and the change set the attempt is judged by is no
+        longer the change set this attempt produced.  So the paths are
+        put back against the attempt's baseline.
+
+        The content is captured **before** the tree is put back: a patch
+        is the difference between two states, and once the tree is put
+        back that difference no longer exists.  The patch is therefore
+        evidence rather than a description — ``git apply`` restores it.
+
+        The failure text keeps the executor's own ``undeclared_write:``
+        spelling in its FIRST line, because that is what
+        ``failure_classification`` parses; the lines after it carry the
+        outcome (where the evidence is, what was rolled back, what
+        could not be).
+
+        The declared paths are handed to the rollback so it never
+        touches the task's own work: the rollback undoes the overstep,
+        not the deliverable.
+
+        Never raises.  A rollback that cannot run is *reported* as a
+        failure, not as an exception — the task still fails as an
+        undeclared write, which is the outcome the write contract
+        demands either way.
+
+        Args:
+            task: The task whose attempt overstepped.
+            baseline: The commit the attempt started from.
+            paths: The paths the attempt wrote without declaring them.
+            attempt: The attempt number, 1-based — it names the
+                evidence file.
+
+        Returns:
+            The failure text for the task.
+        """
+        project_dir = (
+            getattr(task, "project_dir", None) or self.project_dir
+        )
+        try:
+            result = rollback_attempt(
+                project_dir=project_dir,
+                baseline=baseline,
+                paths=paths,
+                task_id=task.id,
+                attempt=attempt,
+                plan_dir=self._pdt_state_root(task),
+                declared_paths=_declared_modification_files(task) or [],
+            )
+        except Exception as exc:  # noqa: BLE001 - a rollback never fails a task
+            log.warning(
+                "attempt_rollback_failed: cannot roll the undeclared "
+                "writes of task %r back (%s); the task still fails as an "
+                "undeclared write",
+                getattr(task, "id", ""), type(exc).__name__,
+            )
+            result = RollbackResult(
+                rolled_back=[], patch_path="", failed=list(paths),
+            )
+        text = format_rollback_failure(paths, result)
+        if self.logger:
+            self.logger.info(
+                "task_attempt_rollback",
+                (
+                    f"Task [{task.id}] attempt {attempt} wrote "
+                    f"{len(result.rolled_back)} undeclared file(s); they "
+                    f"were rolled back to the attempt baseline. "
+                    f"{len(result.failed)} path(s) could not be rolled "
+                    f"back."
+                ),
+                task_id=task.id,
+                data={
+                    "attempt": attempt,
+                    "rolled_back": list(result.rolled_back),
+                    "failed": list(result.failed),
+                    "patch_path": result.patch_path,
+                },
+            )
+        return text
 
     def _lineage_id(self, task_id: str) -> str:
         """Root task id of a (possibly already split) task.

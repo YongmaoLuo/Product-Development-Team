@@ -6430,7 +6430,7 @@ def _stop_running_execution(
             "plan=%s", plan_id,
         )
 
-    # --- 1b. cancel the verification chain ----------------------------
+    # --- 1b. the cancel flag is NOT requested here --------------------
     # 2026-10-23: killing the executor is NOT enough to stop a plan.
     #
     # The repair executor is killed by step 2 below, and its
@@ -6441,25 +6441,33 @@ def _stop_running_execution(
     # ``begin_verification`` → ``start_verification_cycle`` →
     # ``_run_repair_execution_async`` → a NEW executor subprocess.
     #
-    # So without this flag the operator's stop is a no-op for the
+    # So without the cancel flag the operator's stop is a no-op for the
     # chain: stop → kill the repair executor → the callback re-enters
     # verification → a new repair round → a new executor. The gate in
     # ``_on_repair_complete`` that was written for exactly this case
     # ("if the operator stopped the plan while this repair was running,
     # do NOT re-enter verification") consults
-    # ``verification_cancel.is_cancelled(plan_id)`` — and this endpoint
-    # never set it. The gate was right; nothing ever flipped the flag.
+    # ``verification_cancel.is_cancelled(plan_id)`` — and nothing ever
+    # flipped the flag. The gate was right; nothing ever flipped it.
     #
-    # The flag is set BEFORE the kill, so it is already in place when
-    # the killed process's callback fires.
-    try:
-        import verification_cancel
-        verification_cancel.request_cancel(plan_id)
-    except Exception:  # noqa: BLE001 — a missing flag must not abort the stop
-        _server.logger.exception(
-            "stop_execution: could not request the verification cancel "
-            "plan=%s", plan_id,
-        )
+    # 2026-11-21: the flag is requested by the CALLER, on the request
+    # thread, and NOT from here.  This half runs on the background stop
+    # worker, and a request from here had no ordering guarantee against
+    # the resume's ``clear()`` (``start_execution``): a background half
+    # that arrived after the clear re-raised the flag on a plan that
+    # had already been resumed, and the resumed plan was born
+    # cancelled — the verification chain could never run again.  One
+    # stop is ONE request for ONE cancel, and the request belongs to
+    # the thread that answered the operator:
+    #
+    #   * the asynchronous path asks for it in
+    #     ``_stop_execution_asynchronously`` — on the request thread,
+    #     before the shutdown is handed over;
+    #   * the synchronous fallback asks for it in ``stop_execution`` —
+    #     also on the request thread, before it calls this function.
+    #
+    # Both ask for it BEFORE the kill, so the flag is already in place
+    # when the killed process's callback fires.
 
     # --- 2. terminate -------------------------------------------------
     # The ledger first: it knows the whole tree — the executor, its
@@ -6540,6 +6548,37 @@ def _stop_running_execution(
     # refusal has to reach the answer as ``phase_transition_error`` —
     # the caller is what builds the answer.
     return STOP_STATUS_STOPPED, []
+
+
+def _request_verification_cancel(plan_id: str) -> None:
+    """Ask the verification chain to stop — on the request thread.
+
+    2026-11-21. One stop is ONE request for ONE cooperative cancel, and
+    the request belongs to the thread that answered the operator: the
+    request thread asks for it BEFORE the shutdown is handed over to
+    the background worker, and the background half never asks for it
+    again.
+
+    The reason is an ordering. The resume clears the flag
+    (``start_execution`` → ``verification_cancel.clear``) on the
+    request thread, and a cancel asked for by the background half had
+    no guarantee against that clear: a half that arrived late re-raised
+    the flag on a plan that had already been resumed, and the resumed
+    plan was born cancelled — the verification chain could never run
+    again.
+
+    The idle path does NOT ask for a cancel: a stop of a plan that is
+    not running has no round to cancel, and that semantic is unchanged.
+    """
+    try:
+        import verification_cancel
+
+        verification_cancel.request_cancel(plan_id)
+    except Exception:  # noqa: BLE001 — a missing flag must not abort the stop
+        _server.logger.exception(
+            "stop_execution: could not request the verification cancel "
+            "plan=%s", plan_id,
+        )
 
 
 def _stop_idle_execution(
@@ -6625,32 +6664,53 @@ _STOP_QUIET_ENV = "PDT_STOP_QUIET_SECONDS"
 
 
 #: The background workers that are shutting a plan's execution down.
-#: The plan id is the key: one worker per plan.  The entry is also what
-#: the quiet window watches — while the worker runs, the resume point
-#: is not written yet, so the plan is not quiet yet.
-_stop_workers: Dict[str, threading.Event] = {}
+#: The plan id is the key; the value is the number of workers that are
+#: still running for that plan.  The entry is also what the quiet
+#: window watches — while a worker runs, the resume point is not
+#: written yet, so the plan is not quiet yet.
+#:
+#: It is a COUNT and not a single entry because two stops of the same
+#: plan can overlap.  The ledger used to keep one event per plan: the
+#: second worker overwrote the first one's entry, and the first worker
+#: to finish popped the SECOND's entry and set it — so the ledger said
+#: "this plan's stop has finished" while a stop was still running.  The
+#: quiet judgement believed it, parked the plan in the ``stopped``
+#: phase, and let a resume through — while the stop that was still
+#: running could go on to change the plan's state.
+_stop_workers: Dict[str, int] = {}
 _stop_workers_lock = threading.Lock()
 
 
 def _stop_worker_started(plan_id: str) -> None:
-    """Record that this plan's stop has a background worker running."""
+    """Record that this plan's stop has one more background worker running."""
     with _stop_workers_lock:
-        _stop_workers[plan_id] = threading.Event()
+        _stop_workers[plan_id] = _stop_workers.get(plan_id, 0) + 1
 
 
 def _stop_worker_running(plan_id: str) -> bool:
-    """True while this plan's stop worker is still running."""
+    """True while ANY of this plan's stop workers is still running.
+
+    The plan is quiet only when the LAST of its stops is done: a stop
+    that is still running keeps the plan from being parked in the
+    ``stopped`` phase, and keeps it from being resumed.
+    """
     with _stop_workers_lock:
-        event = _stop_workers.get(plan_id)
-    return event is not None and not event.is_set()
+        return _stop_workers.get(plan_id, 0) > 0
 
 
 def _stop_worker_finished(plan_id: str) -> None:
-    """Record that this plan's stop worker is done."""
+    """Record that ONE of this plan's stop workers is done.
+
+    The plan's stop is over only when the last worker is done, so this
+    decrements the plan's count and leaves the entry in place while
+    another worker is still running.
+    """
     with _stop_workers_lock:
-        event = _stop_workers.pop(plan_id, None)
-    if event is not None:
-        event.set()
+        remaining = _stop_workers.get(plan_id, 0) - 1
+        if remaining > 0:
+            _stop_workers[plan_id] = remaining
+        else:
+            _stop_workers.pop(plan_id, None)
 
 
 def _resolve_stop_quiet_seconds() -> float:
@@ -7150,13 +7210,11 @@ def _stop_execution_asynchronously(
     # The flag goes up BEFORE anything is killed: a killed executor
     # fires its callback immediately, and that callback re-enters
     # verification unless the flag is already set.
-    try:
-        verification_cancel.request_cancel(plan_id)
-    except Exception:  # noqa: BLE001 — a missing flag must not abort the stop
-        _server.logger.exception(
-            "stop_execution: could not request the verification cancel "
-            "plan=%s", plan_id,
-        )
+    #
+    # It is asked for HERE, on the request thread, and not by the
+    # background half: one stop is one cancel, and the request has to
+    # be ordered against the resume's ``clear()``.
+    _request_verification_cancel(plan_id)
 
     # --- 5. the shutdown, off the request thread ----------------------
     _start_execution_stop_worker(
@@ -7285,6 +7343,12 @@ def stop_execution(plan_id: str, discard: bool = False):
             )
             if answer is not None:
                 return answer
+        # The cancel belongs to the REQUEST thread, and it is asked for
+        # before the kill: a killed executor fires its callback
+        # immediately, and that callback re-enters verification unless
+        # the flag is already set.  The background half does not ask
+        # for it — one stop is one cancel.
+        _request_verification_cancel(plan_id)
         status, surviving_pids = _stop_running_execution(
             plan_id, plan_dir, state, proc, discard=discard,
         )

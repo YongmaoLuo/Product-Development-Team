@@ -415,13 +415,30 @@ def test_plan_state_has_preflight_review_phase():
     import plan_state as plan_state_mod
 
     # ``reload`` re-executes the module, which rebinds every module-level
-    # name — including ``MIGRATION_AUDIT_SCHEMA`` — to a NEW object, while
-    # every already-imported consumer (tasks_generator, preflight_review)
-    # still holds the original reference. That breaks the cross-module
-    # identity contract pinned by
-    # ``tests/integration/test_migration_audit_schema.py`` when the whole
-    # suite runs in one process. Snapshot and restore it.
-    _original_schema = plan_state_mod.MIGRATION_AUDIT_SCHEMA
+    # name to a NEW object — every class among them (``PlanState``,
+    # ``MigrationAudit``), the ``migration_audit`` instance and the
+    # ``MIGRATION_AUDIT_SCHEMA`` mapping — while every already-imported
+    # consumer (server, verification_loop, tasks_generator,
+    # preflight_review) still holds the ORIGINAL reference.
+    #
+    # That leaves the process with TWO ``PlanState`` classes: the one the
+    # production code runs on and the one ``plan_state.PlanState`` names.
+    # Everything that compares identities breaks on it — the
+    # cross-module identity contract pinned by
+    # ``tests/integration/test_migration_audit_schema.py``, and any test
+    # that patches ``plan_state.PlanState.<method>`` and then watches for
+    # the production call: the spy is attached to the NEW class, the
+    # production code runs on the OLD one, and the spy records nothing —
+    # a false negative that reads as "the call never happened".
+    #
+    # So the reload is scoped to THIS assertion: every name it rebound
+    # is restored afterwards, and the module is left exactly as the
+    # consumers found it.
+    _originals = {
+        _name: _value
+        for _name, _value in plan_state_mod.__dict__.items()
+        if not _name.startswith("__")
+    }
     try:
         importlib.reload(plan_state_mod)
         assert "preflight_review" in plan_state_mod.VALID_PHASES, (
@@ -429,7 +446,8 @@ def test_plan_state_has_preflight_review_phase():
             f"got {plan_state_mod.VALID_PHASES}"
         )
     finally:
-        plan_state_mod.MIGRATION_AUDIT_SCHEMA = _original_schema
+        for _name, _value in _originals.items():
+            setattr(plan_state_mod, _name, _value)
 
 
 # ---------------------------------------------------------------------------
