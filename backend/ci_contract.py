@@ -11,13 +11,15 @@
 ``<plan_dir>/ci_contract.json``。本模块只负责**读它、校验它、缺省回落**，
 不做任何判定 —— 判定接入在 :mod:`verification_ci_runner` 那一侧。
 
-四个字段
+五个字段
 --------
 ==================  ==============  =========================================
 字段                 缺省             含义
 ==================  ==============  =========================================
 ``inconclusive_    ``(3,)``        哪些退出码表示"门禁没能判定"（不是失败）。
-``exit_codes``                       缺省沿用框架自己门禁的 3。
+``exit_codes``                       缺省沿用框架自己门禁的 3。**写成 ``[]``**
+                                    是一句声明："我的门禁没有判不了的退出
+                                    码"，每个非零退出码都是真失败。
 ``budget_source``  ``"gate_script"`` 预算从哪来：``"gate_script"`` = 读门禁
                                     脚本自己声明的预算；``"contract"`` =
                                     用契约里写的 ``budget_seconds``。
@@ -26,18 +28,34 @@
                                     且必须是正整数。
 ``summary_format``  ``"gate_v1"``   摘要格式：``"gate_v1"`` = 按框架自己的
                                     门禁摘要格式解析；``"none"`` = 不解析摘要。
+``result_format``  ``"none"``      判决格式：``"pdt-gate/v1"`` = 门禁在
+                                    ``$PDT_GATE_RESULT_DIR`` 写一份结构化
+                                    判决，框架按它判；``"none"`` = 不读结
+                                    构化判决，只看退出码。
 ==================  ==============  =========================================
 
 两套缺省，为什么不一样
 ----------------------
 * **完全没有契约**（没有 ``plan_dir``，或目录里没有 ``ci_contract.json``）
-  → 框架默认：``(3,)`` / ``"gate_script"`` / ``None`` / ``"gate_v1"``。
+  → 框架默认：``(3,)`` / ``"gate_script"`` / ``None`` / ``"gate_v1"`` /
+  ``"none"``。
   这一条是**零回归**保证：不写契约的项目，判定与引入契约之前逐字一致。
 * **契约存在但没写某个字段** → 该字段回落框架默认，**除了**
   ``summary_format``：契约没声明格式，就**不解析摘要**（``"none"``）。
   契约存在本身就是一句话："这个门禁的输出不一定长得像框架自己的"。
   契约没写摘要格式时按 ``"gate_v1"`` 解析，等于替契约作者猜了一个他没
   答应过的格式。
+
+显式的空列表
+------------
+``"inconclusive_exit_codes": []`` **不是坏字段**。它是一句声明："我的门禁
+没有判不了的退出码" —— 每个非零退出码都表示一次真实失败。框架必须能听懂
+这句话，否则这种门禁只能靠框架默认的 3 去猜，而默认的 3 在它是"真失败"
+的退出码时会把一次代码失败说成"机器答不了"。
+
+所以 ``[]`` 读成**空元组**，不记 problem、不回落默认值。键不存在或写
+``null`` 仍然是框架默认 ``(3,)`` —— 那说的是"我没说"，和"我说了：没有"是
+两句话。
 
 契约坏了不影响判定
 ------------------
@@ -64,7 +82,8 @@ JSON 里表达"这个字段不适用"的常规写法，不当成类型错误。
 --------
 * :func:`load_ci_contract` —— 唯一入口，只读文件，绝不抛异常。
 * :class:`CiContract` —— 结果；:meth:`CiContract.parses_summary` 回答
-  "要不要解析摘要"，:meth:`CiContract.to_evidence` 给出可 JSON 序列化的
+  "要不要解析摘要"，:meth:`CiContract.reads_gate_result` 回答"要不要读
+  结构化判决"，:meth:`CiContract.to_evidence` 给出可 JSON 序列化的
   证据（落在审计产物里的那份）。
 """
 
@@ -98,12 +117,22 @@ SUMMARY_FORMAT_NONE = "none"
 #: 摘要格式的合法取值。
 SUMMARY_FORMATS: Tuple[str, ...] = (SUMMARY_FORMAT_GATE_V1, SUMMARY_FORMAT_NONE)
 
+#: 判决格式：不读结构化判决（只看退出码）。
+RESULT_FORMAT_NONE = "none"
+#: 判决格式：框架级标准 ``pdt-gate/v1`` —— 门禁写一份结构化判决，
+#: 框架按它判，退出码降级为传输信号。
+RESULT_FORMAT_PDT_GATE_V1 = "pdt-gate/v1"
+#: 判决格式的合法取值。
+RESULT_FORMATS: Tuple[str, ...] = (RESULT_FORMAT_NONE, RESULT_FORMAT_PDT_GATE_V1)
+
 #: 没有契约时的缺省预算来源。
 DEFAULT_BUDGET_SOURCE = BUDGET_SOURCE_GATE_SCRIPT
 #: 没有契约时的缺省摘要格式（框架自己的格式，零回归）。
 DEFAULT_SUMMARY_FORMAT = SUMMARY_FORMAT_GATE_V1
 #: 契约存在、但没声明摘要格式时的取值：不解析摘要。
 CONTRACT_ABSENT_SUMMARY_FORMAT = SUMMARY_FORMAT_NONE
+#: 缺省的判决格式：不读结构化判决（零回归）。
+DEFAULT_RESULT_FORMAT = RESULT_FORMAT_NONE
 
 
 @dataclass(frozen=True)
@@ -117,6 +146,8 @@ class CiContract:
         budget_seconds: 契约声明的预算秒数；只在 ``budget_source`` 是
             ``"contract"`` 时有意义，否则是 ``None``。
         summary_format: ``"gate_v1"`` / ``"none"``。
+        result_format: ``"none"`` / ``"pdt-gate/v1"``。缺省
+            ``DEFAULT_RESULT_FORMAT``。
         path: 契约文件的路径；没有契约文件（或 ``plan_dir`` 是 ``None``）
             时是 ``None``。
         applied: 契约是否被用上了。文件级失败（读不了 / 非法 JSON /
@@ -129,6 +160,7 @@ class CiContract:
     budget_source: str = DEFAULT_BUDGET_SOURCE
     budget_seconds: Optional[int] = None
     summary_format: str = DEFAULT_SUMMARY_FORMAT
+    result_format: str = DEFAULT_RESULT_FORMAT
     path: Optional[Path] = None
     applied: bool = False
     error: Optional[str] = None
@@ -140,6 +172,15 @@ class CiContract:
         输出格式，解析就是猜。
         """
         return self.summary_format == SUMMARY_FORMAT_GATE_V1
+
+    def reads_gate_result(self) -> bool:
+        """要不要读门禁写出来的结构化判决。
+
+        只有 ``"pdt-gate/v1"`` 读。``"none"`` 表示这份门禁没有承诺过
+        判决格式 —— 框架去翻一个自己没答应过的文件，读到的不是判决，
+        是运气。
+        """
+        return self.result_format == RESULT_FORMAT_PDT_GATE_V1
 
     def to_evidence(self) -> Dict[str, Any]:
         """给出可 JSON 序列化的证据（落在审计产物里的那份）。
@@ -155,6 +196,8 @@ class CiContract:
             "budget_seconds": self.budget_seconds,
             "summary_format": self.summary_format,
             "parses_summary": self.parses_summary(),
+            "result_format": self.result_format,
+            "reads_gate_result": self.reads_gate_result(),
             "error": self.error,
         }
 
@@ -237,6 +280,7 @@ def _apply(path: Path, data: Dict[str, Any]) -> CiContract:
     budget_source = _read_budget_source(data, problems)
     budget_seconds = _read_budget_seconds(data, budget_source, problems)
     summary_format = _read_summary_format(data, problems)
+    result_format = _read_result_format(data, problems)
 
     if problems:
         logger.warning(
@@ -248,6 +292,7 @@ def _apply(path: Path, data: Dict[str, Any]) -> CiContract:
         budget_source=budget_source,
         budget_seconds=budget_seconds,
         summary_format=summary_format,
+        result_format=result_format,
         path=path,
         applied=True,
         error="; ".join(problems) if problems else None,
@@ -255,7 +300,17 @@ def _apply(path: Path, data: Dict[str, Any]) -> CiContract:
 
 
 def _read_exit_codes(data: Dict[str, Any], problems: List[str]) -> Tuple[int, ...]:
-    """读 ``inconclusive_exit_codes``；类型不对就回落框架默认。"""
+    """读 ``inconclusive_exit_codes``；类型不对就回落框架默认。
+
+    **空列表不是坏字段**：它是一句声明 —— "我的门禁没有判不了的退出
+    码"，每个非零退出码都表示一次真实失败。这句话必须能说出来，否则
+    这种门禁只能靠框架默认的 3 去猜，而默认的 3 在它是真失败的退出码
+    时会把一次代码失败说成"机器答不了"。
+
+    所以 ``[]`` 读成空元组：不记 problem，也不回落默认值。键不存在或
+    写 ``null`` 仍然是框架默认 —— 那说的是"我没说"，和"我说了：没有"
+    是两句话。
+    """
     raw = data.get("inconclusive_exit_codes")
     if raw is None:
         return FRAMEWORK_INCONCLUSIVE_EXIT_CODES
@@ -277,12 +332,6 @@ def _read_exit_codes(data: Dict[str, Any], problems: List[str]) -> Tuple[int, ..
             )
             return FRAMEWORK_INCONCLUSIVE_EXIT_CODES
         codes.append(item)
-
-    if not codes:
-        # 空列表会让框架自己的 3 号退出码静默失效 —— 那正是这个特性要
-        # 修的"机器跑不动被记成代码坏了"。当作坏字段，回落默认。
-        problems.append("inconclusive_exit_codes is empty")
-        return FRAMEWORK_INCONCLUSIVE_EXIT_CODES
 
     return tuple(codes)
 
@@ -342,5 +391,25 @@ def _read_summary_format(data: Dict[str, Any], problems: List[str]) -> str:
             f"summary_format must be one of {list(SUMMARY_FORMATS)}, got {raw!r}"
         )
         return SUMMARY_FORMAT_NONE
+
+    return raw
+
+
+def _read_result_format(data: Dict[str, Any], problems: List[str]) -> str:
+    """读 ``result_format``；只接受 ``"none"`` / ``"pdt-gate/v1"``。
+
+    没声明时是 ``"none"``：框架不主动去翻一个门禁没承诺过的判决文件
+    —— 读到的不是判决，只是运气。声明了 ``"pdt-gate/v1"`` 的门禁则由
+    判定侧去读它写出来的那份结构化判决。
+    """
+    raw = data.get("result_format")
+    if raw is None:
+        return DEFAULT_RESULT_FORMAT
+
+    if not isinstance(raw, str) or raw not in RESULT_FORMATS:
+        problems.append(
+            f"result_format must be one of {list(RESULT_FORMATS)}, got {raw!r}"
+        )
+        return RESULT_FORMAT_NONE
 
     return raw
