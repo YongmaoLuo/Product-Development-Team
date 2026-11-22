@@ -1391,8 +1391,18 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 文件内容因此变化，按本 gate 的既定流程把冻结基线前移到合并态哈希
     # （`shasum -a 256` 实测值）。表内条目集合与断言强度不变：被钉文件的范围不变、
     # sha256 仍逐字节比对，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-22：因已批准的「有失败项、却 0 条修复任务 → 交人工裁定」改动了
+    # `verification_loop.py` —— 新增 stop_reason
+    # `FAILURES_WITHOUT_REPAIR_TASKS_STOP_REASON` 与对应的分支（本轮确实有失败项、
+    # 修复队列却一条任务都没有时，不再回到 `executing` 空转，改为以
+    # `chain_ending=True` 结束链条并交给人工裁定）。改动只落在该分支一处，
+    # 空修复队列的其余行为一字未动。
+    # 按本 gate 的既定流程把冻结基线前移到本分支的批准态哈希（`shasum -a 256`
+    # 实测值）。这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、
+    # 被钉文件的范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
+    # 任何再编辑照样红。
     "backend/verification_loop.py": (
-        "2e82f87a3c0db6d251537cfc254fce45a2b39bf538aa2efe84d41f49eac6277b"
+        "5ae1af2eb429e1eea90cec98ef9498f03a77af6efc52d3286db6638222d15a99"
     ),
 }
 
