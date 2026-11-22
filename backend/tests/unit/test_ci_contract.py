@@ -454,3 +454,119 @@ def test_the_module_exposes_the_documented_constants():
     assert CONTRACT_FILENAME == "ci_contract.json"
     assert FRAMEWORK_INCONCLUSIVE_EXIT_CODES == (3,)
     assert ci_contract.CONTRACT_FILENAME == "ci_contract.json"
+
+# --------------------------------------------------------------------------
+# An explicit empty list: "my gate has no 'could not decide' exit code"
+# --------------------------------------------------------------------------
+
+
+def test_an_explicit_empty_list_means_no_inconclusive_codes(tmp_path):
+    """``[]`` is a **declaration**, not a broken field.
+
+    A gate whose every non-zero exit code means "the code really is
+    broken" has to be able to say so.  The framework's default (3) would
+    otherwise turn one of its real failures into "the machine could not
+    decide" — which is the very misreading this field exists to stop.
+    """
+    _write_contract(tmp_path, json.dumps({"inconclusive_exit_codes": []}))
+
+    contract = load_ci_contract(tmp_path)
+
+    assert contract.inconclusive_exit_codes == ()
+    assert contract.applied is True
+    assert contract.error is None
+
+
+def test_an_absent_field_still_defaults_to_three(tmp_path):
+    """No declaration at all -> the framework default, unchanged.
+
+    "I did not say" and "I said: there is none" are two different
+    sentences, and only the second one empties the set.  This test pins
+    the zero-regression side of that distinction.
+    """
+    _write_contract(tmp_path, json.dumps({}))
+
+    contract = load_ci_contract(tmp_path)
+
+    assert contract.inconclusive_exit_codes == (3,)
+
+
+def test_an_empty_list_is_not_reported_as_a_problem(tmp_path, caplog):
+    """A declared empty list is not a problem — so nothing is warned about.
+
+    The contract reader says out loud every field it refused.  An empty
+    list is a field it **accepted**, so a warning here would tell the
+    operator their contract was broken when it was read perfectly.
+    """
+    _write_contract(tmp_path, json.dumps({"inconclusive_exit_codes": []}))
+
+    with caplog.at_level(logging.WARNING):
+        contract = load_ci_contract(tmp_path)
+
+    assert contract.inconclusive_exit_codes == ()
+    assert not _warnings(caplog), (
+        "an explicitly empty list was accepted, so nothing was refused "
+        "and nothing should have been warned about"
+    )
+
+
+def test_a_null_exit_code_list_still_defaults_to_three(tmp_path, caplog):
+    """``null`` means "not applicable" — it is the framework default."""
+    _write_contract(
+        tmp_path, json.dumps({"inconclusive_exit_codes": None}),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        contract = load_ci_contract(tmp_path)
+
+    assert contract.inconclusive_exit_codes == (3,)
+    assert not _warnings(caplog)
+
+
+# --------------------------------------------------------------------------
+# result_format: does the gate write a structured verdict?
+# --------------------------------------------------------------------------
+
+
+def test_an_absent_result_format_reads_no_gate_result(tmp_path):
+    """No declaration -> no structured verdict is read (zero regression)."""
+    _write_contract(tmp_path, json.dumps({}))
+
+    contract = load_ci_contract(tmp_path)
+
+    assert contract.result_format == "none"
+    assert contract.reads_gate_result() is False
+
+
+def test_a_declared_gate_result_format_is_read(tmp_path):
+    """``"pdt-gate/v1"`` -> the runner reads the gate's verdict file."""
+    _write_contract(tmp_path, json.dumps({"result_format": "pdt-gate/v1"}))
+
+    contract = load_ci_contract(tmp_path)
+
+    assert contract.result_format == "pdt-gate/v1"
+    assert contract.reads_gate_result() is True
+    assert contract.error is None
+
+
+def test_an_unknown_result_format_falls_back_to_none_and_logs(tmp_path, caplog):
+    """A format the framework does not know -> no verdict file is read."""
+    _write_contract(tmp_path, json.dumps({"result_format": "pdt-gate/v9"}))
+
+    with caplog.at_level(logging.WARNING):
+        contract = load_ci_contract(tmp_path)
+
+    assert contract.result_format == "none"
+    assert contract.reads_gate_result() is False
+    assert _warnings(caplog)
+
+
+def test_the_evidence_carries_the_result_format(tmp_path):
+    """The evidence says which verdict format was in force."""
+    _write_contract(tmp_path, json.dumps({"result_format": "pdt-gate/v1"}))
+
+    evidence = load_ci_contract(tmp_path).to_evidence()
+
+    assert evidence["result_format"] == "pdt-gate/v1"
+    assert evidence["reads_gate_result"] is True
+    assert json.dumps(evidence)
