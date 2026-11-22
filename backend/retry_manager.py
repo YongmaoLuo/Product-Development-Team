@@ -116,14 +116,69 @@ class RetryManager:
 
         modifier_parts = [f"\n\n[RETRY CONTEXT - Attempt {state.attempt_count + 1} of {bound}]"]
 
-        # 2026-09-11: the empty-diff case is the most common
-        # failure mode of this branch and a generic
-        # "please try a different approach" hint gives the subagent
-        # nothing actionable. Detect the sentinel prefix and emit a
-        # targeted hint that tells the subagent exactly which tool to
-        # use and what to verify (``git diff --stat`` before claiming
-        # done). The sentinel prefix is set in
-        # ``backend/agent.py`` (the empty-diff hard-fail branch).
+        # 2026-11-21: an undeclared write is a WRITE-CONTRACT failure,
+        # and — since the rollback landed — the qualified part of the
+        # work is NOT lost: it lives in the patch the rollback captured
+        # before the tree was put back.
+        #
+        # So the next attempt has to be told two things: where that
+        # patch is, and that it should be restored from it.  Without
+        # this the failure falls through to the generic "please try a
+        # different approach" hint, which reads as "your code is wrong"
+        # — and the subagent's response is to rewrite the work from
+        # scratch, throwing away the patch that already holds it.
+        #
+        # The branch is matched FIRST: the sentinel is written by the
+        # executor (with the rollback evidence lines after it), not
+        # produced by a subagent.
+        if state.last_error.startswith("undeclared_write:"):
+            modifier_parts.append(
+                "Previous attempt wrote files OUTSIDE the task's "
+                "declared scope (write-contract violation); the "
+                "undeclared writes were rolled back:\n"
+                f"{state.last_error}"
+            )
+            patch_path = _rollback_patch_path(state.last_error)
+            if patch_path:
+                modifier_parts.append(
+                    "\nACTION REQUIRED — this is a WRITE-CONTRACT failure, "
+                    'not a "my code is wrong" failure.\n'
+                    "  1. Your work was NOT lost: it is in the rollback "
+                    f"patch at {patch_path}. Inspect it with "
+                    f"`git apply --stat {patch_path}`, then restore the "
+                    "part that belongs to this task with "
+                    f"`git apply {patch_path}`.\n"
+                    "  2. If a restored file belongs to this task, add "
+                    "its path to this task's ``files_to_modify`` — the "
+                    "next attempt is judged against the declared scope, "
+                    "so an undeclared file is a violation no matter how "
+                    "good its content is.\n"
+                    "  3. Write ONLY the paths listed in "
+                    "``files_to_modify`` from now on; do not touch a "
+                    "path this task never declared.\n"
+                    "  4. Recover from the patch; do not rewrite the "
+                    "work from scratch — the patch already holds it, and "
+                    "re-applying it preserves the parts you already got "
+                    "right.\n"
+                    "  5. Re-run the task's test command and report the "
+                    "real TEST_RESULT line."
+                )
+            else:
+                modifier_parts.append(
+                    "\nACTION REQUIRED — this is a WRITE-CONTRACT failure, "
+                    'not a "my code is wrong" failure.\n'
+                    "  1. No rollback patch was captured for this "
+                    "attempt, so there is nothing to restore with "
+                    "`git apply` — redo only the declared work.\n"
+                    "  2. Write ONLY the paths listed in this task's "
+                    "``files_to_modify``; a path outside it is a "
+                    "violation no matter how good its content is.\n"
+                    "  3. Recover only what is missing from the declared "
+                    "files; do not rewrite the rest of the task and do "
+                    "not re-create the out-of-scope files.\n"
+                    "  4. Re-run the task's test command and report the "
+                    "real TEST_RESULT line."
+                )
         # 2026-10-19: the report-shape rejection is NOT a code
         # failure. The executor classifies the failure and, when this
         # is the first occurrence in the task's lineage, buys one more
@@ -139,7 +194,7 @@ class RetryManager:
         # Order matters: this sentinel is written by the executor, not
         # produced by a subagent, so it must be matched before the
         # generic attempt_count branches below.
-        if state.last_error.startswith("report_format_retry:"):
+        elif state.last_error.startswith("report_format_retry:"):
             modifier_parts.append(
                 f"Previous attempt was rejected on the SHAPE OF YOUR ANSWER:\n"
                 f"{state.last_error}"
@@ -157,6 +212,14 @@ class RetryManager:
                 "TEST_RESULT line.\n"
                 "  4. Do NOT restructure the task or rewrite unrelated code."
             )
+        # 2026-09-11: the empty-diff case is the most common
+        # failure mode of this branch and a generic
+        # "please try a different approach" hint gives the subagent
+        # nothing actionable. Detect the sentinel prefix and emit a
+        # targeted hint that tells the subagent exactly which tool to
+        # use and what to verify (``git diff --stat`` before claiming
+        # done). The sentinel prefix is set in
+        # ``backend/agent.py`` (the empty-diff hard-fail branch).
         elif state.last_error.startswith("empty_diff_no_changes"):
             modifier_parts.append(
                 f"Previous attempt produced no file changes:\n{state.last_error}"
@@ -228,3 +291,32 @@ class RetryManager:
         if task_id not in self._retry_states:
             self._retry_states[task_id] = RetryState(task_id=task_id)
         return self._retry_states[task_id]
+
+
+def _rollback_patch_path(error_text: str) -> str:
+    """The rollback patch path carried by a failure text, or ``""``.
+
+    The executor writes the failure of an undeclared write as a block
+    of facts, one per line (``attempt_rollback.
+    format_rollback_failure``)::
+
+        undeclared_write: scripts/x.sh
+        rollback_patch: /p/1.patch
+        rollback_rolled_back: scripts/x.sh
+        rollback_failed: (none)
+
+    Only the ``rollback_patch:`` line carries evidence.  The value
+    ``(none)`` — and a missing line — both mean "there is no patch",
+    which the caller must be able to tell apart from a real path, so
+    this returns ``""`` for either.  It never raises: a failure text
+    that is not shaped like the block above simply has no patch.
+    """
+    for line in (error_text or "").splitlines():
+        stripped = line.strip()
+        if not stripped.lower().startswith("rollback_patch:"):
+            continue
+        value = stripped.split(":", 1)[1].strip()
+        if not value or value.lower() in ("(none)", "none"):
+            return ""
+        return value
+    return ""
