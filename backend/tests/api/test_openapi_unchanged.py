@@ -157,7 +157,23 @@ SNAPSHOT_PATH = _TESTS_DIR / "openapi_snapshot.json"
 # 先由重新生成后落盘的快照现算（`_fingerprint(json.loads(SNAPSHOT_PATH.read_text()))`），
 # 再与线上 app 实际发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零差异、
 # 指纹相同——才把该值写进本常量（`3facbf98…`）。
-BASELINE_FINGERPRINT = "3facbf98c802347794208c3377c6d612a8bc405aa0f1e1016c030a9909c51095"
+#
+# 2026-11-23（调度页收尾分区 / 本分支）：本次变更新增了只读端点
+# `GET /api/scheduler/finishing`（收尾中的计划与它们等待的问题），对外 HTTP
+# 契约的形状随之改变，故按同一条规矩重取基线：`openapi_snapshot.json` 相对
+# 上一版**只增不删**（唯一新增是路径 `/api/scheduler/finishing`；既有路径的
+# 集合、请求体与响应逐项零差异）。
+# 快照与指纹在**同一次变更**里更新：先由重新生成后落盘的快照现算
+# （`_fingerprint(json.loads(SNAPSHOT_PATH.read_text()))`），再与线上 app
+# 实际发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零差异、指纹
+# 相同——才把该值写进本常量。
+#
+# 本分支同时把 origin/main（2026-11-22 的 `POST
+# /api/verification/{plan_id}/postprocess/resume`）合了进来：合并后的对外
+# 形状是**两侧的并集**（88 条路径），两侧的指纹常量各自只描述自己那一半的
+# 形状，合并后都已过期，故按同一条规矩重取——现算出的值写在下面
+# （`e164c9d7…`）。
+BASELINE_FINGERPRINT = "e164c9d74b208a46679e7d5f842474d31a23442d35e6f9aa8f033ea667995610"
 
 #: The capture runs in its own process so the schema is the one a clean
 #: start produces: debug routes off, no schema cache carried over from
