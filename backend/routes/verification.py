@@ -5356,3 +5356,140 @@ def force_verification_terminal(plan_id: str):
         "forced_at": forced_at,
     }
 
+
+@router.post("/api/verification/{plan_id}/postprocess/resume")
+def resume_postprocess_route(plan_id: str):
+    """Continue a plan parked at ``postprocess_failed`` — with a budget.
+
+    ``postprocess_failed`` is a **parking** phase, not a terminal one:
+    the finishing stage (收尾阶段) failed a required item, the plan is
+    parked, and a human decides whether to run the stage again.  The
+    phase graph has always said so (``postprocess_failed →
+    post_processing`` is a legal edge), but until now **nothing could
+    take that edge** — the plan was a dead end: one finishing failure
+    and the plan could never move again.
+
+    This route is that missing edge, and it is deliberately narrow:
+
+    * only ``postprocess_failed`` may be resumed — any other phase is a
+      409, because resuming a stage that is not parked is not a resume
+      but a second run of something else;
+    * the number of resumes is **capped** (:data:`MAX_RETRIES` — 2).
+      The budget lives in the plan's own directory
+      (``postprocess_retries.json``) and is spent one unit per resume;
+      a third attempt is refused with a 409 and the numbers in the
+      answer;
+    * nothing here triggers a resume by itself.  A5 forbids repeating
+      an action behind a human's back, so the only way to spend the
+      budget is this explicit call.
+
+    Concurrency: no extra lock is needed.  The phase is moved to
+    ``post_processing`` **before** the stage is started, so a second
+    call arriving afterwards reads ``post_processing`` in the phase
+    check above and is refused with a 409 — the phase move is what
+    serialises the two calls, not a mutex.
+
+    Answers:
+      * 404 — there is no such plan;
+      * 409 — the plan is not parked at ``postprocess_failed``, or the
+        resume budget is used up;
+      * 200 — the stage was started (in the background).
+    """
+    _server._validated_plan_id(plan_id)   # uniform contract
+
+    plan_dir = _server._plan_dir(plan_id)
+    if not plan_dir.exists():
+        raise HTTPException(
+            404,
+            {
+                "error": "Plan not found",
+                "plan_id": plan_id,
+                "detail": "没有这个 plan：磁盘上没有这个计划的目录。",
+            },
+        )
+
+    # --- 1. the phase, read the way ``force_terminal`` reads it --------
+    from state_machine.db.connection import open as open_db
+    from state_machine.db.schema import migrate as migrate_schema
+    from state_machine.repositories.routing_repository import (
+        RoutingRepository,
+    )
+
+    conn = open_db(_server._state_db_path())
+    try:
+        migrate_schema(conn)
+        current_phase = (RoutingRepository(conn).current(plan_id) or {}).get(
+            "current_phase"
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    from postprocess.state import POSTPROCESS_FAILED, POST_PROCESSING
+
+    if current_phase != POSTPROCESS_FAILED:
+        raise HTTPException(
+            409,
+            {
+                "error": "phase_mismatch",
+                "plan_id": plan_id,
+                "current_phase": current_phase,
+                "detail": (
+                    f"只有 postprocess_failed 才能续跑；"
+                    f"current_phase={current_phase!r}。"
+                ),
+            },
+        )
+
+    # --- 2. the budget: one unit per resume, capped -------------------
+    from postprocess.retry_budget import (
+        MAX_RETRIES,
+        RetryBudgetExhausted,
+        claim_retry,
+    )
+
+    try:
+        retry_index = claim_retry(
+            plan_dir, reason="operator resumed the finishing stage",
+        )
+    except RetryBudgetExhausted as exc:
+        raise HTTPException(
+            409,
+            {
+                "error": "retry_budget_exhausted",
+                "plan_id": plan_id,
+                "retries_used": exc.retries_used,
+                "max_retries": exc.max_retries,
+                "detail": (
+                    f"续跑额度已用完，需要人工介入："
+                    f"retries_used={exc.retries_used}, "
+                    f"max_retries={exc.max_retries}。"
+                ),
+            },
+        )
+
+    # --- 3. move the phase off the parking phase ----------------------
+    # The same shape the gate uses (``verification_loop.py``): the legal
+    # edge first, and a force when the edge is not there after all.
+    ps = _server.PlanState(plan_dir)
+    try:
+        ps.transition_to(POST_PROCESSING)
+    except ValueError:
+        ps.force_set_phase(POST_PROCESSING)
+
+    # --- 4. start the stage (in the background) -----------------------
+    # The import is inside the function: ``verification_loop`` reaches
+    # back into ``server``, so a module-level edge would close a cycle.
+    import verification_loop as _verification_loop
+
+    _verification_loop.resume_postprocess(plan_id)
+
+    return {
+        "plan_id": plan_id,
+        "resumed": True,
+        "retry_index": retry_index,
+        "retries_left": MAX_RETRIES - retry_index,
+        "phase": POST_PROCESSING,
+    }

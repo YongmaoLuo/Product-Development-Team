@@ -1401,8 +1401,19 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 实测值）。这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、
     # 被钉文件的范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
     # 任何再编辑照样红。
+    # 2026-11-22（本次：收尾阶段「有上限的续跑入口」）：已批准的改动落在
+    # `verification_loop.py` 上 —— 新增模块级 `resume_postprocess(plan_id)`，
+    # 它照 `_start_postprocess` 的形状写，**唯一**区别是 `orchestrator.resume()`
+    # 而不是 `orchestrator.start()`（`resume()` 只重跑进度文件里未完成/失败的条目，
+    # `start()` 才会重算第一轮）；线程、懒导入、`finally` 里
+    # `_settle_postprocess_phase` 的写法与 `_start_postprocess` 一致。
+    # `_start_postprocess` 本身与其它函数的字节**一字未动**。
+    # 按本 gate 的既定流程把冻结基线前移到本分支的批准态哈希（`shasum -a 256`
+    # 实测值）。这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、
+    # 被钉文件的范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
+    # 任何再编辑照样红。
     "backend/verification_loop.py": (
-        "5ae1af2eb429e1eea90cec98ef9498f03a77af6efc52d3286db6638222d15a99"
+        "2b085ab0e430a3f1b91172dde96116d24af90aff2d3a8870593d425e85d4d95c"
     ),
 }
 
