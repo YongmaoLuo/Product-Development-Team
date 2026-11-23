@@ -16,6 +16,17 @@
 
 ### 新增
 
+- **调度面板有了自己的「收尾」分区。** 正在收尾的计划不占槽位、不等容量，所以它既不
+  在队列里也不在运行列表里，操作者根本看不到有计划走到了收尾阶段。
+  `GET /api/scheduler/finishing`（`backend/routes/scheduler.py`）把这些计划点出来 ——
+  它们处在哪个阶段（收尾中 / 收尾失败），以及它们在等哪些问题，那些问题带着等待表格
+  同样的延长 / 终止 / 回答三个操作。面板把它画在 `frontend/index.html` 与
+  `frontend/app.js` 里。
+
+- **调度视图有了自己的地址。** 点开面板会把 `#/scheduler` 写进 URL
+  （`frontend/app.js`），于是刷新之后回到面板，而不是把面板弄丢；hash 变成别的值
+  就回到计划列表。
+
 - **`backend.secret_launcher`：读一次钥匙串，然后变成服务端。** 它解析每个通知 secret、
   把值写进匿名管道、在环境变量里指明描述符，最后 `exec` 出 `backend.server` ——
   PID 不变，所以 supervisor 对这条服务的观察不会变。服务端随后读的是自己继承来的

@@ -155,9 +155,14 @@ SWITCH_WORDS = (
 #: 2026-10-30：因新增容量端点 POST /api/scheduler/capacity（容量的运行期覆盖）
 #: 改动本文件，按本 gate 的既定流程把该端点纳入「不针对单个计划」的路径集合。
 #: 开关判定本身没有放宽：SWITCH_WORDS 未变，任何新的全局调度路由仍然打红。
+#:
+#: 2026-11-23：因新增 GET /api/scheduler/finishing（收尾分区的只读列表）改动
+#: 本文件。它和 state 一样是**读**：读的是路由表里正在收尾的那几条计划，
+#: 不针对某一个计划，也不设置任何东西，因此按本 gate 的既定流程纳入。
 GLOBAL_SCHEDULER_PATHS = (
     "/api/scheduler/state",
     "/api/scheduler/capacity",
+    "/api/scheduler/finishing",
 )
 
 #: The scheduler's routes that answer about ONE plan, under the

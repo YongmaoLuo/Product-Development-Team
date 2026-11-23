@@ -594,14 +594,14 @@ with sync_playwright() as driver:
     page.wait_for_selector(card, timeout=30000)
     report["plan_card_visible"] = page.is_visible(card)
 
-    # The operator names the plan in the scheduler's plan box.  That box
-    # lives in the scheduler view, so the view is opened first and left
-    # again through the button that goes back -- the same two clicks an
-    # operator makes.
+    # 进调度页再回来 —— 模拟操作者的两次点击。锚点用调度视图本身：
+    # 原来这里等的是「要求书」输入框，那个编辑区已经随产品决定被删除
+    # （调度页不再内置 postprocess.json 编辑器），所以锚点换成
+    # 调度视图可见 + 它的分区容器存在。
     page.click("#btn-open-scheduler")
-    page.wait_for_selector("#scheduler-spec-plan", state="visible", timeout=15000)
-    page.fill("#scheduler-spec-plan", plan_id)
-    report["typed_plan_id"] = page.input_value("#scheduler-spec-plan")
+    page.wait_for_selector("#scheduler-view:not(.hidden)", state="visible", timeout=15000)
+    page.wait_for_selector("#scheduler-running-cards", state="attached", timeout=15000)
+    report["scheduler_view_visible"] = page.is_visible("#scheduler-view")
     page.click("#btn-scheduler-back-home")
     page.wait_for_selector("#plans-view:not(.hidden)", timeout=15000)
     page.wait_for_selector(card, timeout=15000)
