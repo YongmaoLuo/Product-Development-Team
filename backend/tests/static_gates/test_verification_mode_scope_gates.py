@@ -929,8 +929,17 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # `hashlib.sha256(Path("frontend/app.js").read_bytes()).hexdigest()` 实测值，
     # 不是抄来的。表内条目集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节
     # 比对，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-23：因已批准的「恢复/启动标签与结果文案」改动（`SCHEDULER_ACTION_LABELS`
+    # 把「恢复」写成「恢复排队」、「启动」写成「立即启动（可抢占）」；新增
+    # `SCHEDULER_ACTION_HINTS` 与 `schedulerActionHint()` 并给按钮加上 `title` 提示；
+    # 新增 `SCHEDULER_OUTCOME_TEXT` 与 `schedulerOutcomeText()`，结果区把英文 token 翻成
+    # 中文句子，`schedulerDetailText()` 改为接收整个 `result`）改动了 `frontend/app.js`，
+    # 按本 gate 的既定流程把冻结基线前移到本分支的批准态。哈希取自工作区文件的
+    # `shasum -a 256 frontend/app.js` 实测值，不是抄来的。表内条目集合与断言强度不变：
+    # 被钉文件的范围不变、sha256 仍逐字节比对，该文件此后仍被逐字节钉住，任何再编辑
+    # 照样红。
     "frontend/app.js": (
-        "73c095694ff5b925dfe6ae956c2e4cad0d3c540f2fe1f2f1a76481f8ac8bdad6"
+        "dfabb4388a35ae4097cbd9e00cd079e1ab9a2cabfb2676ad5fdb40138d496470"
     ),
     # 2026-11-01：因「调度卡片容器与收起态样式」（task-11）改动了 `frontend/style.css`，
     # 按本 gate 的既定流程把哈希前移到本分支的批准态；表内条目集合不变。

@@ -2216,10 +2216,25 @@ const SCHEDULER_REASON_TEXT = {
 const SCHEDULER_ACTION_LABELS = {
     promote: "提升",
     pause: "暂停",
-    resume: "恢复",
-    start: "启动",
+    resume: "恢复排队",
+    start: "立即启动（可抢占）",
     "rerun-verification": "重跑验证",
 };
+
+/** 每个动作一句话，作为按钮的 tooltip。「恢复排队」和「立即启动」在
+    有空位时结果相同，差别只在名额满时是否抢占别人，所以悬停时也
+    把这句写出来。 */
+const SCHEDULER_ACTION_HINTS = {
+    promote: "只调整队列顺序，不占名额、不打断任何人",
+    pause: "停止计划并释放名额",
+    resume: "回到队首等待名额，不抢占正在运行的计划",
+    start: "排到队首并尽快运行；名额已满时会抢占一个已运行较久的计划",
+    "rerun-verification": "重跑验证轮（不重新排队执行）",
+};
+
+function schedulerActionHint(action) {
+    return SCHEDULER_ACTION_HINTS[action] ?? "";
+}
 
 /** Some phases need the button to say more than the action's own name.
     On a failed plan 「启动」 reads as "run the whole thing again", but
@@ -2489,7 +2504,7 @@ function schedulerActionButtons(planId, actions, phase) {
     }
     return actions
         .map((action) =>
-            `<button class="btn btn-outline scheduler-action" data-action="${escapeHtml(action)}" data-plan="${escapeHtml(planId)}">${escapeHtml(schedulerActionLabel(action, phase))}</button>`
+            `<button class="btn btn-outline scheduler-action" data-action="${escapeHtml(action)}" data-plan="${escapeHtml(planId)}" title="${escapeHtml(schedulerActionHint(action))}">${escapeHtml(schedulerActionLabel(action, phase))}</button>`
         )
         .join(" ");
 }
@@ -3830,28 +3845,108 @@ function handleSchedulerVisibilityChange() {
     startSchedulerPolling();
 }
 
+/** The Chinese sentence each outcome is shown as.  The server speaks in
+    words like ``applied`` / ``blocked_by_capacity``; the panel speaks
+    in sentences an operator can act on. */
+const SCHEDULER_OUTCOME_TEXT = {
+    applied: "已执行",
+    started: "已启动（有空位）",
+    blocked_by_capacity: "名额已满，排队等待",
+    conflict: "动作与当前状态冲突",
+    not_found: "计划不存在",
+};
+
+/** The short sentence the result box's first line carries.
+
+    The outcome alone does not say what happened: ``applied`` is the
+    answer to a promotion, to a pause and to a resume alike, and
+    ``started`` is the answer both to a start into a free slot and to
+    a start that had to take a slot away from somebody.  So the
+    detail decides the sentence, and the outcome decides it only when
+    the detail says nothing more. */
+function schedulerOutcomeText(result) {
+    if (!result) return "";
+    const outcome = result.outcome ? String(result.outcome) : "";
+    const detail = result.detail !== undefined && result.detail !== null
+        ? String(result.detail)
+        : "";
+    if (outcome === "applied") {
+        if (detail === "resumed") return "已恢复排队";
+        if (detail.startsWith("promote_order:")) return "已提升顺序";
+        if (detail === "verification_rerun") return "已提交重跑验证";
+        if (detail === "paused" || detail === "stopping" || detail === "idle") {
+            return "已暂停";
+        }
+        return SCHEDULER_OUTCOME_TEXT.applied;
+    }
+    if (outcome === "started") {
+        if (detail.startsWith("evicted:")) return "已启动（抢占了名额）";
+        return SCHEDULER_OUTCOME_TEXT.started;
+    }
+    return SCHEDULER_OUTCOME_TEXT[outcome] ?? outcome;
+}
+
 /** What a command did, in the command's own words. */
 function renderSchedulerOutcome(result) {
-    const outcome = result && result.outcome ? String(result.outcome) : "";
-    const detail = result && result.detail !== undefined && result.detail !== null
-        ? schedulerDetailText(result.detail)
-        : "";
-    schedulerSetText("#scheduler-action-outcome", outcome);
-    schedulerSetText("#scheduler-action-detail", detail);
+    schedulerSetText("#scheduler-action-outcome", schedulerOutcomeText(result));
+    schedulerSetText("#scheduler-action-detail", schedulerDetailText(result));
     const box = $("#scheduler-action-result");
     if (box) box.classList.remove("error");
     schedulerToggle($("#scheduler-action-result"), true);
 }
 
-function schedulerDetailText(detail) {
-    if (typeof detail === "object") {
+/** The long sentence the result box's second line carries: what the
+    command did to the queue, in the operator's terms.
+
+    The server's detail is a token; the panel shows the sentence that
+    token stands for.  A detail the panel does not know is shown as
+    it is — a word nobody has translated yet is still information, and
+    an empty line would not be. */
+function schedulerDetailText(result) {
+    if (!result) return "";
+    const outcome = result.outcome ? String(result.outcome) : "";
+    const raw = result.detail;
+    if (outcome === "not_found") return "调度器里没有这个计划。";
+    if (raw === undefined || raw === null) return "";
+    if (typeof raw === "object") {
         try {
-            return JSON.stringify(detail);
+            return JSON.stringify(raw);
         } catch {
             return "";
         }
     }
-    return String(detail);
+    const detail = String(raw);
+    if (outcome === "conflict") {
+        return `该动作不适用于计划当前状态（${detail}）。`;
+    }
+    if (detail === "resumed") {
+        return "已回到队首等待名额；未抢占任何正在运行的计划。";
+    }
+    if (detail.startsWith("promote_order:")) {
+        const position = detail.slice("promote_order:".length).trim();
+        return `队列位置已提升到第 ${position} 位。`;
+    }
+    if (detail === "verification_rerun") {
+        return "已重绕轮次并提交验证启动。";
+    }
+    if (detail === "paused" || detail === "stopping" || detail === "idle") {
+        return "计划已停止，名额已释放。";
+    }
+    if (detail === "slot_free") {
+        return "当前有空位，下一轮调度即开始。";
+    }
+    if (detail.startsWith("evicted:")) {
+        const victim = detail.slice("evicted:".length).trim();
+        return `名额已满，已抢占 ${victim} 并让它排回队列；本计划排到队首。`;
+    }
+    if (detail === "no_eligible_victim") {
+        return "所有在跑计划都在保护期内，无法抢占；已排在队首等待。";
+    }
+    if (detail.startsWith("eviction_incomplete:")) {
+        const victim = detail.slice("eviction_incomplete:".length).trim();
+        return `${victim} 尚未停下来，名额还没腾出；已排在队首等待。`;
+    }
+    return detail;
 }
 
 function renderSchedulerError(err) {

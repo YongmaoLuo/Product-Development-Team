@@ -226,11 +226,22 @@ STOPPED_PHASE: str = "stopped"
 #: The phase a working plan is in.
 EXECUTING_PHASE: str = "executing"
 
-#: The outcome a refused start is answered with.
+#: The outcome a refused start is answered with.  This is the server's
+#: own word; the panel writes it down as :data:`BLOCKED_OUTCOME_TEXT`.
 BLOCKED_BY_CAPACITY: str = "blocked_by_capacity"
 
 #: The outcome a carried-out action is answered with.
 APPLIED: str = "applied"
+
+#: What the panel writes in the action box after a carried-out
+#: promotion: the panel speaks in sentences, so the box reads
+#: 「已提升顺序」 rather than the server's ``applied``.
+PROMOTE_OUTCOME_TEXT: str = "已提升顺序"
+
+#: What the panel writes in the action box after a start refused by a
+#: full capacity: the server's ``blocked_by_capacity``, in the panel's
+#: own words.
+BLOCKED_OUTCOME_TEXT: str = "名额已满，排队等待"
 
 
 # ---------------------------------------------------------------------------
@@ -2219,7 +2230,7 @@ def test_operator_full_flow(world):
             {
                 "action": "promote",
                 "plan": tail,
-                "expect_outcome": APPLIED,
+                "expect_outcome": PROMOTE_OUTCOME_TEXT,
                 "expect_queue_head_seq": tail_seq,
             },
             {
@@ -2249,7 +2260,7 @@ def test_operator_full_flow(world):
             {
                 "action": "start",
                 "plan": tail,
-                "expect_outcome": BLOCKED_BY_CAPACITY,
+                "expect_outcome": BLOCKED_OUTCOME_TEXT,
             },
         ]
     )
@@ -2260,7 +2271,7 @@ def test_operator_full_flow(world):
     # The scheduler's own tables are read afterwards, for what the four
     # actions together left behind.
     promoted = first["steps"][0]
-    assert promoted["outcome"] == APPLIED, (
+    assert promoted["outcome"] == PROMOTE_OUTCOME_TEXT, (
         f"the promotion was answered with {promoted['outcome']!r} "
         f"({promoted['detail']!r})"
     )
@@ -2346,7 +2357,7 @@ def test_operator_full_flow(world):
     # The capacity is full and every run is young, so nobody may be
     # interrupted: the start is refused, and nobody is evicted.
     refused = second["steps"][1]
-    assert refused["outcome"] == BLOCKED_BY_CAPACITY, (
+    assert refused["outcome"] == BLOCKED_OUTCOME_TEXT, (
         f"the start was answered with {refused['outcome']!r} ({refused['detail']!r})"
     )
     assert refused["capacity"]["used"] == str(before_capacity["used"]), (

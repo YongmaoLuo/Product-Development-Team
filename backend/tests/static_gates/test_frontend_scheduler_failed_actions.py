@@ -15,20 +15,26 @@ verification round — and the label gives them no way to tell that before
 they press it. 「启动」 on a failed plan is a promise the button does not
 keep.
 
+The default label of the ``start`` action now announces that a start
+may preempt: it reads 「立即启动（可抢占）」. The failed phase keeps its
+own label, 「重新排队执行」, because there the button re-queues the
+whole plan rather than preempting anybody.
+
 The rule
 --------
 * ``SCHEDULER_ACTIONS_BY_PHASE['failed']`` offers **both** ``start`` and
   ``rerun-verification``.
 * The two are labelled differently: 「重新排队执行」 for ``start`` (a
-  phase-specific label, because 「启动」 on a failed plan would read as
-  "run the whole thing again") and 「重跑验证」 for
+  phase-specific label, because the default start label on a failed
+  plan would read as "run the whole thing again") and 「重跑验证」 for
   ``rerun-verification`` (the action's own label).
 * A button's label is decided by ``schedulerActionLabel(action, phase)``:
   the phase-specific label when there is one, the action's own label
   otherwise. A phase that is not covered — including *no* phase at all —
   falls back to the action's own label, so ``start`` outside ``failed``
-  still reads 「启动」, and the queue row's start button (which passes no
-  phase) is unchanged.
+  reads 「立即启动（可抢占）」 — the default label announces that a start
+  may take a slot away from somebody — and the queue row's start button
+  (which passes no phase) carries that same default label.
 * The two terminal verification phases offer the re-run: a plan whose
   verification stopped or failed is exactly the plan the operator wants
   to verify again.
@@ -54,12 +60,17 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 _APP_JS = _REPO_ROOT / "frontend" / "app.js"
 
 #: The label a failed plan's start button must carry. The action's own
-#: label is 「启动」; on a failed plan that reads as "run the whole thing
-#: again", which is not what the button does.
+#: label is 「立即启动（可抢占）」; on a failed plan that reads as "run the
+#: whole thing again", which is not what the button does.
 _FAILED_START_LABEL = "重新排队执行"
 
 #: The label the re-run-verification button carries, everywhere.
 _RERUN_LABEL = "重跑验证"
+
+#: The label the ``start`` action carries everywhere the failed phase's
+#: own label does not apply: the default says that a start may take a
+#: slot away from somebody.
+_DEFAULT_START_LABEL = "立即启动（可抢占）"
 
 #: The action key the re-run-verification button carries.
 _RERUN_ACTION = "rerun-verification"
@@ -337,31 +348,35 @@ def test_verification_terminal_phases_offer_rerun() -> None:
         )
 
 
-def test_start_label_default_unchanged() -> None:
-    """``start`` still reads 「启动」 everywhere the failed label does not
-    apply — including where no phase is passed at all.
+def test_start_label_default_announces_preemption() -> None:
+    """``start`` reads 「立即启动（可抢占）」 everywhere the failed label
+    does not apply — including where no phase is passed at all.
 
-    The failed plan's label is an exception, not a new default: the
-    queue row and the running row pass no phase, and their buttons must
-    keep the labels they have always had. A resolver that threw on a
-    missing phase would take the whole scheduler panel down over one
-    row, and a resolver that returned ``undefined`` would print the
-    word "undefined" on a button.
+    The default label has to announce that a start may take a slot away
+    from somebody: the button is the same command everywhere the failed
+    phase's own label does not apply, and the operator has to be able
+    to read that off the button. The failed plan's label is an
+    exception, not a new default: the queue row and the running row
+    pass no phase, and their start button carries the default label. A
+    resolver that threw on a missing phase would take the whole
+    scheduler panel down over one row, and a resolver that returned
+    ``undefined`` would print the word "undefined" on a button.
     """
     source = _source(_APP_JS)
     labels = _labels(source)
     by_phase = _labels_by_phase(source)
 
-    assert labels.get("start") == "启动", (
-        "the `start` action's own label is no longer 「启动」. The failed "
-        "plan's 「重新排队执行」 is a phase-specific label; the action's "
-        "own label must stay where every other phase uses it."
+    assert labels.get("start") == _DEFAULT_START_LABEL, (
+        "the `start` action's own label is no longer 「立即启动（可抢占）」. "
+        "The failed plan's 「重新排队执行」 is a phase-specific label; the "
+        "action's own label must stay where every other phase uses it."
     )
 
     for phase in (None, ""):
-        assert _resolve_label("start", phase, labels, by_phase) == "启动", (
-            f"the `start` label with phase {phase!r} is not 「启动」. A "
-            "missing phase must fall back to the action's own label."
+        assert _resolve_label("start", phase, labels, by_phase) == _DEFAULT_START_LABEL, (
+            f"the `start` label with phase {phase!r} is not "
+            f"「立即启动（可抢占）」. A missing phase must fall back to the "
+            "action's own label."
         )
         assert _resolve_label(_RERUN_ACTION, phase, labels, by_phase) == _RERUN_LABEL, (
             f"the `{_RERUN_ACTION}` label with phase {phase!r} is not "
@@ -396,8 +411,8 @@ def test_start_label_default_unchanged() -> None:
     queue = _normalized(_function_body(source, "renderSchedulerQueue"))
     assert 'schedulerActionButtons(planId,["promote","start"])' in queue, (
         "the queue row no longer calls schedulerActionButtons() with two "
-        "arguments. It passes no phase, so its start button must keep "
-        "the default 「启动」."
+        "arguments. It passes no phase, so its start button must carry "
+        "the default 「立即启动（可抢占）」."
     )
 
     running = _normalized(_function_body(source, "renderSchedulerRunning"))
