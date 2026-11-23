@@ -146,7 +146,18 @@ SNAPSHOT_PATH = _TESTS_DIR / "openapi_snapshot.json"
 #: （`_fingerprint(json.loads(SNAPSHOT_PATH.read_text()))`），再与线上 app
 #: 实际发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零差异、指纹
 #: 相同——才把该值写进本常量（`d1b9ebdb…`）。
-BASELINE_FINGERPRINT = "d1b9ebdb85e6619d06005347daece8c7bbc3e88fe9596ebfec8c1b53a278e217"
+#:
+# 2026-11-22（收尾阶段「有上限的续跑入口」/ 本分支）：本次变更给对外 HTTP
+# 契约**新增一个端点** —— `POST /api/verification/{plan_id}/postprocess/resume`
+# （收尾阶段失败后由人显式续跑；相位不对 409、额度用完 409、成功 200）。
+# 故按同一条规矩重取基线：`openapi_snapshot.json` 相对上一版**只增不删**
+# —— 新增 1 条路径（`/api/verification/{plan_id}/postprocess/resume`），
+# 删除 0 条，其余路径逐项相等，`components` 与 `info` 逐项相等（实测：
+# 新增路径 1 条 / 删除 0 条 / 变更 0 条）。快照与指纹在**同一次变更**里更新：
+# 先由重新生成后落盘的快照现算（`_fingerprint(json.loads(SNAPSHOT_PATH.read_text()))`），
+# 再与线上 app 实际发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零差异、
+# 指纹相同——才把该值写进本常量（`3facbf98…`）。
+BASELINE_FINGERPRINT = "3facbf98c802347794208c3377c6d612a8bc405aa0f1e1016c030a9909c51095"
 
 #: The capture runs in its own process so the schema is the one a clean
 #: start produces: debug routes off, no schema cache carried over from

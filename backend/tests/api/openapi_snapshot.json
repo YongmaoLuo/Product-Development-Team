@@ -4473,6 +4473,44 @@
         "summary": "Force Verification Terminal"
       }
     },
+    "/api/verification/{plan_id}/postprocess/resume": {
+      "post": {
+        "description": "Continue a plan parked at ``postprocess_failed`` \u2014 with a budget.\n\n``postprocess_failed`` is a **parking** phase, not a terminal one:\nthe finishing stage (\u6536\u5c3e\u9636\u6bb5) failed a required item, the plan is\nparked, and a human decides whether to run the stage again.  The\nphase graph has always said so (``postprocess_failed \u2192\npost_processing`` is a legal edge), but until now **nothing could\ntake that edge** \u2014 the plan was a dead end: one finishing failure\nand the plan could never move again.\n\nThis route is that missing edge, and it is deliberately narrow:\n\n* only ``postprocess_failed`` may be resumed \u2014 any other phase is a\n  409, because resuming a stage that is not parked is not a resume\n  but a second run of something else;\n* the number of resumes is **capped** (:data:`MAX_RETRIES` \u2014 2).\n  The budget lives in the plan's own directory\n  (``postprocess_retries.json``) and is spent one unit per resume;\n  a third attempt is refused with a 409 and the numbers in the\n  answer;\n* nothing here triggers a resume by itself.  A5 forbids repeating\n  an action behind a human's back, so the only way to spend the\n  budget is this explicit call.\n\nConcurrency: no extra lock is needed.  The phase is moved to\n``post_processing`` **before** the stage is started, so a second\ncall arriving afterwards reads ``post_processing`` in the phase\ncheck above and is refused with a 409 \u2014 the phase move is what\nserialises the two calls, not a mutex.\n\nAnswers:\n  * 404 \u2014 there is no such plan;\n  * 409 \u2014 the plan is not parked at ``postprocess_failed``, or the\n    resume budget is used up;\n  * 200 \u2014 the stage was started (in the background).",
+        "operationId": "resume_postprocess_route_api_verification__plan_id__postprocess_resume_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resume Postprocess Route"
+      }
+    },
     "/api/verification/{plan_id}/progress": {
       "get": {
         "description": "Get VP-granularity + layer-granularity verification progress.\n\nReturns 404 if the executor hasn't written a progress state\nfile yet (``verification_progress_state.json`` absent under\n``plan_dir``) \u2014 the dashboard falls back to ``/status`` in that\ncase. Otherwise the response is the same shape whether the\nin-memory ``_verification_state`` is populated or the server\nwas just restarted: the live state lives on disk in\n``verification_progress_state.json`` (one write per\n``vp_status_changed`` event), so cross-process recovery is\nautomatic.\n\nSchema::\n\n    {\n      \"plan_id\": str,\n      \"verification_status\": str,           # \"running\" | \"passed\" | ...\n      \"verification_round\": int,\n      \"stop_reason\": Optional[str],         # why the loop ended, e.g.\n                                            # \"max_rounds_reached\" /\n                                            # \"same_failure_repeated_after_max_attempts\"\n                                            # (2026-09-19)\n      \"current_vp\": {                       # None when no VP in flight\n        \"id\": str,\n        \"title\": str,\n        \"started_at\": Optional[str]\n      },\n      \"completed_vps\": [str, ...],\n      \"failed_vps\": [str, ...],\n      \"skipped_vps\": [str, ...],\n      \"pending_vps\": [str, ...],\n      \"current_layer\": None,                # legacy field, always None\n      \"layer_summaries\": {},                # legacy field, always empty\n      \"counts\": {\n        \"total\": int, \"completed\": int, \"failed\": int,\n        \"skipped\": int, \"in_progress\": int, \"pending\": int\n      },\n      \"last_updated_at\": Optional[str]\n    }",
