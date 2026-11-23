@@ -256,6 +256,46 @@ function show(id) {
     $$(".view").forEach((v) => v.classList.add("hidden"));
     const el = $(`#${id}`);
     if (el) el.classList.remove("hidden");
+    schedulerSyncUrl(id);
+}
+
+/** The scheduler view's own address.
+
+    The panel is the one view an operator can come back to by URL:
+    every other view needs a plan id, and a view that needs one
+    cannot be addressed by an address that does not carry it.
+
+    The hash is written with **replaceState**, never pushState: the
+    browser's back button must keep meaning "leave the page" and not
+    "walk through the panel's own history".  And replaceState fires
+    neither hashchange nor popstate, so writing the address from the
+    view cannot start a loop between the two. */
+const SCHEDULER_HASH = "#/scheduler";
+
+/** Put the address in step with the view on screen.
+
+    The scheduler view has an address of its own; every other view is
+    the plain page again, because a view that needs a plan id cannot
+    be addressed by an address that does not carry one.
+
+    An address the browser refuses to change is not a reason to leave
+    the panel unpainted: the panel is what the operator is looking at,
+    and the address is only how they come back to it.
+ */
+function schedulerSyncUrl(viewId) {
+    if (!window.history || typeof window.history.replaceState !== "function") return;
+    const target = viewId === "scheduler-view"
+        ? SCHEDULER_HASH
+        : window.location.pathname;
+    const current = window.location.hash
+        ? window.location.pathname + window.location.hash
+        : window.location.pathname;
+    if (current === target) return;
+    try {
+        window.history.replaceState(null, "", target);
+    } catch (err) {
+        console.warn("the address could not be updated:", err);
+    }
 }
 
 function safeBind(id, event, handler) {
@@ -2216,10 +2256,25 @@ const SCHEDULER_REASON_TEXT = {
 const SCHEDULER_ACTION_LABELS = {
     promote: "提升",
     pause: "暂停",
-    resume: "恢复",
-    start: "启动",
+    resume: "恢复排队",
+    start: "立即启动（可抢占）",
     "rerun-verification": "重跑验证",
 };
+
+/** 每个动作一句话，作为按钮的 tooltip。「恢复排队」和「立即启动」在
+    有空位时结果相同，差别只在名额满时是否抢占别人，所以悬停时也
+    把这句写出来。 */
+const SCHEDULER_ACTION_HINTS = {
+    promote: "只调整队列顺序，不占名额、不打断任何人",
+    pause: "停止计划并释放名额",
+    resume: "回到队首等待名额，不抢占正在运行的计划",
+    start: "排到队首并尽快运行；名额已满时会抢占一个已运行较久的计划",
+    "rerun-verification": "重跑验证轮（不重新排队执行）",
+};
+
+function schedulerActionHint(action) {
+    return SCHEDULER_ACTION_HINTS[action] ?? "";
+}
 
 /** Some phases need the button to say more than the action's own name.
     On a failed plan 「启动」 reads as "run the whole thing again", but
@@ -2489,7 +2544,7 @@ function schedulerActionButtons(planId, actions, phase) {
     }
     return actions
         .map((action) =>
-            `<button class="btn btn-outline scheduler-action" data-action="${escapeHtml(action)}" data-plan="${escapeHtml(planId)}">${escapeHtml(schedulerActionLabel(action, phase))}</button>`
+            `<button class="btn btn-outline scheduler-action" data-action="${escapeHtml(action)}" data-plan="${escapeHtml(planId)}" title="${escapeHtml(schedulerActionHint(action))}">${escapeHtml(schedulerActionLabel(action, phase))}</button>`
         )
         .join(" ");
 }
@@ -3503,24 +3558,8 @@ function renderSchedulerWaiting(snapshot) {
             const itemId = item.item_id ? String(item.item_id) : "";
             const question =
                 item.question === null || item.question === undefined ? "" : String(item.question);
-            // A wait that is no longer pending cannot be pushed out.
-            // The server refuses such an extension with a conflict,
-            // so the button says so before the operator presses it.
-            const extendable = item.extendable !== false;
-            // Only a **human** wait has somebody to answer it: an
-            // external wait is rechecked by the system, and offering
-            // an answer for it would be an answer to nobody.
-            const answerable = item.wait_type === "human";
-            const extendTitle = `延长 ${SCHEDULER_WAIT_EXTEND_SECONDS / 3600} 小时`;
 
-            const buttons = [
-                `<button class="btn btn-outline scheduler-action scheduler-waiting-action" data-action="extend" data-plan="${escapeHtml(planId)}" data-item="${escapeHtml(itemId)}" title="${escapeHtml(extendTitle)}"${extendable ? "" : " disabled"}>延长</button>`,
-                `<button class="btn btn-outline scheduler-action scheduler-waiting-action" data-action="terminate" data-plan="${escapeHtml(planId)}" data-item="${escapeHtml(itemId)}">终止</button>`,
-            ];
-            if (answerable) {
-                buttons.push(`<input class="scheduler-waiting-answer" type="text" placeholder="回答" data-plan="${escapeHtml(planId)}" data-item="${escapeHtml(itemId)}" />`);
-                buttons.push(`<button class="btn btn-outline scheduler-action scheduler-waiting-action" data-action="answer" data-plan="${escapeHtml(planId)}" data-item="${escapeHtml(itemId)}">回答</button>`);
-            }
+            const buttons = schedulerWaitingActions(item);
 
             return `<tr data-plan-id="${escapeHtml(planId)}" data-item-id="${escapeHtml(itemId)}">
                 <td>${escapeHtml(planId || "—")}</td>
@@ -3528,13 +3567,217 @@ function renderSchedulerWaiting(snapshot) {
                 <td>${escapeHtml(schedulerWaitingTypeText(item.wait_type))}</td>
                 <td>${escapeHtml(schedulerRemainingText(item.remaining_seconds))}</td>
                 <td class="scheduler-waiting-question" title="${escapeHtml(question)}">${escapeHtml(schedulerQuestionText(question))}</td>
-                <td class="scheduler-row-actions">${buttons.join(" ")}</td>
+                <td class="scheduler-row-actions">${buttons}</td>
             </tr>`;
         })
         .join("");
 
     schedulerToggle($("#scheduler-waiting-table"), true);
     schedulerToggle($("#scheduler-waiting-empty"), false);
+}
+
+/** The three operations of one waiting row.
+
+    延长 / 终止 / 回答 are three commands against three server paths:
+    two of them are the scheduler's own wait endpoints, and the third
+    is the existing HITL answer path.
+
+    The waiting table and the finishing block both draw a waiting
+    row, and they draw the **same** three operations: a second copy of
+    this markup would be a second answer to "what can I do about this
+    question", and the two could drift apart without anybody noticing.
+ */
+function schedulerWaitingActions(item) {
+    const wait = item || {};
+    const planId = wait.plan_id ? String(wait.plan_id) : "";
+    const itemId = wait.item_id ? String(wait.item_id) : "";
+    // A wait that is no longer pending cannot be pushed out.
+    // The server refuses such an extension with a conflict,
+    // so the button says so before the operator presses it.
+    const extendable = wait.extendable !== false;
+    // Only a **human** wait has somebody to answer it: an
+    // external wait is rechecked by the system, and offering
+    // an answer for it would be an answer to nobody.
+    const answerable = wait.wait_type === "human";
+    const extendTitle = `延长 ${SCHEDULER_WAIT_EXTEND_SECONDS / 3600} 小时`;
+
+    const buttons = [
+        `<button class="btn btn-outline scheduler-action scheduler-waiting-action" data-action="extend" data-plan="${escapeHtml(planId)}" data-item="${escapeHtml(itemId)}" title="${escapeHtml(extendTitle)}"${extendable ? "" : " disabled"}>延长</button>`,
+        `<button class="btn btn-outline scheduler-action scheduler-waiting-action" data-action="terminate" data-plan="${escapeHtml(planId)}" data-item="${escapeHtml(itemId)}">终止</button>`,
+    ];
+    if (answerable) {
+        buttons.push(`<input class="scheduler-waiting-answer" type="text" placeholder="回答" data-plan="${escapeHtml(planId)}" data-item="${escapeHtml(itemId)}" />`);
+        buttons.push(`<button class="btn btn-outline scheduler-action scheduler-waiting-action" data-action="answer" data-plan="${escapeHtml(planId)}" data-item="${escapeHtml(itemId)}">回答</button>`);
+    }
+
+    return buttons.join(" ");
+}
+
+// --- The finishing block ---
+//
+// A plan that has a requirement book enters the finishing stage
+// (``post_processing``) and leaves it as ``completed`` — or stops in
+// ``postprocess_failed`` when a required item did not pass.  Neither
+// phase holds a slot and neither is a run, so those plans are in
+// neither the queue nor the running list: without this block the
+// operator cannot see that a plan has reached the finishing stage at
+// all, and a plan whose finishing stage failed looks like a plan that
+// is still working.
+//
+// The block is drawn from the server's own answer
+// (``GET /api/scheduler/finishing``): the phase, the failing items
+// and the waits are all the server's, and the panel draws them.
+
+/** How many failing items one card lists.
+
+    Five is what an operator reads without scrolling; the rest are
+    counted, so the card says how many there are instead of stopping
+    for no reason. */
+const SCHEDULER_FINISHING_ITEM_LIMIT = 5;
+
+/** The badge's colour, by the phase.
+
+    收尾中 is the quiet blue of a stage that is still working;
+    收尾失败 is the orange of a stage that has stopped and wants a
+    person.  The words are the server's — the panel only says which
+    of its own colours that phase is drawn in. */
+function schedulerFinishingBadgeClass(phase) {
+    return phase === "postprocess_failed"
+        ? "scheduler-finishing-badge-postprocess_failed"
+        : "";
+}
+
+/** The items of the terminal report that did not pass.
+
+    The report's own vocabulary: a verdict that is neither PASS nor
+    SKIPPED is a failure (fail-closed), and a SKIPPED item is an
+    optional one that did not have to run. */
+function schedulerFinishingFailures(postprocess) {
+    if (!postprocess || typeof postprocess !== "object") return [];
+    // The summary the server sends carries the report's items under
+    // ``item_verdicts``; ``items`` is read as well so a summary that
+    // names them the other way is still drawn.
+    const items = postprocess.item_verdicts || postprocess.items || [];
+    if (!Array.isArray(items)) return [];
+    return items.filter((entry) => {
+        const verdict = String((entry && entry.verdict) || "").toUpperCase();
+        return verdict !== "PASS" && verdict !== "SKIPPED";
+    });
+}
+
+/** A stamp, in the operator's own timezone.
+
+    The server writes UTC; the operator reads their own clock.  A
+    stamp that cannot be read is drawn as a dash — not as a guess. */
+function schedulerLocalTime(stamp) {
+    if (!stamp) return "—";
+    const moment = new Date(stamp);
+    if (!moment || Number.isNaN(moment.getTime())) return "—";
+    return moment.toLocaleString();
+}
+
+/** One wait of a finishing plan: the question, the time left, and the
+    three operations.
+
+    The three operations are the very ones the waiting table offers —
+    the same helper draws them — so a question cannot be acted on one
+    way in one block and another way in the other. */
+function schedulerFinishingWaitHtml(wait) {
+    const item = wait || {};
+    const question =
+        item.question === null || item.question === undefined ? "" : String(item.question);
+    return `<div class="scheduler-finishing-wait">
+        <div class="scheduler-finishing-question" title="${escapeHtml(question)}">${escapeHtml(schedulerQuestionText(question))}</div>
+        <div class="scheduler-row-actions">
+            <span class="scheduler-finishing-remaining">剩余 ${escapeHtml(schedulerRemainingText(item.remaining_seconds))}</span>
+            ${schedulerWaitingActions(item)}
+        </div>
+    </div>`;
+}
+
+/** One finishing plan's card.
+
+    The card says which plan it is, which phase the plan is in, when
+    it was last touched, which items did not pass — and the question
+    the plan is waiting on, with the three operations that settle it. */
+function schedulerFinishingCardHtml(plan) {
+    const item = plan || {};
+    const planId = String(item.plan_id || "");
+    const phase = String(item.phase || "");
+    const label = String(item.phase_label || phase || "—");
+
+    const failures = schedulerFinishingFailures(item.postprocess);
+    const shown = failures.slice(0, SCHEDULER_FINISHING_ITEM_LIMIT);
+    const rest = failures.length - shown.length;
+
+    const items = shown.length
+        ? `<ul class="scheduler-finishing-items">${shown.map((entry) => {
+            const id = String((entry && entry.id) || "");
+            const verdict = String((entry && entry.verdict) || "");
+            return `<li class="scheduler-finishing-item">
+                <span class="scheduler-finishing-item-id">${escapeHtml(id)}</span>
+                <span class="scheduler-finishing-item-verdict">${escapeHtml(verdict)}</span>
+            </li>`;
+        }).join("")}</ul>`
+        : "";
+    const more = rest > 0 ? `<div class="scheduler-finishing-more">等 ${rest} 项</div>` : "";
+
+    const waits = Array.isArray(item.waits) ? item.waits : [];
+    const waitBlocks = waits.map((wait) => schedulerFinishingWaitHtml(wait)).join("");
+
+    return `<article class="scheduler-finishing-card" data-plan-id="${escapeHtml(planId)}">
+        <div class="scheduler-finishing-header">
+            <span class="scheduler-finishing-id">${escapeHtml(planId || "—")}</span>
+            <span class="scheduler-finishing-badge ${schedulerFinishingBadgeClass(phase)}">${escapeHtml(label)}</span>
+            <span class="scheduler-finishing-time">${escapeHtml(schedulerLocalTime(item.updated_at))}</span>
+        </div>
+        ${items}
+        ${more}
+        <div class="scheduler-finishing-waits">${waitBlocks}</div>
+    </article>`;
+}
+
+/** Draw the finishing block.
+
+    An empty finishing list is an empty state, not an error: "nothing
+    is being finished" is a normal thing to look at. */
+function renderSchedulerFinishing(plans) {
+    const rows = Array.isArray(plans) ? plans : [];
+    const box = $("#scheduler-finishing-cards");
+    if (!box) return;
+
+    if (!rows.length) {
+        box.innerHTML = "";
+        schedulerToggle(box, false);
+        schedulerToggle($("#scheduler-finishing-empty"), true);
+        return;
+    }
+
+    box.innerHTML = rows.map((plan) => schedulerFinishingCardHtml(plan)).join("");
+    schedulerToggle(box, true);
+    schedulerToggle($("#scheduler-finishing-empty"), false);
+}
+
+/** Read the finishing block's own answer.
+
+    The read is a **second** one, and it rides along with the state
+    read rather than owning a timer of its own.
+
+    A failure here is a failure of an addition to the panel, not of
+    the panel: the last frame stays on screen and the failure is
+    written to the console.  It never paints over a panel that is
+    otherwise working. */
+async function loadSchedulerFinishing() {
+    try {
+        const data = await api("/scheduler/finishing");
+        const plans = Array.isArray(data) ? data : (data.plans || []);
+        renderSchedulerFinishing(plans);
+        schedulerClearPollError("finishing");
+        return plans;
+    } catch (err) {
+        schedulerLogPollError(err, "finishing");
+        return [];
+    }
 }
 
 /** The phase a plan is in: the routing phase when the listing carries
@@ -3699,6 +3942,13 @@ async function loadSchedulerState(options = {}) {
         // The parallel-agent count is a second, optional read: it rides
         // along with this refresh instead of owning a timer of its own.
         loadSchedulerAgentCount();
+        // The finishing block is a third read, and it rides along in
+        // the same way: the plans that are being finished are in no
+        // queue and in no running line, so the read model above
+        // cannot name them.  It is fired and forgotten (see
+        // loadInBackground), so a failure here cannot take the panel
+        // down with it.
+        loadInBackground(() => loadSchedulerFinishing(), "scheduler finishing");
         // The terminal plans are a third read: they are the plans the
         // queue and the running list cannot show.
         await loadSchedulerTerminalPlans();
@@ -3830,28 +4080,108 @@ function handleSchedulerVisibilityChange() {
     startSchedulerPolling();
 }
 
+/** The Chinese sentence each outcome is shown as.  The server speaks in
+    words like ``applied`` / ``blocked_by_capacity``; the panel speaks
+    in sentences an operator can act on. */
+const SCHEDULER_OUTCOME_TEXT = {
+    applied: "已执行",
+    started: "已启动（有空位）",
+    blocked_by_capacity: "名额已满，排队等待",
+    conflict: "动作与当前状态冲突",
+    not_found: "计划不存在",
+};
+
+/** The short sentence the result box's first line carries.
+
+    The outcome alone does not say what happened: ``applied`` is the
+    answer to a promotion, to a pause and to a resume alike, and
+    ``started`` is the answer both to a start into a free slot and to
+    a start that had to take a slot away from somebody.  So the
+    detail decides the sentence, and the outcome decides it only when
+    the detail says nothing more. */
+function schedulerOutcomeText(result) {
+    if (!result) return "";
+    const outcome = result.outcome ? String(result.outcome) : "";
+    const detail = result.detail !== undefined && result.detail !== null
+        ? String(result.detail)
+        : "";
+    if (outcome === "applied") {
+        if (detail === "resumed") return "已恢复排队";
+        if (detail.startsWith("promote_order:")) return "已提升顺序";
+        if (detail === "verification_rerun") return "已提交重跑验证";
+        if (detail === "paused" || detail === "stopping" || detail === "idle") {
+            return "已暂停";
+        }
+        return SCHEDULER_OUTCOME_TEXT.applied;
+    }
+    if (outcome === "started") {
+        if (detail.startsWith("evicted:")) return "已启动（抢占了名额）";
+        return SCHEDULER_OUTCOME_TEXT.started;
+    }
+    return SCHEDULER_OUTCOME_TEXT[outcome] ?? outcome;
+}
+
 /** What a command did, in the command's own words. */
 function renderSchedulerOutcome(result) {
-    const outcome = result && result.outcome ? String(result.outcome) : "";
-    const detail = result && result.detail !== undefined && result.detail !== null
-        ? schedulerDetailText(result.detail)
-        : "";
-    schedulerSetText("#scheduler-action-outcome", outcome);
-    schedulerSetText("#scheduler-action-detail", detail);
+    schedulerSetText("#scheduler-action-outcome", schedulerOutcomeText(result));
+    schedulerSetText("#scheduler-action-detail", schedulerDetailText(result));
     const box = $("#scheduler-action-result");
     if (box) box.classList.remove("error");
     schedulerToggle($("#scheduler-action-result"), true);
 }
 
-function schedulerDetailText(detail) {
-    if (typeof detail === "object") {
+/** The long sentence the result box's second line carries: what the
+    command did to the queue, in the operator's terms.
+
+    The server's detail is a token; the panel shows the sentence that
+    token stands for.  A detail the panel does not know is shown as
+    it is — a word nobody has translated yet is still information, and
+    an empty line would not be. */
+function schedulerDetailText(result) {
+    if (!result) return "";
+    const outcome = result.outcome ? String(result.outcome) : "";
+    const raw = result.detail;
+    if (outcome === "not_found") return "调度器里没有这个计划。";
+    if (raw === undefined || raw === null) return "";
+    if (typeof raw === "object") {
         try {
-            return JSON.stringify(detail);
+            return JSON.stringify(raw);
         } catch {
             return "";
         }
     }
-    return String(detail);
+    const detail = String(raw);
+    if (outcome === "conflict") {
+        return `该动作不适用于计划当前状态（${detail}）。`;
+    }
+    if (detail === "resumed") {
+        return "已回到队首等待名额；未抢占任何正在运行的计划。";
+    }
+    if (detail.startsWith("promote_order:")) {
+        const position = detail.slice("promote_order:".length).trim();
+        return `队列位置已提升到第 ${position} 位。`;
+    }
+    if (detail === "verification_rerun") {
+        return "已重绕轮次并提交验证启动。";
+    }
+    if (detail === "paused" || detail === "stopping" || detail === "idle") {
+        return "计划已停止，名额已释放。";
+    }
+    if (detail === "slot_free") {
+        return "当前有空位，下一轮调度即开始。";
+    }
+    if (detail.startsWith("evicted:")) {
+        const victim = detail.slice("evicted:".length).trim();
+        return `名额已满，已抢占 ${victim} 并让它排回队列；本计划排到队首。`;
+    }
+    if (detail === "no_eligible_victim") {
+        return "所有在跑计划都在保护期内，无法抢占；已排在队首等待。";
+    }
+    if (detail.startsWith("eviction_incomplete:")) {
+        const victim = detail.slice("eviction_incomplete:".length).trim();
+        return `${victim} 尚未停下来，名额还没腾出；已排在队首等待。`;
+    }
+    return detail;
 }
 
 function renderSchedulerError(err) {
@@ -4039,9 +4369,16 @@ async function schedulerAnswerWait(planId, itemId, option) {
     }
 }
 
-/** The answer the operator typed into one waiting row. */
-function schedulerWaitingAnswerText(planId, itemId) {
-    const inputs = Array.from($$(".scheduler-waiting-answer"));
+/** The answer the operator typed into one waiting row.
+
+    The answer is looked for in the row the button belongs to: the
+    same plan and the same item can be drawn twice — once in the
+    waiting table and once on a finishing card — and the answer
+    belongs to the row the operator typed it in. */
+function schedulerWaitingAnswerText(planId, itemId, scope) {
+    const inputs = scope
+        ? Array.from(scope.querySelectorAll(".scheduler-waiting-answer"))
+        : Array.from($$(".scheduler-waiting-answer"));
     const match = inputs.find(
         (input) => input.dataset.plan === planId && input.dataset.item === itemId,
     );
@@ -4049,7 +4386,7 @@ function schedulerWaitingAnswerText(planId, itemId) {
 }
 
 /** Carry out the action a button asks for. */
-async function schedulerRunAction(action, planId, itemId) {
+async function schedulerRunAction(action, planId, itemId, scope) {
     try {
         if (action === "promote") {
             await schedulerPromote(planId);
@@ -4066,7 +4403,7 @@ async function schedulerRunAction(action, planId, itemId) {
         } else if (action === "terminate") {
             await schedulerTerminateWait(planId, itemId);
         } else if (action === "answer") {
-            const option = schedulerWaitingAnswerText(planId, itemId);
+            const option = schedulerWaitingAnswerText(planId, itemId, scope);
             if (!option) {
                 renderSchedulerError(new Error("请先填写回答内容"));
                 return;
@@ -4088,101 +4425,17 @@ function bindSchedulerActions() {
         const button = target && target.closest ? target.closest(".scheduler-action") : null;
         if (!button) return;
         event.preventDefault();
-        schedulerRunAction(button.dataset.action, button.dataset.plan, button.dataset.item);
+        // The row the button is in: the answer is read out of that
+        // row, not out of the first row that happens to carry the same
+        // plan and item.
+        const scope = button.closest("tr") || button.closest(".scheduler-finishing-wait");
+        schedulerRunAction(
+            button.dataset.action,
+            button.dataset.plan,
+            button.dataset.item,
+            scope,
+        );
     });
-}
-
-// --- The requirement sheet (要求书) ---
-//
-// The finishing stage runs against a frozen **requirement sheet**:
-// the plan's own `postprocess.json`.  The panel is where an operator
-// reads it and corrects it — and the correction has to be written
-// back to the plan's file, because the file is what the next freezing
-// round reads.
-//
-// Two rules, and both of them come from the server:
-//
-//   * the write lands on `plans/{id}/postprocess.json` and on nothing
-//     else — so the panel sends one document, and the server decides
-//     where it goes;
-//   * a plan that is already being finished keeps **this** round's
-//     frozen sheet.  An edit made now is the *next* round's sheet, and
-//     the panel says so rather than pretending the round changed.
-//
-// A failed save is never silent: a save that failed quietly leaves
-// the operator believing a sheet was written that was not.
-
-/** Say something in the requirement sheet's own message line. */
-function schedulerSpecMessage(text, isError) {
-    const box = $("#scheduler-spec-message");
-    if (!box) return;
-    box.textContent = text;
-    box.classList.toggle("error", Boolean(isError));
-}
-
-/** The plan the requirement sheet belongs to. */
-function schedulerSpecPlanId() {
-    const input = $("#scheduler-spec-plan");
-    return input ? String(input.value || "").trim() : "";
-}
-
-/** Read a plan's requirement sheet into the editor.
-
-    The sheet is shown as it is — the operator edits what the next
-    freezing round will read, so nothing is prettified away. */
-async function loadPostprocessSpec(planId) {
-    const editor = $("#scheduler-spec-text");
-    const target = String(planId || "").trim();
-    if (!target) {
-        schedulerSpecMessage("请先填写计划 ID", true);
-        return null;
-    }
-    try {
-        const spec = await api(`/scheduler/${encodeURIComponent(target)}/postprocess-spec`);
-        if (editor) editor.value = JSON.stringify(spec, null, 2);
-        schedulerSpecMessage("要求书已载入", false);
-        return spec;
-    } catch (err) {
-        schedulerSpecMessage(
-            `读取失败：${err && err.message ? err.message : "未知错误"}`,
-            true,
-        );
-        throw err;
-    }
-}
-
-/** Write the requirement sheet back to the plan.
-
-    The editor holds JSON, so a text that is not JSON is refused here
-    — before the server ever sees it — and a refused write says so. */
-async function savePostprocessSpec(planId) {
-    const editor = $("#scheduler-spec-text");
-    const target = String(planId || "").trim();
-    if (!target) {
-        schedulerSpecMessage("请先填写计划 ID", true);
-        return null;
-    }
-    let spec;
-    try {
-        spec = JSON.parse(editor ? editor.value : "");
-    } catch {
-        schedulerSpecMessage("要求书不是合法的 JSON，未保存", true);
-        return null;
-    }
-    try {
-        const result = await api(`/scheduler/${encodeURIComponent(target)}/postprocess-spec`, {
-            method: "PUT",
-            body: JSON.stringify(spec),
-        });
-        schedulerSpecMessage("要求书已保存（收尾中的计划从下一轮起采用）", false);
-        return result;
-    } catch (err) {
-        schedulerSpecMessage(
-            `保存失败：${err && err.message ? err.message : "未知错误"}`,
-            true,
-        );
-        throw err;
-    }
 }
 
 /** One listener for every card header: the cards are drawn by the
@@ -4524,23 +4777,6 @@ function init() {
         }
     });
     bindSchedulerActions();
-    // The requirement sheet: 查看 reads it, 保存 writes it back.  Both
-    // failures are already on screen in the editor's own message line,
-    // so neither is swallowed here.
-    safeBind("#btn-scheduler-spec-load", "click", async () => {
-        try {
-            await loadPostprocessSpec(schedulerSpecPlanId());
-        } catch {
-            // The failure is already on screen in the spec editor's message line.
-        }
-    });
-    safeBind("#btn-scheduler-spec-save", "click", async () => {
-        try {
-            await savePostprocessSpec(schedulerSpecPlanId());
-        } catch {
-            // The failure is already on screen in the spec editor's message line.
-        }
-    });
     bindSchedulerCards();
 
     // Initial load.  None of these is waited for — they are fired and
@@ -4555,9 +4791,45 @@ function init() {
     // The sidebar keeps its own list current from here on: the poll
     // reads the plan list on a timer, and a hidden page polls nothing.
     startSidebarPolling();
+
+    // The scheduler view is the one view with an address of its own,
+    // so a refresh on it must come back to it.  The view is opened
+    // here — before the first read is answered — so the panel is what
+    // the operator sees, and the poll runs on it from the start.
+    if (window.location.hash === SCHEDULER_HASH) {
+        show("scheduler-view");
+        startSchedulerPolling();
+    }
 }
 
 document.addEventListener("DOMContentLoaded", init);
+
+/** The address and the view on screen, in step.
+
+    The scheduler view has an address of its own, so an address that
+    names it opens it — and an address that stops naming it goes back
+    to the plan list.
+
+    The listener is on **hashchange** alone.  ``replaceState`` fires
+    neither hashchange nor popstate, so writing the address from the
+    view cannot start a loop; and the two branches below are the only
+    places the view is changed from the address, so one change settles
+    one change. */
+function handleSchedulerHashChange() {
+    const wantsScheduler = window.location.hash === SCHEDULER_HASH;
+    const onScheduler = schedulerViewVisible();
+    if (wantsScheduler && !onScheduler) {
+        show("scheduler-view");
+        loadInBackground(() => loadSchedulerState(), "scheduler state");
+        startSchedulerPolling();
+        return;
+    }
+    if (!wantsScheduler && onScheduler) {
+        goHome();
+    }
+}
+
+window.addEventListener("hashchange", handleSchedulerHashChange);
 
 /** One event, two consumers.
 

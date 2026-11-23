@@ -929,8 +929,32 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # `hashlib.sha256(Path("frontend/app.js").read_bytes()).hexdigest()` 实测值，
     # 不是抄来的。表内条目集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节
     # 比对，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-23：因已批准的「恢复/启动标签与结果文案」改动（`SCHEDULER_ACTION_LABELS`
+    # 把「恢复」写成「恢复排队」、「启动」写成「立即启动（可抢占）」；新增
+    # `SCHEDULER_ACTION_HINTS` 与 `schedulerActionHint()` 并给按钮加上 `title` 提示；
+    # 新增 `SCHEDULER_OUTCOME_TEXT` 与 `schedulerOutcomeText()`，结果区把英文 token 翻成
+    # 中文句子，`schedulerDetailText()` 改为接收整个 `result`）改动了 `frontend/app.js`，
+    # 按本 gate 的既定流程把冻结基线前移到本分支的批准态。哈希取自工作区文件的
+    # `shasum -a 256 frontend/app.js` 实测值，不是抄来的。表内条目集合与断言强度不变：
+    # 被钉文件的范围不变、sha256 仍逐字节比对，该文件此后仍被逐字节钉住，任何再编辑
+    # 照样红。
+    # 2026-11-23（本次合并 origin/main@446635d3 —— PR #193「调度页收尾分区」）：
+    # base 侧也改了 `frontend/app.js`（新增 `loadSchedulerFinishing` /
+    # `renderSchedulerFinishing` 与 `schedulerSyncUrl` / `handleSchedulerHashChange`，
+    # 抽出 `schedulerWaitingActions` 共用函数，删掉要求书那一段），与本分支的
+    # 「恢复/启动标签与结果文案」落在**不同位置**，互不覆盖，故两边都保留；文件内容
+    # 因此再次变化，按本 gate 的既定流程把冻结基线前移到**合并态**哈希
+    # （`shasum -a 256` 实测值）。前移的两端都记在这里：基线由 `dfabb438…`（本分支
+    # 合并前的批准态）移到 `c784b2f8…`（合并后的批准态）。
+    # 表内条目集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
+    # 2026-11-23：因本次「调度页收尾分区 + 调度视图 URL + 删掉要求书编辑框」改动
+    # `frontend/app.js`（新增 `loadSchedulerFinishing` / `renderSchedulerFinishing`
+    # 与 `schedulerSyncUrl` / `handleSchedulerHashChange`，抽出 `schedulerWaitingActions`
+    # 共用函数，删掉要求书那一段），按本 gate 的既定流程把冻结基线前移到本分支的
+    # 批准态。哈希取自工作区文件的 `shasum -a 256` 实测值，不是抄来的。表内条目
+    # 集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
     "frontend/app.js": (
-        "73c095694ff5b925dfe6ae956c2e4cad0d3c540f2fe1f2f1a76481f8ac8bdad6"
+        "c784b2f8da98f1ee44929a40029abdbbebbd1fd1bb9059ca74a392fc68a33364"
     ),
     # 2026-11-01：因「调度卡片容器与收起态样式」（task-11）改动了 `frontend/style.css`，
     # 按本 gate 的既定流程把哈希前移到本分支的批准态；表内条目集合不变。
@@ -987,8 +1011,12 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # `.phase-archived`），按本 gate 的既定流程把冻结基线前移到本分支的批准态。
     # 哈希取自工作区文件的 `shasum -a 256` 实测值，不是抄来的。表内条目集合与断言
     # 强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
+    # 2026-11-23：因本次改动删掉了要求书编辑框的 `.scheduler-spec-*` 样式、并新增
+    # 收尾卡片的 `.scheduler-finishing-*` 样式，改动了 `frontend/style.css`，
+    # 按本 gate 的既定流程把冻结基线前移到本分支的批准态。哈希取自工作区文件的
+    # `shasum -a 256` 实测值，不是抄来的。表内条目集合不变。
     "frontend/style.css": (
-        "626864d268af3dd1f03ffdf736f8882d1e3c0845f33a5a24b44f1336911c8de2"
+        "8f867c72aa08ca46bd0db2b56e230cd3a27bea9078d6b0e41f1ee306179c2c36"
     ),
     # 2026-10-31：因本分支新增 `_repair_exit_writer`（修复轮退出事件的单一写入器）
     # 改动本文件，按本 gate 的既定流程重新钉住该文件的哈希。
@@ -1401,19 +1429,25 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 实测值）。这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、
     # 被钉文件的范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
     # 任何再编辑照样红。
-    # 2026-11-22（本次：收尾阶段「有上限的续跑入口」）：已批准的改动落在
+    # 2026-11-22（收尾阶段「有上限的续跑入口」）：已批准的改动落在
     # `verification_loop.py` 上 —— 新增模块级 `resume_postprocess(plan_id)`，
-    # 它照 `_start_postprocess` 的形状写，**唯一**区别是 `orchestrator.resume()`
-    # 而不是 `orchestrator.start()`（`resume()` 只重跑进度文件里未完成/失败的条目，
-    # `start()` 才会重算第一轮）；线程、懒导入、`finally` 里
+    # 它照 `_start_postprocess` 的形状写，唯一区别是 `orchestrator.resume()`
+    # 而不是 `orchestrator.start()`；线程、懒导入、`finally` 里
     # `_settle_postprocess_phase` 的写法与 `_start_postprocess` 一致。
-    # `_start_postprocess` 本身与其它函数的字节**一字未动**。
-    # 按本 gate 的既定流程把冻结基线前移到本分支的批准态哈希（`shasum -a 256`
-    # 实测值）。这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、
-    # 被钉文件的范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
-    # 任何再编辑照样红。
+    #
+    # 2026-11-23（卡片认识收尾相位）：同一个文件上再落一处已批准的改动 ——
+    # 进 `post_processing` 与进 `postprocess_failed` 两个相位转换各发一条
+    # `KIND_PLAN_PHASE_CHANGED` 事件（各带 try/except，通知层失败不影响收尾）。
+    # 状态机的相位边、终态记录（`_record_verification_terminal` /
+    # `_persist_verification_terminal`）、验证状态语义一律未动 ——
+    # 收尾期间 `verification_status` 仍是 `running`。
+    #
+    # 两处改动合并后的批准态哈希（`shasum -a 256` 实测值）。按本 gate 的既定
+    # 流程把冻结基线前移到本分支的批准态哈希：这是「移动冻结」而不是
+    # 「放松门禁」—— 断言（mismatched == []）、被钉文件的范围与 sha256 逐字节
+    # 比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
     "backend/verification_loop.py": (
-        "2b085ab0e430a3f1b91172dde96116d24af90aff2d3a8870593d425e85d4d95c"
+        "6c43e4e8bac8e21253a9c90fbcd890b7fe1df300cb66e81a8e6181123275bb6b"
     ),
 }
 
@@ -1502,8 +1536,13 @@ FROZEN_SCHEDULER_SURFACE_SHA256: dict[str, str] = {
     # 该文件只被 base 侧改动（本分支未动它），合并后的内容与 base 侧一致；按本 gate
     # 的既定流程把冻结基线钉在**合并态**哈希（`shasum -a 256` 实测值）。
     # 表内条目集合与断言强度不变：被钉文件的范围不变、sha256 逐字节比对。
+    # 2026-11-23：因本次改动在调度视图里新增「收尾」分区（`scheduler-finishing-cards`
+    # / `scheduler-finishing-empty`）并删掉「要求书」编辑框，改动了
+    # `frontend/index.html`，按本 gate 的既定流程把冻结基线前移到本分支的批准态。
+    # 哈希取自工作区文件的 `shasum -a 256` 实测值，不是抄来的。表内条目集合与断言
+    # 强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
     "frontend/index.html": (
-        "f8c07759d90a2a0eb4edc790f0a62e6877123f2532d39e5c215a5e7cf629168f"
+        "f219545e11e47aacae6b011adcc025188b6a2ce8d3da1b8fcf6f24019325486d"
     ),
 }
 
