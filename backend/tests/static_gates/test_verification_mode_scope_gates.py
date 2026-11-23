@@ -1411,19 +1411,25 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 实测值）。这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、
     # 被钉文件的范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
     # 任何再编辑照样红。
-    # 2026-11-22（本次：收尾阶段「有上限的续跑入口」）：已批准的改动落在
+    # 2026-11-22（收尾阶段「有上限的续跑入口」）：已批准的改动落在
     # `verification_loop.py` 上 —— 新增模块级 `resume_postprocess(plan_id)`，
-    # 它照 `_start_postprocess` 的形状写，**唯一**区别是 `orchestrator.resume()`
-    # 而不是 `orchestrator.start()`（`resume()` 只重跑进度文件里未完成/失败的条目，
-    # `start()` 才会重算第一轮）；线程、懒导入、`finally` 里
+    # 它照 `_start_postprocess` 的形状写，唯一区别是 `orchestrator.resume()`
+    # 而不是 `orchestrator.start()`；线程、懒导入、`finally` 里
     # `_settle_postprocess_phase` 的写法与 `_start_postprocess` 一致。
-    # `_start_postprocess` 本身与其它函数的字节**一字未动**。
-    # 按本 gate 的既定流程把冻结基线前移到本分支的批准态哈希（`shasum -a 256`
-    # 实测值）。这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、
-    # 被钉文件的范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
-    # 任何再编辑照样红。
+    #
+    # 2026-11-23（卡片认识收尾相位）：同一个文件上再落一处已批准的改动 ——
+    # 进 `post_processing` 与进 `postprocess_failed` 两个相位转换各发一条
+    # `KIND_PLAN_PHASE_CHANGED` 事件（各带 try/except，通知层失败不影响收尾）。
+    # 状态机的相位边、终态记录（`_record_verification_terminal` /
+    # `_persist_verification_terminal`）、验证状态语义一律未动 ——
+    # 收尾期间 `verification_status` 仍是 `running`。
+    #
+    # 两处改动合并后的批准态哈希（`shasum -a 256` 实测值）。按本 gate 的既定
+    # 流程把冻结基线前移到本分支的批准态哈希：这是「移动冻结」而不是
+    # 「放松门禁」—— 断言（mismatched == []）、被钉文件的范围与 sha256 逐字节
+    # 比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
     "backend/verification_loop.py": (
-        "2b085ab0e430a3f1b91172dde96116d24af90aff2d3a8870593d425e85d4d95c"
+        "6c43e4e8bac8e21253a9c90fbcd890b7fe1df300cb66e81a8e6181123275bb6b"
     ),
 }
 
