@@ -189,13 +189,19 @@ def test_parked_phase_is_accepted_by_the_real_routing_cas(tmp_path):
 
 
 def test_the_source_phase_set_only_grew_by_the_parked_phase():
-    """The parked phase was ADDED — no other source phase was lost.
+    """The parked phases were ADDED — no other source phase was lost.
 
     The gate is the list of phases the start accepts.  Adding one is
     safe; rewriting the list is not — a phase that drops out of it
     stops being re-enterable, and the plan behind it can never be
     started again.  So the whole previous set has to survive, and the
-    parked phase has to be the only thing that joined it.
+    parked phases have to be the only things that joined it.
+
+    Two conditional entries are expected to have joined it:
+    ``waiting_for_quota`` — a round parked for provider capacity — and
+    ``queued``, the phase the scheduler leaves a requeued plan on, which
+    is where an interrupted verification round sits when it is resumed
+    through the scheduler rather than by hand.
     """
     phases = _start_cas_source_phases()
     previous = {
@@ -218,9 +224,9 @@ def test_the_source_phase_set_only_grew_by_the_parked_phase():
         "the start endpoint's source phases lost a phase: "
         f"{sorted(previous - phases)}"
     )
-    assert phases - previous == {"waiting_for_quota"}, (
+    assert phases - previous == {"waiting_for_quota", "queued"}, (
         "the start endpoint's source phases grew by more than the "
-        f"parked phase: {sorted(phases - previous)}"
+        f"parked phases: {sorted(phases - previous)}"
     )
 
 

@@ -1349,6 +1349,16 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
     # what this start retires once it has honoured it.
     _checkpoint = _read_verification_checkpoint(plan_dir)
 
+    # 2026-11-23: the checkpoint's ``kind`` names the half of the loop
+    # that was interrupted.  Only a checkpoint of kind ``verification``
+    # means this plan is carrying an interrupted verification round, so
+    # only then may a phase the scheduler left behind count as a
+    # legitimate source below.
+    _verification_checkpoint = (
+        isinstance(_checkpoint, dict)
+        and _checkpoint.get("kind") == "verification"
+    )
+
     from state_machine.repositories.routing_repository import ConflictError, PlanNotFoundError
 
     conn = None
@@ -1566,7 +1576,24 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
             # keeps the old source set — so it still answers the
             # existing ``409 stage_mismatch`` instead of a new error
             # code.
-            + (("verification_plan_review",) if _review_ready else ()),
+            + (("verification_plan_review",) if _review_ready else ())
+            # 2026-11-23: the scheduler requeues a stopped plan to
+            # ``queued`` before it admits it again, so an interrupted
+            # verification round that is resumed through the scheduler
+            # reaches this endpoint sitting on ``queued``.  Without
+            # this entry the start was refused with
+            # ``409 stage_mismatch`` every single time, and the
+            # scheduler read that refusal as a permanent failure and
+            # pruned the plan back to ``stopped`` — a plan that could
+            # never be started again.
+            #
+            # The entry is conditional on the plan really carrying a
+            # verification checkpoint, for the same reason the entries
+            # above are conditional: a plan that is not carrying an
+            # interrupted verification round keeps the old source set
+            # item-for-item, and is still refused with the existing
+            # ``409 stage_mismatch`` instead of a new error code.
+            + (("queued",) if _verification_checkpoint else ()),
             "verification_running",
         )
         verification.init_round(plan_id, round_n=next_round, max_rounds=max_rounds)
