@@ -32,10 +32,11 @@ The contract, in five parts
 4. **The question keeps its full text.**  The cell may be shortened
    for the eye, but the ``title`` attribute carries the whole original
    question — a truncated question is a question nobody can answer.
-5. **The requirement sheet can be read and written.**  The spec
-   editor is an *entry point* (arch decision point 6), so it has to
-   exist, and saving it has to go through ``savePostprocessSpec()``
-   onto the spec endpoint — and a failure has to say so out loud.
+5. **The requirement sheet editor is gone.**  The spec editor was
+   removed from the panel on 2026-11-23 (the sheet itself is written
+   by the pipeline, not by the operator): the markup, the functions and
+   the styles are gone together.  The **backend** spec endpoint is
+   untouched — the capability stays, the box on the page does not.
 
 Why the row shape is checked on the source
 ------------------------------------------
@@ -92,6 +93,12 @@ WAITING_STYLE_CLASSES = (
     ".scheduler-waiting-table",
     ".scheduler-waiting-question",
     ".scheduler-waiting-answer",
+)
+
+#: The requirement sheet editor's own classes.  They were removed
+#: together with the editor (2026-11-23): a class the page no longer
+#: uses is a rule the stylesheet has no reason to keep.
+REMOVED_SPEC_STYLE_CLASSES = (
     ".scheduler-spec-editor",
     ".scheduler-spec-text",
 )
@@ -242,12 +249,29 @@ def test_waiting_row_offers_three_actions() -> None:
     endpoints, and the third is the existing HITL answer path — a
     panel that grew its own approval channel would be a second answer
     to the same question.
+
+    The markup lives in ``schedulerWaitingActions()`` since
+    2026-11-23: the waiting table and the finishing block draw the
+    same three operations, and a second copy of this markup would be
+    a second answer to "what can I do about this question".
     """
-    body = _function_body(_source(_APP_JS), "renderSchedulerWaiting")
+    helper = _function_body(_source(_APP_JS), "schedulerWaitingActions")
     for action in WAITING_ACTIONS:
-        assert f'data-action="{action}"' in body, (
+        assert f'data-action="{action}"' in helper, (
             f"等待行没有 {action} 操作"
         )
+
+
+def test_waiting_row_uses_the_shared_actions() -> None:
+    """The waiting table draws its rows through the shared helper.
+
+    A row that built its own buttons would be the second copy the
+    helper was extracted to prevent.
+    """
+    body = _function_body(_source(_APP_JS), "renderSchedulerWaiting")
+    assert "schedulerWaitingActions(" in body, (
+        "renderSchedulerWaiting() 没有复用 schedulerWaitingActions()"
+    )
 
 
 def test_wait_actions_reach_the_server_paths() -> None:
@@ -317,71 +341,27 @@ def test_waiting_row_keeps_the_server_row_shape() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_spec_edit_entry_present() -> None:
-    """The spec editor is an entry point, and saving it goes through
-    ``savePostprocessSpec()``.
+def test_spec_edit_entry_is_gone() -> None:
+    """The requirement sheet editor is gone from the panel.
 
-    Three things, and all three are needed: the editor exists in the
-    page, the function that saves it is defined, and the save button
-    actually calls it.  A defined-but-uncalled function is a door
-    that is painted on the wall.
+    Removed on 2026-11-23: the sheet is written by the pipeline, and a
+    box that lets an operator retype it only invites the two of them
+    to disagree.  The backend spec endpoint stays — only the editor
+    on the page is gone.
     """
     html = _source(_INDEX_HTML)
     js = _source(_APP_JS)
 
-    assert 'id="scheduler-spec-editor"' in html, "调度页没有要求书编辑区"
-    assert 'id="scheduler-spec-editor"' in _scheduler_view(html), (
-        "要求书编辑区不在 #scheduler-view 里"
+    assert 'id="scheduler-spec-editor"' not in html, "调度页还留着要求书编辑区"
+    assert "scheduler-spec-editor" not in html, "调度页还留着要求书编辑区的引用"
+    assert "function savePostprocessSpec(" not in js, (
+        "前端还留着 savePostprocessSpec()"
     )
-
-    assert "function savePostprocessSpec(" in js, (
-        "前端没有定义 savePostprocessSpec()"
+    assert "function loadPostprocessSpec(" not in js, (
+        "前端还留着 loadPostprocessSpec()"
     )
-
-    calls = [
-        match
-        for match in re.finditer(r"(?<!function )savePostprocessSpec\(", js)
-    ]
-    assert len(calls) >= 1, "保存按钮没有调用 savePostprocessSpec()"
-
-
-def test_save_postprocess_spec_puts_the_spec_endpoint() -> None:
-    """Saving writes the spec endpoint with ``PUT``.
-
-    The endpoint is the one the architecture decided on
-    (``PUT /api/scheduler/{plan_id}/postprocess-spec``), and the write
-    goes through ``api()`` — which is what carries the request guard's
-    ``X-PDT-Request`` header the server answers 403 without.
-    """
-    body = _function_body(_source(_APP_JS), "savePostprocessSpec")
-    assert "postprocess-spec" in body, "savePostprocessSpec() 没有写要求书端点"
-    assert 'method: "PUT"' in body, "savePostprocessSpec() 没有用 PUT"
-    assert "api(" in body, "savePostprocessSpec() 没有走 api() 包装"
-
-
-def test_save_postprocess_spec_reports_the_failure() -> None:
-    """A failed save says so — it is never silent.
-
-    The panel writes back into a plan's directory; a save that fails
-    quietly leaves the operator believing a requirement sheet was
-    written that was not.
-
-    The chain is checked end to end: the save reports through
-    ``schedulerSpecMessage()``, and that helper writes into the
-    editor's own message line — so the operator reads the failure
-    where the editor is, and not only in a console nobody watches.
-    """
-    js = _source(_APP_JS)
-    body = _function_body(js, "savePostprocessSpec")
-    assert "catch" in body, "savePostprocessSpec() 没有处理失败"
-    assert "schedulerSpecMessage(" in body, (
-        "savePostprocessSpec() 的失败没有写进要求书的提示区"
-    )
-
-    helper = _function_body(js, "schedulerSpecMessage")
-    assert "#scheduler-spec-message" in helper, (
-        "schedulerSpecMessage() 没有写进 #scheduler-spec-message"
-    )
+    assert "#btn-scheduler-spec-load" not in js, "前端还绑着要求书读取按钮"
+    assert "#btn-scheduler-spec-save" not in js, "前端还绑着要求书保存按钮"
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +370,7 @@ def test_save_postprocess_spec_reports_the_failure() -> None:
 
 
 def test_style_has_waiting_table_rules() -> None:
-    """The stylesheet knows the waiting block and the spec editor.
+    """The stylesheet knows the waiting block.
 
     A class the stylesheet does not know is a class the browser
     ignores, so the markup and the stylesheet have to name each other.
@@ -398,6 +378,17 @@ def test_style_has_waiting_table_rules() -> None:
     css = _source(_STYLE_CSS)
     for selector in WAITING_STYLE_CLASSES:
         assert selector in css, f"样式表缺少 {selector} 的规则"
+
+
+def test_spec_editor_rules_are_gone() -> None:
+    """The spec editor's rules went with the editor.
+
+    A rule for a box that is no longer on the page is a rule nobody
+    can see take effect.
+    """
+    css = _source(_STYLE_CSS)
+    for selector in REMOVED_SPEC_STYLE_CLASSES:
+        assert selector not in css, f"样式表还留着 {selector} 的规则"
 
 
 def test_asset_versions_are_incremented() -> None:

@@ -41,9 +41,11 @@ So the driver counts what the page itself did:
 * the **requests the page issued** — a panel that acted on something
   would have asked the server to do something, and the case asserts
   that it did not;
-* the **navigations the page made** — a page that reloaded itself would
+* the **loads the page made** — a page that reloaded itself would
   show the new state for the wrong reason, and the case asserts that
-  it was loaded once and never again.
+  it was loaded once and never again.  The address the panel writes for
+  itself (``#/scheduler``) is a same-document change: it is not a
+  load, and the case counts loads rather than URL changes.
 
 What is real here
 -----------------
@@ -202,9 +204,20 @@ watch_seconds = float(sys.argv[4])
 poll_seconds = float(sys.argv[5])
 screens.mkdir(parents=True, exist_ok=True)
 
-#: The navigations the page made.  One is the load; a second one would
-#: be a reload, which would show the new state for the wrong reason.
-navigations = []
+#: The document loads the page made.  One is the load; a second one
+#: would be a reload, which would show the new state for the wrong
+#: reason.  A **load** is counted, not a URL change: the panel writes
+#: its own address (#/scheduler) when it is opened, and that is a
+#: same-document change — the page is not reloaded, the document is the
+#: same one, and the browser reports it as a navigation all the same.
+#: The load event is the honest signal for "the document was loaded
+#: again".
+loads = []
+
+#: The URLs the page was at, in order.  The address the panel writes
+#: itself shows up here; the loads above say whether the document was
+#: ever replaced.
+urls = []
 
 #: The action requests the page issued.  A panel that acted on
 #: something would have asked the server to do something.
@@ -214,9 +227,14 @@ with sync_playwright() as driver:
     browser = driver.chromium.launch()
     page = browser.new_page()
 
+    def on_load():
+        loads.append(page.url)
+
     def on_navigation(frame):
         if frame == page.main_frame:
-            navigations.append(frame.url)
+            urls.append(frame.url)
+
+    page.on("load", on_load)
 
     def on_request(request):
         url = request.url
@@ -296,7 +314,8 @@ with sync_playwright() as driver:
         "api_queue_after": api_after.get("queue_length"),
         "api_head_seq": head_seq,
         "page_action_requests": actions,
-        "page_navigations": len(navigations),
+        "page_navigations": len(loads),
+        "page_urls": urls,
     }, ensure_ascii=False))
     browser.close()
 '''
@@ -572,8 +591,8 @@ def test_panel_updates_itself_without_a_click(panel_world):
         f"not to act"
     )
     assert report["page_navigations"] == 1, (
-        f"the page navigated {report['page_navigations']} times; it was to "
-        f"be loaded once and never reloaded"
+        f"the page was loaded {report['page_navigations']} times; it was "
+        f"to be loaded once and never reloaded"
     )
 
     # -- the evidence: the two screenshots the case was asked to keep ------

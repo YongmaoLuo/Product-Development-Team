@@ -3414,6 +3414,27 @@
         "summary": "Set Capacity"
       }
     },
+    "/api/scheduler/finishing": {
+      "get": {
+        "description": "Answer with the plans that are being finished.\n\nThe finishing stage is a phase of a plan's life, and it is a phase\nthe read model above does not carry: a plan being finished holds\nno slot and waits for no capacity, so it is in neither the queue\nnor the running list.  This endpoint is where those plans are\nnamed, and it names them with the two things an operator needs\nabout each of them:\n\n* the **phase** \u2014 \u6536\u5c3e\u4e2d or \u6536\u5c3e\u5931\u8d25 \u2014 so a plan whose finishing\n  stage failed is not mistaken for a plan that is still working;\n* the **waiting rows** \u2014 the questions the stage is waiting on,\n  with the three operations the waiting table offers.\n\nThe answer is a **read**: it starts no subprocess, opens no\ndatabase of its own beyond the routing table it is asked about,\nand writes nothing.  A plan that is not being finished is not in\nit, and no finishing plan at all is an empty list rather than an\nerror \u2014 the panel polls this endpoint, and an endpoint that fails\nwhen there is nothing to report leaves the operator with a broken\npanel and no way to tell an idle stage from a broken one.",
+        "operationId": "get_scheduler_finishing_api_scheduler_finishing_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Scheduler Finishing Api Scheduler Finishing Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Scheduler Finishing"
+      }
+    },
     "/api/scheduler/plan/{plan_id}/detail": {
       "get": {
         "description": "Answer with one plan's progress \u2014 the card's own wording.\n\nThe scheduler's read model says **which** plans are queued and\nwhich are running.  When the operator opens one of them, the panel\nasks a second question \u2014 \"what is this plan doing right now?\" \u2014 and\nthat answer already exists: it is the Feishu progress card's body,\nthe same three sections (where the plan is, how the tasks are\ncounted, what is running this moment), worded by the same builders.\n\nSo this endpoint grows no second phrasing of it.  It asks the plan's\nstatus for where the plan is, asks the card's builder\n(``cards.build_progress_lines``) for the wording, and hands both on.\nA panel and a card that read the same lines cannot disagree about\nwhat a plan is doing.\n\nIt is a **read**, and it reads one thing only: the routing row's\nphase is the same before the call and after it.  A detail endpoint\nthat stamped a phase would be a second writer of the plan's state.\n\nTwo refusals, and they are told apart:\n\n* a **malformed** id is a bad request \u2014 the shared guard's own 400,\n  left alone;\n* a plan that is **not there** is a 404 that says so.\n\nA refusal of the third kind \u2014 this instance may not say whether the\nplan exists \u2014 travels on unchanged: it is the plans route's answer\nabout **its** data plane, and re-wording it here would replace a\ntrue statement with a vaguer one.",

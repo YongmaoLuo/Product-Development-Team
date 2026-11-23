@@ -938,8 +938,23 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # `shasum -a 256 frontend/app.js` 实测值，不是抄来的。表内条目集合与断言强度不变：
     # 被钉文件的范围不变、sha256 仍逐字节比对，该文件此后仍被逐字节钉住，任何再编辑
     # 照样红。
+    # 2026-11-23（本次合并 origin/main@446635d3 —— PR #193「调度页收尾分区」）：
+    # base 侧也改了 `frontend/app.js`（新增 `loadSchedulerFinishing` /
+    # `renderSchedulerFinishing` 与 `schedulerSyncUrl` / `handleSchedulerHashChange`，
+    # 抽出 `schedulerWaitingActions` 共用函数，删掉要求书那一段），与本分支的
+    # 「恢复/启动标签与结果文案」落在**不同位置**，互不覆盖，故两边都保留；文件内容
+    # 因此再次变化，按本 gate 的既定流程把冻结基线前移到**合并态**哈希
+    # （`shasum -a 256` 实测值）。前移的两端都记在这里：基线由 `dfabb438…`（本分支
+    # 合并前的批准态）移到 `c784b2f8…`（合并后的批准态）。
+    # 表内条目集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
+    # 2026-11-23：因本次「调度页收尾分区 + 调度视图 URL + 删掉要求书编辑框」改动
+    # `frontend/app.js`（新增 `loadSchedulerFinishing` / `renderSchedulerFinishing`
+    # 与 `schedulerSyncUrl` / `handleSchedulerHashChange`，抽出 `schedulerWaitingActions`
+    # 共用函数，删掉要求书那一段），按本 gate 的既定流程把冻结基线前移到本分支的
+    # 批准态。哈希取自工作区文件的 `shasum -a 256` 实测值，不是抄来的。表内条目
+    # 集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
     "frontend/app.js": (
-        "dfabb4388a35ae4097cbd9e00cd079e1ab9a2cabfb2676ad5fdb40138d496470"
+        "c784b2f8da98f1ee44929a40029abdbbebbd1fd1bb9059ca74a392fc68a33364"
     ),
     # 2026-11-01：因「调度卡片容器与收起态样式」（task-11）改动了 `frontend/style.css`，
     # 按本 gate 的既定流程把哈希前移到本分支的批准态；表内条目集合不变。
@@ -996,8 +1011,12 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # `.phase-archived`），按本 gate 的既定流程把冻结基线前移到本分支的批准态。
     # 哈希取自工作区文件的 `shasum -a 256` 实测值，不是抄来的。表内条目集合与断言
     # 强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
+    # 2026-11-23：因本次改动删掉了要求书编辑框的 `.scheduler-spec-*` 样式、并新增
+    # 收尾卡片的 `.scheduler-finishing-*` 样式，改动了 `frontend/style.css`，
+    # 按本 gate 的既定流程把冻结基线前移到本分支的批准态。哈希取自工作区文件的
+    # `shasum -a 256` 实测值，不是抄来的。表内条目集合不变。
     "frontend/style.css": (
-        "626864d268af3dd1f03ffdf736f8882d1e3c0845f33a5a24b44f1336911c8de2"
+        "8f867c72aa08ca46bd0db2b56e230cd3a27bea9078d6b0e41f1ee306179c2c36"
     ),
     # 2026-10-31：因本分支新增 `_repair_exit_writer`（修复轮退出事件的单一写入器）
     # 改动本文件，按本 gate 的既定流程重新钉住该文件的哈希。
@@ -1511,8 +1530,13 @@ FROZEN_SCHEDULER_SURFACE_SHA256: dict[str, str] = {
     # 该文件只被 base 侧改动（本分支未动它），合并后的内容与 base 侧一致；按本 gate
     # 的既定流程把冻结基线钉在**合并态**哈希（`shasum -a 256` 实测值）。
     # 表内条目集合与断言强度不变：被钉文件的范围不变、sha256 逐字节比对。
+    # 2026-11-23：因本次改动在调度视图里新增「收尾」分区（`scheduler-finishing-cards`
+    # / `scheduler-finishing-empty`）并删掉「要求书」编辑框，改动了
+    # `frontend/index.html`，按本 gate 的既定流程把冻结基线前移到本分支的批准态。
+    # 哈希取自工作区文件的 `shasum -a 256` 实测值，不是抄来的。表内条目集合与断言
+    # 强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
     "frontend/index.html": (
-        "f8c07759d90a2a0eb4edc790f0a62e6877123f2532d39e5c215a5e7cf629168f"
+        "f219545e11e47aacae6b011adcc025188b6a2ce8d3da1b8fcf6f24019325486d"
     ),
 }
 

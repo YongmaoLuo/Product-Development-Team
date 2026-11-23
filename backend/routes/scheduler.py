@@ -13,6 +13,12 @@ The wording is the Feishu card's own — the panel and the card cannot
 disagree about what a plan is doing — and asking for it is a **read**:
 it writes nothing.
 
+``GET /api/scheduler/finishing`` — the plans that are being **finished**:
+the ones in the finishing stage, with the phase they are in and the
+questions they are waiting on.  They are in no queue and in no running
+line, so the read model below cannot name them — a plan being finished
+holds no slot and waits for no capacity.
+
 ``POST /api/scheduler/capacity`` — the operator's capacity knob: how
 many plans may run at the same time, written while the scheduler runs.
 
@@ -40,6 +46,12 @@ read the database: it asks the engine for its snapshot and hands the
 answer on.  A second reader would be a second answer to the same
 question, and the only way of telling the two apart would be to watch a
 plan start in the wrong order.
+
+The finishing endpoint is the one place that reads a row of its own:
+the plans that are being finished are not in the read model at all,
+and their phase lives in the routing table — the same table the plans
+listing reads, so the phase here and the phase in the sidebar are the
+same fact.
 
 The same goes for the actions.  The **policy** — what a promotion is,
 who may be interrupted, what a start does when the capacity is full —
@@ -217,7 +229,7 @@ from plan_scheduler.commands import (
 )
 from plan_scheduler.capacity import CAPACITY_OVERRIDE_KEY
 from plan_scheduler.engine import FAILED, PENDING_ANSWER
-from plan_scheduler.snapshot import build
+from plan_scheduler.snapshot import build, postprocess_summary
 
 # The finishing stage's waiting lifecycle.  The registry is the one
 # thing that may move a deadline, append an audit entry or give up on
@@ -424,6 +436,158 @@ def get_scheduler_state(request: Request) -> Dict[str, Any]:
         return _state_with_waiting(_with_phase_labels(_empty_snapshot()))
 
     return _state_with_waiting(_with_phase_labels(dict(snapshot)))
+
+
+# ---------------------------------------------------------------------------
+# The finishing plans
+# ---------------------------------------------------------------------------
+#
+# A plan that has a requirement book enters the finishing stage
+# (``post_processing``) and leaves it as ``completed`` — or stays in
+# ``postprocess_failed`` when a required item did not pass.  Neither
+# phase holds a slot and neither is a run: a plan that is being
+# finished is in no queue and in no running line, so the two blocks
+# above cannot show it, and an operator cannot see that a plan has
+# reached the finishing stage at all.
+#
+# The phase is read from the **routing table** — the same table the
+# plans listing reads (``plan_routing.current_phase``) — and not from
+# a scan of the plans directory: the phase is the workflow's own
+# answer, and it lives in exactly one place.
+
+
+#: The phases that mean "this plan is being finished".
+FINISHING_PHASES = ("post_processing", "postprocess_failed")
+
+#: The label each of those phases is drawn with.  The words are the
+#: panel's, and they are said once here: the same phase must not be
+#: labelled two ways in two places.
+FINISHING_PHASE_LABELS = {
+    "post_processing": "收尾中",
+    "postprocess_failed": "收尾失败",
+}
+
+
+def _finishing_rows(request: Request) -> List[Dict[str, Any]]:
+    """The routing rows of the plans that are being finished.
+
+    The rows come from the routing table — the one the plans listing
+    reads — so the phase in this answer and the phase in the sidebar
+    are the same fact and cannot tell two different stories.
+
+    A routing table that cannot be opened is not a failure of the
+    panel: the endpoint answers with no finishing plans and the panel
+    shows its empty state.  The panel polls this endpoint every five
+    seconds, so a refusal here would be a refusal five times a minute
+    for as long as the operator sat there watching.
+    """
+    try:
+        sm = _server._open_state_machine(request)
+    except Exception:  # noqa: BLE001 — the panel must keep answering
+        logger.exception("the state machine could not be opened")
+        return []
+    try:
+        if sm is None:
+            return []
+        # ``data_dir`` is left out on purpose: the archived section of
+        # the listing carries no phase at all (an archived plan is not
+        # in the state machine), so it can never be a finishing plan,
+        # and scanning the plans tree on every poll would be a cost
+        # paid for an answer that cannot change the result.
+        rows = sm[1].list_all()
+    except Exception:  # noqa: BLE001 — the panel must keep answering
+        logger.exception("the routing table could not be read")
+        return []
+    finally:
+        _server._close_state_machine(sm)
+
+    return [
+        row
+        for row in rows
+        if str(row.get("current_phase") or "").strip() in FINISHING_PHASES
+    ]
+
+
+def _finishing_waits(plan_id: str) -> List[Dict[str, Any]]:
+    """One plan's pending waiting rows.
+
+    The rows are the panel's own rows — the very ones the waiting
+    table draws — so the finishing block and the waiting block cannot
+    tell two different stories about what a plan is waiting for.
+
+    A plan whose wait records cannot be read is listed with no waits
+    rather than not listed at all: the plan **is** being finished, and
+    that is the fact this section is here to answer.
+    """
+    try:
+        return plan_waiting_rows(plan_id)
+    except Exception:  # noqa: BLE001 — one bad plan must not 500 the page
+        logger.warning(
+            "the waiting rows of plan %s could not be read", plan_id
+        )
+        return []
+
+
+def _finishing_summary(plan_id: str) -> Optional[Dict[str, Any]]:
+    """One plan's terminal summary, or ``None`` when it has none.
+
+    A plan that is still being finished has no terminal report yet —
+    that is an ordinary state, not an error — and a report that cannot
+    be read is a plan whose verdicts were destroyed, which is also not
+    a reason to fail the whole answer.
+    """
+    try:
+        return postprocess_summary(plan_id, plans_dir=resolve_plans_dir())
+    except Exception:  # noqa: BLE001 — one bad report must not 500 the page
+        logger.warning(
+            "the terminal report of plan %s could not be read", plan_id
+        )
+        return None
+
+
+@router.get("/api/scheduler/finishing")
+def get_scheduler_finishing(request: Request) -> Dict[str, Any]:
+    """Answer with the plans that are being finished.
+
+    The finishing stage is a phase of a plan's life, and it is a phase
+    the read model above does not carry: a plan being finished holds
+    no slot and waits for no capacity, so it is in neither the queue
+    nor the running list.  This endpoint is where those plans are
+    named, and it names them with the two things an operator needs
+    about each of them:
+
+    * the **phase** — 收尾中 or 收尾失败 — so a plan whose finishing
+      stage failed is not mistaken for a plan that is still working;
+    * the **waiting rows** — the questions the stage is waiting on,
+      with the three operations the waiting table offers.
+
+    The answer is a **read**: it starts no subprocess, opens no
+    database of its own beyond the routing table it is asked about,
+    and writes nothing.  A plan that is not being finished is not in
+    it, and no finishing plan at all is an empty list rather than an
+    error — the panel polls this endpoint, and an endpoint that fails
+    when there is nothing to report leaves the operator with a broken
+    panel and no way to tell an idle stage from a broken one.
+    """
+    plans: List[Dict[str, Any]] = []
+
+    for row in _finishing_rows(request):
+        plan_id = str(row.get("plan_id") or "").strip()
+        phase = str(row.get("current_phase") or "").strip()
+        if not plan_id:
+            continue
+        plans.append(
+            {
+                "plan_id": plan_id,
+                "phase": phase,
+                "phase_label": FINISHING_PHASE_LABELS.get(phase, phase),
+                "postprocess": _finishing_summary(plan_id),
+                "waits": _finishing_waits(plan_id),
+                "updated_at": str(row.get("updated_at") or ""),
+            }
+        )
+
+    return {"plans": plans}
 
 
 # ---------------------------------------------------------------------------

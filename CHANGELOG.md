@@ -20,6 +20,21 @@ machine may execute, stops being what grants the read.
 
 ### Added
 
+- **The scheduler panel has a 「收尾」 section of its own.** A plan that is
+  being finished holds no slot and waits for no capacity, so it was in
+  neither the queue nor the running list, and an operator could not see
+  that a plan had reached the finishing stage at all. `GET
+  /api/scheduler/finishing` (`backend/routes/scheduler.py`) names those
+  plans — the phase they are in, 收尾中 or 收尾失败 — and the questions
+  they wait on, with the same 延长 / 终止 / 回答 operations the waiting
+  table offers. The panel draws it in `frontend/index.html` and
+  `frontend/app.js`.
+
+- **The scheduler view has an address of its own.** Clicking the panel
+  writes `#/scheduler` into the URL (`frontend/app.js`), so a refresh
+  comes back to the panel instead of losing it; a `hashchange` to
+  anything else goes back to the plan list.
+
 - **`backend.secret_launcher` reads the keychain once, then becomes the
   server.** It resolves each notification secret, writes the values onto
   anonymous pipes, names the descriptors in the environment, and `exec`s
