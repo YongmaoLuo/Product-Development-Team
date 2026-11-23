@@ -241,6 +241,16 @@ _PHASE_LABEL = {
     # 不是终态：停的动作已经发生，停的结果还没落地。卡片上要说得出来，
     # 否则标题退回相位名本身，读者看到的是裸英文 ``user_stopping``。
     "user_stopping": "🛑 正在停止",
+    # 2026-11-23: the finishing (post-processing) window.  A plan that
+    # declares a requirement book runs its finishing stage AFTER the
+    # verification verdict, and during that stage
+    # ``verification_status`` is still ``running`` — the verdict is not
+    # recorded until the stage closes.  Without these two labels the
+    # header said 「🔄 验证中」 for the whole stage, and a failed
+    # finishing stage said nothing at all (the card froze).
+    "post_processing": "🧹 收尾中",
+    # Parked, NOT terminal: a human decides whether to resume it.
+    "postprocess_failed": "⚠️ 收尾失败",
     # Terminal vocabulary.
     "verification_passed": "✅ 验证通过",
     "verification_failed": "❌ 验证失败",
@@ -1070,6 +1080,27 @@ def _resolve_header(
     # snapshot, which reads the same record the watchdog and
     # ``/api/system/active`` read.
     execution_in_flight = status.execution_in_flight
+
+    # 2026-11-23: the finishing (post-processing) window.  Both branches
+    # live ABOVE the verification-verdict branches on purpose:
+    #
+    # * ``post_processing`` — the finishing stage runs while
+    #   ``verification_status`` is still ``running`` (the verdict is not
+    #   recorded until the stage closes), so the header would say
+    #   「🔄 验证中」 for the whole stage.  The status may also read
+    #   ``passed`` — either way the phase must not be hidden.
+    # * ``postprocess_failed`` — the plan is PARKED, not closed: the
+    #   verification itself passed, the finishing stage did not.  The
+    #   generic failed branch below would say 「❌ 验证失败」, which is
+    #   false.
+    if phase == "post_processing":
+        return {"title": f"✅ 验证通过 · 🧹 收尾中 · {plan_id}", "color": "blue"}
+    if phase == "postprocess_failed":
+        return {
+            "title": f"⚠️ 收尾失败（待决定是否续跑）· {plan_id}",
+            "color": "orange",
+        }
+
     if verification_status == "passed" and not execution_in_flight:
         return {"title": f"✅ 验证通过 · {plan_id}", "color": "green"}
     # 2026-09-19: the "⏹ 循环停止" check moved ABOVE the generic

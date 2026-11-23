@@ -7367,6 +7367,27 @@ def _settle_postprocess_phase(plan_id: str, plan_dir: Any) -> None:
         phase_target=POSTPROCESS_FAILED,
         publish_closed=False,
     )
+    # 2026-11-23: the plan is PARKED at ``postprocess_failed`` — the
+    # routing CAS inside ``_record_verification_terminal`` expects the
+    # row to still be in a verification phase, so it does NOT fire a
+    # phase event here (the row reads ``post_processing`` already).
+    # Without this publish the card froze on its last wording for good.
+    try:
+        from notifications.state_events import (
+            KIND_PLAN_PHASE_CHANGED,
+            publish_safe,
+        )
+        publish_safe(
+            KIND_PLAN_PHASE_CHANGED,
+            plan_id,
+            phase=POSTPROCESS_FAILED,
+            previous_phase=POST_PROCESSING,
+        )
+    except Exception:  # noqa: BLE001 — a notification failure is not a stage failure
+        _server.logger.warning(
+            "[postprocess] plan=%s could not publish the phase change to %s",
+            plan_id, POSTPROCESS_FAILED, exc_info=True,
+        )
 
 
 def _handle_passed_round(
@@ -7452,6 +7473,30 @@ def _handle_passed_round(
             ps.transition_to(POST_PROCESSING)
         except ValueError:
             ps.force_set_phase(POST_PROCESSING)
+        # 2026-11-23: announce the phase change so the card stops saying
+        # 「🔄 验证中」 for the whole finishing stage.  The event is
+        # published HERE and not inside ``plan_state._transition_to`` on
+        # purpose: the generic path would fire an event for EVERY phase
+        # change in the system.
+        #
+        # The publish is best-effort — a broken notifier must never break
+        # the finishing stage.
+        try:
+            from notifications.state_events import (
+                KIND_PLAN_PHASE_CHANGED,
+                publish_safe,
+            )
+            publish_safe(
+                KIND_PLAN_PHASE_CHANGED,
+                plan_id,
+                phase=POST_PROCESSING,
+                previous_phase="verification_running",
+            )
+        except Exception:  # noqa: BLE001 — a notification failure is not a stage failure
+            _server.logger.warning(
+                "[postprocess] plan=%s could not publish the phase change "
+                "to %s", plan_id, POST_PROCESSING, exc_info=True,
+            )
         _server.logger.info(
             "[postprocess] plan=%s enters the finishing stage (phase=%s)",
             plan_id, POST_PROCESSING,
