@@ -929,6 +929,24 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # `hashlib.sha256(Path("frontend/app.js").read_bytes()).hexdigest()` 实测值，
     # 不是抄来的。表内条目集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节
     # 比对，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-23：因已批准的「恢复/启动标签与结果文案」改动（`SCHEDULER_ACTION_LABELS`
+    # 把「恢复」写成「恢复排队」、「启动」写成「立即启动（可抢占）」；新增
+    # `SCHEDULER_ACTION_HINTS` 与 `schedulerActionHint()` 并给按钮加上 `title` 提示；
+    # 新增 `SCHEDULER_OUTCOME_TEXT` 与 `schedulerOutcomeText()`，结果区把英文 token 翻成
+    # 中文句子，`schedulerDetailText()` 改为接收整个 `result`）改动了 `frontend/app.js`，
+    # 按本 gate 的既定流程把冻结基线前移到本分支的批准态。哈希取自工作区文件的
+    # `shasum -a 256 frontend/app.js` 实测值，不是抄来的。表内条目集合与断言强度不变：
+    # 被钉文件的范围不变、sha256 仍逐字节比对，该文件此后仍被逐字节钉住，任何再编辑
+    # 照样红。
+    # 2026-11-23（本次合并 origin/main@446635d3 —— PR #193「调度页收尾分区」）：
+    # base 侧也改了 `frontend/app.js`（新增 `loadSchedulerFinishing` /
+    # `renderSchedulerFinishing` 与 `schedulerSyncUrl` / `handleSchedulerHashChange`，
+    # 抽出 `schedulerWaitingActions` 共用函数，删掉要求书那一段），与本分支的
+    # 「恢复/启动标签与结果文案」落在**不同位置**，互不覆盖，故两边都保留；文件内容
+    # 因此再次变化，按本 gate 的既定流程把冻结基线前移到**合并态**哈希
+    # （`shasum -a 256` 实测值）。前移的两端都记在这里：基线由 `dfabb438…`（本分支
+    # 合并前的批准态）移到 `c784b2f8…`（合并后的批准态）。
+    # 表内条目集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
     # 2026-11-23：因本次「调度页收尾分区 + 调度视图 URL + 删掉要求书编辑框」改动
     # `frontend/app.js`（新增 `loadSchedulerFinishing` / `renderSchedulerFinishing`
     # 与 `schedulerSyncUrl` / `handleSchedulerHashChange`，抽出 `schedulerWaitingActions`
@@ -936,7 +954,7 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 批准态。哈希取自工作区文件的 `shasum -a 256` 实测值，不是抄来的。表内条目
     # 集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
     "frontend/app.js": (
-        "c8ffe24d9ef057cec9b863d6ce135b28d5d22a47e6766d0b95923b3136eda094"
+        "c784b2f8da98f1ee44929a40029abdbbebbd1fd1bb9059ca74a392fc68a33364"
     ),
     # 2026-11-01：因「调度卡片容器与收起态样式」（task-11）改动了 `frontend/style.css`，
     # 按本 gate 的既定流程把哈希前移到本分支的批准态；表内条目集合不变。
