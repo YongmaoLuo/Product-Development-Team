@@ -89,6 +89,18 @@ half the readers never see.*
   three checks are no longer a step inside a lane whose name says nothing
   about the judgment surface.
 
+- **`backend/verification_loop.py` gains a bounded resume entry for the
+  finishing stage.** A plan parked in `postprocess_failed` used to have no
+  way out: the phase existed, but nothing could trigger it. A human can now
+  call the resume endpoint, which continues only the items the progress file
+  records as unfinished or failed — an item whose outward action already
+  succeeded is not performed again. Nothing resumes on its own, and the
+  number of resumes is capped by a fixed retry budget
+  (`backend/postprocess/retry_budget.py`): a resume repeats an outward
+  action (open a PR, push), and an unbounded loop of those is exactly what
+  this human-gated stage exists to prevent.
+
+
 ## [0.1.2] - 2026-10-07
 
 **What a run may touch, and what a green report proves.** Three capabilities

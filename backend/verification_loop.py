@@ -7214,6 +7214,73 @@ def _start_postprocess(plan_id: str) -> None:
     ).start()
 
 
+def resume_postprocess(plan_id: str) -> None:
+    """Continue the finishing stage (收尾阶段) for a parked plan.
+
+    The shape of this function is the shape of :func:`_start_postprocess`
+    — the same imports, the same orchestrator, the same background
+    thread, the same terminal exit.  There is exactly ONE difference:
+    ``orchestrator.resume()`` instead of ``orchestrator.start()``.
+
+    Why the difference matters, in one sentence: ``resume()`` repeats
+    only the items the progress file records as **unfinished or failed**
+    — an item whose outward action already succeeded is not done again,
+    because doing it again would repeat that action — while ``start()``
+    recomputes the **first round** from scratch.
+
+    The stage runs on a **daemon thread** for the same reason it does
+    in ``_start_postprocess``: it performs outward actions (open a PR,
+    push) and may have to wait for a human, so it must not block the
+    caller (the verification chain's thread, or an HTTP request thread).
+
+    Nothing here triggers a resume on its own: the only caller is the
+    route a human calls explicitly.  A5 forbids repeating an action
+    behind a human's back.
+
+    Args:
+        plan_id: The plan the stage continues for.
+    """
+    def _run() -> None:
+        try:
+            # The imports live here, not in the function body: a broken
+            # finishing subsystem must not rewrite the plan's phase.
+            from postprocess.executor import CommandRunner
+            from postprocess.orchestrator import PostProcessOrchestrator
+            from postprocess.spec import freeze, load_spec
+
+            plan_dir = _server._plan_dir(plan_id)
+            frozen = freeze(load_spec(plan_dir))
+            # The commands of the book run in the plan's project — the
+            # repository the plan was executed in.  A plan that has no
+            # project has no repository to act on; the plan directory is
+            # then the workspace, and the command says so itself.
+            workspace = _server._get_project_dir(plan_id) or plan_dir
+            orchestrator = PostProcessOrchestrator(
+                plan_id,
+                plan_dir=plan_dir,
+                executor=CommandRunner(frozen, workspace=workspace),
+                sink=_postprocess_notification_sink(plan_dir),
+            )
+            try:
+                # ``resume()`` continues what the files on disk say is
+                # unfinished (or failed); ``start()`` would recompute
+                # the first round.
+                orchestrator.resume()
+            finally:
+                # The stage owns the terminal exit here too: whatever it
+                # decided, the plan's phase follows the report it wrote.
+                _settle_postprocess_phase(plan_id, plan_dir)
+        except Exception:  # noqa: BLE001 — the stage's own failure
+            _server.logger.exception(
+                "[postprocess] the finishing stage resume crashed plan=%s",
+                plan_id,
+            )
+
+    threading.Thread(
+        target=_server._run_in_plan_ctx, args=(plan_id, _run), daemon=True
+    ).start()
+
+
 def _postprocess_notification_sink(plan_dir: Any) -> Any:
     """The channel a finishing-stage failure travels — the plan's own route.
 
