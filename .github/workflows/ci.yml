@@ -3361,6 +3361,43 @@ jobs:
         run: bash scripts/ci_judgment_surface.sh --root .
 
   # ---------------------------------------------------------------------------
+  # PULL REQUEST COMMIT CAP
+  # ---------------------------------------------------------------------------
+  #
+  # A pull request is one decision a human reviews once. Past five commits
+  # its history stops reading as a single decision, and the per-commit CI
+  # record that makes a merge auditable is the first thing to go: fixups
+  # land inside the branch without ever being checked on their own.
+  #
+  # The cap asks for the squash at the moment the branch is opened, rather
+  # than asking a reviewer to reconstruct afterwards what the pull request
+  # did. Five is the number the owner set; it lives here as a literal in
+  # the step, not as a repository variable, so that raising it is a code
+  # change someone reviews.
+  #
+  # The count comes from the event payload (`pull_request.commits`) — the
+  # same number GitHub prints on the pull request — so this job needs no
+  # checkout and no git history.
+
+  pr-commit-cap:
+    name: Pull request carries at most five commits
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 5
+    steps:
+      - name: Enforce the commit cap
+        env:
+          COMMITS: ${{ github.event.pull_request.commits }}
+          CAP: "5"
+        run: |
+          set -euo pipefail
+          echo "pull request commits: ${COMMITS} (cap ${CAP})"
+          if [ "${COMMITS}" -gt "${CAP}" ]; then
+            echo "::error::this pull request carries ${COMMITS} commits; the cap is ${CAP}. Squash it before merging."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
   # STAGE 5 — MERGE GATE
   #
   # The single job branch protection requires. Everything above it can be
@@ -3429,6 +3466,7 @@ jobs:
       - static-gates
       - changelog-gate
       - judgment-surface-consistency
+      - pr-commit-cap
       - unit-tests
       - coverage-gate
       - integration-tests
