@@ -1,0 +1,625 @@
+{
+  "agent": {
+    "cases": [
+      {
+        "id": "declared-path-inside-the-project",
+        "out": []
+      },
+      {
+        "id": "declared-path-leaving-the-project",
+        "out": [
+          "backend/../elsewhere/y.py"
+        ]
+      },
+      {
+        "id": "no-declared-path-at-all",
+        "out": []
+      },
+      {
+        "id": "declared-file-exists-in-the-tree",
+        "out": []
+      },
+      {
+        "id": "declared-file-missing-from-the-tree",
+        "out": [
+          "backend/never_written.py"
+        ]
+      },
+      {
+        "id": "no-declared-files-at-all",
+        "out": []
+      }
+    ]
+  },
+  "buckets": {
+    "cases": [
+      {
+        "id": "code-review-point-lands-in-the-review-bucket",
+        "out": {
+          "completed_vps": [
+            "VP-159"
+          ],
+          "deferred_vps": [],
+          "failed_vps": [],
+          "skipped_vps": []
+        }
+      },
+      {
+        "id": "command-point-lands-in-the-command-bucket",
+        "out": {
+          "completed_vps": [
+            "VP-160"
+          ],
+          "deferred_vps": [],
+          "failed_vps": [],
+          "skipped_vps": []
+        }
+      },
+      {
+        "id": "browser-point-lands-in-the-ui-bucket",
+        "out": {
+          "completed_vps": [
+            "VP-161"
+          ],
+          "deferred_vps": [],
+          "failed_vps": [],
+          "skipped_vps": []
+        }
+      },
+      {
+        "id": "unknown-method-lands-in-the-default-bucket",
+        "out": {
+          "completed_vps": [
+            "VP-162"
+          ],
+          "deferred_vps": [],
+          "failed_vps": [],
+          "skipped_vps": []
+        }
+      },
+      {
+        "id": "command-entry-exit-nonzero",
+        "out": {
+          "completed_vps": [],
+          "deferred_vps": [],
+          "failed_vps": [
+            "VP-102"
+          ],
+          "skipped_vps": []
+        }
+      },
+      {
+        "id": "non-dict-verdict-is-handed-back",
+        "out": {
+          "completed_vps": [],
+          "deferred_vps": [],
+          "failed_vps": [],
+          "skipped_vps": []
+        }
+      }
+    ]
+  },
+  "ci_runner": {
+    "cases": [
+      {
+        "id": "e2e-kind-interpreted-as-command",
+        "out": "command"
+      },
+      {
+        "id": "a-point-without-an-e2e-kind-is-a-browser-flow",
+        "out": "browser"
+      },
+      {
+        "id": "the-entry-asks-for-the-whole-gate",
+        "out": "all"
+      },
+      {
+        "id": "a-python-test-belongs-to-the-unit-lane",
+        "out": [
+          "backend/tests/unit"
+        ]
+      },
+      {
+        "id": "a-path-like-token-is-recognized",
+        "out": true
+      },
+      {
+        "id": "a-failing-test-counts-as-a-blocking-failure",
+        "out": 1
+      },
+      {
+        "id": "a-skipped-test-is-not-a-blocking-failure",
+        "out": 0
+      },
+      {
+        "id": "an-empty-report-names-no-failure",
+        "out": 0
+      },
+      {
+        "id": "a-gate-that-could-not-decide-is-inconclusive",
+        "out": true
+      },
+      {
+        "id": "a-failure-shape-keeps-the-test-name",
+        "out": "backend/tests/unit/test_judgment_corpus.py::test_corpus_has_no_plan_id_or_absolute_path"
+      }
+    ]
+  },
+  "evidence": {
+    "cases": [
+      {
+        "id": "command-entry-exit-zero",
+        "out": true
+      },
+      {
+        "id": "command-entry-exit-nonzero",
+        "out": true
+      },
+      {
+        "id": "command-evidence-records-another-command",
+        "out": false
+      },
+      {
+        "id": "command-evidence-without-exit-code",
+        "out": false
+      },
+      {
+        "id": "command-evidence-is-not-a-dict",
+        "out": false
+      },
+      {
+        "id": "ci-entry-exit-zero",
+        "out": true
+      },
+      {
+        "id": "projected-command-record-carries-exit-code",
+        "out": true
+      },
+      {
+        "id": "projected-raw-line-is-prose-only",
+        "out": false
+      },
+      {
+        "id": "point-without-declared-entry",
+        "out": false
+      }
+    ]
+  },
+  "executor": {
+    "cases": [
+      {
+        "id": "a-passed-verdict-is-a-round-conclusion",
+        "out": true
+      },
+      {
+        "id": "a-failed-verdict-is-a-round-conclusion",
+        "out": true
+      },
+      {
+        "id": "a-deferred-marker-is-not-a-round-conclusion",
+        "out": false
+      },
+      {
+        "id": "a-passed-verdict-needs-no-further-dispatch",
+        "out": []
+      },
+      {
+        "id": "a-failed-verdict-needs-no-further-dispatch",
+        "out": []
+      },
+      {
+        "id": "a-deferred-verdict-needs-another-dispatch",
+        "out": [
+          "VP-154"
+        ]
+      },
+      {
+        "id": "a-verdict-without-a-round-number-is-round-zero",
+        "out": 0
+      },
+      {
+        "id": "a-later-conclusion-does-not-keep-the-earlier-one",
+        "out": false
+      },
+      {
+        "id": "a-deferred-marker-in-the-same-round-tops-the-earlier-conclusion",
+        "out": false
+      },
+      {
+        "id": "the-deferred-layer-order-is-stable",
+        "out": [
+          [
+            "VP-153"
+          ],
+          [
+            "VP-154"
+          ],
+          [
+            "VP-155"
+          ],
+          [
+            "VP-156"
+          ],
+          [
+            "VP-157"
+          ],
+          [
+            "VP-158"
+          ]
+        ]
+      },
+      {
+        "id": "a-full-ci-point-is-promoted-to-the-final-gate",
+        "out": {
+          "gates": [
+            {
+              "id": "VP-170",
+              "phase_order": 1
+            },
+            {
+              "id": "VP-171",
+              "phase_order": 2
+            },
+            {
+              "id": "VP-172",
+              "phase_order": 3
+            },
+            {
+              "id": "VP-173",
+              "phase_order": 4
+            },
+            {
+              "id": "VP-174",
+              "phase_order": 5
+            },
+            {
+              "id": "VP-175",
+              "phase_order": 6
+            }
+          ],
+          "missing_phase_order": [
+            "VP-170",
+            "VP-171",
+            "VP-172",
+            "VP-173",
+            "VP-174",
+            "VP-175"
+          ],
+          "phase1": 0,
+          "phase2": 6,
+          "phase_promoted": [
+            {
+              "id": "VP-170",
+              "method": "full_ci"
+            },
+            {
+              "id": "VP-171",
+              "method": "full_ci"
+            },
+            {
+              "id": "VP-172",
+              "method": "full_ci"
+            },
+            {
+              "id": "VP-173",
+              "method": "full_ci"
+            },
+            {
+              "id": "VP-174",
+              "method": "full_ci"
+            },
+            {
+              "id": "VP-175",
+              "method": "full_ci"
+            }
+          ],
+          "total": 6
+        }
+      },
+      {
+        "id": "the-final-gates-keep-their-plan-order",
+        "out": [
+          [],
+          [
+            "VP-170",
+            "VP-171",
+            "VP-172",
+            "VP-173",
+            "VP-174",
+            "VP-175"
+          ]
+        ]
+      }
+    ]
+  },
+  "loop": {
+    "cases": [
+      {
+        "id": "a-question-without-a-deadline-never-expires",
+        "out": false
+      },
+      {
+        "id": "deadline-not-reached-keeps-the-round-running",
+        "out": false
+      },
+      {
+        "id": "deadline-reached-ends-the-round",
+        "out": true
+      },
+      {
+        "id": "a-deadline-reached-exactly-now-has-passed",
+        "out": true
+      },
+      {
+        "id": "a-deadline-without-a-timezone-is-read-as-utc",
+        "out": false
+      },
+      {
+        "id": "a-naive-deadline-in-the-past-has-passed",
+        "out": true
+      },
+      {
+        "id": "a-deadline-written-in-zulu-has-passed",
+        "out": true
+      },
+      {
+        "id": "an-unreadable-deadline-never-expires",
+        "out": false
+      },
+      {
+        "id": "a-snapshot-from-an-earlier-round-is-an-old-verdict",
+        "out": true
+      },
+      {
+        "id": "a-snapshot-from-the-live-round-is-not-an-old-verdict",
+        "out": false
+      },
+      {
+        "id": "a-snapshot-without-a-round-number-cannot-be-placed",
+        "out": false
+      },
+      {
+        "id": "the-stop-reason-comes-from-the-snapshot",
+        "out": "轮次超时"
+      },
+      {
+        "id": "a-snapshot-without-a-stop-reason-gets-the-placeholder",
+        "out": "verification_round_verdict_unrecorded"
+      },
+      {
+        "id": "a-missing-state-counts-as-a-gone-thread",
+        "out": true
+      },
+      {
+        "id": "a-live-thread-is-not-gone",
+        "out": false
+      },
+      {
+        "id": "a-dead-thread-is-gone",
+        "out": true
+      }
+    ]
+  },
+  "subagent": {
+    "cases": [
+      {
+        "id": "a-checkpoint-that-passed-is-not-named",
+        "out": []
+      },
+      {
+        "id": "checkpoint-summary-counts-the-failed-ones",
+        "out": [
+          "checkpoint[1]"
+        ]
+      },
+      {
+        "id": "a-checkpoint-without-a-boolean-passed-did-not-pass",
+        "out": [
+          "checkpoint[0]"
+        ]
+      },
+      {
+        "id": "a-checkpoint-that-is-not-a-mapping-is-skipped",
+        "out": [
+          "cp-2"
+        ]
+      },
+      {
+        "id": "a-checkpoint-with-a-written-id-answers-to-that-id",
+        "out": [
+          "cp-3"
+        ]
+      },
+      {
+        "id": "declared-timeout-comes-from-the-point",
+        "out": 600.0
+      },
+      {
+        "id": "a-point-that-declares-no-timeout-declares-nothing",
+        "out": null
+      },
+      {
+        "id": "a-timeout-of-zero-is-not-a-declaration",
+        "out": null
+      },
+      {
+        "id": "a-timeout-that-is-not-a-number-is-not-a-declaration",
+        "out": null
+      },
+      {
+        "id": "the-evidence-retry-block-quotes-the-frameworks-complaints",
+        "out": [
+          "Retry attempt — the previous attempt's EVIDENCE ARTIFACT did not satisfy the evidence contract. Your conclusion was not disputed: only the artifact you shipped with it was incomplete.",
+          "",
+          "DO NOT change the repository under verification: it is READ-ONLY for you, and a verification agent that edits what it is verifying is not a verification. Fix ONLY the evidence artifact:",
+          "    plans/demo/vp_artifacts/VP-180/citations.json",
+          "",
+          "The framework rejected these entries — each one is a concrete thing to complete, with the text it expects there:",
+          "  - [missing_snippet] citations[0] 缺少 snippet",
+          "",
+          "Rewrite plans/demo/vp_artifacts/VP-180/citations.json so every entry carries what the contract asks for (the quoted text you actually read there, the real line number, the path relative to the project root), then report the verdict again."
+        ]
+      },
+      {
+        "id": "the-evidence-retry-block-names-the-checkpoints-artifact",
+        "out": [
+          "Retry attempt — the previous attempt's EVIDENCE ARTIFACT did not satisfy the evidence contract. Your conclusion was not disputed: only the artifact you shipped with it was incomplete.",
+          "",
+          "DO NOT change the repository under verification: it is READ-ONLY for you, and a verification agent that edits what it is verifying is not a verification. Fix ONLY the evidence artifact:",
+          "    plans/demo/vp_artifacts/VP-183/checkpoints.json",
+          "",
+          "The framework rejected these entries — each one is a concrete thing to complete, with the text it expects there:",
+          "  - [missing_snippet] citations[0] 缺少 snippet",
+          "",
+          "Rewrite plans/demo/vp_artifacts/VP-183/checkpoints.json so every entry carries what the contract asks for (the quoted text you actually read there, the real line number, the path relative to the project root), then report the verdict again."
+        ]
+      },
+      {
+        "id": "a-method-that-owes-no-evidence-has-no-complaint",
+        "out": []
+      },
+      {
+        "id": "a-method-that-owes-evidence-but-has-no-artifact-has-no-complaint",
+        "out": []
+      }
+    ]
+  },
+  "verification_agent": {
+    "cases": [
+      {
+        "id": "split-verdicts-are-aggregated-into-one",
+        "out": {
+          "actual_result": "All split children PASSED",
+          "child_count": 2,
+          "id": "VP-186",
+          "reasons": [
+            "All split children PASSED"
+          ],
+          "status": "PASSED",
+          "subtask_results": [
+            {
+              "id": "split-1",
+              "status": "PASSED"
+            },
+            {
+              "id": "split-2",
+              "status": "PASSED"
+            }
+          ]
+        }
+      },
+      {
+        "id": "a-failed-split-child-fails-the-parent",
+        "out": {
+          "actual_result": "1 split child(ren) FAILED",
+          "child_count": 2,
+          "id": "VP-186",
+          "reasons": [
+            "1 split child(ren) FAILED"
+          ],
+          "requirement_deviations": [
+            {
+              "clause_index": null,
+              "description": "",
+              "evidence": "",
+              "severity": "high",
+              "type": "missing",
+              "verification_point_id": "split-2"
+            }
+          ],
+          "status": "FAILED",
+          "subtask_results": [
+            {
+              "id": "split-1",
+              "status": "PASSED"
+            },
+            {
+              "id": "split-2",
+              "status": "FAILED"
+            }
+          ]
+        }
+      },
+      {
+        "id": "all-skipped-split-children-leave-the-parent-split",
+        "out": {
+          "actual_result": "All split children SKIPPED",
+          "id": "VP-186",
+          "reasons": [
+            "All split children SKIPPED"
+          ],
+          "status": "SPLIT"
+        }
+      },
+      {
+        "id": "mixed-split-children-leave-the-parent-split",
+        "out": {
+          "actual_result": "Mixed split children statuses",
+          "child_count": 2,
+          "id": "VP-186",
+          "reasons": [
+            "Mixed split children statuses"
+          ],
+          "status": "SPLIT",
+          "subtask_results": [
+            {
+              "id": "split-1",
+              "status": "PASSED"
+            },
+            {
+              "id": "split-2",
+              "status": "SKIPPED"
+            }
+          ]
+        }
+      },
+      {
+        "id": "a-non-terminal-child-leaves-the-parent-split",
+        "out": {
+          "actual_result": "Mixed split children statuses",
+          "child_count": 1,
+          "id": "VP-186",
+          "reasons": [
+            "Mixed split children statuses"
+          ],
+          "status": "SPLIT",
+          "subtask_results": [
+            {
+              "id": "split-1",
+              "status": "timeout"
+            }
+          ]
+        }
+      },
+      {
+        "id": "an-empty-split-is-an-illegal-state",
+        "out": "ValueError"
+      },
+      {
+        "id": "attempt-count-comes-from-the-ledger",
+        "out": [
+          1,
+          2
+        ]
+      },
+      {
+        "id": "a-point-that-was-never-asked-has-no-attempt",
+        "out": 0
+      },
+      {
+        "id": "evidence-written-as-json-comes-back-as-a-dict",
+        "out": {
+          "citations": []
+        }
+      },
+      {
+        "id": "evidence-that-is-not-json-is-not-evidence",
+        "out": {}
+      },
+      {
+        "id": "evidence-that-is-not-a-mapping-is-not-evidence",
+        "out": {}
+      }
+    ]
+  }
+}
