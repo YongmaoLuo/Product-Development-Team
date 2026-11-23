@@ -1867,3 +1867,103 @@ class TestEndpointContractRegression:
             != by_id["VP-001"]["execution_group"]
         ), "ui_validation must be in a different group from automated_test"
 
+
+# ---------------------------------------------------------------------------
+# A plan the scheduler requeued: "queued" is a legitimate start source
+# ---------------------------------------------------------------------------
+
+
+def _read_routing_phase(plan_id):
+    """The plan's routing phase, read from the authoritative row."""
+    from server import _state_db_path
+    from state_machine.db.connection import open as open_db
+    from state_machine.repositories.routing_repository import RoutingRepository
+
+    conn = open_db(_state_db_path())
+    try:
+        row = RoutingRepository(conn).current(plan_id)
+        return (row or {}).get("current_phase")
+    finally:
+        conn.close()
+
+
+def _seed_queued_plan(sample_plan_factory, plan_sqlite_seeder, plan_id):
+    """A plan sitting on the phase the scheduler leaves a requeued plan on.
+
+    The scheduler requeues a stopped plan to ``queued`` and then admits
+    it again, so a plan that is resumed through the scheduler reaches
+    ``POST /start`` on ``queued`` — never on ``executing`` or on one of
+    the terminal phases.
+    """
+    plan_dir = sample_plan_factory(plan_id, phase="queued")
+    project_dir = plan_dir / "project"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    plan_sqlite_seeder(
+        plan_dir, plan_id, phase="queued", project_dir=project_dir,
+    )
+    return plan_dir, project_dir
+
+
+def test_start_accepts_a_queued_plan_carrying_a_verification_checkpoint(
+    sample_plan_factory, plan_sqlite_seeder, monkeypatch
+):
+    """A requeued plan that carries an interrupted round starts.
+
+    The scheduler's own resume path lands on ``queued``; without that
+    phase in the start's source set the endpoint answers
+    ``409 stage_mismatch`` every time, and the scheduler reads that
+    refusal as a permanent failure and prunes the plan back to
+    ``stopped`` — a plan that can never be started again.
+    """
+    plan_id = "queued-plan-with-checkpoint"
+    plan_dir, project_dir = _seed_queued_plan(
+        sample_plan_factory, plan_sqlite_seeder, plan_id,
+    )
+
+    from pause_state import write_pause_checkpoint
+
+    write_pause_checkpoint(
+        plan_dir,
+        kind="verification",
+        project_dir=str(project_dir),
+        reason="user_stopped",
+        verification_round=1,
+    )
+
+    monkeypatch.setattr("server.threading.Thread", FakeThread)
+    monkeypatch.setattr("server.VerificationOrchestrator", MagicMock())
+    # The auto-loop runs inline under the thread double and drives the
+    # routing row to its own terminal phase when the rounds are spent,
+    # which would hide the phase the start's CAS wrote.  Stubbing it
+    # leaves the routing row where the start left it.
+    monkeypatch.setattr("server._run_auto_verification_loop", MagicMock())
+
+    resp = client.post(f"/api/verification/{plan_id}/start")
+    assert resp.status_code == 200, resp.text
+
+    assert _read_routing_phase(plan_id) == "verification_running"
+
+    # The checkpoint this start honoured is retired: it is single-shot.
+    from pause_state import read_pause_checkpoint
+
+    assert read_pause_checkpoint(plan_dir) is None
+
+
+def test_start_refuses_a_queued_plan_without_a_verification_checkpoint(
+    sample_plan_factory, plan_sqlite_seeder, monkeypatch
+):
+    """``queued`` is only a source for a plan that carries a checkpoint.
+
+    The entry is conditional, so a plan that is not carrying an
+    interrupted verification round keeps the old source set and is
+    still refused with the existing ``409 stage_mismatch``.
+    """
+    plan_id = "queued-plan-without-checkpoint"
+    _seed_queued_plan(sample_plan_factory, plan_sqlite_seeder, plan_id)
+
+    monkeypatch.setattr("server.threading.Thread", FakeThread)
+    monkeypatch.setattr("server.VerificationOrchestrator", MagicMock())
+
+    resp = client.post(f"/api/verification/{plan_id}/start")
+    assert resp.status_code == 409, resp.text
+    assert resp.json() == {"error": "conflict", "reason": "stage_mismatch"}
