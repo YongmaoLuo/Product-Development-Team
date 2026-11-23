@@ -100,6 +100,14 @@ half the readers never see.*
   action (open a PR, push), and an unbounded loop of those is exactly what
   this human-gated stage exists to prevent.
 
+- **`.github/workflows/ci.yml` now caps a pull request at five commits.**
+  The cap turns "squash before opening" into a check instead of a habit:
+  past five commits the branch's history stops reading as one decision,
+  and the per-commit CI record that makes a merge auditable is the first
+  thing to go. The job reads `pull_request.commits` — the number the pull
+  request itself shows — and joins the merge gate's `needs`.
+
+
 
 ## [0.1.2] - 2026-10-07
 
