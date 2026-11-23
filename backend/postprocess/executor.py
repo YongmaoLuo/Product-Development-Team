@@ -80,6 +80,7 @@ What this module does NOT do
 from __future__ import annotations
 
 import hashlib
+import logging
 import subprocess
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -88,6 +89,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from postprocess.models import AuditRecord, EvidenceRecord
+
+
+#: 本模块的 logger —— 缺省产品代码路径的 warning、声明文件里写坏的行，
+#: 都记在这里。
+logger = logging.getLogger(__name__)
 
 
 __all__ = [
@@ -128,8 +134,41 @@ MONEY_MARKERS: Tuple[str, ...] = (
 #: 强制类 git 选项。
 _FORCE_FLAGS: Tuple[str, ...] = ("-f", "--force", "--force-with-lease")
 
-#: 产品代码路径 —— 收尾阶段改这里就是越界（仓库根下的相对路径）。
-PRODUCT_CODE_PATHS: Tuple[str, ...] = ("backend", "frontend")
+#: 产品代码路径的**缺省值** —— 仓库根下的相对路径。
+#:
+#: 守卫对产品代码路径下的每一个文件做 sha256 比对：新增、改动、删除都算
+#: 越界。这条判据同时覆盖**已跟踪**与**未跟踪**的文件（``ls-files -co
+#: --exclude-standard`` 把未跟踪的也列出来），所以条目新写一个源码文件也
+#: 抓得到 —— 不依赖 porcelain 报不报得出它。
+#:
+#: 这是**缺省值**，不是真相：每个项目的源码目录叫什么名字不一样，框架不
+#: 可能全知道，也不该猜。真正生效的清单由项目自己声明 ——
+#: ``<repo>/.pdt/product_paths``，见 :func:`declared_product_paths`。
+#: 项目声明了就用项目的，没声明才退回这张表（并打一条 warning）。
+#:
+#: 刻意**不含** ``tests``：e2e 截图之类的产物落在 ``tests/screenshots/``
+#: 下，含进去会把产物误判成产品代码。
+#:
+#: 刻意**不含** ``reports`` / ``docs`` / ``data`` / ``coverage`` / ``projects``：
+#: 那些是产物与数据，不是产品代码。
+PRODUCT_CODE_PATHS: Tuple[str, ...] = (
+    "api",
+    "app",
+    "backend",
+    "components",
+    "domain",
+    "frontend",
+    "infrastructure",
+    "models",
+    "scripts",
+    "services",
+    "src",
+)
+
+#: 项目声明产品代码路径的**文件**（仓库相对路径）—— 放在项目已有的、被
+#: gitignore 的 ``.pdt/`` 目录下面（``.pdt/evidence``、``.pdt/service-locks``
+#: 就在那儿）。
+PRODUCT_PATHS_FILE: str = ".pdt/product_paths"
 
 #: 收尾产物的根目录 —— 计划目录 ``plans/{id}/`` 下的产物允许写。
 FINISHING_ARTIFACT_ROOT: str = "plans"
@@ -769,12 +808,19 @@ class _WorkingTree:
     """一个时刻的工作区状态。
 
     Attributes:
-        changed: ``git status --porcelain`` 报出来的路径（含未跟踪文件）。
+        changed: **跑完那一刻**的 ``git status --porcelain`` 全量路径
+            （含未跟踪文件）—— 它是当时工作区的整个快照，不区分哪一条
+            是这次跑出来的、哪一条是跑之前就有的。判「本次越界」时要用
+            跑之前的那一份作差集。
         hashes: 产品代码路径下每个文件的 sha256 —— 路径 → 摘要。
+        tracked: ``git ls-files`` 报出的**已跟踪**路径 —— 未跟踪的产物不在
+            里面，所以守卫不会把「跑的时候新出现的临时文件」算成越界
+            （``plans/`` 下别的计划目录另有判据，见 :meth:`touched`）。
     """
 
     changed: Tuple[str, ...] = ()
     hashes: Mapping[str, str] = field(default_factory=dict)
+    tracked: Tuple[str, ...] = ()
 
     @classmethod
     def capture(cls, root: Path) -> "_WorkingTree":
@@ -784,7 +830,8 @@ class _WorkingTree:
             root: 仓库根目录。
 
         Returns:
-            工作区状态：porcelain 报出的路径，加上产品代码文件的哈希。
+            工作区状态：porcelain 报出的路径，加上产品代码文件的哈希，
+            加上已跟踪路径的全量清单。
 
         Raises:
             RuntimeError: git 读不出来（不是仓库、或 git 本身坏了）。
@@ -801,14 +848,20 @@ class _WorkingTree:
             )
         )
         hashes: Dict[str, str] = {}
+        tracked = tuple(
+            p for p in _git_text(root, "ls-files", "-z").split("\0") if p
+        )
         listing = _git_text(
             root,
+            "--literal-pathspecs",
             "ls-files",
             "-co",
             "--exclude-standard",
             "-z",
             "--",
-            *PRODUCT_CODE_PATHS,
+            # 前缀列表不会为空（项目没声明就用缺省值），所以这里传出去的
+            # pathspec 一定是非空的 —— 空 pathspec 会列出全仓。
+            *product_paths(root),
         )
         for relative in listing.split("\0"):
             if not relative:
@@ -816,7 +869,7 @@ class _WorkingTree:
             path = root / relative
             if path.is_file():
                 hashes[relative] = _sha256(path)
-        return cls(changed=tuple(changed), hashes=hashes)
+        return cls(changed=tuple(changed), hashes=hashes, tracked=tracked)
 
     def touched(
         self,
@@ -827,10 +880,26 @@ class _WorkingTree:
 
         两条判据合起来看：
 
-        1. porcelain 里出现在允许范围之外的路径 —— 越界（含未跟踪文件）；
-        2. 产品代码文件的哈希变了、消失了或新出现了 —— 越界。这一条覆盖
-           git 自己不报的情形：被 ``assume-unchanged`` / ``skip-worktree``
-           藏起来的文件，改了它 ``git status`` 仍然是空的。
+        1. porcelain 里**本次跑出来的、落在允许范围之外的**路径 —— 越界。
+           其中两条入选条件满足其一即可：
+
+           a. 该路径**是已跟踪的** —— 已跟踪的文件不许被条目改动，不管它在
+              产品代码路径之内还是之外；
+           b. 该路径**在收尾产物根目录（``plans/``）之下、但不在本计划的
+              目录之下** —— **别的计划的收尾产物目录不许被写，新建也不行**。
+
+           跑之前就已经存在的改动不算本次越界，那是进入收尾阶段之前的状态，
+           不是条目干的。其余的未跟踪新文件也不算越界（那是产物，不是产品
+           代码）；产品代码路径下的新文件由下面的哈希判据抓。理由：守卫对
+           「仓库被改了什么」负责，不对「仓库里多了个临时产物」负责 ——
+           条目只对**自己跑的那段时间**负责。
+        2. 产品代码文件的哈希变了、消失了或新出现了 —— 越界。「产品代码
+           文件」= 落在**项目声明的**产品代码路径下的文件（项目在
+           ``.pdt/product_paths`` 里声明；没声明就用缺省值，见
+           :func:`product_paths`）。这一条同时覆盖 git 自己不报的情形：被
+           ``assume-unchanged`` / ``skip-worktree`` 藏起来的文件，改了它
+           ``git status`` 仍然是空的；以及条目**新写**的源码文件（未跟踪，
+           但落在产品代码路径下）。
 
         Args:
             before: 条目跑之前的状态。
@@ -839,8 +908,14 @@ class _WorkingTree:
         Returns:
             越界路径，已排序去重；没有越界时是空列表。
         """
+        before_changed = set(before.changed)
+        tracked_any = set(before.tracked) | set(self.tracked)
         out_of_scope = [
-            path for path in self.changed if not _within(path, allowed)
+            path
+            for path in self.changed
+            if path not in before_changed
+            and not _within(path, allowed)
+            and (path in tracked_any or _protected_new_path(path, allowed))
         ]
         rewritten = [
             path
@@ -1052,6 +1127,122 @@ def _within(path: str, allowed: Sequence[str]) -> bool:
         if path == normalized or path.startswith(normalized + "/"):
             return True
     return False
+
+
+def declared_product_paths(repo: Path) -> Optional[Tuple[str, ...]]:
+    """读**项目自己声明**的产品代码路径清单。
+
+    位置：``<repo>/.pdt/product_paths`` —— ``.pdt/`` 是框架已有的、被
+    gitignore 的项目级定制目录（``.pdt/evidence``、``.pdt/service-locks``
+    就在那儿），清单放那儿最自然。
+
+    为什么由项目声明：每个项目的源码目录名不一样，框架不可能全知道，也不
+    该猜 —— 猜出来的清单要么漏掉真正的产品代码，要么把产物误判成产品代码。
+
+    格式：纯文本，一行一个仓库相对路径前缀（``src`` 或 ``frontend/components``
+    都行）；``#`` 开头是注释；空行忽略；行首行尾空白去掉。绝对路径、``..``、
+    ``~`` 一律**跳过该行**并记一条 warning —— 一份写坏的文件不该让收尾阶段
+    整个瘫掉。
+
+    Args:
+        repo: 仓库根目录。
+
+    Returns:
+        声明的路径前缀（元组，保持文件里的顺序）；文件不存在或解析后为空时
+        返回 ``None`` —— 表示「没声明」。
+    """
+    declaration = Path(repo) / PRODUCT_PATHS_FILE
+    try:
+        text = declaration.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as error:
+        logger.warning(
+            "读不到 %s（%s），按缺省产品代码路径判定", declaration, error
+        )
+        return None
+
+    paths: List[str] = []
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = line.rstrip("/")
+        if not line:
+            continue
+        if not _is_repo_relative_prefix(line):
+            logger.warning(
+                "%s 第 %d 行不是仓库相对路径前缀（%r），跳过",
+                declaration,
+                number,
+                line,
+            )
+            continue
+        if line not in paths:
+            paths.append(line)
+    if not paths:
+        return None
+    return tuple(paths)
+
+
+def _is_repo_relative_prefix(line: str) -> bool:
+    """这一行是不是一个仓库相对路径前缀。
+
+    Args:
+        line: 已经去掉空白的一行。
+
+    Returns:
+        ``True`` 表示它是仓库相对路径前缀；绝对路径、``..``、``~`` 一律
+        ``False``。
+    """
+    if line.startswith("/") or line.startswith("~"):
+        return False
+    parts = line.split("/")
+    return ".." not in parts and "~" not in parts
+
+
+def product_paths(repo: Path) -> Tuple[str, ...]:
+    """这个仓的产品代码路径 —— 项目声明的优先，否则用缺省值。
+
+    项目在 ``<repo>/.pdt/product_paths`` 里声明了就用项目的（**覆盖**缺省
+    值，不是并集 —— 项目最清楚自己的源码在哪）；没声明才退回
+    :data:`PRODUCT_CODE_PATHS`，并打一条 warning，让运维知道该去建那个文件。
+
+    Args:
+        repo: 仓库根目录。
+
+    Returns:
+        仓库相对路径前缀元组；不会为空。
+    """
+    declared = declared_product_paths(repo)
+    if declared:
+        return declared
+    logger.warning(
+        "项目没有声明 %s（%s），按缺省产品代码路径 %s 判定；"
+        "建议在该项目里创建这个文件，一行一个产品代码目录。",
+        PRODUCT_PATHS_FILE,
+        Path(repo) / PRODUCT_PATHS_FILE,
+        list(PRODUCT_CODE_PATHS),
+    )
+    return PRODUCT_CODE_PATHS
+
+
+def _protected_new_path(path: str, allowed: Sequence[str]) -> bool:
+    """未跟踪也要拦的路径：收尾产物根目录下、但不在本计划的目录里。
+
+    **别的计划的收尾产物目录不许被写** —— 新建也不行。收尾阶段只允许写
+    ``plans/{本 plan}/``；写到别的计划目录里，不管那个文件是新建的还是
+    改动已跟踪的，都是越界。
+
+    Args:
+        path: 仓库相对路径。
+        allowed: 允许改动的路径前缀（本计划的收尾产物目录）。
+
+    Returns:
+        ``True`` 表示这个路径落在收尾产物根目录下、但不在允许范围之内。
+    """
+    root = FINISHING_ARTIFACT_ROOT.rstrip("/")
+    return _within(path, (root,)) and not _within(path, allowed)
 
 
 def _porcelain_paths(text: str) -> List[str]:

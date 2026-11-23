@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import subprocess
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
@@ -53,6 +54,7 @@ from postprocess import progress as progress_module
 from postprocess.executor import (
     CommandRunner,
     ProductCodeModified,
+    declared_product_paths,
     product_diff_guard,
 )
 from postprocess.judge import judge
@@ -127,6 +129,14 @@ def _item(item_id: str, command: Optional[List[str]] = None) -> SpecItem:
 def _make_repo(path: Path) -> Path:
     """一个有一次基线提交的临时 git 仓 —— 产品代码树。
 
+    基线提交里除了产品代码（``backend/``、``frontend/``），还有一个**已跟踪
+    的非产品文件** ``README.md``。它让「改了已跟踪的、产品代码之外的文件照样
+    越界」这一条有个能落脚的场景 —— 守卫对未跟踪的临时产物收口（未跟踪的新
+    文件不算越界），所以这条判据只能拿已跟踪的文件来钉。
+
+    基线里**没有** ``plans/`` 下的任何东西 —— 「往别的计划目录里新建文件」
+    那个场景要的是一个空白的起点。
+
     Args:
         path: 仓的目录。
 
@@ -152,6 +162,7 @@ def _make_repo(path: Path) -> Path:
     (path / "frontend" / "app.js").write_text(
         "export default 1;\n", encoding="utf-8"
     )
+    (path / "README.md").write_text("baseline\n", encoding="utf-8")
 
     subprocess.run(["git", "-C", str(path), "add", "-A"], check=True)
     subprocess.run(
@@ -202,6 +213,35 @@ def _write_plan_artifact(plan_id: str) -> Callable[[Path], None]:
         target.write_text("{}\n", encoding="utf-8")
 
     return effect
+
+
+def _leave_untracked_file(relative: str, content: str = "{}\n") -> Callable[[Path], None]:
+    """一个副作用剧本：在仓库里写一个**未跟踪**文件（父目录一并建出来）。"""
+
+    def effect(workspace: Path) -> None:
+        target = workspace / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+
+    return effect
+
+
+def _declare_product_paths(repo: Path, content: str) -> Path:
+    """在仓里写下项目自己声明的产品代码路径清单。
+
+    位置就是框架已有的、被 gitignore 的项目级定制目录：``.pdt/``。
+
+    Args:
+        repo: 仓的目录。
+        content: 清单的原文。
+
+    Returns:
+        写下的清单文件路径。
+    """
+    target = repo / ".pdt" / "product_paths"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    return target
 
 
 # ---------------------------------------------------------------------
@@ -301,6 +341,30 @@ def test_finishing_artifacts_under_the_plan_dir_are_allowed(tmp_path):
     assert (repo / "plans" / "2026-01-01" / "postprocess_report.json").is_file()
 
 
+def test_new_file_under_another_plan_dir_is_out_of_scope(tmp_path):
+    """条目在**别的**计划目录下**新建**文件 —— 越界，即使那个文件未被跟踪。
+
+    收尾阶段只允许写 ``plans/{本 plan}/``。别的计划目录不许被写 —— 新建
+    也不行，否则一个条目就能把另一个计划的收尾产物目录搅乱。
+    """
+    repo = _make_repo(tmp_path / "repo")
+    assert not (repo / "plans" / "2026-02-02").exists(), (
+        "基线里不该有这个计划目录 —— 这个用例测的是「新建」"
+    )
+    item = _item("report", STATUS_COMMAND)
+    runner = CommandRunner(
+        Spec(items=(item,), markdown=""),
+        workspace=repo,
+        run=RecordingRun(_write_plan_artifact("2026-02-02")),
+    )
+
+    with pytest.raises(ProductCodeModified) as excinfo:
+        with product_diff_guard(item, repo=repo, plan_id="2026-01-01"):
+            runner.run_item(item)
+
+    assert "plans/2026-02-02/postprocess_report.json" in excinfo.value.paths
+
+
 def test_artifact_outside_the_named_plan_dir_is_out_of_scope(tmp_path):
     """允许范围只到那一个计划目录 —— 别的计划目录照样越界。"""
     repo = _make_repo(tmp_path / "repo")
@@ -340,7 +404,11 @@ def test_modified_tracked_product_file_is_out_of_scope(tmp_path):
 
 
 def test_change_outside_product_code_is_still_out_of_scope(tmp_path):
-    """产品代码之外的改动也算越界 —— porcelain 非空即越界。"""
+    """**已跟踪的**、产品代码之外的文件被改也算越界。
+
+    守卫对「仓库被改了什么」负责：已跟踪的文件不许被条目改动，不管它在
+    产品代码路径之内还是之外。（未跟踪的新文件另说 —— 那是产物。）
+    """
     repo = _make_repo(tmp_path / "repo")
     item = _item("refactor", STATUS_COMMAND)
 
@@ -385,6 +453,299 @@ def test_assume_unchanged_product_file_is_still_out_of_scope(tmp_path):
             runner.run_item(item)
 
     assert "backend/agent.py" in excinfo.value.paths
+
+
+# ---------------------------------------------------------------------
+# 差分语义：跑之前就存在的改动，不算本次条目干的
+# ---------------------------------------------------------------------
+
+
+def test_pre_existing_untracked_file_is_not_a_violation(tmp_path):
+    """跑之前就存在的未跟踪文件 —— 不是这次条目干的，不判越界。
+
+    这正是实测踩到的坑：收尾阶段的计划自己在工作区里留了一份证据文件
+    （``reports/refactor/perf_p99.json``），那是**进收尾阶段之前**就在
+    的状态。条目对它记账，每一条都会 FAIL，重跑多少次都一样。
+    """
+    repo = _make_repo(tmp_path / "repo")
+    pre_existing = repo / "reports" / "refactor" / "perf_p99.json"
+    pre_existing.parent.mkdir(parents=True, exist_ok=True)
+    pre_existing.write_text("{}\n", encoding="utf-8")
+
+    item = _item("report", STATUS_COMMAND)
+    runner = CommandRunner(
+        Spec(items=(item,), markdown=""), workspace=repo, run=RecordingRun()
+    )
+
+    with product_diff_guard(item, repo=repo):
+        runner.run_item(item)
+
+    assert pre_existing.is_file(), "跑之前就存在的未跟踪文件被守卫弄没了"
+
+
+def test_new_untracked_file_is_still_a_violation(tmp_path):
+    """条目在**产品代码路径下**新写的未跟踪文件照样越界 —— 且只报它一个。
+
+    它是未跟踪的，所以 porcelain 那条判据（只看已跟踪路径）不抓它 —— 但它
+    在产品代码路径下，哈希判据抓得到（``ls-files -co`` 把未跟踪的也列出来）。
+    跑之前已有的那个未跟踪文件不该出现在 ``paths`` 里。
+    """
+    repo = _make_repo(tmp_path / "repo")
+    pre_existing = repo / "reports" / "refactor" / "perf_p99.json"
+    pre_existing.parent.mkdir(parents=True, exist_ok=True)
+    pre_existing.write_text("{}\n", encoding="utf-8")
+
+    item = _item("refactor", STATUS_COMMAND)
+    runner = CommandRunner(
+        Spec(items=(item,), markdown=""),
+        workspace=repo,
+        run=RecordingRun(_leave_untracked_file("backend/latency.py")),
+    )
+
+    with pytest.raises(ProductCodeModified) as excinfo:
+        with product_diff_guard(item, repo=repo):
+            runner.run_item(item)
+
+    assert excinfo.value.paths == ("backend/latency.py",), (
+        "越界路径不止新写的那个：%r" % (excinfo.value.paths,)
+    )
+
+
+def test_new_untracked_file_outside_product_paths_is_not_a_violation(tmp_path):
+    """条目新写的**非产品路径**未跟踪文件不算越界 —— 那是产物，不是产品代码。
+
+    守卫的职责是「产品代码零改动」，不是「仓库里不许出现任何新文件」。
+    """
+    repo = _make_repo(tmp_path / "repo")
+    item = _item("report", STATUS_COMMAND)
+    runner = CommandRunner(
+        Spec(items=(item,), markdown=""),
+        workspace=repo,
+        run=RecordingRun(_leave_untracked_file("reports/refactor/latency.json")),
+    )
+
+    with product_diff_guard(item, repo=repo):
+        runner.run_item(item)
+
+    assert (repo / "reports" / "refactor" / "latency.json").is_file(), (
+        "条目写出来的产物不见了"
+    )
+
+
+def test_modified_tracked_file_outside_product_paths_is_a_violation(tmp_path):
+    """改了**已跟踪的**、产品代码之外的文件 —— 仍然越界。
+
+    守卫对「仓库被改了什么」负责：已跟踪的文件不许被条目改动，不管它在
+    产品代码路径之内还是之外。
+    """
+    repo = _make_repo(tmp_path / "repo")
+    assert "README.md" in _git(repo, "ls-files").split(), (
+        "夹具里得有一个已跟踪的非产品文件"
+    )
+    item = _item("refactor", STATUS_COMMAND)
+
+    def rewrite_readme(workspace: Path) -> None:
+        (workspace / "README.md").write_text("changed\n", encoding="utf-8")
+
+    runner = CommandRunner(
+        Spec(items=(item,), markdown=""), workspace=repo, run=RecordingRun(rewrite_readme)
+    )
+
+    with pytest.raises(ProductCodeModified) as excinfo:
+        with product_diff_guard(item, repo=repo):
+            runner.run_item(item)
+
+    assert "README.md" in excinfo.value.paths
+
+
+def test_new_untracked_file_under_src_is_a_violation(tmp_path):
+    """条目在 ``src/`` 下**新写**一个未跟踪的源码文件 —— 越界。
+
+    收尾阶段的 workspace 常常不是框架仓：产品代码可能长在 ``src/``、
+    ``api/`` 之类的目录下。哈希那条判据按产品代码路径逐文件比对，所以这些
+    目录下的新源码文件也抓得到。
+    """
+    repo = _make_repo(tmp_path / "repo")
+    item = _item("refactor", STATUS_COMMAND)
+    runner = CommandRunner(
+        Spec(items=(item,), markdown=""),
+        workspace=repo,
+        run=RecordingRun(_leave_untracked_file("src/new_module.py")),
+    )
+
+    with pytest.raises(ProductCodeModified) as excinfo:
+        with product_diff_guard(item, repo=repo):
+            runner.run_item(item)
+
+    assert excinfo.value.paths == ("src/new_module.py",), (
+        "src/ 下的新源码文件没被抓到：%r" % (excinfo.value.paths,)
+    )
+
+
+def test_new_untracked_file_under_a_declared_source_dir_is_a_violation(tmp_path):
+    """条目在**项目声明的**源码目录下新写文件 —— 越界。
+
+    守卫不能靠一张写死的目录名表来认产品代码：被测仓的源码目录叫什么名字
+    本仓不知道（也不该知道）。清单由项目自己在 ``.pdt/product_paths`` 里
+    声明 —— 这条用一个不在缺省名单里的目录名来钉。
+    """
+    repo = _make_repo(tmp_path / "repo")
+    _declare_product_paths(repo, "core_logic\n")
+    source = repo / "core_logic"
+    source.mkdir()
+    (source / "engine.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    item = _item("refactor", STATUS_COMMAND)
+    runner = CommandRunner(
+        Spec(items=(item,), markdown=""),
+        workspace=repo,
+        run=RecordingRun(_leave_untracked_file("core_logic/extra.py")),
+    )
+
+    with pytest.raises(ProductCodeModified) as excinfo:
+        with product_diff_guard(item, repo=repo):
+            runner.run_item(item)
+
+    assert excinfo.value.paths == ("core_logic/extra.py",), (
+        "已跟踪的源码目录下的新文件没被抓到：%r" % (excinfo.value.paths,)
+    )
+
+
+def test_declared_product_paths_file_wins(tmp_path):
+    """项目声明了 ``.pdt/product_paths`` —— 声明**覆盖**缺省值，不是并集。
+
+    声明里有的 ``src``：条目在 ``src/`` 下新写文件 → 越界。声明里没有的
+    ``backend``（它在缺省名单里）：条目在 ``backend/`` 下新写文件 → 不越界。
+    """
+    repo = _make_repo(tmp_path / "repo")
+    _declare_product_paths(repo, "# 注释\nsrc\napi\n")
+    item = _item("refactor", STATUS_COMMAND)
+
+    def write_both(workspace: Path) -> None:
+        for relative in ("src/x.py", "backend/extra.py"):
+            target = workspace / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("VALUE = 1\n", encoding="utf-8")
+
+    runner = CommandRunner(
+        Spec(items=(item,), markdown=""), workspace=repo, run=RecordingRun(write_both)
+    )
+
+    with pytest.raises(ProductCodeModified) as excinfo:
+        with product_diff_guard(item, repo=repo):
+            runner.run_item(item)
+
+    assert excinfo.value.paths == ("src/x.py",), (
+        "声明覆盖缺省值这件事没成立：%r" % (excinfo.value.paths,)
+    )
+
+
+def test_declared_product_paths_ignores_blank_and_comment_lines(tmp_path):
+    """清单里的注释、空行、行尾空白都被正确跳过。"""
+    repo = _make_repo(tmp_path / "repo")
+    _declare_product_paths(
+        repo, "# 这是一行注释\n\n   src   \n\t\napi\n\n# 又一行注释\n"
+    )
+    assert declared_product_paths(repo) == ("src", "api")
+
+    item = _item("refactor", STATUS_COMMAND)
+
+    def write_both(workspace: Path) -> None:
+        for relative in ("src/y.py", "backend/extra.py"):
+            target = workspace / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("VALUE = 1\n", encoding="utf-8")
+
+    runner = CommandRunner(
+        Spec(items=(item,), markdown=""), workspace=repo, run=RecordingRun(write_both)
+    )
+
+    with pytest.raises(ProductCodeModified) as excinfo:
+        with product_diff_guard(item, repo=repo):
+            runner.run_item(item)
+
+    assert excinfo.value.paths == ("src/y.py",), (
+        "带注释和空行的清单没解析对：%r" % (excinfo.value.paths,)
+    )
+
+
+def test_declared_product_paths_rejects_absolute_and_parent_paths(tmp_path):
+    """清单里的绝对路径与 ``..`` 被跳过 —— 剩下的行照常生效，且不抛异常。"""
+    repo = _make_repo(tmp_path / "repo")
+    _declare_product_paths(repo, "/etc/passwd\n../outside\nsrc\n")
+    assert declared_product_paths(repo) == ("src",)
+
+    item = _item("refactor", STATUS_COMMAND)
+    runner = CommandRunner(
+        Spec(items=(item,), markdown=""),
+        workspace=repo,
+        run=RecordingRun(_leave_untracked_file("src/z.py")),
+    )
+
+    with pytest.raises(ProductCodeModified) as excinfo:
+        with product_diff_guard(item, repo=repo):
+            runner.run_item(item)
+
+    assert excinfo.value.paths == ("src/z.py",), (
+        "写坏的行没有让整个清单失效：%r" % (excinfo.value.paths,)
+    )
+
+
+def test_missing_declaration_falls_back_to_defaults_and_warns(
+    tmp_path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """项目没有声明清单 → 按缺省值判定，并打一条 warning。"""
+    repo = _make_repo(tmp_path / "repo")
+    assert not (repo / ".pdt" / "product_paths").exists()
+    item = _item("refactor", STATUS_COMMAND)
+    runner = CommandRunner(
+        Spec(items=(item,), markdown=""),
+        workspace=repo,
+        run=RecordingRun(_leave_untracked_file("backend/x.py")),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="postprocess.executor"):
+        with pytest.raises(ProductCodeModified) as excinfo:
+            with product_diff_guard(item, repo=repo):
+                runner.run_item(item)
+
+    assert excinfo.value.paths == ("backend/x.py",), (
+        "缺省产品代码路径没生效：%r" % (excinfo.value.paths,)
+    )
+    assert any("pdt/product_paths" in record.getMessage() for record in caplog.records), (
+        "没有为「项目没声明清单」打 warning：%r" % ([r.getMessage() for r in caplog.records],)
+    )
+
+
+def test_pre_existing_untracked_file_does_not_hide_a_rewrite(tmp_path):
+    """跑之前就存在的未跟踪文件，不得把哈希那条判据一起放掉。
+
+    改了已跟踪的产品文件（``backend/agent.py``）仍然必须抛 —— 差分只
+    作用于 porcelain 那一条判据，哈希比对仍然是跑前跑后的差分。
+    """
+    repo = _make_repo(tmp_path / "repo")
+    pre_existing = repo / "reports" / "refactor" / "perf_p99.json"
+    pre_existing.parent.mkdir(parents=True, exist_ok=True)
+    pre_existing.write_text("{}\n", encoding="utf-8")
+
+    item = _item("refactor", STATUS_COMMAND)
+
+    def rewrite_agent(workspace: Path) -> None:
+        (workspace / "backend" / "agent.py").write_text(
+            "VALUE = 2\n", encoding="utf-8"
+        )
+
+    runner = CommandRunner(
+        Spec(items=(item,), markdown=""), workspace=repo, run=RecordingRun(rewrite_agent)
+    )
+
+    with pytest.raises(ProductCodeModified) as excinfo:
+        with product_diff_guard(item, repo=repo):
+            runner.run_item(item)
+
+    assert "backend/agent.py" in excinfo.value.paths
+    assert "reports/refactor/perf_p99.json" not in excinfo.value.paths
 
 
 # ---------------------------------------------------------------------
@@ -563,3 +924,28 @@ def test_the_judge_can_say_the_product_code_diff_is_empty() -> None:
 
     assert judge(item, [untouched]).passed is True
     assert judge(item, [touched]).passed is False
+
+
+def test_the_orchestrator_passes_with_a_pre_existing_untracked_file(
+    tmp_path: Path,
+    plan_dir: Path,
+) -> None:
+    """生产入口上：跑之前就存在的未跟踪文件，不该让整轮判失败。
+
+    这是编排器真的把守卫套在每个条目上的那条路径 —— 差分语义修好之后，
+    一份进收尾阶段之前就在工作区里的证据文件，不再让每一条都 FAIL。
+    """
+    repo = _make_repo(tmp_path / "repo")
+    pre_existing = repo / "reports" / "refactor" / "perf_p99.json"
+    pre_existing.parent.mkdir(parents=True, exist_ok=True)
+    pre_existing.write_text("{}\n", encoding="utf-8")
+    write_book(plan_dir, [book_item("report")])
+    stub = RecordingRun(stdout="done\n")
+    orchestrator = _orchestrator(plan_dir, repo, stub)
+
+    report = orchestrator.start()
+
+    entry = next(e for e in report["items"] if e["id"] == "report")
+    assert report["terminal_status"] == "completed", report["terminal_status"]
+    assert entry["verdict"] == "PASS", entry
+    assert pre_existing.is_file(), "跑之前就存在的未跟踪文件被弄没了"
