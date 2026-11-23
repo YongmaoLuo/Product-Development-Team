@@ -209,7 +209,7 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, Iterator, List, Optional
+from typing import Any, Dict, FrozenSet, Iterator, List, Optional, Tuple
 
 from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -217,7 +217,16 @@ from filelock import FileLock, Timeout
 from pydantic import BaseModel, Field
 
 from config_paths import resolve_plans_dir, resolve_state_db_path
+
+# The failure review's announcement record.  A plan that failed at the
+# end was announced as a decision, and the announcement left a sidecar
+# behind: the sidecar says **what** was announced, the decision store
+# says **whether it is still waiting**.  The sidecar is read through
+# the module that wrote it, so the row the panel draws and the record
+# the announcement left behind cannot tell two different stories.
+from failure_review import build_question, read_review
 from file_lock_protocol import locks_dir_for_plan
+from hitl.models import DecisionStatus
 from hitl.store import HitlStore
 from plan_scheduler.commands import (
     APPLIED,
@@ -699,6 +708,70 @@ def _detail_running_sec(payload: Any) -> Optional[int]:
     return seconds if seconds > 0 else 0
 
 
+#: The title the failure review's section carries in the detail view.
+_FAILURE_REVIEW_TITLE = "失败分析"
+
+#: The four fields the failure review hands on — the same four the
+#: read-only failure-review endpoint hands on, so the detail view and
+#: that endpoint cannot tell two different stories about one failure.
+_FAILURE_REVIEW_FIELDS = ("decision_id", "problem", "suggestion", "created_at")
+
+
+def _failure_review_payload(plan_id: str) -> Optional[Dict[str, Any]]:
+    """The plan's failure review — the announcement's own record.
+
+    A plan that failed at the end was announced as a **decision**, and
+    the announcement left a sidecar behind: it says what went wrong and
+    what should happen about it.  The sidecar is read through the
+    module that wrote it (:func:`failure_review.read_review`), so the
+    detail view and the announcement cannot tell two different stories
+    about the same failure.
+
+    ``None`` means "there is nothing to show": no sidecar, a sidecar
+    that does not parse, or one missing a field.  Nothing here raises
+    — a broken record must not take the whole detail down with it.
+    """
+    try:
+        plan_dir = _server._plan_dir(plan_id)
+        review = read_review(plan_dir)
+    except Exception:  # noqa: BLE001 — a broken record is not a failure.
+        logger.warning(
+            "the failure review of plan %s could not be read",
+            plan_id,
+            exc_info=True,
+        )
+        return None
+
+    if review is None:
+        return None
+
+    # ``read_review`` only answers with a record that carries all four
+    # fields, so the reads below cannot fail on a missing key.  A field
+    # that is not text is reported as no text at all: the panel draws
+    # what is there, and it does not draw a repr.
+    payload: Dict[str, Any] = {}
+    for field in _FAILURE_REVIEW_FIELDS:
+        value = review.get(field)
+        payload[field] = value if isinstance(value, str) else ""
+    return payload
+
+
+def _failure_review_section(review: Dict[str, Any]) -> Dict[str, Any]:
+    """The failure review as a section of the detail view.
+
+    The section carries the **same paragraph** the announcement wrote —
+    the problem and the suggestion, in the announcement's own words.
+    There is no second phrasing of it: a panel that showed a different
+    sentence would be answering a question nobody asked.
+    """
+    return {
+        "kind": "failure_review",
+        "title": _FAILURE_REVIEW_TITLE,
+        "problem": review.get("problem", ""),
+        "suggestion": review.get("suggestion", ""),
+    }
+
+
 @router.get("/api/scheduler/plan/{plan_id}/detail")
 def get_scheduler_plan_detail(plan_id: str) -> Any:
     """Answer with one plan's progress — the card's own wording.
@@ -767,15 +840,33 @@ def get_scheduler_plan_detail(plan_id: str) -> Any:
     #
     # The route's docstring is the published HTTP contract's (the
     # OpenAPI baseline freezes it), so the new keys are described here.
+    #
+    # The **failure review** is one of them: a plan that failed at the
+    # end was announced to a human, and the announcement left a record
+    # of what went wrong and what should happen about it.  The detail
+    # view shows **that same paragraph** (R5) — the record is read
+    # through the module that wrote it, and it is handed on in a
+    # section of its own, **first**, because it is the one thing the
+    # operator has to act on.  The sections that were there are still
+    # there, in the card's own order, below it.
+    sections = _cards.build_progress_sections(
+        payload, running_sec, phase_label,
+    )
+    failure_review = _failure_review_payload(plan_id)
+    if failure_review is not None:
+        sections = [_failure_review_section(failure_review), *sections]
+
     return {
         "plan_id": plan_id,
         "phase": phase,
         "phase_label": phase_label,
         "running_sec": running_sec,
-        "sections": _cards.build_progress_sections(
-            payload, running_sec, phase_label,
-        ),
+        "sections": sections,
         "lines": _cards.build_progress_lines(payload)["lines"],
+        # ``None`` when the plan has no review to show — the key is
+        # always there, so a caller never has to guess between "no such
+        # key" and "no review for this plan".
+        "failure_review": failure_review,
     }
 
 
@@ -1728,6 +1819,121 @@ def _pending_waiting_rows() -> List[Dict[str, Any]]:
     return rows
 
 
+#: The kind of wait a failure review is.
+#:
+#: The finishing stage's own waits name their kind in a two-word
+#: vocabulary of their own; a failure review is not one of them — it
+#: is a question about a plan that already failed.  The panel tells the
+#: two apart by this word, so it is written down once, here.
+_FAILURE_REVIEW_WAIT_TYPE = "failure_review"
+
+
+def _failure_review_question(review: Mapping[str, Any]) -> str:
+    """The question a failure review asked, as the row carries it.
+
+    The sidecar holds the question as it was asked.  A record that does
+    not hold it is asked for again from the two fields it does hold —
+    the problem and the suggestion — so the row never shows a question
+    that is not there.
+    """
+    question = review.get("question")
+    if isinstance(question, str) and question.strip():
+        return question
+    return build_question(
+        str(review.get("problem") or ""),
+        str(review.get("suggestion") or ""),
+    )
+
+
+def _failure_review_waiting_rows() -> List[Dict[str, Any]]:
+    """The announced failures that are still waiting for a human.
+
+    A plan that failed at the end was announced as a **decision**
+    (:func:`failure_review.announce_failure`): the announcement left a
+    sidecar behind, and the decision sits in the store waiting for an
+    answer.  This turns the two into the read model's waiting rows, so
+    the panel finds the question the same way it finds every other
+    waiting item.
+
+    Only the decisions that are still **pending** are listed.  A
+    decision that has been answered is not waiting any more, and a row
+    for it would say "this is waiting" about something that is over.
+
+    The row is not a countdown: a failure review has no deadline to
+    push out, so the row carries none and says it is not extendable
+    rather than inviting the operator to try.
+
+    Nothing here raises.  The panel polls this endpoint every few
+    seconds, so a plans root that is not there, a sidecar that cannot
+    be read and a store that cannot be opened are all answered with
+    "nothing is waiting" rather than with an error.
+    """
+    root = resolve_plans_dir()
+    if not root.is_dir():
+        return []
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        logger.warning("the plans root could not be read", exc_info=True)
+        return []
+
+    announced: List[Tuple[str, Dict[str, Any]]] = []
+    for entry in entries:
+        try:
+            if not entry.is_dir():
+                continue
+            review = read_review(entry)
+        except Exception:  # noqa: BLE001 — a broken record is not a failure.
+            logger.warning(
+                "the failure review of plan %s could not be read",
+                entry.name,
+                exc_info=True,
+            )
+            continue
+        if review is None:
+            continue
+        announced.append((entry.name, review))
+
+    if not announced:
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    with _hitl_store() as store:
+        if store is None:
+            return []
+        for plan_id, review in announced:
+            decision_id = str(review.get("decision_id") or "")
+            if not decision_id:
+                continue
+            try:
+                decision = store.get(decision_id)
+            except Exception:  # noqa: BLE001 — an unreadable row is not a failure.
+                logger.warning(
+                    "the failure-review decision %s could not be read",
+                    decision_id,
+                    exc_info=True,
+                )
+                continue
+            if decision is None:
+                continue
+            if getattr(decision, "status", None) != DecisionStatus.PENDING.value:
+                continue
+            rows.append(
+                {
+                    "plan_id": plan_id,
+                    "item_id": decision_id,
+                    "wait_type": _FAILURE_REVIEW_WAIT_TYPE,
+                    "question": _failure_review_question(review),
+                    "created_at": str(review.get("created_at") or ""),
+                    "deadline": None,
+                    "remaining_seconds": None,
+                    "extendable": False,
+                    "extensions_count": 0,
+                }
+            )
+    return rows
+
+
 def _state_with_waiting(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
     """The read model with the finishing stage's waits in it.
 
@@ -1746,6 +1952,16 @@ def _state_with_waiting(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
     known = {(str(row.get("plan_id")), str(row.get("item_id"))) for row in rows}
 
     for row in _pending_waiting_rows():
+        key = (str(row.get("plan_id")), str(row.get("item_id")))
+        if key in known:
+            continue
+        known.add(key)
+        rows.append(row)
+
+    # The failure reviews are merged the same way: a question that is
+    # already on the panel is one question, however many records
+    # mention it.
+    for row in _failure_review_waiting_rows():
         key = (str(row.get("plan_id")), str(row.get("item_id")))
         if key in known:
             continue

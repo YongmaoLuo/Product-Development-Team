@@ -6085,6 +6085,34 @@ if debug_routes_enabled():
     app.include_router(_routes_debug.router)
 
 
+# --- routes/failure_review.py -------------------------------------
+# The failure review of a failed plan: ``GET
+# /api/plan/{plan_id}/failure-review``.  It answers with what was
+# announced about the failure — the decision it was announced as, what
+# went wrong, what should happen about it, and when — read from the
+# announcement's own sidecar.
+#
+# Mounted here for the same reason the routers above are: this block
+# runs before the frontend catch-all at the bottom of the file.  This
+# one is a GET, and the catch-all is a GET too, so the ordering is
+# load-bearing: route matching is first-match-wins, so a route
+# registered after the catch-all would never be reached and the caller
+# would get the catch-all's answer instead — a 404 with the body
+# ``{"detail": "Not found"}``, which reads like a missing asset rather
+# than a missing route.
+#
+# The order is pinned by a test, not by this comment:
+# ``tests/api/test_failure_review_endpoint.py`` asserts that this route
+# is registered ahead of the catch-all, so moving this block below it
+# turns the suite red rather than turning the endpoint quiet.
+from routes import failure_review as _routes_failure_review  # noqa: E402
+from routes.failure_review import (  # noqa: E402,F401
+    get_failure_review,
+)
+
+app.include_router(_routes_failure_review.router)
+
+
 def iter_app_routes() -> list:
     """Every ``APIRoute`` this app serves, included routers flattened.
 

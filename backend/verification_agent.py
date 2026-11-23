@@ -1873,6 +1873,53 @@ def _load_service_manager(project_dir: Any = None) -> Any:
         return service_manager
 
 
+def _plan_scope_kwargs(ensure_services: Any, plan_dir: Any) -> Dict[str, Any]:
+    """The round's **own** plan directory — for a manager that can take it.
+
+    What this is for
+    ----------------
+    ``ensure_services`` reads the plan's ledger when it asks the
+    ownership question: *is the holder of the declared port our own
+    leftover?*  The plan's directory is what lets it read **that**
+    ledger; without it the question falls back to a scan of the whole
+    plans tree, which does not even hold this plan's ledger, and the
+    round's own leftover is taken for a stranger's.
+
+    Why this is not simply two more keyword arguments
+    --------------------------------------------------
+    The manager the round talks to is not always the harness' own:
+    :func:`_load_service_manager` prefers the **project's** copy of
+    ``service_manager``, and an older copy of that module was written
+    before the manager knew about a plan's directory.  Handing such a
+    manager an argument it does not accept raises ``TypeError`` — and
+    the preflight swallows that ("preflight errored: … proceeding"), so
+    the round goes on **without its services**.  That reads as a service
+    that will not start, not as a version mismatch.
+
+    So the argument is offered to a manager that can take it, and only
+    to such a manager.  One that cannot is an older one, and it keeps
+    the answer it has always given.
+
+    Never raises: a callable whose signature cannot be read is taken at
+    its word, and is called the way it was called before.
+    """
+    try:
+        parameters = inspect.signature(ensure_services).parameters
+    except (TypeError, ValueError):  # pragma: no cover — a C callable
+        return {}
+    if any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    ):
+        return {"plan_dir": plan_dir, "plan_id": Path(plan_dir).name}
+    kwargs: Dict[str, Any] = {}
+    if "plan_dir" in parameters:
+        kwargs["plan_dir"] = plan_dir
+    if "plan_id" in parameters:
+        kwargs["plan_id"] = Path(plan_dir).name
+    return kwargs
+
+
 # ---------------------------------------------------------------------------
 # The plan's CI contract file — named by the tree under test (2026-11-06)
 # ---------------------------------------------------------------------------
@@ -15155,6 +15202,15 @@ class Orchestrator:
             self.project_dir,
             self._service_declarations,
             round_number=self._current_round,
+            # 2026-11-20: the round's **own** plan directory.  It is what
+            # lets the manager read this plan's ledger — the only record
+            # that says "this process, on this port, is ours" — instead
+            # of guessing from a scan of the whole plans tree, which
+            # does not even hold this plan's ledger.  Without it the
+            # round's own leftover was taken for a stranger's, the
+            # reclaim was attempted without an identity anchor, and the
+            # stop was refused: the declared port stayed held.
+            **_plan_scope_kwargs(ensure_services, self.plan_dir),
         )
         self._service_runtime_map = runtime_map
         # 2026-10-25 (repair-r1-22): 本轮 ensure 产出的实例就是本轮的绑定 ——
@@ -17864,6 +17920,14 @@ class Orchestrator:
             self.project_dir,
             declarations,
             round_number=self._current_round,
+            # 2026-11-20: the round's **own** plan directory, so the
+            # manager reads this plan's ledger when it asks whether the
+            # holder of a declared port is our leftover.  A scan of the
+            # whole plans tree cannot answer it: that tree does not
+            # hold this plan's ledger.
+            **_plan_scope_kwargs(
+                service_manager.ensure_services, self.plan_dir,
+            ),
         )
         record_runtimes = getattr(service_manager, "record_runtimes", None)
         if record_runtimes is not None:

@@ -5375,6 +5375,54 @@ def _failure_detail(
 # against it right now.
 
 
+def _ledger_recorded_listener(
+    entry: Dict[str, Any], live_pids: Set[int],
+) -> Optional[int]:
+    """The listener the ledger's **own** record points at.
+
+    The ledger records the process it spawned, and the port is often
+    held by a **descendant** of it: a declaration's ``start_cmd`` is a
+    shell line, and the process it starts carries only the program.
+    The reap path has always answered that shape (see the group proof
+    in :func:`reap_services`); the ensure path asked for the recorded
+    pid to be the holder, exactly, and when it was not the answer was
+    "not ours" — so the round got out of the way of its own leftover.
+
+    Two proofs, both of them the ledger's own words:
+
+    * the **data plane** the ledger recorded for this service names the
+      process that answered on this port, and that is the process
+      holding it now;
+    * the **process group** the ledger recorded is the group the
+      listener is in — a child inherits the group its parent created.
+
+    A command line that "looks like ours" is **not** one of these and
+    is not accepted: a process that merely resembles ours is somebody
+    else's, and the caller has a weaker shape for that question.
+    """
+    data_plane = entry.get("data_plane")
+    if isinstance(data_plane, dict):
+        try:
+            recorded_pid = int(data_plane.get("pid"))
+        except (TypeError, ValueError):
+            recorded_pid = None
+        if (
+            recorded_pid is not None
+            and recorded_pid in live_pids
+            and str(data_plane.get("verdict") or "") == DATA_PLANE_PROVED
+        ):
+            return recorded_pid
+    try:
+        pgid = int(entry.get("pgid"))
+    except (TypeError, ValueError):
+        pgid = None
+    if pgid is not None and pgid > 1:
+        for candidate in sorted(live_pids):
+            if _process_group_of(candidate) == pgid:
+                return candidate
+    return None
+
+
 def _ledger_holder_evidence(
     plan_dir: Path, decl: ServiceDeclaration, probe: PortProbe,
 ) -> Optional[Dict[str, Any]]:
@@ -5399,12 +5447,31 @@ def _ledger_holder_evidence(
             pid = int(entry.get("pid"))
         except (TypeError, ValueError):
             continue
+        start_epoch: Any = entry.get("start_epoch")
         if pid not in live_pids:
-            continue
-        if _pid_reused(entry):
-            # The number was recycled: the process the ledger recorded is
-            # gone and somebody else holds the port now.
-            continue
+            # The holder is not the process the ledger recorded.  The
+            # entry is asked again, on the ledger's own record of who
+            # that is (2026-11-20).
+            listener = _ledger_recorded_listener(entry, live_pids)
+            if listener is None:
+                continue
+            pid = listener
+            # The anchor has to belong to the process that is going to
+            # be signalled: the ledger never recorded *this* pid, so the
+            # start time is the one measured now, off the live process.
+            # The stop path's identity gate compares the two, and a
+            # pid it cannot place is refused (2026-11-03, VP-018).
+            start_epoch = _process_start_epoch(listener)
+            if start_epoch is None:
+                # The port-wide reading is the fallback: it is the
+                # earliest start among the listeners, so it belongs to
+                # the listener only when there is one.
+                start_epoch = probe.process_start_epoch
+        else:
+            if _pid_reused(entry):
+                # The number was recycled: the process the ledger recorded is
+                # gone and somebody else holds the port now.
+                continue
         return {
             "source": "ledger",
             "plan_dir": str(plan_dir),
@@ -5424,7 +5491,7 @@ def _ledger_holder_evidence(
             # path's identity gate compares the live process' start
             # time with this one; without it the gate has nothing to
             # compare against and cannot refuse a recycled pid.
-            "start_epoch": entry.get("start_epoch"),
+            "start_epoch": start_epoch,
             "cwd": str(entry.get("cwd") or ""),
             "start_cmd": str(entry.get("start_cmd") or ""),
             "owner_token": str(entry.get("owner_token") or ""),
@@ -5465,6 +5532,19 @@ def _evidence_is_our_workspace(
     return True
 
 
+def _led_process_group(pid: int) -> Optional[int]:
+    """The group *pid* **leads**, or ``None`` when it leads none.
+
+    A process that is a member of a group it does not lead has no group
+    of its own to signal: the group belongs to whoever leads it, and a
+    group signal reaches **every** member of it (2026-11-20).
+    """
+    group = _process_group_of(pid)
+    if group is None or group != pid:
+        return None
+    return group
+
+
 def _workspace_evidence(
     decl: ServiceDeclaration, project_dir: Path, probe: PortProbe,
 ) -> Optional[Dict[str, Any]]:
@@ -5474,6 +5554,18 @@ def _workspace_evidence(
     start ours, holding a port we declared.  It is weaker evidence than
     the ledger — no pid was recorded — so it is only used where the
     alternative is relocating the round away from the port it declared.
+
+    The evidence still has to be **actionable** (2026-11-20).  Two more
+    readings make it so, and both are measured off the process that was
+    recognised rather than read out of somebody else's record:
+
+    * the **anchor** — when the holder started.  The stop path compares
+      the live process' start time with the recorded one, and a runtime
+      without an anchor cannot place a live pid in time: the signal is
+      refused, and the port stays held by the very leftover the reclaim
+      was called for (2026-11-03, VP-018, L2).
+    * the **group** — and only when the holder **leads** it.  A group
+      the holder merely sits in belongs to somebody else.
     """
     if not matches_service_program(decl, probe):
         return None
@@ -5490,6 +5582,15 @@ def _workspace_evidence(
     return {
         "source": "workspace",
         "pid": pid,
+        # The group the holder leads, or ``None`` when it leads none:
+        # the group is signalled only when the holder is its leader, so
+        # a stop can never reach a group this process does not own.
+        "pgid": _led_process_group(pid),
+        # The anchor: when the holder started, measured now, off the
+        # process the probe named.  Without it the stop path has
+        # nothing to compare the live process against and refuses the
+        # pid (2026-11-03, VP-018, L2).
+        "start_epoch": probe.process_start_epoch,
         "cwd": cwd,
         "project_dir": str(project_dir),
         "plan_id": "",
@@ -5526,6 +5627,52 @@ def _holder_is_pinned(
             except (TypeError, ValueError):
                 continue
     return False
+
+
+def _live_pin_holding(
+    evidence: Dict[str, Any],
+    decl: ServiceDeclaration,
+    plan_dir: Optional[Path] = None,
+) -> Optional[str]:
+    """Which plan's live pin holds the holder of the declared port.
+
+    :func:`_holder_is_pinned` asks **one** plan's pin file.  The
+    reclaim needs the wider question: a round of **any** plan may be
+    using the port right now, not only a round of this plan — the pin
+    is how a running round says "this service is mine" (2026-10-25).
+    So the plans tree is asked as well.
+
+    The answer is the directory whose pin holds the holder, or ``None``
+    when no live round has pinned it.  A pin file that cannot be read
+    is **not** a verdict: it reads as "no pins", so a corrupt file can
+    never keep a service alive for good.
+    """
+    candidates: List[Path] = []
+    if plan_dir is not None:
+        candidates.append(Path(plan_dir))
+    try:
+        tree = _plans_tree()
+        children = sorted(tree.iterdir())
+    except Exception:  # noqa: BLE001 - a damaged tree is not a verdict
+        children = []
+    for child in children:
+        try:
+            if (child / ROUND_PINS_FILENAME).is_file():
+                candidates.append(child)
+        except OSError:
+            continue
+    seen: Set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if _holder_is_pinned(candidate, evidence, decl):
+                return key
+        except Exception:  # noqa: BLE001 - a damaged book is not a verdict
+            continue
+    return None
 
 
 def _holder_evidence(
@@ -6251,7 +6398,9 @@ def _reclaim_leftover(
     decl: ServiceDeclaration,
     project_dir: Path,
     evidence: Dict[str, Any],
-) -> ServiceRuntime:
+    *,
+    plan_dir: Optional[Path] = None,
+) -> Optional[ServiceRuntime]:
     """Stop our own leftover and take the declared port back.
 
     The point is the **declared** port: this round's copy is started on
@@ -6259,7 +6408,22 @@ def _reclaim_leftover(
     relocation would move our copy elsewhere while the declarations kept
     pointing here — the VPs would talk to the leftover, which cannot
     see this plan's fixture.
+
+    ``None`` means the reclaim was **vetoed**: a live round has pinned
+    the holder of the declared port, so the holder is not a leftover at
+    all and nothing is signalled.  The veto is asked here — at the last
+    gate before the signal — so it covers every kind of evidence, not
+    only the ones that happen to remember to ask the ledger.  The
+    caller then gets out of the way exactly as it does for a holder it
+    cannot identify, and the live round keeps the service it is using.
     """
+    pinned_by = _live_pin_holding(evidence, decl, plan_dir)
+    if pinned_by is not None:
+        logger.info(
+            "[service_manager] not reclaiming port %s: the live-round pin "
+            "in %s says a round is using its holder", decl.port, pinned_by,
+        )
+        return None
     reason = _reclaim_reason(decl, evidence)
     try:
         pid = int(evidence.get("pid"))  # type: ignore[arg-type]
@@ -6271,11 +6435,23 @@ def _reclaim_leftover(
     )
     runtime.pid = pid
     try:
-        runtime.pgid = (
+        recorded_group = (
             int(evidence["pgid"]) if evidence.get("pgid") is not None else None
         )
     except (TypeError, ValueError):
-        runtime.pgid = None
+        recorded_group = None
+    # The group is handed to the stop only when the **measured** group
+    # of the pid that is going to be signalled is that group (2026-11-20).
+    # A number read out of a record may belong to another process by
+    # now, and a group signal reaches every member of the group it
+    # names.  When the group cannot be read, it is ``None`` — the stop
+    # then signals the pid alone, which is the narrowest thing it may
+    # do.
+    runtime.pgid = None
+    if recorded_group is not None and pid is not None:
+        measured = _process_group_of(pid)
+        if measured is not None and int(measured) == recorded_group:
+            runtime.pgid = recorded_group
     # The anchor: when the leftover started.  The ledger recorded it
     # when the service was spawned, and the stop path's identity gate
     # compares the live process' start time with it — without it the
@@ -6419,7 +6595,10 @@ def ensure_services(
          with the declared command, not the captured one).
       3. Port held by *our own* leftover → reclaim the declared port:
          stop the leftover, start this round's copy on the declared
-         port, and record why.
+         port, and record why.  The reclaim is **vetoed** when a live
+         round has pinned the holder — of this plan or of any other —
+         for then the holder is not a leftover at all, and rule 4 is
+         the shape that fits.
       4. Port held by anything else → **get out of the way**: nothing is
          killed.  First this plan's own instance of the very same
          service is looked for on any port: a **live** one is adopted
@@ -6519,7 +6698,37 @@ def _ensure_services(
                 continue
 
             if probe.listening:
-                if not matches_declaration(decl, probe):
+                # 2026-11-20: the identity gate.  A declaration's start
+                # command is a **shell line** — activate a virtualenv,
+                # export the data plane, seed the fixture, run the program
+                # — and the process it starts carries only the program.
+                # The whole line can therefore never match that command
+                # line, so our own listener looked like a stranger: the
+                # round got out of its way instead of restarting it, and
+                # the VPs were pointed at the process an earlier round
+                # had left behind.
+                #
+                # The gate that survives is the one the adopt path
+                # already uses (:func:`_probe_runs_our_program`): the
+                # strict match first, then the program's own tokens.
+                runs_our_program = _probe_runs_our_program(
+                    decl, decl.port, probe,
+                )
+                stale = (
+                    not ignore_freshness
+                    and newest_source is not None
+                    and probe.process_start_epoch is not None
+                    and probe.process_start_epoch < newest_source
+                )
+                # A listener is ours to act on when it runs our program
+                # and it is **stale** (restart it with the declared
+                # command), or when the whole declaration matches it and
+                # it is fresh (adopt it).  A fresh listener that merely
+                # runs our program may belong to a live round, so it is
+                # not adopted — it goes the way every other holder goes.
+                if not runs_our_program or not (
+                    stale or matches_declaration(decl, probe)
+                ):
                     # Rule 3 first: is the holder a leftover of our own?  If
                     # it is, the declared port comes back to us and the
                     # effective declarations stay valid.
@@ -6528,9 +6737,18 @@ def _ensure_services(
                         plan_dir=plan_dir, plan_id=plan_id,
                     )
                     if evidence is not None:
-                        runtime = _reclaim_leftover(decl, project_dir, evidence)
-                        result.runtimes[name] = runtime
-                        continue
+                        runtime = _reclaim_leftover(
+                            decl, project_dir, evidence, plan_dir=plan_dir,
+                        )
+                        if runtime is not None:
+                            result.runtimes[name] = runtime
+                            continue
+                        # The reclaim was **vetoed**: a live round has
+                        # pinned the holder of the declared port, so it is
+                        # not our leftover and the port is not ours to
+                        # take.  Rule 4 below is the shape that fits —
+                        # we get out of the way — and the round that is
+                        # using the service keeps it (2026-11-20).
                     # Rule 4: the port is held by something we cannot identify,
                     # so we neither adopt it nor kill it — **we get out of the
                     # way**. Start our own copy on a free port and point every
@@ -6587,12 +6805,6 @@ def _ensure_services(
                     result.runtimes[name] = runtime
                     continue
 
-                stale = (
-                    not ignore_freshness
-                    and newest_source is not None
-                    and probe.process_start_epoch is not None
-                    and probe.process_start_epoch < newest_source
-                )
                 if not stale:
                     runtime.origin = "adopted"
                     runtime.ready = True
@@ -6618,9 +6830,12 @@ def _ensure_services(
                     result.runtimes[name] = runtime
                     continue
 
-                # Matching but stale: restart it. Its cmdline matched the
-                # declaration, so killing it is the identified-process case
-                # the safety model allows.
+                # Ours but stale: restart it.  Its command line carries
+                # the program we run — the declaration itself, or the
+                # program the declaration's last segment runs — so killing
+                # it is the identified-process case the safety model
+                # allows.  The *declared* command is authoritative: the
+                # captured cmdline of an old process is not.
                 logger.info(
                     "[service_manager] restarting stale listener port=%s "
                     "pid=%s start_epoch=%s newest_source=%s",
@@ -6642,8 +6857,8 @@ def _ensure_services(
                     runtime, decl,
                     caller="service_manager._ensure_services",
                     reason=(
-                        f"the listener on port {runtime.port} matches the "
-                        f"declaration but is stale; it is restarted so the "
+                        f"the listener on port {runtime.port} runs our "
+                        f"program but is stale; it is restarted so the "
                         f"round serves the current source"
                     ),
                     round_token=round_token,

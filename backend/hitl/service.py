@@ -20,7 +20,10 @@ Six actions
     Asks a human.  Reads the plan's own ``hitl_config.json`` (through
     :func:`hooks.config.load_for_plan` — the *one* reader of that file)
     and freezes the two fields that decide what happens when the
-    deadline passes: ``mode`` and ``timeout_sec``.
+    deadline passes: ``mode`` and ``timeout_sec``.  A caller that says
+    ``require_answer=True`` overrides both — the decision is built
+    ``strict`` and without a deadline, so it waits for a person rather
+    than for the clock.
 ``list_decisions()``
     Reports what a plan has been asked, optionally narrowed to one state.
 ``answer_decision()``
@@ -61,6 +64,13 @@ deadline passes, so they are read from the plan's own
 there is.  There is no environment variable, no global configuration
 and no sibling plan's file in the path: the plan says what happens when
 its deadline passes, and nothing else gets a vote.
+
+There is exactly one exception, and it is asked for explicitly:
+``create_decision(..., require_answer=True)`` builds the decision
+``strict`` and without a deadline, because a question that has to be
+answered by a person must not be answered by the clock.  The exception
+is per decision and opt-in — every other decision inherits the plan's
+configuration, and the plan's file is still the only file that is read.
 
 The two values are **frozen into the row** at creation time.  A decision
 that is already open keeps the meaning it was created with, however the
@@ -394,6 +404,8 @@ def create_decision(
     *,
     store: Optional[HitlStore] = None,
     now: Optional[datetime] = None,
+    settle_unrouted: bool = True,
+    require_answer: bool = False,
 ) -> Decision:
     """Ask a human, on behalf of ``request``, and store the question.
 
@@ -424,6 +436,46 @@ def create_decision(
         The clock reading used for the timestamps and the deadline.
         Injected so a test can assert a deadline without waiting for
         it.
+    settle_unrouted:
+        Whether a question nobody was asked is settled as
+        ``unroutable`` on the spot.  ``True`` — the default — is the
+        behaviour every caller had before this argument existed: a
+        question no human ever received must not sit in the table as
+        ``pending``, because it would hold the schedule shut over a
+        question nobody was asked.
+
+        ``False`` keeps the question ``pending`` instead, so that it can
+        be answered where the question is *read* rather than where it
+        was asked.  The answer API takes a pending question and refuses
+        a settled one, so a question that has to be answerable on a
+        panel cannot be closed here.  The delivery is unaffected either
+        way: the question is still handed to the plan's outlet, and a
+        plan with no binding still only records that nobody was asked.
+
+    require_answer:
+        Whether the question waits for a person, or for the clock.
+        ``False`` — the default — is the behaviour every caller had
+        before this argument existed: the plan's configuration decides
+        the mode and the timeout, and an ``auto`` question nobody
+        answered in time falls back to its default answer.
+
+        ``True`` says the question has to be answered **explicitly**,
+        so the plan's configuration does not get to decide it: the
+        decision is built ``strict`` (there is no fallback answer) and
+        without a deadline (``timeout_sec`` is ``None``, so
+        ``deadline_at`` is ``None`` too).  The expiry sweep only settles
+        the ``auto`` decisions that have a deadline, so a question built
+        this way is never answered on the clock's behalf — the only
+        thing that settles it is a human answering it.
+
+        It is the failure-review question that needs this: "what are
+        you going to do about this failure" is asked to be confirmed by
+        a person, and a decision that quietly becomes ``defaulted``
+        after half an hour is the system answering it instead.  Note
+        that this argument governs the *mode and the deadline* only —
+        whether a question nobody was asked is closed as ``unroutable``
+        is ``settle_unrouted``'s business, and a caller that wants the
+        question to stay answerable asks for both.
 
     Returns
     -------
@@ -432,6 +484,8 @@ def create_decision(
         is about to be — the delivery runs on its own thread), and
         ``unroutable`` when the plan's outlet names nobody who can be
         asked: nobody was asked, so there is no question to wait for.
+        With ``settle_unrouted=False`` the question stays ``pending``
+        in the second case too.
 
     Raises
     ------
@@ -444,6 +498,13 @@ def create_decision(
     config = load_for_plan(plan_dir)
     mode = config["mode"]
     timeout_sec = config["timeout_sec"]
+    if require_answer:
+        # The plan's configuration does not get to decide this one: a
+        # question that waits for a person is built ``strict`` (no
+        # fallback answer) and without a deadline, so the expiry sweep
+        # has nothing to settle it on.
+        mode = DecisionMode.STRICT.value
+        timeout_sec = None
 
     with _store_of(store) as opened:
         reason = _refusal_reason(request, mode, timeout_sec)
@@ -463,7 +524,12 @@ def create_decision(
         decision = _build(request, mode, timeout_sec, now=now)
         opened.insert(decision)
         return _ask_the_human(
-            opened, decision, plan_dir, config["hooks"], store_for_later=store
+            opened,
+            decision,
+            plan_dir,
+            config["hooks"],
+            store_for_later=store,
+            settle_unrouted=settle_unrouted,
         )
 
 
@@ -474,6 +540,7 @@ def _ask_the_human(
     hooks: List[Dict[str, Any]],
     *,
     store_for_later: Optional[HitlStore],
+    settle_unrouted: bool = True,
 ) -> Decision:
     """Tell the plan's outlet that a question was asked, and settle the
     question when there is nobody to ask.
@@ -495,16 +562,27 @@ def _ask_the_human(
     as ``pending``: it would hold the schedule shut (the task it is
     about and everything downstream of it) over a question no human
     ever received.
+
+    **The caller says not to settle.**  ``settle_unrouted=False`` turns
+    both settlements above off, and the question stays ``pending`` on
+    both paths: nobody was asked, and the question stays open for
+    whoever reads it.  The delivery is not affected — the question is
+    still handed to the outlet, and the outlet's audit line still says
+    that it reached nobody.  Only the *settlement* is withheld.
     """
     payload = _event_payload(decision)
     if deliverable_hooks(hooks):
         _dispatch_in_background(
-            decision, plan_dir, payload, store=store_for_later
+            decision,
+            plan_dir,
+            payload,
+            store=store_for_later,
+            settle_unrouted=settle_unrouted,
         )
         return decision
 
     report = dispatch(EVENT_DECISION_CREATED, payload, plan_dir)
-    if report.delivered == 0:
+    if report.delivered == 0 and settle_unrouted:
         store.mark_unroutable(decision.decision_id, note=_NOTE_NO_DESTINATION)
         settled = store.get(decision.decision_id)
         if settled is not None:
@@ -546,6 +624,7 @@ def _dispatch_in_background(
     payload: Dict[str, Any],
     *,
     store: Optional[HitlStore],
+    settle_unrouted: bool = True,
 ) -> None:
     """Deliver the question on a worker thread, and settle it if it
     reaches nobody.
@@ -555,6 +634,12 @@ def _dispatch_in_background(
     worker owns the delivery *and* the settlement, because the
     settlement is a fact about the delivery — a question is only
     ``unroutable`` once the outlet has said that it reached nobody.
+
+    ``settle_unrouted=False`` withholds that settlement: the delivery
+    still happens and is still audited, but a question the outlet did
+    not take stays ``pending`` — so the caller's decision to keep the
+    question open holds on this path too, not only on the path where
+    nobody was named at all.
 
     The store the worker settles through is the caller's when there is
     one (the caller owns its lifetime) and an own store otherwise (the
@@ -570,7 +655,7 @@ def _dispatch_in_background(
                 owned = HitlStore(resolve_state_db_path())
                 target = owned
             report = dispatch(EVENT_DECISION_CREATED, payload, plan_dir)
-            if report.delivered == 0:
+            if report.delivered == 0 and settle_unrouted:
                 target.mark_unroutable(
                     decision.decision_id, note=_NOTE_NO_DELIVERY
                 )

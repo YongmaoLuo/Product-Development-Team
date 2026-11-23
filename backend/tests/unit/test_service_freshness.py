@@ -129,6 +129,14 @@ def _stub_run(monkeypatch, lsof_out, ps_cmd_out, ps_lstart_out):
     monkeypatch.setattr(
         "service_freshness._run_probe_cmd", fake,
     )
+    # The kernel's own table must not answer for the pids these stubs
+    # invent: 4984 is synthetic, and on a Linux host the real
+    # ``/proc/4984/cmdline`` belongs to whatever process happens to hold
+    # that number.  Pinning the kernel reader to "nothing here" makes
+    # these cases take the ``ps`` fallback deterministically.
+    monkeypatch.setattr(
+        "service_freshness._proc_cmdline", lambda pid: None,
+    )
 
 
 @contextmanager
@@ -179,6 +187,47 @@ def test_probe_listening_process(monkeypatch) -> None:
     assert "uvicorn" in probe.cmdlines[0]
     assert probe.process_start_epoch is not None
     assert probe.error == ""
+
+
+def test_probe_reads_the_command_line_from_the_kernel_not_from_ps(
+    monkeypatch,
+) -> None:
+    """The command line must come from the kernel's table, not from ``ps``.
+
+    ``ps`` truncates what it prints when its stdout is not a terminal —
+    procps clips ``-o command=`` to 80 columns.  A long path then loses
+    its tail, the program's own name goes with it, and the holder stops
+    looking like the program the declaration starts: our own leftover
+    becomes unrecognisable and the workspace fallback declines to reclaim
+    it.
+
+    The kernel's own argument table has no notion of a width, so reading
+    the command line from there returns the whole line.  The stubbed
+    ``ps`` below answers with a *different* string, so equality with the
+    kernel's line also proves the answer did not come from ``ps``.
+    """
+    from service_freshness import probe_port
+
+    kernel_cmdline = (
+        "/opt/venv/bin/python3 "
+        "/tmp/pytest-of-runner/pytest-2/test_workspace_leftover_recl0/"
+        "project/svc.py --port 8731"
+    )
+    # The premise of the case: the program's own name only appears past
+    # column 80, which is exactly where ``ps`` stops.
+    assert len(kernel_cmdline) > 80
+    assert kernel_cmdline.index("svc.py") >= 80
+
+    _stub_run(monkeypatch, "4984\n", "the-line-ps-would-have-printed",
+              "Thu Sep  4 09:32:01 2026")
+    monkeypatch.setattr(
+        "service_freshness._proc_cmdline", lambda pid: kernel_cmdline,
+    )
+
+    probe = probe_port(8080)
+    assert probe.listening is True
+    assert probe.cmdlines == [kernel_cmdline]
+    assert "svc.py" in probe.cmdlines[0]
 
 
 def _stub_no_listener(monkeypatch):

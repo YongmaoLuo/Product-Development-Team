@@ -111,7 +111,15 @@ SNAPSHOT_PATH = _TESTS_DIR / "openapi_snapshot.json"
 #: （`openapi_snapshot()`）交叉验证——两者逐项零差异、指纹相同——才写下本值
 #: （`bcd1ce6d…`）。
 #:
-#: 2026-11-19（导入请求体新增 `mode` 字段 / 本分支）：本次变更给导入请求体
+#: 2026-11-20（失败复盘只读端点 / 本分支）：失败复盘端点
+#: `GET /api/plan/{plan_id}/failure-review` 是**有意新增**的对外契约，故按
+#: 同一条规矩重取基线：删掉 `openapi_snapshot.json` 让门禁重新生成一份（快照
+#: 与指纹在**同一次变更**里更新），再由该快照的规范形式现算指纹，并与线上
+#: app 实际发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零差异、
+#: 指纹相同——才把该值写进本常量（`ff73bd34…`）。重取前后的差异**只有**这一
+#: 条路径（87 → 88 条路径，`components` 与 `info` 逐项相等），没有顺带改动
+#: 任何其它端点的形状。
+#: 2026-11-19（导入请求体新增 `mode` 字段 / base 侧）：本次变更给导入请求体
 #: 模型 `ImportPlanRequest` 增加了一个 `mode` 字段（不传时取 'production'），
 #: 对外 HTTP 契约的形状随之改变，故按同一条规矩重取基线：
 #: `openapi_snapshot.json` 相对上一版**只增不删**（新增 5 行、删除 0 行，唯一
@@ -121,6 +129,15 @@ SNAPSHOT_PATH = _TESTS_DIR / "openapi_snapshot.json"
 #: （`_fingerprint(json.loads(SNAPSHOT_PATH.read_text()))`），再与线上 app
 #: 实际发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零差异、指纹
 #: 相同——才把该值写进本常量（`c74a35fc…`）。
+#: 2026-11-20（合入 origin/main / 2b9efa16）：两侧各自的指纹常量都只描述
+#: 自己那一半的形状，合并后**都已过期**——合并后的对外形状是**两侧的并集**
+#: （路径集合 88 条 = 本分支侧 88 条 + base 侧 87 条 − 公共 87 条；`components`
+#: 侧本分支的失败复盘路径与 base 侧的 `ImportPlanRequest.properties.mode`
+#: 同时在）。故按同一条规矩重取：先由合并后的 `openapi_snapshot.json` 规范
+#: 形式现算指纹（`_fingerprint(json.loads(SNAPSHOT_PATH.read_text()))`），再与
+#: 线上 app 实际发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零差异
+#: （88 条路径，`components` 与 `info` 逐项相等）、指纹相同——才把该值写进
+#: 本常量（`49cac9dd…`；该值已被下一次合并的现算值取代，见下）。
 #:
 #: 2026-11-20（导入重复拦截 / 本分支）：本次变更给导入请求体模型
 #: `ImportPlanRequest` 增加了一个 `allow_duplicate` 字段（默认 False；置 True
@@ -171,9 +188,20 @@ SNAPSHOT_PATH = _TESTS_DIR / "openapi_snapshot.json"
 # 本分支同时把 origin/main（2026-11-22 的 `POST
 # /api/verification/{plan_id}/postprocess/resume`）合了进来：合并后的对外
 # 形状是**两侧的并集**（88 条路径），两侧的指纹常量各自只描述自己那一半的
-# 形状，合并后都已过期，故按同一条规矩重取——现算出的值写在下面
-# （`e164c9d7…`）。
-BASELINE_FINGERPRINT = "e164c9d74b208a46679e7d5f842474d31a23442d35e6f9aa8f033ea667995610"
+# 形状，合并后都已过期，故按同一条规矩重取——当时现算出的值是 `e164c9d7…`
+# （该值已被下一次合并的现算值取代，见下）。
+#: 2026-11-23（合入 origin/main / deb9b009）：两侧各自新增了对外端点，合并后
+#: 的对外形状是**两侧的并集**（90 条路径 = 本分支侧 88 条 + base 侧 89 条 −
+#: 公共 87 条；本分支侧的 `GET /api/plan/{plan_id}/failure-review` 与 base 侧的
+#: `GET /api/scheduler/finishing`、
+#: `POST /api/verification/{plan_id}/postprocess/resume` 同时在）。两侧的指纹
+#: 常量各自只描述自己那一半的形状，合并后都已过期，故按同一条规矩重取：先由
+#: 合并后的 `openapi_snapshot.json` 规范形式现算指纹
+#: （`_fingerprint(json.loads(SNAPSHOT_PATH.read_text()))`），再与线上 app 实际
+#: 发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零差异（90 条路径，
+#: 路径集合、`components` 与 `info` 逐项相等，整份 schema 相等）、指纹相同——
+#: 才把该值写进本常量（`b021d16f…`）。
+BASELINE_FINGERPRINT = "b021d16f5240a4dad3743c85ec913e69b1520251d4ed6c5747505434f447360a"
 
 #: The capture runs in its own process so the schema is the one a clean
 #: start produces: debug routes off, no schema cache carried over from

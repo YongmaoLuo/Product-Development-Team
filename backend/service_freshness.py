@@ -330,6 +330,50 @@ def _run_probe_cmd(argv: List[str], timeout: int = 10) -> Optional[str]:
         return None
 
 
+def _proc_cmdline(pid: int) -> Optional[str]:
+    """Read a process's command line from the kernel's own table.
+
+    ``/proc/<pid>/cmdline`` holds the argument vector as NUL-separated
+    bytes.  The kernel has no notion of a column width, so a long path
+    comes back in full — which is the whole reason this is preferred
+    over ``ps`` (see :func:`_process_cmdline`).
+
+    Returns ``None`` when the platform has no ``/proc`` (macOS), when
+    the process is already gone, or when the file cannot be read.
+    """
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (OSError, ValueError):
+        return None
+    parts = [part for part in raw.split(b"\x00") if part]
+    if not parts:
+        return None
+    return " ".join(part.decode("utf-8", errors="replace") for part in parts)
+
+
+def _process_cmdline(pid: int) -> Optional[str]:
+    """The command line of *pid*, preferring the kernel's own table.
+
+    ``ps`` truncates the command it prints when its stdout is not a
+    terminal: procps clips ``-o command=`` to 80 columns.  A probe
+    always reads a pipe, so the truncation is the normal case rather
+    than the exception — and a path that reaches past column 80 loses
+    its tail, which is exactly where the program's own name tends to
+    sit.  The holder then stops matching the program the declaration
+    starts, and our own leftover becomes unrecognisable: the workspace
+    fallback declines to reclaim it and the declared port stays held.
+
+    The kernel's argument table has no width, so it is the primary
+    source.  ``ps`` stays as the fallback for platforms without
+    ``/proc`` (macOS) and for processes that vanish mid-probe; ``-ww``
+    turns off the line wrapping on that path.
+    """
+    cmdline = _proc_cmdline(pid)
+    if cmdline:
+        return cmdline
+    return _run_probe_cmd(["ps", "-ww", "-p", str(pid), "-o", "command="])
+
+
 def _port_is_listening(port: int, host: str = "127.0.0.1") -> Optional[bool]:
     """Whether something accepts a TCP connection on *port*.
 
@@ -437,7 +481,7 @@ def probe_port(port: int) -> PortProbe:
 
     starts: List[float] = []
     for pid in pids:
-        cmdline = _run_probe_cmd(["ps", "-p", str(pid), "-o", "command="])
+        cmdline = _process_cmdline(pid)
         if cmdline:
             probe.cmdlines.append(cmdline)
         lstart = _run_probe_cmd(["ps", "-p", str(pid), "-o", "lstart="])

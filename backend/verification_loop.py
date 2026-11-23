@@ -5935,6 +5935,51 @@ def _persist_verification_terminal(
             plan_id, e,
         )
 
+    # ----- Failure review: announce the terminal failure -----
+    #
+    # 2026-11-19: a plan that really ended in failure has to be
+    # announced to a human.  The question "what went wrong, and what
+    # should happen next?" becomes a decision on the panel, and the
+    # sidecar ``failure_review.json`` is what the read-only consumers
+    # read.
+    #
+    # 2026-11-20: the announcement runs **after** the routing CAS
+    # (step 2), not before it.  The shared rule that decides whether
+    # this is a terminal failure worth announcing
+    # (``failure_review.is_terminal_failure``) reads the plan's phase
+    # out of ``plan_routing.current_phase`` — the very row step 2
+    # writes.  An announcement that ran before the CAS read
+    # ``verification_running`` (or ``verification_repairing``, or
+    # ``executing``) and was therefore vetoed every time: the real
+    # verification chain produced no sidecar and asked no human
+    # anything.  Terminal write first, announcement second.
+    #
+    # A step 2 that failed outright leaves the phase where it was, so
+    # the rule vetoes the announcement there too — and that is the
+    # right answer: a terminal that never reached the database is not
+    # a terminal the panel can act on.
+    #
+    # Two conditions, and BOTH are needed:
+    #
+    #   * ``_chain_ending`` — this write really ended the chain.  A
+    #     mid-loop failure (the executor subprocess is still in flight)
+    #     is not a terminal outcome: the plan is about to try again,
+    #     and asking a human to review a failure the plan may recover
+    #     from is noise.
+    #   * the STATUS is a failure — ``passed`` has nothing to review.
+    #
+    # The import is inside the function on purpose.  It keeps
+    # ``failure_review`` out of this module's import graph (the frozen
+    # surface holds the import graph still too), and it lets a test
+    # intercept the call by patching the module attribute.
+    # ``announce_failure`` never raises — it is a side path, and a
+    # failure to report a failure must not become a second failure —
+    # so there is nothing to guard here.
+    if _chain_ending and status in {"failed", "loop_stopped"}:
+        from failure_review import announce_failure
+
+        announce_failure(plan_id, stop_reason=stop_reason)
+
     # ----- 3) Confirm the phase + record the terminal in PlanState -----
     #
     # 2026-09-07 fix, revised by the 2026-09-17 schema-v5 collapse.
