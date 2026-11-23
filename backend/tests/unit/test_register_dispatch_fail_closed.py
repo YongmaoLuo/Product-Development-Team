@@ -66,6 +66,12 @@ from coding_tool import ClaudeCodingTool  # noqa: E402
 from sub_agent_registry import sub_agent_registry  # noqa: E402
 from verification_cancel import VerificationCancelled  # noqa: E402
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 PLAN = "plan-register-dispatch-fail-closed"
 
 #: A fake CLI that stays alive until it is killed. It ignores the EOF on
@@ -288,7 +294,7 @@ def test_the_call_site_reaps_the_child_and_reraises_untouched(
 
     monkeypatch.setattr(sub_agent_registry, "register_sub_agent", boom)
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     with pytest.raises(VerificationCancelled) as excinfo:
         tool.query_json(prompt="hello", system_instruction="sys")
 

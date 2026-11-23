@@ -72,6 +72,12 @@ from coding_tool import (  # noqa: E402
     query_json_in_session,
 )
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 def _tool(monkeypatch, side_effect):
     """A tool whose ``_run_interactive_resilient`` is driven by ``side_effect``.
@@ -82,7 +88,7 @@ def _tool(monkeypatch, side_effect):
     method returns — or an exception instance to raise. Every dispatch is
     recorded with its kwargs, which is what the assertions below read.
     """
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     tool.EMPTY_RESPONSE_RETRY_BACKOFF_SEC = 0.0
     tool.logger = MagicMock()
     recorded: list[dict] = []

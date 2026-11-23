@@ -33,6 +33,13 @@ import pytest
 # Import the module — pytest collects from the backend root, so a
 # bare ``coding_tool`` import resolves the package.
 import coding_tool
+from pathlib import Path
+
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _make_timer(total_sec: float, last_line_time: list):
@@ -273,7 +280,7 @@ def test_watcher_ignores_silence_that_predates_its_own_start(
     clock = _StaleFirstStamp()
     monkeypatch.setattr(coding_tool, "time", clock)
 
-    tool = coding_tool.ClaudeCodingTool()
+    tool = coding_tool.ClaudeCodingTool( cwd=_REPO_ROOT)
     with pytest.raises(coding_tool.HardTimeoutError) as excinfo:
         tool._run_claude_interactive(
             "hello",

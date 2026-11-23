@@ -29,6 +29,13 @@ from coding_tool import (
     ClaudeCodingTool,
     EmptyResponseError,
 )
+from pathlib import Path
+
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture
@@ -165,7 +172,7 @@ def test_plan_usage_context_resets_after_scope(plans_dir, monkeypatch):
 
 
 def _make_tool(monkeypatch, stub):
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     monkeypatch.setattr(tool, "_run_claude_interactive", stub)
     return tool
 

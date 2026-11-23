@@ -28,6 +28,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import coding_tool as ct
 from coding_tool import ClaudeCodingTool, create_coding_tool
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 PLAN_PROMPT = "生成验证计划书"
 PLAN_ANSWER = "这是脚本化的验证计划书"
@@ -65,7 +71,7 @@ def script_dir(tmp_path, monkeypatch):
 
 def test_scripted_mode_returns_registered_response(script_dir):
     """A registered prompt answers with its fixture, verbatim."""
-    tool = create_coding_tool()
+    tool = create_coding_tool( cwd=_REPO_ROOT)
     assert isinstance(tool, ct.ScriptedCodingTool)
 
     answer = tool.query(f"{PLAN_PROMPT}：第 3 层")
@@ -74,7 +80,7 @@ def test_scripted_mode_returns_registered_response(script_dir):
 
 def test_unregistered_prompt_fails_loudly(script_dir):
     """A prompt nobody registered raises instead of answering empty."""
-    tool = create_coding_tool()
+    tool = create_coding_tool( cwd=_REPO_ROOT)
 
     with pytest.raises(RuntimeError) as excinfo:
         tool.query("一个没有登记的 prompt")
@@ -89,7 +95,7 @@ def test_default_mode_unchanged(monkeypatch):
     monkeypatch.delenv("PDT_LLM_MODE", raising=False)
     monkeypatch.delenv("PDT_LLM_SCRIPT_DIR", raising=False)
 
-    tool = create_coding_tool()
+    tool = create_coding_tool( cwd=_REPO_ROOT)
     assert isinstance(tool, ClaudeCodingTool)
     assert not isinstance(tool, ct.ScriptedCodingTool)
 
@@ -109,7 +115,7 @@ def test_missing_script_dir_raises(tmp_path, monkeypatch):
     monkeypatch.setenv("PDT_LLM_SCRIPT_DIR", str(missing))
 
     with pytest.raises(RuntimeError):
-        create_coding_tool()
+        create_coding_tool( cwd=_REPO_ROOT)
 
     with pytest.raises(RuntimeError):
         ct.ScriptedCodingTool(script_dir=str(missing))
@@ -124,10 +130,10 @@ def test_scripted_mode_never_reaches_the_cli(script_dir, monkeypatch):
     monkeypatch.setattr(ClaudeCodingTool, "_query_json_internal", _must_not_run)
 
     # The factory's tool ...
-    tool = create_coding_tool()
+    tool = create_coding_tool( cwd=_REPO_ROOT)
     assert tool.query(PLAN_PROMPT) == PLAN_ANSWER
 
     # ... and a tool built directly, which is how most of the codebase
     # builds one.
-    direct = ClaudeCodingTool()
+    direct = ClaudeCodingTool( cwd=_REPO_ROOT)
     assert direct.query(PLAN_PROMPT) == PLAN_ANSWER

@@ -24,6 +24,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from background_manager import BackgroundManager, ProcessState
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 class TestBackgroundManagerProcessGroups:
     """BackgroundManager uses start_new_session=True and kills the whole group."""
@@ -193,7 +199,7 @@ class TestCodingToolCleanup:
         from coding_tool import ClaudeCodingTool
 
         with patch.object(ClaudeCodingTool, "_load_provider_from_db", return_value={}):
-            tool = ClaudeCodingTool()
+            tool = ClaudeCodingTool( cwd=_REPO_ROOT)
 
         mock_proc = MagicMock()
         mock_proc.poll.return_value = None  # still running
@@ -213,7 +219,7 @@ class TestCodingToolCleanup:
         from coding_tool import ClaudeCodingTool
 
         with patch.object(ClaudeCodingTool, "_load_provider_from_db", return_value={}):
-            tool = ClaudeCodingTool()
+            tool = ClaudeCodingTool( cwd=_REPO_ROOT)
 
         assert tool._current_process is None
         tool.cleanup()  # Should not raise
@@ -223,7 +229,7 @@ class TestCodingToolCleanup:
         from coding_tool import ClaudeCodingTool
 
         with patch.object(ClaudeCodingTool, "_load_provider_from_db", return_value={}):
-            tool = ClaudeCodingTool()
+            tool = ClaudeCodingTool( cwd=_REPO_ROOT)
 
         mock_proc = MagicMock()
         mock_proc.poll.return_value = None

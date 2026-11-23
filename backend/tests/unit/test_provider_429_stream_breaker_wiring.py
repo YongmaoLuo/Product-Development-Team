@@ -54,6 +54,12 @@ if str(BACKEND_DIR) not in sys.path:
 import coding_tool  # noqa: E402
 from coding_tool import ApiError, ClaudeCodingTool  # noqa: E402
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 def _breaker_text() -> str:
     """The message the breaker raises as.
@@ -181,7 +187,7 @@ def _make_tool() -> tuple[ClaudeCodingTool, _RecordingLogger]:
     because the breaker reads the scene, not the provider.
     """
     log = _RecordingLogger()
-    tool = ClaudeCodingTool(logger=log)
+    tool = ClaudeCodingTool(logger=log, cwd=_REPO_ROOT)
     tool.inherit_providers = True
     return tool, log
 

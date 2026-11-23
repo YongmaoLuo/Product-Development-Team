@@ -35,6 +35,12 @@ if str(BACKEND_DIR) not in sys.path:
 
 from coding_tool import ClaudeCodingTool  # noqa: E402
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 _INIT_EVENT = json.dumps(
     {
         "type": "system",
@@ -67,7 +73,21 @@ def _dispatch(tmp_path: Path, *, mode: str, ambient: dict):
     """Run one dispatch; return ``(cmd, written_settings_dict)``."""
     base = tmp_path / "base_settings.json"
     base.write_text(
-        json.dumps({"env": {"PDT_PROJECT_DIR": "/somewhere"}, "hooks": {}}),
+        json.dumps({
+            # ``AC_BASE_MARKER`` is a key the tool does not own: it has
+            # to survive the dispatch untouched.  ``PDT_PROJECT_DIR``
+            # is the one env key the tool DOES own — see the note in
+            # ``test_hooks_are_still_written`` for what it now carries.
+            "env": {"PDT_PROJECT_DIR": "/somewhere", "AC_BASE_MARKER": "kept"},
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "*",
+                        "hooks": [{"type": "command", "command": "echo base-hook"}],
+                    }
+                ]
+            },
+        }),
         encoding="utf-8",
     )
 
@@ -79,7 +99,7 @@ def _dispatch(tmp_path: Path, *, mode: str, ambient: dict):
         "coding_tool.subprocess.Popen"
     ) as popen:
         popen.return_value = _mock_process()
-        tool = ClaudeCodingTool(settings=base)
+        tool = ClaudeCodingTool(settings=base, cwd=_REPO_ROOT)
         tool._run_claude_interactive("do something")
 
         cmd = popen.call_args[1].get("args") or popen.call_args[0][0]
@@ -129,9 +149,33 @@ class TestInheritModeReachesTheSubprocess:
         stuck-subagent watchdog.
         """
         _cmd, written = _dispatch(tmp_path, mode="inherit", ambient=_AMBIENT)
-        assert written.get("env", {}).get("PDT_PROJECT_DIR") == "/somewhere", (
+        # The base payload rides through: an env key the tool does not
+        # own, and the base hook list.
+        assert written.get("env", {}).get("AC_BASE_MARKER") == "kept", (
             "the base settings payload (AC_* keys, hooks) must survive"
         )
+        assert any(
+            "base-hook" in json.dumps(entry)
+            for entry in written.get("hooks", {}).get("PreToolUse", [])
+        ), "the base settings payload (AC_* keys, hooks) must survive"
+        # ``PDT_PROJECT_DIR`` is the one env key the tool DOES own, and
+        # it now always has a value to publish: since ``cwd`` became a
+        # required keyword (72f82fb2) every tool names the tree it runs
+        # in, and the dispatch publishes exactly that tree — the
+        # template's stale ``/somewhere`` is replaced by the tool's own
+        # root, so the guard hook and the lock broker resolve against
+        # the directory the child actually runs in.
+        assert written.get("env", {}).get("PDT_PROJECT_DIR") == str(
+            _REPO_ROOT.resolve()
+        ), (
+            "the published project dir must be the tool's own working "
+            "root, not the stale value the template carried"
+        )
+        # The working root travels with the child as well, so the child
+        # can tell which checkout it is in instead of inferring it.
+        assert written.get("env", {}).get("PDT_WORK_ROOT") == str(
+            _REPO_ROOT.resolve()
+        ), "the working root must ride in the --settings payload"
 
 
 class TestTheNormalPathStillWritesProviderConfiguration:

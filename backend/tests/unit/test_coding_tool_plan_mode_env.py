@@ -33,6 +33,12 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 _BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
@@ -139,8 +145,7 @@ def test_the_dispatched_settings_payload_carries_the_mode(
         # CC Switch row (and leaking live credentials into the file).
         provider_priority=["__no_such_provider__"],
         settings=str(template),
-        plan_mode="test",
-    )
+        plan_mode="test", cwd=_REPO_ROOT)
     assert tool.plan_mode == "test"
 
     mock_proc = MagicMock()

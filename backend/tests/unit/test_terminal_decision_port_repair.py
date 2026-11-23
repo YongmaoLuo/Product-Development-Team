@@ -398,3 +398,188 @@ def test_default_writer_persists_rows_to_state_db(tmp_path, monkeypatch):
         assert task_id.startswith("repair-"), f"not a repair task id: {task_id!r}"
         # ``add_task`` owns the runtime status — a new row starts pending.
         assert row.get("status") == "pending", f"unexpected status: {row!r}"
+
+
+# ---------------------------------------------------------------------------
+# 6. The port's tool names the tree it runs in
+# ---------------------------------------------------------------------------
+
+
+class _RecordingTool:
+    """A stand-in for the coding tool that records how it was built.
+
+    The real tool is heavy and this contract is about *how it is
+    built*: which scene it runs on, and which checkout it runs in.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+
+
+def _no_registered_project_dir(monkeypatch) -> None:
+    """Say that no plan has a registered project directory.
+
+    The lookup goes through ``server``; a test that says "this plan has
+    no workspace" must not depend on what the operator's own database
+    happens to hold.
+    """
+    import server
+
+    monkeypatch.setattr(server, "_get_project_dir", lambda plan_id: None)
+
+
+def test_the_port_builds_its_tool_in_the_named_root(monkeypatch, tmp_path):
+    """The tool the repair path calls runs in the tree that was named.
+
+    ``cwd`` is a required keyword on the tool (2026-10-29): a tool with
+    no root runs its child in the backend server's working directory —
+    a *different* checkout from the one the repair is about.
+    """
+    module = _port_module()
+    monkeypatch.setattr("coding_tool.ClaudeCodingTool", _RecordingTool)
+
+    root = tmp_path / "checkout"
+    port = module.DefaultTerminalDecisionPort(
+        plan_dir_of=lambda plan_id: tmp_path,
+        cwd=str(root),
+    )
+
+    tool = port.coding_tool
+
+    assert tool.kwargs.get("cwd") == str(root), (
+        f"the tool must run in the tree that was named; got {tool.kwargs!r}"
+    )
+    assert tool.kwargs.get("scene") == "verification"
+
+
+def test_the_port_falls_back_to_the_plan_directory(monkeypatch, tmp_path):
+    """A plan with no workspace owns only its plan directory.
+
+    That directory is the root its tool gets — never the server's
+    directory, and never nothing at all.
+    """
+    module = _port_module()
+    monkeypatch.setattr("coding_tool.ClaudeCodingTool", _RecordingTool)
+    _no_registered_project_dir(monkeypatch)
+
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir()
+    port = module.DefaultTerminalDecisionPort(
+        plan_dir_of=lambda plan_id: plan_dir,
+        plan_id="p1",
+    )
+
+    tool = port.coding_tool
+
+    assert tool.kwargs.get("cwd") == str(plan_dir), (
+        f"the tool must run in the plan's own directory; got {tool.kwargs!r}"
+    )
+
+
+def test_the_port_prefers_the_project_directory(monkeypatch, tmp_path):
+    """The registered workspace wins over the plan directory.
+
+    The workspace is where the plan's work happens — the tree the
+    verification branch owns — so the tool that reads it must run
+    there.
+    """
+    module = _port_module()
+    monkeypatch.setattr("coding_tool.ClaudeCodingTool", _RecordingTool)
+
+    project_dir = tmp_path / "workspace"
+    plan_dir = tmp_path / "plan"
+    port = module.DefaultTerminalDecisionPort(
+        plan_dir_of=lambda plan_id: plan_dir,
+        plan_id="p1",
+        project_dir=str(project_dir),
+    )
+
+    tool = port.coding_tool
+
+    assert tool.kwargs.get("cwd") == str(project_dir), (
+        f"the registered workspace must win; got {tool.kwargs!r}"
+    )
+
+
+def test_the_port_refuses_to_build_a_tool_with_no_root(monkeypatch, tmp_path):
+    """A plan that names no tree gets no tool.
+
+    The refusal is the point: a silent fallback is the server's own
+    directory, and the server's directory is a different checkout from
+    the one the repair is about.
+    """
+    module = _port_module()
+    monkeypatch.setattr("coding_tool.ClaudeCodingTool", _RecordingTool)
+    _no_registered_project_dir(monkeypatch)
+
+    def _no_plan_dir(plan_id):
+        raise LookupError("no plan directory for this plan")
+
+    port = module.DefaultTerminalDecisionPort(
+        plan_dir_of=_no_plan_dir,
+        plan_id="p1",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        port.coding_tool
+
+    assert str(excinfo.value) == "explicit cwd required", (
+        f"the refusal must be the contract's own words; got {excinfo.value!r}"
+    )
+
+
+def test_default_port_carries_the_cwd(monkeypatch, tmp_path):
+    """The factory hands the root it was given to the port it builds.
+
+    The dispatch path builds its port through the factory, so a root
+    named there has to reach the tool — otherwise the factory would be
+    the one place where the root goes missing.
+    """
+    module = _port_module()
+    monkeypatch.setattr("coding_tool.ClaudeCodingTool", _RecordingTool)
+
+    root = tmp_path / "checkout"
+    port = module.default_port(cwd=str(root))
+
+    tool = port.coding_tool
+
+    assert tool.kwargs.get("cwd") == str(root), (
+        f"the factory dropped the root on the way; got {tool.kwargs!r}"
+    )
+
+
+def test_the_dispatch_hands_the_port_a_root(monkeypatch, tmp_path):
+    """The service that dispatches a terminal decision names a root.
+
+    The port is built there, from the plan's own ids — so that is
+    where the root has to be named.
+    """
+    from hitl import service
+
+    captured = {}
+
+    def _fake_default_port(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(service, "default_port", _fake_default_port)
+    monkeypatch.setattr(
+        service, "dispatch_terminal_execution",
+        lambda **kwargs: captured.update(kwargs),
+    )
+    _no_registered_project_dir(monkeypatch)
+
+    plan_dir = tmp_path / "plan"
+    service._dispatch_terminal_execution(
+        plan_id="p1",
+        decision_id="d1",
+        option="accept_as_failed",
+        note="",
+        plan_dir=plan_dir,
+        record=None,
+    )
+
+    assert captured.get("cwd") == str(plan_dir), (
+        f"the dispatch must name a root for the port's tool; "
+        f"got {captured!r}"
+    )

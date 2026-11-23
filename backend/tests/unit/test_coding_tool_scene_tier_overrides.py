@@ -52,6 +52,12 @@ import coding_tool as coding_tool_module
 import provider_routing
 from coding_tool import ClaudeCodingTool
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -231,7 +237,7 @@ class TestSceneTierOverrides:
         """
         overrides["value"] = {"model": "m-2"}
 
-        tool = ClaudeCodingTool(scene="execution", settings=str(settings_template))
+        tool = ClaudeCodingTool(scene="execution", settings=str(settings_template), cwd=_REPO_ROOT)
         env = _run_dispatch(tool)["env"]
 
         assert env["ANTHROPIC_MODEL"] == "m-2"
@@ -253,7 +259,7 @@ class TestSceneTierOverrides:
         """
         overrides["value"] = {"effort": "max"}
 
-        tool = ClaudeCodingTool(scene="execution", settings=str(settings_template))
+        tool = ClaudeCodingTool(scene="execution", settings=str(settings_template), cwd=_REPO_ROOT)
         env = _run_dispatch(tool)["env"]
 
         assert env["CLAUDE_CODE_EFFORT_LEVEL"] == "max"
@@ -278,7 +284,7 @@ class TestSceneTierOverrides:
         """
         overrides["value"] = {}
 
-        tool = ClaudeCodingTool(scene="execution", settings=str(settings_template))
+        tool = ClaudeCodingTool(scene="execution", settings=str(settings_template), cwd=_REPO_ROOT)
         env = _run_dispatch(tool)["env"]
 
         # The scene path DID ask — an empty answer is what licenses the
@@ -317,12 +323,12 @@ class TestSceneTierOverrides:
         # it the assertion below would pass for the wrong reason — a
         # resolver nobody ever calls satisfies "not consulted without a
         # scene" just as well as a correctly-scoped one does.
-        scene_tool = ClaudeCodingTool(scene="execution", settings=str(settings_template))
+        scene_tool = ClaudeCodingTool(scene="execution", settings=str(settings_template), cwd=_REPO_ROOT)
         _run_dispatch(scene_tool)
         assert overrides["calls"] == [("execution", "Vendor A Pro")]
 
         # The call under test: no scene → no tier → no lookup.
-        tool = ClaudeCodingTool(settings=str(settings_template))
+        tool = ClaudeCodingTool(settings=str(settings_template), cwd=_REPO_ROOT)
         env = _run_dispatch(tool)["env"]
 
         assert overrides["calls"] == [("execution", "Vendor A Pro")], (
@@ -343,7 +349,7 @@ class TestSceneTierOverrides:
         """
         overrides["value"] = {"model": "m-2", "effort": "max"}
 
-        tool = ClaudeCodingTool(scene="execution", settings=str(settings_template))
+        tool = ClaudeCodingTool(scene="execution", settings=str(settings_template), cwd=_REPO_ROOT)
         env = _run_dispatch(tool)["env"]
 
         # The override really was in effect — otherwise "unchanged"
@@ -375,7 +381,7 @@ class TestSceneTierOverrides:
         monkeypatch.setenv("PDT_PROVIDER_MODE", "inherit")
         overrides["value"] = {"model": "m-2", "effort": "max"}
 
-        tool = ClaudeCodingTool(scene="execution", settings=str(settings_template))
+        tool = ClaudeCodingTool(scene="execution", settings=str(settings_template), cwd=_REPO_ROOT)
         assert tool.inherit_providers is True
 
         env = _run_dispatch(tool)["env"]
@@ -410,8 +416,7 @@ class TestSceneTierOverrides:
 
         logger = MagicMock()
         tool = ClaudeCodingTool(
-            scene="execution", settings=str(settings_template), logger=logger,
-        )
+            scene="execution", settings=str(settings_template), logger=logger, cwd=_REPO_ROOT)
         env = _run_dispatch(tool)["env"]
 
         assert env["ANTHROPIC_MODEL"] == "cc-default-model"

@@ -701,6 +701,15 @@ def merge_round(
     idempotency guarantee the docstring always claimed and makes the
     freshest verdict the one that survives.
 
+    2026-10-29 (VP-030, R7): the verdict that is overwritten is not
+    **erased** — it travels with the entry that replaced it, under
+    ``superseded_verdict``.  The round counter went 3 → 1 once, the
+    round-1 write overwrote round 1's original record, and the history
+    held three records for four failed rounds: "连续第几次失败" and
+    "上一轮到底说了什么" both became unanswerable.  One record per round
+    is kept (the count and the history have to agree), and nothing that
+    happened is thrown away.
+
     Entries keep only the fields the repair prompt renders, plus any
     extra keys the caller supplies — and the two keys the triage reads:
     ``failure_class`` and ``failure_class_source``. A caller that names
@@ -752,11 +761,69 @@ def merge_round(
                 entry[key] = vp_data[key]
         for index, existing in enumerate(entries):
             if existing.get("round") == round_number:
+                # 2026-10-29 (VP-030, R7): the freshest verdict wins (the
+                # 2026-09-19 rule), but the one it replaces is not
+                # **erased**.  It used to be: the round-1 write of a
+                # re-run overwrote round 1's original record, so the
+                # earliest round's evidence was gone and the history held
+                # three records for four failed rounds.  The earlier
+                # verdict travels with the entry that replaced it.
+                earlier = _verdict_of(existing)
+                if earlier and earlier != _verdict_of(entry):
+                    entry["superseded_verdict"] = earlier
                 entries[index] = entry
                 break
         else:
             entries.append(entry)
     return history
+
+
+#: The fields of a record that carry the verdict itself.
+_VERDICT_FIELDS = (
+    "round",
+    "actual_result",
+    "evidence",
+    "failure_class",
+    "failure_class_source",
+)
+
+
+def _verdict_of(entry: Mapping[str, Any]) -> Dict[str, Any]:
+    """The verdict half of a record — what it said, not what happened to it.
+
+    Only the fields that make the record a *verdict* are carried over:
+    the bookkeeping keys (``repair_task_id`` and friends) describe the
+    repair, not the failure, and a stale repair id on a superseded
+    verdict would be a lie about what was tried.
+    """
+    if not isinstance(entry, Mapping):
+        return {}
+    out: Dict[str, Any] = {}
+    for key in _VERDICT_FIELDS:
+        if key in entry:
+            out[key] = entry[key]
+    return out
+
+
+def highest_recorded_round(
+    history: Mapping[str, Sequence[Dict[str, Any]]],
+) -> int:
+    """The highest round any record in the history carries.
+
+    ``0`` when the history is empty — "no round has been recorded yet",
+    which is a different thing from "round 0 ran".
+
+    This is the plan's **high-water mark**: a round number below it is a
+    round that has already run, and running it again would write over
+    the plan's own evidence (VP-030, R7).
+    """
+    highest = 0
+    for entries in (history or {}).values():
+        for entry in entries or []:
+            round_number = _entry_round(entry)
+            if round_number is not None and round_number > highest:
+                highest = round_number
+    return highest
 
 
 def prune(

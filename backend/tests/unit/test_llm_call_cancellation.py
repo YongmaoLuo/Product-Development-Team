@@ -77,6 +77,12 @@ from coding_tool import (  # noqa: E402
 from sub_agent_registry import sub_agent_registry  # noqa: E402
 from verification_cancel import VerificationCancelled  # noqa: E402
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 PLAN = "plan-llm-cancel"
 
 
@@ -241,7 +247,7 @@ def test_a_plan_dispatch_registers_a_handle_and_unregisters_it(
         tmp_path, monkeypatch, body=_wait_for_release(release),
     )
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     box: dict = {}
     thread = _dispatch_in_background(tool, box)
     try:
@@ -294,7 +300,7 @@ def test_two_concurrent_dispatches_get_two_distinct_handles(
         tmp_path, monkeypatch, body=_wait_for_release(release),
     )
 
-    tools = [ClaudeCodingTool(), ClaudeCodingTool()]
+    tools = [ClaudeCodingTool( cwd=_REPO_ROOT), ClaudeCodingTool( cwd=_REPO_ROOT)]
     boxes: list = [{}, {}]
     threads = [
         _dispatch_in_background(tool, box)
@@ -333,7 +339,7 @@ def test_no_plan_means_no_registration(tmp_path, monkeypatch):
     monkeypatch.delenv("PDT_PLAN_ID", raising=False)
     _install_fake_claude(tmp_path, monkeypatch)
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     assert tool.query_json(prompt="hello", system_instruction="sys") == {
         "ok": True
     }
@@ -391,7 +397,7 @@ def test_a_registration_failure_does_not_affect_the_dispatch(
 
     monkeypatch.setattr(sub_agent_registry, "register_sub_agent", _boom)
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     try:
         with pytest.raises(VerificationCancelled) as excinfo:
             tool.query_json(prompt="hello", system_instruction="sys")
@@ -443,7 +449,7 @@ def test_an_unregistration_failure_does_not_affect_the_dispatch(
 
     monkeypatch.setattr(sub_agent_registry, "unregister", _boom)
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     assert tool.query_json(prompt="hello", system_instruction="sys") == {
         "ok": True
     }
@@ -482,7 +488,7 @@ def test_a_cancelled_dispatch_raises_and_is_not_retried(
     launches, _args = _install_fake_claude(tmp_path, monkeypatch)
     verification_cancel.request_cancel(PLAN)
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     with caplog.at_level("WARNING", logger="coding_tool"):
         with pytest.raises(VerificationCancelled) as excinfo:
             tool.query_json(prompt="hello", system_instruction="sys")
@@ -530,7 +536,7 @@ def test_without_a_cancel_flag_an_abnormal_exit_still_fails_and_retries(
         tmp_path, monkeypatch, body="exit 3", announce=False, answer=False,
     )
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     tool.EMPTY_RESPONSE_RETRY_BACKOFF_SEC = 0.0
     with pytest.raises(EmptyResponseError):
         tool.query_json(prompt="hello", system_instruction="sys")
@@ -564,7 +570,7 @@ def test_the_stop_reaches_the_subprocess_through_the_registry(
         tmp_path, monkeypatch, body=_wait_for_release(release),
     )
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     box: dict = {}
     thread = _dispatch_in_background(tool, box)
     try:
@@ -637,7 +643,7 @@ def test_the_repair_content_step_creates_then_resumes_one_stable_session(
     )
 
     _install_fake_claude(tmp_path, monkeypatch)
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     assert query_json_in_session(
         tool, session, prompt="hello", system_instruction="sys",
     ) == {"ok": True}

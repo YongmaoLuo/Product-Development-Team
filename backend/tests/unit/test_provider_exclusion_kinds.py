@@ -54,6 +54,12 @@ from dynamic_provider_concurrency import (  # noqa: E402
     set_shared_cooldown,
 )
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 #: The provider every test fails on.
 PROVIDER = "Vendor A"
 
@@ -124,7 +130,7 @@ def _tool(monkeypatch, side_effect):
     raise. The provider label is stamped on every dispatch, so the
     failure has somebody to be attributed to.
     """
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     tool.EMPTY_RESPONSE_RETRY_BACKOFF_SEC = 0.0
     tool.logger = MagicMock()
     recorded = []

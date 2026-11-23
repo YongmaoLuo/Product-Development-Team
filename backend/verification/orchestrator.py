@@ -1498,7 +1498,11 @@ class VerificationOrchestrator:
         self.plan_dir = Path(plan_dir)
         self.project_dir = Path(project_dir)
         self.plan_state = PlanState(self.plan_dir)
-        self.coding_tool = coding_tool or ClaudeCodingTool()
+        # 2026-10-29 — the tool names the tree under verification.  A
+        # tool built without a working root runs its child in the
+        # backend server's working directory, which is a different
+        # checkout.
+        self.coding_tool = coding_tool or ClaudeCodingTool(cwd=self.project_dir)
         # No ``max_parallel``. The round has no width to pass: the
         # provider slot pool decides how many verification points run at
         # once, per dispatch, so every orchestrator — including the fresh
@@ -4221,6 +4225,10 @@ class VerificationOrchestrator:
 
             self._terminal_judge = TerminalDecisionJudge(
                 coding_tool=self.coding_tool,
+                # The working root travels with the judge: the tool
+                # takes it as a required keyword, and the judge reads
+                # the tree this round ran in.
+                cwd=str(self.project_dir),
             )
         return self._terminal_judge
 

@@ -124,6 +124,12 @@ def live_llm_required():
 
 import sys  # noqa: E402  (used by the probe above)
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 @pytest.fixture
 def temp_plan_dir():
     """Create temporary plan directory."""
@@ -1273,7 +1279,7 @@ class TestLLMOutputStructure:
         from coding_tool import ClaudeCodingTool
         from verification_subagent import SUPPORTED_METHODS
 
-        coding_tool = ClaudeCodingTool(model="claude-3-5-haiku-20241022")
+        coding_tool = ClaudeCodingTool(model="claude-3-5-haiku-20241022", cwd=_REPO_ROOT)
         temp_plan = sample_prd.parent
         temp_project = Path(tempfile.mkdtemp())
 
@@ -1318,7 +1324,7 @@ class TestLLMOutputStructure:
         """Test that verification report output contains all required fields."""
         from coding_tool import ClaudeCodingTool
 
-        coding_tool = ClaudeCodingTool(model="claude-3-5-haiku-20241022")
+        coding_tool = ClaudeCodingTool(model="claude-3-5-haiku-20241022", cwd=_REPO_ROOT)
         temp_plan = sample_prd.parent
         temp_project = Path(tempfile.mkdtemp())
 
@@ -3005,7 +3011,7 @@ class TestIntegrationScenarios:
         """
         from coding_tool import ClaudeCodingTool
 
-        coding_tool = ClaudeCodingTool(model="claude-3-5-haiku-20241022")
+        coding_tool = ClaudeCodingTool(model="claude-3-5-haiku-20241022", cwd=_REPO_ROOT)
         temp_plan = sample_prd.parent
 
         tests_dir = temp_project_dir / "tests"
@@ -3084,7 +3090,7 @@ class TestIntegrationScenarios:
         verdict = asyncio.run(
             sub_agent.run(
                 vp_node=vp,
-                coding_tool=ClaudeCodingTool(model="claude-3-5-haiku-20241022"),
+                coding_tool=ClaudeCodingTool(model="claude-3-5-haiku-20241022", cwd=_REPO_ROOT),
                 log_dir=temp_project_dir / "logs",
                 project_dir=temp_project_dir,
                 plan_id="honesty-pass",
@@ -3135,7 +3141,7 @@ class TestIntegrationScenarios:
         verdict = asyncio.run(
             sub_agent.run(
                 vp_node=vp,
-                coding_tool=ClaudeCodingTool(model="claude-3-5-haiku-20241022"),
+                coding_tool=ClaudeCodingTool(model="claude-3-5-haiku-20241022", cwd=_REPO_ROOT),
                 log_dir=temp_project_dir / "logs",
                 project_dir=temp_project_dir,
                 plan_id="honesty-fail",

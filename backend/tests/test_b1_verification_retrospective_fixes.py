@@ -42,6 +42,12 @@ sys.path.insert(0, str(BACKEND_DIR))
 from verification_executor import VerificationExecutor
 from coding_tool import ClaudeCodingTool
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 # ---------------------------------------------------------------------------
 # Bug 1 — _save_state / _save_progress_state must not silently swallow OSError
@@ -163,8 +169,7 @@ class TestSubagentSettingsPropagatesAnthropicEnv(unittest.TestCase):
             mock_popen.return_value = mock_proc
             tool = ClaudeCodingTool(
                 settings=str(self.original_settings),
-                model="m2.7",
-            )
+                model="m2.7", cwd=_REPO_ROOT)
             # Simulate the registry pick: pre-set env exactly the way
             # the registry loop does after selecting a provider.
             # We intercept the Popen call to inspect what the SDK
@@ -257,8 +262,7 @@ class TestProviderFallbackLogsWarning(unittest.TestCase):
             tool = ClaudeCodingTool(
                 provider_priority=["vendor-a-pro", "vendor-b", "vendor-c-app"],
                 model="m2.7",
-                logger=mock_logger,
-            )
+                logger=mock_logger, cwd=_REPO_ROOT)
             # Force every provider's checker to return unavailable
             for prov in ("vendor_a_pro", "vendor-b", "vendor-c_apple"):
                 setattr(

@@ -62,6 +62,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from coding_tool import ApiError, ClaudeCodingTool, SettingsTemplateMissing
 from subagent_config import SubagentConfig
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 # ---------------------------------------------------------------------------
 # Helpers — same harness shape as test_coding_tool_settings_write_order.py
@@ -116,8 +122,7 @@ def _build_tool(settings: str) -> ClaudeCodingTool:
         base_url="https://vendor-a.example.invalid/anthropic",
         auth_token="sk-test-token",
         provider_priority=["__no_such_provider__"],
-        settings=settings,
-    )
+        settings=settings, cwd=_REPO_ROOT)
 
 
 def _settings_arg(mock_popen: MagicMock) -> str:

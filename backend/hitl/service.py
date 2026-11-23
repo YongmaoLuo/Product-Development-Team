@@ -191,7 +191,7 @@ from typing import (
 from config_paths import resolve_plans_dir, resolve_state_db_path
 from hitl.models import Decision, DecisionMode, DecisionRequest, DecisionStatus
 from hitl.store import HitlStore
-from hitl.terminal_decision_port import default_port
+from hitl.terminal_decision_port import default_port, resolve_tool_cwd
 from hitl.terminal_execution import (
     AUDIT_EVENT_FAILED,
     STATUS_FAILED,
@@ -1068,13 +1068,22 @@ def _dispatch_terminal_execution(
     background thread, which opens its own store.  The store this
     answer's caller holds is about to be closed, and handing a closed
     store to another thread would fail the write for the wrong reason.
+
+    The port is built with the **working root**: the plan's registered
+    project directory when it has one, the plan's own directory
+    otherwise.  The tool refuses to be built without a root, because a
+    tool with no root runs its child in the backend server's working
+    directory — a different checkout from the one the repair is about.
     """
     dispatch_terminal_execution(
         plan_id=plan_id,
         decision_id=decision_id,
         option=option,
         note=note,
-        port=default_port(),
+        port=default_port(
+            cwd=resolve_tool_cwd(plan_id=plan_id, plan_dir=plan_dir),
+            plan_id=plan_id,
+        ),
         plan_dir=plan_dir,
         record=record,
         audit=None,

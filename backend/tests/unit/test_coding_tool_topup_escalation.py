@@ -55,6 +55,12 @@ from coding_tool import ClaudeCodingTool  # noqa: E402
 from dynamic_provider_concurrency import ActiveConcurrencyTracker  # noqa: E402
 from provider_order import ProviderQuota  # noqa: E402
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 def _now():
     return datetime.now(timezone.utc)
@@ -196,7 +202,7 @@ def test_escalation_is_not_swallowed_by_resume_fallback(monkeypatch):
     to a provider that has already said it has no budget answers a
     question nobody asked.
     """
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     tool.logger = MagicMock()
     tool.current_call_provider = "MiniMax"
     escalated = QuotaWaitExhausted(
@@ -271,8 +277,7 @@ def _fleet_at_hard_cap(monkeypatch):
 def _tool(scene_name):
     return ClaudeCodingTool(
         scene=scene_name,
-        concurrency_tracker=ActiveConcurrencyTracker(),
-    )
+        concurrency_tracker=ActiveConcurrencyTracker(), cwd=_REPO_ROOT)
 
 
 class _StopWaiting(Exception):

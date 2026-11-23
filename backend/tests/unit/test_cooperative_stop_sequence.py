@@ -40,6 +40,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import coding_tool
 from coding_tool import ClaudeCodingTool
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 class FakeStdout:
     """``process.stdout`` 的替身：记录自己被关掉了没有。"""
@@ -279,7 +285,7 @@ def test_dispatch_registers_the_tool_while_its_child_runs():
         }) + "\n"
         yield json.dumps({"type": "result", "result": "ok", "is_error": False}) + "\n"
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     # Inherit mode: no provider lookup, no DB, no network — the dispatch
     # only needs a child to talk to.
     tool.inherit_providers = True
@@ -301,7 +307,7 @@ def test_dispatch_registers_the_tool_while_its_child_runs():
 
 def test_cleanup_unregisters_the_tool():
     """``cleanup()`` 也注销 —— 它已经把子进程从 ``_current_process`` 拿走了。"""
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     tool.inherit_providers = True
     coding_tool.register_live_dispatch(tool)
 
@@ -325,7 +331,7 @@ def test_failed_dispatch_leaves_no_stale_entry():
         }) + "\n"
         raise RuntimeError("provider blew up mid-stream")
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     tool.inherit_providers = True
     proc = _make_mock_process(_stdout)
 

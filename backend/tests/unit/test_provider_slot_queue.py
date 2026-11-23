@@ -59,6 +59,12 @@ from dynamic_provider_concurrency import (  # noqa: E402
     set_shared_cooldown,
 )
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 #: Three rows in the scene's own tier, and one row in the tier next to
 #: it. The neighbouring row is reachable and idle in every test here: it
 #: is the thing that must never be used, and a test that proved it by
@@ -192,7 +198,7 @@ class _Log:
 
 
 def _tool(tracker, log=None, budget=None):
-    tool = ClaudeCodingTool(scene="execution", concurrency_tracker=tracker)
+    tool = ClaudeCodingTool(scene="execution", concurrency_tracker=tracker, cwd=_REPO_ROOT)
     # One attempt, one look at the tracker. The queue's own steps are
     # what this file is about; letting each attempt poll as well would
     # make a three-round test cost seconds of real sleeping without

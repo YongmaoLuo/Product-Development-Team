@@ -136,15 +136,26 @@ class TestSubagentWalksProviderChain(unittest.TestCase):
             })
 
         vp_node = {"id": "VP-001", "verification_method": "code_review"}
-        with patch.object(ClaudeCodingTool, "__init__", _spy_init):
-            import asyncio
-            asyncio.run(self.sub._execute_attempt(
-                vp_node=vp_node,
-                coding_tool=parent,
-                settings_path="/tmp/fake_settings.json",
-                log_path=Path("/tmp/fake_log.json"),
-                attempt=0,
-            ))
+        # The scoped clone is built with the tree it runs in
+        # (``cwd=project_dir``), and ``cwd`` is a required keyword on
+        # ``ClaudeCodingTool`` — so the attempt has to be told which
+        # tree it is about.  Production always has one (the plan's
+        # project directory); this test names a temp directory instead.
+        project_dir = Path(tempfile.mkdtemp(prefix="ws-scoped-"))
+        try:
+            with patch.object(ClaudeCodingTool, "__init__", _spy_init):
+                import asyncio
+                asyncio.run(self.sub._execute_attempt(
+                    vp_node=vp_node,
+                    coding_tool=parent,
+                    settings_path="/tmp/fake_settings.json",
+                    log_path=Path("/tmp/fake_log.json"),
+                    attempt=0,
+                    project_dir=project_dir,
+                ))
+        finally:
+            import shutil
+            shutil.rmtree(project_dir, ignore_errors=True)
 
         # CORRECT fix: NO base_url / auth_token inheritance
         self.assertIsNone(

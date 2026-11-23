@@ -30,6 +30,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 _BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
 if str(_BACKEND_DIR) not in sys.path:
@@ -48,7 +54,7 @@ def _make_tool(responses):
     """
     from coding_tool import ClaudeCodingTool
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     captured_prompts = []
 
     def _side_effect(prompt, *args, **kwargs):

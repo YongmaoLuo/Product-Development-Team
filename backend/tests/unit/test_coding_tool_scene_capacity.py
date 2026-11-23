@@ -40,6 +40,12 @@ from coding_tool import (  # noqa: E402
 )
 from dynamic_provider_concurrency import ActiveConcurrencyTracker  # noqa: E402
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 CHAIN = ["Vendor A Pro", "Vendor A", "Vendor A API"]
 
 #: Ten per pool, so "fill it" is ``range(10)`` throughout and the three
@@ -94,7 +100,7 @@ def scene(monkeypatch):
 
 
 def _tool(tracker, **kw):
-    return ClaudeCodingTool(scene="verification", concurrency_tracker=tracker, **kw)
+    return ClaudeCodingTool(scene="verification", concurrency_tracker=tracker, **kw, cwd=_REPO_ROOT)
 
 
 def _run(tool, **kw):
@@ -422,9 +428,9 @@ def test_a_saturated_fleet_queues_and_never_over_subscribes(
 
 def test_slot_wait_is_configurable_by_env(monkeypatch):
     monkeypatch.setenv("PDT_PROVIDER_SLOT_WAIT_SEC", "12.5")
-    assert ClaudeCodingTool().provider_slot_wait_sec == 12.5
+    assert ClaudeCodingTool( cwd=_REPO_ROOT).provider_slot_wait_sec == 12.5
 
 
 def test_a_bad_env_value_does_not_break_construction(monkeypatch):
     monkeypatch.setenv("PDT_PROVIDER_SLOT_WAIT_SEC", "not-a-number")
-    assert ClaudeCodingTool().provider_slot_wait_sec == ClaudeCodingTool.PROVIDER_SLOT_WAIT_SEC
+    assert ClaudeCodingTool( cwd=_REPO_ROOT).provider_slot_wait_sec == ClaudeCodingTool.PROVIDER_SLOT_WAIT_SEC

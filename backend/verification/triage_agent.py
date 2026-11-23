@@ -324,10 +324,16 @@ class VPTriageJudge:
 
     The judge is constructed with the coding tool it should use, which
     is what makes it testable: the unit tests hand it a recorder and
-    assert on the shape of the single call. Without a tool it builds a
-    :class:`coding_tool.ClaudeCodingTool` on first use, on the
-    ``verification`` scene — the same scene the verification path
-    itself runs on.
+    assert on the shape of the single call.
+
+    2026-10-31: the tool is **required**.  The judge used to build a
+    :class:`coding_tool.ClaudeCodingTool` on first use when it was
+    handed none — a tool with no working root, whose child process
+    would run in the backend server's working directory, which is a
+    different checkout than the tree under verification (the very
+    mismatch this contract exists to close).  The fallback is gone:
+    the caller injects a tool that names its root, and a judge with no
+    tool is refused rather than quietly given one.
     """
 
     #: How long one triage call may take.
@@ -338,6 +344,12 @@ class VPTriageJudge:
         coding_tool: Any = None,
         timeout_seconds: Optional[int] = None,
     ) -> None:
+        if coding_tool is None:
+            raise ValueError(
+                "VPTriageJudge requires a coding tool; a tool built "
+                "without a named working root would run its child in "
+                "the backend server's working directory"
+            )
         self._coding_tool = coding_tool
         self._timeout = (
             int(timeout_seconds) if timeout_seconds else self.TIMEOUT_SECONDS
@@ -349,11 +361,7 @@ class VPTriageJudge:
 
     @property
     def coding_tool(self) -> Any:
-        """The tool the judge calls — built on first use when absent."""
-        if self._coding_tool is None:
-            from coding_tool import ClaudeCodingTool
-
-            self._coding_tool = ClaudeCodingTool(scene="verification")
+        """The tool the judge calls — the one it was constructed with."""
         return self._coding_tool
 
     # ------------------------------------------------------------------

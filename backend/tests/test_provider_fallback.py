@@ -33,6 +33,12 @@ import pytest
 from coding_tool import ClaudeCodingTool
 from provider_order import ProviderOrderError, cache_clear, load_fallback_order
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 # ---------------------------------------------------------------------------
 # Local helpers
@@ -223,8 +229,7 @@ def test_fallback_chain_skips_unusable_primary_and_takes_the_next(
     """
     monkeypatch.setenv("HOME", str(tmp_path))
     tool = ClaudeCodingTool(
-        provider_priority=["Vendor A Pro", "Vendor B Pro"],
-    )
+        provider_priority=["Vendor A Pro", "Vendor B Pro"], cwd=_REPO_ROOT)
 
     calls = _run_dispatch(tool, {
         "Vendor B Pro": (
@@ -258,8 +263,7 @@ def test_exhausted_chain_falls_back_to_parent_config(
     logger = MagicMock()
     tool = ClaudeCodingTool(
         logger=logger,
-        provider_priority=["Vendor A Pro", "Vendor B Pro"],
-    )
+        provider_priority=["Vendor A Pro", "Vendor B Pro"], cwd=_REPO_ROOT)
 
     calls = _run_dispatch(tool, {})  # nothing available
 

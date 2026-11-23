@@ -94,6 +94,12 @@ from coding_tool import (  # noqa: E402
     query_json_in_session,
 )
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 @pytest.fixture(autouse=True)
 def _no_rate_limit_waits(monkeypatch):
@@ -122,7 +128,7 @@ def _tool(monkeypatch, side_effect, *, calls=None):
     Every dispatch is recorded — prompt positionally, the rest by keyword —
     so a test can assert on what the launcher was asked to run.
     """
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     tool.EMPTY_RESPONSE_RETRY_BACKOFF_SEC = 0.0
     tool.logger = MagicMock()
     recorded = calls if calls is not None else []
@@ -432,7 +438,7 @@ def test_the_launcher_builds_resume_with_the_first_session_id(
         )),
     )
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     tool.EMPTY_RESPONSE_RETRY_BACKOFF_SEC = 0.0
 
     # The first attempt is failed here rather than by the fake CLI so

@@ -42,6 +42,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import coding_tool
 import pdt_requirements
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 #: 被测源码（``backend/tests/unit/x.py`` → ``parents[2]`` == ``backend/``）。
 SRC = Path(__file__).resolve().parents[2] / "coding_tool.py"
@@ -160,7 +166,7 @@ def test_factory_forwards_scene_to_opencode(monkeypatch):
     """工厂把 scene 转发给 opencode 分支（现状是丢弃）。"""
     monkeypatch.setattr(coding_tool, "scripted_mode_enabled", lambda: False)
 
-    tool = coding_tool.create_coding_tool("opencode", scene="execution")
+    tool = coding_tool.create_coding_tool("opencode", scene="execution", cwd=_REPO_ROOT)
 
     assert isinstance(tool, coding_tool.OpenCodeCodingTool)
     assert tool.scene == "execution"
