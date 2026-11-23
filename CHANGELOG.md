@@ -74,6 +74,21 @@ languages on purpose: the CI gate reads one string out of both
 changelogs, and a section that exists in only one of them is a section
 half the readers never see.*
 
+- **A terminal failure announces its own review once.** When execution or
+  verification settles on a terminal failure, `backend/verification_loop.py`
+  announces a failure review after the terminal phase is written — once per
+  plan and round, and a failed announcement never raises. The decision it
+  creates has no deadline and is not settled by the timeout window. **No
+  verdict changed**: the status the round reports is the one it always
+  reported.
+
+- **A round reclaims the services it declared from its own ledger.**
+  `backend/verification_agent.py` hands the round's plan directory and
+  service ledger to the declared-service reclamation, so a listener left
+  behind by an earlier round is recognised as the service it is instead of
+  turning the whole round into environment-blocked. **No verdict changed**:
+  a service that really is foreign is still refused.
+
 - **The scheduler card tells the finishing stage apart from a running
   verification.** While the finishing stage ran, the card said 「验证中」
   the whole time; a plan parked at a failed finishing stage stopped
