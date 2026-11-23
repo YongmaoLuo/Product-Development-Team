@@ -74,6 +74,18 @@ languages on purpose: the CI gate reads one string out of both
 changelogs, and a section that exists in only one of them is a section
 half the readers never see.*
 
+- **The scheduler card tells the finishing stage apart from a running
+  verification.** While the finishing stage ran, the card said 「验证中」
+  the whole time; a plan parked at a failed finishing stage stopped
+  pushing entirely, so the card froze on its last pre-failure content and
+  nobody was told the plan was waiting for a human. The card now has a
+  label and a header for each of the two phases (「收尾中」 /
+  「收尾失败（待决定是否续跑）」), and each transition publishes a state
+  event so the card is refreshed when it happens. **No verdict changed**:
+  verification still reports whatever it reported, `verification_status`
+  still reads `running` throughout the stage, and the plan keeps its
+  scheduler slot.
+
 - **`_ran_the_declared_entry` command exemption (`88d898f9`).** A
   command-kind verification point asks one question — does *this* command
   exit 0 — and a verdict that records that same command together with the

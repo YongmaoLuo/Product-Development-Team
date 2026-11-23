@@ -101,12 +101,22 @@ def _state_db() -> Path:
 # Startup-sweep filter
 # ---------------------------------------------------------------------------
 #
-# Only sweep plans whose ``current_phase`` is one of these two values.
+# Only sweep plans whose ``current_phase`` is one of these values.
 # Other phases either have no card content yet (interview, prd_*) or
 # are work the notifier should not amplify. See the docstring on
 # ``list_active_plan_ids`` for the 2026-09-06 decision behind this
 # filter.
-_ACTIVE_PHASES: tuple[str, ...] = ("executing", "verification_running")
+# 2026-11-23: ``post_processing`` joined the set.  The finishing stage
+# runs CI / performance work and can take tens of minutes; a server
+# restart in the middle of it must still be able to repaint the card
+# (the phase event that starts it is long gone by then).
+#
+# ``postprocess_failed`` is deliberately NOT here: that phase is PARKED,
+# not active work — the single phase event it fires is enough, and
+# sweeping it on every restart is noise.
+_ACTIVE_PHASES: tuple[str, ...] = (
+    "executing", "verification_running", "post_processing",
+)
 
 # Plans not touched in this many days are skipped — they're either
 # stale interview prompts or plans that the operator has stopped
@@ -223,8 +233,9 @@ def list_active_plan_ids() -> list[str]:
 
     **Important** (2026-09-06): we only sweep plans
     that are CURRENTLY doing work — i.e. ``current_phase`` is one of
-    the two phases that actually produce card content
-    (``executing`` or ``verification_running``). Interview /
+    the phases that actually produce card content
+    (``executing``, ``verification_running`` or — since 2026-11-23 —
+    ``post_processing``). Interview /
     prd_generation / arch_* / test_* / task_generation plans have
     not yet emitted any task or VP events, so refreshing their
     cards produces a blank progress card with no useful
