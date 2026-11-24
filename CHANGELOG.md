@@ -149,6 +149,29 @@ half the readers never see.*
   thing to go. The job reads `pull_request.commits` — the number the pull
   request itself shows — and joins the merge gate's `needs`.
 
+- **The base-drift check now names its base per plan
+  (`backend/verification_agent.py`).** The base a branch is measured
+  against is a property of the **repository**, not of the deployment:
+  the remote may be called `origin` or `github`, the default branch may
+  be `main` or `master`. One environment variable cannot carry that,
+  and the default `origin/main` did not resolve in every repository —
+  where it did not, the check reported a failure every round and
+  measured no drift at all, which reads in the log exactly like a
+  branch that was never behind anything.
+
+  Each plan now states its own base in
+  `plans/<plan_id>/base_drift.json`, and the environment stays the
+  fallback for every plan that says nothing. The layering is plan file
+  over environment over default, so **a plan without that file behaves
+  exactly as it did before** — same base, same mode, same result. The
+  file never raises: a missing file, a broken one and a key of the
+  wrong type each fall back to the layer underneath, key by key,
+  because a typo in the configuration must not disable the check nor
+  break the round that reads it. The alternative — guessing a list of
+  candidate remote names — is what this replaces: it would have
+  measured the wrong thing, or nothing, while looking as though it had
+  worked.
+
 - **A coding tool now has to be told which checkout it is about, and the
   failure fingerprint is decided by the payload.** `ClaudeCodingTool`
   (`backend/coding_tool.py`) takes its working root as a required

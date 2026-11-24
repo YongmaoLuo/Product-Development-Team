@@ -16588,7 +16588,12 @@ class Orchestrator:
         """
         project_dir = getattr(self, "project_dir", None)
         try:
-            report = base_drift.check_and_merge_base(project_dir)
+            report = base_drift.check_and_merge_base(
+                project_dir,
+                config=base_drift.BaseDriftConfig.from_plan_dir(
+                    getattr(self, "plan_dir", None)
+                ),
+            )
         except Exception as exc:  # noqa: BLE001 — a broken check never blocks
             logger.warning(
                 "[base_drift] the base-drift check raised (%s: %s); "

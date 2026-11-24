@@ -19,8 +19,10 @@ This module holds three layers:
 
 * the **vocabulary** of the check:
 
-  * :class:`BaseDriftConfig` — the three environment knobs, their safe
-    defaults, and how a malformed value falls back.
+  * :class:`BaseDriftConfig` — the three knobs, their safe defaults, and
+    how a malformed value falls back.  The knobs come from two layers:
+    the process environment, and the plan's own
+    ``base_drift.json`` (see :meth:`BaseDriftConfig.from_plan_dir`).
   * :class:`BaseDriftReport` — the JSON-safe shape every outcome is
     reported in, plus the two predicates the caller needs
     (:attr:`~BaseDriftReport.event` and
@@ -51,7 +53,18 @@ Design constraints
   check that never runs, and the drift it exists to catch stays
   invisible — the failure mode of a mis-typed knob is "the check is
   quietly off", which is exactly the failure the check was added to
-  prevent.
+  prevent.  The same rule governs the plan's own configuration file:
+  a missing file, a broken one and a key of the wrong type all fall
+  back, key by key, to the layer underneath.
+* **The base ref belongs to the plan, not to the deployment.**  The
+  remotes and default branches of the repositories a deployment hosts
+  do not agree with each other, so one environment variable cannot
+  name them all.  Each plan says which base is its own
+  (``plans/<plan_id>/base_drift.json``), and the environment stays the
+  fallback for every plan that says nothing.  Guessing a list of
+  candidate names is the alternative this rule exists to rule out: it
+  would measure the wrong thing — or nothing at all — while looking
+  as though it had worked.
 * **The status set is closed.**  Seven statuses, seven event names.
   A status outside the set is reported as ``failed`` — the
   conservative choice, because "something went wrong" is the only
@@ -81,6 +94,7 @@ Status semantics
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from dataclasses import dataclass, field
@@ -119,6 +133,25 @@ FALSY_ENABLED_VALUES = frozenset({"0", "false", "no", "off"})
 junk value — leaves it on, because a check that is silently disabled
 by a typo is worse than a check that runs with its default
 configuration."""
+
+PLAN_CONFIG_FILENAME = "base_drift.json"
+"""The name of the per-plan configuration file, inside the plan directory.
+
+A plan lives in ``plans/<plan_id>/``; its base-drift configuration
+therefore lives in ``plans/<plan_id>/base_drift.json``.
+
+Why a file and not another environment variable: **the base ref is a
+property of the repository, not of the deployment.**  A deployment may
+host several plans against several repositories, and those repositories
+do not agree on what their base is called — the remote may be
+``origin`` or ``github``, the default branch may be ``main`` or
+``master``.  One environment variable cannot carry that, and guessing
+a list of candidate names would silently check the wrong thing (or
+nothing at all) while looking like it worked.
+
+So each plan states its own base, and the deployment's environment
+remains the fallback for every plan that says nothing.
+"""
 
 # ── statuses ───────────────────────────────────────────────────────────────
 
@@ -219,6 +252,106 @@ class BaseDriftConfig:
             base_ref=_base_ref_from_env(env),
             mode=_mode_from_env(env),
         )
+
+    @classmethod
+    def from_plan_dir(
+        cls,
+        plan_dir: Any,
+        environ: Optional[Mapping[str, str]] = None,
+    ) -> "BaseDriftConfig":
+        """Build a config from the environment, then let the plan's own
+        file override it.
+
+        The plan's file is ``<plan_dir>/base_drift.json`` — see
+        :data:`PLAN_CONFIG_FILENAME`.  It is a JSON **object** whose
+        keys are the same three knobs the environment carries:
+
+        .. code-block:: json
+
+            {"base_ref": "github/master", "mode": "report", "enabled": true}
+
+        The layering is **environment first, plan file second**: the
+        plan file wins, because the plan file is the more specific
+        statement.  A plan that says nothing keeps exactly the
+        behaviour it had before this file existed — the environment's
+        value, or the default.
+
+        **The file never raises.**  A missing file, a file that is not
+        JSON, a JSON document that is not an object, a key of the wrong
+        type — each of them falls back to the layer underneath, key by
+        key.  This is the same stance the environment knobs take, and
+        for the same reason: a typo in the configuration must not
+        disable the check, and must not break the round that reads it.
+        The check that quietly stops running is the failure mode this
+        module exists to prevent.
+
+        The key rules:
+
+        * ``enabled`` — a JSON boolean.  Any other type is ignored and
+          the environment's value is kept.
+        * ``base_ref`` — a non-empty string.  An empty string and a
+          non-string are both ignored.
+        * ``mode`` — one of :data:`VALID_MODES`.  Anything else is
+          ignored, so a misspelled mode falls back to the layer
+          underneath rather than being handed the working tree.
+
+        Unknown keys are ignored: a file written for a newer version of
+        this module must not break an older one.
+        """
+        base = cls.from_env(environ)
+        overrides = cls._read_plan_overrides(plan_dir)
+        return cls(
+            enabled=overrides.get("enabled", base.enabled),
+            base_ref=overrides.get("base_ref", base.base_ref),
+            mode=overrides.get("mode", base.mode),
+            timeout_sec=base.timeout_sec,
+        )
+
+    @classmethod
+    def _read_plan_overrides(cls, plan_dir: Any) -> Dict[str, Any]:
+        """The keys the plan's own file overrides, if it has any.
+
+        Returns an empty mapping when the file is missing, unreadable,
+        not JSON, not a JSON object, or carries no usable key.  It never
+        raises — every failure mode of a configuration file ends in
+        "this file says nothing".
+        """
+        if plan_dir is None:
+            return {}
+        try:
+            path = Path(str(plan_dir)) / PLAN_CONFIG_FILENAME
+        except (TypeError, ValueError):
+            return {}
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            return {}
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+
+        overrides: Dict[str, Any] = {}
+
+        enabled = data.get("enabled")
+        if isinstance(enabled, bool):
+            overrides["enabled"] = enabled
+
+        base_ref = data.get("base_ref")
+        if isinstance(base_ref, str):
+            trimmed = base_ref.strip()
+            if trimmed:
+                overrides["base_ref"] = trimmed
+
+        mode = data.get("mode")
+        if isinstance(mode, str):
+            trimmed = mode.strip().lower()
+            if trimmed in VALID_MODES:
+                overrides["mode"] = trimmed
+
+        return overrides
 
 
 @dataclass(frozen=True)
@@ -973,6 +1106,133 @@ def _work_tree_report(
     )
 
 
+MISSING_REVISION_MARKER = "Needed a single revision"
+"""Git's own wording when a rev names no single revision.
+
+``git rev-parse --verify <ref>^{commit}`` fails with exactly this when
+the ref does not exist.  It is the one failure this module can do
+something useful about: the base ref is a *name*, and the repository
+knows which names it has.
+"""
+
+REMOTE_REF_PREFIX = "refs/remotes/"
+"""Where git keeps the remote-tracking refs.  Stripped off to get the
+short name a ``base_ref`` is written with."""
+
+
+def _remote_names(
+    project_dir: Any,
+    timeout_sec: int,
+    runner: Any,
+) -> List[str]:
+    """The remotes this repository has configured.
+
+    Read from the repository rather than guessed: a repository whose
+    remote is called ``github`` cannot be served by a check that
+    assumes ``origin``.
+    """
+    completed = runner(project_dir, ["remote"], timeout_sec)
+    if completed.returncode != 0:
+        return []
+    return [
+        line.strip()
+        for line in (completed.stdout or "").splitlines()
+        if line.strip()
+    ]
+
+
+def _remote_tracking_refs(
+    project_dir: Any,
+    timeout_sec: int,
+    runner: Any,
+) -> List[str]:
+    """The remote-tracking refs this repository knows about.
+
+    ``origin/HEAD`` is a pointer to another ref, not a base anybody can
+    merge, so it is left out — what is left is a list of names that
+    could really be compared against.
+
+    The **full** refname is asked for and the prefix is stripped here
+    rather than in the format string: ``%(refname:short)`` shortens
+    ``refs/remotes/github/HEAD`` to plain ``github``, which would look
+    like a remote name and would slip past the ``/HEAD`` filter.
+    """
+    completed = runner(
+        project_dir,
+        ["for-each-ref", "--format=%(refname)", "refs/remotes"],
+        timeout_sec,
+    )
+    if completed.returncode != 0:
+        return []
+    refs: List[str] = []
+    for line in (completed.stdout or "").splitlines():
+        full = line.strip()
+        if not full.startswith(REMOTE_REF_PREFIX):
+            continue
+        name = full[len(REMOTE_REF_PREFIX):]
+        if not name or name.endswith("/HEAD"):
+            continue
+        refs.append(name)
+    return refs
+
+
+def _base_ref_hint(
+    project_dir: Any,
+    timeout_sec: int,
+    runner: Any,
+) -> str:
+    """A readable hint about which base ref this repository can use.
+
+    Never raises and never decides: the remotes and the
+    remote-tracking refs are read from the repository, and the hint
+    *lists* them rather than picking one.  Choosing is the plan's
+    business — a hint that silently picked a remote would be the
+    guessing this whole feature exists to avoid.
+
+    Returns an empty string when the repository says nothing, so the
+    caller can append it unconditionally.
+    """
+    remotes = _remote_names(project_dir, timeout_sec, runner)
+    refs = _remote_tracking_refs(project_dir, timeout_sec, runner)
+    if not remotes and not refs:
+        return (
+            "; this repository has no remote configured, so there is no "
+            "base ref to compare against"
+        )
+
+    parts: List[str] = []
+    if remotes:
+        parts.append("the remotes here are: " + ", ".join(remotes))
+    if refs:
+        parts.append("the remote-tracking refs here are: " + ", ".join(refs))
+        example = refs[0]
+    else:
+        example = f"{remotes[0]}/<branch>"
+    parts.append(
+        f"a base_ref must name one of them (for example {example})"
+    )
+    parts.append(
+        "and it can be set per plan in plans/<plan_id>/base_drift.json"
+    )
+    return "; " + "; ".join(parts)
+
+
+def _resolution_hint(
+    project_dir: Any,
+    stderr: str,
+    timeout_sec: int,
+    runner: Any,
+) -> str:
+    """The hint to append when the base ref simply does not exist.
+
+    Empty for every other git complaint: a timeout or a missing binary
+    says nothing about which base ref the plan should use.
+    """
+    if MISSING_REVISION_MARKER not in (stderr or ""):
+        return ""
+    return _base_ref_hint(project_dir, timeout_sec, runner)
+
+
 def check_and_merge_base(
     project_dir: Any,
     *,
@@ -1053,7 +1313,10 @@ def check_and_merge_base(
             ahead=ahead,
             stderr_excerpt=stderr,
             mode=cfg.mode,
-            detail=f"could not compare HEAD with {resolved}",
+            detail=(
+                f"could not compare HEAD with {resolved}"
+                + _resolution_hint(project_dir, stderr, timeout_sec, runner)
+            ),
         )
 
     if behind == 0:
@@ -1139,7 +1402,10 @@ def check_and_merge_base(
             ahead=ahead,
             stderr_excerpt=stderr,
             mode=cfg.mode,
-            detail=f"could not compare HEAD with {resolved} after the fetch",
+            detail=(
+                f"could not compare HEAD with {resolved} after the fetch"
+                + _resolution_hint(project_dir, stderr, timeout_sec, runner)
+            ),
         )
 
     if behind == 0:
