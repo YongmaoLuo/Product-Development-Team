@@ -87,13 +87,14 @@ def _seed_execution(
     plan_id: str,
     exec_status: str = "waiting_for_quota",
     stop_reason: str = "waiting_for_quota",
+    project_dir: str = None,
 ) -> None:
     """Write one ``plan_execution`` row."""
     conn.execute(
         "INSERT OR REPLACE INTO plan_execution "
-        "(plan_id, exec_status, stop_reason, updated_at) "
-        "VALUES (?, ?, ?, ?)",
-        (plan_id, exec_status, stop_reason, _STAMP),
+        "(plan_id, exec_status, stop_reason, project_dir, updated_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (plan_id, exec_status, stop_reason, project_dir, _STAMP),
     )
 
 
@@ -403,3 +404,61 @@ def test_read_parked_plans_opens_its_own_connection(tmp_path, monkeypatch):
     for leaked in opened:
         with pytest.raises(sqlite3.ProgrammingError):
             leaked.execute("SELECT 1")
+
+
+# ---------------------------------------------------------------------------
+# The working directory the row records
+# ---------------------------------------------------------------------------
+
+
+def test_read_parked_plans_reads_project_dir():
+    """The reader brings the recorded working directory out with it.
+
+    The park lives in ``exec_status`` / ``stop_reason``, but the
+    directory the run was in lives in a third column — and it is the
+    column the start path needs.  A run that stopped for capacity has
+    no pause checkpoint to carry the directory, so the durable row is
+    the only place it can come from; a reader that does not bring it
+    out leaves the resumer with nothing to hand over, and the start
+    path refuses the plan (400) on every tick, forever.
+
+    The directory is carried as it is recorded: no resolution, no
+    normalisation, no default.  The start path resolves it itself, and
+    a reader that resolved it too would be a second opinion about
+    which directory the run was in.
+    """
+    conn = _state_db()
+    _seed_execution(conn, "p9", project_dir="/tmp/worktrees/p9")
+
+    parked = read_parked_plans(conn)
+
+    assert [entry.plan_id for entry in parked] == ["p9"]
+    assert [entry.project_dir for entry in parked] == ["/tmp/worktrees/p9"]
+
+
+def test_read_parked_plans_without_project_dir_still_reads_the_row():
+    """A row that records no directory is still a parked plan.
+
+    The column is optional in the schema and empty in every row written
+    before the run had a directory, so the reader has to cope with its
+    absence: the plan is parked either way.  What it cannot be is
+    *revived* — which is a fact the resumer reports, not a reason for
+    the reader to pretend the plan is not parked.
+
+    This is the backwards-compatible half of the change: an old row
+    reads as before, with no directory attached.
+    """
+    conn = _state_db()
+    _seed_execution(conn, "p9")
+
+    parked = read_parked_plans(conn)
+
+    assert parked == [
+        ParkedPlan(
+            plan_id="p9",
+            kind="execution",
+            round=0,
+            reason="waiting_for_quota",
+        )
+    ]
+    assert parked[0].project_dir is None

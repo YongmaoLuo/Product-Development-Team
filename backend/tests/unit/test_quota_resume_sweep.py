@@ -106,13 +106,14 @@ def _seed_execution(
     plan_id: str,
     exec_status: str = "waiting_for_quota",
     stop_reason: str = "waiting_for_quota",
+    project_dir: str = None,
 ) -> None:
     """Write one ``plan_execution`` row."""
     conn.execute(
         "INSERT OR REPLACE INTO plan_execution "
-        "(plan_id, exec_status, stop_reason, updated_at) "
-        "VALUES (?, ?, ?, ?)",
-        (plan_id, exec_status, stop_reason, _STAMP),
+        "(plan_id, exec_status, stop_reason, project_dir, updated_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (plan_id, exec_status, stop_reason, project_dir, _STAMP),
     )
 
 
@@ -557,3 +558,89 @@ def test_default_probe_never_raises_on_a_bad_fixture(monkeypatch, tmp_path):
     not_an_object.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
     monkeypatch.setenv("PDT_QUOTA_FIXTURE", str(not_an_object))
     assert quota_resume._default_probe() == {}
+
+
+# ---------------------------------------------------------------------------
+# The working directory, all the way through the sweep
+# ---------------------------------------------------------------------------
+#
+# The sweep is the production entry: the heartbeat calls it, it reads
+# the parked plans, and it hands each one to the resumer.  The cases
+# below therefore drive the whole chain — the row, the read, the
+# decision, the resumer, the start path — because that chain is where
+# a parked run used to stop.
+
+
+def test_sweep_starts_a_parked_plan_with_the_recorded_project_dir(caplog):
+    """A parked plan whose row records a directory is started with it.
+
+    The chain that matters: the row carries the directory, the reader
+    brings it out, and the resumer hands it to the start path in the
+    request body.  Drop any link and the start path refuses the plan
+    with a 400 — and the plan is refused again on the next tick, and
+    the one after that, with nothing in the log to say why.
+    """
+    calls: list = []
+
+    def fake_start(plan_id: str, req=None):
+        calls.append((plan_id, req))
+        return {"status": "running"}
+
+    conn = _state_db()
+    _seed_execution(conn, "p9", project_dir="/tmp/worktrees/p9")
+
+    with caplog.at_level(logging.INFO, logger="quota_resume"):
+        resumed = quota_resume.run_resume_sweep(
+            conn=conn,
+            probe=lambda: {"p1": _open_window()},
+            now=1000.0,
+            resume_execution_fn=lambda plan: quota_resume.resume_execution(
+                plan, starter=fake_start
+            ),
+        )
+
+    assert resumed == ["p9"]
+    assert len(calls) == 1
+    plan_id, req = calls[0]
+    assert plan_id == "p9"
+    assert req is not None
+    assert req.project_dir == "/tmp/worktrees/p9"
+
+
+def test_sweep_names_the_missing_project_dir_in_its_skip_line(caplog):
+    """A plan with no recorded directory is skipped, and says why.
+
+    The skip line is what an operator reads when a parked plan does
+    not come back.  ``start_refused`` says "the start path said no"
+    and leaves the operator to guess; ``missing_project_dir`` says
+    the one thing that is true here: the row carries no working
+    directory, so the start path has nowhere to put the executor.
+
+    The line is written from inside the sweep — the production entry —
+    so the reason cannot be lost between the resumer and the log.
+    """
+    from fastapi import HTTPException
+
+    def fake_start(plan_id: str):
+        raise HTTPException(400, "project_dir is required. Provide the absolute path.")
+
+    conn = _state_db()
+    _seed_execution(conn, "p9")
+
+    with caplog.at_level(logging.INFO, logger="quota_resume"):
+        resumed = quota_resume.run_resume_sweep(
+            conn=conn,
+            probe=lambda: {"p1": _open_window()},
+            now=1000.0,
+            resume_execution_fn=lambda plan: quota_resume.resume_execution(
+                plan, starter=fake_start
+            ),
+        )
+
+    assert resumed == []
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "quota_resume_skipped plan=p9 kind=execution reason=missing_project_dir" in message
+        for message in messages
+    )
+    assert any("reason=missing_project_dir" in message for message in messages)
