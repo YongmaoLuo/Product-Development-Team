@@ -661,7 +661,15 @@ def import_plan(req: ImportPlanRequest, request: Request):
 
     warnings: List[str] = [id_warning] if id_warning else []
 
-    coding_tool = _server.create_coding_tool(scene="tasks_generation")
+    # The rule for naming a tool's working root lives in ``routes.phases``
+    # (the module that builds the phase tools); it is imported here rather
+    # than at module level because ``routes.phases`` reads the server's
+    # request models at import time, and the server imports this module.
+    from routes.phases import _coding_tool_cwd
+
+    coding_tool = _server.create_coding_tool(
+        cwd=_coding_tool_cwd(plan_id, plan_dir, project_dir), scene="tasks_generation"
+    )
     # ``self_review_enabled`` is DP1's default (``True``) rather than a
     # read from the state store, and that is not a shortcut: ``_allocate_plan_id``
     # hands back a directory that did not exist a line ago, so there is
@@ -1006,7 +1014,15 @@ def revise_plan(plan_id: str, req: RevisePlanRequest):
     session = JsonSession(session_id)
     session_reused = bool(session_id)
 
-    coding_tool = _server.create_coding_tool(scene="tasks_generation")
+    # The rule for naming a tool's working root lives in ``routes.phases``
+    # (the module that builds the phase tools); it is imported here rather
+    # than at module level because ``routes.phases`` reads the server's
+    # request models at import time, and the server imports this module.
+    from routes.phases import _coding_tool_cwd
+
+    coding_tool = _server.create_coding_tool(
+        cwd=_coding_tool_cwd(plan_id, plan_dir, project_dir), scene="tasks_generation"
+    )
     generator = TasksGenerator(
         coding_tool, plan_dir,
         self_review_enabled=True,

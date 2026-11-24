@@ -88,6 +88,12 @@ from coding_tool import (  # noqa: E402
     query_in_session,
 )
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 # ---------------------------------------------------------------------------
 # argv capture -- the real spawn, no subprocess
@@ -181,7 +187,7 @@ def recorder(monkeypatch):
 
 
 def _tool():
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     tool.EMPTY_RESPONSE_RETRY_BACKOFF_SEC = 0.0
     tool.logger = MagicMock()
     return tool
@@ -932,7 +938,13 @@ def _popen(cmd, *a, **k):
 
 
 ct.subprocess.Popen = _popen
-tool = ct.ClaudeCodingTool()
+# The tool names the tree it runs in: ``cwd`` is a required keyword
+# (2026-11-23), and a tool with no named root would run its child in
+# the backend server's working directory.  Here the tree the phase work
+# is about is the plan's own directory -- the same root production
+# falls back to when a plan has no project directory
+# (``_coding_tool_cwd`` in routes/phases.py).
+tool = ct.ClaudeCodingTool(cwd=str(plan_dir))
 tool.EMPTY_RESPONSE_RETRY_BACKOFF_SEC = 0.0
 tool.logger = MagicMock()
 

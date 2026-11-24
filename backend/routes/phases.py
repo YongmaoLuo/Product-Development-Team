@@ -123,6 +123,30 @@ class StartInterviewRequest(_server.StartInterviewRequest):
     hook_session_id: Optional[str] = None
 
 
+def _coding_tool_cwd(
+    plan_id: str,
+    plan_dir: Path,
+    project_dir: Optional[Union[str, Path]] = None,
+) -> str:
+    """The checkout a coding tool for ``plan_id`` must run in.
+
+    ``create_coding_tool`` refuses to build a tool with no named root
+    (2026-10-29): a tool with no root runs its child in the backend
+    server's working directory, which is a *different* checkout — so
+    every construction site has to say which tree the call is about.
+
+    The plan's own ``project_dir`` is that tree: it is the checkout the
+    plan's work happens in, and the one the agent's Read/Grep/Glob are
+    meant to see.  A plan that has no ``project_dir`` owns only its plan
+    directory, so that is the root its tool gets — never the server's
+    directory, and never nothing at all.
+    """
+    if project_dir is None:
+        project_dir = _server._get_project_dir(plan_id)
+    named = str(project_dir).strip() if project_dir else ""
+    return named if named else str(plan_dir)
+
+
 @router.post("/api/interview/start")
 def start_interview(req: StartInterviewRequest):
     """Start a new interview."""
@@ -212,7 +236,7 @@ def start_interview(req: StartInterviewRequest):
     # is not silently regressed.
     _server._seed_plan_routing_phase(plan_id, phase="interview")
 
-    coding_tool = _server.create_coding_tool(scene="interview")
+    coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="interview")
     interviewer = Interviewer(coding_tool, plan_dir)
     try:
         questions = interviewer.start(req.requirement)
@@ -242,7 +266,7 @@ def continue_interview(plan_id: str, req: _server.ContinueInterviewRequest):
     if not plan_dir.exists():
         raise HTTPException(404, "Plan not found")
 
-    coding_tool = _server.create_coding_tool(scene="interview")
+    coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="interview")
     interviewer = Interviewer(coding_tool, plan_dir)
     try:
         questions = interviewer.continue_interview(req.reply)
@@ -528,7 +552,7 @@ def get_review_items(plan_id: str):
     if not (plan_dir / "prd.json").exists() and not (plan_dir / "prd.md").exists():
         raise HTTPException(404, "PRD not found")
 
-    coding_tool = _server.create_coding_tool(scene="prd")
+    coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="prd")
     reviewer = PRDReviewer(coding_tool, plan_dir)
     items = reviewer.extract_decision_points()
 
@@ -595,7 +619,7 @@ def review_item(plan_id: str, item_index: int, req: _server.ReviewActionRequest)
     elif req.action == "skip":
         item["status"] = "skipped"
     elif req.action == "revise":
-        coding_tool = _server.create_coding_tool(scene="prd_refine")
+        coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="prd_refine")
         reviewer = PRDReviewer(coding_tool, plan_dir)
         result = reviewer.submit_action(item_index, "revise", question=req.question)
         return result
@@ -675,7 +699,7 @@ def refine_prd(plan_id: str):
     if not plan_dir.exists():
         raise HTTPException(404, "Plan not found")
 
-    coding_tool = _server.create_coding_tool(scene="prd_refine")
+    coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="prd_refine")
     refiner = PRDRefiner(coding_tool, plan_dir)
     try:
         refined_prd = refiner.refine()
@@ -818,7 +842,7 @@ def generate_arch(plan_id: str):
     # VP-006: block downstream phases while the PRD is a placeholder.
     _reject_if_placeholder_prd(plan_dir, plan_id)
 
-    coding_tool = _server.create_coding_tool(scene="arch")
+    coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="arch")
     state = _server.PlanState(plan_dir)
     gen = ArchGenerator(
         coding_tool, plan_dir,
@@ -894,7 +918,7 @@ def regenerate_arch(plan_id: str):
     state.reset_review_round("arch")
 
     # Re-generate
-    coding_tool = _server.create_coding_tool(scene="arch")
+    coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="arch")
     state = _server.PlanState(plan_dir)
     gen = ArchGenerator(
         coding_tool, plan_dir,
@@ -940,7 +964,7 @@ def refine_arch(plan_id: str, req: _server.RefineRequest):
     if not plan_dir.exists():
         raise HTTPException(404, "Plan not found")
 
-    coding_tool = _server.create_coding_tool(scene="arch_refine")
+    coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="arch_refine")
     refiner = ArchRefiner(coding_tool, plan_dir)
     try:
         refined_arch = refiner.refine(feedback=req.feedback)
@@ -978,7 +1002,7 @@ def get_arch_review_items(plan_id: str):
     with open(arch_file) as f:
         content = f.read()
 
-    coding_tool = _server.create_coding_tool(scene="arch")
+    coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="arch")
     reviewer = ArchReviewer(coding_tool, plan_dir)
     items = reviewer.get_items(content)
 
@@ -1013,7 +1037,7 @@ def review_arch_item(plan_id: str, item_index: int, req: _server.ReviewActionReq
     if not plan_dir.exists():
         raise HTTPException(404, "Plan not found")
 
-    coding_tool = _server.create_coding_tool(scene="arch_refine")
+    coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="arch_refine")
     reviewer = ArchReviewer(coding_tool, plan_dir)
     result = reviewer.submit_action(item_index, req.action, req.note, req.question)
 
@@ -1057,7 +1081,7 @@ def generate_test_design(plan_id: str):
     # VP-006: block downstream phases while the PRD is a placeholder.
     _reject_if_placeholder_prd(plan_dir, plan_id)
 
-    coding_tool = _server.create_coding_tool(scene="test_design")
+    coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="test_design")
     state = _server.PlanState(plan_dir)
     gen = TestDesignGenerator(
         coding_tool, plan_dir,
@@ -1117,7 +1141,7 @@ def regenerate_test_design(plan_id: str):
     state.reset_review_round("test")
 
     # Re-generate
-    coding_tool = _server.create_coding_tool(scene="test_design")
+    coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="test_design")
     state = _server.PlanState(plan_dir)
     gen = TestDesignGenerator(
         coding_tool, plan_dir,
@@ -1163,7 +1187,7 @@ def refine_test_design(plan_id: str, req: _server.RefineRequest):
     if not plan_dir.exists():
         raise HTTPException(404, "Plan not found")
 
-    coding_tool = _server.create_coding_tool(scene="test_refine")
+    coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="test_refine")
     refiner = TestDesignRefiner(coding_tool, plan_dir)
     try:
         refined_test = refiner.refine(feedback=req.feedback)
@@ -1201,7 +1225,7 @@ def get_test_review_items(plan_id: str):
     with open(test_file) as f:
         content = f.read()
 
-    coding_tool = _server.create_coding_tool(scene="test_design")
+    coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="test_design")
     reviewer = TestDesignReviewer(coding_tool, plan_dir)
     items = reviewer.get_items(content)
 
@@ -1236,7 +1260,7 @@ def review_test_item(plan_id: str, item_index: int, req: _server.ReviewActionReq
     if not plan_dir.exists():
         raise HTTPException(404, "Plan not found")
 
-    coding_tool = _server.create_coding_tool(scene="test_refine")
+    coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="test_refine")
     reviewer = TestDesignReviewer(coding_tool, plan_dir)
     result = reviewer.submit_action(item_index, req.action, req.note, req.question)
 
@@ -1275,7 +1299,7 @@ def add_prd_decision_point(plan_id: str, req: _server.AddDecisionPointRequest):
     if not prd_json.exists():
         raise HTTPException(404, "PRD not found")
 
-    coding_tool = _server.create_coding_tool(scene="prd")
+    coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="prd")
     adder = PRDDecisionPointAdder(coding_tool, plan_dir)
     reviewer = PRDReviewer(coding_tool, plan_dir)
     try:
@@ -1327,7 +1351,7 @@ def add_arch_decision_point(plan_id: str, req: _server.AddDecisionPointRequest):
     if not arch_file.exists():
         raise HTTPException(404, "Architecture design not found")
 
-    coding_tool = _server.create_coding_tool(scene="arch")
+    coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="arch")
     adder = ArchDecisionPointAdder(coding_tool, plan_dir)
     reviewer = ArchReviewer(coding_tool, plan_dir)
     try:
@@ -1376,7 +1400,7 @@ def add_test_decision_point(plan_id: str, req: _server.AddDecisionPointRequest):
     if not test_file.exists():
         raise HTTPException(404, "Test design not found")
 
-    coding_tool = _server.create_coding_tool(scene="test_design")
+    coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="test_design")
     adder = TestDecisionPointAdder(coding_tool, plan_dir)
     reviewer = TestDesignReviewer(coding_tool, plan_dir)
     try:
@@ -1736,7 +1760,7 @@ def generate_tasks(plan_id: str):
     # VP-006: block downstream phases while the PRD is a placeholder.
     _reject_if_placeholder_prd(plan_dir, plan_id)
 
-    coding_tool = _server.create_coding_tool(scene="tasks_generation")
+    coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="tasks_generation")
     state = _server.PlanState(plan_dir)
     gen = TasksGenerator(
         coding_tool, plan_dir,
@@ -1881,7 +1905,7 @@ def run_preflight(plan_id: str):
             "(plan_state.flags.preflight_enabled == False)",
         )
 
-    coding_tool = _server.create_coding_tool(scene="tasks_generation")
+    coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="tasks_generation")
     reviewer = PreFlightReviewer(coding_tool, plans_root=_server.PLANS_DIR)
     report = reviewer.run(plan_id)
     return report
@@ -1948,7 +1972,7 @@ def validate_task_workspace(plan_id: str, req: Optional[dict] = None):
     with open(tasks_file) as f:
         tasks_data = json.load(f)
 
-    coding_tool = _server.create_coding_tool(scene="tasks_generation")
+    coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="tasks_generation")
     gen = TasksGenerator(coding_tool, plan_dir)
     # Default: the formal repo is the repository that hosts this
     # server.py. It must never be selected as a dev workspace.
@@ -2331,7 +2355,7 @@ def generate_verification_plan(plan_id: str, req: _server.RefineRequest = None):
         },
     }
 
-    coding_tool = _server.create_coding_tool(scene="tasks_generation")
+    coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="tasks_generation")
     try:
         generate_plan_doc(plan_dir, context, coding_tool)
     except PlanDocError as exc:
@@ -3193,7 +3217,7 @@ def refine_verification_plan(plan_id: str, req: _server.RefineRequest = None):
             },
         )
 
-    coding_tool = _server.create_coding_tool(scene="tasks_generation")
+    coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="tasks_generation")
     try:
         refine_plan_doc(plan_dir, feedback, coding_tool)
     except PlanDocError as exc:

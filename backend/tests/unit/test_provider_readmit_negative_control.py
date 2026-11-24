@@ -78,6 +78,12 @@ from dynamic_provider_concurrency import (  # noqa: E402
     set_shared_cooldown,
 )
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 #: The scene's tier: one provider that failed, two that ran out.
 CHAIN = ["Vendor A", "Vendor B", "Vendor C"]
 
@@ -282,8 +288,7 @@ def _tool():
     return ClaudeCodingTool(
         scene="verification",
         concurrency_tracker=ActiveConcurrencyTracker(),
-        logger=_Recorder(),
-    )
+        logger=_Recorder(), cwd=_REPO_ROOT)
 
 
 # ---------------------------------------------------------------------------

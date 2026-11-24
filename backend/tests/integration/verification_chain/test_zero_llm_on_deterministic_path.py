@@ -84,6 +84,12 @@ from .test_runner_outcomes import (  # noqa: E402
     load_fixture_points,
 )
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+
 pytestmark = pytest.mark.integration
 
 
@@ -251,7 +257,7 @@ def test_control_group_session_increment(
     monkeypatch.setattr(
         ClaudeCodingTool, "_run_claude_interactive", _fake_interactive
     )
-    tool = ClaudeCodingTool(scene="verification")
+    tool = ClaudeCodingTool(scene="verification", cwd=_REPO_ROOT)
 
     before = count_session_lines(plan_dir)
     with usage_registry.plan_usage_context(plan_id=CONTROL_PLAN_ID):

@@ -92,6 +92,7 @@ __all__ = [
     "FINGERPRINT_RULE_IDENTITY",
     "FINGERPRINT_RULE_LEGACY",
     "canonical_fingerprint_input",
+    "normalized_failed_assertions",
     "failure_fingerprint",
     "fingerprint_rule",
 ]
@@ -100,6 +101,11 @@ __all__ = [
 #: The sentinel for a field the caller did not supply. A fixed string, so
 #: the canonical input never carries a ``None`` literal into the hash.
 _MISSING = "<missing>"
+
+#: The marker that replaces the prose when a payload decides.  It is a
+#: fixed string, so two payloads that differ only in their prose hash
+#: identically — which is the whole point.
+_PROSE_NOT_HASHED = "<prose-not-hashed>"
 
 #: The fingerprint is the first ``FINGERPRINT_LENGTH`` hex digits of the
 #: sha256 of the canonical input. 16 hex digits is 64 bits: short enough to
@@ -330,6 +336,20 @@ def _normalize_assertions(value: Any) -> List[str]:
     return sorted(_normalize_text(str(item)) for item in items)
 
 
+def normalized_failed_assertions(value: Any) -> Optional[List[str]]:
+    """The failed assertions, normalized — or ``None`` when there are none.
+
+    The payload's own spelling, so two callers can compare payloads
+    without each growing its own normalization.  ``None`` means "this
+    round carried no payload", which is not the same as "the payload was
+    empty": one says *we do not know*, the other says *we know, and
+    nothing failed*.
+    """
+    if value is None:
+        return None
+    return _normalize_assertions(value)
+
+
 def canonical_fingerprint_input(
     *,
     vp_id: Any = None,
@@ -345,6 +365,13 @@ def canonical_fingerprint_input(
     field sentinel must be visible in it, and the ``None`` literal must
     not). It is the same string the fingerprint hashes — not a
     reconstruction of it.
+
+    **The prose is only hashed when there is no payload.**  A caller that
+    supplies ``failed_assertions`` has said what failed; the prose is then
+    a *description* of that failure, and descriptions are rewritten from
+    one round to the next.  Hashing it made the fingerprint track the
+    wording, which is how "the root cause moved" came to mean "the report
+    was worded differently".
 
     Two shapes exist:
 
@@ -367,13 +394,17 @@ def canonical_fingerprint_input(
         )
         return _TOKEN_SEP.join(parts)
 
+    if failed_assertions is None:
+        prose = _normalize_scalar(first_error_line)
+    else:
+        prose = _PROSE_NOT_HASHED
     parts = (
         "vp_id=" + _normalize_identifier(vp_id),
         "failure_class=" + _normalize_identifier(failure_class),
         "failed_assertions="
         + _TOKEN_SEP.join(_normalize_assertions(failed_assertions)),
         "command=" + _normalize_scalar(command),
-        "first_error_line=" + _normalize_scalar(first_error_line),
+        "first_error_line=" + prose,
     )
     return _TOKEN_SEP.join(parts)
 
@@ -394,9 +425,11 @@ def failure_fingerprint(
         failure_class: The failure's classification, e.g.
             ``"deliverable_defect"``.
         failed_assertions: The assertions that failed. A set, not a
-            sequence: the order does not change the fingerprint.
+            sequence: the order does not change the fingerprint.  **When
+            this is supplied, the prose is not part of the identity.**
         command: The command that was run.
-        first_error_line: The first line of the error output.
+        first_error_line: The first line of the error output.  Used only
+            when there is no payload to hash.
         failed_cases: The **machine-written** ids of the failing cases
             (pytest node ids). Given them, the fingerprint is the
             identity of the failing set — the prose above is deliberately

@@ -62,6 +62,12 @@ from coding_tool import (  # noqa: E402
     query_json_in_session,
 )
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 ANCHOR = (
     "本会话正在判定验证点 VP-028：延后关卡重算，"
     "最终回复必须是该验证点的裁决 JSON 并引用它点名的源码。"
@@ -76,7 +82,7 @@ def _tool(monkeypatch, side_effect):
     far; it returns either ``(text, session_id)`` — the pair the real
     method returns — or an exception instance to raise.
     """
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     tool.EMPTY_RESPONSE_RETRY_BACKOFF_SEC = 0.0
     tool.logger = MagicMock()
     recorded: List[Dict[str, Any]] = []

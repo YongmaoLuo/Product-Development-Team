@@ -43,6 +43,12 @@ from coding_tool import ApiError, ClaudeCodingTool  # noqa: E402
 from subagent_config import SubagentConfig  # noqa: E402
 from utils.secret_files import REDACTED  # noqa: E402
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 _PROXY_BASE_URL = "https://proxy.invalid/anthropic"
 _ROUTED_BASE_URL = "https://scene-routed.invalid/anthropic"
@@ -112,8 +118,7 @@ def test_dispatch_redacts_the_settings_file_it_hands_the_child(
         tool = ClaudeCodingTool(
             provider_priority=[],
             settings=subagent_cfg.settings_file_path,
-            scene="execution",
-        )
+            scene="execution", cwd=_REPO_ROOT)
         tool.query("test prompt")
 
     written = json.loads(
@@ -178,8 +183,7 @@ def test_dispatch_redacts_when_the_read_loop_raises_api_error(
         tool = ClaudeCodingTool(
             provider_priority=[],
             settings=subagent_cfg.settings_file_path,
-            scene="execution",
-        )
+            scene="execution", cwd=_REPO_ROOT)
         with pytest.raises(ApiError):
             tool._run_claude_interactive("test prompt")
 
@@ -213,8 +217,7 @@ def test_dispatch_redacts_when_the_child_cannot_be_spawned(
         tool = ClaudeCodingTool(
             provider_priority=[],
             settings=subagent_cfg.settings_file_path,
-            scene="execution",
-        )
+            scene="execution", cwd=_REPO_ROOT)
         with pytest.raises(OSError):
             tool._run_claude_interactive("test prompt")
 
@@ -250,8 +253,7 @@ def test_dispatch_does_not_touch_the_callers_settings_file(
         tool = ClaudeCodingTool(
             provider_priority=[],
             settings=caller_settings,
-            scene="execution",
-        )
+            scene="execution", cwd=_REPO_ROOT)
         tool.query("first prompt")
         tool.query("second prompt")
         assert mock_popen.call_count == 2

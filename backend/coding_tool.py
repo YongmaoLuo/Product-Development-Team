@@ -23,7 +23,7 @@ import uuid
 import contextvars
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 # 2026-10-26 (merge): 本分支删掉了这一行 —— 它原来只服务于
 # ``_quota_reset_seconds_for``，而那个函数被本分支删了。main 那边保留了它，
@@ -4206,6 +4206,15 @@ def _verification_query_cap_seconds() -> float:
     return value
 
 
+#: The environment variable that carries the working root into the child
+#: process.  The CLI folds its settings scopes into the process
+#: environment last, so the same name is also written into the
+#: ``--settings`` payload; the child therefore reads one authoritative
+#: value — and it is always *this* tool's root, never one inherited
+#: from the server's environment.
+WORK_ROOT_ENV = "PDT_WORK_ROOT"
+
+
 class ClaudeCodingTool(CodingTool):
     """Claude Code CLI tool using stdin/stdout stream-json protocol.
 
@@ -4363,7 +4372,7 @@ class ClaudeCodingTool(CodingTool):
     # which provider candidates a call may use. The complex/medium
     # model_map tiering had degenerated to identical values anyway.
 
-    def __init__(self, model: Optional[str] = None, cwd: Optional[str] = None, logger=None, api_key: Optional[str] = None,
+    def __init__(self, model: Optional[str] = None, logger=None, api_key: Optional[str] = None,
                  model_type: Optional[str] = None, model_map: Optional[Dict] = None,
                  provider_priority: Optional[list] = None,
                  mcp_config: Optional[str] = None,
@@ -4373,12 +4382,60 @@ class ClaudeCodingTool(CodingTool):
                  auth_token: Optional[str] = None,
                  scene: Optional[str] = None,
                  concurrency_tracker=None,
-                 plan_mode: Optional[str] = None):
+                 plan_mode: Optional[str] = None,
+                 *,
+                 cwd: Union[str, Path]):
         # Default: inherit from parent process env (no override).
         # Only when explicitly passed do we override the child process.
         self.model = model
         self.api_key = api_key
+        # 2026-10-29 — the working root is a contract, not a default.
+        #
+        # ``cwd`` is a required keyword: a tool cannot be born without
+        # a named tree, because ``subprocess.Popen(cwd=None)`` runs the
+        # child in the backend server's working directory — the checkout
+        # the server was started from, and the checkout a review's
+        # citations were read from when this repair's incident
+        # happened.
+        #
+        #   * a named tree: the caller says which checkout this call is
+        #     about.  ``self.cwd`` keeps the value as it was named (the
+        #     child is started there and the file-lock broker derives
+        #     its socket from it), and ``self.work_root`` records the
+        #     tree's *realpath* — the canonical name, so two spellings
+        #     of one checkout can never be read as two checkouts.
+        #   * an explicit ``cwd=None``: a caller who meant to name a
+        #     checkout and named nothing.  That is refused here, at
+        #     once: the child would silently run in the server's
+        #     directory — the checkout the review's citations were read
+        #     from in the incident this closes.
+        #   * an empty ``cwd``: the same mistake spelled differently.
+        #     ``Path("").resolve()`` is the process's own directory.
+        #
+        # The message is EXACTLY ``explicit cwd required``: that string
+        # is the contract, and a caller (or a test) that matches on it
+        # must not have to match a paragraph to find it.  What to do
+        # about it rides along as a note, so the traceback still says
+        # it while the message stays the contract's own words.
+        if cwd is None:
+            err = ValueError("explicit cwd required")
+            err.add_note(
+                "ClaudeCodingTool must be told which checkout to run in "
+                "— cwd=None would make the child process inherit the "
+                "backend server's working directory. Name the tree the "
+                "call is about."
+            )
+            raise err
+        if not str(cwd).strip():
+            err = ValueError("explicit cwd required")
+            err.add_note(
+                "ClaudeCodingTool must be told which checkout to run in "
+                "— an empty cwd resolves to the backend server's working "
+                "directory."
+            )
+            raise err
         self.cwd = cwd
+        self.work_root = str(Path(cwd).resolve())
         self.logger = logger
         # base_url / auth_token: explicit SubagentConfig-driven env
         # overrides (decision 2/3 plumbing). When passed, the
@@ -4996,6 +5053,18 @@ class ClaudeCodingTool(CodingTool):
         env = os.environ.copy()
         env["PDT_SUBAGENT_UUID"] = subagent_uuid
         env["PDT_SUBAGENT_LOG_FILE"] = subagent_log_file
+        # 2026-10-29 — the working root travels with the child process.
+        #
+        # Anything running inside the child (the CLI, the guard hook,
+        # a shell) can then assert which checkout it is in, instead of
+        # inferring it from the process's own directory.  The name is
+        # dropped first and set afterwards on purpose: a stale value
+        # inherited from the server's environment would name a
+        # checkout this tool is not running in — a worse confusion
+        # than no name at all.
+        env.pop(WORK_ROOT_ENV, None)
+        if self.work_root:
+            env[WORK_ROOT_ENV] = self.work_root
 
         effective_settings_path: Optional[Path] = None
         # The ``--settings`` payload is only *assembled* here. The
@@ -5072,6 +5141,16 @@ class ClaudeCodingTool(CodingTool):
             )
             settings_data["env"]["PDT_SUBAGENT_UUID"] = subagent_uuid
             settings_data["env"]["PDT_SUBAGENT_LOG_FILE"] = subagent_log_file
+            # The working root rides here as well as in the process
+            # environment, for the reason spelled out above: the CLI
+            # folds its settings scopes into ``process.env`` last, so
+            # the payload is the channel that cannot be clobbered by
+            # the machine's own ``~/.claude/settings.json``.  A stale
+            # name in the template is dropped first — the published
+            # root is this tool's root and nothing else.
+            settings_data["env"].pop(WORK_ROOT_ENV, None)
+            if self.work_root:
+                settings_data["env"][WORK_ROOT_ENV] = self.work_root
             if self.cwd:
                 settings_data["env"]["PDT_PROJECT_DIR"] = str(Path(self.cwd).resolve())
                 # File-lock broker (see ``file_lock_broker``): the socket
@@ -10190,13 +10269,43 @@ def _scripted_registry() -> ScriptedLLMRegistry:
     return ScriptedLLMRegistry(_scripted_script_dir())
 
 
-def create_coding_tool(tool_type: Optional[str] = None, cwd: Optional[str] = None, logger=None,
-                       scene: Optional[str] = None) -> CodingTool:
+#: The tools the factory builds WITHOUT handing them the working root.
+#:
+#: ``create_coding_tool`` refuses a caller that names no root — that
+#: check sits above every branch — but two of its branches build a tool
+#: that does not *carry* the root onwards: the vendor-c and opencode
+#: adapters spawn their CLI without ``cwd=``, so their child runs in the
+#: backend server's working directory instead of the tree the call is
+#: about.
+#:
+#: That gap is written down here rather than left to be discovered.  The
+#: gate in ``backend/tests/unit/test_coding_tool_work_root.py``
+#: (``test_every_factory_branch_either_carries_the_root_or_is_pinned``)
+#: reads this list, so a *third* branch that drops the root fails the
+#: gate instead of joining the list quietly — and a listed tool that
+#: stops dropping the root fails it too, because a pin that outlives the
+#: gap it names is a hole in the gate.
+#:
+#: Closing the gap means giving those two adapters a root, which in turn
+#: means threading one into the executor path that builds them.  That is
+#: a separate change; until it lands, the gap is pinned here rather than
+#: left silent.
+FACTORY_TOOLS_WITHOUT_A_WORKING_ROOT = ("VendorCCodingTool", "OpenCodeCodingTool")
+
+
+def create_coding_tool(tool_type: Optional[str] = None, logger=None,
+                       scene: Optional[str] = None,
+                       *,
+                       cwd: Union[str, Path]) -> CodingTool:
     """Factory function to create the appropriate coding tool.
 
     Args:
         tool_type: Tool type — 'claude', 'vendor-c', 'opencode', or None (auto from env).  # kebab-case test_provider marker
-        cwd: Working directory for the tool.
+        cwd: Working directory for the tool — the tree the call is
+            about.  Required, and checked before anything is built
+            (2026-10-29): a tool with no named root runs its child in
+            the backend server's working directory, which is a
+            different checkout.
         logger: Optional logger for structured logging.
         scene: Workflow scene for provider routing (2026-09-13). Forwarded
             to ``ClaudeCodingTool`` and (2026-11-04) to
@@ -10211,6 +10320,22 @@ def create_coding_tool(tool_type: Optional[str] = None, cwd: Optional[str] = Non
     Returns:
         CodingTool instance.
     """
+    # 2026-10-29 — the working root is checked here, before any branch.
+    #
+    # The factory is where the routes build their tools, so it is the
+    # last place where "no root" could still be translated into a tool
+    # that runs somewhere else.  It refuses instead: the check sits
+    # *above* the scripted branch on purpose, because a scripted run
+    # is still a run that records which tree it belongs to.
+    if cwd is None or not str(cwd).strip():
+        err = ValueError("explicit cwd required")
+        err.add_note(
+            "create_coding_tool must be told which checkout the call is "
+            "about — a tool with no named root runs its child in the "
+            "backend server's working directory."
+        )
+        raise err
+
     if scripted_mode_enabled():
         return ScriptedCodingTool(cwd=cwd, logger=logger, scene=scene)
 
@@ -10222,12 +10347,23 @@ def create_coding_tool(tool_type: Optional[str] = None, cwd: Optional[str] = Non
         # per-call ``scene`` parameter, so the instance value is the only
         # place it can live; dropping it made the vendor-c path the one
         # provider that never saw the deployment's requirements.
+        # 2026-11-12 — this branch does NOT hand the working root to the
+        # tool it builds: ``VendorCCodingTool`` spawns its CLI without
+        # ``cwd=``, so the child runs in the backend server's working
+        # directory.  The factory still refuses a caller that names no
+        # root (the check above), and the gap is pinned in
+        # ``FACTORY_TOOLS_WITHOUT_A_WORKING_ROOT`` — the gate reads that
+        # list, so this branch is a written-down gap and not a silent one.
         return VendorCCodingTool(scene=scene)
     elif tool_type == "opencode":
         # 2026-11-04 — the scene used to be dropped here.  OpenCode has no
         # per-call ``scene`` parameter, so the instance value is the only
         # place it can live; dropping it made the opencode path the one
         # provider that never saw the deployment's requirements.
+        # 2026-11-12 — same gap as the vendor-c branch above: the root is
+        # checked above but not carried into the tool, and the pin in
+        # ``FACTORY_TOOLS_WITHOUT_A_WORKING_ROOT`` is what keeps it
+        # visible to the gate.
         return OpenCodeCodingTool(scene=scene)
     else:
         return ClaudeCodingTool(cwd=cwd, logger=logger, scene=scene)

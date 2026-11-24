@@ -74,6 +74,12 @@ from dynamic_provider_concurrency import (  # noqa: E402
     set_shared_cooldown,
 )
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 CHAIN = ["Vendor A Pro", "Vendor A", "Vendor A API"]
 
 _POOL_CAPS = [
@@ -229,8 +235,7 @@ def _serve(monkeypatch, readings):
 
 def _tool(tracker, log):
     tool = ClaudeCodingTool(
-        scene="verification", concurrency_tracker=tracker, logger=log,
-    )
+        scene="verification", concurrency_tracker=tracker, logger=log, cwd=_REPO_ROOT)
     tool.provider_slot_wait_sec = 0.2
     return tool
 

@@ -42,7 +42,10 @@ class Pipeline:
     def __init__(self, project_dir: Path, config_name: Optional[str] = None):
         self.project_dir = project_dir.resolve()
         self.config_name = config_name
-        self.coding_tool = ClaudeCodingTool()
+        # 2026-10-29 — the tool names the tree it works in.  A tool
+        # built without a working root runs its child in the backend
+        # server's working directory, which is a different checkout.
+        self.coding_tool = ClaudeCodingTool(cwd=self.project_dir)
 
         # Determine plan ID from project dir name or generate one
         plan_id = self.project_dir.name

@@ -87,6 +87,12 @@ from coding_tool import (  # noqa: E402
 )
 from verification_cancel import VerificationCancelled  # noqa: E402
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 #: The id a task's binding names before the session exists — the state a
 #: ``/start`` after a ``/stop`` finds when the stopped round never got
 #: as far as creating the session.
@@ -132,7 +138,7 @@ def _tool(monkeypatch, side_effect):
         staticmethod(lambda *args, **kwargs: {}),
     )
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     tool.EMPTY_RESPONSE_RETRY_BACKOFF_SEC = 0.0
     tool.logger = MagicMock()
     recorded: list[dict] = []

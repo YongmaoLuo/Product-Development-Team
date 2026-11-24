@@ -105,6 +105,22 @@
   正是第一个丢掉的东西。这个 job 读的是 `pull_request.commits` ——
   也就是 PR 页面自己显示的数字 —— 并接入 merge gate 的 `needs`。
 
+- **编码工具现在必须被告知它是在哪棵树里干活，而失败指纹改由载荷决定。**
+  `ClaudeCodingTool`（`backend/coding_tool.py`）把工作根变成必填的关键字
+  参数，不给名字就不肯被造出来 —— 没有名字的根会让子进程落在服务端自己的
+  目录里，而那不是这次调用关心的那棵树。现在每个构造点都点名了根：验证
+  编排器把自己建出来的工具指向计划的 project directory
+  （`backend/verification_agent.py`），而给卡住的那次尝试下裁决的
+  summarizer 拿到的是同一个根（`backend/verification_subagent.py`）。
+  终局裁决的判定者与 HITL 端口不再自己猜这个根：判定者在被告知的那棵树里
+  调查，点不出树名就干脆不给工具（`backend/verification/terminal_analysis.py`），
+  端口则先取计划登记的 project directory、其次才是计划自己的目录
+  （`backend/hitl/terminal_decision_port.py`）。失败指纹遵守同一条「一个问题
+  一个权威」：评分器自己的 `failed_assertions` 载荷在场时，由载荷决定指纹，
+  报告的散文不再被一起哈希，于是同一个缺陷无论散文怎么改写都得到同一个
+  指纹；散文（`first_error_line`）只在没有载荷可哈希时才参与
+  （`backend/verification/failure_fingerprint.py`）。
+
 
 
 ## [0.1.2] - 2026-10-07

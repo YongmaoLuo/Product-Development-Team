@@ -47,6 +47,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from coding_tool import ClaudeCodingTool
 from subagent_config import SubagentConfig
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -167,8 +173,7 @@ class TestSettingsFileWriteOrder:
             tool = ClaudeCodingTool(
                 provider_priority=[],
                 settings=subagent_cfg.settings_file_path,
-                scene="execution",
-            )
+                scene="execution", cwd=_REPO_ROOT)
             tool.query("test prompt")
 
         _, kwargs = mock_popen.call_args
@@ -220,8 +225,7 @@ class TestSettingsFileWriteOrder:
                 # does resolve a provider (and would then, correctly,
                 # outrank the override under test).
                 provider_priority=["__no_such_provider__"],
-                settings=subagent_cfg.settings_file_path,
-            )
+                settings=subagent_cfg.settings_file_path, cwd=_REPO_ROOT)
             tool.query("test prompt")
 
         file_env = _settings_payload(mock_popen).get("env", {})
@@ -398,8 +402,7 @@ class TestNoCredentialInAPreselectionSettingsFile:
             tool = ClaudeCodingTool(
                 provider_priority=[],
                 settings=template_path,
-                scene="execution",
-            )
+                scene="execution", cwd=_REPO_ROOT)
             tool.query("test prompt")
 
         file_env = _settings_payload(mock_popen).get("env", {})

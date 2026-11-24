@@ -38,6 +38,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import coding_tool as coding_tool_module
 from coding_tool import ClaudeCodingTool, create_coding_tool
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 @pytest.mark.unit
 class TestCreateCodingToolScene:
@@ -45,17 +51,17 @@ class TestCreateCodingToolScene:
         with mock.patch.object(
             coding_tool_module, "ClaudeCodingTool", wraps=coding_tool_module.ClaudeCodingTool
         ) as spy:
-            tool = create_coding_tool(scene="prd")
+            tool = create_coding_tool(scene="prd", cwd=_REPO_ROOT)
             assert tool.scene == "prd"
 
     def test_factory_no_scene_yields_none(self):
-        tool = create_coding_tool()
+        tool = create_coding_tool( cwd=_REPO_ROOT)
         assert tool.scene is None
 
     def test_factory_non_claude_ignores_scene(self):
         # VendorCCodingTool has no scene concept; must not crash.
         with mock.patch.object(coding_tool_module, "VendorCCodingTool") as _k:
-            tool = create_coding_tool(tool_type="vendor-c", scene="prd")
+            tool = create_coding_tool(tool_type="vendor-c", scene="prd", cwd=_REPO_ROOT)
             assert tool is not None
 
 

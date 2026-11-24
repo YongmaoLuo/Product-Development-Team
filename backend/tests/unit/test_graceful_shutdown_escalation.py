@@ -29,11 +29,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from coding_tool import ClaudeCodingTool
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 def _make_tool() -> ClaudeCodingTool:
     """Build a tool without touching the provider database."""
     with patch.object(ClaudeCodingTool, "_load_provider_from_db", return_value={}):
-        return ClaudeCodingTool()
+        return ClaudeCodingTool( cwd=_REPO_ROOT)
 
 
 class _FakeStdin:

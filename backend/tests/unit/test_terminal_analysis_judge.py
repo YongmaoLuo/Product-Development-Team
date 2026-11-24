@@ -396,3 +396,99 @@ def test_recommendations_match_terminal_options():
     from verification.orchestrator import TERMINAL_OPTIONS
 
     assert _terminal_analysis().RECOMMENDATIONS == TERMINAL_OPTIONS
+
+
+# ---------------------------------------------------------------------------
+# 6. The judge's tool names the tree it runs in
+# ---------------------------------------------------------------------------
+
+
+class _RecordingTool:
+    """A stand-in for the coding tool that records how it was built."""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+def test_the_judge_builds_its_tool_in_the_named_root(monkeypatch, tmp_path):
+    """The tool the judge investigates with runs in the tree it was told.
+
+    The judge reads the tree under verification; a tool with no root
+    reads the backend server's own directory instead — a different
+    checkout, and therefore the wrong evidence.
+    """
+    monkeypatch.setattr("coding_tool.ClaudeCodingTool", _RecordingTool)
+
+    root = tmp_path / "checkout"
+    judge = _terminal_analysis().TerminalDecisionJudge(cwd=str(root))
+
+    tool = judge.coding_tool
+
+    assert tool.kwargs.get("cwd") == str(root), (
+        f"the judge must run in the tree that was named; got {tool.kwargs!r}"
+    )
+    assert tool.kwargs.get("scene") == "verification"
+
+
+def test_the_judge_refuses_to_build_a_tool_with_no_root(monkeypatch):
+    """A judge that cannot name a tree gets no tool.
+
+    Silently falling back to the server's directory would hand the
+    judge evidence from the wrong checkout, and the answer it gives
+    would look authoritative all the same.
+    """
+    monkeypatch.setattr("coding_tool.ClaudeCodingTool", _RecordingTool)
+
+    judge = _terminal_analysis().TerminalDecisionJudge()
+
+    with pytest.raises(ValueError) as excinfo:
+        judge.coding_tool
+
+    assert str(excinfo.value) == "explicit cwd required", (
+        f"the refusal must be the contract's own words; got {excinfo.value!r}"
+    )
+
+
+def test_the_orchestrator_hands_the_judge_the_project_directory(
+    monkeypatch, tmp_path,
+):
+    """The judge is built with the tree the round ran in.
+
+    The orchestrator knows the project directory; the judge does not,
+    so the root has to travel with the judge.
+    """
+    from unittest.mock import Mock
+
+    import verification.orchestrator as orchestrator_module
+    import verification.terminal_analysis as terminal_analysis
+
+    captured = {}
+
+    class _Judge:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(terminal_analysis, "TerminalDecisionJudge", _Judge)
+    monkeypatch.setattr(
+        orchestrator_module, "VerificationAgent",
+        lambda *args, **kwargs: Mock(),
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "RepairTaskGenerator",
+        lambda *args, **kwargs: Mock(),
+    )
+
+    project_dir = tmp_path / "workspace"
+    project_dir.mkdir()
+
+    orchestrator = orchestrator_module.VerificationOrchestrator(
+        plan_dir=tmp_path,
+        project_dir=project_dir,
+        coding_tool=Mock(),
+    )
+    judge = orchestrator._terminal_judge_for()
+
+    assert isinstance(judge, _Judge)
+    assert captured.get("cwd") == str(project_dir), (
+        f"the judge must be told the tree the round ran in; got {captured!r}"
+    )

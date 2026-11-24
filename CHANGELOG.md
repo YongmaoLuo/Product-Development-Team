@@ -149,6 +149,30 @@ half the readers never see.*
   thing to go. The job reads `pull_request.commits` — the number the pull
   request itself shows — and joins the merge gate's `needs`.
 
+- **A coding tool now has to be told which checkout it is about, and the
+  failure fingerprint is decided by the payload.** `ClaudeCodingTool`
+  (`backend/coding_tool.py`) takes its working root as a required
+  keyword-only argument and refuses to be built without one — an unnamed
+  root would run the child in the backend server's own directory, a
+  different tree than the one the call is about. Every construction site
+  names a root now: the verification orchestrator passes the plan's
+  project directory into the tool it builds
+  (`backend/verification_agent.py`), and the summarizer that decides a
+  stuck attempt's verdict is handed the same root
+  (`backend/verification_subagent.py`). The terminal-decision judge and
+  the HITL port resolve that root instead of guessing one: the judge
+  investigates in the tree it was told about and gets no tool at all
+  when it cannot name one (`backend/verification/terminal_analysis.py`),
+  while the port resolves the plan's registered project directory first
+  and the plan's own directory second
+  (`backend/hitl/terminal_decision_port.py`). The failure fingerprint
+  follows the same one-authority-per-question rule: when the grader's own
+  `failed_assertions` payload is present, the payload decides the
+  fingerprint and the report's prose is not hashed around it, so one
+  defect fingerprints the same way however the prose is reworded; the
+  prose (`first_error_line`) takes part only when there is no payload to
+  hash (`backend/verification/failure_fingerprint.py`).
+
 
 
 ## [0.1.2] - 2026-10-07
