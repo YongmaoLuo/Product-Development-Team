@@ -168,6 +168,7 @@ short.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import queue
@@ -178,7 +179,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from .commands import CommandRejected, CommandResult
 from .config import (
@@ -235,6 +236,11 @@ class EngineParts:
         commands: the command executor.
         sink: where the tick's decisions go.
         conn: the connection the engine writes on.
+        read_conn: the connection the **read model** reads on — a
+            second connection to the same database, so that the panel's
+            document does not wait for the worker's transaction.
+            ``None`` means there is no such connection, and the read
+            model reads on ``conn``.
     """
 
     store: Any
@@ -243,6 +249,7 @@ class EngineParts:
     commands: Any
     sink: Any
     conn: Any
+    read_conn: Any = None
 
 
 #: The file in a plan's own directory that carries the intent the
@@ -538,6 +545,34 @@ def _connection_of(*sources: Any) -> Optional[sqlite3.Connection]:
     return None
 
 
+def _read_twin_ledger(
+    ledger: Any, facts: Any, conn: sqlite3.Connection
+) -> Any:
+    """Return the ledger that reads through ``conn``.
+
+    The ledger holds no state, so the twin is the ledger with its
+    facts replaced by the read-side ones and its connection replaced by
+    the read one.  A ledger that cannot be twinned is refused rather
+    than used as it is: a ledger that still reads through the write
+    connection would count the plans of the write database, and the
+    number on the panel would be the number of another database.
+    """
+    factory = getattr(ledger, "with_connection", None)
+    if callable(factory):
+        return factory(conn)
+    twin = copy.copy(ledger)
+    try:
+        twin._facts = facts
+        twin._conn = conn
+    except AttributeError as exc:
+        raise RuntimeError(
+            "the capacity ledger cannot be read through another "
+            "connection; the read model would read the write connection "
+            "instead"
+        ) from exc
+    return twin
+
+
 def _stamp(epoch: float) -> str:
     """Return the moment the way the state database writes timestamps."""
     return (
@@ -632,6 +667,7 @@ class PlanSchedulerEngine:
         clock: Optional[Callable[[], float]] = None,
         *,
         conn: Optional[sqlite3.Connection] = None,
+        read_conn: Optional[sqlite3.Connection] = None,
         thread_name: str = THREAD_NAME,
         plans_dir: Optional[Any] = None,
         binder: Optional[Callable[[], EngineParts]] = None,
@@ -655,6 +691,13 @@ class PlanSchedulerEngine:
                 parameter so that a case can move time by hand.
             conn: the connection to write on.  When it is omitted the
                 engine uses the one its collaborators already hold.
+            read_conn: the connection the **read model** reads on.  It
+                is a second connection to the same database: the worker
+                writes on ``conn``, and the panel's document reads on
+                this one, so that the document does not wait for the
+                worker's transaction.  When it is omitted the read
+                model reads on ``conn`` — the behaviour this split
+                replaced.
             thread_name: the name the worker thread carries.
             plans_dir: the directory the plans live in.  The engine
                 reads one file out of it — the plan's own import
@@ -698,6 +741,19 @@ class PlanSchedulerEngine:
         #: the engine was given belongs to whoever made it; a connection
         #: the engine opened is the engine's to give back.
         self._owns_conn = False
+        #: The connection the read model reads on.  ``None`` means the
+        #: read model reads on the write connection.
+        self._read_conn = read_conn
+        #: The read-side twin of the plan facts — the same reader,
+        #: reading on the read connection.
+        self._read_facts: Any = None
+        #: The read-side twin of the capacity ledger — the same ledger,
+        #: answering from the read-side facts.
+        self._read_ledger: Any = None
+        #: Whether the engine took the read connection over.  A
+        #: connection the engine was given belongs to whoever made it;
+        #: a connection the binder opened is the engine's to give back.
+        self._owns_read_conn = False
         #: The switch as the last tick saw it.  ``None`` means "the
         #: scheduler has not said yet", so the first tick says it.
         self._enabled_state: Optional[bool] = None
@@ -711,6 +767,13 @@ class PlanSchedulerEngine:
         self._errors: List[Tuple[str, BaseException]] = []
         self._ticks = 0
         self._next_tick_at = 0.0
+
+        # The read-side twin is built **here**, when the engine is
+        # built, and not on the first read: a twin that were built
+        # lazily could be built from the write connection, and the read
+        # model would be back where it started.
+        if read_conn is not None:
+            self._build_read_twin(read_conn)
 
     # ------------------------------------------------------------------
     # What the caller can see
@@ -813,6 +876,10 @@ class PlanSchedulerEngine:
         that is never returned.  A connection the engine was *given* is
         not the engine's to close — it belongs to whoever made it.
 
+        The same rule holds for the read connection: the one the binder
+        opened is the engine's to give back, and the one the engine was
+        given is the caller's to close.
+
         Args:
             timeout: how long to wait for the worker to finish.
         """
@@ -831,6 +898,16 @@ class PlanSchedulerEngine:
             except Exception:  # noqa: BLE001 — the teardown must not raise
                 log.exception("the scheduler's connection could not be closed")
             self._conn = None
+        if self._owns_read_conn and self._read_conn is not None:
+            try:
+                self._read_conn.close()
+            except Exception:  # noqa: BLE001 — the teardown must not raise
+                log.exception(
+                    "the scheduler's read connection could not be closed"
+                )
+            self._read_conn = None
+            self._read_facts = None
+            self._read_ledger = None
 
     # ------------------------------------------------------------------
     # The recovery
@@ -1488,13 +1565,25 @@ class PlanSchedulerEngine:
         comparator the tick uses, so the panel cannot show one order
         while the scheduler runs another.
 
+        The read model reads through the **read connection** when the
+        engine has one: the panel's document must not wait for the
+        worker's transaction.  The tick keeps the write connection —
+        the tick decides on what it has just written, and the document
+        is the panel's, not the scheduler's.
+
         A scheduler that has never been bound has no state to read:
         it answers with the idle document, which is what the panel
         shows for a scheduler that is not running.
         """
         if not self._bound:
             return build({})
-        return build(self._read_state())
+        return build(
+            self._read_state(
+                conn=self._read_conn,
+                facts=self._read_facts,
+                ledger=self._read_ledger,
+            )
+        )
 
     # ------------------------------------------------------------------
     # The worker
@@ -1526,12 +1615,54 @@ class PlanSchedulerEngine:
         self._commands = parts.commands
         self._sink = parts.sink
         self._conn = parts.conn
+        read_conn = getattr(parts, "read_conn", None)
+        try:
+            if read_conn is not None:
+                self._build_read_twin(read_conn)
+        except Exception as exc:  # noqa: BLE001 — the tick tries again
+            self._record_error("bind", exc)
+            log.exception(
+                "the scheduler could not build its read-side twin"
+            )
+            return False
+        self._read_conn = read_conn
+        self._owns_read_conn = read_conn is not None
         self._bound = True
         self._owns_conn = True
         # The recovery is the worker's first job, and it can only run
         # once the engine knows the world it is recovering.
         self._recover_safely()
         return True
+
+    def _build_read_twin(self, read_conn: sqlite3.Connection) -> None:
+        """Build the read-side twin of the facts and of the ledger.
+
+        The twin reads through the read connection and through nothing
+        else.  A read that quietly fell back to the write connection
+        would put the lock back where this split took it out, and a
+        panel that waits for the worker is a panel that shows nothing
+        while the worker works.
+
+        A collaborator that cannot be read through another connection
+        is refused rather than used as it is: the read model would then
+        be a mixture of two databases, and a mixture is not an answer
+        anybody can act on.
+        """
+        facts = self._facts
+        if facts is not None:
+            factory = getattr(facts, "with_connection", None)
+            if not callable(factory):
+                raise RuntimeError(
+                    "the plan facts cannot be read through another "
+                    "connection; the read model would read the write "
+                    "connection instead"
+                )
+            self._read_facts = factory(read_conn)
+        ledger = self._ledger
+        if ledger is not None and self._read_facts is not None:
+            self._read_ledger = _read_twin_ledger(
+                ledger, self._read_facts, read_conn
+            )
 
     def _may_schedule(self) -> bool:
         """Whether this tick may schedule anything.
@@ -2216,12 +2347,24 @@ class PlanSchedulerEngine:
     # The state
     # ------------------------------------------------------------------
 
-    def _read_state(self) -> Dict[str, Any]:
+    def _read_state(
+        self,
+        conn: Optional[sqlite3.Connection] = None,
+        facts: Any = None,
+        ledger: Any = None,
+    ) -> Dict[str, Any]:
         """Read the state the tick decides on.
 
         Every answer is derived from what is in the database at this
         moment: the plan facts from the reader, the queue and the slots
         from the store.  Nothing is cached between the ticks.
+
+        The connection, the facts and the ledger are the ones the
+        caller reads on.  The tick reads the write connection — it
+        decides on what it has just written — and the read model reads
+        the read connection, so that the panel's document does not wait
+        for the worker's transaction.  A caller that says nothing reads
+        what the engine reads by default: the write connection.
 
         The capacity comes with the word that says where it came from,
         so the read model may show the operator that the number in
@@ -2232,6 +2375,9 @@ class PlanSchedulerEngine:
         see it at all without them.
         """
         now = self._now()
+        conn = self._conn if conn is None else conn
+        facts = self._facts if facts is None else facts
+        ledger = self._ledger if ledger is None else ledger
         waiting = [
             {
                 "plan_id": str(row.get("plan_id") or ""),
@@ -2244,17 +2390,17 @@ class PlanSchedulerEngine:
                 # is the routing layer's business.
                 "phase": row.get("phase"),
             }
-            for row in self._facts.queued_plans()
+            for row in facts.queued_plans()
             if str(row.get("plan_id") or "")
         ]
 
-        capacity, capacity_source = self._capacity_and_source()
+        capacity, capacity_source = self._capacity_and_source(conn=conn)
 
         state: Dict[str, Any] = {
             "now": now,
             "capacity": capacity,
             "capacity_source": capacity_source,
-            "used": self._ledger.used(),
+            "used": ledger.used(),
             "min_runtime_seconds": self._min_runtime(),
             # The tick never interrupts anybody to make room: the
             # convergence above is the only thing that does, and the
@@ -2266,18 +2412,18 @@ class PlanSchedulerEngine:
             "queued": [],
             "queue": [],
             "running": self._running_view(
-                self._store.list_slots(self._conn), now
+                self._store.list_slots(conn), now, facts=facts
             ),
             # The plans parked for quota — the facts' answer.  A parked
             # plan holds no slot and is in no line, so without this the
             # read model could not see the one plan that stopped for
             # want of provider capacity.
-            "parked": self._parked_plans(),
+            "parked": self._parked_plans(facts=facts),
         }
-        self._rebuild_line(state)
+        self._rebuild_line(state, conn=conn, facts=facts, ledger=ledger)
         return state
 
-    def _parked_plans(self) -> List[Dict[str, Any]]:
+    def _parked_plans(self, facts: Any = None) -> List[Dict[str, Any]]:
         """Return the plans parked for quota, or none when the facts cannot say.
 
         The parked set is a fact the tick does not need to admit
@@ -2292,8 +2438,13 @@ class PlanSchedulerEngine:
         The reader is duck-typed on purpose: the engine asks the
         facts what they know, and a fact the reader does not carry is
         not a fact the engine may insist on.
+
+        The facts are the ones the caller reads on: the read model
+        reads the read-side facts, so the parked set it shows is the
+        parked set of the database it reads.
         """
-        reader = getattr(self._facts, "parked_plans", None)
+        source = self._facts if facts is None else facts
+        reader = getattr(source, "parked_plans", None)
         if not callable(reader):
             return []
         try:
@@ -2311,7 +2462,13 @@ class PlanSchedulerEngine:
         except TypeError:
             return []
 
-    def _rebuild_line(self, state: Dict[str, Any]) -> None:
+    def _rebuild_line(
+        self,
+        state: Dict[str, Any],
+        conn: Optional[sqlite3.Connection] = None,
+        facts: Any = None,
+        ledger: Any = None,
+    ) -> None:
         """Rebuild the line from the queue table and the plan facts.
 
         The queue table says **where** the plans stand; the facts say
@@ -2320,18 +2477,45 @@ class PlanSchedulerEngine:
         comparator gives, which is the order the panel shows and the
         order the admission check reads.
 
+        A plan that is waiting **without** a row is in the line as
+        well: it is waiting, and the line is the waiting plans.  Its
+        row is synthesized for the read model — nothing is written
+        here — and it carries the number and the priority the row will
+        hold once the reconcile has landed it, so the line does not
+        move when the rows arrive.
+
+        The queue table, the facts and the ledger are the ones the
+        caller reads on: the tick reads the write connection and the
+        read model reads the read one.
+
         Each row also carries the ``phase`` the plan is in, as the
         facts read it: the line says what each waiting plan is, not
         only that it is waiting.  The value travels as it is — the
         engine does not map it to a label, because a label is the
         routing layer's business.
         """
+        conn = self._conn if conn is None else conn
+        facts = self._facts if facts is None else facts
+        ledger = self._ledger if ledger is None else ledger
+        waiting_rows = list(state.get("waiting", []))
         waiting = {
-            str(row["plan_id"]): row for row in state.get("waiting", [])
+            str(row["plan_id"]): row for row in waiting_rows
         }
         queued: List[Dict[str, Any]] = []
-        for row in self._store.list_queue(self._conn):
+        existing_ids: Set[str] = set()
+        max_seq = 0
+        for row in self._store.list_queue(conn):
             plan_id = str(row.get("plan_id") or "")
+            existing_ids.add(plan_id)
+            # The highest number the table has handed out.  It is read
+            # over the whole table and not only over the plans that
+            # are still waiting: a number that was handed out is not
+            # handed out again, and the reconcile hands the next one
+            # out the same way.
+            try:
+                max_seq = max(max_seq, int(row.get("seq")))
+            except (TypeError, ValueError):
+                pass
             fact = waiting.get(plan_id)
             if fact is None:
                 continue
@@ -2340,6 +2524,9 @@ class PlanSchedulerEngine:
                     "plan_id": plan_id,
                     "priority": int(row.get("priority") or 0),
                     "seq": row.get("seq"),
+                    # The promotion is the table's to record: a plan
+                    # that was never promoted is not promoted now.
+                    "promote_order": row.get("promote_order"),
                     "due": bool(fact.get("due", True)),
                     # The phase the plan is in, as the facts read it
                     # and passed it on.  The engine does not map it to
@@ -2349,24 +2536,132 @@ class PlanSchedulerEngine:
                     # waiting plan is neither paused nor parked.
                     "paused": False,
                     "hitl_pending": bool(
-                        self._facts.has_pending_decision(plan_id)
+                        facts.has_pending_decision(plan_id)
                     ),
                     "workspace_busy": bool(
-                        self._ledger.workspace_busy(
-                            self._facts.workspace_key(plan_id)
+                        ledger.workspace_busy(
+                            facts.workspace_key(plan_id)
                         )
                     ),
                 }
             )
+        queued.extend(
+            self._synthesized_queued_rows(
+                waiting_rows,
+                existing_ids,
+                max_seq,
+                facts=facts,
+                ledger=ledger,
+            )
+        )
         state["queued"] = queued
-        state["queue"] = self._queue_view(state)
+        state["queue"] = self._queue_view(state, conn=conn)
 
-    def _queue_view(self, state: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _synthesized_queued_rows(
+        self,
+        waiting: List[Dict[str, Any]],
+        existing_ids: Set[str],
+        max_seq: int,
+        facts: Any = None,
+        ledger: Any = None,
+    ) -> List[Dict[str, Any]]:
+        """Return the rows the waiting plans do not have yet.
+
+        A plan that is waiting without a queue row is in the line: the
+        line is the plans that are waiting, and the plan was waiting
+        before the table heard of it.  So the read model gives it a row
+        of its own — a **synthesized** one, which lives in the read
+        model and nowhere else.  Nothing here is written: the row is
+        written by the reconcile, in the reconcile's own transaction.
+
+        The rows join the **tail**, in the order the facts give them:
+        the plan that has been waiting longer stands in front.  Their
+        numbers are the numbers the reconcile hands out — the table's
+        highest number plus one, and one more for each row after it —
+        and their priorities are the priorities their rows will carry,
+        so the line the operator is looking at does not move when the
+        rows arrive.
+
+        A plan that has a row of its own is left alone: its row says
+        where it stands, and a number that was handed out is not
+        handed out twice.
+
+        Args:
+            waiting: the plans that are waiting, in the facts' order.
+            existing_ids: the plans that already have a queue row.
+            max_seq: the highest number the queue table has handed out.
+            facts: the facts the caller reads on.
+            ledger: the ledger the caller reads on.
+
+        Returns:
+            One row per waiting plan that has no row of its own, in the
+            waiting order.  Empty when every waiting plan has a row.
+        """
+        facts = self._facts if facts is None else facts
+        ledger = self._ledger if ledger is None else ledger
+        rows: List[Dict[str, Any]] = []
+        seq = int(max_seq)
+        for entry in waiting:
+            plan_id = str(entry.get("plan_id") or "")
+            if not plan_id or plan_id in existing_ids:
+                continue
+            seq += 1
+            # The priority is the one the caller gave the plan, read
+            # out of the plan's own artifact — the number the row will
+            # carry.  The facts have no priority to give for a plan
+            # that has no row: their answer for such a plan is the
+            # default, and a default the row will not carry would move
+            # the plan when the row lands.  A plan that expressed no
+            # intent runs at the ordinary weight, which is what its
+            # row will say as well.
+            intended = self._intended_priority(plan_id)
+            priority = (
+                int(intended)
+                if intended is not None
+                else int(entry.get("priority") or 0)
+            )
+            rows.append(
+                {
+                    "plan_id": plan_id,
+                    "priority": priority,
+                    "seq": seq,
+                    # The promotion is the table's to record: a plan
+                    # that was never promoted is not promoted now.
+                    "promote_order": None,
+                    "due": bool(entry.get("due", True)),
+                    # The phase the plan is in, as the facts read it.
+                    "phase": entry.get("phase"),
+                    # A plan that is in the line is waiting, and a
+                    # waiting plan is neither paused nor parked.
+                    "paused": False,
+                    "hitl_pending": bool(
+                        facts.has_pending_decision(plan_id)
+                    ),
+                    "workspace_busy": bool(
+                        ledger.workspace_busy(
+                            facts.workspace_key(plan_id)
+                        )
+                    ),
+                }
+            )
+        return rows
+
+    def _queue_view(
+        self,
+        state: Dict[str, Any],
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> List[Dict[str, Any]]:
         """The queue as the panel reads it.
 
         The rows come back in the shared comparator's order, and the
         head carries the reason the policy gave for it — the same
         reason the admission check reached.
+
+        The view is built from the **line** — the state the tick
+        decided on — and not from the queue table: the table does not
+        know about a plan that is waiting yet, and a view that read
+        the table would drop the plan the line holds.  The connection
+        is accepted and left alone: the view reads no table at all.
 
         A row the facts do not vouch for is not in the line at all:
         the queue table may still carry a plan whose directory is
@@ -2388,29 +2683,27 @@ class PlanSchedulerEngine:
         routing layer's business and a second mapping here would be a
         second answer to the same question.
         """
-        rows = self._store.list_queue(self._conn)
         verdict = admission_verdict(state)
-        queued = {
-            str(entry.get("plan_id") or ""): entry
-            for entry in state.get("queued", [])
-        }
         view: List[Dict[str, Any]] = []
-        for row in rows:
-            plan_id = str(row.get("plan_id") or "")
-            if plan_id not in queued:
-                continue
-            entry = dict(row)
-            # The phase the plan is in, as the line read it — the
-            # facts' answer, passed on as it is.  The engine does not
-            # map it to a label: the label is the routing layer's job,
-            # and a second mapping here would be a second answer to
-            # the same question.
-            entry["phase"] = queued[plan_id].get("phase")
+        for entry in state.get("queued", []):
+            row = {
+                "plan_id": str(entry.get("plan_id") or ""),
+                "seq": entry.get("seq"),
+                "priority": int(entry.get("priority") or 0),
+                "promote_order": entry.get("promote_order"),
+                "due": bool(entry.get("due", True)),
+                # The phase the plan is in, as the line read it — the
+                # facts' answer, passed on as it is.  The engine does
+                # not map it to a label: the label is the routing
+                # layer's job, and a second mapping here would be a
+                # second answer to the same question.
+                "phase": entry.get("phase"),
+            }
             if not view:
-                entry["reason"] = verdict
+                row["reason"] = verdict
             else:
-                entry["reason"] = self._reason_behind(queued.get(plan_id))
-            view.append(entry)
+                row["reason"] = self._reason_behind(entry)
+            view.append(row)
         return view
 
     def _reason_behind(self, entry: Optional[Dict[str, Any]]) -> str:
@@ -2439,15 +2732,22 @@ class PlanSchedulerEngine:
         self,
         slots: Sequence[Dict[str, Any]],
         now: float,
+        facts: Any = None,
     ) -> List[Dict[str, Any]]:
         """The plans that hold compute, as the policy reads them.
 
         The **facts** say who is working; the slots say when each of
-        them took its slot.  A slot row for a plan that is not working
-        is a reservation the ledger has not reconciled away yet, and it
-        is not a plan that is running: the panel and the eviction rule
-        both talk about the plans that are working, and a plan that
-        has been admitted but has not started yet is neither.
+        them took its slot.  The facts are the ones the caller reads
+        on: the read model hands over its own reader, so the document
+        does not fall back on the write connection and wait for the
+        worker.  A caller that says nothing reads what the engine
+        reads by default — the write-side facts.
+
+        A slot row for a plan that is not working is a reservation
+        the ledger has not reconciled away yet, and it is not a plan
+        that is running: the panel and the eviction rule both talk
+        about the plans that are working, and a plan that has been
+        admitted but has not started yet is neither.
 
         The facts also say when the plan really started, and that
         stamp is passed on as it is.  The slot's moment is the
@@ -2469,6 +2769,7 @@ class PlanSchedulerEngine:
         and not only that it is working.
 
         """
+        facts = self._facts if facts is None else facts
         held: Dict[str, Dict[str, Any]] = {}
         for slot in slots:
             plan_id = str(slot.get("plan_id") or "")
@@ -2481,7 +2782,7 @@ class PlanSchedulerEngine:
             }
 
         running: List[Dict[str, Any]] = []
-        for row in self._facts.active_plans():
+        for row in facts.active_plans():
             plan_id = str(row.get("plan_id") or "")
             if not plan_id:
                 continue
@@ -2810,7 +3111,9 @@ class PlanSchedulerEngine:
         value = getattr(self._config, name, None)
         return default if value is None else value
 
-    def _capacity_override(self) -> Optional[int]:
+    def _capacity_override(
+        self, conn: Optional[sqlite3.Connection] = None
+    ) -> Optional[int]:
         """The capacity override in force, if there is one.
 
         The override is a row in the state database, and it is read
@@ -2818,6 +3121,11 @@ class PlanSchedulerEngine:
         the scheduler runs, so a value kept in the configuration
         snapshot would only take effect after a restart — which is
         exactly what the override is not for.
+
+        The row is read on the connection the caller reads on: the
+        tick reads the write connection and the read model reads the
+        read one, so the number on the panel is the number of the
+        database the panel reads.
 
         A row that does not hold a usable capacity is ignored rather
         than obeyed: the number of plans that may run at the same time
@@ -2833,8 +3141,9 @@ class PlanSchedulerEngine:
             The capacity override in force, or ``None`` when there is
             none to obey.
         """
+        conn = self._conn if conn is None else conn
         try:
-            raw = self._store.get_setting(self._conn, CAPACITY_OVERRIDE_KEY)
+            raw = self._store.get_setting(conn, CAPACITY_OVERRIDE_KEY)
         except Exception as exc:  # noqa: BLE001 — a tick must not die here
             self._record_error("capacity", exc)
             log.warning(
@@ -2851,7 +3160,9 @@ class PlanSchedulerEngine:
             return None
         return value if value >= 0 else None
 
-    def _capacity_and_source(self) -> Tuple[int, str]:
+    def _capacity_and_source(
+        self, conn: Optional[sqlite3.Connection] = None
+    ) -> Tuple[int, str]:
         """How many plans may run, and where that number came from.
 
         The override is read **once**, so the number and the word that
@@ -2865,8 +3176,12 @@ class PlanSchedulerEngine:
         The configured capacity is the fallback: the override wins
         while it is there, and removing it puts the configured capacity
         back.
+
+        The override is read on the connection the caller reads on: the
+        tick reads the write connection and the read model reads the
+        read one.
         """
-        override = self._capacity_override()
+        override = self._capacity_override(conn=conn)
         if override is not None:
             return override, CAPACITY_SOURCE_OVERRIDE
         try:
