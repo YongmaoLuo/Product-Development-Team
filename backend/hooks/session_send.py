@@ -166,6 +166,48 @@ _DEADLINE_LINE = "- **截止时间**：{deadline_at}"
 #: "（未提供）（超时未答时采用）" says nothing twice.
 _DEFAULT_NOTE = "（超时未答时采用）"
 
+# ---------------------------------------------------------------------------
+# Events that are not decisions
+# ---------------------------------------------------------------------------
+
+#: The event name the finishing stage's failure is dispatched under.
+#: It is the same string :mod:`postprocess.notify` writes as its
+#: notification kind, because the dispatcher puts the outlet's event
+#: name at the top level of the body the destination receives.
+EVENT_POSTPROCESS_FAILED = "postprocess_failed"
+
+#: The event name a HITL decision is dispatched under.  Its message is
+#: the decision template, unchanged.
+EVENT_HITL_DECISION_CREATED = "hitl_decision_created"
+
+#: The header of a finishing-stage failure.  It names the plan and
+#: says what the message is about: the finishing stage failed, and a
+#: human has to decide whether to run it again.
+_POSTPROCESS_HEADER = "**⚠️ 收尾失败（待决定是否续跑）** · `{plan_id}`"
+
+#: The items that failed, one per backticked id, joined with "、".
+_POSTPROCESS_ITEMS_LINE = "- **失败项**：{items}"
+
+#: Where the failure context lives — the file a human opens to see
+#: why the stage failed.
+_POSTPROCESS_EVIDENCE_LINE = "- **证据**：`{evidence_path}`"
+
+#: What to do about it.  The message is not a decision to be answered
+#: here: it points at the panel and at the endpoint that resumes a
+#: parked plan, because that is where the decision is made.
+_POSTPROCESS_FOOTER = (
+    "在调度面板的「收尾」分区查看详情并决定是否续跑"
+    "（`POST /api/verification/{plan_id}/postprocess/resume`）。"
+)
+
+#: The header of an event this module has no template for.  The
+#: event's own name is the title, and the plan is beside it.
+_GENERIC_HEADER = "**🔔 {event}** · `{plan_id}`"
+
+#: One field of an event this module has no template for.  The label is
+#: bold and the value is code, like every other line in this module.
+_GENERIC_FIELD_LINE = "- **{key}**：`{value}`"
+
 
 def format_message(event: Mapping[str, Any]) -> str:
     """The message that carries ``event`` to a human.
@@ -224,6 +266,138 @@ def format_message(event: Mapping[str, Any]) -> str:
             _DEADLINE_LINE.format(deadline_at=deadline_at),
         ]
     )
+
+
+def format_event(event: Mapping[str, Any]) -> str:
+    """The message that carries ``event`` to a human, whatever it is.
+
+    :func:`format_message` speaks one language: the HITL decision.
+    The dispatcher, however, delivers more than decisions — a plan's
+    finishing stage can fail, and the failure is delivered through the
+    same route and therefore arrives here as the same kind of event.
+    A message built by :func:`format_message` from such an event would
+    be a decision template with nothing in it: every field a
+    placeholder, and a reader asked to answer a decision that does not
+    exist, while the facts that mattered — which items failed, and
+    where the evidence is — are dropped on the floor.
+
+    So the event's own name decides the wording:
+
+    * ``postprocess_failed`` gets the finishing-stage template;
+    * ``hitl_decision_created`` — and an event that carries no usable
+      event name at all — gets exactly the message
+      :func:`format_message` writes, byte for byte;
+    * anything else gets a generic rendering: the event's name, the
+      plan, and every field of the payload.
+
+    The generic rendering is deliberately never the decision template.
+    An event this module has no template for is still an event with
+    facts in it, and a reader must be able to see them.
+
+    The function never raises, for the same reason
+    :func:`format_message` never raises: it is called on the delivery
+    path, and a delivery that raises is a delivery that never happens.
+
+    Parameters
+    ----------
+    event:
+        The event, as JSON.  Only a mapping is read; anything else is
+        treated as an event with no fields at all.
+
+    Returns
+    -------
+    str
+        The Markdown message.
+    """
+    fields = event if isinstance(event, Mapping) else {}
+
+    name = fields.get("event")
+    if not isinstance(name, str) or not name:
+        return format_message(fields)
+
+    if name == EVENT_POSTPROCESS_FAILED:
+        return _format_postprocess_failed(fields)
+
+    if name == EVENT_HITL_DECISION_CREATED:
+        return format_message(fields)
+
+    return _format_generic(name, fields)
+
+
+def _format_postprocess_failed(fields: Mapping[str, Any]) -> str:
+    """The message for a plan whose finishing stage failed.
+
+    It says three things — which plan, which items failed and where
+    the evidence is — and points at the place where the decision about
+    resuming it is actually made.  It is not a decision message: there
+    is no question to answer and no options to choose between, so the
+    template that asks for one would be a lie.
+    """
+    plan_id = _text(fields.get("plan_id"))
+    evidence_path = _text(fields.get("evidence_path"))
+    items = _postprocess_items(fields.get("failed_items"))
+
+    return "\n".join(
+        [
+            _POSTPROCESS_HEADER.format(plan_id=plan_id),
+            "",
+            _POSTPROCESS_ITEMS_LINE.format(items=items),
+            _POSTPROCESS_EVIDENCE_LINE.format(evidence_path=evidence_path),
+            "",
+            _POSTPROCESS_FOOTER.format(plan_id=plan_id),
+        ]
+    )
+
+
+def _postprocess_items(value: Any) -> str:
+    """The failed items, one per backticked id, joined with "、".
+
+    A missing list and an empty list are the same thing — no item is
+    known to have failed — and both show :data:`PLACEHOLDER` rather
+    than an empty line.  An item that is not text is shown as its
+    string form, so a fact is never dropped.
+    """
+    if not isinstance(value, (list, tuple)) or not value:
+        return PLACEHOLDER
+
+    return "、".join("`{0}`".format(_text(item)) for item in value)
+
+
+def _format_generic(name: str, fields: Mapping[str, Any]) -> str:
+    """The message for an event this module has no template for.
+
+    The event's name is the title, the plan is beside it, and every
+    other field of the payload is a list item.  The fields are shown
+    in the order the payload carries them, because that order is the
+    sender's order and reordering somebody else's fields would be
+    reading them on its behalf.
+    """
+    plan_id = _text(fields.get("plan_id"))
+
+    lines = [_GENERIC_HEADER.format(event=name, plan_id=plan_id), ""]
+    for key, value in fields.items():
+        if key in ("event", "plan_id"):
+            continue
+        lines.append(
+            _GENERIC_FIELD_LINE.format(key=key, value=_generic_value(value))
+        )
+
+    return "\n".join(lines)
+
+
+def _generic_value(value: Any) -> str:
+    """One field of an event with no template, as text.
+
+    A scalar is shown as it is; a list is joined with "、", so the
+    reader sees its members instead of a Python repr.  Anything else
+    falls back to its string form — a fact the reader cannot parse is
+    better than a fact that is missing.
+    """
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return PLACEHOLDER
+        return "、".join(_text(item) for item in value)
+    return _text(value)
 
 
 def _quote_question(question: str) -> str:
@@ -448,7 +622,7 @@ def main(
         return EXIT_NO_BINARY
 
     command = build_command(binary, args.project, args.session)
-    message = format_message(event)
+    message = format_event(event)
 
     try:
         process = subprocess.Popen(command, stdin=subprocess.PIPE)
