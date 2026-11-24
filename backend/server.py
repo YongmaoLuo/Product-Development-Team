@@ -1380,26 +1380,50 @@ def _dryrun_reference() -> Any:
         return None
 
 
-def _release_scheduler_engine(engine: Any, conn: Any) -> None:
+def _close_scheduler_connection(conn: Any, what: str) -> None:
+    """Close one of the scheduler's connections, and never raise.
+
+    The teardown must not raise: a connection that cannot be closed is
+    worth logging, but it is not a reason to take the server down on
+    the way out.
+    """
+    if conn is None:
+        return
+    try:
+        conn.close()
+    except Exception:  # noqa: BLE001 — the teardown must not raise
+        logger.exception("[scheduler] %s could not be closed", what)
+
+
+def _release_scheduler_engine(
+    engine: Any,
+    conn: Any,
+    read_conn: Any = None,
+) -> None:
     """Give back what a half-built engine left behind.
 
     An engine that was constructed but never started has no thread to
     stop; a connection that was opened has to be closed either way —
     a descriptor that is never returned is a descriptor that is never
     given back.
+
+    The **read** connection is given back on the same terms as the write
+    one: the read model reads on a second handle to the same database,
+    and a second handle that is never closed is a second descriptor that
+    is never returned.
     """
     if engine is not None:
         try:
             engine.stop()
         except Exception:  # noqa: BLE001 — the teardown must not raise
             logger.exception("[scheduler] the engine did not stop cleanly")
-    if conn is not None:
-        try:
-            conn.close()
-        except Exception:  # noqa: BLE001 — the teardown must not raise
-            logger.exception(
-                "[scheduler] the engine's connection could not be closed"
-            )
+        # The engine gives back the connections it owns.  A read
+        # connection it still holds after that is given back here.
+        held = getattr(engine, "_read_conn", None)
+        if held is not None:
+            read_conn = held
+    _close_scheduler_connection(read_conn, "the engine's read connection")
+    _close_scheduler_connection(conn, "the engine's connection")
 
 
 def _build_scheduler_engine() -> _SchedulerRuntime:
@@ -1450,11 +1474,25 @@ def _build_scheduler_engine() -> _SchedulerRuntime:
         run, and not before.  A connection that was opened and never
         given back is a file descriptor that is never returned, so a
         failure here closes it again.
+
+        **Two** connections are opened, not one.  The worker writes on
+        ``conn``; the panel's read model reads on ``read_conn`` — a
+        second handle on the **same** database.  A read on the write
+        connection waits for the worker's transaction, so a panel that
+        reads there shows nothing exactly while the worker is busy.
+
+        The read connection is opened **after** the write connection
+        migrated the schema, and it does not migrate it a second time:
+        the schema is a fact about the database, not about one handle on
+        it.
         """
         conn = None
+        read_conn = None
         try:
-            conn = open_db(_state_db_path())
+            db_path = _state_db_path()
+            conn = open_db(db_path)
             migrate(conn)
+            read_conn = open_db(db_path)
             current = config_loader.current()
             store = SqliteSchedulerStore()
             facts = PlanFactsReader(conn, PLANS_DIR, live_plan_ids=_live_plan_ids)
@@ -1482,15 +1520,18 @@ def _build_scheduler_engine() -> _SchedulerRuntime:
                 commands=commands,
                 sink=_scheduler_sink(current, lifecycle, facts, store, conn),
                 conn=conn,
+                read_conn=read_conn,
             )
         except Exception:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:  # noqa: BLE001 — the teardown must not raise
-                    logger.exception(
-                        "[scheduler] the scheduler's connection could not be closed"
-                    )
+            # Whatever was opened is given back: the read connection
+            # first, then the write one.  The failure is re-raised as it
+            # came — the caller's own error is the one that matters.
+            _close_scheduler_connection(
+                read_conn, "the scheduler's read connection"
+            )
+            _close_scheduler_connection(
+                conn, "the scheduler's connection"
+            )
             raise
 
     engine = None
@@ -1576,13 +1617,15 @@ def _stop_scheduler_engine(runtime: _SchedulerRuntime) -> None:
             thread.join(_SCHEDULER_JOIN_TIMEOUT)
         except Exception:  # noqa: BLE001 — the teardown must not raise
             logger.exception("[scheduler] the engine thread could not be joined")
-    if runtime.conn is not None:
-        try:
-            runtime.conn.close()
-        except Exception:  # noqa: BLE001 — the teardown must not raise
-            logger.exception(
-                "[scheduler] the engine's connection could not be closed"
-            )
+    # The engine gives back the connections it owns — the write one and
+    # the read one alike.  A read connection it still holds after that
+    # is given back here: the read model reads on a second handle to the
+    # same database, and a handle that is never closed is a descriptor
+    # that is never returned.
+    _close_scheduler_connection(
+        getattr(engine, "_read_conn", None), "the engine's read connection"
+    )
+    _close_scheduler_connection(runtime.conn, "the engine's connection")
 
 
 #: The directories a temporary file may live in, as this platform spells
