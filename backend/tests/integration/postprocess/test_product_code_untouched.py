@@ -44,7 +44,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
@@ -949,3 +951,272 @@ def test_the_orchestrator_passes_with_a_pre_existing_untracked_file(
     assert report["terminal_status"] == "completed", report["terminal_status"]
     assert entry["verdict"] == "PASS", entry
     assert pre_existing.is_file(), "跑之前就存在的未跟踪文件被弄没了"
+
+
+# ---------------------------------------------------------------------
+# 窄豁免：声明的上游合并（``git merge origin/main``）可以改产品代码
+# ---------------------------------------------------------------------
+
+
+#: 收尾要求书里声明上游合并的那一条命令 —— 逐字匹配。
+UPSTREAM_MERGE: List[str] = ["git", "merge", "origin/main"]
+
+
+def _current_branch(repo: Path) -> str:
+    """当前分支名。"""
+    return _git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
+
+
+def _commit_file(repo: Path, relative: str, content: str, message: str) -> str:
+    """在当前分支上提交一个文件，返回这次提交的 sha。
+
+    Args:
+        repo: 仓的目录。
+        relative: 仓库相对路径。
+        content: 文件内容。
+        message: 提交消息。
+
+    Returns:
+        这次提交的 sha。
+    """
+    target = repo / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "--quiet", "-m", message],
+        check=True,
+        capture_output=True,
+    )
+    return _git(repo, "rev-parse", "HEAD").strip()
+
+
+def _make_upstream_ref(repo: Path) -> None:
+    """在临时仓里造一个 ``origin/main`` —— 含一条改产品代码的提交。
+
+    用远程跟踪 ref（``refs/remotes/origin/main``）而不是本地分支：``git
+    merge origin/main`` 走的就是远程跟踪分支的解析路径。
+
+    上游这一条只**新增**一个产品文件 —— 与基线没有冲突，合并是干净的。
+
+    Args:
+        repo: 仓的目录。
+    """
+    base = _current_branch(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "--quiet", "-b", "upstream-fixture"],
+        check=True,
+        capture_output=True,
+    )
+    sha = _commit_file(repo, "backend/upstream.py", "UPSTREAM = 1\n", "upstream")
+    subprocess.run(
+        ["git", "-C", str(repo), "update-ref", "refs/remotes/origin/main", sha],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "--quiet", base],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _make_conflicting_upstream_ref(repo: Path) -> None:
+    """在临时仓里造一个会**冲突**的 ``origin/main``。
+
+    上游与本地各改一次 ``backend/agent.py`` —— 合起来必然冲突，工作区
+    会留下 ``UU backend/agent.py``。
+
+    Args:
+        repo: 仓的目录。
+    """
+    base = _current_branch(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "--quiet", "-b", "upstream-fixture"],
+        check=True,
+        capture_output=True,
+    )
+    _commit_file(repo, "backend/agent.py", "VALUE = 2\n", "upstream edits agent")
+    subprocess.run(
+        ["git", "-C", str(repo), "update-ref", "refs/remotes/origin/main", "HEAD"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "--quiet", base],
+        check=True,
+        capture_output=True,
+    )
+    _commit_file(repo, "backend/agent.py", "VALUE = 3\n", "local edits agent")
+
+
+def _make_feature_branch(repo: Path) -> None:
+    """在临时仓里造一个别的分支 ``feature/x`` —— 它也改产品代码。
+
+    Args:
+        repo: 仓的目录。
+    """
+    base = _current_branch(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "--quiet", "-b", "feature/x"],
+        check=True,
+        capture_output=True,
+    )
+    _commit_file(repo, "backend/agent.py", "VALUE = 9\n", "feature edits agent")
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "--quiet", base],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _merge(repo: Path, ref: str) -> subprocess.CompletedProcess:
+    """在仓里真的跑一次 ``git merge``。
+
+    合并不带 ``--no-edit`` —— 命令逐字就是 ``git merge {ref}``；编辑器
+    用环境变量按掉，免得在无终端的环境里卡住。
+
+    Args:
+        repo: 仓的目录。
+        ref: 要合的 ref。
+
+    Returns:
+        完成的进程结果（合并冲突时返回码非零）。
+    """
+    environment = dict(os.environ)
+    environment["GIT_MERGE_AUTOEDIT"] = "no"
+    environment["GIT_EDITOR"] = "true"
+    return subprocess.run(
+        ["git", "-C", str(repo), "merge", ref],
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+
+def test_an_upstream_merge_may_change_product_code(tmp_path):
+    """声明的上游合并（``git merge origin/main``）改了产品代码 —— 不抛。
+
+    收尾要求书的第一条就是合并上游；上游的改动必然落在产品代码路径下，
+    所以这一条必须豁免，否则每次收尾都判越界、整轮停 ``postprocess_failed``。
+    """
+    repo = _make_repo(tmp_path / "repo")
+    _make_upstream_ref(repo)
+    item = _item("merge-upstream", UPSTREAM_MERGE)
+
+    with product_diff_guard(item, repo=repo):
+        merged = _merge(repo, "origin/main")
+
+    assert merged.returncode == 0, merged.stdout + merged.stderr
+    assert (repo / "backend" / "upstream.py").is_file(), "合并没把上游内容带进来"
+
+
+def test_a_conflicted_upstream_merge_is_still_a_violation(tmp_path):
+    """冲突未完成的上游合并 —— 仍然判红。
+
+    豁免只针对「一次干净完成的合并」：冲突留下的 ``UU`` 状态是 porcelain
+    改动，第 1 条判据照样抓住它。
+    """
+    repo = _make_repo(tmp_path / "repo")
+    _make_conflicting_upstream_ref(repo)
+    item = _item("merge-upstream", UPSTREAM_MERGE)
+
+    with pytest.raises(ProductCodeModified) as excinfo:
+        with product_diff_guard(item, repo=repo):
+            merged = _merge(repo, "origin/main")
+
+    assert merged.returncode != 0, "这一条的前提是合并真的失败了"
+    assert "backend/agent.py" in excinfo.value.paths, excinfo.value.paths
+
+
+def test_a_merge_of_another_ref_is_still_a_violation(tmp_path):
+    """合并别的 ref（``git merge feature/x``）改了产品代码 —— 仍然判红。
+
+    豁免是逐字匹配 ``git merge origin/main`` 的窄豁免，不是「凡是 merge
+    都放行」。
+    """
+    repo = _make_repo(tmp_path / "repo")
+    _make_feature_branch(repo)
+    item = _item("merge-feature", ["git", "merge", "feature/x"])
+
+    with pytest.raises(ProductCodeModified) as excinfo:
+        with product_diff_guard(item, repo=repo):
+            merged = _merge(repo, "feature/x")
+
+    assert merged.returncode == 0, merged.stdout + merged.stderr
+    assert "backend/agent.py" in excinfo.value.paths, excinfo.value.paths
+
+
+def test_a_non_merge_item_writing_product_code_is_still_a_violation(tmp_path):
+    """不是合并的条目写下产品代码 —— 仍然判红。
+
+    与已有的 ``test_modification_outside_scope_fails_item`` 同一件事，
+    区别只在这里的命令是 ``python -c ...``：豁免的判据是「是不是那一条
+    上游合并」，别的命令一律不豁免。
+    """
+    repo = _make_repo(tmp_path / "repo")
+    script = "open('backend/x.py', 'w').write('X = 1\\n')"
+    item = _item("rewrite", ["python", "-c", script])
+
+    with pytest.raises(ProductCodeModified) as excinfo:
+        with product_diff_guard(item, repo=repo):
+            subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=str(repo),
+                check=True,
+                capture_output=True,
+            )
+
+    assert "backend/x.py" in excinfo.value.paths, excinfo.value.paths
+
+
+def test_an_upstream_merge_followed_by_a_hand_edit_is_still_a_violation(tmp_path):
+    """上游合并之后又手工改了产品文件 —— 仍然判红。
+
+    合并本身干净完成（porcelain 为空），但合并之后的手工改动留下了
+    porcelain 改动 —— 第 1 条判据抓住它，豁免放不住它。
+    """
+    repo = _make_repo(tmp_path / "repo")
+    _make_upstream_ref(repo)
+    item = _item("merge-upstream", UPSTREAM_MERGE)
+
+    with pytest.raises(ProductCodeModified) as excinfo:
+        with product_diff_guard(item, repo=repo):
+            merged = _merge(repo, "origin/main")
+            assert merged.returncode == 0, merged.stdout + merged.stderr
+            (repo / "backend" / "upstream.py").write_text(
+                "HAND EDIT = 1\n", encoding="utf-8"
+            )
+
+    assert "backend/upstream.py" in excinfo.value.paths, excinfo.value.paths
+
+
+def test_the_orchestrator_passes_an_upstream_merge_item(
+    tmp_path: Path,
+    plan_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """生产入口上：收尾要求书里那一条上游合并判 PASS。
+
+    真的 git、真的临时仓、真的编排器、真的执行器（不注入桩）—— 豁免
+    是在生产路径上生效的，不只是守卫单测里成立。
+    """
+    repo = _make_repo(tmp_path / "repo")
+    _make_upstream_ref(repo)
+    monkeypatch.setenv("GIT_MERGE_AUTOEDIT", "no")
+    monkeypatch.setenv("GIT_EDITOR", "true")
+    write_book(plan_dir, [book_item("merge-upstream", command=UPSTREAM_MERGE)])
+    executor = CommandRunner(freeze(load_spec(plan_dir)), workspace=repo)
+    orchestrator = PostProcessOrchestrator(
+        PLAN_ID,
+        plan_dir=plan_dir,
+        executor=executor,
+        sink=FakeNotifier(),
+    )
+
+    report = orchestrator.start()
+
+    entry = next(e for e in report["items"] if e["id"] == "merge-upstream")
+    assert report["terminal_status"] == "completed", report["terminal_status"]
+    assert entry["verdict"] == "PASS", entry
+    assert (repo / "backend" / "upstream.py").is_file(), "合并没把上游内容带进来"

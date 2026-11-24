@@ -102,6 +102,7 @@ __all__ = [
     "MONEY_MARKERS",
     "PRODUCT_CODE_PATHS",
     "PROTECTED_BRANCHES",
+    "UPSTREAM_MERGE_COMMAND",
     "CommandRejected",
     "CommandRunner",
     "NeedsApproval",
@@ -172,6 +173,17 @@ PRODUCT_PATHS_FILE: str = ".pdt/product_paths"
 
 #: 收尾产物的根目录 —— 计划目录 ``plans/{id}/`` 下的产物允许写。
 FINISHING_ARTIFACT_ROOT: str = "plans"
+
+#: 收尾要求书里声明的**上游合并**命令 —— 逐字匹配，不做宽判据。
+#:
+#: 这一条命令（``git merge origin/main``）按定义就会把上游的改动带进
+#: 工作区，而上游的改动里有产品代码 —— 所以「产品代码零改动」对它没有
+#: 意义：这不是条目改了产品代码，是条目把上游合进来了。
+#:
+#: 刻意**逐字匹配**：``git merge feature/x``、``git merge origin/main
+#: --no-ff``、``git -c x=y merge origin/main`` 都不算 —— 那些不是
+#: 「合上游主干的这一条」。
+UPSTREAM_MERGE_COMMAND: Tuple[str, ...] = ("git", "merge", "origin/main")
 
 
 class CommandRejected(Exception):
@@ -875,6 +887,8 @@ class _WorkingTree:
         self,
         before: "_WorkingTree",
         allowed: Sequence[str],
+        *,
+        skip_product_hashes: bool = False,
     ) -> List[str]:
         """这段时间里被碰到的越界路径。
 
@@ -904,6 +918,13 @@ class _WorkingTree:
         Args:
             before: 条目跑之前的状态。
             allowed: 允许改动的路径前缀（收尾产物目录）。
+            skip_product_hashes: 跳过第 2 条判据（产品代码路径下文件的
+                sha256 比对）。只给「声明的上游合并」用：干净完成的
+                ``git merge origin/main`` 会把上游的内容带进产品代码路径
+                下的文件 —— 那是上游的改动，不是条目自己改的。
+                **第 1 条判据（porcelain 越界路径）不受影响**：一次干净
+                完成的合并不留 porcelain 改动；合并冲突未完成、或合并
+                之后又手工改了文件，都会留下 porcelain 改动，照样判红。
 
         Returns:
             越界路径，已排序去重；没有越界时是空列表。
@@ -917,6 +938,8 @@ class _WorkingTree:
             and not _within(path, allowed)
             and (path in tracked_any or _protected_new_path(path, allowed))
         ]
+        if skip_product_hashes:
+            return sorted(set(out_of_scope))
         rewritten = [
             path
             for path, digest in self.hashes.items()
@@ -945,6 +968,11 @@ def product_diff_guard(
     —— 包括未跟踪文件 —— 就是越界，于是抛 :class:`ProductCodeModified`，
     编排器据此判该条 FAIL、停止收尾、通知人工。剩下的条目不再执行。
 
+    **窄豁免**：条目若正是 ``git merge origin/main``（逐字匹配，见
+    :data:`UPSTREAM_MERGE_COMMAND`），则跳过产品代码 sha256 那一判据 ——
+    合入上游必然会改动产品代码路径下的文件，那是上游的改动。porcelain
+    那一判据原样保留：冲突未完成的合并、合并之后的手工改动照样判红。
+
     Args:
         item: 要求书条目 —— 它的 id 进异常消息，指得回是哪一条越界。
         repo: 被校验的仓库；不给就是当前工作目录。
@@ -963,16 +991,57 @@ def product_diff_guard(
     root = _repository_root(repo)
     allowed = _allowed_prefixes(plan_id)
     before = _WorkingTree.capture(root)
+    # 「声明的上游合并」豁免第 2 条判据（产品代码哈希）。豁免**只**针对
+    # 一次干净完成的 ``git merge origin/main``：它把上游的内容带进工作区，
+    # 那是上游的改动，不是条目改的。第 1 条判据（porcelain 越界路径）
+    # 原样保留 —— 合并冲突未完成、或者合并之后又手工改了文件，都会留下
+    # porcelain 改动，照样判红。
+    skip_product_hashes = _is_upstream_merge(item)
 
     try:
         yield
     except BaseException as failure:
         # 条目自己失败时，它自己的异常更有信息量 —— 但产品代码被改过这
         # 一事实不能丢，所以两条一起报：守卫的异常从条目那个异常派生。
-        _raise_if_modified(root, before, allowed, item_id, cause=failure)
+        _raise_if_modified(
+            root,
+            before,
+            allowed,
+            item_id,
+            cause=failure,
+            skip_product_hashes=skip_product_hashes,
+        )
         raise
 
-    _raise_if_modified(root, before, allowed, item_id)
+    _raise_if_modified(
+        root, before, allowed, item_id, skip_product_hashes=skip_product_hashes
+    )
+
+
+def _is_upstream_merge(item: Any) -> bool:
+    """这一条是不是「声明的上游合并」。
+
+    判据是**精确 argv 匹配** :data:`UPSTREAM_MERGE_COMMAND`
+    （``["git", "merge", "origin/main"]``）—— 不是「命令里含 merge 字样」。
+    含 merge 字样的命令多得很（``git merge feature/x``、
+    ``git merge origin/main --no-ff``），那些不是「合上游主干的这一条」。
+
+    条目的形状可以是 dataclass（``SpecItem``）也可以是映射 —— 两种都认。
+
+    Args:
+        item: 要求书条目。
+
+    Returns:
+        ``True`` 表示这一条就是那一条上游合并命令。
+    """
+    command = _field(item, "command")
+    if command is None or isinstance(command, (str, bytes)):
+        return False
+    try:
+        argv = tuple(str(token) for token in command)
+    except TypeError:
+        return False
+    return argv == UPSTREAM_MERGE_COMMAND
 
 
 def _raise_if_modified(
@@ -981,6 +1050,8 @@ def _raise_if_modified(
     allowed: Sequence[str],
     item_id: str,
     cause: Optional[BaseException] = None,
+    *,
+    skip_product_hashes: bool = False,
 ) -> None:
     """条目跑完之后，工作区被改了就抛。
 
@@ -990,12 +1061,16 @@ def _raise_if_modified(
         allowed: 允许改动的路径前缀。
         item_id: 条目 id —— 进异常消息。
         cause: 条目自己的异常（有的话，守卫的异常从它派生）。
+        skip_product_hashes: 跳过产品代码哈希判据 —— 只给声明的上游合并
+            用，语义见 :meth:`_WorkingTree.touched`。
 
     Raises:
         ProductCodeModified: 出现了越界改动。
     """
     after = _WorkingTree.capture(root)
-    touched = after.touched(before, allowed)
+    touched = after.touched(
+        before, allowed, skip_product_hashes=skip_product_hashes
+    )
     if not touched:
         return
     message = f"item {item_id!r} touched {', '.join(touched)}"
