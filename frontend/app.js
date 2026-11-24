@@ -2855,6 +2855,29 @@ function schedulerSectionHtml(section) {
         .map((line) => `<span class="scheduler-detail-text">${escapeHtml(line)}</span>`)
         .join("");
 
+    // The failure review: what went wrong with the plan, and what to
+    // do about it.  It is drawn as a **foldable** block — the operator
+    // opens it when they want to read the analysis, and the card keeps
+    // the shape it had when they do not.
+    //
+    // The wording is the server's own — the same paragraph the
+    // announcement carried — so it is escaped on the way in, like every
+    // other value this renderer draws.  The block is drawn with the
+    // styles the other sections already use, and it says which kind it
+    // is the way every other section says it.
+    if (kind === "failure_review") {
+        const title = data.title ? String(data.title) : "失败分析";
+        const problem = data.problem ? String(data.problem) : "";
+        const problemLine = `<p class="scheduler-detail-text">问题：${escapeHtml(problem)}</p>`;
+        const suggestion = data.suggestion ? String(data.suggestion) : "";
+        const suggestionLine = `<p class="scheduler-detail-text">建议：${escapeHtml(suggestion)}</p>`;
+        return `<details data-section="failure_review">` +
+            `<summary class="scheduler-detail-section-title">${escapeHtml(title)}</summary>` +
+            problemLine +
+            suggestionLine +
+            `</details>`;
+    }
+
     // The status header: the plan's own title, its id, the phase it
     // is in, and how long the run has been going.  The colour is the
     // backend's — the panel does not decide what a plan's colour is.
@@ -3468,6 +3491,7 @@ function renderSchedulerRunning(snapshot) {
 const SCHEDULER_WAIT_TYPE_TEXT = {
     human: "人工",
     external: "外部",
+    failure_review: "失败复盘",
 };
 
 /** How much time 延长 pushes a wait's deadline out by.
@@ -3558,8 +3582,43 @@ function renderSchedulerWaiting(snapshot) {
             const itemId = item.item_id ? String(item.item_id) : "";
             const question =
                 item.question === null || item.question === undefined ? "" : String(item.question);
+            // A wait that is no longer pending cannot be pushed out.
+            // The server refuses such an extension with a conflict,
+            // so the button says so before the operator presses it.
+            const extendable = item.extendable !== false;
+            // A **failure review** wait is not one of the scheduler's
+            // own durable waits: it has no deadline to push out and no
+            // wait to terminate.  Offering 延长 / 终止 for it would
+            // offer a command the server has no such wait for.
+            const isFailureReview = item.wait_type === "failure_review";
+            // A wait somebody has to answer: a **human** wait, and the
+            // failure review's own question.  An external wait is
+            // rechecked by the system, and offering an answer for it
+            // would be an answer to nobody.
+            const answerable = item.wait_type === "human" || item.wait_type === "failure_review";
+            const extendTitle = `延长 ${SCHEDULER_WAIT_EXTEND_SECONDS / 3600} 小时`;
 
-            const buttons = schedulerWaitingActions(item);
+            const buttons = [];
+            if (item.wait_type !== "failure_review") {
+                // The scheduler's own two operations, drawn here next to
+                // the guard that keeps them off a failure review row:
+                // they act on the scheduler's own durable wait records,
+                // and a failure review has no such record.  The answer
+                // below is the shared helper's — the waiting table and
+                // the finishing block draw the same row, and a second
+                // copy of that markup would be a second answer to
+                // "what can I do about this question".
+                buttons.push(`<button class="btn btn-outline scheduler-action scheduler-waiting-action" data-action="extend" data-plan="${escapeHtml(planId)}" data-item="${escapeHtml(itemId)}" title="${escapeHtml(extendTitle)}"${extendable ? "" : " disabled"}>延长</button>`);
+                buttons.push(`<button class="btn btn-outline scheduler-action scheduler-waiting-action" data-action="terminate" data-plan="${escapeHtml(planId)}" data-item="${escapeHtml(itemId)}">终止</button>`);
+            }
+            if (answerable) {
+                // A failure review row's item_id **is** the decision id,
+                // so the row hands it to the answer path directly; an
+                // ordinary human wait's item_id is not a decision id,
+                // and there the answer path looks the decision up.
+                const decision = isFailureReview ? ` data-decision="${escapeHtml(itemId)}"` : "";
+                buttons.push(schedulerWaitingActions(item, { answerOnly: true, decision }));
+            }
 
             return `<tr data-plan-id="${escapeHtml(planId)}" data-item-id="${escapeHtml(itemId)}">
                 <td>${escapeHtml(planId || "—")}</td>
@@ -3586,8 +3645,19 @@ function renderSchedulerWaiting(snapshot) {
     row, and they draw the **same** three operations: a second copy of
     this markup would be a second answer to "what can I do about this
     question", and the two could drift apart without anybody noticing.
- */
-function schedulerWaitingActions(item) {
+
+    ``options`` narrows what one call draws:
+
+    * ``answerOnly`` — draw the answer and nothing else.  The waiting
+      table draws 延长 / 终止 itself, because the guard that keeps them
+      off a **failure review** row belongs with the row that carries
+      the wait type.
+    * ``decision`` — the ``data-decision`` attribute the answer
+      carries.  A failure review row's ``item_id`` **is** the HITL
+      decision id, and the row hands it to the answer path directly.
+    */
+function schedulerWaitingActions(item, options) {
+    const opts = options || {};
     const wait = item || {};
     const planId = wait.plan_id ? String(wait.plan_id) : "";
     const itemId = wait.item_id ? String(wait.item_id) : "";
@@ -3595,19 +3665,26 @@ function schedulerWaitingActions(item) {
     // The server refuses such an extension with a conflict,
     // so the button says so before the operator presses it.
     const extendable = wait.extendable !== false;
-    // Only a **human** wait has somebody to answer it: an
-    // external wait is rechecked by the system, and offering
-    // an answer for it would be an answer to nobody.
-    const answerable = wait.wait_type === "human";
+    // A **failure review** wait is not one of the scheduler's own
+    // durable waits: it has no deadline to push out and no wait to
+    // terminate, so it is neither extended nor terminated.
+    const isFailureReview = wait.wait_type === "failure_review";
+    // A wait somebody has to answer: a **human** wait, and the failure
+    // review's own question.  An external wait is rechecked by the
+    // system, and offering an answer for it would be an answer to
+    // nobody.
+    const answerable = wait.wait_type === "human" || wait.wait_type === "failure_review";
     const extendTitle = `延长 ${SCHEDULER_WAIT_EXTEND_SECONDS / 3600} 小时`;
 
-    const buttons = [
-        `<button class="btn btn-outline scheduler-action scheduler-waiting-action" data-action="extend" data-plan="${escapeHtml(planId)}" data-item="${escapeHtml(itemId)}" title="${escapeHtml(extendTitle)}"${extendable ? "" : " disabled"}>延长</button>`,
-        `<button class="btn btn-outline scheduler-action scheduler-waiting-action" data-action="terminate" data-plan="${escapeHtml(planId)}" data-item="${escapeHtml(itemId)}">终止</button>`,
-    ];
+    const buttons = [];
+    if (!opts.answerOnly && !isFailureReview) {
+        buttons.push(`<button class="btn btn-outline scheduler-action scheduler-waiting-action" data-action="extend" data-plan="${escapeHtml(planId)}" data-item="${escapeHtml(itemId)}" title="${escapeHtml(extendTitle)}"${extendable ? "" : " disabled"}>延长</button>`);
+        buttons.push(`<button class="btn btn-outline scheduler-action scheduler-waiting-action" data-action="terminate" data-plan="${escapeHtml(planId)}" data-item="${escapeHtml(itemId)}">终止</button>`);
+    }
     if (answerable) {
-        buttons.push(`<input class="scheduler-waiting-answer" type="text" placeholder="回答" data-plan="${escapeHtml(planId)}" data-item="${escapeHtml(itemId)}" />`);
-        buttons.push(`<button class="btn btn-outline scheduler-action scheduler-waiting-action" data-action="answer" data-plan="${escapeHtml(planId)}" data-item="${escapeHtml(itemId)}">回答</button>`);
+        const decision = opts.decision || "";
+        buttons.push(`<input class="scheduler-waiting-answer" type="text" placeholder="回答" data-plan="${escapeHtml(planId)}" data-item="${escapeHtml(itemId)}"${decision} />`);
+        buttons.push(`<button class="btn btn-outline scheduler-action scheduler-waiting-action" data-action="answer" data-plan="${escapeHtml(planId)}" data-item="${escapeHtml(itemId)}"${decision}>回答</button>`);
     }
 
     return buttons.join(" ");
@@ -4347,10 +4424,15 @@ async function schedulerWaitDecisionId(planId, itemId) {
     The answer is the operator's own text.  The HITL route stores the
     option as it was given — which of the offered options it is is
     not the route's business to decide — so what is typed here is
-    what is written down. */
-async function schedulerAnswerWait(planId, itemId, option) {
+    what is written down.
+
+    ``decisionIdHint`` is the decision id the waiting row already
+    carries.  A failure review row's ``item_id`` **is** that id, so
+    the answer goes straight to it; a row whose id is not a decision
+    id passes no hint and the decision is looked up as before. */
+async function schedulerAnswerWait(planId, itemId, option, decisionIdHint) {
     try {
-        const decisionId = await schedulerWaitDecisionId(planId, itemId);
+        const decisionId = decisionIdHint || await schedulerWaitDecisionId(planId, itemId);
         if (!decisionId) {
             throw new Error("该等待没有可回答的人工决策");
         }
@@ -4385,8 +4467,15 @@ function schedulerWaitingAnswerText(planId, itemId, scope) {
     return match ? String(match.value || "").trim() : "";
 }
 
-/** Carry out the action a button asks for. */
-async function schedulerRunAction(action, planId, itemId, scope) {
+/** Carry out the action a button asks for.
+
+    ``scope`` is the row the button is in: the answer is read out of
+    that row, not out of the first row that happens to carry the same
+    plan and item.  ``button`` is the button that was pressed.  The
+    answer action needs the decision id the waiting row carried on
+    that button, so the button comes along instead of a fifth string
+    the caller would have to read out of it. */
+async function schedulerRunAction(action, planId, itemId, scope, button) {
     try {
         if (action === "promote") {
             await schedulerPromote(planId);
@@ -4408,7 +4497,12 @@ async function schedulerRunAction(action, planId, itemId, scope) {
                 renderSchedulerError(new Error("请先填写回答内容"));
                 return;
             }
-            await schedulerAnswerWait(planId, itemId, option);
+            // The clicked button carries the decision id the waiting
+            // row put on it — a failure review row's id **is** the
+            // decision's id.  An ordinary row carries none, and the
+            // answer path looks the decision up by itself.
+            const decisionIdHint = button && button.dataset ? button.dataset.decision || "" : "";
+            await schedulerAnswerWait(planId, itemId, option, decisionIdHint);
         }
     } catch {
         // The failure is already on screen in the action-result box.
@@ -4434,6 +4528,7 @@ function bindSchedulerActions() {
             button.dataset.plan,
             button.dataset.item,
             scope,
+            button,
         );
     });
 }

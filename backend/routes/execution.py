@@ -97,6 +97,14 @@ from log_guardian import spawn_guardian
 # cannot answer differently about the same plan.
 from plan_status import normalize_exec_status
 
+# The failure review — the question a human is asked when a run ends in
+# a terminal failure.  It is imported at module level and reached through
+# its module object, so the route calls ``failure_review.announce_failure``
+# and a test can swap the implementation out from under it.  The module
+# imports neither ``server`` nor ``routes.*``, so this import cannot
+# become a cycle.
+import failure_review
+
 # The plan's mode — "production" or "test" — has to reach the executor
 # subprocess, which is a *different process* and cannot see the plan's
 # flags.  It travels in the environment (``PDT_PLAN_MODE``).
@@ -2657,6 +2665,40 @@ def _memory_verdict(plan_id: str) -> Tuple[Optional[str], Optional[str]]:
     return (state.get("status"), state.get("stop_reason"))
 
 
+def _watchdog_may_judge(plan_id: str) -> bool:
+    """Whether the watchdog may judge this run's executor dead.
+
+    The watchdog judges liveness with ``os.kill(pid, 0)``, and that
+    probe cannot tell a process that has just died from a process that
+    is gone: a child that has exited but has not been reaped yet is
+    already invisible to it.  So the probe answers "gone" while the
+    parent — the thread that holds the handle and is waiting for the
+    exit status — is a moment away from learning *how* the executor
+    died.
+
+    The parent is the only party that knows the exit status, and the
+    exit status is the fact the crash forensics exist to keep ("the
+    executor was killed by signal 9", not "the process died
+    unexpectedly").  Worse, the parent's own crash branch is skipped
+    once the watchdog has judged: it finds the status already settled
+    and leaves the vague reason standing.  So the watchdog stands down
+    while the handle has not learned the exit status yet — the
+    placeholder it would write would overwrite the precise verdict.
+
+    A run with no handle in this process (a run recovered after a
+    restart, or one this process never started) is supervised by
+    nobody: there the watchdog is the only judge there is, and it
+    judges.
+    """
+    state = _server._execution_state.get(plan_id) or {}
+    process = state.get("process")
+    if process is None:
+        return True
+    # ``Popen.returncode`` is set when the parent reaps the child.
+    # Until then the parent is still waiting for the exit status.
+    return getattr(process, "returncode", None) is not None
+
+
 def _adopt_row_verdict(plan_id: str, row: Optional[Dict[str, Any]]) -> None:
     """Make this process's memory agree with the row's verdict.
 
@@ -3044,6 +3086,97 @@ def _judge_process_dead(
     return True
 
 
+def _write_failed_phase(plan_dir: Path, *, force: bool = False) -> None:
+    """Stamp the plan's terminal phase — ``failed``.
+
+    ``force=True`` overwrites whatever phase the plan is in: a plan that
+    was still ``ready`` when the server went down has no legal
+    transition into ``failed``, and the run is over either way.
+    ``force=False`` asks for the legal transition and accepts that a
+    plan already in a terminal phase keeps it — the row stays the
+    authority about the run.
+
+    A phase write that fails is not a failed verdict: the memory and
+    the row already carry it.
+    """
+    try:
+        ps = _server.PlanState(plan_dir)
+        if force:
+            if ps.get_current_phase() not in _server._TERMINAL_PHASES:
+                ps.force_set_phase("failed")
+            return
+        ps.transition_to("failed")
+    except ValueError:
+        # The plan is already in a terminal phase (e.g. from a previous
+        # interrupted run); the execution status is still authoritative
+        # through the row.
+        pass
+    except Exception:  # noqa: BLE001 — a failed phase write is not a failed verdict
+        pass
+
+
+def _write_failed_row(
+    plan_id: str,
+    stop_reason: Optional[str] = None,
+    *,
+    create_if_missing: bool = False,
+) -> None:
+    """Write the terminal failure to the row — the status and the reason.
+
+    The row is the run's durable verdict.  It is written **after** the
+    phase write and after this process's memory carries the reason, so a
+    reader that has seen ``failed`` can read the reason and the phase
+    that belong to it.
+
+    ``stop_reason`` is written only when the caller has one: a caller
+    with no reason to report leaves the column exactly as it found it.
+
+    ``create_if_missing=True`` creates the row when there is none — the
+    spawn-failure branch runs before the row was ever written, and a
+    failed run that leaves no trace in SQLite is a failure nobody can
+    read.
+
+    Never raises: a row that cannot be written is a lost fact, not a
+    failed verdict.
+    """
+    from state_machine.db.connection import open as open_db
+    from state_machine.db.schema import migrate
+    from state_machine.repositories.execution_repository import (
+        ExecutionRepository,
+        PlanNotFoundError as ExecPlanNotFoundError,
+    )
+
+    try:
+        persist_conn = open_db(_server._state_db_path())
+        try:
+            migrate(persist_conn)
+            repository = ExecutionRepository(persist_conn)
+            if create_if_missing:
+                repository.update_fields(
+                    plan_id,
+                    create_if_missing=True,
+                    exec_status="failed",
+                    stop_reason=stop_reason,
+                    # The executor never came up, so there is no pid to
+                    # keep.  A stale pid left on a row that says
+                    # ``failed`` reads as a live execution to every
+                    # "is this execution alive?" reader — the same ghost
+                    # the terminal-status rule forbids (accident B,
+                    # 2026-10-23).
+                    exec_pid=None,
+                )
+            else:
+                repository.update_status(
+                    plan_id,
+                    "failed",
+                    stop_reason=stop_reason,
+                )
+        finally:
+            persist_conn.close()
+    except ExecPlanNotFoundError:
+        pass
+
+
 def _mark_failed_with_reason(
     plan_id: str,
     stop_reason: str,
@@ -3098,12 +3231,6 @@ def _mark_failed_with_reason(
     lost on the floor — the row would stay ``running`` for ever, and an
     execution that had already died would read as one still going.
     """
-    from state_machine.db.connection import open as open_db
-    from state_machine.db.schema import migrate
-    from state_machine.repositories.execution_repository import (
-        ExecutionRepository,
-        PlanNotFoundError as ExecPlanNotFoundError,
-    )
     from verification_loop import _reap_orphaned_in_progress_tasks
 
     lock = _server._execution_locks.setdefault(plan_id, threading.Lock())
@@ -3125,29 +3252,17 @@ def _mark_failed_with_reason(
 
     plan_dir = _server._plan_dir(plan_id)
     if plan_dir.exists():
-        try:
-            ps = _server.PlanState(plan_dir)
-            if ps.get_current_phase() not in _server._TERMINAL_PHASES:
-                # Recovery context: override the normal transition
-                # rules — a plan may still be in ``ready`` if the
-                # server went down between the start and the crash.
-                ps.force_set_phase("failed")
-        except Exception:  # noqa: BLE001 — a failed phase write is not a failed verdict
-            pass
+        _write_failed_phase(plan_dir, force=True)
 
-    try:
-        persist_conn = open_db(_server._state_db_path())
-        try:
-            migrate(persist_conn)
-            ExecutionRepository(persist_conn).update_status(
-                plan_id,
-                "failed",
-                stop_reason=stop_reason,
-            )
-        finally:
-            persist_conn.close()
-    except ExecPlanNotFoundError:
-        pass
+    _write_failed_row(plan_id, stop_reason)
+
+    # The run is over: announce the failure to a human.  The
+    # announcement is a side path — it never raises, and it comes after
+    # the terminal writes (memory, phase, row), so it can neither delay
+    # nor change them.
+    failure_review.announce_failure(
+        plan_id, plan_dir=plan_dir, stop_reason=stop_reason,
+    )
 
 
 def _judge_executor_dead(
@@ -4410,40 +4525,29 @@ def start_execution(
         _server.logger.exception(
             "subprocess.Popen failed for plan %s: %s", plan_id, exc
         )
+        # The executor never came up: that is a terminal failure.
+        #
+        # 2026-09-13: the row is written with ``create_if_missing=True``
+        # (same rationale as the Step-3 persist below): when spawn fails,
+        # Step 3 never ran, so no ``plan_execution`` row exists and the
+        # ``update_status`` call used here raised ``ExecPlanNotFoundError``
+        # and silently persisted nothing — the failed run left zero trace
+        # in SQLite. ``stop_reason`` is persisted too since this branch
+        # creates the row fresh.
         state["status"] = "failed"
         state["stop_reason"] = "process_died_unexpectedly"
         state["ended_at"] = datetime.now().isoformat()
-        # 2026-09-13: use ``create_if_missing=True`` (same rationale as the
-        # Step-3 persist below): when spawn fails, Step 3 never ran, so no
-        # ``plan_execution`` row exists and the ``update_status`` call used
-        # here raised ``ExecPlanNotFoundError`` and silently persisted
-        # nothing — the failed run left zero trace in SQLite. ``stop_reason``
-        # is persisted too since this branch creates the row fresh.
-        try:
-            persist_conn = open_db(_server._state_db_path())
-            try:
-                migrate(persist_conn)
-                ExecutionRepository(persist_conn).update_fields(
-                    plan_id,
-                    create_if_missing=True,
-                    exec_status="failed",
-                    stop_reason="process_died_unexpectedly",
-                    # The executor never came up, so there is no pid to
-                    # keep.  A stale pid left on a row that says
-                    # ``failed`` reads as a live execution to every
-                    # "is this execution alive?" reader — the same ghost
-                    # the terminal-status rule forbids (accident B,
-                    # 2026-10-23).
-                    exec_pid=None,
-                )
-            finally:
-                persist_conn.close()
-        except ExecPlanNotFoundError:
-            pass
-        try:
-            _server.PlanState(plan_dir).transition_to("failed")
-        except Exception:
-            pass
+        _write_failed_row(
+            plan_id, "process_died_unexpectedly", create_if_missing=True,
+        )
+        _write_failed_phase(plan_dir)
+        # The failure is announced to a human like any other — after the
+        # terminal writes, so the announcement can neither delay nor
+        # change them.
+        failure_review.announce_failure(
+            plan_id, plan_dir=plan_dir,
+            stop_reason="process_died_unexpectedly",
+        )
         # The resume point is deliberately NOT consumed here: nothing was
         # continued, so the interruption is still the truth about what
         # was interrupted.
@@ -4863,25 +4967,20 @@ def start_execution(
                             f":{unfinished['pending_or_unstarted']}"
                         )
                         state["ended_at"] = datetime.now().isoformat()
-                        try:
-                            persist_conn = open_db(_server._state_db_path())
-                            try:
-                                migrate(persist_conn)
-                                ExecutionRepository(persist_conn).update_status(
-                                    plan_id, "failed"
-                                )
-                            finally:
-                                persist_conn.close()
-                        except ExecPlanNotFoundError:
-                            pass
-                        try:
-                            _server.PlanState(plan_dir).transition_to("failed")
-                        except ValueError:
-                            # Plan might already be in a terminal
-                            # phase (e.g. from a previous interrupted
-                            # run); the executor status update is
-                            # still authoritative via the DB row.
-                            pass
+                        _write_failed_row(plan_id)
+                        # Plan might already be in a terminal phase
+                        # (e.g. from a previous interrupted run); the
+                        # executor status update is still authoritative
+                        # via the DB row.
+                        _write_failed_phase(plan_dir)
+                        # A run that exits with unfinished tasks is a
+                        # terminal failure: announce it to a human —
+                        # after the terminal writes, so the announcement
+                        # can neither delay nor change them.
+                        failure_review.announce_failure(
+                            plan_id, plan_dir=plan_dir,
+                            stop_reason=state["stop_reason"],
+                        )
                         _server.logger.warning(
                             "executor_exited_0_with_unfinished_tasks plan=%s "
                             "unfinished=%s",
@@ -5100,17 +5199,15 @@ def start_execution(
                 state["stop_reason"] = "process_died_unexpectedly"
                 state["ended_at"] = datetime.now().isoformat()
                 _server.PlanState(plan_dir).transition_to("failed")
-                try:
-                    persist_conn = open_db(_server._state_db_path())
-                    try:
-                        migrate(persist_conn)
-                        ExecutionRepository(persist_conn).update_status(
-                            plan_id, "failed"
-                        )
-                    finally:
-                        persist_conn.close()
-                except ExecPlanNotFoundError:
-                    pass
+                _write_failed_row(plan_id)
+                # The watcher itself crashed: the run is over and the
+                # failure is terminal, so it is announced to a human —
+                # after the terminal writes, so the announcement can
+                # neither delay nor change them.
+                failure_review.announce_failure(
+                    plan_id, plan_dir=plan_dir,
+                    stop_reason="process_died_unexpectedly",
+                )
 
     # Usage-registry attribution: bind plan_id for the watcher thread
     # (auto-verification triggers can call the LLM from here).
@@ -5398,7 +5495,8 @@ def get_execution_status(plan_id: str):
     _adopt_row_verdict(plan_id, row)
 
     before = _memory_verdict(plan_id)
-    _server._lazy_check_execution(plan_id)
+    if _watchdog_may_judge(plan_id):
+        _server._lazy_check_execution(plan_id)
     if _memory_verdict(plan_id) != before:
         # The watchdog reached a verdict.  The row is where that
         # verdict lives, so the row is re-read: from here on the answer
@@ -7617,7 +7715,8 @@ def get_execution_progress(plan_id: str):
             # it is after the verdict, not as it was before it.
             try:
                 before = _memory_verdict(plan_id)
-                _server._lazy_check_execution(plan_id)
+                if _watchdog_may_judge(plan_id):
+                    _server._lazy_check_execution(plan_id)
                 judged = _memory_verdict(plan_id) != before
             except Exception:  # noqa: BLE001 - a watchdog failure must not 500
                 _server.logger.exception(

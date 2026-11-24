@@ -438,6 +438,38 @@ def _phase(conn: sqlite3.Connection, plan_id: str) -> Optional[str]:
     return row.get("current_phase")
 
 
+def _answered_decisions(
+    conn: sqlite3.Connection, plan_id: str
+) -> List[Tuple[str, str]]:
+    """Return the decisions about ``plan_id`` that are no longer open.
+
+    A decision that is still ``pending`` is a question nobody has
+    answered yet: it says that a human *is* being asked, not that a
+    human *has* answered.  Every other state — ``answered``,
+    ``defaulted``, ``paused``, ``unroutable`` — is a question that is
+    over, and only those can have caused a release.
+
+    The question is asked of the table itself rather than of a
+    reader: the reader speaks of ``pending`` only, and a case that
+    wants to know whether anything was *answered* has to look at the
+    rows.
+
+    Args:
+        conn: the connection to read from.
+        plan_id: the plan to ask about.
+
+    Returns:
+        The ``(plan_id, status)`` pairs of the decisions about the
+        plan that are not ``pending``.
+    """
+    rows = conn.execute(
+        "SELECT plan_id, status FROM plan_decisions "
+        "WHERE plan_id = ? AND status != 'pending'",
+        (plan_id,),
+    ).fetchall()
+    return [(str(row[0]), str(row[1])) for row in rows]
+
+
 def _pid_is_alive(pid: Optional[int]) -> bool:
     """Return whether the process ``pid`` is still there."""
     if not pid:
@@ -1669,11 +1701,25 @@ def test_workspace_block_is_recomputed_every_tick(tmp_path, monkeypatch):
     plan that was waiting is admitted.
 
     The release is caused by **one** fact and one fact only: the
-    holder's process is gone.  There is no pending decision anywhere in
-    this case — and the case says so, because a release that came from a
-    pending decision would be a different rule, and one this
-    architecture does not have: a plan that is still running holds its
-    slot whether or not anybody is waiting to hear about it.
+    holder's process is gone.  Nothing was **answered** about either
+    plan — and the case says so, because a release that came from an
+    answer would be a different rule, and one this architecture does
+    not have: a plan that is still running holds its slot whether or
+    not anybody is waiting to hear about it.
+
+    The holder's death *is* announced — the failure review asks a
+    human what to do with a plan that failed, and the question it
+    leaves behind is ``pending``.  A pending decision is a **guard,
+    not a gate**: it keeps a plan from being mistaken for idle, it
+    never frees a slot on its own, and a release cannot come out of
+    it.  So the case does not exclude that pending question, it
+    excludes the **answer** — and it does so without waiting for the
+    announcement to land, because a question that has not been written
+    down yet is not an answer either.
+
+    The blocked plan is the other side of the same rule: it never ran
+    and never failed, so nobody was ever asked about it, and the case
+    says so in the strictest form of the statement there is.
 
     Negative control
     ----------------
@@ -1745,12 +1791,17 @@ def test_workspace_block_is_recomputed_every_tick(tmp_path, monkeypatch):
         "a race and not an observation"
     )
 
-    # And nothing else changed: no human was asked about either plan,
-    # so the release below cannot be a release that waited for an
-    # answer.
-    assert not world.facts.has_pending_decision(running_id), (
-        "the holder has a pending decision: the release below would not "
-        "say what it was caused by"
+    # And nothing else changed: no human **answered** anything about
+    # either plan, so the release below cannot be a release that
+    # waited for an answer.  The holder's failure review may well have
+    # asked its question by now — a pending question is a guard, not a
+    # gate — so what is ruled out here is the answer, not the
+    # question.
+    answered = _answered_decisions(world.conn, running_id)
+    assert not answered, (
+        "a decision about the holder was answered before the release: "
+        "the release below would not say what it was caused by: "
+        "{0!r}".format(answered)
     )
     assert not world.facts.has_pending_decision(blocked_id), (
         "the blocked plan has a pending decision: the release below would "

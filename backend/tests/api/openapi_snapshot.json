@@ -2252,6 +2252,48 @@
         "summary": "Import Plan"
       }
     },
+    "/api/plan/{plan_id}/failure-review": {
+      "get": {
+        "description": "Answer with the plan's failure review, or say there is none.\n\nParameters\n----------\nplan_id:\n    The plan the review belongs to.  It is admitted through the\n    shared guard (``server._plan_dir``), so a malformed id \u2014 a\n    traversal, a separator \u2014 is refused with the guard's own 400.\n    That answer is left alone: a malformed id is a bad request, not\n    a missing plan.\n\nReturns\n-------\nThe four recorded fields: ``decision_id``, ``problem``,\n``suggestion`` and ``created_at``.\n\nRaises\n------\nHTTPException: 404 when the plan has no review to show \u2014 no\n    sidecar, a sidecar that does not parse, or one missing a field.",
+        "operationId": "get_failure_review_api_plan__plan_id__failure_review_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Failure Review Api Plan  Plan Id  Failure Review Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Failure Review"
+      }
+    },
     "/api/plan/{plan_id}/lifecycle/start": {
       "post": {
         "description": "\u6309\u68c0\u67e5\u70b9\u7684 kind \u542f\u52a8\u8fd9\u4e2a\u8ba1\u5212\uff08\u6062\u590d\u6267\u884c\u6216\u6062\u590d\u9a8c\u8bc1\uff09\u3002\n\n:raises fastapi.HTTPException: \u672a\u77e5\u8ba1\u5212 404\uff1b\u5904\u7406\u5668\u629b\u51fa\u7684\u5f02\u5e38\u539f\u6837\u900f\u4f20\n    \uff08\u7f3a ``project_dir`` \u90a3\u4e2a 400 \u7531\u6267\u884c\u4fa7\u8bf4\uff0c\u95e8\u9762\u4e0d\u81ea\u5df1\u7f16\uff09\u3002",

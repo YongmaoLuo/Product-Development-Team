@@ -270,6 +270,81 @@ def test_stale_matching_listener_is_restarted_with_the_declared_command(
     assert result.runtimes["chart"].ready
 
 
+def test_shell_wrapped_declaration_restarts_a_stale_listener(
+    project, monkeypatch
+):
+    """A declaration shaped like production writes it is recognised too.
+
+    The start command is a **shell line**: activate a virtualenv, export
+    the data plane, seed the fixture, run the program — and the process
+    it starts carries only the program.  The whole line can therefore
+    never match that command line, so our own listener looked like a
+    stranger: the round got out of its way instead of restarting it, and
+    the VPs were pointed at the process an earlier round had left behind
+    (2026-11-20).
+
+    The listener here is **stale** — it started before the current
+    source — so the round must stop it and start its own copy with the
+    declared command, on the declared port.
+    """
+    decl = _shell_decl(
+        name="api",
+        port=3000,
+        start_cmd=(
+            "source venv/bin/activate "
+            "&& export PDT_PLANS_DIR=/tmp/plans "
+            "&& export PDT_STATE_DB_PATH=/tmp/state.db "
+            "&& python -c 'seed()' "
+            "&& python -m api.server"
+        ),
+    )
+    started = []
+
+    def _fake_start(decl, project_dir, timeout_seconds=None):
+        started.append((decl.name, decl.port))
+        return sm.ServiceRuntime(
+            name=decl.name, port=decl.port, pid=4242, pgid=4242,
+            start_cmd=decl.start_cmd, cwd=decl.cwd,
+            origin="spawned", ready=True, detail="stub",
+        )
+
+    monkeypatch.setattr(sm, "start_service", _fake_start)
+    source = project / "server.py"
+    source.write_text("x = 1\n")
+    now = source.stat().st_mtime
+
+    # The listener carries the program only — the setup the shell ran is
+    # gone from its command line, exactly as in production.
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(
+            p, ["/opt/homebrew/bin/Python -m api.server"],
+            start_epoch=now - 3600,
+        ),
+    )
+    stop_calls = []
+
+    def _fake_stop(runtime, decl=None, **kwargs):
+        stop_calls.append(runtime.name)
+        return {"name": runtime.name, "port": runtime.port, "killed": [],
+                "signalled": [], "port_free": True, "detail": "stub"}
+
+    monkeypatch.setattr(sm, "stop_service", _fake_stop)
+    monkeypatch.setattr(sm, "allocate_free_port", lambda: 38921)
+
+    result = sm.ensure_services(project, {"api": decl})
+
+    assert stop_calls == ["api"], (
+        f"our own stale listener must be stopped; stopped {stop_calls!r}"
+    )
+    assert started == [("api", 3000)], (
+        f"the round's own copy takes the DECLARED port; started {started!r}"
+    )
+    runtime = result.runtimes["api"]
+    assert runtime.ready, "the round must come back with a service"
+    assert runtime.port == 3000
+
+
 def test_foreign_listener_is_relocated_around_never_killed(project, monkeypatch):
     """2026-09-18 a port held by a process we cannot
     identify is neither adopted nor killed — **we get out of the way**.
@@ -3119,6 +3194,175 @@ def test_a_live_rounds_service_is_not_reclaimed_even_when_it_looks_like_ours(
         f"the round gets out of its way instead; started on {started!r}"
     )
     assert result.runtimes["api"].reclaimed is False
+
+
+def _write_round_pin(
+    plan_dir: Path, *, port: int, pid: int, writer_pid: int,
+    expires_at: Optional[float] = None,
+) -> None:
+    """Write the pin file a **live** round leaves behind.
+
+    The shape is the one production writes: the pin names the process,
+    the port it holds, and the process that wrote the pin — the witness
+    that survives an empty ``round_token``.
+    """
+    pins = {
+        "updated_at": "",
+        "pins": [{
+            "name": "api",
+            "pid": pid,
+            "pgid": None,
+            "boot_id": str(pid),
+            "port": port,
+            "declared_port": port,
+            "round_token": "",
+            "writer_pid": writer_pid,
+            "created_at": time.time() - 1.0,
+            "expires_at": (
+                time.time() + 3600.0 if expires_at is None else expires_at
+            ),
+        }],
+    }
+    (Path(plan_dir) / ".round_pins.json").write_text(
+        json.dumps(pins), encoding="utf-8",
+    )
+
+
+def test_a_live_rounds_pin_shields_the_holder_from_the_reclaim(
+    tmp_path, monkeypatch,
+):
+    """A live round's pin protects the holder — the reclaim must not fire.
+
+    The shape is the leftover's: our own program, out of our own
+    workspace, on a port we declared, and **no ledger entry** to say it
+    is ours.  The workspace fallback answers, and the reclaim is about
+    to signal it.
+
+    But a live round has **pinned** that holder, and the pin is the
+    strongest witness there is — it names the process itself.  A
+    running round that loses its api service between two VPs is the
+    2026-10-25 incident, so the reclaim is vetoed: nothing is
+    signalled, the holder survives, and this round gets out of the way
+    onto a free port.
+
+    The veto is asked at the **action** — the last gate before the
+    signal — so it covers every kind of evidence, not only the ones
+    that happen to remember to ask the ledger.
+
+    Three cases are pinned here:
+
+    * this plan's own pin file holds the pin;
+    * **another** plan's does — a round of a different plan is using
+      the port just as much as one of ours does;
+    * a pin that has **expired** protects nobody, and the reclaim goes
+      through as it always did.  Without that case the veto would be a
+      blanket "never reclaim", and a real leftover would live for good.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    decl = _shell_decl()
+
+    # A **real** holder: our own program, out of our own workspace,
+    # holding the declared port.  It has to be a live process — a pin
+    # that names a process that is gone protects nothing.
+    package = project / "api"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "server.py").write_text(
+        "import time\n\ntime.sleep(120)\n", encoding="utf-8",
+    )
+    holder = subprocess.Popen(
+        [sys.executable, "-m", "api.server"],
+        cwd=str(project),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, start_new_session=True,
+    )
+    try:
+        monkeypatch.setattr(
+            sm, "probe_port",
+            lambda p: _holder_probe(
+                decl.port, holder.pid, "/usr/bin/python3 -m api.server",
+            ),
+        )
+        # The holder's cwd is our workspace — the shape a leftover has.
+        monkeypatch.setattr(sm, "_process_cwd", lambda pid: str(project))
+        monkeypatch.setattr(sm, "allocate_free_port", lambda: 38921)
+
+        # --- 1. this plan's own pin -------------------------------------
+        own_tree = tmp_path / "tree-own"
+        own_plan = own_tree / "20261024-vp-quota-parked"
+        own_plan.mkdir(parents=True)
+        _write_round_pin(
+            own_plan, port=decl.port, pid=holder.pid, writer_pid=os.getpid(),
+        )
+        monkeypatch.setattr(sm, "_plans_tree", lambda: own_tree)
+        stopped, started = _stub_reclaim_spy(monkeypatch)
+
+        result = sm.ensure_services(
+            project, {"api": decl}, plan_dir=own_plan, plan_id=own_plan.name,
+        )
+
+        assert stopped == [], (
+            f"a holder a live round has pinned must not be signalled; "
+            f"stopped {stopped!r}"
+        )
+        assert holder.poll() is None, (
+            "the holder must survive: a running round is using it"
+        )
+        assert started == [38921], (
+            f"the round gets out of the way instead; started on {started!r}"
+        )
+        assert result.runtimes["api"].reclaimed is False
+        assert result.runtimes["api"].port == 38921
+
+        # --- 2. another plan's pin --------------------------------------
+        cross_tree = tmp_path / "tree-cross"
+        cross_plan = cross_tree / "20261103-other-round"
+        cross_plan.mkdir(parents=True)
+        _write_round_pin(
+            cross_plan, port=decl.port, pid=holder.pid,
+            writer_pid=os.getpid(),
+        )
+        this_plan = cross_tree / "20261024-vp-quota-parked"
+        this_plan.mkdir(parents=True)
+        monkeypatch.setattr(sm, "_plans_tree", lambda: cross_tree)
+        stopped, started = _stub_reclaim_spy(monkeypatch)
+
+        result = sm.ensure_services(
+            project, {"api": decl},
+            plan_dir=this_plan, plan_id=this_plan.name,
+        )
+
+        assert stopped == [], (
+            f"another plan's live round is using the port just as much; "
+            f"stopped {stopped!r}"
+        )
+        assert holder.poll() is None, "the holder must survive"
+        assert started == [38921], started
+        assert result.runtimes["api"].reclaimed is False
+
+        # --- 3. an expired pin protects nobody --------------------------
+        _write_round_pin(
+            cross_plan, port=decl.port, pid=holder.pid,
+            writer_pid=os.getpid(), expires_at=time.time() - 1.0,
+        )
+        stopped, started = _stub_reclaim_spy(monkeypatch)
+
+        result = sm.ensure_services(
+            project, {"api": decl},
+            plan_dir=this_plan, plan_id=this_plan.name,
+        )
+
+        assert stopped == [holder.pid], (
+            f"an expired pin protects nobody: the holder is a leftover "
+            f"again and has to be reclaimed; stopped {stopped!r}"
+        )
+        assert started == [decl.port], (
+            f"the declared port comes back to us; started on {started!r}"
+        )
+        assert result.runtimes["api"].reclaimed is True
+    finally:
+        _force_cleanup(holder.pid)
 
 
 # ---------------------------------------------------------------------------
@@ -6504,3 +6748,344 @@ def test_adaptive_ready_timeout_keeps_the_declared_bound_without_a_load(
     assert sm._adaptive_ready_timeout(10.0) == 10.0, (
         "a host without a load average keeps the declared bound"
     )
+
+
+# ---------------------------------------------------------------------------
+# The workspace fallback has to be actionable (2026-11-20)
+# ---------------------------------------------------------------------------
+#
+# The ledger cannot always claim the holder of a declared port.  The
+# record may name the **wrapper** a round spawned while the port is
+# held by the program that wrapper ran, and the ledger's own record of
+# that program's group may have gone with the wrapper.  What is left is
+# the **workspace** fallback: our own program, out of our own
+# workspace, on a port we declared.
+#
+# That fallback used to answer with an identity and nothing else — no
+# start time, no group.  The reclaim built its runtime out of that, the
+# stop path found a live pid it could not place in time, and **refused**
+# to signal it.  Fail-closed, and right as far as it went — but the port
+# stayed held by the very leftover the reclaim was called for, and the
+# round went on reading that old process' answers.
+#
+# The evidence therefore has to carry two more readings, both measured
+# off the process that was recognised:
+#
+#   * the **anchor** — when the holder started, so the stop path can
+#     compare it against the live process;
+#   * the **group** — and only when the holder **leads** it, because a
+#     group signal reaches every member of the group it names, and a
+#     group the holder does not lead belongs to somebody else.
+
+
+def test_workspace_leftover_evidence_carries_a_live_anchor(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """The fallback evidence must say when the holder started.
+
+    Without the start time the stop path cannot place a live pid in
+    time: it refuses the signal (fail-closed), the port stays held by
+    the leftover, and the reclaim that was supposed to take the declared
+    port back has taken nothing back.
+
+    The group is the other half of the answer, and it is the narrower
+    one: it is filled in only when the holder **leads** the group.  A
+    process that merely sits in somebody else's group must not drag
+    that group into a stop — the group signal reaches every member of
+    it, and those members are not ours.
+
+    The evidence is read through :func:`_holder_evidence`, which is the
+    path the round takes: the ledger cannot claim the holder, so the
+    workspace fallback answers.
+    """
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    # A plan directory with no ledger in it: the ledger cannot claim the
+    # holder, so the workspace fallback is what answers.
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir()
+    decl = _decl(
+        name="api", port=8917,
+        start_cmd=(
+            "source backend/.venv/bin/activate && python -m backend.server"
+        ),
+    )
+    probe = PortProbe(
+        port=decl.port,
+        listening=True,
+        pids=[1000],
+        cmdlines=["/…/Python -m backend.server"],
+        process_start_epoch=1_795_118_191.0,
+    )
+    monkeypatch.setattr(sm, "_process_cwd", lambda pid: str(project_dir))
+    # The listener leads the group it is in.
+    monkeypatch.setattr(sm, "_process_group_of", lambda pid: 1000)
+
+    evidence = sm._holder_evidence(
+        decl, project_dir, probe, plan_dir=plan_dir,
+    )
+
+    assert evidence is not None, (
+        "our own program, out of our own workspace, on a port we declared "
+        "is our own leftover"
+    )
+    assert evidence["pid"] == 1000, evidence
+    assert evidence["start_epoch"] == 1_795_118_191.0, (
+        "the evidence must say when the holder started; without it the stop "
+        f"path cannot place the pid in time. Got {evidence!r}"
+    )
+    assert evidence["pgid"] == 1000, (
+        "the holder leads the group it is in, so that group is ours to "
+        f"signal: {evidence!r}"
+    )
+
+    # The holder that does **not** lead its group: the group belongs to
+    # somebody else, and a group signal reaches every member of it.
+    monkeypatch.setattr(sm, "_process_group_of", lambda pid: 999)
+    led_by_other = sm._holder_evidence(
+        decl, project_dir, probe, plan_dir=plan_dir,
+    )
+    assert led_by_other is not None
+    assert led_by_other["pgid"] is None, (
+        "a group the holder does not lead is somebody else's, and a group "
+        f"signal reaches every member of it: {led_by_other!r}"
+    )
+    assert led_by_other["start_epoch"] == 1_795_118_191.0, (
+        "the anchor does not depend on the group: it is measured, not "
+        f"guessed. Got {led_by_other!r}"
+    )
+
+    # A group that cannot be read at all is no group: the reading is
+    # missing, so nothing is claimed on the strength of it.
+    monkeypatch.setattr(sm, "_process_group_of", lambda pid: None)
+    unreadable = sm._holder_evidence(
+        decl, project_dir, probe, plan_dir=plan_dir,
+    )
+    assert unreadable is not None
+    assert unreadable["pgid"] is None, unreadable
+
+    # And a start time that cannot be read is no anchor: the evidence
+    # carries none, and the stop path refuses the pid as it does today.
+    blind = PortProbe(
+        port=decl.port,
+        listening=True,
+        pids=[1000],
+        cmdlines=["/…/Python -m backend.server"],
+        process_start_epoch=None,
+    )
+    without_anchor = sm._holder_evidence(
+        decl, project_dir, blind, plan_dir=plan_dir,
+    )
+    assert without_anchor is not None
+    assert without_anchor.get("start_epoch") is None, (
+        f"there is no anchor to carry: {without_anchor!r}"
+    )
+
+
+#: A service that does nothing but hold a port and answer a health
+#: request — the shape of a leftover: our own program, out of our own
+#: workspace, on a port we declared, left behind by an earlier round.
+_WORKSPACE_HOLDER_SOURCE = '''\
+import http.server
+import sys
+
+port = int(sys.argv[sys.argv.index("--port") + 1])
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b'{"status": "ok"}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+'''
+
+
+@pytest.mark.timeout(180)
+def test_workspace_leftover_reclaim_stops_with_that_anchor(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """The reclaim has to reach the process, not merely describe it.
+
+    The leftover is a **real** process: our own program, out of our own
+    workspace, holding the port we declared.  The evidence the
+    workspace fallback produces has to be enough for the stop path to
+    place that pid in time and signal it — and the declared port has to
+    come back, because a reclaim that leaves the port held has not
+    reclaimed anything.
+
+    Three things are pinned here:
+
+    * the **anchor** reaches the stop, and the signal goes out: the
+      runtime the reclaim hands over carries the start time of the
+      process it is about to signal;
+    * the **group** reaches the stop too, and only when the holder
+      leads it — a group read out of a record may belong to somebody
+      else by now, and a group signal reaches every member of it;
+    * the **fail-closed** rule survives: without the anchor the stop is
+      refused, the reclaim reports ``failed``, and this round's own
+      copy is never started on top of a port the leftover still holds.
+    """
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir()
+    port = _free_port()
+    script = project_dir / "svc.py"
+    script.write_text(_WORKSPACE_HOLDER_SOURCE)
+    start_cmd = (
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} "
+        f"--port {port}"
+    )
+    decl = _decl(
+        name="chart", port=port, start_cmd=start_cmd,
+        health_url=f"http://127.0.0.1:{port}/health",
+        ready_timeout_seconds=int(_readiness_budget_seconds(30)),
+    )
+
+    holder = subprocess.Popen(
+        [sys.executable, str(script), "--port", str(port)],
+        cwd=str(project_dir),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, start_new_session=True,
+    )
+    runtime = None
+    try:
+        _wait_for_a_listener(port, holder)
+        probe = sm.probe_port(port)
+        evidence = sm._workspace_evidence(decl, project_dir, probe)
+        assert evidence is not None, (
+            "our own program, out of our own workspace, on a port we "
+            "declared is our own leftover"
+        )
+        assert evidence["pid"] == holder.pid, evidence
+        assert evidence["start_epoch"] is not None, (
+            f"the evidence must carry the anchor; got {evidence!r}"
+        )
+        assert evidence["pgid"] == holder.pid, (
+            "the holder leads the session it was started in, so that group "
+            f"is ours to signal: {evidence!r}"
+        )
+
+        # --- the fail-closed rule survives ---------------------------------
+        #
+        # Without the anchor the stop path cannot place a live pid in
+        # time, so it refuses to signal it — the rule this change must
+        # not relax.  The reclaim then fails, and this round's own copy
+        # is never started on top of a port the leftover still holds.
+        blind = PortProbe(
+            port=port, listening=True, pids=[holder.pid],
+            cmdlines=probe.cmdlines, process_start_epoch=None,
+        )
+        unanchored = sm._workspace_evidence(decl, project_dir, blind)
+        assert unanchored is not None
+        assert unanchored.get("start_epoch") is None, unanchored
+
+        started = []
+        real_stop = sm.stop_service
+
+        def _short_grace_stop(runtime_, decl_=None, *, grace_seconds=10.0,
+                              **kwargs):
+            # The real stop, with a shorter wait for the port to come
+            # back: the verdict is the real one, the case is just not
+            # charged for ten seconds of a grace nothing answers.
+            return real_stop(
+                runtime_, decl_, grace_seconds=1.0, **kwargs
+            )
+
+        with monkeypatch.context() as inner:
+            inner.setattr(
+                sm, "start_service",
+                lambda d, p: started.append(d) or sm.ServiceRuntime(
+                    name=d.name, port=d.port,
+                ),
+            )
+            inner.setattr(sm, "stop_service", _short_grace_stop)
+            refused = sm._reclaim_leftover(decl, project_dir, unanchored)
+        assert refused.origin == "failed", (
+            f"a reclaim that could not stop the leftover must fail: "
+            f"{refused.detail!r}"
+        )
+        assert started == [], (
+            "the round must not start its own copy while the leftover "
+            "still holds the declared port"
+        )
+        assert holder.poll() is None, (
+            "the holder must survive a refused stop; it was killed"
+        )
+
+        # --- the group the reclaim hands over is the measured one -------
+        handed = {}
+
+        def _capture_stop(runtime_, decl_=None, **kwargs):
+            handed["pgid"] = runtime_.pgid
+            handed["start_epoch"] = runtime_.start_epoch
+            return {"port_free": False, "detail": "captured"}
+
+        doctored = dict(evidence)
+        doctored["pgid"] = holder.pid + 1
+        with monkeypatch.context() as inner:
+            inner.setattr(sm, "stop_service", _capture_stop)
+            sm._reclaim_leftover(decl, project_dir, doctored)
+        assert handed.get("start_epoch") is not None, (
+            "the runtime the reclaim hands to the stop must carry the "
+            f"anchor of the process it is about to signal: {handed!r}"
+        )
+        assert handed.get("pgid") is None, (
+            "a group the holder is not measured in must not be handed to "
+            f"the stop: {handed!r}"
+        )
+
+        # --- the reclaim itself -------------------------------------------
+        groups = []
+        real_killpg = os.killpg
+
+        def _record_killpg(pgid, sig):
+            groups.append((int(pgid), int(sig)))
+            real_killpg(pgid, sig)
+
+        monkeypatch.setattr(sm.os, "killpg", _record_killpg)
+
+        with sm.address_event_context(plan_dir):
+            runtime = sm._reclaim_leftover(decl, project_dir, evidence)
+
+        assert runtime.origin == "spawned", (
+            f"the reclaim did not start this round's own copy: "
+            f"{runtime.detail!r}"
+        )
+        assert runtime.ready is True, runtime.detail
+        assert runtime.reclaimed is True, runtime.detail
+        assert runtime.pid != holder.pid, (
+            "the copy that took the port back must be a new process"
+        )
+        assert groups == [(holder.pid, int(signal.SIGTERM))], (
+            "the holder leads the group it was started in, so that group "
+            f"is ours to signal and the stop has to reach it: {groups!r}"
+        )
+
+        deadline = time.monotonic() + 10.0
+        while holder.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert holder.poll() is not None, (
+            "the leftover must be gone once the reclaim has run"
+        )
+        # A replacement, not a second copy alongside the leftover.
+        assert sm.probe_port(port).pids == [runtime.pid], (
+            "exactly one service may hold the declared port after the "
+            f"reclaim: {sm.probe_port(port).pids!r}"
+        )
+    finally:
+        if runtime is not None and runtime.pid:
+            try:
+                sm.stop_service(runtime, plan_dir=plan_dir)
+            except Exception:  # noqa: BLE001 - cleanup only
+                pass
+        _force_cleanup(holder.pid)

@@ -841,7 +841,13 @@ def test_answer_releases(server):
     _start_execution(client, plan_id, plan_dir)
     progress = _wait_for_stop_reason(client, plan_id, STOP_REASON_SUCCESS)
 
-    assert progress["pending_decisions"]["count"] == 0, progress
+    # Only the failure review may remain pending: it holds no task.
+    still_holding = [
+        item
+        for item in progress["pending_decisions"]["items"]
+        if item["source"] != "failure_review"
+    ]
+    assert still_holding == [], progress
     assert _scheduled_task_ids(handle.state_db, plan_id) == ["A", "B", "C"], (
         "the released tasks must be picked up by the next run"
     )

@@ -36,6 +36,7 @@ would not pin the other.
 
 from __future__ import annotations
 
+import json
 import shlex
 import subprocess
 import sys
@@ -254,3 +255,266 @@ def test_freshness_module_regression():
         assert node_id in collected, (
             f"{node_id} is not in the collected set:\n{collected[-4000:]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# The ledger's own record of the holder (2026-11-20)
+# ---------------------------------------------------------------------------
+#
+# A declaration's ``start_cmd`` is a **shell line** — activate a
+# virtualenv, export the data plane, seed the fixture, run the program
+# — and the process it starts carries only the program.  The ledger
+# therefore records the **wrapper** it spawned, while the port is held
+# by the program the wrapper ran:
+#
+#     ledger:  pid 9967, pgid 9967        <- the wrapper
+#     holder:  pid 9972, group 9967       <- the program it ran
+#
+# The reap path has always known how to see that shape (the listener is
+# a **descendant** of the recorded process, in the recorded group), and
+# a case pins it.  The **ensure** path did not: it asked for the
+# recorded pid to be the listener, exactly, and when it was not the
+# answer was "not ours" — so the round relocated around its own
+# leftover, the reclaim it did attempt had no identity anchor, and the
+# stop was refused.  The port stayed held.
+#
+# The two proofs below are the ledger's **own** words, not a guess:
+#
+#   * the **data plane** the ledger recorded for the service names the
+#     process that answered on that port;
+#   * the **process group** the ledger recorded is the group the
+#     listener is in — a child inherits its parent's group.
+#
+# A command line that "looks like ours" is not one of them and is not
+# accepted: a process that merely resembles ours is somebody else's.
+
+
+def _ledger_entry(**over) -> dict:
+    """One service entry, in the shape the ledger writes."""
+    base = {
+        "name": "api",
+        "port": 8917,
+        "declared_port": 8917,
+        "pid": 9967,
+        "pgid": 9967,
+        "start_epoch": 1795118192.383248,
+        "start_cmd": "source backend/.venv/bin/activate && python -m backend.server",
+        "cwd": ".",
+        "log_path": "",
+        "origin": "spawned",
+        "ready": True,
+        "reap_on_exit": True,
+        "detail": "",
+        "owner_token": "",
+        "reclaimed": False,
+        "reclaim_reason": "",
+        "unusable": False,
+        "failure_reason": "",
+        "dead": False,
+        "exit": None,
+        "data_plane": None,
+    }
+    base.update(over)
+    return base
+
+
+def _write_plan_ledger(plan_dir: Path, entries: list, project_dir: Path = None):
+    """The plan's ledger, in the shape the reader understands."""
+    import service_manager as sm
+
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"plan_id": plan_dir.name, "services": entries}
+    if project_dir is not None:
+        payload["project_dir"] = str(project_dir)
+    sm.ledger_path(plan_dir).write_text(
+        json.dumps(payload), encoding="utf-8",
+    )
+
+
+def _api_declaration(port: int = 8917):
+    from service_declaration import ServiceDeclaration
+
+    return ServiceDeclaration(
+        name="api",
+        port=port,
+        start_cmd=(
+            "source backend/.venv/bin/activate && "
+            "python -m backend.server"
+        ),
+        cwd=".",
+        health_url=f"http://127.0.0.1:{port}/health",
+        ready_timeout_seconds=30,
+    )
+
+
+def test_ledger_holder_evidence_recognises_the_data_plane_listener(
+    tmp_path: Path, monkeypatch,
+):
+    """The ledger's data-plane record names the process that answers.
+
+    The ledger recorded two pids for one service: the wrapper it
+    spawned (9967) and, in the data plane it wrote down, the process
+    that answered on the port (9972).  The port is held by the second
+    one, and the entry has to say so — otherwise the round cannot tell
+    its own leftover from a stranger, and the stranger is what it gets
+    out of the way for.
+
+    What the evidence carries matters as much as that it exists: the
+    **pid** has to be the one that will be signalled, the **group** is
+    the one the ledger recorded (never one read off the process table),
+    and the **anchor** is the start time of the process being
+    signalled — the ledger never recorded this pid, so the anchor has
+    to come from the live process.
+    """
+    import service_manager as sm
+    from service_freshness import PortProbe
+
+    plan_dir = tmp_path / "plan"
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    _write_plan_ledger(
+        plan_dir,
+        [_ledger_entry(data_plane={
+            "status": "ok",
+            "plan_routing_rows": 1,
+            "boot_id": "222db6ca95fe42b7843639fcb128558c",
+            "state_db_path": str(project_dir / "state.db"),
+            "pid": 9972,
+            "pgid": 9967,
+            "verdict": "proved",
+            "error": "",
+        })],
+        project_dir=project_dir,
+    )
+
+    decl = _api_declaration()
+    probe = PortProbe(
+        port=decl.port,
+        listening=True,
+        pids=[9972],
+        cmdlines=["/usr/bin/python3 -m backend.server"],
+        process_start_epoch=1795118193.5,
+    )
+    monkeypatch.setattr(
+        sm, "_process_group_of", lambda pid: 9967 if pid == 9972 else pid,
+    )
+    # The anchor is measured on the process that is going to be
+    # signalled — not read off the port-wide probe, which is the
+    # earliest start among *all* the listeners.
+    monkeypatch.setattr(
+        sm, "_process_start_epoch",
+        lambda pid: 1795118193.75 if pid == 9972 else None,
+    )
+
+    evidence = sm._ledger_holder_evidence(plan_dir, decl, probe)
+
+    assert evidence is not None, (
+        "the ledger's own data-plane record names the holder, and the "
+        "entry was not read as ours"
+    )
+    assert evidence["pid"] == 9972, evidence
+    assert evidence["pgid"] == 9967, evidence
+    assert evidence["start_epoch"] == 1795118193.75, (
+        f"the anchor has to be the start time of the process being "
+        f"signalled; got {evidence['start_epoch']!r}"
+    )
+    assert evidence["start_epoch"] != 1795118192.383248, (
+        "the anchor is the recorded wrapper's start time, and the wrapper "
+        "is not the process that would be signalled"
+    )
+
+    # And the negative control: a holder the ledger says nothing about
+    # is not ours, however much its command line resembles ours.
+    stranger = PortProbe(
+        port=decl.port,
+        listening=True,
+        pids=[4242],
+        cmdlines=["/usr/bin/python3 -m backend.server"],
+        process_start_epoch=1795119000.0,
+    )
+    monkeypatch.setattr(
+        sm, "_process_group_of", lambda pid: 9999 if pid == 4242 else pid,
+    )
+    assert sm._ledger_holder_evidence(plan_dir, decl, stranger) is None, (
+        "a holder the ledger records nothing about was taken for ours"
+    )
+
+
+def test_ledger_holder_evidence_recognises_a_descendant_in_the_recorded_group(
+    tmp_path: Path, monkeypatch,
+):
+    """The listener is a descendant of the recorded process.
+
+    This is the ``next dev`` shape the reap path already answers: the
+    ledger records the process it spawned, the port is held by a
+    **child** of it, and the child inherits the group the parent
+    created.  The group is what connects the two — the command line of
+    the child matches nothing at all, because such a process rewrites
+    its own title.
+
+    The same rule has to hold on the ensure path, or the round
+    relocates around its own leftover and the port it declared stays
+    held by the process it started.
+    """
+    import service_manager as sm
+    from service_freshness import PortProbe
+
+    plan_dir = tmp_path / "plan"
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    _write_plan_ledger(
+        plan_dir,
+        [_ledger_entry(
+            name="chart", port=3000, declared_port=3000,
+            pid=4242, pgid=4242, start_epoch=1.0,
+            start_cmd="npx next dev -p 3000",
+        )],
+        project_dir=project_dir,
+    )
+
+    from service_declaration import ServiceDeclaration
+
+    decl = ServiceDeclaration(
+        name="chart",
+        port=3000,
+        start_cmd="npx next dev -p 3000",
+        cwd=".",
+        health_url="http://127.0.0.1:3000/health",
+        ready_timeout_seconds=30,
+    )
+    probe = PortProbe(
+        port=decl.port,
+        listening=True,
+        pids=[1000],
+        cmdlines=["next-server (v15.5.20)"],
+        process_start_epoch=42.5,
+    )
+    monkeypatch.setattr(
+        sm, "_process_group_of", lambda pid: 4242 if pid == 1000 else pid,
+    )
+    monkeypatch.setattr(
+        sm, "_process_start_epoch",
+        lambda pid: 42.75 if pid == 1000 else None,
+    )
+
+    evidence = sm._ledger_holder_evidence(plan_dir, decl, probe)
+
+    assert evidence is not None, (
+        "the listener is in the group the ledger recorded, and the entry "
+        "was not read as ours"
+    )
+    assert evidence["pid"] == 1000, evidence
+    assert evidence["pgid"] == 4242, evidence
+    assert evidence["start_epoch"] == 42.75, (
+        f"the anchor has to be the start time of the process being "
+        f"signalled; got {evidence['start_epoch']!r}"
+    )
+
+    # And the negative control: a holder in another group is a
+    # stranger, and the ledger's group does not make it ours.
+    monkeypatch.setattr(
+        sm, "_process_group_of", lambda pid: 9999 if pid == 1000 else pid,
+    )
+    assert sm._ledger_holder_evidence(plan_dir, decl, probe) is None, (
+        "a holder in another group was taken for ours"
+    )
