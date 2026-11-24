@@ -149,6 +149,14 @@ pause 与 requeue
 * ``requeue_plan`` —— **停住 / 失败** → 既有合法边 ``stopped → queued`` 与
   ``failed → queued``（复用 ``_requeue_to_queued``）。
 
+**暂停意图先落库。** ``pause_plan`` 在动手停**之前**把意图写进
+``plan_dir/pause_intent.json``（``reason='user_pause'``）：动手停的那个
+进程可能紧接着就被杀掉，落库必须排在它前面 —— 否则修复轮读到的是空的
+意图，把「用户暂停」与「崩溃」一律写成 failed。落库失败时**不动手停**
+（``detail='pause_intent_write_failed'``）：停完之后没有证据的意图，等于
+把一次崩溃说成一次暂停。``requeue_plan`` 成功后把意图清掉 —— 暂停已经
+兑现，那份「有人要停它吗」的记录问完了。
+
 两条边都由状态机承担，门面只发起迁移：合法性查的是状态机那两张边表，
 门面不自己判断「这条边存不存在」——自己判断就是一份会漂移的边表副本。
 
@@ -212,6 +220,14 @@ from plan_state import PlanState
 # 读哪一行是等待相位由这个模块说了算 —— 门面不自己判一次「ready 算不算」。
 from phase_vocabulary import is_waiting_phase
 
+# 暂停意图（``pause_intent.json``）的写与清。门面在**动手停之前**先把
+# 意图落库（见 ``pause_plan``）：动手停的那个进程可能紧接着就被杀掉，
+# 落库必须排在它前面。
+#
+# 按模块取（``pause_state.write_pause_intent``）而不是按名字取，是为了让
+# 「这两个名字来自哪一层」在代码里一眼看得出来。
+import pause_state
+
 # checkpoint 只读回显，不消费（见模块 docstring）。
 from pause_state import read_pause_checkpoint
 
@@ -232,11 +248,19 @@ KILL_INCOMPLETE_DETAIL = "kill_incomplete"
 #: 追加 ``'+requeue'``（与既有那几种 detail 同一个形状）。
 ORPHAN_STOP_DETAIL = "orphan_stop"
 
+#: 暂停意图落库失败时结果里的 ``detail``。
+#:
+#: 暂停没停成，而且**什么都没停**：执行器还在跑，只是没有人知道有人要
+#: 停它。它不是冲突 —— 相位前提是成立的，是磁盘不配合 —— 所以它有自己
+#: 的名字，而不是蹭 ``conflict`` 那一个。
+PAUSE_INTENT_WRITE_FAILED_DETAIL = "pause_intent_write_failed"
+
 __all__ = [
     "CONFLICT_DETAIL",
     "KILL_INCOMPLETE_DETAIL",
     "LifecycleResult",
     "ORPHAN_STOP_DETAIL",
+    "PAUSE_INTENT_WRITE_FAILED_DETAIL",
     "PlanLifecycleService",
     "PlanNotFoundError",
     "StartPlanSpec",
@@ -290,9 +314,11 @@ class LifecycleResult:
       ``'start_execution(fresh)'``；pause / requeue 侧是
       ``'pause_queued'`` / ``'requeue'`` / ``'conflict'``）。stop 侧还有
       两个**裁决**：``'kill_incomplete'``（进程还活着，不算停）与
-      ``'orphan_stop'``（孤儿执行行被停到了 ``stopped``）。请求了
-      requeue 时追加 ``'+requeue'``（如 ``'stop_execution+requeue'``）——
-      它说的是**动作**，最终相位落在哪儿看 ``final_phase``。
+      ``'orphan_stop'``（孤儿执行行被停到了 ``stopped``）。pause 侧还有
+      一个**没做成**：``'pause_intent_write_failed'``（暂停意图没能落库，
+      所以什么都没停）。请求了 requeue 时追加 ``'+requeue'``（如
+      ``'stop_execution+requeue'``）—— 它说的是**动作**，最终相位落在
+      哪儿看 ``final_phase``。
 
     **字段恰好六个**：两个生命周期端点原样拿这个 dataclass 当响应体，
     仓库另一侧的消费者按那六个键解析
@@ -303,7 +329,8 @@ class LifecycleResult:
 
     * ``phase`` —— ``final_phase`` 的另一个名字。
     * ``ok`` —— 这次操作做成了没有。冲突（``detail`` 是 ``'conflict'``）
-      时是 ``False``，其余是 ``True``。
+      与「暂停意图没能落库」（``detail`` 是
+      ``'pause_intent_write_failed'``）时是 ``False``，其余是 ``True``。
     """
 
     plan_id: str
@@ -326,13 +353,23 @@ class LifecycleResult:
     def ok(self) -> bool:
         """这次操作**做成了没有**。
 
-        冲突（相位前提不成立）时是 ``False`` —— 那时两个相位都还是计划
-        原来所在的那个相位（冲突不改相位）。
+        两种「没做成」：
 
-        这是**视图**不是字段：``detail`` 已经说了是不是冲突，再加一个
+        * **冲突**（相位前提不成立）—— 那时两个相位都还是计划原来所在的
+          那个相位（冲突不改相位）。
+        * **暂停意图落库失败**（``detail`` 是
+          ``'pause_intent_write_failed'``）—— 暂停没停成，而且**什么都
+          没停**：执行器还在跑，只是没有人知道有人要停它。它不是冲突
+          （相位前提是成立的，是磁盘不配合），所以它有自己的名字。
+
+        其余是 ``True``。
+
+        这是**视图**不是字段：``detail`` 已经说了是不是失败，再加一个
         字段就是给响应体多加一个键。
         """
-        return not self.detail.startswith(CONFLICT_DETAIL)
+        if self.detail.startswith(CONFLICT_DETAIL):
+            return False
+        return self.detail != PAUSE_INTENT_WRITE_FAILED_DETAIL
 
 
 class PlanLifecycleService:
@@ -725,9 +762,24 @@ class PlanLifecycleService:
 
         其余相位 → **冲突**：结果原样返回，相位一个字节都不动。
 
+        暂停意图
+        --------
+        动手停之前，意图**先**落库（``plan_dir/pause_intent.json``），
+        写的是 ``reason='user_pause'``。顺序是契约，不是偏好：动手停的
+        那个进程（修复执行器）可能紧接着就被 SIGTERM / SIGKILL 掉，
+        它没来得及写下的东西跟着它一起没了。意图落在停之后，落库就永远
+        慢一步 —— 修复轮读到的是空的意图，于是把「用户暂停」与「崩溃」
+        一律写成 failed。
+
+        落库失败（磁盘不配合）时**不动手停**，答案带自己的名字
+        （``'pause_intent_write_failed'``）：停完之后没有证据的意图，
+        等于把一次崩溃说成一次暂停。
+
         :param plan_id: 目标计划。
         :return: :class:`LifecycleResult`；冲突时 ``ok`` 是 ``False``，
-            两个相位都还是计划原来所在的那个相位。
+            两个相位都还是计划原来所在的那个相位。意图落库失败时同样
+            ``ok`` 是 ``False``（``detail`` 是
+            ``'pause_intent_write_failed'``），相位一个字节都没动。
         :raises PlanNotFoundError: 计划不存在。
         :raises ConflictError: CAS 冲突（行在读与写之间被别的手改了）——
             照既有语义往外抛，调用方按既有说法报成 409；**不重试**。
@@ -738,8 +790,34 @@ class PlanLifecycleService:
         if not plan_dir.exists():
             raise PlanNotFoundError(plan_id)
 
+        # 暂停意图**先**落库，然后才动手停。
+        #
+        # 落库失败时不动手停：停完之后没有证据的意图，等于把一次崩溃
+        # 说成一次暂停。答案带自己的名字，操作员看得见「有人要停它，
+        # 但没停成」。
+        try:
+            pause_state.write_pause_intent(plan_dir, reason="user_pause")
+        except OSError:
+            logger.warning(
+                "plan_lifecycle_pause_intent_write_failed: plan=%s the pause "
+                "intent could not be written; nothing was stopped",
+                plan_id, exc_info=True,
+            )
+            phase = self._current_phase(plan_dir)
+            return LifecycleResult(
+                plan_id=plan_id,
+                dispatched=None,
+                berth_phase=phase,
+                final_phase=phase,
+                checkpoint=None,
+                detail=PAUSE_INTENT_WRITE_FAILED_DETAIL,
+            )
+
         # 在跑 → 既有 stop 路径，而且明确**不**迁回队列：暂停不是恢复。
         # 这一步同时回答了「有没有在跑」——idle 时 ``dispatched`` 是 None。
+        #
+        # 意图已经落库了，所以这一句抛出去的时候意图**留在盘上**：停到
+        # 哪一步算哪一步（修复轮就是靠这个意图把「暂停」与「崩溃」分开）。
         stopped = self.stop_plan(plan_id, requeue=False)
         if stopped.dispatched is not None:
             return stopped
@@ -803,6 +881,10 @@ class PlanLifecycleService:
         在跑的计划没有「放回等待相位」这回事 —— 那是一次停止加一次入队，
         两件事，不能用一个名字糊过去。
 
+        迁回队列之后，暂停意图（``plan_dir/pause_intent.json``）被清掉：
+        暂停已经兑现，那份「有人要停它」的记录问完了 —— 留着它，下一次
+        崩溃会被读成「又是一次暂停」。
+
         :param plan_id: 目标计划。
         :return: :class:`LifecycleResult`；冲突时 ``ok`` 是 ``False``。
         :raises PlanNotFoundError: 计划不存在。
@@ -845,6 +927,15 @@ class PlanLifecycleService:
         # 行上的裁决。少清一次，用户点的「恢复」就会把计划从调度页上弄没
         # —— 计划回来了，却不见了。
         self._clear_terminal_exec_verdict(plan_id)
+
+        # 迁回队列之后，暂停意图**退休**：暂停已经被兑现了，「有人要停
+        # 它吗」这个问题问完了。留着它，下一次崩溃会被读成「又是一次
+        # 暂停」（修复轮就是靠这个意图把两者分开的）。
+        #
+        # 清意图**不**判成败：清不掉只是留下一份陈旧的意图，而让一次
+        # 已经成功的恢复变成失败更糟。``clear_pause_intent`` 自己也不
+        # 抛（它把 ``OSError`` 记成一条 warning）。
+        pause_state.clear_pause_intent(plan_dir)
 
         return LifecycleResult(
             plan_id=plan_id,

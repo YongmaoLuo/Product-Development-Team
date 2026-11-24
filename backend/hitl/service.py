@@ -789,6 +789,54 @@ def list_decisions(
         return opened.list_by_plan(plan_id, status=narrowed)
 
 
+def list_open_decisions(
+    *,
+    store: Optional[HitlStore] = None,
+) -> List[Dict[str, Any]]:
+    """Return every decision that is still open, across every plan.
+
+    An open decision is one that may still be answered: ``pending``
+    (waiting for an answer) or ``paused`` (waiting for a human who may
+    still come).  A settled decision -- ``answered`` / ``defaulted`` /
+    ``unroutable`` -- is not waiting for anybody, so it is not
+    returned.
+
+    This is the cross-plan counterpart of :func:`list_decisions`: a
+    question asked by a plan that is not the one on screen is still a
+    question a human is being waited on, so the aggregation that shows
+    what is outstanding cannot be scoped to a single plan.
+
+    Parameters
+    ----------
+    store:
+        The store to read through.  One is opened for the call when not
+        given; a database that does not exist yet is created by that
+        open and reads empty, so "nothing is outstanding" is an answer
+        rather than an error.
+
+    Returns
+    -------
+    list of dict
+        One dict per open decision, with exactly the keys
+        ``decision_id``, ``plan_id``, ``kind``, ``question`` and
+        ``created_at``.  ``kind`` is the decision's ``source`` -- the
+        postprocess approval is ``postprocess_approval``, a failure
+        review is whatever source it was asked under -- because that
+        is the name the event payload gives it too.
+    """
+    with _store_of(store) as opened:
+        return [
+            {
+                "decision_id": row["decision_id"],
+                "plan_id": row["plan_id"],
+                "kind": row["kind"],
+                "question": row["question"],
+                "created_at": row["created_at"],
+            }
+            for row in opened.list_open_all()
+        ]
+
+
 def _canonical_status(
     status: Optional[Union[str, DecisionStatus]],
 ) -> Optional[str]:

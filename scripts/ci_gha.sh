@@ -511,6 +511,15 @@ while :; do
             # A lane that ran and failed -- or a job list that could not
             # be read, which is the fail-safe direction.  Nothing is
             # relaxed here.
+            #
+            # The exit code says *that* the gate is red; the job list says
+            # *which* lane is red.  Without the second half the verdict
+            # carries no locatable evidence, and whoever reads the run has
+            # to go back to the API by hand to find out what failed.  The
+            # job list is already in hand here, so the failing job(s) are
+            # named before the verdict is emitted.
+            printf 'ci_gha: failing job(s) of run %s:\n' "${run_id}"
+            ci_gha_describe_jobs "${jobs_json}" || true
             emit_gate "FAILED" "1"
             exit 1
         fi

@@ -74,6 +74,20 @@ languages on purpose: the CI gate reads one string out of both
 changelogs, and a section that exists in only one of them is a section
 half the readers never see.*
 
+- **A paused plan is only stopped when its processes really are.** The
+  repair-round pause in `backend/verification_loop.py` reads the plan's
+  process ledger after the stop and reports `pause_kill_incomplete` when
+  anything of the plan is still alive, instead of treating the executor's
+  exit as proof that the work stopped — a plan never says "stopped" while
+  part of it still runs. **No verdict changed**: what a round reports
+  about its verification points is unchanged.
+
+- **A red CI gate names the lane that failed.** `scripts/ci_gha.sh`
+  prints the failing job(s) of the run before it emits the FAILED
+  verdict — the job list is already in hand — so a red whole-repo gate
+  carries locatable evidence instead of an exit code alone. **No verdict
+  changed**: the gate's pass/fail decision is the same.
+
 - **A terminal failure announces its own review once.** When execution or
   verification settles on a terminal failure, `backend/verification_loop.py`
   announces a failure review after the terminal phase is written — once per

@@ -4484,6 +4484,53 @@ def _repair_stop_reason(exit_code: int) -> str:
     return f"repair_non_zero_exit:{exit_code}"
 
 
+def _pause_surviving_pids(plan_dir: Path) -> List[int]:
+    """The plan's processes that are still alive — a read-only probe.
+
+    A pause is only *honoured* when the work it asked to stop has
+    actually stopped.  The stop's kill is best-effort — SIGTERM, then
+    SIGKILL, then give up — and the executor's children detach from
+    it, so the executor's own exit proves nothing about the rest of the
+    plan's tree.
+
+    The answer comes from the plan's own process ledger: the records it
+    holds whose pid the kernel still says is alive.  Reading it sends
+    no signal and reaps nothing, so asking the question does not
+    change what it measures.
+
+    A ledger that cannot be read answers "nothing survives".  The
+    conservative direction would be the other way round, but a plan
+    whose ledger is unreadable is a plan the reaper cannot act on
+    either — and a false survivor would strand the plan in
+    ``pause_kill_incomplete`` with nothing running to end it.
+
+    The liveness read is the plain "is this pid still a process"
+    question, not an identity check — the same trade-off
+    :func:`routes.verification._surviving_vp_ids` makes.  A pid the
+    kernel handed to somebody else is therefore possible, and it errs
+    towards the *safe* side: the stranger is reported as a survivor,
+    so the round is not declared stopped.  The cost of that error is
+    that the pause is not honoured (the plan keeps running and the
+    warning names the pid) — recoverable, and never a plan that says
+    "stopped" while something of it is still running.
+    """
+    try:
+        import process_reaper
+
+        records = process_ledger.live_records(plan_dir)
+    except Exception:  # noqa: BLE001 — an unreadable ledger is not a survivor
+        return []
+    surviving: List[int] = []
+    for pid in sorted(records):
+        try:
+            alive = bool(process_reaper._alive(int(pid)))
+        except Exception:  # noqa: BLE001 — "I could not look" is not "it lives"
+            alive = False
+        if alive:
+            surviving.append(int(pid))
+    return surviving
+
+
 def _repair_exit_writer(
     plan_id: str,
     plan_dir: Path,
@@ -5208,6 +5255,12 @@ def _run_repair_execution_async(
         # exit verdict below and the re-entry callback after it --
         # stands down together.
         interrupted_by_shutdown = False
+        # 2026-11-20 (arch decision R1): the pause's two verdicts.
+        # ``_pause_honoured`` says the pause took and the round ends as
+        # ``stopped``; ``_pause_kill_incomplete`` says the kill did not
+        # land, so the plan is still running and the round does not end.
+        _pause_honoured = False
+        _pause_kill_incomplete = False
         try:
             # ``process.wait()`` is safe — stdout/stderr redirected to
             # log file (no PIPE-buffer deadlock). The verification
@@ -5363,24 +5416,66 @@ def _run_repair_execution_async(
                     # otherwise linger here and keep the watchdog
                     # yielding over this crash.
                     state["executor_finished_cleanly"] = False
-                    state["status"] = "failed"
-                    # The reason says HOW the round ended — an exit
-                    # code the executor chose, or a signal that
-                    # killed it.  See :func:`_repair_stop_reason`.
-                    state["stop_reason"] = _repair_stop_reason(
-                        process.returncode
-                    )
+                    # 2026-11-20 (arch decision R1 — 暂停必须停在
+                    # stopped): a pause that was ASKED FOR is not a
+                    # failure.  The exit code cannot tell the two
+                    # apart — the SIGTERM the pause's own kill sends
+                    # looks exactly like a crash — so the intent on
+                    # disk is what decides it.
+                    #
+                    # The intent is READ, never assumed: a torn or
+                    # reasonless file reads as no intent (see
+                    # :func:`pause_state.read_pause_intent`), so a
+                    # damaged file cannot turn a crash into a pause.
+                    # No intent → the round failed, exactly as before.
+                    from pause_state import read_pause_intent
+
+                    if read_pause_intent(plan_dir) is not None:
+                        _surviving = _pause_surviving_pids(plan_dir)
+                        if _surviving:
+                            # The kill did not land: the plan is still
+                            # running, so it is NOT stopped and its
+                            # phase stays where it is.  The reason says
+                            # why — a pause was requested and the pause
+                            # did not take.
+                            _pause_kill_incomplete = True
+                            state["stop_reason"] = "pause_kill_incomplete"
+                            _server.logger.warning(
+                                "pause_kill_incomplete plan=%s pids=%s",
+                                plan_id, _surviving,
+                            )
+                        else:
+                            # The tree is gone: the pause is honoured
+                            # and the round ends as ``stopped`` — the
+                            # status a resume can pick up.  The intent
+                            # is cleared once that status is on disk.
+                            state["status"] = "stopped"
+                            state["stop_reason"] = "paused"
+                            _pause_honoured = True
+                    else:
+                        state["status"] = "failed"
+                        # The reason says HOW the round ended — an exit
+                        # code the executor chose, or a signal that
+                        # killed it.  See :func:`_repair_stop_reason`.
+                        state["stop_reason"] = _repair_stop_reason(
+                            process.returncode
+                        )
                 # A parked round is not over — ``ended_at`` stays None so
                 # the readers that ask "did this run end?" are not told
                 # it did.  Every other outcome (completed, failed) ends
-                # the round.
+                # the round.  A pause whose kill did not land is not
+                # over either: the plan is still running.
                 state["ended_at"] = (
                     None
-                    if state["status"] == QUOTA_WAIT_PHASE
+                    if (
+                        state["status"] == QUOTA_WAIT_PHASE
+                        or _pause_kill_incomplete
+                    )
                     else datetime.now().isoformat()
                 )
 
             # Persist terminal status to plan_execution.
+            _status_written = False
             try:
                 from state_machine.db.connection import open as _open_db
                 from state_machine.db.schema import migrate as _migrate
@@ -5395,6 +5490,7 @@ def _run_repair_execution_async(
                         plan_id,
                         state["status"],
                     )
+                    _status_written = True
                 finally:
                     _persist_conn.close()
             except _PlanNotFoundError:
@@ -5404,6 +5500,18 @@ def _run_repair_execution_async(
                     "[repair_async] update_status to plan_execution failed plan=%s",
                     plan_id,
                 )
+
+            # The pause's intent is cleared only once the status it
+            # claims is on disk.  Clearing it first would leave a round
+            # that says "stopped" with nothing on disk to show that a
+            # pause was ever asked for; a write that FAILED would leave
+            # a round that never landed with its intent gone — and the
+            # next round would find no evidence of the pause at all and
+            # write the crash back as a failure.
+            if _pause_honoured and _status_written:
+                from pause_state import clear_pause_intent
+
+                clear_pause_intent(plan_dir)
 
             # Fire on_complete callback. The callback runs in this
             # background thread (NOT the FastAPI request thread).

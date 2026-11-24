@@ -874,7 +874,9 @@ def test_202_is_pending_and_carries_the_command_id(
     The caller's wait is bounded; the command is not.  So the answer is
     202 with the command's id, the command is still carried out by the
     worker, and the row the id names ends up with a final outcome the
-    caller can read.
+    caller can read.  The answer also says ``stopping`` and names the
+    plan, so a reader can see which plan the command is about before it
+    has been answered.
 
     The **handshake** is bounded as well: it is the wait that says "the
     command has a record now", and a bounded wait on a busy machine
@@ -899,7 +901,12 @@ def test_202_is_pending_and_carries_the_command_id(
     assert response.status_code == 202, response.text
     body = response.json()
     assert body["outcome"] == "pending", body
-    assert body["status"] == "pending", body
+    # A pause that timed out **with its command recorded** answers
+    # ``stopping``: the worker is carrying the command out, and the read
+    # model's stopping list names the plan, so the panel can draw that
+    # row at once instead of waiting for the command to be answered.
+    assert body["status"] == "stopping", body
+    assert body["plan_id"] == "p-target", body
     assert isinstance(body["command_id"], int), body
 
     # The command was not withdrawn: the worker still carries it out,

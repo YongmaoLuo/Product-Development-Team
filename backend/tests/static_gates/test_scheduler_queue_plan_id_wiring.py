@@ -52,7 +52,7 @@ _PLAN_ID_FIELD = "item.plan_id"
 
 #: The actions the queue card's buttons offer, in the words the source
 #: spells them: 提升 is ``promote`` and 启动 is ``start``.
-_QUEUE_ACTIONS = ("promote", "start")
+_QUEUE_ACTIONS = ("promote", "pause", "start")
 
 #: A call to the button renderer, with its arguments.
 _ACTION_CALL_RE = re.compile(r"schedulerActionButtons\s*\(([^)]*)\)")

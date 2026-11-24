@@ -117,7 +117,7 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from config_paths import resolve_state_db_path
 from hitl.models import Decision, DecisionRequest
@@ -125,6 +125,7 @@ from hitl.service import EVENT_DECISION_CREATED
 from hitl.store import HitlStore
 from hooks.dispatcher import dispatch
 from postprocess.executor import NeedsApproval
+from postprocess.pr_ref import extract_pr_ref
 from postprocess.progress import mark
 
 
@@ -186,10 +187,30 @@ POSTPROCESS_WAIT_SOURCE = "postprocess_wait"
 #: an action the executor refused to run on its own.
 POSTPROCESS_APPROVAL_SOURCE = "postprocess_approval"
 
+#: The ``source`` recorded on a wait for something outside.  Such a
+#: wait asks nobody anything, so it has no approval behind it — this
+#: says what it waits for instead.
+EXTERNAL_WAIT_SOURCE = "external"
+
 #: The sources the finishing stage asks its questions under.  A row is
 #: looked up by its source as well as by its item, so a question of the
 #: verification round's own is never mistaken for one of ours.
 _BRIDGE_SOURCES = frozenset({POSTPROCESS_WAIT_SOURCE, POSTPROCESS_APPROVAL_SOURCE})
+
+#: The keys the shared state model of decision point 5 is made of — the
+#: six keys **both** kinds of wait carry.  A wait *record* carries these
+#: and the source the wait came from and the pull request it is about
+#: (:meth:`_Wait.to_record`); the model itself is the part every kind
+#: of wait has, and it is what a caller that only wants to know "what
+#: is this wait" is handed.
+SHARED_STATE_KEYS: Tuple[str, ...] = (
+    "item_id",
+    "wait_type",
+    "question",
+    "deadline",
+    "extensions",
+    "status",
+)
 
 #: The answers a wait offers.  The answer itself is stored as it is
 #: given — the option set is what the question advertises, not what
@@ -302,6 +323,14 @@ class _Wait:
         question: The question put to whoever answers the wait.
         created_at: When the wait was created.
         deadline: When the wait is due.
+        source: Where the wait came from — the approval's own source
+            for a request a human has to approve, the external wait's
+            own source for a wait for something outside, and nothing at
+            all for an ordinary question.
+        pr_number: The pull request the wait is about, when it is about
+            one.
+        pr_url: The link of that pull request, when the command named
+            the repository it lives in.
     """
 
     __slots__ = (
@@ -314,6 +343,9 @@ class _Wait:
         "status",
         "answer",
         "termination",
+        "source",
+        "pr_number",
+        "pr_url",
     )
 
     def __init__(
@@ -323,6 +355,9 @@ class _Wait:
         question: str,
         created_at: datetime,
         deadline: datetime,
+        source: str = "",
+        pr_number: Optional[int] = None,
+        pr_url: Optional[str] = None,
     ) -> None:
         self.item_id = item_id
         self.wait_type = wait_type
@@ -333,14 +368,23 @@ class _Wait:
         self.status = PENDING
         self.answer: Any = None
         self.termination: Optional[Dict[str, str]] = None
+        self.source = source
+        self.pr_number = pr_number
+        self.pr_url = pr_url
 
     def to_record(self) -> Dict[str, Any]:
         """This wait as the shared record — a copy, never the live state.
 
+        The record carries the shared state model — the item, the kind
+        of wait, the question, the deadline, the extension audit and
+        the status — **and** where the wait came from and the pull
+        request it is about (architecture decision points R5 and R6).
+        The answer is **not** part of it: the answer is the registry's
+        own state, and it never lands in the record that goes to the
+        progress file.
+
         Returns:
-            A fresh dict carrying exactly the shared state model: the
-            item, the kind of wait, the question, the deadline, the
-            extension audit and the status.
+            A fresh dict carrying exactly those nine keys.
         """
         return {
             "item_id": self.item_id,
@@ -349,7 +393,23 @@ class _Wait:
             "deadline": self.deadline.isoformat(),
             "extensions": copy.deepcopy(self.extensions),
             "status": self.status,
+            "source": self.source,
+            "pr_number": self.pr_number,
+            "pr_url": self.pr_url,
         }
+
+    def to_shared_state(self) -> Dict[str, Any]:
+        """The shared state model alone — the six keys both kinds share.
+
+        This is what :meth:`WaitRegistry.create_wait` answers with: the
+        part of the record that says what the wait **is** — its item,
+        its kind, its question, its deadline, its extension audit and
+        its status.  The rest of the record — the source the wait came
+        from and the pull request it is about — is read back with
+        :meth:`WaitRegistry.get`.
+        """
+        record = self.to_record()
+        return {key: record[key] for key in SHARED_STATE_KEYS}
 
 
 class WaitRegistry:
@@ -429,6 +489,70 @@ class WaitRegistry:
         """
         return [wait.to_record() for wait in self._waits.values()]
 
+    def decision_id_of(self, item_id: str) -> Optional[str]:
+        """The id of the decision row this item's question was stored as.
+
+        The id is remembered when the question is created.  A wait
+        outlives the process that created it — a week-long wait does —
+        so the row is looked up in the store when the registry does not
+        remember it: the row carries the item's id, and its ``source``
+        says the finishing stage is who asked.
+
+        Read-only: this accessor never writes, and it never answers a
+        question.  What the row carries is read with
+        :meth:`decision_by_id`.
+
+        Args:
+            item_id: The item the wait belongs to.
+
+        Returns:
+            The id of the decision row, or ``None`` when this item never
+            had a question stored.
+        """
+        remembered = self._decision_ids.get(item_id)
+        if remembered is not None:
+            return remembered
+
+        try:
+            decision = self._decision_of(item_id)
+        except Exception as exc:  # noqa: BLE001 — 读不到就是没有
+            logger.warning(
+                "postprocess_wait_decision_unreadable: item=%s: %s", item_id, exc
+            )
+            return None
+        if decision is None:
+            return None
+        return str(decision.decision_id)
+
+    def decision_by_id(self, decision_id: str) -> Optional[Decision]:
+        """The decision row with this id — read-only.
+
+        The row is what a human answered: it carries the question, the
+        status the answer left behind and the answer itself.  It is
+        read here and nowhere else, so the answer stays where it was
+        written — the row in the ``plan_decisions`` table — and never
+        lands in a wait record.
+
+        Args:
+            decision_id: The id of the row.
+
+        Returns:
+            The decision, or ``None`` when there is no such row — no
+            store behind the registry, an unknown id, or a store that
+            cannot be read.
+        """
+        if self._store is None or not decision_id:
+            return None
+        try:
+            return self._store.get(decision_id)
+        except Exception as exc:  # noqa: BLE001 — 读不到就是没有答复
+            logger.warning(
+                "postprocess_wait_decision_unreadable: decision=%s: %s",
+                decision_id,
+                exc,
+            )
+            return None
+
     def remaining_seconds(self, item_id: str) -> int:
         """How much time is left on a wait.
 
@@ -457,6 +581,9 @@ class WaitRegistry:
         *,
         wait_type: Optional[str] = None,
         seconds: Optional[int] = None,
+        record_source: str = "",
+        pr_number: Optional[int] = None,
+        pr_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create the wait of one requirement item.
 
@@ -471,9 +598,17 @@ class WaitRegistry:
             wait_type: Overrides the kind of wait the item declares.
             seconds: The limit of this wait, in seconds.  Defaults to
                 :data:`DEFAULT_WAIT_SECONDS`.
+            record_source: The source the record carries — it says
+                where the wait came from.  A wait for something
+                outside says so itself when the caller states nothing.
+            pr_number: The pull request the wait is about, when it is
+                about one.
+            pr_url: The link of that pull request.
 
         Returns:
-            The new wait record.
+            The new wait's shared state — the six keys of decision
+            point 5.  The record that also carries the source and the
+            pull request is read back with :meth:`get`.
 
         Raises:
             WaitError: When the item has no usable id, the question is
@@ -494,6 +629,7 @@ class WaitRegistry:
             seconds
         )
 
+        source = record_source or (EXTERNAL_WAIT_SOURCE if kind == "external" else "")
         created_at = self._now()
         deadline = created_at + timedelta(seconds=limit)
         wait = _Wait(
@@ -502,10 +638,13 @@ class WaitRegistry:
             question=question,
             created_at=created_at,
             deadline=deadline,
+            source=source,
+            pr_number=pr_number,
+            pr_url=pr_url,
         )
         self._waits[item_id] = wait
         self._persist(wait)
-        return wait.to_record()
+        return wait.to_shared_state()
 
     def extend_deadline(
         self,
@@ -655,6 +794,9 @@ class WaitRegistry:
         source: str = POSTPROCESS_WAIT_SOURCE,
         options: Tuple[str, ...] = WAIT_OPTIONS,
         note: str = "",
+        record_source: str = "",
+        pr_number: Optional[int] = None,
+        pr_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Ask a human, on behalf of one requirement item, and wait.
 
@@ -684,6 +826,13 @@ class WaitRegistry:
             options: The answers the question offers.
             note: A remark stored with the question — the command an
                 approval request is about, for instance.
+            record_source: The source the **wait record** carries.  It
+                is the row's own business: it says where the wait came
+                from, so a reader of the waiting rows can tell an
+                approval from an ordinary question.
+            pr_number: The pull request the question is about, when it
+                is about one.
+            pr_url: The link of that pull request.
 
         Returns:
             The wait record, carrying the id of the decision row the
@@ -701,12 +850,18 @@ class WaitRegistry:
             source=source,
             options=options,
             note=note,
+            record_source=record_source,
+            pr_number=pr_number,
+            pr_url=pr_url,
         )
 
     def create_approval_request(
         self,
         item: Mapping[str, Any],
         question: Any,
+        *,
+        pr_number: Optional[int] = None,
+        pr_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Turn an action the executor refused to run into a question.
 
@@ -722,12 +877,23 @@ class WaitRegistry:
         the delivery are the ones a plain question gets, with the
         approval's own source, options and note.
 
+        The record says where the wait came from — an approval request
+        is not an ordinary question — and names the pull request it is
+        about when the command names one (architecture decision points
+        R5 and R6).
+
         Args:
             item: The requirement item the request belongs to.
             question: Either the question itself, or the
                 :class:`~postprocess.executor.NeedsApproval` the
                 executor produced — its question is used verbatim and
                 the argv it names is recorded with the question.
+            pr_number: The pull request the request is about.  When the
+                caller states nothing, it is read off the argv the
+                executor refused to run.
+            pr_url: The link of that pull request.  It is read off the
+                same argv when the caller states nothing, and it stays
+                empty when the argv names no repository.
 
         Returns:
             The wait record, carrying the id of the decision row the
@@ -741,6 +907,9 @@ class WaitRegistry:
         note = ""
         if isinstance(question, NeedsApproval):
             note = "待批准的命令: " + " ".join(str(part) for part in question.command)
+            pr_number, pr_url = _pull_request_of(
+                question.command, pr_number=pr_number, pr_url=pr_url
+            )
             question = question.question
         return self.create_human_wait(
             item,
@@ -748,6 +917,9 @@ class WaitRegistry:
             source=POSTPROCESS_APPROVAL_SOURCE,
             options=APPROVAL_OPTIONS,
             note=note,
+            record_source=POSTPROCESS_APPROVAL_SOURCE,
+            pr_number=pr_number,
+            pr_url=pr_url,
         )
 
     def create_external_wait(
@@ -787,9 +959,9 @@ class WaitRegistry:
             raise WaitError(f"外部复查必须是可调用对象, got {type(check).__name__}")
         item_id = self._item_id_of(item)
         asked = question if question else item.get("action", "")
-        record = self.create_wait(item, asked, wait_type="external")
+        self.create_wait(item, asked, wait_type="external")
         self._checks[item_id] = check
-        return {**record, "decision_id": None}
+        return {**self._waits[item_id].to_record(), "decision_id": None}
 
     def check_external_wait(self, item_id: str) -> Dict[str, Any]:
         """Run the registered recheck of one external wait.
@@ -1094,6 +1266,9 @@ class WaitRegistry:
         source: str,
         options: Tuple[str, ...],
         note: str = "",
+        record_source: str = "",
+        pr_number: Optional[int] = None,
+        pr_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a wait whose question is stored in the HITL table.
 
@@ -1117,7 +1292,15 @@ class WaitRegistry:
             raise WaitError("等待的问题必须是非空字符串")
 
         item_id = self._item_id_of(item)
-        record = self.create_wait(item, question, wait_type="human")
+        self.create_wait(
+            item,
+            question,
+            wait_type="human",
+            record_source=record_source,
+            pr_number=pr_number,
+            pr_url=pr_url,
+        )
+        record = self._waits[item_id].to_record()
 
         existing = self._decision_of(item_id)
         if existing is not None:
@@ -1408,3 +1591,28 @@ def _plan_delivery(plan_dir: Path) -> Callable[[Mapping[str, Any]], Any]:
         return report
 
     return deliver
+
+
+def _pull_request_of(
+    command: Sequence[Any],
+    *,
+    pr_number: Optional[int],
+    pr_url: Optional[str],
+) -> Tuple[Optional[int], Optional[str]]:
+    """The pull request a command is about, and the link to it.
+
+    What the caller stated wins: a caller that read the pull request
+    somewhere else knows more than this module does.  Only what the
+    caller left open is read off the command — and a command that names
+    no pull request at all leaves both of them empty.
+    """
+    if pr_number is not None and pr_url is not None:
+        return pr_number, pr_url
+    reference = extract_pr_ref(command)
+    if reference is None:
+        return pr_number, pr_url
+    if pr_number is None:
+        pr_number = reference["pr_number"]
+    if pr_url is None:
+        pr_url = reference["pr_url"]
+    return pr_number, pr_url

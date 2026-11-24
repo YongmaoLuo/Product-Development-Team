@@ -191,6 +191,7 @@ from .config import (
 )
 from .facts import QUEUED_PHASE
 from .policy import admission_verdict, converge
+from .retry import is_db_locked, retry_on_busy
 from .snapshot import (
     CAPACITY_SOURCE_CONFIG,
     CAPACITY_SOURCE_OVERRIDE,
@@ -1872,10 +1873,37 @@ class PlanSchedulerEngine:
         The plans are enqueued in the facts' own order — the order the
         shared comparator gives — so the line the scheduler runs is the
         line the panel shows, even on the very first tick.
+
+        The reconciliation writes to the state database, and the state
+        database is shared with every other writer in the process.  A
+        write that arrives while somebody else holds the write lock
+        comes back as SQLite's ``database is locked``, and that is a
+        transient condition rather than a fault of the plan: so the
+        phase waits it out (see :meth:`_retry_reconcile`) instead of
+        letting one busy moment cost the tick its whole queue.
         """
         state = self._state
         if state is None:
             return
+        if not self._retry_reconcile(
+            "queue", lambda: self._reconcile_queue_once(state)
+        ):
+            # The database stayed busy: this phase is deferred to the
+            # next tick, and the tick goes on to the next phase.
+            return
+
+    def _reconcile_queue_once(self, state: Dict[str, Any]) -> None:
+        """Reconcile the queue table with the plan facts.
+
+        This is the work :meth:`_phase_reconcile_queue` does, without
+        the waiting: the caller runs it again when the database is
+        busy, and every step in it is safe to run twice — a plan that
+        is already queued keeps its number and its place, and a plan
+        whose row was already taken away is not there to take again.
+
+        Args:
+            state: the state this tick decides on.
+        """
         waiting = {str(row["plan_id"]) for row in state.get("waiting", [])}
         # The rows that already exist are read from the **table** and
         # not from the view: the view drops the rows the facts do not
@@ -1917,16 +1945,84 @@ class PlanSchedulerEngine:
         an answer and has nothing running any more gives its slot
         back, so the release is a decision the tick takes and not a
         side effect of the reconciliation.
+
+        The reconciliation writes to the state database, and the state
+        database is shared with every other writer in the process.  A
+        write that arrives while somebody else holds the write lock
+        comes back as SQLite's ``database is locked``, and that is a
+        transient condition rather than a fault of the plan: so the
+        phase waits it out (see :meth:`_retry_reconcile`) instead of
+        letting one busy moment cost the tick its whole count.
         """
         state = self._state
         if state is None:
             return
+        if not self._retry_reconcile(
+            "capacity", lambda: self._reconcile_capacity_once(state)
+        ):
+            # The database stayed busy: this phase is deferred to the
+            # next tick, and the tick goes on to the next phase.
+            return
+
+    def _reconcile_capacity_once(self, state: Dict[str, Any]) -> None:
+        """Reconcile the slots with the plan facts.
+
+        This is the work :meth:`_phase_reconcile_capacity` does, without
+        the waiting: the caller runs it again when the database is
+        busy, and every step in it is safe to run twice — a slot that
+        was already given back is not there to give back again, and the
+        ledger's reconciliation is a reconciliation.
+
+        Args:
+            state: the state this tick decides on.
+        """
         self._release_hitl_slots()
         self._ledger.reconcile()
         state["used"] = self._ledger.used()
         state["running"] = self._running_view(
             self._store.list_slots(self._conn), self._now()
         )
+
+    def _retry_reconcile(self, name: str, work: Callable[[], Any]) -> bool:
+        """Run a reconciliation, waiting out a locked database.
+
+        A reconcile writes to the state database, and the state
+        database is shared with every other writer in the process.  A
+        write that arrives while somebody else holds the write lock
+        comes back as SQLite's ``database is locked`` — a transient
+        condition, and not a fault of the plan the reconcile was about.
+
+        So the work is run through :func:`retry_on_busy`: a lock is
+        waited out with a bounded backoff and the work is tried again.
+        When the attempts are spent the phase gives up **quietly**: it
+        says it deferred the reconciliation and returns, so the next
+        tick tries again.  A deferred reconcile is not a failure: no
+        plan is marked failed, nothing is written to the command log,
+        and the phases that follow in this tick still run.
+
+        An error that is **not** a lock is raised as it happened.  A
+        missing table or a broken row is not going to be fixed by
+        waiting, and a reconcile that cannot do its work must not be
+        swallowed — the failure is recorded and the tick goes on.
+
+        Args:
+            name: what the reconciliation is called — the phase's name.
+            work: the reconciliation to run.
+
+        Returns:
+            ``True`` when the work was carried out, ``False`` when it
+            was deferred because the database stayed busy.
+        """
+        try:
+            retry_on_busy(work)
+        except Exception as exc:
+            if not is_db_locked(exc):
+                # Not a lock: the reconcile is broken, and a broken
+                # reconcile must be seen.
+                raise
+            log.warning("reconcile_%s_deferred", name)
+            return False
+        return True
 
     def _phase_converge(self) -> None:
         """Interrupt the plans that are over the capacity.
@@ -2373,6 +2469,12 @@ class PlanSchedulerEngine:
         The parked plans are in the state too: a plan parked for quota
         holds no slot and is in no line, so the read model would not
         see it at all without them.
+
+        The commands that are still in flight are in the state as well:
+        a plan that is asked to stop and is not answered yet is in
+        neither the running line nor the queue, so the read model has
+        to name it somewhere — otherwise the operator cannot tell "the
+        pause worked" from "the pause was lost".
         """
         now = self._now()
         conn = self._conn if conn is None else conn
@@ -2419,9 +2521,62 @@ class PlanSchedulerEngine:
             # read model could not see the one plan that stopped for
             # want of provider capacity.
             "parked": self._parked_plans(facts=facts),
+            # The commands that are still in flight — the command
+            # log's answer.  A plan that is asked to stop and is not
+            # answered yet is in neither the running line nor the
+            # queue, so the read model has to name it somewhere.
+            "stopping": self._open_commands(conn=conn),
         }
         self._rebuild_line(state, conn=conn, facts=facts, ledger=ledger)
         return state
+
+    def _open_commands(
+        self, conn: Optional[sqlite3.Connection] = None
+    ) -> List[Dict[str, Any]]:
+        """Return the commands that were accepted and are not answered yet.
+
+        The command log is the scheduler's own fact: a command is
+        written the moment the worker takes it, with the outcome it
+        has *so far* (``accepted``), and it is turned into ``applied``
+        or ``failed`` only once the worker has answered.  A command
+        that is still ``accepted`` is therefore a command that is still
+        in flight.
+
+        A store that cannot answer — one whose database another writer
+        holds the lock on — costs the read model nothing: the answer
+        is "no command is in flight", which is the safe direction, and
+        the tick itself keeps going.  The failure is logged rather
+        than swallowed.
+
+        The command log is read on the connection the caller reads on:
+        the tick reads the write connection — it decides on what it
+        has just written — and the read model reads the read
+        connection, so the document does not wait for the worker's
+        transaction.  A command log read on the write connection would
+        put the lock the split took out right back.
+
+        The reader is duck-typed on purpose, like the parked plans':
+        the engine asks the store what it knows, and a fact the store
+        does not carry is not a fact the engine may insist on.
+        """
+        reader = getattr(self._store, "list_open_commands", None)
+        if not callable(reader):
+            return []
+        conn = self._conn if conn is None else conn
+        try:
+            rows = reader(conn)
+        except Exception as exc:  # noqa: BLE001 — the tick must survive
+            log.warning(
+                "[scheduler] the open commands could not be read (%s: %s); "
+                "reporting none",
+                type(exc).__name__,
+                exc,
+            )
+            return []
+        try:
+            return list(rows or [])
+        except TypeError:
+            return []
 
     def _parked_plans(self, facts: Any = None) -> List[Dict[str, Any]]:
         """Return the plans parked for quota, or none when the facts cannot say.

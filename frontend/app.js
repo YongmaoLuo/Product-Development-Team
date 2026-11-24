@@ -3378,7 +3378,7 @@ function renderSchedulerQueue(snapshot) {
                     value: schedulerReasonText(item.reason),
                 },
             ],
-            actions_html: schedulerActionButtons(planId, ["promote", "start"]),
+            actions_html: schedulerActionButtons(planId, ["promote", "pause", "start"]),
         };
     });
 
@@ -3571,6 +3571,16 @@ function schedulerQuestionText(question) {
     return text.slice(0, SCHEDULER_QUESTION_MAX) + "…";
 }
 
+/** How long ago the stop command was asked for — whole seconds, the
+    unit the panel speaks in.  An age nobody knows is "—" and not a
+    zero: a zero would say the command was taken just now. */
+function schedulerStoppingAgeText(seconds) {
+    if (seconds === null || seconds === undefined) return "—";
+    const total = Number(seconds);
+    if (!Number.isFinite(total)) return "—";
+    return `${Math.max(0, Math.floor(total))}s`;
+}
+
 /** The waiting list — what the operator is actually waiting for.
 
     The row carries the plan, the item, the kind of wait, the time
@@ -3578,21 +3588,37 @@ function schedulerQuestionText(question) {
     order is the read model's own; the panel does not sort the waits
     either.
 
+    The plans that are **stopping** are drawn in the same panel, and
+    they come first.  A plan whose stop command was accepted but not
+    yet carried out is in neither the queue nor the running list, so
+    without this row it would simply be gone — and the operator would
+    not know whether the plan is on its way out or has fallen off
+    the panel (arch decision R3).
+
     An empty list is an empty state, not an error: "nothing is
     waiting" is a normal thing to look at. */
 function renderSchedulerWaiting(snapshot) {
     const rows = snapshot && Array.isArray(snapshot.waiting) ? snapshot.waiting : [];
+    const stopping = snapshot && Array.isArray(snapshot.stopping) ? snapshot.stopping : [];
     const body = $("#scheduler-waiting-body");
     if (!body) return;
 
-    if (!rows.length) {
-        body.innerHTML = "";
-        schedulerToggle($("#scheduler-waiting-table"), false);
-        schedulerToggle($("#scheduler-waiting-empty"), true);
-        return;
-    }
+    // The panel is repainted every five seconds.  The rows of the last
+    // paint are cleared before the new ones are drawn, so a plan that
+    // stopped and started again leaves no row behind, and the stopping
+    // rows do not stack under themselves either.
+    body.innerHTML = "";
 
-    body.innerHTML = rows
+    const stoppingRows = stopping
+        .map((row) => {
+            const item = row || {};
+            const planId = item.plan_id ? String(item.plan_id) : "";
+            const action = item.action ? String(item.action) : "—";
+            return `<tr data-stopping-plan="${escapeHtml(planId)}"><td>${escapeHtml(planId || "—")}</td><td>停止中</td><td>${escapeHtml(action)}</td><td>${escapeHtml(schedulerStoppingAgeText(item.age_seconds))}</td><td></td></tr>`;
+        })
+        .join("");
+
+    const waitRows = rows
         .map((row) => {
             const item = row || {};
             const planId = item.plan_id ? String(item.plan_id) : "";
@@ -3648,8 +3674,18 @@ function renderSchedulerWaiting(snapshot) {
         })
         .join("");
 
-    schedulerToggle($("#scheduler-waiting-table"), true);
-    schedulerToggle($("#scheduler-waiting-empty"), false);
+    // The stopping rows go in first: they are the ones the operator is
+    // waiting for, and they are in no other list.
+    if (stoppingRows) body.insertAdjacentHTML("beforeend", stoppingRows);
+    if (waitRows) body.insertAdjacentHTML("beforeend", waitRows);
+
+    // The hint says that this panel is showing something other than
+    // the waits — and only while it is.
+    schedulerToggle($("#scheduler-stopping-hint"), Boolean(stoppingRows));
+
+    const filled = Boolean(stoppingRows) || Boolean(waitRows);
+    schedulerToggle($("#scheduler-waiting-table"), filled);
+    schedulerToggle($("#scheduler-waiting-empty"), !filled);
 }
 
 /** The three operations of one waiting row.
@@ -3881,6 +3917,68 @@ function schedulerPlanPhase(plan) {
     return String(plan.current_phase || plan.status || "");
 }
 
+/** The review queue (待你审核): what is waiting for the operator's
+    answer.
+
+    The three groups are always in the markup — a pull request to
+    merge, a HITL decision, and an approval — so "empty" and "missing"
+    are two different things: an empty group is hidden, and a group
+    with rows is shown.  The panel is repainted every five seconds, so
+    the rows of the last paint go before the new ones go in; a row
+    that outlived its paint would stack under itself.
+
+    A row that names a link is that link: the pull request is the
+    thing the operator has to act on, and the browser takes them
+    there.  A row that names no link is clicked to go to the plan it
+    is about — the same navigation the plan list uses, so there is no
+    second way of opening a plan. */
+function renderReviewQueue(queue) {
+    const data = queue && typeof queue === "object" ? queue : {};
+    const groups = [
+        ["review-queue-pr-merge", "pr_merge"],
+        ["review-queue-hitl", "hitl"],
+        ["review-queue-approval", "approval"],
+    ];
+
+    groups.forEach(([id, key]) => {
+        const box = document.getElementById(id);
+        if (!box) return;
+        const rows = Array.isArray(data[key]) ? data[key] : [];
+
+        // The rows of the last paint go first.
+        box.querySelectorAll(".scheduler-review-row").forEach((row) => row.remove());
+
+        rows.forEach((row) => {
+            const item = row && typeof row === "object" ? row : {};
+            const planId = item.plan_id ? String(item.plan_id) : "";
+            const title = item.title ? String(item.title) : "";
+            const detail = item.detail ? String(item.detail) : "";
+            // Only a web link is a link: anything else is treated as
+            // no link at all, and the row goes to the plan instead.
+            const raw = item.link ? String(item.link) : "";
+            const link = /^https?:\/\//i.test(raw) ? raw : "";
+            const inner = [
+                `<span class="scheduler-review-title">${escapeHtml(title || "—")}</span>`,
+                `<span class="scheduler-review-detail">${escapeHtml(detail)}</span>`,
+                `<span class="scheduler-review-plan">${escapeHtml(planId || "—")}</span>`,
+            ].join(" ");
+            const html = link
+                ? `<a class="scheduler-review-row" data-review-plan="${escapeHtml(planId)}" href="${escapeHtml(link)}" target="_blank" rel="noopener noreferrer">${inner}</a>`
+                : `<button type="button" class="scheduler-review-row" data-review-plan="${escapeHtml(planId)}">${inner}</button>`;
+            box.insertAdjacentHTML("beforeend", html);
+        });
+
+        // An empty group is hidden: the three groups are always in the
+        // markup, and the operator must not be shown a heading with
+        // nothing under it.
+        if (rows.length) {
+            box.style.display = "";
+        } else {
+            box.style.display = "none";
+        }
+    });
+}
+
 /** The plans an operator can act on, with the actions their phase
     allows.  The order is the listing's own — the panel does not sort
     the plans either.
@@ -3933,6 +4031,10 @@ function renderScheduler(snapshot) {
     renderSchedulerQueue(data);
     renderSchedulerRunning(data);
     renderSchedulerWaiting(data);
+    // The review queue is part of the same read model: what is waiting
+    // for the operator's answer is answered by the same document that
+    // answers what is running.
+    renderReviewQueue(data.review_queue);
     // The cards are written folded; the ones the operator opened are
     // re-opened here, so a repaint does not close them under the
     // operator's eyes.
@@ -4195,9 +4297,16 @@ const SCHEDULER_OUTCOME_TEXT = {
     ``started`` is the answer both to a start into a free slot and to
     a start that had to take a slot away from somebody.  So the
     detail decides the sentence, and the outcome decides it only when
-    the detail says nothing more. */
+    the detail says nothing more.
+
+    A pause that timed out is the one answer that is not in the
+    command's own words: the command was carried out on the record and
+    the worker is still working on it, so the plan is **stopping** —
+    and that is what the panel says, at once, instead of the word
+    "pending" that tells the operator nothing they can act on. */
 function schedulerOutcomeText(result) {
     if (!result) return "";
+    if (result.status === "stopping") return "停止中";
     const outcome = result.outcome ? String(result.outcome) : "";
     const detail = result.detail !== undefined && result.detail !== null
         ? String(result.detail)
@@ -4218,7 +4327,12 @@ function schedulerOutcomeText(result) {
     return SCHEDULER_OUTCOME_TEXT[outcome] ?? outcome;
 }
 
-/** What a command did, in the command's own words. */
+/** What a command did, in the command's own words.
+
+    The outcome line carries the short sentence and the detail line the
+    long one; both are the panel's own words, so a server token never
+    reaches the operator.  A pause that timed out is answered 「停止中」
+    — see ``schedulerOutcomeText``. */
 function renderSchedulerOutcome(result) {
     schedulerSetText("#scheduler-action-outcome", schedulerOutcomeText(result));
     schedulerSetText("#scheduler-action-detail", schedulerDetailText(result));
@@ -4291,9 +4405,26 @@ function renderSchedulerError(err) {
 }
 
 /** An action has been carried out: show what it did and read the read
-    model again, so the panel shows the state the command produced. */
+    model again, so the panel shows the state the command produced.
+
+    A pause that timed out is the one answer that does **not** wait:
+    the command is on the record, the worker is still carrying it out,
+    and the answer says ``stopping``.  The read model is therefore
+    refreshed in the background — the page must not block on a
+    scheduler that is busy, because that wait is what made the whole
+    page hang on a single click.
+
+    The refresh goes through ``loadInBackground`` and not through a
+    bare call: a load nobody holds is a rejection nobody catches, and
+    an uncaught rejection is a page-level failure.  It is the **same**
+    entry point either way — ``loadSchedulerState``, with the sequence
+    guard that keeps two reads from painting over each other. */
 async function schedulerActionDone(result) {
     renderSchedulerOutcome(result);
+    if (result && result.status === "stopping") {
+        loadInBackground(loadSchedulerState, "scheduler state");
+        return;
+    }
     await loadSchedulerState();
 }
 
@@ -4569,6 +4700,30 @@ function bindSchedulerCards() {
         if (!header) return;
         event.preventDefault();
         toggleSchedulerCard(header.dataset.schedulerToggle);
+    });
+}
+
+/** One listener for the review queue: a row that names no link is
+    clicked to go to the plan it is about.
+
+    The navigation is the one the plan list uses — a second way of
+    opening a plan would be a second thing to keep in step with the
+    first.  A row that carries a link is that link, and the browser
+    takes the operator to the pull request. */
+function bindSchedulerReviewQueue() {
+    const root = $("#scheduler-review-queue");
+    if (!root) return;
+    root.addEventListener("click", (event) => {
+        const target = event.target;
+        if (!target || !target.closest) return;
+        const row = target.closest("[data-review-plan]");
+        if (!row) return;
+        // A row that carries a link is that link.
+        if (row.getAttribute("href")) return;
+        const planId = row.getAttribute("data-review-plan");
+        if (!planId) return;
+        event.preventDefault();
+        loadInBackground(() => resumePlan(planId), "review queue");
     });
 }
 
@@ -4893,6 +5048,9 @@ function init() {
     });
     bindSchedulerActions();
     bindSchedulerCards();
+    // The review queue: a row that names no link goes to the plan it
+    // is about, through the plan list's own navigation.
+    bindSchedulerReviewQueue();
 
     // Initial load.  None of these is waited for — they are fired and
     // forgotten, so each one carries its own rejection handler (see

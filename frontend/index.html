@@ -120,6 +120,35 @@
                     <span id="scheduler-action-detail" class="scheduler-action-detail"></span>
                 </div>
 
+                <!-- The review queue (待你审核): what is waiting for the
+                     operator's answer — a pull request to merge, a HITL
+                     decision, and an approval.  All three groups are in
+                     the markup from the start; the ones with nothing in
+                     them are hidden, so an empty group is never a
+                     heading with nothing under it.
+
+                     A div, and not a nested section: the panel's layout
+                     gates scan the scheduler view as the raw markup
+                     between its opening tag and the first closing
+                     section tag, so a nested one would cut the scan
+                     short.  The heading wears an extra class for the
+                     same reason the waiting and terminal blocks wear
+                     theirs: the panel's two-block scan counts the
+                     headings whose class is exactly "scheduler-subtitle",
+                     and this block is not one of those two. -->
+                <div id="scheduler-review-queue" class="scheduler-review-queue">
+                    <h3 class="scheduler-subtitle scheduler-review-heading">待你审核</h3>
+                    <div id="review-queue-pr-merge" class="scheduler-review-group" style="display: none;">
+                        <h4 class="scheduler-review-group-title">待合入的 PR</h4>
+                    </div>
+                    <div id="review-queue-hitl" class="scheduler-review-group" style="display: none;">
+                        <h4 class="scheduler-review-group-title">待回答的决策</h4>
+                    </div>
+                    <div id="review-queue-approval" class="scheduler-review-group" style="display: none;">
+                        <h4 class="scheduler-review-group-title">待批准</h4>
+                    </div>
+                </div>
+
                 <h3 class="scheduler-subtitle">在跑</h3>
                 <div id="scheduler-running-empty" class="empty-state">
                     <p>没有在跑的计划</p>
@@ -177,6 +206,11 @@
                      The three are commands against three server paths;
                      the answer one reuses the existing HITL path. -->
                 <h3 class="scheduler-subtitle scheduler-waiting-subtitle">等待中</h3>
+                <!-- The hint for the plans that are stopping: they are
+                     drawn in the table below, and this is what says so.
+                     The panel shows it while a plan is stopping and
+                     hides it again when none is. -->
+                <span id="scheduler-stopping-hint" class="hidden">停止中</span>
                 <div id="scheduler-waiting-empty" class="empty-state">
                     <p>没有等待中的条目</p>
                 </div>

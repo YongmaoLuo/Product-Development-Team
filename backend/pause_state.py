@@ -75,6 +75,29 @@ one, never a half-written file — and a delete that fails is silent
 because a checkpoint that cannot be removed costs one wasted resume,
 while a resume path that raised on removal would cost the whole run.
 
+The pause intent
+----------------
+The checkpoint records what a stop interrupted. The **pause intent**
+records the request itself — "a pause was asked for, and here is why" —
+and it is a separate document (``pause_intent.json``) written *before*
+anything acts on the request, because the thing that acts on it may be
+killed right after. A repair round that finds no intent on disk has no
+evidence to give an exit code anything but "failed".
+
+::
+
+    {
+      "schema_version": 1,
+      "reason": "user_pause",                     # why it was asked for
+      "requested_at": "2026-11-20T08:42:50+00:00"  # when it was asked
+    }
+
+It follows the same degradation rule as the checkpoint — absent,
+torn, or reasonless all read as ``None`` — with one difference: a
+**write** that fails is raised rather than swallowed. Storing the
+intent is this layer's whole job; deciding what a failed store means
+belongs to the caller that asked for the pause.
+
 The second half: the session mapping
 ------------------------------------
 The checkpoint above is written *at stop time*, so it can only record a
@@ -105,6 +128,14 @@ PathLike = Union[str, Path]
 
 #: Name of the per-plan checkpoint file.
 PAUSE_CHECKPOINT_FILENAME = "pause_state.json"
+
+#: Name of the per-plan pause-intent file. A separate document from the
+#: checkpoint on purpose: the intent is written *before* the stop
+#: happens, the checkpoint *because of* it.
+PAUSE_INTENT_FILENAME = "pause_intent.json"
+
+#: Bumped only on an incompatible change to the intent document shape.
+_INTENT_SCHEMA_VERSION = 1
 
 #: Bumped only on an incompatible change to the document shape. A
 #: checkpoint written by a newer PDT is treated as unreadable by an older
@@ -374,6 +405,120 @@ def checkpoint_summary(plan_dir: PathLike) -> Optional[Dict[str, Any]]:
     if decision_id is not None:
         summary[_DECISION_ID_FIELD] = decision_id
     return summary
+
+
+# ---------------------------------------------------------------------------
+# The pause intent
+# ---------------------------------------------------------------------------
+#
+# The checkpoint above answers "what did the stop interrupt". The intent
+# answers an earlier and simpler question: "was a pause asked for at
+# all, and why". It is written *before* anything acts on the request,
+# because the thing that acts on it is a process that may be killed
+# right after — and a repair round that cannot find an intent on disk
+# has no evidence to give an exit code anything but "failed".
+#
+# The record is deliberately small:
+#
+#     {
+#       "schema_version": 1,
+#       "reason": "user_pause",              # why the pause was asked for
+#       "requested_at": "2026-11-20T08:42:50+00:00"   # when it was asked
+#     }
+#
+# One file per plan directory, ``pause_intent.json``, written atomically
+# and cleared once the pause has been honoured.
+
+
+def intent_path(plan_dir: PathLike) -> Path:
+    """Where ``plan_dir``'s pause intent lives."""
+    return Path(plan_dir) / PAUSE_INTENT_FILENAME
+
+
+def write_pause_intent(plan_dir: PathLike, *, reason: str) -> Dict[str, Any]:
+    """Record that a pause was asked for, and return what was written.
+
+    The return value is the stored document itself, so a caller can log
+    or assert on exactly the fields a later read will see rather than
+    on what it hoped it passed.
+
+    ``plan_dir`` is created if it does not exist: the intent is the
+    first thing written for a pause, and "the directory is not there
+    yet" is not a reason to drop the request on the floor.
+
+    The write is atomic (tempfile + ``os.replace``), so a kill
+    mid-write leaves no torn file. Unlike the checkpoint, a write that
+    still fails is **raised** rather than swallowed: this layer stores
+    the intent, it does not get to decide what a failed store means —
+    that call belongs to whoever asked for the pause.
+    """
+    intent: Dict[str, Any] = {
+        "schema_version": _INTENT_SCHEMA_VERSION,
+        "reason": _text(reason),
+        "requested_at": _now_iso(),
+    }
+
+    path = intent_path(plan_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, intent, reraise=True, logger=logger)
+    return intent
+
+
+def read_pause_intent(plan_dir: PathLike) -> Optional[Dict[str, Any]]:
+    """The stored pause intent, or ``None`` if there is none to honour.
+
+    ``None`` covers every unusable case — absent, unreadable, not JSON,
+    JSON but not an object, or a document without a ``reason``. Callers
+    therefore have one "no pause was requested" answer to handle and no
+    exception to catch.
+    """
+    path = intent_path(plan_dir)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        # ``ValueError`` covers ``json.JSONDecodeError``. An intent file
+        # torn by a crash mid-write, or written by something else, costs
+        # a pause with no recorded reason and nothing else.
+        logger.warning(
+            "pause_intent_unreadable: ignoring unreadable pause intent %s "
+            "(%s); no pause intent on record",
+            path, type(exc).__name__,
+        )
+        return None
+    if not isinstance(data, dict):
+        return None
+    reason = data.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        # A document without a reason does not say *why* the pause was
+        # asked for, which is the whole content of an intent.
+        logger.warning(
+            "pause_intent_reasonless: ignoring pause intent %s without a "
+            "usable reason; no pause intent on record",
+            path,
+        )
+        return None
+    return data
+
+
+def clear_pause_intent(plan_dir: PathLike) -> None:
+    """Remove the pause intent if it exists; do nothing if it does not.
+
+    Idempotent by design — the "the pause was honoured" path calls this
+    unconditionally, and making it conditional on an existing file would
+    only move the ``FileNotFoundError`` to the caller.
+    """
+    path = intent_path(plan_dir)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning(
+            "pause_intent_clear_failed: could not remove %s (%s); "
+            "a stale pause intent may be re-read",
+            path, type(exc).__name__,
+        )
 
 
 # ---------------------------------------------------------------------------

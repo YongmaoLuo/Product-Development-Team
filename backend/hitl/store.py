@@ -316,6 +316,41 @@ class HitlStore:
         sql += " ORDER BY created_at, decision_id"
         return [Decision.from_row(row) for row in self._conn.execute(sql, params)]
 
+    def list_open_all(self) -> List[Dict[str, Any]]:
+        """Return every open decision, across every plan, oldest first.
+
+        An open decision is one that may still be answered: ``pending``
+        (waiting for an answer) or ``paused`` (waiting for a human who
+        may still come).  The settled states -- ``answered`` /
+        ``defaulted`` / ``unroutable`` -- are not questions anybody is
+        waiting for any more, so they are not returned.
+
+        Unlike :meth:`list_by_plan`, this is not scoped to one plan: a
+        question asked by a plan that is not the one on screen is still
+        a question a human is being waited on.
+
+        The row's ``kind`` is the decision's ``source`` column.  The
+        source is what tells a failure review from a postprocess
+        approval, and ``kind`` is the name the event payload already
+        gives it (``hitl.service._event_payload``) -- so it is read
+        under that name here rather than carried as a column of its
+        own.
+
+        Returns
+        -------
+        list of dict
+            One dict per open decision, with the keys ``decision_id``,
+            ``plan_id``, ``kind``, ``question`` and ``created_at``.
+        """
+        placeholders = ", ".join("?" for _ in _OPEN_STATUSES)
+        sql = (
+            "SELECT decision_id, plan_id, source AS kind, question, created_at "
+            f"FROM plan_decisions WHERE status IN ({placeholders}) "
+            "ORDER BY created_at, decision_id"
+        )
+        rows = self._conn.execute(sql, list(_OPEN_STATUSES))
+        return [dict(row) for row in rows]
+
     # ------------------------------------------------------------------
     # Writes
     # ------------------------------------------------------------------

@@ -271,13 +271,18 @@ def test_key_set_is_closed() -> None:
 
     The phase is one of the row's keys now — what the plan is doing,
     in the routing layer's own words — and it is a key of **both** rows
-    and of neither of the document's eight keys.
+    and of neither of the document's nine keys.
 
     The eighth key — ``parked`` — was added on purpose too: a plan
     parked for quota holds no slot and is in no line, so the two lists
     above could never name it.  The set is compared **exactly** and
     not as a subset: a subset assertion would let the next key in
     without anybody deciding to add it.
+
+    The ninth key — ``stopping`` — was added for the same reason: the
+    commands the scheduler has accepted and not answered yet are a
+    list of their own, so a plan on its way to a stop is visible before
+    it is stopped.  The set is still compared **exactly**.
     """
     result = build(_state())
 
@@ -289,6 +294,7 @@ def test_key_set_is_closed() -> None:
         "running",
         "waiting",
         "parked",
+        "stopping",
         "generated_at",
     }
     assert set(result["capacity"]) == {"total", "used", "source"}
@@ -384,6 +390,8 @@ def test_a_state_with_nothing_in_it_still_builds() -> None:
     assert result["over_capacity"] is False
     # Nothing is parked either, and that too is an empty list.
     assert result["parked"] == []
+    # And nothing is stopping, for the same reason.
+    assert result["stopping"] == []
     assert set(result) == {
         "capacity",
         "queue_length",
@@ -392,5 +400,6 @@ def test_a_state_with_nothing_in_it_still_builds() -> None:
         "running",
         "waiting",
         "parked",
+        "stopping",
         "generated_at",
     }

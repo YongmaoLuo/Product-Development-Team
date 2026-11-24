@@ -82,6 +82,7 @@ from typing import Any, Dict, Iterator, List, Optional
 
 from .capacity import CAPACITY_OVERRIDE_KEY
 from .queue import queue_key
+from .retry import retry_on_busy
 
 __all__ = [
     "CAPACITY_OVERRIDE_KEY",
@@ -124,6 +125,18 @@ _SLOT_COLUMNS = ("plan_id", "acquired_at", "updated_at", "priority")
 #: The columns of ``scheduler_command``, in the order they are read.
 _COMMAND_COLUMNS = (
     "command_id",
+    "plan_id",
+    "action",
+    "outcome",
+    "detail",
+    "created_at",
+)
+
+#: The columns of ``scheduler_command`` as the **open-command list**
+#: reads them: the command's id under the name this list gives it, and
+#: then the row's own columns.
+_OPEN_COMMAND_COLUMNS = (
+    "id",
     "plan_id",
     "action",
     "outcome",
@@ -562,6 +575,22 @@ class SqliteSchedulerStore:
         reader tell "this was requested" apart from "this was carried
         out".
 
+        A lock is waited out here rather than handed to the caller.  The
+        command log is the scheduler's own fact about what the operator
+        asked for, and a command that is missing from it is a command
+        that never happened — the caller would be answered with the id
+        of a row that is not there.  So the write is retried while the
+        database is locked, and the retry covers the **whole**
+        transaction: the failed attempt is rolled back, so the next one
+        starts from a clean state and can only ever leave one row
+        behind.
+
+        Two errors are not retried, and both are raised to the caller
+        unchanged: an error that is not a lock — waiting cannot fix a
+        missing table — and a lock that outlives the retries.  What to
+        do with a command that could not be written down is the
+        caller's decision, and this method does not make it.
+
         Args:
             conn: the connection to write on.
             plan_id: the plan the command is about.
@@ -576,14 +605,19 @@ class SqliteSchedulerStore:
             The id of the command that was written.
         """
         stamp = now or _utcnow_iso()
-        with self.transaction(conn):
-            cursor = conn.execute(
-                "INSERT INTO scheduler_command "
-                "(plan_id, action, outcome, detail, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (plan_id, action, outcome, detail, stamp),
-            )
-            return int(cursor.lastrowid)
+
+        def _write() -> int:
+            """The write itself, in one transaction."""
+            with self.transaction(conn):
+                cursor = conn.execute(
+                    "INSERT INTO scheduler_command "
+                    "(plan_id, action, outcome, detail, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (plan_id, action, outcome, detail, stamp),
+                )
+                return int(cursor.lastrowid)
+
+        return retry_on_busy(_write)
 
     def finish_command(
         self,
@@ -604,6 +638,13 @@ class SqliteSchedulerStore:
         alone; finishing a command with an outcome is not a reason to
         erase the detail the command already carries.
 
+        A lock is waited out here the way it is waited out in
+        :meth:`record_command`: the retry covers the whole transaction,
+        so a failed attempt leaves the command pending and the attempt
+        after it finishes it exactly once.  An error that is not a lock
+        and a lock that outlives the retries are both raised to the
+        caller unchanged.
+
         Args:
             conn: the connection to write on.
             command_id: the command to finish.
@@ -615,14 +656,19 @@ class SqliteSchedulerStore:
             ``True`` if this call finished the command, ``False`` if the
             command was already finished (or does not exist).
         """
-        with self.transaction(conn):
-            cursor = conn.execute(
-                "UPDATE scheduler_command "
-                "SET outcome = ?, detail = COALESCE(?, detail) "
-                "WHERE command_id = ? AND outcome = ?",
-                (outcome, detail, command_id, PENDING_OUTCOME),
-            )
-            return cursor.rowcount > 0
+
+        def _write() -> bool:
+            """The write itself, in one transaction."""
+            with self.transaction(conn):
+                cursor = conn.execute(
+                    "UPDATE scheduler_command "
+                    "SET outcome = ?, detail = COALESCE(?, detail) "
+                    "WHERE command_id = ? AND outcome = ?",
+                    (outcome, detail, command_id, PENDING_OUTCOME),
+                )
+                return cursor.rowcount > 0
+
+        return retry_on_busy(_write)
 
     def get_command(
         self, conn: sqlite3.Connection, command_id: int
@@ -642,6 +688,36 @@ class SqliteSchedulerStore:
             (command_id,),
         ).fetchone()
         return _as_dict(_COMMAND_COLUMNS, row)
+
+    def list_open_commands(
+        self, conn: sqlite3.Connection
+    ) -> List[Dict[str, Any]]:
+        """The commands that were accepted and have not been answered yet.
+
+        A command is written the moment it is taken, with the outcome
+        it has *so far* — ``accepted`` — and it is turned into
+        ``applied`` or ``failed`` only once the worker has answered.
+        The rows this method returns are therefore the commands that are
+        **still in flight**: the request is still open — the scheduler
+        has it, and no answer has been recorded.
+
+        The rows come back in the order the commands were taken, so a
+        reader sees them the way they happened.
+
+        Args:
+            conn: the connection to read on.
+
+        Returns:
+            One dict per open command.  The command's id is under
+            ``id``; the rest of the keys are the row's own columns.
+        """
+        rows = conn.execute(
+            "SELECT command_id AS id, plan_id, action, outcome, detail, "
+            "created_at FROM scheduler_command WHERE outcome = ? "
+            "ORDER BY command_id",
+            (PENDING_OUTCOME,),
+        ).fetchall()
+        return [_as_dict(_OPEN_COMMAND_COLUMNS, row) for row in rows]
 
     # ------------------------------------------------------------------
     # The runtime settings

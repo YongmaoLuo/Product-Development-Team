@@ -97,6 +97,12 @@ BASE_EPOCH = 1_700_000_000.0
 #: The eighth key is ``parked`` — the plans stopped for want of
 #: provider capacity, which hold no slot and are in no line, so the
 #: queue and the running line could never name them.
+#:
+#: The ninth key is ``stopping`` — the commands the scheduler has
+#: accepted and not been answered yet.  A plan that is asked to stop
+#: and is not answered is in neither the running line nor the queue,
+#: so the read model has to name it somewhere: that is the 「停止中」
+#: row the requirements ask for, and it may never be missing.
 SNAPSHOT_KEYS = {
     "capacity",
     "queue_length",
@@ -105,6 +111,7 @@ SNAPSHOT_KEYS = {
     "running",
     "waiting",
     "parked",
+    "stopping",
     "generated_at",
 }
 
@@ -575,6 +582,16 @@ def test_snapshot_is_the_read_model(db_factory, plan_factory) -> None:
     # 都打红。
     assert snapshot["parked"] == [], (
         "nothing is parked, but the panel says {0!r}".format(snapshot["parked"])
+    )
+
+    # 2026-11-24：读模型多了 stopping 列表（已接受、尚未被回答的在飞命令，也就是
+    # R3 要求的「停止中」那一行）。按本 gate 的既定流程把它纳入断言集合；形状仍
+    # 按全等比较，多一个键或少一个键都打红。本场景没有在飞命令，所以它是空的 ——
+    # 但键必须在，因为面板按名字读它。
+    assert snapshot["stopping"] == [], (
+        "nothing is stopping, but the panel says {0!r}".format(
+            snapshot["stopping"]
+        )
     )
 
     # 2026-10-30：快照的 capacity 增加了 source 字段（容量来自配置文件还是运行期
