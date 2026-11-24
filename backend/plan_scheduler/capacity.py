@@ -111,7 +111,7 @@ import os
 import sqlite3
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from .config import DEFAULT_MIN_RUNTIME_SECONDS
 
@@ -155,6 +155,25 @@ def _field(row: Any, name: str, default: Any = None) -> Any:
     else:
         value = getattr(row, name, default)
     return default if value is None else value
+
+
+def _plan_ids(items: Any) -> List[str]:
+    """The plan ids a collection of plans or of rows names.
+
+    A plain id is taken as it is, and a row is read for its
+    ``plan_id``.  A mapping is read by its **keys** — the ledger reads
+    its slot rows as a mapping of plan id to row, and there the keys
+    are the ids.
+    """
+    candidates: Iterable[Any]
+    candidates = items.keys() if isinstance(items, Mapping) else items
+    ids: List[str] = []
+    for candidate in candidates:
+        if isinstance(candidate, str):
+            ids.append(candidate)
+        else:
+            ids.append(str(_field(candidate, "plan_id", "")))
+    return ids
 
 
 def _to_epoch(value: Any) -> Optional[float]:
@@ -351,10 +370,23 @@ class CapacityLedger:
         alone — including its ``acquired_at``, because a plan that
         changes phase is still the same plan holding the same slot.
 
-        The whole reconciliation is one transaction: the slots and the
-        moment they were taken are one fact about the plans that are
-        working, and a half-applied reconciliation is a scheduler that
-        counts a plan it has no record of.
+        The ledger **reads before it writes**.  The working plans and
+        the slot rows are read first, without taking SQLite's write
+        lock, and the write transaction is opened only when the two
+        disagree.  A tick that has nothing to write — the steady state,
+        which is every tick but the ones where a plan started or
+        finished — therefore does not make the other writers of the
+        database wait, and that wait is where ``database is locked``
+        comes from.
+
+        When there is something to write, the write is one transaction:
+        the slots and the moment they were taken are one fact about the
+        plans that are working, and a half-applied reconciliation is a
+        scheduler that counts a plan it has no record of.  The two sides
+        are read **again** inside that transaction, because the
+        difference may have disappeared between the light read and the
+        moment the write lock was taken — and the read inside the
+        transaction is the one that counts.
 
         Returns:
             A summary of what the reconciliation did: ``used`` (how many
@@ -365,6 +397,24 @@ class CapacityLedger:
             the summary is the same on every run.
         """
         conn = self._require_conn()
+
+        # The light read: the working plans and the slot rows, taken
+        # without the write lock.
+        active = self._active_ids()
+        slots = self._slot_rows(conn)
+
+        if not self._writes_needed(active, slots):
+            # The slots already say what the facts say.  There is
+            # nothing to write, so the ledger does not take SQLite's
+            # write lock: a tick like this must not make the other
+            # writers of the database wait for it.
+            return {
+                "used": len(active),
+                "added": [],
+                "removed": [],
+                "preserved": sorted(active),
+            }
+
         stamp = _to_iso(self._now())
 
         added: List[str] = []
@@ -372,11 +422,12 @@ class CapacityLedger:
         preserved: List[str] = []
 
         with self._store.transaction(conn):
+            # The light read may be stale by the time the write lock
+            # is taken: a plan may have started or finished in between.
+            # The read inside the transaction is the one that decides
+            # what is written.
             active = self._active_ids()
-            slots = {
-                str(_field(slot, "plan_id", "")): slot
-                for slot in self._store.list_slots(conn)
-            }
+            slots = self._slot_rows(conn)
 
             for plan_id in slots:
                 if plan_id not in active:
@@ -569,6 +620,32 @@ class CapacityLedger:
             if plan_id and plan_id not in seen:
                 seen.append(plan_id)
         return seen
+
+    def _slot_rows(self, conn: sqlite3.Connection) -> Dict[str, Any]:
+        """The slot rows that are there, by plan id.
+
+        The rows are read in the order the store hands them over —
+        oldest acquisition first — so that the ledger writes in the
+        same order it always did.
+        """
+        return {
+            str(_field(slot, "plan_id", "")): slot
+            for slot in self._store.list_slots(conn)
+        }
+
+    def _writes_needed(self, active: Any, slots: Any) -> bool:
+        """Whether the slot rows and the working plans disagree.
+
+        ``active`` are the plans that are working and ``slots`` are the
+        slot rows that are there — the mapping the ledger read, whose
+        keys are the plan ids; a plain collection of ids or of rows is
+        understood as well.  The two disagree when one of them names a
+        plan the other does not: a plan that works without a slot row,
+        or a slot row for a plan that does not work.  Either way there
+        is something to write, and only then is the write lock worth
+        taking.
+        """
+        return set(_plan_ids(active)) != set(_plan_ids(slots))
 
     def _runtime_starts(self, conn: sqlite3.Connection) -> Dict[str, float]:
         """Return the moment each plan's own work began.
