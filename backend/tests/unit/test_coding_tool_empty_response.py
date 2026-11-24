@@ -44,6 +44,12 @@ if str(_BACKEND_DIR) not in sys.path:
 import coding_tool  # noqa: E402
 from coding_tool import ClaudeCodingTool, EmptyResponseError  # noqa: E402
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 def _install_fake_claude(tmp_path, monkeypatch, script: str) -> None:
     """Put an executable ``claude`` first on ``PATH``."""
@@ -64,7 +70,7 @@ def test_clean_exit_with_no_output_raises_empty_response(tmp_path, monkeypatch):
     """``exit 0`` with no stdout is a failure, not an empty success."""
     _install_fake_claude(tmp_path, monkeypatch, "#!/bin/sh\nexit 0\n")
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     with pytest.raises(EmptyResponseError) as excinfo:
         tool._run_claude_interactive("hello", idle_timeout=30, total_timeout=30)
 
@@ -89,7 +95,7 @@ def test_stderr_from_the_empty_run_is_captured(tmp_path, monkeypatch):
         "#!/bin/sh\necho 'API Error: 529 overloaded_error' >&2\nexit 0\n",
     )
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     with pytest.raises(EmptyResponseError) as excinfo:
         tool._run_claude_interactive("hello", idle_timeout=30, total_timeout=30)
 
@@ -100,7 +106,7 @@ def test_stderr_from_the_empty_run_is_captured(tmp_path, monkeypatch):
 def test_nonzero_exit_with_no_output_is_still_an_empty_response(tmp_path, monkeypatch):
     _install_fake_claude(tmp_path, monkeypatch, "#!/bin/sh\nexit 3\n")
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     with pytest.raises(EmptyResponseError) as excinfo:
         tool._run_claude_interactive("hello", idle_timeout=30, total_timeout=30)
 
@@ -110,7 +116,7 @@ def test_nonzero_exit_with_no_output_is_still_an_empty_response(tmp_path, monkey
 def test_the_error_serialises_for_log_payloads(tmp_path, monkeypatch):
     _install_fake_claude(tmp_path, monkeypatch, "#!/bin/sh\nexit 0\n")
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     with pytest.raises(EmptyResponseError) as excinfo:
         tool._run_claude_interactive("hello", idle_timeout=30, total_timeout=30)
 
@@ -131,7 +137,7 @@ def _resp_tool(monkeypatch, side_effect):
     Retry backoff is zeroed on the instance so the test does not wait
     the real 2 s / 4 s.
     """
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     tool.EMPTY_RESPONSE_RETRY_BACKOFF_SEC = 0.0
     calls = []
 

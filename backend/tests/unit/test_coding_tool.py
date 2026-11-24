@@ -28,6 +28,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from coding_tool import ClaudeCodingTool, ApiError
 import coding_tool as ct
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 class TestClaudeCodingToolSubprocessInvocation:
     """Tests for ClaudeCodingTool._run_claude_interactive() subprocess behavior.
@@ -95,7 +101,7 @@ class TestClaudeCodingToolSubprocessInvocation:
             {k: v for k, v in os.environ.items() if not k.startswith("ANTHROPIC_")},
             clear=True,
         ):
-            tool = ClaudeCodingTool()
+            tool = ClaudeCodingTool( cwd=_REPO_ROOT)
             result, _sid, _meta = tool._run_claude_interactive("test prompt")
 
         assert result == "hello"
@@ -126,7 +132,7 @@ class TestClaudeCodingToolSubprocessInvocation:
         ])
         mock_popen.return_value = mock_proc
 
-        tool = ClaudeCodingTool()
+        tool = ClaudeCodingTool( cwd=_REPO_ROOT)
         tool._run_claude_interactive("test")
 
         _, kwargs = mock_popen.call_args
@@ -144,7 +150,7 @@ class TestClaudeCodingToolSubprocessInvocation:
         ])
         mock_popen.return_value = mock_proc
 
-        tool = ClaudeCodingTool(model="claude-opus-4-7")
+        tool = ClaudeCodingTool(model="claude-opus-4-7", cwd=_REPO_ROOT)
         tool._run_claude_interactive("test")
 
         args, kwargs = mock_popen.call_args
@@ -165,7 +171,7 @@ class TestClaudeCodingToolSubprocessInvocation:
         ])
         mock_popen.return_value = mock_proc
 
-        tool = ClaudeCodingTool(api_key="sk-ant-test-key")
+        tool = ClaudeCodingTool(api_key="sk-ant-test-key", cwd=_REPO_ROOT)
         tool._run_claude_interactive("test")
 
         _, kwargs = mock_popen.call_args
@@ -181,7 +187,7 @@ class TestClaudeCodingToolSubprocessInvocation:
         ])
         mock_popen.return_value = mock_proc
 
-        tool = ClaudeCodingTool(model="claude-opus-4-7", api_key="sk-ant-test")
+        tool = ClaudeCodingTool(model="claude-opus-4-7", api_key="sk-ant-test", cwd=_REPO_ROOT)
         tool._run_claude_interactive("test")
 
         args, kwargs = mock_popen.call_args
@@ -210,7 +216,7 @@ class TestClaudeCodingToolSubprocessInvocation:
         ])
         mock_popen.return_value = mock_proc
 
-        tool = ClaudeCodingTool()
+        tool = ClaudeCodingTool( cwd=_REPO_ROOT)
         result, _sid, _meta = tool._run_claude_interactive("test")
 
         assert result == "Hello world"
@@ -224,7 +230,7 @@ class TestClaudeCodingToolSubprocessInvocation:
         ])
         mock_popen.return_value = mock_proc
 
-        tool = ClaudeCodingTool()
+        tool = ClaudeCodingTool( cwd=_REPO_ROOT)
         result, _sid, _meta = tool._run_claude_interactive("test")
 
         assert result == "final answer"
@@ -239,7 +245,7 @@ class TestClaudeCodingToolSubprocessInvocation:
         ])
         mock_popen.return_value = mock_proc
 
-        tool = ClaudeCodingTool()
+        tool = ClaudeCodingTool( cwd=_REPO_ROOT)
         _result, sid, _meta = tool._run_claude_interactive("test")
         assert sid == target_sid
 
@@ -257,7 +263,7 @@ class TestClaudeCodingToolSubprocessInvocation:
         ])
         mock_popen.return_value = mock_proc
 
-        tool = ClaudeCodingTool()
+        tool = ClaudeCodingTool( cwd=_REPO_ROOT)
         with pytest.raises(ApiError) as exc_info:
             tool._run_claude_interactive("test")
 
@@ -273,7 +279,7 @@ class TestClaudeCodingToolSubprocessInvocation:
         ])
         mock_popen.return_value = mock_proc
 
-        tool = ClaudeCodingTool()
+        tool = ClaudeCodingTool( cwd=_REPO_ROOT)
         tool._run_claude_interactive("my prompt text")
 
         mock_proc.stdin.write.assert_called()
@@ -291,7 +297,7 @@ class TestClaudeCodingToolSubprocessInvocation:
         ])
         mock_popen.return_value = mock_proc
 
-        tool = ClaudeCodingTool()
+        tool = ClaudeCodingTool( cwd=_REPO_ROOT)
         tool._run_claude_interactive("test")
 
         mock_proc.stdin.close.assert_called()
@@ -306,7 +312,7 @@ class TestClaudeCodingToolSubprocessInvocation:
         ])
         mock_popen.return_value = mock_proc
 
-        tool = ClaudeCodingTool()
+        tool = ClaudeCodingTool( cwd=_REPO_ROOT)
         result = tool.query("test prompt", system_instruction="be helpful")
 
         assert result == "response text"
@@ -329,7 +335,7 @@ class TestClaudeCodingToolSubprocessInvocation:
         ])
         mock_popen.return_value = mock_proc
 
-        tool = ClaudeCodingTool()
+        tool = ClaudeCodingTool( cwd=_REPO_ROOT)
         result = tool.query_json("return json")
 
         assert result == {"key": "value", "num": 42}
@@ -347,7 +353,7 @@ class TestClaudeCodingToolSubprocessInvocation:
         ])
         mock_popen.return_value = mock_proc
 
-        tool = ClaudeCodingTool()
+        tool = ClaudeCodingTool( cwd=_REPO_ROOT)
         result = tool.query_json("plan tasks")
 
         assert result == {"tasks": [{"id": "1", "title": "test"}]}
@@ -400,7 +406,7 @@ class TestClaudeCodingToolInit:
 
     def test_init_defaults_none(self):
         """Default: model and api_key are None (inherit from parent)."""
-        tool = ClaudeCodingTool()
+        tool = ClaudeCodingTool( cwd=_REPO_ROOT)
         assert tool.model is None
         assert tool.api_key is None
 
@@ -413,7 +419,7 @@ class TestClaudeCodingToolInit:
 
     def test_init_does_not_auto_set_default_model(self):
         """Constructor does NOT auto-set a model — not even a default one."""
-        tool = ClaudeCodingTool()
+        tool = ClaudeCodingTool( cwd=_REPO_ROOT)
         # The class used to carry a ``DEFAULT_MODEL`` constant and stamp it
         # here. That is exactly the shape this project avoids: naming a
         # model in source picks one for every deployment. The model now
@@ -825,7 +831,7 @@ class TestClaudeCodingToolProviderSelection:
                 },
             )),
         ):
-            tool = ClaudeCodingTool(provider_priority=["Vendor B Pro"])
+            tool = ClaudeCodingTool(provider_priority=["Vendor B Pro"], cwd=_REPO_ROOT)
             tool._run_claude_interactive("test")
 
         _, kwargs = mock_popen.call_args
@@ -853,7 +859,7 @@ class TestClaudeCodingToolProviderSelection:
             "_check_provider_availability",
             staticmethod(lambda name: (False, {})),
         ):
-            tool = ClaudeCodingTool(provider_priority=["Vendor B Pro"])
+            tool = ClaudeCodingTool(provider_priority=["Vendor B Pro"], cwd=_REPO_ROOT)
             tool._run_claude_interactive("test")
 
         _, kwargs = mock_popen.call_args
@@ -898,8 +904,7 @@ class TestClaudeCodingToolProviderSelection:
             )),
         ):
             tool = ClaudeCodingTool(
-                api_key="explicit-key", provider_priority=["Vendor B Pro"]
-            )
+                api_key="explicit-key", provider_priority=["Vendor B Pro"], cwd=_REPO_ROOT)
             tool._run_claude_interactive("test")
 
         _, kwargs = mock_popen.call_args
@@ -927,8 +932,7 @@ class TestClaudeCodingToolProviderSelection:
         ):
             tool = ClaudeCodingTool(
                 api_key="explicit-key",
-                provider_priority=["__no_such_provider__"],
-            )
+                provider_priority=["__no_such_provider__"], cwd=_REPO_ROOT)
             tool._run_claude_interactive("test")
 
         _, kwargs = mock_popen.call_args
@@ -952,7 +956,7 @@ class TestClaudeCodingToolProviderSelection:
                 },
             )),
         ):
-            tool = ClaudeCodingTool(logger=mock_logger, provider_priority=["Vendor B Pro"])
+            tool = ClaudeCodingTool(logger=mock_logger, provider_priority=["Vendor B Pro"], cwd=_REPO_ROOT)
             tool._run_claude_interactive("test")
 
         info_calls = [c for c in mock_logger.info.call_args_list]
@@ -1019,7 +1023,7 @@ class TestClaudeCodingToolProviderSelection:
                 {k: v for k, v in os.environ.items() if not k.startswith("ANTHROPIC_")},
                 clear=True,
             ):
-                tool = ClaudeCodingTool(provider_priority=["Vendor B Pro"])
+                tool = ClaudeCodingTool(provider_priority=["Vendor B Pro"], cwd=_REPO_ROOT)
                 result = tool.query("test")
 
         assert result == "fallback-ok"
@@ -1093,7 +1097,7 @@ class TestClaudeCodingToolProviderSelection:
                 {k: v for k, v in os.environ.items() if not k.startswith("ANTHROPIC_")},
                 clear=True,
             ):
-                tool = ClaudeCodingTool(provider_priority=["Vendor B Pro"])
+                tool = ClaudeCodingTool(provider_priority=["Vendor B Pro"], cwd=_REPO_ROOT)
                 result = tool.query("test")
 
         assert result == "fallback-ok"
@@ -1148,7 +1152,7 @@ class TestClaudeCodingToolProviderSelection:
                 {k: v for k, v in os.environ.items() if not k.startswith("ANTHROPIC_")},
                 clear=True,
             ):
-                tool = ClaudeCodingTool(provider_priority=["Vendor B Pro"])
+                tool = ClaudeCodingTool(provider_priority=["Vendor B Pro"], cwd=_REPO_ROOT)
                 result = tool.query_json("return json")
 
         assert result == {"key": "fallback-value"}
@@ -1176,8 +1180,7 @@ class TestClaudeCodingToolProviderSelection:
             staticmethod(lambda name: (False, {})),
         ):
             tool = ClaudeCodingTool(
-                provider_priority=["__no_such_provider__"]
-            )
+                provider_priority=["__no_such_provider__"], cwd=_REPO_ROOT)
             with pytest.raises(ApiError) as exc_info:
                 tool.query("test")
 
@@ -1223,7 +1226,7 @@ class TestClaudeCodingToolProviderSelection:
                 {k: v for k, v in os.environ.items() if not k.startswith("ANTHROPIC_")},
                 clear=True,
             ):
-                tool = ClaudeCodingTool(provider_priority=["Vendor B Pro"])
+                tool = ClaudeCodingTool(provider_priority=["Vendor B Pro"], cwd=_REPO_ROOT)
                 with pytest.raises(ApiError):
                     tool.query("test")
 
@@ -1322,7 +1325,7 @@ def test_query_returns_str_from_interactive_tuple(mock_popen):
     mock_proc.wait.return_value = 0
     mock_popen.return_value = mock_proc
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     result = tool.query("hello")
     assert result == "the-answer"
     assert isinstance(result, str)
@@ -1358,7 +1361,7 @@ def test_query_interactive_pins_a_session_id_and_never_resumes(
     mock_proc.wait.return_value = 0
     mock_popen.return_value = mock_proc
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     tool.query("hello")
 
     call_args = mock_popen.call_args
@@ -1395,7 +1398,7 @@ def test_query_interactive_no_print_flag(mock_popen):
     mock_proc.wait.return_value = 0
     mock_popen.return_value = mock_proc
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     tool.query("hello")
 
     call_args = mock_popen.call_args
@@ -1482,7 +1485,7 @@ def test_query_timeout_fallback_resumes_the_same_session(
         {k: v for k, v in os.environ.items() if not k.startswith("ANTHROPIC_")},
         clear=True,
     ):
-        tool = ClaudeCodingTool()
+        tool = ClaudeCodingTool( cwd=_REPO_ROOT)
         call_count = {"n": 0}
 
         def fake_interactive(prompt, *args, **kwargs):
@@ -1559,7 +1562,7 @@ def test_query_api_error_fallback_resumes_the_same_session(
             raise ApiError("rate_limit", status="rate_limit")
         return ("fallback-ok", "session-z", {})
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     fake_mock = MagicMock(side_effect=fake_interactive)
     with patch.object(tool, "_run_claude_interactive", fake_mock):
         result = tool.query("hello")
@@ -1607,7 +1610,7 @@ def test_query_internal_m1_api_error_falls_back_instead_of_name_error(monkeypatc
         ct, "_park_provider_after_error", lambda provider, exc: 60.0,
     )
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     tool.logger = MagicMock()
     tool.current_call_provider = "Vendor A API"
 
@@ -1764,7 +1767,7 @@ def test_a_blocking_registration_must_not_starve_the_child_of_its_prompt(
 
     monkeypatch.setattr(ct, "_record_dispatch_process", _slow_record)
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     result, _session_id, _meta = tool._run_claude_interactive(
         "please review this", idle_timeout=30, total_timeout=30,
     )
@@ -1831,7 +1834,7 @@ def test_the_prompt_is_written_before_the_dispatch_registration(monkeypatch):
         staticmethod(lambda provider_name: {}),
     )
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     tool._run_claude_interactive("the prompt")
 
     assert order[0] == "spawn"

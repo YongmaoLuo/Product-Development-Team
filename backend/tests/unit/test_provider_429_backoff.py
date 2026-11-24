@@ -76,6 +76,12 @@ from dynamic_provider_concurrency import (  # noqa: E402
     get_shared_cooldown,
 )
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 #: The provider every test fails on. One spelling, so the exclusion set
 #: and the cooldown list are both readable as themselves.
 PROVIDER = "vendor-a-pro"
@@ -231,8 +237,7 @@ def _tool(monkeypatch, side_effect, *, calls=None, real_from=None, logger=None):
         scene=SCENE if real_from is not None else None,
         concurrency_tracker=(
             ActiveConcurrencyTracker() if real_from is not None else None
-        ),
-    )
+        ), cwd=_REPO_ROOT)
     tool.EMPTY_RESPONSE_RETRY_BACKOFF_SEC = 0.0
     tool.logger = logger if logger is not None else MagicMock()
     recorded = calls if calls is not None else []

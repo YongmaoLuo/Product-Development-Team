@@ -46,6 +46,12 @@ if str(_BACKEND_DIR) not in sys.path:
 from coding_tool import ClaudeCodingTool, _QueryProgressReporter  # noqa: E402
 from execution_logger import LOG_EVENT_TYPES  # noqa: E402
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 #: The event name the reporter writes.  It is a first-class event in
 #: the log's registry, not an ad-hoc string.
 PROGRESS_EVENT = "coding_query_progress"
@@ -296,7 +302,7 @@ def test_query_json_writes_progress_while_in_flight(monkeypatch):
     """
     monkeypatch.setenv("PDT_CODING_QUERY_PROGRESS_SECONDS", "1")
     logger = _RecordingLogger()
-    tool = ClaudeCodingTool(logger=logger)
+    tool = ClaudeCodingTool(logger=logger, cwd=_REPO_ROOT)
 
     def _slow_dispatch(prompt, *args, **kwargs):
         # The dispatch stays outstanding until the heartbeat has shown
@@ -323,7 +329,7 @@ def test_the_heartbeat_stops_when_the_dispatch_is_over(monkeypatch):
     """No line is written after the dispatch returned."""
     monkeypatch.setenv("PDT_CODING_QUERY_PROGRESS_SECONDS", "1")
     logger = _RecordingLogger()
-    tool = ClaudeCodingTool(logger=logger)
+    tool = ClaudeCodingTool(logger=logger, cwd=_REPO_ROOT)
 
     monkeypatch.setattr(
         tool, "_run_claude_interactive",
@@ -353,7 +359,7 @@ def test_the_provider_fallback_shares_the_heartbeat(monkeypatch):
     """
     monkeypatch.setenv("PDT_CODING_QUERY_PROGRESS_SECONDS", "1")
     logger = _RecordingLogger()
-    tool = ClaudeCodingTool(logger=logger)
+    tool = ClaudeCodingTool(logger=logger, cwd=_REPO_ROOT)
     # The provider-fallback arm only retries when it knows which
     # provider failed; the real dispatch sets this, the double does not.
     tool.current_call_provider = "vendor-a"
@@ -382,7 +388,7 @@ def test_the_elapsed_time_never_goes_backwards(monkeypatch):
     """Across a fallback, the reported elapsed time only grows."""
     monkeypatch.setenv("PDT_CODING_QUERY_PROGRESS_SECONDS", "1")
     logger = _RecordingLogger()
-    tool = ClaudeCodingTool(logger=logger)
+    tool = ClaudeCodingTool(logger=logger, cwd=_REPO_ROOT)
     tool.current_call_provider = "vendor-a"
 
     calls = []

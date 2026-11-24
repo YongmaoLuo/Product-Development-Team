@@ -60,6 +60,12 @@ import coding_tool as coding_tool_module
 import provider_routing
 from coding_tool import ClaudeCodingTool
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -292,7 +298,7 @@ class TestTierOverridesEndToEnd:
         """
         monkeypatch.setenv("PDT_PROVIDER_ROUTING_FILE", str(_TEMPLATE))
 
-        tool = ClaudeCodingTool(scene="verification", settings=str(settings_template))
+        tool = ClaudeCodingTool(scene="verification", settings=str(settings_template), cwd=_REPO_ROOT)
         env = _dispatch(tool)["env"]
 
         for var in MODEL_ENV_VARS:
@@ -323,7 +329,7 @@ class TestTierOverridesEndToEnd:
         """
         monkeypatch.setenv("PDT_PROVIDER_ROUTING_FILE", str(_TEMPLATE))
 
-        tool = ClaudeCodingTool(scene="prd", settings=str(settings_template))
+        tool = ClaudeCodingTool(scene="prd", settings=str(settings_template), cwd=_REPO_ROOT)
         env = _dispatch(tool)["env"]
 
         assert env["ANTHROPIC_MODEL"] == "cc-default"
@@ -349,7 +355,7 @@ class TestTierOverridesEndToEnd:
         """
         monkeypatch.setenv("PDT_PROVIDER_ROUTING_FILE", str(_TEMPLATE))
 
-        tool = ClaudeCodingTool(scene="execution", settings=str(settings_template))
+        tool = ClaudeCodingTool(scene="execution", settings=str(settings_template), cwd=_REPO_ROOT)
         env = _dispatch(tool)["env"]
 
         assert env["CLAUDE_CODE_EFFORT_LEVEL"] == "medium"
@@ -397,7 +403,7 @@ class TestTierOverridesEndToEnd:
         )
         monkeypatch.setenv("PDT_PROVIDER_ROUTING_FILE", str(routing_copy))
 
-        first = ClaudeCodingTool(scene="execution", settings=str(settings_template))
+        first = ClaudeCodingTool(scene="execution", settings=str(settings_template), cwd=_REPO_ROOT)
         env_before = _dispatch(first)["env"]
         assert env_before["CLAUDE_CODE_EFFORT_LEVEL"] == "medium"
 
@@ -410,6 +416,6 @@ class TestTierOverridesEndToEnd:
             text.replace("effort: 'medium'", "effort: 'low'"), encoding="utf-8"
         )
 
-        second = ClaudeCodingTool(scene="execution", settings=str(settings_template))
+        second = ClaudeCodingTool(scene="execution", settings=str(settings_template), cwd=_REPO_ROOT)
         env_after = _dispatch(second)["env"]
         assert env_after["CLAUDE_CODE_EFFORT_LEVEL"] == "low"

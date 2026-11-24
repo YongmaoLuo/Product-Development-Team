@@ -117,12 +117,13 @@ import hashlib
 import json
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 __all__ = [
     "DefaultTerminalDecisionPort",
     "default_port",
     "failed_vps_from_record",
+    "resolve_tool_cwd",
 ]
 
 
@@ -144,6 +145,87 @@ def _default_plan_dir_of(plan_id: str) -> Any:
 
     return _server._plan_dir(plan_id)
 
+
+# ---------------------------------------------------------------------------
+# The working root
+# ---------------------------------------------------------------------------
+
+
+def _registered_project_dir(plan_id: str) -> str:
+    """The project directory the execution row registers, if any.
+
+    The row is the authority — it is the one field the whole execution
+    chain reads — and a plan that has not registered one owns no
+    workspace at all.  Best-effort by design: an unreadable database
+    must not stop a repair round, and the fallbacks cover that.
+    """
+    try:
+        import server as _server
+
+        registered = _server._get_project_dir(plan_id)
+    except Exception:  # noqa: BLE001 - the fallbacks cover this
+        return ""
+    return str(registered).strip() if registered else ""
+
+
+def _plan_registered_project_dir(plan_dir: Any) -> str:
+    """The project directory the plan's own row registers, if any.
+
+    The same lookup the repair generator does (see
+    :func:`repair_generator.resolve_repair_project_dir`), reached
+    through the plan directory rather than through the plan id.
+    """
+    try:
+        from repair_generator import resolve_repair_project_dir
+
+        resolved = resolve_repair_project_dir(Path(plan_dir))
+    except Exception:  # noqa: BLE001 - the fallbacks cover this
+        return ""
+    return str(resolved).strip() if resolved else ""
+
+
+def resolve_tool_cwd(
+    *,
+    plan_id: Optional[str] = None,
+    plan_dir: Optional[Any] = None,
+    project_dir: Optional[Any] = None,
+) -> Optional[str]:
+    """The checkout a terminal-decision tool must run in.
+
+    ``create_coding_tool`` refuses to build a tool with no named root
+    (2026-10-29): a tool with no root runs its child in the backend
+    server's working directory, which is a *different* checkout — so
+    every construction site has to say which tree the call is about.
+
+    The order is the one the route layer uses
+    (:func:`routes.phases._coding_tool_cwd`): the plan's registered
+    project directory first, the plan's own directory second.  A plan
+    that has no project directory owns only its plan directory, so that
+    is the root its tool gets — never the server's directory, and never
+    nothing at all.
+
+    ``None`` means *nothing could be named* — the caller decides
+    whether that is an error (a tool must be built) or simply means
+    there is no tool to build yet.
+    """
+    named = str(project_dir).strip() if project_dir else ""
+    if named:
+        return named
+
+    if plan_id:
+        registered = _registered_project_dir(plan_id)
+        if registered:
+            return registered
+
+    if plan_dir:
+        resolved = _plan_registered_project_dir(plan_dir)
+        if resolved:
+            return resolved
+        named = str(plan_dir).strip()
+        if named:
+            return named
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +403,9 @@ class DefaultTerminalDecisionPort:
         coding_tool: Any = None,
         repair_generator_factory: Optional[Callable[[str], Any]] = None,
         task_writer: Optional[Callable[[str, List[Dict[str, Any]]], Any]] = None,
+        cwd: Optional[Union[str, Path]] = None,
+        plan_id: Optional[str] = None,
+        project_dir: Optional[Union[str, Path]] = None,
     ) -> None:
         """Build the port.
 
@@ -341,6 +426,15 @@ class DefaultTerminalDecisionPort:
         and the rows.  The default writes them into ``state.db``'s
         ``plan_tasks`` table.
 
+        ``cwd`` is the checkout the tool runs in, ``plan_id`` the plan
+        the port serves and ``project_dir`` that plan's workspace.
+        Together they are the **working root**: the tool refuses to be
+        built without one, because a tool with no root runs its child
+        in the backend server's working directory — a different
+        checkout from the one the repair is about.  A named ``cwd``
+        wins; otherwise the root is resolved from the plan (see
+        :func:`resolve_tool_cwd`).
+
         There is deliberately no ``engine`` parameter: none of these
         actions needs the scheduler.
         """
@@ -356,6 +450,9 @@ class DefaultTerminalDecisionPort:
         self._task_writer = (
             task_writer if task_writer is not None else _default_write_tasks
         )
+        self._cwd = cwd
+        self._plan_id = plan_id
+        self._project_dir = project_dir
 
     # -- the tool --------------------------------------------------------
 
@@ -368,10 +465,65 @@ class DefaultTerminalDecisionPort:
         asked for.
         """
         if self._coding_tool is None:
-            from coding_tool import ClaudeCodingTool
-
-            self._coding_tool = ClaudeCodingTool(scene="verification")
+            self._coding_tool = self._build_tool(self._plan_id)
         return self._coding_tool
+
+    def _build_tool(self, plan_id: Optional[str] = None) -> Any:
+        """The tool, built in the tree that was named.
+
+        The working root is a contract, not a default: the tool takes
+        ``cwd`` as a required keyword and refuses an empty one, because
+        a child process with no root of its own inherits the backend
+        server's working directory.
+        """
+        from coding_tool import ClaudeCodingTool
+
+        return ClaudeCodingTool(
+            scene="verification",
+            cwd=self._tool_cwd(plan_id),
+        )
+
+    def _tool_cwd(self, plan_id: Optional[str] = None) -> str:
+        """The checkout this port's tool runs in.
+
+        The named ``cwd`` wins.  Otherwise the plan's registered
+        workspace does, and the plan's own directory is the last resort
+        — a plan with no workspace owns only its plan directory.
+
+        A plan that names neither gets **no** tool: the refusal is
+        explicit, because the silent alternative is the server's own
+        directory, and the server's directory is a different checkout
+        from the one the repair is about.
+        """
+        named = str(self._cwd).strip() if self._cwd else ""
+        if named:
+            return named
+
+        plan = plan_id or self._plan_id
+        plan_dir = None
+        if plan is not None:
+            try:
+                plan_dir = Path(self._plan_dir_of(plan))
+            except Exception:  # noqa: BLE001 - the fallbacks cover this
+                plan_dir = None
+
+        resolved = resolve_tool_cwd(
+            plan_id=plan,
+            plan_dir=plan_dir,
+            project_dir=self._project_dir,
+        )
+        if resolved:
+            return resolved
+
+        err = ValueError("explicit cwd required")
+        err.add_note(
+            "The terminal-decision port must be told which checkout to "
+            "run in — name the plan's project directory or its plan "
+            "directory. A tool with no root would run its child in the "
+            "backend server's working directory, which is a different "
+            "checkout from the one the repair is about."
+        )
+        raise err
 
     # -- the actions -----------------------------------------------------
 
@@ -443,6 +595,10 @@ class DefaultTerminalDecisionPort:
         from repair_generator import RepairTaskGenerator
 
         plan_dir = Path(self._plan_dir_of(plan_id))
+        if self._coding_tool is None:
+            # Built for *this* plan: the working root is resolved from
+            # the plan the generator is about.
+            self._coding_tool = self._build_tool(plan_id)
         return RepairTaskGenerator(
             self.coding_tool,
             plan_dir,
@@ -703,11 +859,24 @@ class DefaultTerminalDecisionPort:
 # ---------------------------------------------------------------------------
 
 
-def default_port() -> DefaultTerminalDecisionPort:
+def default_port(
+    *,
+    cwd: Optional[Union[str, Path]] = None,
+    plan_id: Optional[str] = None,
+    project_dir: Optional[Union[str, Path]] = None,
+) -> DefaultTerminalDecisionPort:
     """The port to use when nobody supplied one.
 
     A factory rather than a module-level instance so the port is built
     where it is used, and so a caller that wants a different plan
     directory resolver can still build its own.
+
+    ``cwd`` is the working root the port's tool runs in; ``plan_id``
+    and ``project_dir`` are what the port resolves one from when it was
+    not named.  See :class:`DefaultTerminalDecisionPort`.
     """
-    return DefaultTerminalDecisionPort()
+    return DefaultTerminalDecisionPort(
+        cwd=cwd,
+        plan_id=plan_id,
+        project_dir=project_dir,
+    )

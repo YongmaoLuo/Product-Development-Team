@@ -66,6 +66,12 @@ from coding_tool import ClaudeCodingTool  # noqa: E402
 from sub_agent_registry import sub_agent_registry  # noqa: E402
 from verification_cancel import VerificationCancelled  # noqa: E402
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 PLAN = "plan-stop-spawn-gate"
 OTHER_PLAN = "plan-stop-spawn-gate-other"
 
@@ -233,7 +239,7 @@ def test_spawn_rejected_while_stopping(tmp_path, monkeypatch, spawn_gate_log):
         coding_tool, "subprocess", _SubprocessProxy(subprocess, spy),
     )
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     with pytest.raises(VerificationCancelled) as excinfo:
         tool.query_json(prompt="hello", system_instruction="sys")
 
@@ -270,7 +276,7 @@ def test_spawn_allowed_without_stop(tmp_path, monkeypatch, spawn_gate_log):
     assert stop_state.is_stopping(PLAN) is False
     launches = _install_fake_claude(tmp_path, monkeypatch)
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     result = tool.query_json(prompt="hello", system_instruction="sys")
 
     assert result == {"ok": True}, (

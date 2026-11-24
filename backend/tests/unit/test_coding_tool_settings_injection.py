@@ -83,6 +83,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from coding_tool import ClaudeCodingTool
 from subagent_config import SubagentConfig
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -200,8 +206,7 @@ def _build_tool(subagent_cfg: SubagentConfig) -> ClaudeCodingTool:
         base_url=subagent_cfg.base_url,
         auth_token=subagent_cfg.auth_token,
         provider_priority=["__no_such_provider__"],  # nothing resolvable
-        settings=subagent_cfg.settings_file_path,
-    )
+        settings=subagent_cfg.settings_file_path, cwd=_REPO_ROOT)
 
 
 # ---------------------------------------------------------------------------

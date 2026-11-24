@@ -1907,6 +1907,7 @@ class VerificationSubAgent:
                     log_path=log_path,
                     artifact_dir=e.artifact_dir or artifact_dir,
                     terminated=e.terminated,
+                    project_dir=project_dir,
                 )
                 # Whatever the summarizer returns is treated as the
                 # final verdict — the stuck agent's retry would just
@@ -2148,8 +2149,15 @@ class VerificationSubAgent:
             # the unit test sandbox when no real LLM is wired up).
             try:
                 from coding_tool import ClaudeCodingTool
+                # The tool names the tree it runs in: ``cwd`` is a
+                # required keyword, and an unnamed root would run the
+                # child in the backend server's working directory —
+                # a different checkout than the tree the log came
+                # from.  Same precedent as the summarizer path below:
+                # the project's own directory, else the plan's.
+                root = project_dir or getattr(self, "plan_dir", None)
                 coding_tool = ClaudeCodingTool(
-                    cwd=str(project_dir) if project_dir else None,
+                    cwd=str(root) if root else None,
                     scene=self.scene,
                 )
             except Exception as e:
@@ -2199,7 +2207,17 @@ class VerificationSubAgent:
                 mcp_config=getattr(coding_tool, "mcp_config", None),
                 logger=getattr(coding_tool, "logger", None),
                 settings=_Path(settings_path),
-                cwd=str(project_dir) if project_dir else None,
+                # The clone runs in the SAME tree as the parent tool:
+                # the project's own directory when there is one, else
+                # the tree the parent tool was given.  The parent's
+                # ``cwd`` is non-empty by construction (the tool
+                # refuses an unnamed root), so the clone never falls
+                # back to "no tree at all".
+                cwd=(
+                    str(project_dir)
+                    if project_dir
+                    else getattr(coding_tool, "cwd", None)
+                ),
                 scene=self.scene,
                 # 2026-11-18: the plan's mode, read off the plan's own
                 # state row.  The scoped tool's ``--settings`` payload is
@@ -3197,6 +3215,7 @@ class VerificationSubAgent:
         log_path: Path,
         artifact_dir: Optional[Path] = None,
         terminated: bool = False,
+        project_dir: Optional[Path] = None,
     ) -> "Verdict":
         """Decide a stuck attempt's verdict — from its artifact first.
 
@@ -3296,7 +3315,17 @@ class VerificationSubAgent:
 
         if coding_tool is None:
             from coding_tool import ClaudeCodingTool
-            coding_tool = ClaudeCodingTool(scene="summarizer")
+            # 2026-10-31: the summarizer's tool names the tree it runs
+            # in, like every other tool in the codebase: ``cwd`` is a
+            # required keyword, and an unnamed root would run the child
+            # in the backend server's working directory — a different
+            # checkout than the tree the log came from.  The refusal
+            # when ``cwd`` is missing is ``ClaudeCodingTool``'s own:
+            # "explicit cwd required".
+            root = project_dir or getattr(self, "plan_dir", None)
+            coding_tool = ClaudeCodingTool(
+                scene="summarizer", cwd=str(root) if root else None,
+            )
 
         # Read the tee'd log tail (last ~200 lines is enough for the
         # pytest summary line + the last few FAILED entries).

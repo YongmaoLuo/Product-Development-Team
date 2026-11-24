@@ -10,7 +10,7 @@
       "command": "pytest tests/x.py",
       "first_error_line": "AssertionError at /tmp/a.py:12"
     },
-    "fingerprint": "e7adb050a217d77f"
+    "fingerprint": "dfe26f0f1f38b4b4"
   },
   {
     "input": {
@@ -32,6 +32,6 @@
       "command": "pytest tests/unit/test_y.py",
       "first_error_line": "ValueError at 0x7f3c9a21 in backend/app.py"
     },
-    "fingerprint": "12793c67936085a2"
+    "fingerprint": "bb73c851ef6c53b7"
   }
 ]

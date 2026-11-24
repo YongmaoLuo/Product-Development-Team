@@ -55,6 +55,12 @@ from coding_tool import (  # noqa: E402
 )
 from verification_subagent import VerificationSubAgent  # noqa: E402
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 VP_NODE = {
     "id": "VP-028",
@@ -269,7 +275,7 @@ async def test_the_attempt_log_records_the_pinned_session_id(
     round-24 post-mortem could not answer.
     """
     _real_tool(monkeypatch)
-    tool = ClaudeCodingTool(settings=tmp_path / "settings.json")
+    tool = ClaudeCodingTool(settings=tmp_path / "settings.json", cwd=_REPO_ROOT)
 
     _verdict, log_path = await _run(tool, tmp_path, monkeypatch)
 
@@ -291,7 +297,7 @@ async def test_the_attempt_log_records_the_session_that_answered(
     able to open.
     """
     _real_tool(monkeypatch, reported_session_id="sid-reported-by-cli")
-    tool = ClaudeCodingTool(settings=tmp_path / "settings.json")
+    tool = ClaudeCodingTool(settings=tmp_path / "settings.json", cwd=_REPO_ROOT)
 
     _verdict, log_path = await _run(tool, tmp_path, monkeypatch)
 
@@ -370,7 +376,7 @@ async def test_a_verdict_no_session_produced_is_not_a_pass(
     the deliverable.
     """
     settings = tmp_path / "settings.json"
-    tool = _SessionlessTool(settings=settings)
+    tool = _SessionlessTool(settings=settings, cwd=_REPO_ROOT)
 
     verdict, _log = await _run(tool, tmp_path, monkeypatch)
 

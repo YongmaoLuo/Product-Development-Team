@@ -68,6 +68,12 @@ import process_reaper  # noqa: E402
 from coding_tool import ClaudeCodingTool  # noqa: E402
 from sub_agent_registry import sub_agent_registry  # noqa: E402
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 PLAN = "plan-subagent-ledger"
 
@@ -215,7 +221,7 @@ def test_subagent_spawn_writes_record_with_pgid(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("PDT_PLAN_ID", PLAN)
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     answer = {}
     thread = threading.Thread(
         target=_dispatch, args=(tool, answer), daemon=True,
@@ -343,7 +349,7 @@ def test_dispatch_that_finishes_writes_the_exit_event(tmp_path, monkeypatch):
     _install_fake_claude(tmp_path, monkeypatch, _FINISHING_CLAUDE)
     monkeypatch.setenv("PDT_PLAN_ID", PLAN)
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     tool._run_claude_interactive("hello", idle_timeout=30, total_timeout=30)
 
     spawns = _spawn_events(plan_dir)
@@ -381,7 +387,7 @@ def test_timeout_kill_writes_the_exit_event(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("PDT_PLAN_ID", PLAN)
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     with pytest.raises(TimeoutError):
         tool._run_claude_interactive("hello", idle_timeout=2, total_timeout=10)
 
@@ -411,7 +417,7 @@ def test_watchdog_kill_writes_the_exit_event(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("PDT_PLAN_ID", PLAN)
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     failures = []
 
     def _run() -> None:
@@ -462,7 +468,7 @@ def test_popen_failure_writes_no_record(tmp_path, monkeypatch):
 
     monkeypatch.setattr(coding_tool.subprocess, "Popen", _boom)
 
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     with pytest.raises(OSError):
         tool._run_claude_interactive("hello", idle_timeout=30, total_timeout=30)
 

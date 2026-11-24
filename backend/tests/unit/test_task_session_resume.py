@@ -115,6 +115,12 @@ from plan_sessions import (  # noqa: E402
     stable_session_id,
 )
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 #: A canonical dashed UUID — the shape ``--session-id`` accepts.
 PINNED_ID = "11111111-2222-3333-4444-555555555555"
 
@@ -126,7 +132,7 @@ def _tool(monkeypatch):
     the CLI does in the ordinary case: the id the dispatch asked for is
     the id that exists afterwards.
     """
-    tool = ClaudeCodingTool()
+    tool = ClaudeCodingTool( cwd=_REPO_ROOT)
     tool.EMPTY_RESPONSE_RETRY_BACKOFF_SEC = 0.0
     tool.logger = MagicMock()
     recorded: list[dict] = []

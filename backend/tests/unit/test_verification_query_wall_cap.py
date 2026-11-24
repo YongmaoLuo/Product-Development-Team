@@ -67,6 +67,12 @@ from coding_tool import (  # noqa: E402
 import server as srv  # noqa: E402
 import verification_loop as vl  # noqa: E402
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 #: The event the wall-cap expiry writes into the execution log.
 WALL_TIMEOUT_EVENT = "coding_query_wall_timeout"
 
@@ -173,7 +179,7 @@ def test_dispatch_past_the_cap_is_killed_and_raises(monkeypatch):
     * the log says why — ``coding_query_wall_timeout``.
     """
     logger = _RecordingLogger()
-    tool = ClaudeCodingTool(logger=logger)
+    tool = ClaudeCodingTool(logger=logger, cwd=_REPO_ROOT)
     tool.query_wall_cap_seconds = 1.0
 
     killed = _capture_kills(monkeypatch)
@@ -249,7 +255,7 @@ def test_dispatch_under_the_cap_is_untouched(monkeypatch):
     """
     monkeypatch.setenv("PDT_CODING_QUERY_PROGRESS_SECONDS", "1")
     logger = _RecordingLogger()
-    tool = ClaudeCodingTool(logger=logger)
+    tool = ClaudeCodingTool(logger=logger, cwd=_REPO_ROOT)
     tool.query_wall_cap_seconds = 3600.0
 
     killed = _capture_kills(monkeypatch)
@@ -399,7 +405,7 @@ def _wire_inner(
         # A REAL tool, built the way the factory builds it: the scene
         # the loop asked for is what decides the cap.  A stand-in with
         # a hardcoded attribute would answer a different question.
-        tool = ClaudeCodingTool(scene=kwargs.get("scene"))
+        tool = ClaudeCodingTool(scene=kwargs.get("scene"), cwd=_REPO_ROOT)
         if built is not None:
             built.append(tool)
         return tool
@@ -477,13 +483,13 @@ def test_the_cap_is_a_construction_time_default(monkeypatch: Any):
     monkeypatch.delenv(vl.VERIFICATION_LLM_QUERY_CAP_ENV, raising=False)
     monkeypatch.delenv("PDT_LLM_MODE", raising=False)
 
-    direct = ClaudeCodingTool(scene="verification")
+    direct = ClaudeCodingTool(scene="verification", cwd=_REPO_ROOT)
     assert direct.query_wall_cap_seconds == 2700.0, (
         f"a directly built verification tool carries "
         f"{direct.query_wall_cap_seconds!r} instead of the cap"
     )
 
-    from_factory = coding_tool.create_coding_tool(scene="verification")
+    from_factory = coding_tool.create_coding_tool(scene="verification", cwd=_REPO_ROOT)
     assert from_factory.query_wall_cap_seconds == 2700.0, (
         f"a factory-built verification tool carries "
         f"{from_factory.query_wall_cap_seconds!r} instead of the cap"
@@ -504,7 +510,7 @@ def test_a_tool_outside_the_verification_scene_carries_no_cap(
     monkeypatch.delenv("PDT_LLM_MODE", raising=False)
 
     for scene in ("summarizer", None, "", "task_execution"):
-        tool = ClaudeCodingTool(scene=scene)
+        tool = ClaudeCodingTool(scene=scene, cwd=_REPO_ROOT)
         assert tool.query_wall_cap_seconds is None, (
             f"a tool built for scene={scene!r} carries a cap "
             f"({tool.query_wall_cap_seconds!r}) — the cap belongs to "
@@ -512,8 +518,7 @@ def test_a_tool_outside_the_verification_scene_carries_no_cap(
         )
 
     assert coding_tool.create_coding_tool(
-        scene="summarizer",
-    ).query_wall_cap_seconds is None
+        scene="summarizer", cwd=_REPO_ROOT).query_wall_cap_seconds is None
 
 
 def test_the_environment_override_moves_the_cap_at_construction(
@@ -529,17 +534,15 @@ def test_the_environment_override_moves_the_cap_at_construction(
     monkeypatch.delenv("PDT_LLM_MODE", raising=False)
 
     monkeypatch.setenv(coding_tool.VERIFICATION_LLM_QUERY_CAP_ENV, "60")
-    assert ClaudeCodingTool(scene="verification").query_wall_cap_seconds == 60.0
+    assert ClaudeCodingTool(scene="verification", cwd=_REPO_ROOT).query_wall_cap_seconds == 60.0
     assert coding_tool.create_coding_tool(
-        scene="verification",
-    ).query_wall_cap_seconds == 60.0
+        scene="verification", cwd=_REPO_ROOT).query_wall_cap_seconds == 60.0
 
     # A value that is not a number falls back to the default.
     monkeypatch.setenv(coding_tool.VERIFICATION_LLM_QUERY_CAP_ENV, "abc")
-    assert ClaudeCodingTool(scene="verification").query_wall_cap_seconds == 2700.0
+    assert ClaudeCodingTool(scene="verification", cwd=_REPO_ROOT).query_wall_cap_seconds == 2700.0
     assert coding_tool.create_coding_tool(
-        scene="verification",
-    ).query_wall_cap_seconds == 2700.0
+        scene="verification", cwd=_REPO_ROOT).query_wall_cap_seconds == 2700.0
 
 
 # ---------------------------------------------------------------------------
@@ -556,7 +559,7 @@ def test_none_cap_keeps_todays_behaviour(monkeypatch):
     """
     monkeypatch.setenv("PDT_CODING_QUERY_PROGRESS_SECONDS", "1")
     logger = _RecordingLogger()
-    tool = ClaudeCodingTool(logger=logger)
+    tool = ClaudeCodingTool(logger=logger, cwd=_REPO_ROOT)
 
     assert tool.query_wall_cap_seconds is None, (
         "a tool that nobody capped must not carry a cap"
@@ -580,7 +583,7 @@ def test_none_cap_keeps_todays_behaviour(monkeypatch):
     )
 
     # And a tool with no logger grows no thread at all — as before.
-    quiet = ClaudeCodingTool()
+    quiet = ClaudeCodingTool( cwd=_REPO_ROOT)
     reporter = _QueryProgressReporter(
         quiet.logger, wall_cap_seconds=quiet.query_wall_cap_seconds,
     )
@@ -605,7 +608,7 @@ def test_a_process_that_already_exited_is_not_killed_again(monkeypatch):
     answer is different: one is a no-op, the other is the whole point.
     """
     logger = _RecordingLogger()
-    tool = ClaudeCodingTool(logger=logger)
+    tool = ClaudeCodingTool(logger=logger, cwd=_REPO_ROOT)
     tool.query_wall_cap_seconds = 1.0
 
     killed = _capture_kills(monkeypatch)
@@ -641,7 +644,7 @@ def test_kill_in_flight_dispatch_kills_the_process_group():
     has to take the whole process group down and say that it did.
     """
     logger = _RecordingLogger()
-    tool = ClaudeCodingTool(logger=logger)
+    tool = ClaudeCodingTool(logger=logger, cwd=_REPO_ROOT)
 
     proc = subprocess.Popen(
         ["sleep", "300"], start_new_session=True,
@@ -691,7 +694,7 @@ def test_kill_in_flight_dispatch_without_a_dispatch_returns_false():
     missing process must not turn into an exception.
     """
     logger = _RecordingLogger()
-    tool = ClaudeCodingTool(logger=logger)
+    tool = ClaudeCodingTool(logger=logger, cwd=_REPO_ROOT)
 
     assert tool._current_process is None
     assert tool.kill_in_flight_dispatch("test:nothing_in_flight") is False
@@ -762,7 +765,7 @@ def test_the_outer_cap_ends_the_in_flight_dispatch(
         ClaudeCodingTool, "kill_in_flight_dispatch", _fake_kill, raising=True,
     )
 
-    parent_tool = ClaudeCodingTool(scene="verification")
+    parent_tool = ClaudeCodingTool(scene="verification", cwd=_REPO_ROOT)
     settings_path = tmp_path / "settings.json"
     settings_path.write_text("{}")
     vp_node = {
@@ -869,7 +872,7 @@ def test_the_scoped_tool_the_sub_agent_builds_carries_the_cap(
     async def _run() -> Any:
         return await agent._execute_attempt(
             vp_node=vp_node,
-            coding_tool=_RecordingTool(scene="verification"),
+            coding_tool=_RecordingTool(scene="verification", cwd=_REPO_ROOT),
             settings_path=str(settings_path),
             log_path=tmp_path / "attempt.log",
             attempt=0,

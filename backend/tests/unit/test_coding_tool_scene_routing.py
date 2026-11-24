@@ -42,6 +42,12 @@ import provider_routing
 import usage_registry
 from coding_tool import ClaudeCodingTool, SceneProviderUnavailable
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -199,7 +205,7 @@ class TestSceneConstructor:
         monkeypatch.setattr(
             ClaudeCodingTool, "_get_live_provider_priority", lambda *a, **k: ["Vendor B Pro"],
         )
-        tool = ClaudeCodingTool(scene="execution")
+        tool = ClaudeCodingTool(scene="execution", cwd=_REPO_ROOT)
         ppatch, calls = _capture_popen_env_and_args()
         with ppatch:
             tool._run_claude_interactive("hi")
@@ -213,7 +219,7 @@ class TestSceneConstructor:
         self, fake_db, scene_chain
     ):
         scene_chain["chain"] = ["Ghost Provider", "Vendor A"]
-        tool = ClaudeCodingTool(scene="execution")
+        tool = ClaudeCodingTool(scene="execution", cwd=_REPO_ROOT)
         ppatch, calls = _capture_popen_env_and_args()
         with ppatch:
             tool._run_claude_interactive("hi")
@@ -236,7 +242,7 @@ class TestSceneConstructor:
         monkeypatch.setattr(
             ClaudeCodingTool, "_get_live_provider_priority", lambda *a, **k: ["Vendor B Pro"],
         )
-        tool = ClaudeCodingTool(scene="execution")
+        tool = ClaudeCodingTool(scene="execution", cwd=_REPO_ROOT)
         ppatch, calls = _capture_popen_env_and_args()
         with ppatch:
             with pytest.raises(SceneProviderUnavailable) as excinfo:
@@ -255,7 +261,7 @@ class TestSceneConstructor:
         monkeypatch.setattr(
             ClaudeCodingTool, "_get_live_provider_priority", lambda *a, **k: ["Vendor B Pro"],
         )
-        tool = ClaudeCodingTool()
+        tool = ClaudeCodingTool( cwd=_REPO_ROOT)
         assert tool.scene is None
         ppatch, calls = _capture_popen_env_and_args()
         with ppatch:
@@ -275,7 +281,7 @@ class TestPerCallSceneOverride:
         self, fake_db, scene_chain
     ):
         scene_chain["chain"] = ["Vendor A Pro"]
-        tool = ClaudeCodingTool(scene="execution")
+        tool = ClaudeCodingTool(scene="execution", cwd=_REPO_ROOT)
         ppatch, calls = _capture_popen_env_and_args()
         with ppatch:
             # The instance scene would select Vendor A Pro; the per-call
@@ -290,7 +296,7 @@ class TestPerCallSceneOverride:
         monkeypatch.setattr(
             ClaudeCodingTool, "_get_live_provider_priority", lambda *a, **k: ["Vendor B Pro"],
         )
-        tool = ClaudeCodingTool(scene="verification")
+        tool = ClaudeCodingTool(scene="verification", cwd=_REPO_ROOT)
         captured = {}
 
         real_interactive = ClaudeCodingTool._run_claude_interactive
@@ -315,7 +321,7 @@ class TestPerCallSceneOverride:
         """The chain holder mutates between two calls; the second call
         must pick the NEW chain (no construction-time freezing)."""
         scene_chain["chain"] = ["Vendor A Pro"]
-        tool = ClaudeCodingTool(scene="execution")
+        tool = ClaudeCodingTool(scene="execution", cwd=_REPO_ROOT)
         ppatch, calls = _capture_popen_env_and_args()
         with ppatch:
             tool._run_claude_interactive("call-1")
@@ -335,7 +341,7 @@ class TestSceneObservability:
     def test_selected_provider_log_carries_scene(self, fake_db, scene_chain):
         scene_chain["chain"] = ["Vendor A Pro"]
         logger = MagicMock()
-        tool = ClaudeCodingTool(scene="execution", logger=logger)
+        tool = ClaudeCodingTool(scene="execution", logger=logger, cwd=_REPO_ROOT)
         ppatch, calls = _capture_popen_env_and_args()
         with ppatch:
             tool._run_claude_interactive("hi")
@@ -394,8 +400,7 @@ class TestProviderMappingIsSingleSourceOfTruth:
         tool = ClaudeCodingTool(
             scene="execution",
             base_url="https://api.vendor-c.test/coding/",
-            auth_token="sk-vendor-c-runlevel",
-        )
+            auth_token="sk-vendor-c-runlevel", cwd=_REPO_ROOT)
         ppatch, calls = _capture_popen_env_and_args()
         with ppatch:
             tool._run_claude_interactive("hi")
@@ -433,8 +438,7 @@ class TestProviderMappingIsSingleSourceOfTruth:
             scene="execution",
             settings=base_settings,
             base_url="https://api.vendor-c.test/coding/",
-            auth_token="sk-vendor-c-runlevel",
-        )
+            auth_token="sk-vendor-c-runlevel", cwd=_REPO_ROOT)
         ppatch, calls = _capture_popen_env_and_args()
         with ppatch:
             tool._run_claude_interactive("hi")
@@ -511,8 +515,7 @@ class TestSceneFailsClosed:
         tool = ClaudeCodingTool(
             scene="execution",
             base_url=run_level_url,
-            auth_token=run_level_key,
-        )
+            auth_token=run_level_key, cwd=_REPO_ROOT)
 
         built_env = _capture_dispatch_env(monkeypatch)
         written = []
@@ -556,7 +559,7 @@ class TestSceneFailsClosed:
         which of the ways the chain came up empty it was.
         """
         scene_chain["chain"] = []
-        tool = ClaudeCodingTool(scene="refiner")
+        tool = ClaudeCodingTool(scene="refiner", cwd=_REPO_ROOT)
         with pytest.raises(SceneProviderUnavailable) as excinfo:
             tool._run_claude_interactive("hi")
 
@@ -587,7 +590,7 @@ class TestSceneFailsClosed:
             provider_routing, "resolve_provider_chain",
             lambda scene, *a, **k: ["Vendor A Pro", "Vendor A"],
         )
-        tool = ClaudeCodingTool(scene="execution")
+        tool = ClaudeCodingTool(scene="execution", cwd=_REPO_ROOT)
         with pytest.raises(SceneProviderUnavailable) as excinfo:
             # Excluding every candidate is the cheapest way to make the
             # chain resolvable-but-unusable without touching the fake DB.
@@ -619,8 +622,7 @@ class TestSceneFailsClosed:
         run_level_key = "sk-run-level-key"
         tool = ClaudeCodingTool(
             base_url=run_level_url,
-            auth_token=run_level_key,
-        )
+            auth_token=run_level_key, cwd=_REPO_ROOT)
         assert tool.scene is None
 
         built_env = _capture_dispatch_env(monkeypatch)
@@ -649,7 +651,7 @@ class TestSceneFailsClosed:
         monkeypatch.setattr(
             ClaudeCodingTool, "_get_live_provider_priority", lambda *a, **k: [],
         )
-        tool = ClaudeCodingTool()
+        tool = ClaudeCodingTool( cwd=_REPO_ROOT)
 
         built_env = _capture_dispatch_env(monkeypatch)
         ppatch, calls = _capture_popen_env_and_args()
@@ -699,8 +701,7 @@ class TestSceneFailsClosed:
         tool = ClaudeCodingTool(
             scene="execution",
             base_url="https://run-level-provider.invalid/anthropic",
-            auth_token="sk-run-level-key",
-        )
+            auth_token="sk-run-level-key", cwd=_REPO_ROOT)
 
         ppatch, calls = _capture_popen_env_and_args()
         with ppatch, usage_registry.plan_usage_context(

@@ -95,6 +95,12 @@ from dynamic_provider_concurrency import (  # noqa: E402
     set_shared_cooldown,
 )
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 # Module-level, so it covers every case here rather than one decorator.
 #
 # Why ``e2e`` and not ``time_sensitive``. This file sleeps through a real
@@ -401,8 +407,7 @@ def test_a_closed_window_is_slept_through_and_then_dispatched(
         )
         tracker = ActiveConcurrencyTracker()
         tool = ClaudeCodingTool(
-            scene="verification", concurrency_tracker=tracker,
-        )
+            scene="verification", concurrency_tracker=tracker, cwd=_REPO_ROOT)
         tool.provider_slot_wait_sec = 0.2
 
         started = time.monotonic()

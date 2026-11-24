@@ -197,7 +197,8 @@ import json
 import logging
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from coding_tool import JsonSession
@@ -1430,7 +1431,9 @@ class TerminalDecisionJudge:
     assert on the shape of the single call.  Without a tool it builds a
     :class:`coding_tool.ClaudeCodingTool` on first use, on the
     ``verification`` scene — the same scene the verification path itself
-    runs on.
+    runs on — and in the checkout it was told about (``cwd``): the tool
+    takes its working root as a required keyword, so a judge that
+    cannot name a tree gets no tool at all.
 
     The judge investigates with the **read-only** tools
     (:data:`READ_ONLY_TOOLS`): it may read the chain record, the
@@ -1450,11 +1453,16 @@ class TerminalDecisionJudge:
         self,
         coding_tool: Any = None,
         timeout_seconds: Optional[int] = None,
+        cwd: Optional[Union[str, Path]] = None,
     ) -> None:
         self._coding_tool = coding_tool
         self._timeout = (
             int(timeout_seconds) if timeout_seconds else self.TIMEOUT_SECONDS
         )
+        # The checkout the judge investigates in.  The tool takes its
+        # working root as a required keyword, so a judge that has to
+        # build one has to know which tree it is about.
+        self._cwd = cwd
         # The session the last call ran in, and the id of that session.
         # Both start empty: a judge that has not called anything yet has
         # no session, and saying so is better than inheriting one.
@@ -1481,8 +1489,35 @@ class TerminalDecisionJudge:
         if self._coding_tool is None:
             from coding_tool import ClaudeCodingTool
 
-            self._coding_tool = ClaudeCodingTool(scene="verification")
+            self._coding_tool = ClaudeCodingTool(
+                scene="verification",
+                cwd=self._tool_cwd(),
+            )
         return self._coding_tool
+
+    def _tool_cwd(self) -> str:
+        """The checkout the judge's own tool runs in.
+
+        The judge reads the tree under verification, so its tool has to
+        run there.  A judge that cannot name a tree gets **no** tool:
+        the tool would refuse an empty root, and the alternative — a
+        tool with no root at all — would read the backend server's own
+        directory, which is a different checkout and therefore the
+        wrong evidence.
+        """
+        named = str(self._cwd).strip() if self._cwd else ""
+        if named:
+            return named
+
+        err = ValueError("explicit cwd required")
+        err.add_note(
+            "TerminalDecisionJudge must be told which checkout to run "
+            "in — name the plan's project directory. A tool with no "
+            "root would run its child in the backend server's working "
+            "directory, which is a different checkout from the tree "
+            "under verification."
+        )
+        raise err
 
     # ------------------------------------------------------------------
     # The prompt

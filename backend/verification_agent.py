@@ -2863,6 +2863,36 @@ def _result_evidence(result: Any) -> Dict[str, Any]:
     return {}
 
 
+#: The key the grader writes its failed assertions under, in the evidence
+#: blob.  ``verification_api_runner`` produces it; the report entry is
+#: where it has to **land** (see :func:`_failed_assertions_of`).
+_FAILED_ASSERTIONS_FIELD = "assertions_failed"
+
+
+def _failed_assertions_of(result: Any) -> Optional[List[str]]:
+    """The failed assertions one result carries — the grader's own payload.
+
+    2026-10-29 (VP-030, root-cause report ``root-cause-VP-030.md``, R0):
+    the payload has to reach the report entry **as a field**.  It used to
+    live only inside the evidence blob, so the failure's fingerprint had
+    nothing to hash but the prose around it — and prose is rewritten from
+    one round to the next.  That is how "the root cause moved" came to
+    mean "the report was worded differently".
+
+    ``None`` means "this result carries no payload", which is **not** the
+    same as "nothing failed": one says *we do not know*, the other says
+    *we know, and nothing failed*.
+    """
+    value = _result_evidence(result).get(_FAILED_ASSERTIONS_FIELD)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    return [str(value)]
+
+
 def _result_serving_handover(result: Any) -> bool:
     """Did the address change hands during the look that produced *result*?
 
@@ -4782,7 +4812,11 @@ class Orchestrator:
         """
         self.plan_dir = Path(plan_dir)
         self.project_dir = Path(project_dir)
-        self.coding_tool = coding_tool or ClaudeCodingTool()
+        # 2026-10-29 — the tool names the tree under verification.  A
+        # tool built without a working root runs its child in the
+        # backend server's working directory, which is a different
+        # checkout.
+        self.coding_tool = coding_tool or ClaudeCodingTool(cwd=self.project_dir)
         self.vp_capacity_resolver = (
             vp_capacity_resolver or _verification_vp_capacity
         )
@@ -9842,7 +9876,14 @@ class Orchestrator:
             # docstring.  Only the executor's own ids are copied, and
             # only when it named some: an entry without them keeps the
             # field it came with.
-            failed_assertions = source.get("failed_assertions")
+            # 2026-10-29 (VP-030, R0): the grader's own payload is
+            # read out of the executor's evidence first — it is the
+            # machine-written record of what failed.  The executor's
+            # own field is the fallback for a gate that wrote the
+            # failing-case ids instead.
+            failed_assertions = _failed_assertions_of(source)
+            if not failed_assertions:
+                failed_assertions = source.get("failed_assertions")
             if isinstance(failed_assertions, str):
                 failed_assertions = [failed_assertions]
             if isinstance(failed_assertions, (list, tuple)):
@@ -9852,6 +9893,59 @@ class Orchestrator:
                 ]
                 if ids:
                     entry["failed_assertions"] = sorted(set(ids))
+        return report_data
+
+    def _attach_failed_assertions(
+        self, report_data: Dict[str, Any], execution_results: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Copy the grader's failed assertions onto the report entries.
+
+        2026-10-29 (VP-030, R0): the report's prose is written by the
+        judgment LLM, and that LLM rewords it from one round to the next.
+        The payload is not the LLM's to write — it is the grader's, and it
+        is already in the executor's result.  So the framework copies it
+        across: after this call every entry that has a payload carries it
+        **as a field**, and the failure's fingerprint is computed from it.
+
+        An entry that already carries a payload keeps its own — the
+        framework does not second-guess a payload that was recorded.
+
+        This is the **fallback report's** half: the judgment path gets
+        the same payload through :meth:`_backfill_failure_classes`, which
+        also restores the executor's failure class (the executor is the
+        authority there, and the class has to travel with the payload).
+        The fallback report is written when the judgment LLM could not
+        be reached at all, so there is no LLM entry to backfill — the
+        executor's own entries are the report's entries, and this is what
+        gives them their payload field.
+        """
+        results = execution_results.get("execution_results") or []
+        if not isinstance(results, list):
+            return report_data
+        payloads: Dict[str, List[str]] = {}
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            vp_id = str(result.get("id") or "").strip()
+            failed = _failed_assertions_of(result)
+            if not vp_id or failed is None:
+                continue
+            payloads.setdefault(vp_id, failed)
+        if not payloads:
+            return report_data
+        entries = report_data.get("verification_results")
+        if not isinstance(entries, list):
+            return report_data
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            vp_id = str(entry.get("id") or "").strip()
+            failed = payloads.get(vp_id)
+            if failed is None:
+                continue
+            if entry.get("failed_assertions"):
+                continue
+            entry["failed_assertions"] = list(failed)
         return report_data
 
     def _backfill_reuse_markers(
@@ -11286,11 +11380,25 @@ class Orchestrator:
         # 2026-11-02: the machine-written set of failing cases travels
         # with the entry, so the report and the artifact say the same
         # thing about which cases failed.
-        failed_cases = verdict.get("failed_assertions")
-        if isinstance(failed_cases, (list, tuple)) and failed_cases:
-            entry["failed_assertions"] = [
-                str(item) for item in failed_cases if str(item).strip()
-            ]
+        #
+        # 2026-10-29 (VP-030, R0): the **payload** travels as its own
+        # field, so the failure's identity can be computed from it
+        # instead of from the prose around it.  The prose is rewritten
+        # every round; the payload is not.  The payload is the grader's
+        # own list (``assertions_failed`` in the evidence); when the
+        # grader named no assertions there is no payload, and the
+        # machine-written failing-case ids the gate produced keep the
+        # field — one field, one meaning: the machine-written identity
+        # of what failed.
+        failed = _failed_assertions_of(verdict)
+        if failed:
+            entry["failed_assertions"] = list(failed)
+        else:
+            failed_cases = verdict.get("failed_assertions")
+            if isinstance(failed_cases, (list, tuple)) and failed_cases:
+                entry["failed_assertions"] = [
+                    str(item) for item in failed_cases if str(item).strip()
+                ]
         return entry
 
     def _attach_machine_written_failed_cases(
@@ -13821,7 +13929,7 @@ class Orchestrator:
         # SKIPPED, never PASSED.
         overall_status = _derive_overall_status(execution_results_list)
 
-        return {
+        report = {
             "overall_status": overall_status,
             "summary": f"自动生成报告: {status_counts['PASSED']} 通过, {status_counts['FAILED']} 失败, {status_counts['SKIPPED']} 跳过, {status_counts['PARTIAL']} 部分",
             "verification_results": execution_results_list,
@@ -13833,6 +13941,13 @@ class Orchestrator:
             "plan_id": self.plan_dir.name,
             "project_dir": str(self.project_dir)
         }
+        # 2026-10-29 (VP-030, R0): the fallback report's entries are the
+        # executor's own entries — there is no judgment LLM to copy a
+        # payload from — so the payload is attached here, as a field of
+        # its own.  Without it the fallback report's failure has nothing
+        # but prose to fingerprint, and the prose is reworded every
+        # round.
+        return self._attach_failed_assertions(report, execution_results)
 
     def _persist_fallback_report(self, execution_results: dict) -> dict:
         """Build the minimal report AND write it to disk.

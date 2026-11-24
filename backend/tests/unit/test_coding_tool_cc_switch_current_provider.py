@@ -35,6 +35,12 @@ import coding_tool as coding_tool_module
 from cc_switch import ProviderConfig
 from coding_tool import ClaudeCodingTool
 
+#: The checkout these tests run in.  Every coding tool built
+#: in this file names it as its working root — the tool cannot be
+#: born without one, and a root that is not named runs the child
+#: in the backend server's directory instead.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -196,7 +202,7 @@ class TestLegacyWalkUsesCcSwitchCurrentProvider:
             lambda *a, **k: list(priority),
         )
         monkeypatch.delenv("PDT_PROVIDER_PRIORITY", raising=False)
-        return ClaudeCodingTool()
+        return ClaudeCodingTool( cwd=_REPO_ROOT)
 
     def test_current_provider_wins_over_priority_walk(self, monkeypatch):
         monkeypatch.setattr(
@@ -258,7 +264,7 @@ class TestLegacyWalkUsesCcSwitchCurrentProvider:
             })),
         )
 
-        tool = ClaudeCodingTool()
+        tool = ClaudeCodingTool( cwd=_REPO_ROOT)
         ppatch, calls = _capture_popen_env_and_args()
         with ppatch:
             tool._run_claude_interactive("hi")
