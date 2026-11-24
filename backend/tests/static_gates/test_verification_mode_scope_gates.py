@@ -982,8 +982,19 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 按本 gate 的既定流程把冻结基线前移到**合并态**哈希（`shasum -a 256` 实测值，
     # 不是抄来的）。表内条目集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节
     # 比对。
+    # 2026-11-24：因已批准的「终态计划分区只画终态计划」改动了 `frontend/app.js`
+    # —— 新增 `SCHEDULER_TERMINAL_PHASES`（终态相位的集合：stopped / failed /
+    # waiting_for_quota / verification_loop_stopped / verification_failed），
+    # `renderSchedulerTerminalPlans()` 的行筛选改为「相位属于终态**且**该相位有动作」
+    # 两个条件同时成立。原来只看「该相位有没有动作」，于是 `executing`（动作表里有
+    # `pause`）的**正在跑**的计划也被画进了终态表，还带着一个「暂停」按钮；队列/
+    # 运行列表的相位不属于终态。`SCHEDULER_ACTIONS_BY_PHASE` 的现有条目一字未动
+    # （运行列表的「暂停」按钮仍靠它）。按本 gate 的既定流程把冻结基线前移到本分支的
+    # 批准态。哈希取自工作区文件的 `shasum -a 256 frontend/app.js` 实测值，不是抄来的。
+    # 表内条目集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节比对，该文件此后
+    # 仍被逐字节钉住，任何再编辑照样红。
     "frontend/app.js": (
-        "562e5dd802474c80e21b17624c99546fdf129ba3b4625a6a02d16be96402830f"
+        "b7bcd0ff70d5308c1d17f8f67d45827acf0f217dc8bce092c4b9f4d0bb93e645"
     ),
     # 2026-11-01：因「调度卡片容器与收起态样式」（task-11）改动了 `frontend/style.css`，
     # 按本 gate 的既定流程把哈希前移到本分支的批准态；表内条目集合不变。

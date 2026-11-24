@@ -2299,6 +2299,23 @@ const SCHEDULER_ACTIONS_BY_PHASE = {
     verification_failed: ["rerun-verification"],
 };
 
+/** The phases a *terminal* plan can be in — the ones that have come to
+    a stop and can only be acted on again by an operator.  A terminal
+    plan is in neither the queue nor the running list, so the terminal
+    block is the only place it can be drawn.
+
+    The phases of the queue and of the running list are deliberately
+    **not** here: ``queued`` and ``executing`` are alive, and they are
+    drawn in their own lists (with their own buttons — the running row's
+    「暂停」 comes from the action matrix, not from this set).  Listing
+    them here would draw a running plan in the terminal table a second
+    time, next to a pause button that reads as if the plan were already
+    stopped. */
+const SCHEDULER_TERMINAL_PHASES = new Set([
+    "stopped", "failed", "waiting_for_quota",
+    "verification_loop_stopped", "verification_failed",
+]);
+
 /** The text one action's button carries.  The phase-specific label wins
     when there is one; otherwise the action's own label; and an action
     nobody labelled falls back to its own name, so a button never reads
@@ -3878,7 +3895,10 @@ function renderSchedulerTerminalPlans(plans) {
 
     const actionable = rows.filter((plan) => {
         const phase = schedulerPlanPhase(plan);
-        return (SCHEDULER_ACTIONS_BY_PHASE[phase] || []).length > 0;
+        return (
+            SCHEDULER_TERMINAL_PHASES.has(phase) &&
+            (SCHEDULER_ACTIONS_BY_PHASE[phase] || []).length > 0
+        );
     });
 
     if (!actionable.length) {
