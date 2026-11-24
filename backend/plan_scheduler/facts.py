@@ -513,6 +513,41 @@ class PlanFactsReader:
         #: creation time does not change while the directory is there.
         self._created_at_cache: Dict[str, Optional[float]] = {}
 
+    def with_connection(
+        self, conn: sqlite3.Connection
+    ) -> "PlanFactsReader":
+        """Return this reader again, reading through another connection.
+
+        The twin is the same reader with the same parameters — the same
+        plans root, the same clock and the same source of live plans —
+        and it reads through the connection it is given.  It exists so
+        that the read model can read without waiting for the writer: a
+        read on the writer's own connection waits for the writer's
+        transaction, and a panel that waits for the worker is a panel
+        that shows nothing while the worker works.
+
+        The twin shares this reader's bookkeeping — the plans it has
+        already complained about and the creation times it has already
+        read — so a plan whose directory is gone is reported once and
+        not twice, and the two readers cannot disagree about a fact
+        that cannot change under them.
+
+        Args:
+            conn: the connection the twin reads on.
+
+        Returns:
+            The reader that reads on ``conn``.
+        """
+        twin = type(self)(
+            conn,
+            self._project_root,
+            clock=self._clock,
+            live_plan_ids=self._live_plan_ids_source,
+        )
+        twin._missing_dir_warned = self._missing_dir_warned
+        twin._created_at_cache = self._created_at_cache
+        return twin
+
     # ------------------------------------------------------------------
     # The queued plans
     # ------------------------------------------------------------------
@@ -546,14 +581,28 @@ class PlanFactsReader:
         layer's business, and a second mapping here would be a second
         answer to the same question.
 
+        A plan without a queue row has no number in the line, so
+        something else has to say where it stands: the plan's own
+        ``plan_routing.updated_at`` and then its plan id.  That is the
+        rule the restart recovery already follows, and it is the only
+        one that leaves the tail the same tail on every read — the
+        order of the query's own rows is an accident of the storage
+        layer, and two reads of the same database could answer
+        differently.  The row of such a plan carries the
+        ``updated_at`` it was ordered by, so the caller that gives the
+        plan its number reads the same fact the reader ordered by
+        instead of a second answer to the same question.
+
         Returns:
             The queued plans, each a dict of ``plan_id``, ``priority``,
-            ``seq``, ``due`` and ``phase``, in the order the shared
-            comparator gives.  Empty when nothing is waiting.
+            ``seq``, ``due`` and ``phase`` — and, for a plan without a
+            queue row, the ``updated_at`` it was ordered by — in the
+            order the shared comparator gives.  Empty when nothing is
+            waiting.
         """
         rows = self._conn.execute(
             "SELECT r.plan_id, q.seq, q.priority, q.promote_order, "
-            "       e.next_run_at "
+            "       e.next_run_at, r.updated_at "
             "FROM plan_routing r "
             "LEFT JOIN scheduler_queue q ON q.plan_id = r.plan_id "
             "LEFT JOIN plan_execution e ON e.plan_id = r.plan_id "
@@ -562,24 +611,38 @@ class PlanFactsReader:
         ).fetchall()
 
         now = self._now_iso()
-        entries: List[Tuple[Tuple[bool, int, int, int], Dict[str, Any]]] = []
+        entries: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = []
         for row in rows:
-            plan_id, seq, priority, promote_order, next_run_at = tuple(row)
+            plan_id, seq, priority, promote_order, next_run_at, updated_at = tuple(
+                row
+            )
             if self._plan_dir(plan_id) is None:
                 self._warn_missing_plan_dir(plan_id)
                 continue
+            # The plan's own routing timestamp — the fact that says
+            # where a plan without a queue row stands.
+            stamp = "" if not updated_at else str(updated_at)
+            payload: Dict[str, Any] = {
+                "plan_id": plan_id,
+                "priority": int(priority) if priority is not None else 0,
+                "seq": int(seq) if seq is not None else None,
+                "due": _is_due(next_run_at, now),
+                # The phase the plan is in, read from the
+                # routing row and passed on as it is.
+                "phase": self._phase(plan_id),
+            }
+            if seq is None:
+                # The plan has no number in the line yet, so the
+                # timestamp is what says where it stands — and it
+                # rides on the row, so the caller that gives the plan
+                # its number reads the fact the reader ordered by.
+                payload["updated_at"] = stamp
             entries.append(
                 (
-                    _queue_sort_key(seq, priority, promote_order),
-                    {
-                        "plan_id": plan_id,
-                        "priority": int(priority) if priority is not None else 0,
-                        "seq": int(seq) if seq is not None else None,
-                        "due": _is_due(next_run_at, now),
-                        # The phase the plan is in, read from the
-                        # routing row and passed on as it is.
-                        "phase": self._phase(plan_id),
-                    },
+                    _queue_sort_key(
+                        seq, priority, promote_order, stamp, plan_id
+                    ),
+                    payload,
                 )
             )
 
@@ -1202,8 +1265,12 @@ class PlanFactsReader:
 
 
 def _queue_sort_key(
-    seq: Any, priority: Any, promote_order: Any
-) -> Tuple[bool, int, int, int]:
+    seq: Any,
+    priority: Any,
+    promote_order: Any,
+    updated_at: Any = None,
+    plan_id: str = "",
+) -> Tuple[Any, ...]:
     """Return the key a queued plan is ordered by.
 
     The comparator is the one the whole scheduler shares
@@ -1211,9 +1278,25 @@ def _queue_sort_key(
     by promotion order, then by priority, then by arrival.  A plan
     without a queue row has not been enqueued yet, so it is ordered
     behind everything that has.
+
+    A plan without a queue row is also the only one the shared
+    comparator cannot decide on its own: it has no arrival number, so
+    two such plans would fall back on the order the query happened to
+    return them.  The key therefore carries two more tie-breakers —
+    the plan's own ``updated_at`` and then its plan id — and the tail
+    is the same tail on every read.  An empty timestamp sorts before a
+    filled one, and the plan id is always there to break the last
+    tie, so the order is always decided.
     """
     if seq is None:
-        return (True, 0, int(priority) if priority is not None else 0, _NO_SEQ)
+        return (
+            True,
+            0,
+            int(priority) if priority is not None else 0,
+            _NO_SEQ,
+            "" if not updated_at else str(updated_at),
+            str(plan_id or ""),
+        )
     return queue_key(
         {
             "promote_order": promote_order,

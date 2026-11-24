@@ -145,6 +145,25 @@ that "who holds compute" says what the plan facts say.
 The eviction's own writes are **one** transaction: the verdict on the
 execution row, the queue row and the spent promotion.  Either the plan
 gave way and kept its place in the line, or none of it happened.
+
+When the second transaction loses the race
+-------------------------------------------
+The queue write is a transaction of its own, and it can lose the race
+for SQLite's write lock: the lock is held for the whole write
+transaction, the second writer waits for it, and when the wait runs
+out SQLite says ``database is locked`` and **the write did not happen**.
+
+The phase was changed in the *first* transaction — the lifecycle's own,
+committed before the queue write was attempted — so the plan is
+already waiting, and only the queue row is missing.  A lock is the one
+fault that can be waited out, and the reconciler is what waits it out:
+so the answer is ``applied``, with a detail that names the queue row
+that is still missing.  It is not a fault, because the fault says
+nothing about the plan; and it is not a conflict, because the plan
+really is waiting.  Any other fault of the write — a disk that is full,
+a database that is corrupt — stays a fault: it is not a lock, and
+nothing can be believed about the plan while the database cannot be
+written.
 """
 
 from __future__ import annotations
@@ -209,6 +228,12 @@ OUTCOMES = frozenset(
 #: nothing to record, nothing to re-queue and no promotion to spend —
 #: the eviction did not happen.
 _KILL_INCOMPLETE = "kill_incomplete"
+
+#: The detail an action answers with when its queue write could not take
+#: SQLite's write lock: the plan is **waiting** — the phase says so, and
+#: the phase was changed before the queue write was attempted — and the
+#: queue row is still missing, so the reconciler will put it there.
+_QUEUED_PENDING_RECONCILE = "queued_pending_reconcile"
 
 
 class CommandRejected(Exception):
@@ -361,6 +386,42 @@ def _connection_of(source: Any) -> Optional[sqlite3.Connection]:
         if isinstance(conn, sqlite3.Connection):
             return conn
     return None
+
+
+# ---------------------------------------------------------------------------
+# Recognising the write lock
+# ---------------------------------------------------------------------------
+
+
+def _is_locked_error(exc: BaseException) -> bool:
+    """Return whether the exception says the database was locked.
+
+    SQLite takes its write lock for the whole write transaction, so a
+    second writer waits for it — but the wait has a limit, and when the
+    limit is reached SQLite says ``database is locked`` and **the write
+    did not happen**.
+
+    That is the one fault of a queue write that says nothing about the
+    plan: the phase was changed in the lifecycle's own transaction,
+    before the queue write was attempted, and the phase is the plan's
+    state.  A lock is a thing that can be waited out, and the
+    reconciler is what waits it out.
+
+    Only SQLite's own lock message counts.  Another
+    ``OperationalError`` — a disk that is full, a database that is
+    corrupt — is a fault of the database itself, and it stays a fault:
+    it is not a lock, and nothing about the plan can be believed while
+    the database cannot be written.
+
+    Args:
+        exc: the exception the queue write raised.
+
+    Returns:
+        ``True`` when the write lost the race for the write lock.
+    """
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    return "locked" in str(exc).lower()
 
 
 # ---------------------------------------------------------------------------
@@ -670,9 +731,20 @@ class CommandExecutor:
 
         # Back to the head of the queue: the plan is waiting again, and
         # it is the next one to run.
-        with self._store.transaction(self._conn):
-            self._ensure_queued(plan_id)
-            self._store.promote(self._conn, plan_id)
+        try:
+            with self._store.transaction(self._conn):
+                self._ensure_queued(plan_id)
+                self._store.promote(self._conn, plan_id)
+        except sqlite3.OperationalError as exc:
+            if not _is_locked_error(exc):
+                raise
+            degraded = self._degrade_locked_write(plan_id)
+            if degraded is None:
+                # The phase does not say the plan is waiting, so the
+                # lock is not the only thing that went wrong.  The
+                # fault stays a fault.
+                raise
+            return degraded
 
         # The postcondition.  The facade's answer is a **request**, not a
         # fact: what counts is where the plan really is now.  A resume
@@ -726,9 +798,20 @@ class CommandExecutor:
                 return CONFLICT, getattr(result, "detail", None) or "conflict"
 
         # The plan is waiting, and it is the next one to run.
-        with self._store.transaction(self._conn):
-            self._ensure_queued(plan_id)
-            self._store.promote(self._conn, plan_id)
+        try:
+            with self._store.transaction(self._conn):
+                self._ensure_queued(plan_id)
+                self._store.promote(self._conn, plan_id)
+        except sqlite3.OperationalError as exc:
+            if not _is_locked_error(exc):
+                raise
+            degraded = self._degrade_locked_write(plan_id)
+            if degraded is None:
+                # The phase does not say the plan is waiting, so the
+                # lock is not the only thing that went wrong.  The
+                # fault stays a fault.
+                raise
+            return degraded
 
         # The capacity.  The start is the only action that may interrupt
         # somebody, and it does so only when the capacity is full and
@@ -1038,6 +1121,37 @@ class CommandExecutor:
         if self._is_queued(plan_id):
             return
         self._store.enqueue(self._conn, plan_id)
+
+    # ------------------------------------------------------------------
+    # The degraded answer
+    # ------------------------------------------------------------------
+
+    def _degrade_locked_write(
+        self, plan_id: str
+    ) -> Optional[Tuple[str, Optional[str]]]:
+        """Return the answer for a queue write that lost the write lock.
+
+        The phase is the plan's state, and it was moved in the
+        lifecycle's **own** transaction — committed before the queue
+        write was even attempted.  So a phase of ``queued`` says the
+        plan is waiting, whatever the queue table says about it: the
+        queue row is a fact the reconciler puts right, and the action
+        has already done what it was asked to do.
+
+        The answer says exactly that: ``applied``, with a detail that
+        names the row that is still missing.
+
+        Args:
+            plan_id: the plan whose queue write was refused.
+
+        Returns:
+            The answer to give the caller, or ``None`` when the phase
+            does not say the plan is waiting — in which case the caller
+            raises the lock and the fault stays a fault.
+        """
+        if self._phase_of(plan_id) != QUEUED_PHASE:
+            return None
+        return APPLIED, _QUEUED_PENDING_RECONCILE
 
     # ------------------------------------------------------------------
     # The command log
