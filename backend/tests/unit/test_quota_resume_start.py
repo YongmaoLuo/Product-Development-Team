@@ -318,3 +318,91 @@ def test_resume_verification_uses_the_verification_route_by_default(monkeypatch)
 
     assert quota_resume.resume_verification(_verification("p8")) is True
     assert calls == ["p8"]
+
+
+# ---------------------------------------------------------------------------
+# The working directory the plan was in
+# ---------------------------------------------------------------------------
+#
+# The start path refuses a plan it cannot be given a working directory
+# for — a 400, raised before anything is spawned.  A human hands that
+# directory over in the request body.  A *paused* plan does not need to:
+# its checkpoint carries the directory, and the start path prefers the
+# checkpoint over the body.
+#
+# A quota-parked run is not a paused run.  It stopped for want of
+# capacity, so it has no checkpoint, so the only place its directory
+# can come from is the durable row that records it.  A resumer that
+# starts the plan with the plan id alone hands the start path nothing,
+# the start path answers 400, and the plan is refused again on every
+# tick — forever, and invisibly: from the outside a plan that cannot
+# be revived looks exactly like a plan that is waiting.
+
+
+def test_resume_execution_passes_the_recorded_project_dir():
+    """The recorded directory travels in the request body.
+
+    The start path is asked for the plan *and* for the directory the
+    run was in.  Without it the start path cannot place the executor,
+    and it refuses the plan before it spawns anything — so the run
+    never comes back, and the only symptom is a refusal on every tick.
+
+    The request is the real request class, not a stand-in: the start
+    path reads other fields off it, so an object that merely carried a
+    ``project_dir`` would be refused for a different reason.
+    """
+    from server import StartExecutionRequest
+
+    calls: list = []
+
+    def fake_start(plan_id: str, req=None):
+        calls.append((plan_id, req))
+        return {"status": "running"}
+
+    parked = ParkedPlan(
+        "p9", "execution", 0, "waiting_for_quota", "/tmp/worktrees/p9"
+    )
+
+    assert quota_resume.resume_execution(parked, starter=fake_start) is True
+
+    assert len(calls) == 1
+    plan_id, req = calls[0]
+    assert plan_id == "p9"
+    assert isinstance(req, StartExecutionRequest)
+    assert req.project_dir == "/tmp/worktrees/p9"
+
+
+def test_resume_execution_without_project_dir_keeps_the_plain_call(caplog):
+    """A plan whose row records no directory is started as it was.
+
+    The call shape does not change: the plan id alone, exactly as
+    before.  The start path answers 400 — it has to, a plan with no
+    directory cannot be placed — and the resumer reports the refusal
+    and moves on.
+
+    The refusal is *named*, though: ``missing_project_dir`` and not
+    ``start_refused``.  The two are different problems, and an operator
+    needs to tell them apart: a plan that is busy comes back on its
+    own, and a plan with no recorded directory never will, because
+    nothing in the product writes that column for a run that stopped
+    for capacity.
+
+    The stub takes the plan id and nothing else, so a start that
+    carried a request body would raise ``TypeError`` before the body
+    ran — and the refusal would then be reported as an anomaly rather
+    than as the missing directory it is.
+    """
+    seen: list = []
+
+    def fake_start(plan_id: str):
+        seen.append(plan_id)
+        raise HTTPException(400, "project_dir is required. Provide the absolute path.")
+
+    parked = ParkedPlan("p9", "execution", 0, "waiting_for_quota")
+
+    with caplog.at_level(logging.WARNING, logger="quota_resume"):
+        assert quota_resume.resume_execution(parked, starter=fake_start) is False
+
+    assert seen == ["p9"]
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("reason=missing_project_dir" in message for message in messages)

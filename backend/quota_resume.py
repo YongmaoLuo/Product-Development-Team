@@ -30,6 +30,14 @@ copies would drift — which is how a plan ends up with two executors
 writing the same task rows.  So the callers name a plan, call the
 start path that already exists, and read the answer.
 
+The one thing the callers do hand over is the working directory the
+run was in.  The start path refuses a plan it cannot be given a
+directory for, and a run that parked for quota has no pause
+checkpoint to carry one — so the directory the durable row records
+travels in the request body, the way a human's start does.  Without it
+the start path answers 400, on every tick, forever, and the plan never
+comes back.
+
 The **sweep** — the pass that puts the three halves together — is the
 fourth.  It reads the parked plans, asks whether the quota window is
 open again, and revives what it can.  Its defining property is the
@@ -100,6 +108,21 @@ MIN_RETRY_SEC = 120
 #: thirty seconds, which is the very thing the window exists to stop.
 _LAST_ATTEMPT: dict = {}
 
+#: Why each plan's last revival attempt was refused, by plan id.
+#:
+#: It exists for one line of the log.  A refusal has more than one
+#: cause, and the sweep reports a refusal under one name — so the
+#: caller needs the *cause* from the place that saw it: only the start
+#: path knows that the plan was refused because its working directory
+#: was never recorded.  Without it every refusal reads the same, and a
+#: plan that can never be revived because it has no directory looks
+#: exactly like a plan that was busy.
+#:
+#: The entry is dropped before each attempt, so a reason can never be
+#: carried over from an earlier tick: an attempt that recorded no
+#: reason leaves no reason behind.
+_LAST_REFUSAL_REASON: dict = {}
+
 
 @dataclass(frozen=True)
 class ParkedPlan:
@@ -107,6 +130,17 @@ class ParkedPlan:
     kind: str
     round: int
     reason: str
+    #: The working directory the run was in, as the durable row records
+    #: it (``plan_execution.project_dir``).
+    #:
+    #: It is optional because the durable row may not carry it — a row
+    #: written before the column was filled in, or a plan that never
+    #: got as far as a directory — and because the verification table
+    #: has no such column at all (the verification start path reads the
+    #: directory out of the execution row itself).  A parked plan
+    #: without one is still a parked plan; it is only a parked plan
+    #: that the start path cannot be given a directory for.
+    project_dir: Optional[str] = None
 
 
 def quota_recovered(quota_map: Optional[Mapping[str, Any]]) -> bool:
@@ -173,7 +207,13 @@ def select_parked_plans(execution_rows=None, verification_rows=None) -> List[Par
         plan_id = _text(row, ("plan_id",))
         if not plan_id or plan_id in selected:
             continue
-        selected[plan_id] = ParkedPlan(plan_id, KIND_EXECUTION, 0, QUOTA_PARK_REASON)
+        selected[plan_id] = ParkedPlan(
+            plan_id,
+            KIND_EXECUTION,
+            0,
+            QUOTA_PARK_REASON,
+            _text(row, ("project_dir",)) or None,
+        )
     for row in verification_rows or ():
         if not _is_parked(row, _VERIFICATION_STATUS_KEYS, _VERIFICATION_REASON_KEYS):
             continue
@@ -200,7 +240,14 @@ def select_parked_plans(execution_rows=None, verification_rows=None) -> List[Par
 #: and ``stop_reason`` says why it stopped (``plan_status.py`` reads the
 #: same pair, and calls ``stop_reason`` the only place the parked
 #: verdict survives a restart).
-_EXECUTION_COLUMNS = ("plan_id", "exec_status", "stop_reason")
+#:
+#: The third one, ``project_dir``, is not part of the verdict — it is
+#: the working directory the run was in, and the start path needs it:
+#: a plan that is started without a directory is refused with a 400
+#: before anything is spawned.  A quota-parked run has no pause
+#: checkpoint to carry the directory, so the durable row is the only
+#: place it can come from.
+_EXECUTION_COLUMNS = ("plan_id", "exec_status", "stop_reason", "project_dir")
 
 #: The columns of ``plan_verification`` the reader reads.  The
 #: verification table carries its park in its own vocabulary —
@@ -215,7 +262,7 @@ _VERIFICATION_COLUMNS = (
 )
 
 #: The whole-table read of the executions.
-_EXECUTION_SQL = "SELECT plan_id, exec_status, stop_reason FROM plan_execution"
+_EXECUTION_SQL = "SELECT plan_id, exec_status, stop_reason, project_dir FROM plan_execution"
 
 #: The whole-table read of the verification rounds.
 _VERIFICATION_SQL = (
@@ -464,30 +511,71 @@ def _response_status(response: Any) -> Optional[int]:
         return None
 
 
-def _start_outcome(plan: ParkedPlan, starter: Callable[[str], Any], kind: str) -> bool:
+def _refusal_reason(plan: ParkedPlan, status: Optional[int]) -> str:
+    """Why the start path refused this plan, in the log's vocabulary.
+
+    Two reasons are worth telling apart, because an operator acts on
+    them differently.
+
+    ``start_refused`` is the ordinary answer: the plan is running, it
+    is archived, or its working directory is recorded but unusable.
+    Nothing is wrong with the plan; there is simply nothing to do.
+
+    ``missing_project_dir`` is the one that never gets better on its
+    own: the durable row carries no working directory, and the start
+    path refuses a plan it cannot be given a directory for — before it
+    spawns anything.  A plan parked for quota has no pause checkpoint
+    to carry the directory either, so the recorded row is the only
+    place it could have come from, and it did not come from there.  The
+    plan will be refused again on every tick, forever, and a log that
+    calls that ``start_refused`` makes it look like the ordinary case.
+
+    The reason is only claimed for an execution: the verification start
+    path reads the directory out of the execution row itself, so a
+    missing one is not what refuses it.
+    """
+    if plan.kind == KIND_EXECUTION and status == 400 and not plan.project_dir:
+        return "missing_project_dir"
+    return "start_refused"
+
+
+def _start_outcome(
+    plan: ParkedPlan,
+    starter: Callable[..., Any],
+    kind: str,
+    request: Any = None,
+) -> bool:
     """Call ``starter`` for ``plan`` and read the answer.
 
     Args:
         plan: the parked plan to start.
-        starter: the start path to call — it takes the plan id and
-            nothing else.
+        starter: the start path to call — it takes the plan id, and the
+            request body when one is given.
         kind: what is being started, for the log line.
+        request: the request body to hand the start path, or ``None``
+            for a start that carries nothing but the plan id.
 
     Returns:
         Whether the plan is now started.  Every failure answers
         ``False``; none of them is raised.
     """
     try:
-        response = starter(plan.plan_id)
+        if request is None:
+            response = starter(plan.plan_id)
+        else:
+            response = starter(plan.plan_id, request)
     except HTTPException as exc:
         if exc.status_code in _REFUSAL_STATUSES:
             # An ordinary refusal: the plan is running, or archived,
             # or not startable as it stands.  The sweep moves on.
+            reason = _refusal_reason(plan, exc.status_code)
+            _LAST_REFUSAL_REASON[plan.plan_id] = reason
             log.warning(
-                "quota_resume %s start refused plan=%s status=%s detail=%s",
+                "quota_resume %s start refused plan=%s status=%s reason=%s detail=%s",
                 kind,
                 plan.plan_id,
                 exc.status_code,
+                reason,
                 exc.detail,
             )
             return False
@@ -511,14 +599,54 @@ def _start_outcome(plan: ParkedPlan, starter: Callable[[str], Any], kind: str) -
 
     status = _response_status(response)
     if status is not None and status >= 400:
+        reason = _refusal_reason(plan, status)
+        _LAST_REFUSAL_REASON[plan.plan_id] = reason
         log.warning(
-            "quota_resume %s start refused plan=%s status=%s",
+            "quota_resume %s start refused plan=%s status=%s reason=%s",
             kind,
             plan.plan_id,
             status,
+            reason,
         )
         return False
     return True
+
+
+def _execution_start_request(plan: ParkedPlan) -> Any:
+    """The start request that carries the plan's recorded directory.
+
+    ``None`` means "no request body at all" — which is what a plan
+    whose row records no directory gets, because there is nothing to
+    put in it.  That is not a defect of this function: the start path
+    answers such a start with a 400, and it is the start path's answer
+    that says the plan cannot be started without a directory.
+
+    The request class is imported here rather than at module scope:
+    the application module imports the routers back, so a module-level
+    import of it would close that loop — and an import cycle is a
+    failure at *import* time, which is the one moment the server
+    cannot afford to fail.
+
+    An import that fails answers ``None`` as well — the start that
+    was asked for without a directory, and the refusal that follows.
+    The failure is logged rather than swallowed: the caller is a
+    heartbeat thread, and a raise here would stop the revival of
+    every parked plan, not just this one.
+    """
+    project_dir = (plan.project_dir or "").strip()
+    if not project_dir:
+        return None
+
+    try:
+        from server import StartExecutionRequest
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "quota_resume the start request could not be built plan=%s",
+            plan.plan_id,
+        )
+        return None
+
+    return StartExecutionRequest(project_dir=project_dir)
 
 
 def resume_execution(plan: ParkedPlan, starter: Optional[Callable[[str], Any]] = None) -> bool:
@@ -536,6 +664,14 @@ def resume_execution(plan: ParkedPlan, starter: Optional[Callable[[str], Any]] =
     ledger is asked inside the start path, and its 409 is what this
     function reports as "not started".
 
+    The one thing this function *does* add is the working directory:
+    the start path refuses a plan it cannot be given a directory for
+    (400), and a quota-parked run has no pause checkpoint to carry one
+    — so the directory the durable row records is handed over in the
+    request body, exactly as a human hands it over.  A plan whose row
+    records no directory is started the way it was started before:
+    with the plan id alone, and the refusal that follows.
+
     Args:
         plan: the parked execution to revive.
         starter: the start path to call.  ``None`` means the real
@@ -549,7 +685,7 @@ def resume_execution(plan: ParkedPlan, starter: Optional[Callable[[str], Any]] =
         from routes.execution import start_execution
 
         starter = start_execution
-    return _start_outcome(plan, starter, KIND_EXECUTION)
+    return _start_outcome(plan, starter, KIND_EXECUTION, _execution_start_request(plan))
 
 
 def resume_verification(plan: ParkedPlan, starter: Optional[Callable[[str], Any]] = None) -> bool:
@@ -794,6 +930,11 @@ def run_resume_sweep(
         # The attempt is recorded before it is made, so that a
         # revival that raises still puts the plan inside its window.
         _LAST_ATTEMPT[plan.plan_id] = stamp
+        # Any reason left over from an earlier tick is dropped before
+        # this attempt: an attempt that records no reason must leave
+        # no reason behind, or the line below would report a cause
+        # this attempt never had.
+        _LAST_REFUSAL_REASON.pop(plan.plan_id, None)
         revived_plan = _revive_one(plan, resume_execution_fn, resume_verification_fn)
         if revived_plan:
             log.info(
@@ -804,9 +945,10 @@ def run_resume_sweep(
             revived.append(plan.plan_id)
         else:
             log.warning(
-                "quota_resume_skipped plan=%s kind=%s reason=start_refused",
+                "quota_resume_skipped plan=%s kind=%s reason=%s",
                 plan.plan_id,
                 plan.kind,
+                _LAST_REFUSAL_REASON.get(plan.plan_id, "start_refused"),
             )
     return revived
 
