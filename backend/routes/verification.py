@@ -90,6 +90,20 @@ router = APIRouter()
 #   stale lease is removed by the reset (with a WARNING that says what
 #   it was), and both endpoints carry on.
 #
+# Whose lease is it?  (2026-11-25)
+# -------------------------------
+# The lease's holder pid is the **backend process itself** — the round
+# takes it with ``os.getpid()`` and a daemon thread refreshes its
+# heartbeat.  So a lease of THIS process is not evidence: this process
+# knows better than a file does whether it has a live round, and the
+# in-memory state is the authority for that.  A lease of ours is
+# therefore never allowed to block, and the in-memory guard decides
+# instead.
+#
+# The lease file is evidence about **other** processes — a round that
+# outlived a backend restart, or one another backend owns.  That is the
+# case the guard is for, and it still refuses.
+#
 # The heartbeat threshold is the holder's own heartbeat interval times
 # three: one missed beat may be a busy loop, two may be a hiccup, three
 # is a holder that is not coming back.
@@ -220,13 +234,45 @@ def _round_lease_state(plan_dir: Path) -> Dict[str, Any]:
     ``stale``     the lease is provably dead: the heartbeat is older
                   than the threshold, the holder's pid is gone, and the
                   plan has no live verification child;
+    ``same_process``  the holder IS this process (its pid is ours);
     ``blocking``  the lease has to be respected: it is live, or it is
                   not provably stale yet (a fresh heartbeat whose
                   holder has just died becomes stale on its own within
                   the threshold, and nothing may start beside it in
-                  the meantime);
+                  the meantime) — **unless** the holder is this very
+                  process (see below);
     ``holder``    the record the lease file carries;
     ``age``       the heartbeat age in seconds.
+
+    A lease held by THIS process is not evidence (2026-11-25)
+    ----------------------------------------------------------
+    The lease's holder pid is the backend process itself: the round
+    takes the lease with ``os.getpid()`` and a daemon thread refreshes
+    its heartbeat.  So a lease whose holder is us says nothing that
+    this process does not already know better: the in-memory state
+    (``_server._verification_state``'s status and thread) is
+    authoritative for a round of ours, and it is what the guard falls
+    back to.
+
+    The lease file is therefore NOT evidence **for this process** — it
+    is evidence about *other* processes.  Two consequences:
+
+    * a lease we hold ourselves never blocks a reset or a start.  The
+      moment a round of ours dies, its lease file may still be on disk
+      with a fresh heartbeat: the thread that owns it is on its way to
+      its ``finally`` (which releases the lease), and the file outlives
+      that moment.  Refusing there would block the recovery path the
+      death sequence opens — and the round that starts next waits for
+      the lease properly anyway (``_acquire_verification_round_lease``
+      waits up to 30s for the old holder to let go);
+    * a lease held by ANOTHER process is evidence about a round this
+      process cannot see — a round that outlived a backend restart, or
+      one another backend owns.  That is the case the guard exists
+      for, and it still refuses.
+
+    Note that a lease of ours can never be *stale* either: its holder
+    is alive by definition (it is us), so the stale rule — which needs
+    a dead holder — does not reach it.
     """
     from verification_loop import (
         _VERIFICATION_ROUND_LEASE_HEARTBEAT_SECONDS,
@@ -242,6 +288,7 @@ def _round_lease_state(plan_dir: Path) -> Dict[str, Any]:
         "present": False,
         "live": False,
         "stale": False,
+        "same_process": False,
         "blocking": False,
         "holder": {},
         "holder_pid": None,
@@ -272,13 +319,16 @@ def _round_lease_state(plan_dir: Path) -> Dict[str, Any]:
     holder_alive = holder_pid > 0 and bool(_pid_is_alive(holder_pid))
     vp_alive = _plan_has_live_vp_child(plan_dir)
 
+    state["same_process"] = bool(holder_pid > 0 and holder_pid == os.getpid())
     state["live"] = bool(fresh and (holder_alive or vp_alive))
     state["stale"] = bool(
         not fresh
         and not holder_alive
         and not vp_alive
     )
-    state["blocking"] = bool(state["present"] and not state["stale"])
+    state["blocking"] = bool(
+        state["present"] and not state["stale"] and not state["same_process"]
+    )
     return state
 
 
@@ -1519,6 +1569,17 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
     # lock the plan out of recovery.  The reset is what removes it; the
     # start only refuses to be blocked by it.
     #
+    # A lease of THIS process does NOT refuse either.  The holder pid of
+    # a round is the backend process itself, so a lease of ours says
+    # nothing this process does not know better — and right after a
+    # round of ours is judged dead its lease file can still be on disk
+    # with a fresh heartbeat (the owning thread is on its way to its
+    # ``finally``).  Refusing there would block the very recovery the
+    # death sequence opens; the round that starts next waits for the
+    # lease properly (``_acquire_verification_round_lease`` waits up to
+    # 30s for the old holder to let go).  For a round of ours the
+    # in-memory guard further down is the authority.
+    #
     # The gate sits next to the stopping gate on purpose: both are
     # refusals, and a refusal must not touch the plan's work.
     _lease = _round_lease_state(plan_dir)
@@ -2533,6 +2594,13 @@ def reset_verification(
     # lease (old heartbeat, dead holder, no live VP child) is removed
     # here instead: a dead round's leftover lock must not lock the plan
     # out of recovery for good.
+    #
+    # A lease of THIS process is not evidence and never refuses: this
+    # process knows whether it has a live round (the in-memory guard
+    # below), and the moment a round of ours dies its lease file may
+    # still be on disk with a fresh heartbeat — the thread that owns it
+    # is on its way to its ``finally``.  Refusing there would block the
+    # recovery the death sequence opens.
     lease = _round_lease_state(plan_dir)
     if lease["blocking"]:
         raise HTTPException(

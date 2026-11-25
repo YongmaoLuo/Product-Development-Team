@@ -147,6 +147,22 @@ def _dead_pid() -> int:
     raise AssertionError("no free pid found")
 
 
+def _other_live_pid() -> int:
+    """A pid of ANOTHER process that is alive (never this test process).
+
+    The lease of a round is held by the backend process itself, so the
+    lease gate only speaks about **other** processes: a lease whose
+    holder is this very process is not evidence (this process knows
+    better than a file does), and the in-memory guard decides instead.
+    """
+    pid = os.getppid()
+    assert pid > 0 and pid != os.getpid(), (
+        f"the parent pid {pid} cannot stand in for another holder"
+    )
+    os.kill(pid, 0)  # raises ProcessLookupError when it is not alive
+    return pid
+
+
 def _row(db_path: Path, table: str, plan_id: str = PLAN_ID) -> dict:
     conn = open_db(db_path)
     try:
@@ -170,16 +186,18 @@ def test_reset_refuses_a_round_with_a_fresh_lease_and_a_live_holder(
 ):
     """A fresh lease + a live holder = a running round.  409, always.
 
-    The holder is THIS process, so the lease is as live as a lease can
-    be.  ``force=true`` must not cancel it: only ``/stop`` ends a
-    round, and a reset that cancels one behind the operator's back is
-    the bug this guard exists to close.
+    The holder is ANOTHER live process, so the lease speaks about a
+    round this process cannot see (a round that outlived a backend
+    restart, or one another backend owns).  ``force=true`` must not
+    cancel it: only ``/stop`` ends a round, and a reset that cancels
+    one behind the operator's back is the bug this guard exists to
+    close.
     """
     plans_dir, _conn, db_path = env
     plan_dir = _seed_plan(plans_dir, db_path)
     _write_lease(
         plan_dir,
-        pid=os.getpid(),
+        pid=_other_live_pid(),
         heartbeat=datetime.now().isoformat(),
     )
 
@@ -216,12 +234,16 @@ def test_start_refuses_a_round_with_a_fresh_lease(env, client):
     Before the lease was read, the start was admitted and the round
     that lost the race recorded ``round_already_running — this run
     dispatched no VP`` while the endpoint answered 200 "started".
+
+    The holder is ANOTHER live process — a lease of this process is
+    not evidence (see
+    ``test_same_process_ghost_lease_does_not_refuse_reset_or_start``).
     """
     plans_dir, _conn, db_path = env
     plan_dir = _seed_plan(plans_dir, db_path)
     _write_lease(
         plan_dir,
-        pid=os.getpid(),
+        pid=_other_live_pid(),
         heartbeat=datetime.now().isoformat(),
     )
 
@@ -229,6 +251,66 @@ def test_start_refuses_a_round_with_a_fresh_lease(env, client):
     assert resp.status_code == 409, resp.text
     assert resp.json()["error"] == "Already running"
     assert resp.json().get("resumed") is not True
+
+
+# ---------------------------------------------------------------------------
+# 2b. A lease of THIS process is not evidence
+# ---------------------------------------------------------------------------
+
+
+def test_same_process_ghost_lease_does_not_refuse_reset_or_start(
+    env, client, monkeypatch,
+):
+    """The lease of this very process must not block anything.
+
+    The holder pid of a round IS the backend process
+    (``_acquire_verification_round_lease`` uses ``os.getpid()``), and
+    its heartbeat is refreshed by an in-process daemon thread.  So
+    right after a round of ours is judged dead, the lease file can
+    still be on disk with a FRESH heartbeat while the thread that owns
+    it walks to its ``finally``.  That instant is not a live round —
+    this process knows it — and refusing there would block the very
+    recovery the death sequence opens (the E2E
+    ``test_e2e_second_start_is_accepted_after_death`` is that path).
+
+    So the lease gate only speaks about OTHER processes; for a round of
+    ours the in-memory guard is the authority — and here the memory
+    says there is no live round, so neither endpoint refuses.
+    """
+    plans_dir, _conn, db_path = env
+    plan_dir = _seed_plan(plans_dir, db_path)
+    lease_path = _write_lease(
+        plan_dir,
+        pid=os.getpid(),
+        heartbeat=datetime.now().isoformat(),
+    )
+
+    # The in-memory state knows of no live round — that is the point.
+    assert PLAN_ID not in server._verification_state
+
+    resp = client.post(f"/api/verification/{PLAN_ID}/reset", json={})
+    assert resp.status_code == 200, (
+        f"a lease of this process refused the reset: {resp.status_code} "
+        f"{resp.text}"
+    )
+    assert lease_path.exists(), (
+        "the lease of this process must not be deleted by the reset — "
+        "the thread that owns it releases it in its own finally"
+    )
+
+    def _fake_loop(plan_id, plan_dir, project_dir, **kwargs):
+        raise AssertionError("the auto-loop must not run in this test")
+
+    monkeypatch.setattr(server, "_run_auto_verification_loop", _fake_loop)
+    monkeypatch.setattr(
+        server, "_recover_verification_states", lambda *a, **k: None,
+    )
+
+    resp = client.post(f"/api/verification/{PLAN_ID}/start")
+    assert resp.status_code == 200, (
+        f"a lease of this process refused the start: {resp.status_code} "
+        f"{resp.text}"
+    )
 
 
 # ---------------------------------------------------------------------------
