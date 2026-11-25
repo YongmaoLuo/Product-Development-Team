@@ -21,6 +21,7 @@ import re
 import signal
 import sqlite3
 import threading
+import time
 
 # Late binding into the application module: ``server`` owns the shared
 # helpers, request models and module globals, and the suite monkeypatches
@@ -54,6 +55,259 @@ from plan_artifacts import BRANCH_CONFLICT, detect
 from bounded_log import rotated_log_paths
 
 router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# The round lease — the durable answer to "is a round running?" (2026-11-25)
+# ---------------------------------------------------------------------------
+#
+# Why the lease and not the in-memory state
+# ------------------------------------------
+# ``_server._verification_state`` is *this process's* memory.  A backend
+# restart empties it, and a round that is still running — its holder
+# process outlived the backend that dispatched it, or another backend
+# holds it — is invisible to it.  The plan's ``verification_round.lock``
+# is the durable record: the round takes it when it dispatches, refreshes
+# its ``heartbeat`` every ``_VERIFICATION_ROUND_LEASE_HEARTBEAT_SECONDS``
+# while it runs, and deletes it when it gives the plan back.
+#
+# So the lease is what ``/reset`` and ``/start`` have to read.  A reset
+# under a live round is overwritten by that round (the round keeps
+# writing state), and a start beside one is a second round on the same
+# plan.
+#
+# The two failure modes the lease has to keep apart
+# --------------------------------------------------
+# * **A live lease must refuse.**  The round is running: the heartbeat
+#   is fresh and somebody is alive to hold it.  ``/reset`` answers 409
+#   and ``/start`` answers 409 — ``force=true`` included, because
+#   cancelling a round is ``/stop``'s job and nothing else's.
+# * **A stale lease must not block.**  A round that died without
+#   releasing leaves its lock behind; if that lock refused every reset
+#   and every start, the plan would be locked out for good.  A lease is
+#   stale when its heartbeat is older than the threshold, its holder's
+#   pid is gone, and the plan has no live verification child left.  A
+#   stale lease is removed by the reset (with a WARNING that says what
+#   it was), and both endpoints carry on.
+#
+# The heartbeat threshold is the holder's own heartbeat interval times
+# three: one missed beat may be a busy loop, two may be a hiccup, three
+# is a holder that is not coming back.
+
+#: How many missed heartbeats make the lease stale.
+_ROUND_LEASE_STALE_HEARTBEATS = 3
+
+#: The roles in the plan's process ledger that mean "a verification
+#: child of this plan is running": the VP's own service process and the
+#: sub-agent handle the VP drives.
+_ROUND_LEASE_VP_ROLES = ("vp_service", "subagent")
+
+
+def _round_lease_path(plan_dir: Path) -> Path:
+    """The path of the plan's verification-round lease file."""
+    from verification_loop import _verification_round_lock_path
+
+    return _verification_round_lock_path(Path(plan_dir))
+
+
+def _round_lease_holder(path: Path) -> Dict[str, Any]:
+    """What the lease file says about its holder (``{}`` when unreadable)."""
+    from verification_loop import _read_verification_round_lock
+
+    try:
+        return _read_verification_round_lock(Path(path)) or {}
+    except Exception:  # noqa: BLE001 — a damaged lease is not a verdict
+        return {}
+
+
+def _lease_heartbeat_age(holder: Dict[str, Any], path: Path) -> Optional[float]:
+    """How many seconds ago the lease's heartbeat was written.
+
+    ``None`` when the age cannot be established at all (no readable
+    timestamp and no readable file).  The file's own mtime is the
+    fallback: it is the moment the lease was last touched, which is the
+    moment its heartbeat was last refreshed.
+    """
+    raw = (holder or {}).get("heartbeat")
+    moment: Optional[float] = None
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        moment = float(raw)
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            moment = datetime.fromisoformat(raw.strip()).timestamp()
+        except ValueError:
+            moment = None
+    if moment is None:
+        try:
+            moment = Path(path).stat().st_mtime
+        except OSError:
+            return None
+    return max(0.0, time.time() - moment)
+
+
+def _ledger_pid_is_alive(record: Any) -> bool:
+    """Whether the process the ledger records is still running.
+
+    The ledger is a *record*, not a witness: a process that died
+    without an exit event stays in it.  So the pid is asked directly —
+    and when the record carries the process' start time, the live
+    process' start time is compared with it, so a recycled pid is not
+    mistaken for the process that was recorded.
+    """
+    try:
+        pid = int(getattr(record, "pid", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    try:
+        create_time = float(getattr(record, "create_time", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        create_time = 0.0
+    if create_time > 0:
+        try:
+            from process_identity import CREATE_TIME_TOLERANCE, probe
+
+            identity = probe(pid)
+        except Exception:  # noqa: BLE001 — an unreadable identity is no verdict
+            return True
+        if identity is not None and identity.create_time is not None:
+            if abs(identity.create_time - create_time) > CREATE_TIME_TOLERANCE:
+                return False
+    return True
+
+
+def _plan_has_live_vp_child(plan_dir: Path) -> bool:
+    """Whether the plan still has a live verification child process.
+
+    The holder of the lease is the *dispatcher*; the work (the VPs)
+    runs in children of their own.  A holder that died while its VPs
+    kept running has left work behind, and that work is a reason NOT to
+    call the lease stale.
+    """
+    try:
+        import process_ledger
+
+        records = process_ledger.live_records(Path(plan_dir)) or {}
+    except Exception:  # noqa: BLE001 — a damaged ledger is not a verdict
+        return False
+    for record in dict(records).values():
+        role = str(getattr(record, "role", "") or "")
+        if role not in _ROUND_LEASE_VP_ROLES:
+            continue
+        if _ledger_pid_is_alive(record):
+            return True
+    return False
+
+
+def _round_lease_state(plan_dir: Path) -> Dict[str, Any]:
+    """What the plan's round lease says about a running round.
+
+    The returned dict carries:
+
+    ``present``   the lease file exists;
+    ``live``      a round is really running: the heartbeat is fresh AND
+                  somebody is alive to hold it — the holder's pid, or a
+                  live verification child of the plan;
+    ``stale``     the lease is provably dead: the heartbeat is older
+                  than the threshold, the holder's pid is gone, and the
+                  plan has no live verification child;
+    ``blocking``  the lease has to be respected: it is live, or it is
+                  not provably stale yet (a fresh heartbeat whose
+                  holder has just died becomes stale on its own within
+                  the threshold, and nothing may start beside it in
+                  the meantime);
+    ``holder``    the record the lease file carries;
+    ``age``       the heartbeat age in seconds.
+    """
+    from verification_loop import (
+        _VERIFICATION_ROUND_LEASE_HEARTBEAT_SECONDS,
+        _pid_is_alive,
+    )
+
+    threshold = (
+        float(_VERIFICATION_ROUND_LEASE_HEARTBEAT_SECONDS)
+        * _ROUND_LEASE_STALE_HEARTBEATS
+    )
+    path = _round_lease_path(plan_dir)
+    state: Dict[str, Any] = {
+        "present": False,
+        "live": False,
+        "stale": False,
+        "blocking": False,
+        "holder": {},
+        "holder_pid": None,
+        "heartbeat": None,
+        "age": None,
+        "path": str(path),
+        "threshold_seconds": threshold,
+    }
+    try:
+        state["present"] = Path(path).exists()
+    except OSError:
+        state["present"] = False
+    if not state["present"]:
+        return state
+
+    holder = _round_lease_holder(path)
+    state["holder"] = holder
+    state["heartbeat"] = holder.get("heartbeat")
+    try:
+        holder_pid = int(holder.get("pid"))
+    except (TypeError, ValueError):
+        holder_pid = 0
+    state["holder_pid"] = holder_pid
+
+    age = _lease_heartbeat_age(holder, path)
+    state["age"] = age
+    fresh = age is not None and age <= threshold
+    holder_alive = holder_pid > 0 and bool(_pid_is_alive(holder_pid))
+    vp_alive = _plan_has_live_vp_child(plan_dir)
+
+    state["live"] = bool(fresh and (holder_alive or vp_alive))
+    state["stale"] = bool(
+        not fresh
+        and not holder_alive
+        and not vp_alive
+    )
+    state["blocking"] = bool(state["present"] and not state["stale"])
+    return state
+
+
+def _clear_stale_round_lease(plan_dir: Path, lease: Dict[str, Any]) -> bool:
+    """Delete a provably stale lease.  ``True`` when it was removed.
+
+    The WARNING is the point: the operator has to be able to see that
+    the plan was unlocked by a *stale* lease and not by a round that
+    ended.
+    """
+    path = Path(str(lease.get("path") or _round_lease_path(plan_dir)))
+    try:
+        os.unlink(str(path))
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        _server.logger.warning(
+            "[reset] could not remove the stale round lease %s: %s",
+            path, exc,
+        )
+        return False
+    _server.logger.warning(
+        "[reset] removed a STALE verification round lease path=%s "
+        "holder_pid=%s heartbeat_age=%.0fs — the holder is gone and the "
+        "plan has no live verification child, so the stale lease no "
+        "longer blocks recovery",
+        path, lease.get("holder_pid"), float(lease.get("age") or 0.0),
+    )
+    return True
 
 
 class ArchivedPlanError(Exception):
@@ -1243,6 +1497,47 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
             },
         )
 
+    # --- The round-lease gate (2026-11-25) --------------------------------
+    # A plan whose round is running cannot be started again.  The
+    # in-memory guard further down can only see THIS process: after a
+    # backend restart it is empty, so a start beside a round that is
+    # still running was admitted — the 2026-11-25 log shows exactly
+    # that (``round_already_running — this run dispatched no VP`` next
+    # to a 200 "started").
+    #
+    # The plan's round LEASE is the durable record of "a round owns this
+    # plan right now": the holder refreshes its heartbeat every
+    # ``_VERIFICATION_ROUND_LEASE_HEARTBEAT_SECONDS`` while the round
+    # runs.  A fresh lease whose holder (or whose live verification
+    # child) is alive means a round is running, so the start is refused
+    # with the same 409 "Already running" the in-memory guard uses —
+    # never a ``resumed: true`` and never a silent no-op that answers
+    # 200.
+    #
+    # A STALE lease (old heartbeat, dead holder, no live verification
+    # child) does NOT refuse: a dead round's leftover lock must not
+    # lock the plan out of recovery.  The reset is what removes it; the
+    # start only refuses to be blocked by it.
+    #
+    # The gate sits next to the stopping gate on purpose: both are
+    # refusals, and a refusal must not touch the plan's work.
+    _lease = _round_lease_state(plan_dir)
+    if _lease["blocking"]:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "Already running",
+                "detail": (
+                    "A verification round is already running for this plan: "
+                    "it holds the round lease (verification_round.lock) and "
+                    "its heartbeat is fresh. Stop it first — /stop is the "
+                    "only way to end a round."
+                ),
+                "lease_holder_pid": _lease.get("holder_pid"),
+                "lease_heartbeat": _lease.get("heartbeat"),
+            },
+        )
+
     try:
         _ensure_verification_plan(plan_id)
     except ArchivedPlanError:
@@ -2184,10 +2479,27 @@ def reset_verification(
     ``max_rounds`` is NOT touched — it is the plan's immutable budget
     (see :class:`ResetRoundsRequest`).
 
-    Refuses with 409 while a verification thread is live: that thread
+    Refuses with 409 while a verification round is live: that round
     owns the orchestrator and keeps writing state, so a reset under it
-    would be immediately overwritten. ``force=true`` cancels the round
-    first and then resets.
+    would be immediately overwritten.
+
+    2026-11-25: "live" is decided by the plan's round LEASE
+    (``verification_round.lock``), not by this process's memory.  A
+    backend restart empties ``_verification_state``, and a round that is
+    still running was invisible to the old guard — the reset answered
+    ``cancelled_live_round=true`` while the round kept running.  The
+    lease is the durable record, so it is read first:
+
+    * a LIVE lease refuses the reset with 409 — ``force=true`` included,
+      because ending a round is ``/stop``'s job and not the reset's;
+    * a STALE lease (heartbeat older than three heartbeat intervals,
+      holder's pid gone, no live verification child left) is REMOVED
+      here, with a WARNING that says it was stale: a dead round's
+      leftover lock must not lock the plan out of recovery for good.
+
+    The in-memory guard below still stands for what only this process
+    can see; ``force=true`` cancels such an entry (a ghost of a round
+    whose process is gone) and then resets.
     """
     plan_dir = _server._plan_dir(plan_id)
     if not plan_dir.exists():
@@ -2205,6 +2517,44 @@ def reset_verification(
         "cancelled_live_round": False,
         "cleared": {},
     }
+
+    # 2026-11-25: the ROUND LEASE is read FIRST, because it is the only
+    # record that survives a backend restart.  The in-memory guard below
+    # sees this process only: after a restart it is empty, and a round
+    # that is still running (its own holder process outlived the
+    # backend, or another backend holds it) is invisible to it — the
+    # 2026-11-25 incident: ``reset`` answered
+    # ``cancelled_live_round=true`` while the plan's lease was still
+    # beating and its VP child ran for another half hour.
+    #
+    # A live lease refuses the reset — ``force=true`` included.  Ending a
+    # round is ``/stop``'s job; a reset that cancels a round behind the
+    # operator's back is the bug this guard exists to close.  A STALE
+    # lease (old heartbeat, dead holder, no live VP child) is removed
+    # here instead: a dead round's leftover lock must not lock the plan
+    # out of recovery for good.
+    lease = _round_lease_state(plan_dir)
+    if lease["blocking"]:
+        raise HTTPException(
+            409,
+            {
+                "error": "Already running",
+                "detail": (
+                    "A verification round is live for this plan: it holds "
+                    "the round lease (verification_round.lock) and its "
+                    "heartbeat is fresh, so a reset now would be "
+                    "overwritten by that round. Stop it first — /stop is "
+                    "the only way to end a round."
+                ),
+                "lease_holder_pid": lease.get("holder_pid"),
+                "lease_heartbeat": lease.get("heartbeat"),
+            },
+        )
+    if lease["stale"]:
+        summary["cleared"]["stale_round_lease"] = _clear_stale_round_lease(
+            plan_dir, lease,
+        )
+
     live = _server._verification_state.get(plan_id) or {}
     live_status = str(live.get("verification_status") or "").lower()
     live_thread = live.get("thread")
@@ -2226,6 +2576,12 @@ def reset_verification(
         # Force: ask the round to unwind before we pull the floor out.
         # The cancel marker is checked at every round boundary and by the
         # sub-agent teardown, so this is the same path /stop uses.
+        #
+        # 2026-11-25: this path can only ever be reached for a round the
+        # LEASE does not vouch for — a lease that is live has already
+        # refused the reset above, force included.  What is left here is
+        # the ghost of a round whose process is gone (a recovered
+        # entry), where the cancel marker is all that is left to clear.
         #
         # We deliberately do NOT clear the marker afterwards: the round
         # we just cancelled may still be mid-VP, and clearing it would
