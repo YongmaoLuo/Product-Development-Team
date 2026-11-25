@@ -107,14 +107,17 @@ RUNNING_ROW_KEYS = {
 
 #: The keys the **document** carries — and no others.
 #:
-#: Eight.  The phase was a field on a *row* and did not turn the
+#: Nine.  The phase was a field on a *row* and did not turn the
 #: document into a seventh-key document; the seventh key is
 #: ``waiting`` — the finishing stage's waits, a list of the panel's
 #: waiting block, put there by ``plan_scheduler.snapshot.build`` and
 #: merged with the live ones by ``routes.scheduler._state_with_waiting``.
 #: The eighth key is ``parked`` — the plans stopped for want of
 #: provider capacity, which hold no slot and are in no line, so neither
-#: of the two lists above can ever name them.  Both were added beside
+#: of the two lists above can ever name them.  The ninth key is
+#: ``stopping`` — the commands the scheduler has accepted and not
+#: answered yet, so a plan that is on its way to a stop is visible
+#: before it is stopped.  All three were added beside
 #: the original six and not instead of one of them: the keys keep their
 #: names, their types and their meanings.
 TOP_LEVEL_KEYS = {
@@ -125,6 +128,7 @@ TOP_LEVEL_KEYS = {
     "running",
     "waiting",
     "parked",
+    "stopping",
     "generated_at",
 }
 

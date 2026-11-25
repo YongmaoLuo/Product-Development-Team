@@ -256,11 +256,16 @@ class CommandRunner:
     def run_item(
         self,
         item: Any,
+        *,
+        approved_command: Optional[Sequence[str]] = None,
     ) -> Union[Tuple[EvidenceRecord, AuditRecord], NeedsApproval]:
         """跑一个要求书条目，产出证据与审计。
 
         Args:
             item: 要求书条目（``SpecItem`` 或同形状的映射）。
+            approved_command: 人已经批准的那条 argv。给了它，这条命令
+                就不再是要问人的问题 —— 三道闸照过，然后直接 spawn。
+                没给（或者给的是空的），命令仍旧走「要不要问人」那一问。
 
         Returns:
             ``(EvidenceRecord, AuditRecord)`` —— 命令跑了，产出证据与审计
@@ -270,7 +275,8 @@ class CommandRunner:
         Raises:
             CommandRejected: 命令没被放行（形状不对、二进制不在白名单、
                 条目不对外、argv 与冻结要求书不逐字相等、条目根本没被
-                声明）。拒绝发生在 spawn 之前。
+                声明、批准的命令与声明的那条不是逐字相等）。拒绝发生在
+                spawn 之前。
         """
         item_id = _text_field(item, "id")
         command = _field(item, "command")
@@ -291,9 +297,13 @@ class CommandRunner:
 
         self._check_declared(item_id, argv)
 
-        approval = _approval_needed(argv)
-        if approval is not None:
-            return approval
+        if approved_command:
+            # 人已经批准了这条动作：不再问第二次，直接进 spawn。
+            argv = self._approved_argv(item_id, argv, approved_command)
+        else:
+            approval = _approval_needed(argv)
+            if approval is not None:
+                return approval
 
         completed = self._run(
             argv,
@@ -434,6 +444,46 @@ class CommandRunner:
                 item_id=item_id,
                 command=argv,
             )
+
+    def _approved_argv(
+        self,
+        item_id: str,
+        declared: List[str],
+        approved: Sequence[str],
+    ) -> List[str]:
+        """人批准的那条 argv —— 与声明的那条逐字对过才放行。
+
+        批准是**许可**，不是另一条命令：跑起来的仍然是冻结要求书声明的
+        那一条 argv，逐字相等。批准里写了别的命令，就在 spawn 之前拒
+        绝 —— 和任何一条没被声明的命令一样。
+
+        Args:
+            item_id: 条目 id。
+            declared: 冻结要求书声明的那条 argv（已过前面几道闸）。
+            approved: 人批准的那条 argv。
+
+        Returns:
+            批准的那条 argv —— 与声明的那条逐字相等时。
+
+        Raises:
+            CommandRejected: 批准的不是一条 argv 列表，或者它与声明的
+                那条不逐字相等。
+        """
+        if isinstance(approved, str):
+            raise CommandRejected(
+                "批准的 command 必须是 argv 列表（list[str]），不能是字符串",
+                item_id=item_id,
+                command=approved,
+            )
+
+        argv = [str(part) for part in approved]
+        if argv != declared:
+            raise CommandRejected(
+                f"条目 {item_id!r} 批准的命令与冻结要求书声明的命令不逐字相等",
+                item_id=item_id,
+                command=argv,
+            )
+        return argv
 
 
 def execute(

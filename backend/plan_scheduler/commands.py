@@ -179,6 +179,7 @@ from .capacity import CapacityLedger
 from .config import DEFAULT_CAPACITY, DEFAULT_MIN_RUNTIME_SECONDS
 from .facts import IMPORT_FAILED_PHASE, QUEUED_PHASE
 from .policy import select_victim
+from .retry import is_db_locked, retry_on_busy
 from .store import SqliteSchedulerStore
 from state_machine.repositories.execution_repository import (
     ExecutionRepository,
@@ -191,6 +192,7 @@ __all__ = [
     "APPLIED",
     "BLOCKED_BY_CAPACITY",
     "CONFLICT",
+    "DATABASE_LOCKED_DETAIL",
     "NOT_FOUND",
     "OUTCOMES",
     "STARTED",
@@ -228,6 +230,22 @@ OUTCOMES = frozenset(
 #: nothing to record, nothing to re-queue and no promotion to spend —
 #: the eviction did not happen.
 _KILL_INCOMPLETE = "kill_incomplete"
+
+#: The detail a command answers with when the **database stayed busy**.
+#:
+#: The lifecycle writes to the state database, and the state database
+#: is shared with every other writer in the process.  A write that
+#: arrives while somebody else holds the write lock comes back as
+#: SQLite's ``database is locked`` — a transient condition, not a fault
+#: of the plan.  So the call is waited out and tried again; when the
+#: attempts are spent the command answers with this detail.
+#:
+#: It has its own name because it is **not** one of the other
+#: conflicts: the plan is pausable, its phase allows the pause, and
+#: nobody refused anything.  The operator is told the truth — "the
+#: database was busy" — and can try again, instead of being told that
+#: the plan may not be paused.
+DATABASE_LOCKED_DETAIL = "database_locked"
 
 #: The detail an action answers with when its queue write could not take
 #: SQLite's write lock: the plan is **waiting** — the phase says so, and
@@ -670,12 +688,30 @@ class CommandExecutor:
         return APPLIED, "promote_order:{0}".format(order)
 
     def _do_pause(self, plan_id: str) -> Tuple[str, Optional[str]]:
-        """Carry out a pause; return the outcome and the detail."""
+        """Carry out a pause; return the outcome and the detail.
+
+        The lifecycle call is run through :func:`retry_on_busy`: the
+        lifecycle writes to the shared state database, and a write that
+        arrives while somebody else holds the write lock comes back as
+        SQLite's ``database is locked``.  That is a transient condition,
+        not a fault of the plan, so it is waited out and the pause is
+        tried again.  When the attempts are spent the command is a
+        conflict with the detail ``database_locked`` — its own name,
+        because the plan may well be pausable and the database was busy.
+
+        A lifecycle that answers "not ok" is **not** retried: the disk
+        did not cooperate, and waiting does not make it cooperate.  Its
+        own reason is the answer.
+
+        The pause intent the lifecycle writes stays on disk either way:
+        it is written before the plan is stopped, precisely because the
+        process that does the stopping may be killed a moment later.
+        """
         if self._phase_of(plan_id) is None:
             return NOT_FOUND, "no_such_plan"
 
         try:
-            result = self._lifecycle.pause_plan(plan_id)
+            result = retry_on_busy(lambda: self._lifecycle.pause_plan(plan_id))
         except Exception as exc:  # noqa: BLE001 — the type decides
             if self._is_not_found(exc):
                 return NOT_FOUND, "no_such_plan"
@@ -684,6 +720,10 @@ class CommandExecutor:
                 # The lifecycle refused: the refusal is the caller's
                 # answer, and it travels on as it came.
                 raise rejection from exc
+            if is_db_locked(exc):
+                # The database stayed busy: the pause did not happen.
+                # The answer says so in its own words.
+                return CONFLICT, DATABASE_LOCKED_DETAIL
             raise
         if not getattr(result, "ok", True):
             return CONFLICT, getattr(result, "detail", None) or "conflict"
@@ -696,7 +736,17 @@ class CommandExecutor:
         return APPLIED, getattr(result, "detail", None) or "paused"
 
     def _do_resume(self, plan_id: str) -> Tuple[str, Optional[str]]:
-        """Carry out a resume; return the outcome and the detail."""
+        """Carry out a resume; return the outcome and the detail.
+
+        The lifecycle call is run through :func:`retry_on_busy`, for
+        the same reason the pause is: the lifecycle writes to the shared
+        state database, and a locked database is a transient condition
+        rather than a fault of the plan.  A lock that does not go away
+        is a conflict with the detail ``database_locked``.
+
+        A lifecycle that answers "not ok" is **not** retried — it has
+        already said why, and that reason is the answer.
+        """
         phase = self._phase_of(plan_id)
         if phase is None:
             return self._refuse_unknown_plan(plan_id)
@@ -716,7 +766,7 @@ class CommandExecutor:
             return CONFLICT, "running"
 
         try:
-            result = self._lifecycle.requeue_plan(plan_id)
+            result = retry_on_busy(lambda: self._lifecycle.requeue_plan(plan_id))
         except Exception as exc:  # noqa: BLE001 — the type decides
             if self._is_not_found(exc):
                 return NOT_FOUND, "no_such_plan"
@@ -725,6 +775,9 @@ class CommandExecutor:
                 # The lifecycle refused: the refusal is the caller's
                 # answer, and it travels on as it came.
                 raise rejection from exc
+            if is_db_locked(exc):
+                # The database stayed busy: the plan did not come back.
+                return CONFLICT, DATABASE_LOCKED_DETAIL
             raise
         if not getattr(result, "ok", True):
             return CONFLICT, getattr(result, "detail", None) or "conflict"

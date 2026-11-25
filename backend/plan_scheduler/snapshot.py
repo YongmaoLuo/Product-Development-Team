@@ -50,13 +50,13 @@ model down over a field that is allowed to be absent.
 
 The shape is closed
 -------------------
-The document has exactly eight keys: ``capacity``, ``queue_length``,
-``over_capacity``, ``queue``, ``running``, ``waiting``, ``parked`` and
-``generated_at``.  A field that appears without being declared is a
-field the panel cannot render and the LUI cannot rely on, so adding one
-is a decision and not an accident.  The four lists are always lists —
-an empty scheduler
-produces four empty lists, never four ``null``s, because ``null``
+The document has exactly nine keys: ``capacity``, ``queue_length``,
+``over_capacity``, ``queue``, ``running``, ``waiting``, ``parked``,
+``stopping`` and ``generated_at``.  A field that appears without being
+declared is a field the panel cannot render and the LUI cannot rely
+on, so adding one is a decision and not an accident.  The five lists
+are always lists — an empty scheduler
+produces five empty lists, never five ``null``s, because ``null``
 would be a second answer to "how many are waiting".
 
 The seventh key was added on purpose
@@ -71,11 +71,19 @@ without anybody deciding to add it.
 
 The waiting row is a closed shape too
 -------------------------------------
-A waiting row carries exactly eight keys — the plan, the item, the kind
-of wait, the question, the deadline, the time left, whether the wait
-can still be pushed out and how many times it has been.  A ninth key
-would be a field the panel cannot draw, so the row is pinned the same
-way the document is.
+A waiting row carries exactly eleven keys — the plan, the item, the
+kind of wait, the question, the deadline, the time left, whether the
+wait can still be pushed out, how many times it has been, the source
+the wait was asked under and the pull request it is about.  A twelfth
+key would be a field the panel cannot draw, so the row is pinned the
+same way the document is.
+
+The last three keys are the **review fields**: the source the
+finishing stage asked the question under, the number of the pull
+request the question is about and the link to it.  They are passed on
+as the record wrote them, and a record that carries none of them
+answers the empty source and an unknown pull request — a wait written
+before the fields existed is still a row the reader can read.
 
 The time left is counted, not guessed
 ------------------------------------
@@ -120,6 +128,27 @@ round, the reason and the phase — and the reason it carries is the
 quota layer's own word rather than the queue policy's, because a
 parked plan stopped for want of provider capacity and not for want of
 a slot.
+
+The ninth key is ``stopping``
+-----------------------------
+A plan that is asked to pause leaves the running line **before** it
+comes back: the stop is a request the worker has not answered yet, and
+in that gap the plan is in neither the running line nor the queue.  The
+``stopping`` list is that gap made visible — one row per command the
+scheduler has **accepted and not answered yet**.
+
+The rows come from the **command log**, which the engine reads and
+hands over in the state's ``stopping`` key: a command is written the
+moment it is taken, with the outcome it has *so far* (``accepted``),
+and it is turned into ``applied`` or ``failed`` only once the worker
+has answered.  A command that is still ``accepted`` is therefore a
+command that is still in flight.
+
+The age is measured against the **tick's own clock**, like the waiting
+countdown, so two reads of the same state say the same thing.  A
+timestamp that cannot be read answers ``None`` instead of dropping the
+row: the operator has to see that the plan is stopping even when the
+moment it was taken is unreadable.
 
 
 The queue row names its plan
@@ -209,6 +238,7 @@ __all__ = [
     "CAPACITY_SOURCE_OVERRIDE",
     "DEFAULT_CAPACITY_SOURCE",
     "POSTPROCESS_KEYS",
+    "STOPPING_KEYS",
     "WAITING_KEYS",
 ]
 
@@ -233,9 +263,11 @@ CAPACITY_SOURCE_OVERRIDE = "override"
 #: be announced.
 DEFAULT_CAPACITY_SOURCE = CAPACITY_SOURCE_CONFIG
 
-#: The waiting row's eight keys — the shape the panel draws.  A row
-#: that carried a ninth key would be a field the panel cannot render,
-#: so the shape is closed here as firmly as the document's own.
+#: The waiting row's eleven keys — the shape the panel draws.  A row
+#: that carried a twelfth key would be a field the panel cannot render,
+#: so the shape is closed here as firmly as the document's own.  The
+#: last three are the review fields: the source the wait was asked
+#: under and the pull request it is about.
 WAITING_KEYS = frozenset(
     {
         "plan_id",
@@ -246,6 +278,22 @@ WAITING_KEYS = frozenset(
         "remaining_seconds",
         "extendable",
         "extensions_count",
+        "source",
+        "pr_number",
+        "pr_url",
+    }
+)
+
+#: The stopping row's four keys — the shape the panel draws.  The row
+#: names the plan and the action, says when the command was taken and
+#: how long ago that was; a fifth key would be a field the panel cannot
+#: render.
+STOPPING_KEYS = frozenset(
+    {
+        "plan_id",
+        "action",
+        "since",
+        "age_seconds",
     }
 )
 
@@ -731,6 +779,13 @@ def _waiting_view(state: Any, now: float) -> List[Dict[str, Any]]:
     knows — and a hand-made record that names something else is shown
     as it is, because the read model does not rewrite a word it cannot
     vouch for.
+
+    The last three keys are the **review fields** — the source the
+    wait was asked under and the pull request it is about.  They are
+    passed on as the record wrote them, and a record that carries none
+    of them answers the empty source and an unknown pull request: a
+    wait written before the fields existed is still a row the reader
+    can read.
     """
     view: List[Dict[str, Any]] = []
 
@@ -746,10 +801,81 @@ def _waiting_view(state: Any, now: float) -> List[Dict[str, Any]]:
                 "remaining_seconds": _remaining_seconds(deadline, now),
                 "extendable": _extendable(row),
                 "extensions_count": _extensions_count(row),
+                "source": str(_field(row, "source", "")),
+                "pr_number": _field(row, "pr_number", None),
+                "pr_url": _field(row, "pr_url", None),
             }
         )
 
     return view
+
+
+# ---------------------------------------------------------------------------
+# The stopping list
+# ---------------------------------------------------------------------------
+
+
+def _since_text(value: Any) -> Optional[str]:
+    """The moment the command was taken, as the text the panel shows.
+
+    The stamp is passed on as it was written — the command log writes it
+    in ISO-8601 — and a stamp that is not text at all is read as
+    "unknown" rather than guessed at.
+    """
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return None
+
+
+def _stopping_view(rows: Any, now: float) -> List[Dict[str, Any]]:
+    """The commands that were accepted and have not been answered yet.
+
+    One row per open command, in the order the rows were given.  The
+    row names the plan and the action, says when the command was taken
+    and how long ago that was.
+
+    The age is measured against the **tick's own clock** — the moment
+    the state carries — so two reads of the same state say the same
+    thing, exactly like the waiting countdown.
+
+    A timestamp that cannot be read costs the row its age and nothing
+    else: the answer is ``None`` and the row is still there.  Dropping
+    it would hide the very thing the row exists to show — that the
+    plan is stopping.
+    """
+    view: List[Dict[str, Any]] = []
+
+    for row in rows or []:
+        taken = _field(row, "created_at", None)
+        moment = _epoch(taken)
+        view.append(
+            {
+                "plan_id": str(_field(row, "plan_id", "")),
+                "action": str(_field(row, "action", "")),
+                "since": _since_text(taken),
+                "age_seconds": None if moment is None else float(now - moment),
+            }
+        )
+
+    return view
+
+
+def _open_command_rows(state: Any) -> List[Any]:
+    """The open commands the state carries.
+
+    They are read from the state's ``stopping`` key — the name the
+    document gives them — and from ``open_commands``, the name the
+    store's own reader gives them.  A state that carries neither is an
+    empty list: nothing has been accepted and left unanswered, which is
+    the ordinary case.
+    """
+    for name in ("stopping", "open_commands"):
+        rows = _entries(state, name)
+        if rows:
+            return rows
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -770,12 +896,13 @@ def build(state: Any) -> Dict[str, Any]:
     Returns:
         The document the panel renders and the LUI reports.  Its keys
         are exactly ``capacity``, ``queue_length``, ``over_capacity``,
-        ``queue``, ``running``, ``waiting``, ``parked`` and
-        ``generated_at``.  The capacity block carries the number and
-        its source — ``total``, ``used`` and ``source`` — the waiting
-        list carries one row per wait, with the question and the time
-        left on it, and the parked list carries the plans stopped for
-        want of provider capacity.
+        ``queue``, ``running``, ``waiting``, ``parked``, ``stopping``
+        and ``generated_at``.  The capacity block carries the number
+        and its source — ``total``, ``used`` and ``source`` — the
+        waiting list carries one row per wait, with the question and
+        the time left on it, the parked list carries the plans stopped
+        for want of provider capacity, and the stopping list carries
+        the commands that were accepted and have not been answered yet.
     """
     running_rows = _entries(state, "running")
 
@@ -810,6 +937,10 @@ def build(state: Any) -> Dict[str, Any]:
         # names none is an empty list: nothing parked is a normal thing
         # to look at, and a list is an answer a caller can walk.
         "parked": _parked_view(state),
+        # The plans that are stopping — the commands the scheduler has
+        # accepted and not answered yet.  A state that names none is an
+        # empty list: nothing is stopping is a normal thing to look at.
+        "stopping": _stopping_view(_open_command_rows(state), now),
         "generated_at": _now_iso(),
     }
 

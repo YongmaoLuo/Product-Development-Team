@@ -62,11 +62,11 @@ command's own vocabulary of outcomes becomes an HTTP status code and a
 document, and the rules of that translation are the same for all four
 actions.
 
-The eight keys
+The nine keys
 --------------
 ``capacity``, ``queue_length``, ``over_capacity``, ``queue``,
-``running``, ``waiting``, ``parked`` and ``generated_at`` — the document
-the panel renders andthe LUI reports.  The list lives in
+``running``, ``waiting``, ``parked``, ``stopping`` and ``generated_at``
+— the document the panel renders andthe LUI reports.  The list lives in
 :func:`plan_scheduler.snapshot.build`, which is the only place it is
 written down; this module does not repeat it, because a second copy of
 the key set is a second thing to keep in step with the first.
@@ -77,10 +77,31 @@ see those plans at all unless the read model named them — and its rows
 carry a phase, so they carry the label of that phase like every other
 row does.
 
+The ``stopping`` list is the commands the scheduler has accepted and
+not answered yet.  A plan that is asked to pause leaves the running
+line **before** it comes back, and in that gap it is in neither the
+running line nor the queue — so the read model has to name it
+somewhere, or the operator cannot tell "the pause worked" from "the
+pause was lost".  Its rows are the command log's own, so the phase they
+carry is worked out from the command rather than read off the plan.
+
 The route's own published description still says "the six keys": it is
 the endpoint's OpenAPI description, and that description is frozen by
 the approved baseline (``tests/api/openapi_snapshot.json``).  It is
 refreshed when that baseline is re-taken, not here.
+
+The one key the route adds
+--------------------------
+``review_queue`` is the route's own: the snapshot does not carry it,
+because the snapshot knows about plans and not about the questions a
+person is being waited on.  It is the 「待你审核」 block — the open
+decisions and the approval waits, folded into one document with three
+fixed groups by :func:`plan_scheduler.review_queue.build_review_queue`.
+
+It is added on every answer, idle or busy: a question that is waiting
+is waiting whether the scheduler has anything to run or not, and a
+panel that only shows it while the scheduler is busy hides it exactly
+when it is the only thing there is.
 
 What an idle scheduler answers
 ------------------------------
@@ -226,6 +247,13 @@ from config_paths import resolve_plans_dir, resolve_state_db_path
 # the announcement left behind cannot tell two different stories.
 from failure_review import build_question, read_review
 from file_lock_protocol import locks_dir_for_plan
+
+# The human-in-the-loop service — the **module** is imported rather than
+# the function, so the attribute is looked up when the queue is read:
+# a service that is replaced is seen here, and a service that raises is
+# a source that answers empty rather than an endpoint that answers
+# nothing.
+from hitl import service as _hitl_service
 from hitl.models import DecisionStatus
 from hitl.store import HitlStore
 from plan_scheduler.commands import (
@@ -238,6 +266,7 @@ from plan_scheduler.commands import (
 )
 from plan_scheduler.capacity import CAPACITY_OVERRIDE_KEY
 from plan_scheduler.engine import FAILED, PENDING_ANSWER
+from plan_scheduler.review_queue import build_review_queue
 from plan_scheduler.snapshot import build, postprocess_summary
 
 # The finishing stage's waiting lifecycle.  The registry is the one
@@ -254,6 +283,7 @@ from postprocess.progress import (
 )
 from postprocess.waits import (
     PENDING,
+    POSTPROCESS_APPROVAL_SOURCE,
     WAIT_TYPES,
     WaitConflict,
     WaitError,
@@ -348,6 +378,40 @@ def _empty_snapshot() -> Dict[str, Any]:
 _ROW_LISTS = ("queue", "running", "parked")
 
 
+#: The phase a plan is in while one of its commands is still in flight.
+#:
+#: The command log knows what was **asked for**, not what phase a plan
+#: is in — so the stopping row the panel draws would carry no phase at
+#: all, and a row the panel cannot place is a row it cannot draw.  The
+#: phase is therefore worked out from the action, and it is worked out
+#: from the commands' own behaviour:
+#:
+#: * ``pause`` stops the plan: the executor's own words are that the
+#:   plan "ends up in ``stopped``", and a stopped plan is the one that
+#:   can be resumed;
+#: * ``resume`` puts the plan back at the head of the queue — it comes
+#:   back *waiting for a slot*, which is the ``queued`` phase;
+#: * ``promote`` moves the plan up the line and nothing else, and
+#:   ``start`` makes it the next one to run: both leave the plan
+#:   waiting for its turn, which is ``queued`` as well.
+#:
+#: The words are the routing layer's own — they are in ``plan_state``'s
+#: vocabulary — and this table is not a second vocabulary: it only says
+#: which of those words a given action leads to.
+_STOPPING_PHASE_BY_ACTION = {
+    "pause": "stopped",
+    "resume": "queued",
+    "promote": "queued",
+    "start": "queued",
+}
+
+#: The phase a stopping row carries when its action is not one of the
+#: four — a command the route does not know.  The list is the
+#: operator's view of the plans that are stopping, so the answer is the
+#: phase a stopping plan comes to rest in.
+_DEFAULT_STOPPING_PHASE = "stopped"
+
+
 def _phase_label_for(phase: Any) -> str:
     """Return the label of ``phase`` — the empty string when it has none.
 
@@ -381,6 +445,35 @@ def _labeled_row(row: Any) -> Any:
     return labeled
 
 
+def _stopping_row(row: Any) -> Any:
+    """Return a stopping row with the phase the plan is in.
+
+    The read model's stopping rows name the plan, the action, the
+    moment the command was taken and how long ago that was.  They carry
+    no phase: the command log does not know one, and the route works it
+    out from the action instead (see
+    :data:`_STOPPING_PHASE_BY_ACTION`).
+
+    A row that already carries a phase keeps it: the phase is the
+    routing layer's word, and a caller that knows the plan's real phase
+    knows more than this table does.
+
+    A row that is not a document is handed back as it was: the read
+    model's rows are documents, and a row that is not one is the
+    engine's business, not this module's.
+    """
+    if not isinstance(row, Mapping):
+        return row
+
+    labeled = dict(row)
+    if not labeled.get("phase"):
+        action = str(labeled.get("action") or "")
+        labeled["phase"] = _STOPPING_PHASE_BY_ACTION.get(
+            action, _DEFAULT_STOPPING_PHASE
+        )
+    return labeled
+
+
 def _with_phase_labels(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Return the read model with a ``phase_label`` on every row.
 
@@ -388,9 +481,14 @@ def _with_phase_labels(payload: Dict[str, Any]) -> Dict[str, Any]:
     a **supplement** to the phase name, never a replacement for it (see
     ``routes.plans._phase_label``).
 
-    Only the three lists change.  The capacity, the queue length, the
+    Only the four lists change.  The capacity, the queue length, the
     over-capacity flag and the generation stamp are the read model's
     own, and they are handed back untouched.
+
+    The **stopping** list is the fourth one, and it is handled apart:
+    its rows are the command log's, not the line's, so their phase is
+    worked out from the command rather than read off the plan — see
+    :func:`_stopping_row`.
     """
     labeled = dict(payload)
 
@@ -399,6 +497,10 @@ def _with_phase_labels(payload: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(rows, (list, tuple)):
             continue
         labeled[name] = [_labeled_row(row) for row in rows]
+
+    stopping = payload.get("stopping")
+    if isinstance(stopping, (list, tuple)):
+        labeled["stopping"] = [_stopping_row(row) for row in stopping]
 
     return labeled
 
@@ -416,6 +518,18 @@ def get_scheduler_state(request: Request) -> Dict[str, Any]:
     endpoint that fails when there is nothing to report leaves the
     operator with a broken panel and no way to tell an idle scheduler
     from a broken one.
+    """
+    document = _scheduler_read_model(request)
+    document["review_queue"] = _review_queue()
+    return document
+
+
+def _scheduler_read_model(request: Request) -> Dict[str, Any]:
+    """The engine's read model, with the finishing stage's waits in it.
+
+    The engine's snapshot, labelled and merged with the durable waits —
+    and nothing else.  The review queue is a key of its own and is
+    added by the route that answers (see :func:`get_scheduler_state`).
     """
     engine = getattr(request.app.state, "scheduler_engine", None)
 
@@ -1049,13 +1163,47 @@ def set_capacity(body: CapacityRequest, request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
-def _body(outcome: str, command_id: Optional[int], detail: Any) -> Dict[str, Any]:
+def _detail_marked(detail: Any, marker: str) -> str:
+    """The detail with a marker put in front of it.
+
+    The engine's own detail is kept — it says what the engine knows —
+    and the marker says what the answer does **not** have.  A marker
+    that is already in the detail is not put in twice.
+    """
+    text = "" if detail is None else str(detail)
+    if marker in text:
+        return text
+    return "{0}: {1}".format(marker, text) if text else marker
+
+
+def _body(
+    outcome: str,
+    command_id: Optional[int],
+    detail: Any,
+    *,
+    action: Optional[str] = None,
+    plan_id: Optional[str] = None,
+) -> Dict[str, Any]:
     """The document one action is answered with.
 
     Three keys are always there — what happened, which command did it,
     and how — and two are added when they say something: a conflict
     carries the **reason**, and a command that is still in the mailbox
     carries the **status** that says so.
+
+    The status of a **pause** says more than the other actions' does,
+    because the pause is the action the operator waits on.  A pause
+    whose command was carried out is answered ``paused``; a pause that
+    timed out **with its command recorded** is answered ``stopping`` —
+    the worker is carrying the command out and the read model's
+    stopping list names the plan, so the panel can draw that row at
+    once instead of waiting for the command to be answered.
+
+    A pause that timed out **without** a command row has nothing to
+    point at: there is no stopping row to wait for, so the answer stays
+    ``pending`` and its detail carries ``command_not_recorded``.  The
+    other actions keep their own ``pending`` answer — they are not
+    stops, and "on its way" is all they have ever said.
     """
     body: Dict[str, Any] = {
         "outcome": outcome,
@@ -1065,14 +1213,31 @@ def _body(outcome: str, command_id: Optional[int], detail: Any) -> Dict[str, Any
     if outcome == CONFLICT:
         body["reason"] = detail
     if outcome == PENDING_ANSWER:
-        body["status"] = "pending"
+        if action == "pause" and command_id is not None:
+            body["status"] = "stopping"
+            body["plan_id"] = plan_id
+        else:
+            body["status"] = "pending"
+            if action == "pause":
+                body["detail"] = _detail_marked(detail, "command_not_recorded")
+    elif outcome == APPLIED and action == "pause":
+        body["status"] = "paused"
     return body
 
 
-def _answer(status: int, outcome: str, command_id: Optional[int], detail: Any) -> JSONResponse:
+def _answer(
+    status: int,
+    outcome: str,
+    command_id: Optional[int],
+    detail: Any,
+    *,
+    action: Optional[str] = None,
+    plan_id: Optional[str] = None,
+) -> JSONResponse:
     """One action's answer: the status, and the document that goes with it."""
     return JSONResponse(
-        status_code=status, content=_body(outcome, command_id, detail)
+        status_code=status,
+        content=_body(outcome, command_id, detail, action=action, plan_id=plan_id),
     )
 
 
@@ -1116,6 +1281,12 @@ def _run_action(request: Request, plan_id: str, action: str) -> JSONResponse:
     than what was requested.  The route's own work is the translation —
     the outcome becomes a status, and the status is the one the
     vocabulary says it is.
+
+    The wait for that answer is **bounded**, so this call is bounded
+    too: a command the scheduler has not answered yet comes back as a
+    202, and the answer says what the command's own state is — for a
+    pause, that is ``stopping`` (see :func:`_body`), so the operator
+    is not left waiting on a page that has nothing to show.
 
     The plan id has already been admitted through the shared guard by
     the route that calls this: the guard is stated in **each** route's
@@ -1184,7 +1355,9 @@ def _run_action(request: Request, plan_id: str, action: str) -> JSONResponse:
         )
         return _answer(500, FAILED, command_id, "unknown outcome: {0!r}".format(outcome))
 
-    return _answer(status, outcome, command_id, detail)
+    return _answer(
+        status, outcome, command_id, detail, action=action, plan_id=plan_id
+    )
 
 
 @router.post("/api/plan/{plan_id}/scheduler/promote")
@@ -1942,6 +2115,12 @@ def _state_with_waiting(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
     places is one row.  A row is identified by its plan and its item —
     the pair the panel draws the row under and the pair the three
     actions address.
+
+    **A plans tree that cannot be walked costs the operator the waiting
+    rows, not the panel.**  The same read feeds the review queue, and
+    the panel polls this endpoint every few seconds: a source that
+    fails is a source that answers empty, so the endpoint keeps
+    answering and the operator keeps a panel to look at.
     """
     document = dict(snapshot)
     rows: List[Dict[str, Any]] = [
@@ -1951,7 +2130,13 @@ def _state_with_waiting(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
     ]
     known = {(str(row.get("plan_id")), str(row.get("item_id"))) for row in rows}
 
-    for row in _pending_waiting_rows():
+    try:
+        waiting_rows = _pending_waiting_rows()
+    except Exception:
+        logger.exception("the pending waiting rows could not be read")
+        waiting_rows = []
+
+    for row in waiting_rows:
         key = (str(row.get("plan_id")), str(row.get("item_id")))
         if key in known:
             continue
@@ -1970,6 +2155,73 @@ def _state_with_waiting(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
 
     document["waiting"] = rows
     return document
+
+
+# ---------------------------------------------------------------------------
+# The review queue
+# ---------------------------------------------------------------------------
+#
+# The operator has one question to answer — *what is waiting for me* —
+# and the things that make them wait come from two places: the
+# decisions a plan asked a human, and the approvals the finishing stage
+# is holding.  The panel wants one block, so the two are folded into
+# one document by ``plan_scheduler.review_queue.build_review_queue``,
+# which is where the grouping and the de-duplication live.
+
+
+def _approval_wait_rows() -> List[Dict[str, Any]]:
+    """The pending waits that are approvals.
+
+    Only the waits the finishing stage asked under
+    ``postprocess_approval`` are approvals.  An ordinary human wait is
+    not one: the review block answers "what is waiting for **you** to
+    decide", and a wait held for another reason cannot be decided
+    there.
+
+    The rows are the panel's own waiting rows, so the row and the
+    durable record cannot tell two different stories.
+    """
+    return [
+        row
+        for row in _pending_waiting_rows()
+        if row.get("source") == POSTPROCESS_APPROVAL_SOURCE
+    ]
+
+
+def _review_queue() -> Dict[str, List[Dict[str, Any]]]:
+    """The 「待你审核」 queue: what is waiting for the operator's answer.
+
+    Two sources, folded into one document with three fixed groups by
+    :func:`plan_scheduler.review_queue.build_review_queue`:
+
+    * the open HITL decisions — a question a plan asked a human and
+      has not been answered;
+    * the approval waits — the approvals the finishing stage is
+      holding.  The wait speaks for the approval decision as well (the
+      wait carries the pull request, the link and the item), so the
+      decision side gives it up; see ``build_review_queue``.
+
+    **A source that cannot be read is an empty source.**  The panel
+    polls this endpoint every five seconds: a decision store that is
+    momentarily unreadable must cost the operator the *decisions*, not
+    the panel.  The failure is logged rather than swallowed, the failed
+    source answers empty, and the other source carries on.
+    """
+    hitl_rows: List[Dict[str, Any]] = []
+    try:
+        hitl_rows = list(_hitl_service.list_open_decisions() or [])
+    except Exception:
+        logger.exception("the open HITL decisions could not be read")
+        hitl_rows = []
+
+    wait_rows: List[Dict[str, Any]] = []
+    try:
+        wait_rows = _approval_wait_rows()
+    except Exception:
+        logger.exception("the approval waits could not be read")
+        wait_rows = []
+
+    return build_review_queue(hitl_rows=hitl_rows, wait_rows=wait_rows)
 
 
 def _row_of(plan_id: str, item_id: str) -> Optional[Dict[str, Any]]:

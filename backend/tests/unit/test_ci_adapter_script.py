@@ -457,6 +457,41 @@ def test_gate_answers_red_when_a_lane_ran_and_failed(tmp_path):
     )
     assert "gate: FAILED (exit 1)" in result.stdout
     assert state["reruns"] == 0, "a lane that really failed must not be re-run"
+    # The exit code says *that* the gate is red; the job list says *which*
+    # lane is red.  A red verdict that names no job leaves the run's
+    # artifact without locatable evidence, so the red branch has to print
+    # the failing job(s) before it emits the verdict.
+    assert "ci_gha: failing job(s) of run 424242:" in result.stdout, (
+        "the red verdict must name the failing job(s): " + result.stdout
+    )
+    assert "Static gates (contracts) [failure, 10 steps]" in result.stdout, (
+        "the red verdict must name the failing lane: " + result.stdout
+    )
+    assert result.stdout.index("ci_gha: failing job(s) of run 424242:") < result.stdout.index(
+        "gate: FAILED (exit 1)"
+    ), "the failing job(s) must be named before the verdict is emitted"
+
+
+def test_gate_does_not_name_failing_jobs_when_it_answers_green(tmp_path):
+    """A green gate names no failing job -- there is none."""
+    attempts = {
+        "1": _attempt(
+            "success",
+            [
+                _job("Unit tests (unit-00)", "success", 13),
+                _job("Static gates (contracts)", "success", 10),
+            ],
+        )
+    }
+    result, state = _run_gate(tmp_path, attempts)
+    assert result.returncode == 0, (
+        f"the gate must be green, got {result.returncode}: {result.stdout}{result.stderr}"
+    )
+    assert "gate: PASSED (exit 0)" in result.stdout
+    assert "failing job(s)" not in result.stdout, (
+        "a green gate must not report failing jobs: " + result.stdout
+    )
+    assert state["reruns"] == 0, "a green run needs no re-run"
 
 
 def test_gate_answers_green_after_the_rerun_passes(tmp_path):

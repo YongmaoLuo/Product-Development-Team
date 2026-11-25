@@ -972,6 +972,21 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 共用函数，删掉要求书那一段），按本 gate 的既定流程把冻结基线前移到本分支的
     # 批准态。哈希取自工作区文件的 `shasum -a 256` 实测值，不是抄来的。表内条目
     # 集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
+    # 2026-11-23（repair-03）：本分支的调度页改动（等待区块 / 收尾分区 / 停止中
+    # 列表 / 审核队列的渲染）落在 `frontend/app.js` 上，按本 gate 的既定流程把冻结
+    # 基线前移到本分支的批准态。哈希取自工作区文件的 `shasum -a 256 frontend/app.js`
+    # 实测值，不是抄来的。表内条目集合与条目数不变：被钉文件的范围不变、sha256 仍
+    # 逐字节比对，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-23（合入 origin/main / 7d8a195a —— PR #197 框架加固、#198 失败复盘
+    # HITL）：base 侧在本文件上新增失败复盘的渲染（`schedulerSectionHtml` 的
+    # `failure_review` 分支、`SCHEDULER_WAIT_TYPE_TEXT` 的「失败复盘」、
+    # `renderSchedulerWaiting` 的 `answerable` 判据与
+    # `wait_type !== "failure_review"` 守卫、`data-decision`），并把
+    # `schedulerWaitingActions` 扩成带 ``options`` 的共用函数；本分支的等待区块 /
+    # 收尾分区 / 停止中列表 / 审核队列渲染落在**不同位置**，自动合并无冲突，
+    # **两侧的意图都保留**。文件内容因此再次变化，按本 gate 的既定流程把冻结基线
+    # 前移到**合并态**哈希（`shasum -a 256` 实测值，不是抄来的）。表内条目集合与
+    # 断言强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
     # 2026-11-23（合入 origin/main / deb9b009）：两侧都改动了本文件，而且**改到了
     # 同一处** —— 本分支在 `renderSchedulerWaiting` 上加了失败复盘等待行
     # （`answerable` 判据、`wait_type !== "failure_review"` 守卫、`data-decision`），
@@ -993,8 +1008,19 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 批准态。哈希取自工作区文件的 `shasum -a 256 frontend/app.js` 实测值，不是抄来的。
     # 表内条目集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节比对，该文件此后
     # 仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-24（本次合并 origin/main@9900373b —— PR #203 读路径优化）：两侧都改动
+    # 了 `frontend/app.js`，且**改到了同一处** —— 本分支在 `renderSchedulerWaiting` 上
+    # 加了失败复盘等待行（`answerable` 判据、`wait_type !== "failure_review"` 守卫、
+    # `data-decision`），base 侧把同一段等待行的三个操作抽成共用函数
+    # `schedulerWaitingActions`（并新增调度页收尾分区、调度视图 URL 同步、删掉要求书
+    # 编辑区）。冲突标记逐块手工解决，**两侧的意图都保留**：失败复盘行仍然只可回答、
+    # 不可延长/终止（守卫留在渲染器里），共用函数仍然画出延长 / 终止 / 回答三个操作；
+    # 本分支新增的「终态计划分区只画终态计划」（`SCHEDULER_TERMINAL_PHASES`）也仍在。
+    # 文件内容因此再次变化，按本 gate 的既定流程把冻结基线前移到**合并态**哈希
+    # （`shasum -a 256 frontend/app.js` 实测值，不是抄来的）。表内条目集合与断言强度
+    # 不变：被钉文件的范围不变、sha256 仍逐字节比对。
     "frontend/app.js": (
-        "b7bcd0ff70d5308c1d17f8f67d45827acf0f217dc8bce092c4b9f4d0bb93e645"
+        "017e8b387b33fb94de10ddba3758af7dbad9db45b5d62fd70430826b8a050bf9"
     ),
     # 2026-11-01：因「调度卡片容器与收起态样式」（task-11）改动了 `frontend/style.css`，
     # 按本 gate 的既定流程把哈希前移到本分支的批准态；表内条目集合不变。
@@ -1509,14 +1535,21 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 流程把冻结基线前移到本分支的批准态哈希：这是「移动冻结」而不是
     # 「放松门禁」—— 断言（mismatched == []）、被钉文件的范围与 sha256 逐字节
     # 比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
-    # 2026-11-23（合入 origin/main / deb9b009）：两侧都改动了本文件，且改动落在
-    # **不同位置**（本分支在 `_persist_verification_terminal` 里加了失败复盘的终态
-    # 宣告 `announce_failure`，base 侧改的是收尾阶段的续跑入口与相位事件），自动合并
-    # 无冲突，两侧的意图都保留；文件内容因此再次变化，按本 gate 的既定流程把冻结
-    # 基线前移到**合并态**哈希（`shasum -a 256` 实测值，不是抄来的）。表内条目集合与
-    # 断言强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
+    # 2026-11-23（repair-03）：本分支的暂停/恢复改动落在 `verification_loop.py` 上
+    # （暂停意图先落库、再停机；停机未落地时以 `pause_kill_incomplete` 结束），
+    # repair-03 又把该文件里一处带归属形状的注释改写成系统视角的措辞（只改注释、
+    # 不改行为）。按本 gate 的既定流程把冻结基线前移到改写之后的批准态。哈希取自
+    # 工作区文件的 `shasum -a 256 backend/verification_loop.py` 实测值，不是抄来的。
+    # 表内条目集合与条目数不变：被钉文件的范围不变、sha256 仍逐字节比对，该文件
+    # 此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-23（合入 origin/main / 7d8a195a —— PR #197 框架加固、#198 失败复盘
+    # HITL）：base 侧在本文件上新增失败复盘的终态宣告（`_persist_verification_terminal`
+    # 里的 `announce_failure`），本分支的暂停/恢复改动落在**不同位置**，自动合并
+    # 无冲突，**两侧的意图都保留**；文件内容因此再次变化，按本 gate 的既定流程把
+    # 冻结基线前移到**合并态**哈希（`shasum -a 256` 实测值，不是抄来的）。表内条目
+    # 集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
     "backend/verification_loop.py": (
-        "b62532a5d96d02aef6cb5b6e8d14cf38595da7db4d981211e11026dbd8a0300f"
+        "d1c9cbc7290e5bd59632a3f51da47292c4b8e4a3d4d1abbbd71f8debc4bcfab6"
     ),
 }
 
@@ -1616,16 +1649,20 @@ FROZEN_SCHEDULER_SURFACE_SHA256: dict[str, str] = {
     # `frontend/index.html`，按本 gate 的既定流程把冻结基线前移到本分支的批准态。
     # 哈希取自工作区文件的 `shasum -a 256` 实测值，不是抄来的。表内条目集合与断言
     # 强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
-    # 2026-11-23（合入 origin/main / deb9b009）：本分支把 `app.js` 的缓存版本号由
-    # `?v=19` 前移到 `?v=20`（浏览器不能继续用旧的 app.js，否则失败复盘行在旧标签
-    # 页里仍然不可回答），base 侧在同一处把 `style.css` 的版本号由 `?v=16` 前移到
-    # `?v=17`，并新增调度页收尾分区、删掉要求书编辑区；两侧落在**不同位置**，自动
-    # 合并无冲突，两侧的意图都保留。合并后本文件与 base 侧逐字节相同（实测 sha256
-    # 与 base 侧所钉的值一致），按本 gate 的既定流程把冻结基线前移到**合并态**哈希
+    # 2026-11-23（repair-03）：本分支的调度视图改动（等待区块 / 收尾分区 / 停止中
+    # 列表 / 审核队列的标记）落在 `frontend/index.html` 上，按本 gate 的既定流程把
+    # 冻结基线前移到本分支的批准态。哈希取自工作区文件的
+    # `shasum -a 256 frontend/index.html` 实测值，不是抄来的。表内条目集合与条目数
+    # 不变：被钉文件的范围不变、sha256 仍逐字节比对，该文件此后仍被逐字节钉住，
+    # 任何再编辑照样红。
+    # 2026-11-23（合入 origin/main / 7d8a195a —— PR #197 框架加固、#198 失败复盘
+    # HITL）：base 侧本轮没有再改这个文件，本分支的改动（审核队列区块 / 停止中提示
+    # 标记）原样保留，合并后本文件与本分支的批准态逐字节相同（实测 sha256 与本分支
+    # 所钉的值一致），按本 gate 的既定流程把冻结基线前移到**合并态**哈希
     # （`shasum -a 256` 实测值，不是抄来的）。表内条目集合与断言强度不变：被钉文件的
     # 范围不变、sha256 仍逐字节比对。
     "frontend/index.html": (
-        "f219545e11e47aacae6b011adcc025188b6a2ce8d3da1b8fcf6f24019325486d"
+        "21fc813e8c1f0a548765bdd2a330dc718054d631a08b926b5ed9344f29ccbeb8"
     ),
 }
 

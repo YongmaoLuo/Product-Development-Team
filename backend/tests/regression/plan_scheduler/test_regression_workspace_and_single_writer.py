@@ -967,7 +967,9 @@ def test_regression_workspace_block_is_reported(tmp_path, monkeypatch):
         "running",
         "parked",
         "waiting",
+        "stopping",
         "generated_at",
+        "review_queue",
     }, body
     # 2026-11-15: 读模型多了 parked 列表（停放等配额的计划，R4 要求面板能看
     # 出来）。按本 gate 的既定流程把它纳入断言集合；形状仍按全等比较，多一个
@@ -976,6 +978,22 @@ def test_regression_workspace_block_is_reported(tmp_path, monkeypatch):
     # 2026-11-17: 读模型多了 waiting 列表（收尾阶段里等人回答的条目）。本场景
     # 里没有收尾等待条目，所以它是空的 —— 但键必须在，因为面板按名字读它。
     assert body["waiting"] == [], body
+    # 2026-11-24: 读模型多了 stopping 列表（已接受、尚未被回答的在飞命令，也就是
+    # R3 要求的「停止中」那一行）。本场景里没有在飞命令，所以它是空的 —— 但键
+    # 必须在，因为面板按名字读它。
+    assert body["stopping"] == [], body
+    # 2026-11-24: 状态端点多了 review_queue（「待你审核」聚合区，R5）。三个分组
+    # 是固定的，少一个键面板就得多判一次「没有」和「空」的区别，所以按全等比较。
+    assert set(body["review_queue"]) == {"pr_merge", "hitl", "approval"}, body
+    for _group, _rows in body["review_queue"].items():
+        assert isinstance(_rows, list), body
+    # 本场景的两条计划都没有审批 / HITL 在等，所以队列里没有它们的行。
+    _queued_plan_ids = {
+        str(row.get("plan_id"))
+        for _rows in body["review_queue"].values()
+        for row in _rows
+    }
+    assert _queued_plan_ids.isdisjoint({running_id, blocked_id}), body
     assert body["queue_length"] == 1, body
     assert [str(row["reason"]) for row in body["queue"]] == [
         "workspace_busy"

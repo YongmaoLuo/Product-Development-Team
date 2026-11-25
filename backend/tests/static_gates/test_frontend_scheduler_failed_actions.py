@@ -409,7 +409,7 @@ def test_start_label_default_announces_preemption() -> None:
     )
 
     queue = _normalized(_function_body(source, "renderSchedulerQueue"))
-    assert 'schedulerActionButtons(planId,["promote","start"])' in queue, (
+    assert 'schedulerActionButtons(planId,["promote","pause","start"])' in queue, (
         "the queue row no longer calls schedulerActionButtons() with two "
         "arguments. It passes no phase, so its start button must carry "
         "the default 「立即启动（可抢占）」."

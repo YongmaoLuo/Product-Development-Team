@@ -102,9 +102,11 @@ from postprocess.report import (
     read_report,
     write_report,
 )
+from postprocess.pr_ref import extract_pr_ref
 from postprocess.spec import SpecItem, freeze, load_spec
 from postprocess.waits import (
     ITEM_STATUS_BY_WAIT_STATUS,
+    POSTPROCESS_APPROVAL_SOURCE,
     WaitError,
     WaitRegistry,
     production_registry,
@@ -135,6 +137,26 @@ VERDICT_SKIPPED: str = "SKIPPED"
 
 #: The verdict of an item that is waiting for a human.
 VERDICT_WAITING: str = "WAITING"
+
+#: The answer a human gives when the action may run.  It is one of the
+#: two answers an approval request offers (:data:`postprocess.waits.
+#: APPROVAL_OPTIONS`).
+APPROVE_ANSWER: str = "approve"
+
+#: The answer a human gives when the action may not run.
+REJECT_ANSWER: str = "reject"
+
+#: Why an item whose approval was rejected failed.  It is a marker, not
+#: a sentence: the report carries it so a reader can tell a failure a
+#: human decided from a failure a command had.
+REJECTED_REASON: str = "rejected_by_user"
+
+#: What the report says about an item a human rejected.  It names the
+#: marker, so the report and the verdict say the same thing.
+REJECTED_EXCERPT: str = (
+    "rejected_by_user: the approval was rejected by the user, so the "
+    "command was not run"
+)
 
 #: The progress statuses that mean "this item is not to be executed
 #: again in the first round": it is done, or it is waiting.
@@ -469,14 +491,47 @@ class PostProcessOrchestrator:
         failed by an earlier run — is not run again in this round.  The
         failed ones are picked up by the retry round, which is the one
         place a failure is allowed to be repeated.
+
+        A **waiting** item is settled too, with one exception: a wait a
+        human has since answered is not a question any more.  The answer
+        lives in the decision row, and the row outlives the wait's
+        window — so an answer that came in late is still an answer, and
+        the item is taken back into this round to be acted on.  Without
+        that, an approved pull request stays open for ever and the plan
+        never finishes.
+
+        Only the two answers this stage acts on count: "approve" runs the
+        declared command, "reject" ends the item.  A wait nobody
+        answered — or one answered with something else — keeps waiting:
+        running an action behind a human's back is exactly what a wait
+        forbids.
         """
         scope = []
         for item in items:
             status = self._recorded.get(item.id, "")
+            if status == "waiting":
+                if self._answered_approval(item):
+                    scope.append(item)
+                continue
             if status in SETTLED_STATUSES or status == "failed":
                 continue
             scope.append(item)
         return scope
+
+    def _answered_approval(self, item: SpecItem) -> bool:
+        """Whether a human answered this item's approval question.
+
+        Only the two answers this stage acts on count: "approve" runs the
+        declared command, "reject" ends the item.  Any other answer — and
+        no answer at all — leaves the item waiting.
+
+        Args:
+            item: The item the approval is about.
+
+        Returns:
+            ``True`` when the answer that was given is one of the two.
+        """
+        return self._approval_answer_for(item) in (APPROVE_ANSWER, REJECT_ANSWER)
 
     def _retry_scope(self, items: Sequence[SpecItem]) -> List[SpecItem]:
         """The items the retry round runs: the ones the progress file failed.
@@ -722,6 +777,18 @@ class PostProcessOrchestrator:
 
     def _run_item(self, item: SpecItem, *, attempt: int) -> None:
         """Execute one item, judge it, and record what became of it."""
+        if self._rejected_answer_for(item):
+            # A human said no: the action is not run, the item fails,
+            # and no wait is created for an answer that was already
+            # given.
+            self._record_rejection(item, attempt=attempt)
+            return
+
+        # The command a human approved, if they approved one.  It is read
+        # before the guard goes up: reading an answer changes nothing in
+        # the working tree.
+        approved_command = self._approved_command_for(item)
+
         # The in-flight mark states no attempt count: the counter counts
         # the times an item was **through** the stage, and the item is
         # not through it until it has been judged.
@@ -740,7 +807,7 @@ class PostProcessOrchestrator:
         outcome: Any = None
         try:
             with self._product_guard(item):
-                outcome = self._execute(item)
+                outcome = self._execute(item, approved_command=approved_command)
         except ProductCodeModified as violation:
             self._record_violation(item, violation, outcome, attempt=attempt)
             self._halted = True
@@ -765,6 +832,109 @@ class PostProcessOrchestrator:
             self._plan_id,
             item.id,
             "passed" if verdict.passed else "failed",
+            attempts=attempt,
+            spec_sha256=self._frozen.spec_sha256,
+        )
+
+    # ------------------------------------------------------------------
+    # The answer a human gave
+    # ------------------------------------------------------------------
+
+    def _approved_command_for(self, item: SpecItem) -> Optional[List[str]]:
+        """The command a human approved for this item, if they did.
+
+        An approval is a **permission**, not another command: the argv
+        that runs is the one the requirement book declares, and it runs
+        only because a human said yes.  Without that answer the command
+        is still a question, and the item keeps waiting.
+
+        Args:
+            item: The item the approval is about.
+
+        Returns:
+            The argv to run, or ``None`` when nobody approved this item
+            — which is the case for every item that was never asked
+            about, and for every answer that is not an approval.
+        """
+        if self._approval_answer_for(item) != APPROVE_ANSWER:
+            return None
+        command = item.command
+        if not command:
+            return None
+        return list(command)
+
+    def _rejected_answer_for(self, item: SpecItem) -> bool:
+        """Whether a human rejected this item's approval.
+
+        Args:
+            item: The item the approval is about.
+
+        Returns:
+            ``True`` when the answer that was given is a rejection.
+        """
+        return self._approval_answer_for(item) == REJECT_ANSWER
+
+    def _approval_answer_for(self, item: SpecItem) -> Optional[str]:
+        """The answer a human gave for this item's approval request.
+
+        Read-only, and never a guess.  The answer lives in the decision
+        row the human answered: the registry remembers which row that
+        is, and a registry that does not remember it — a run that
+        outlived the one that asked — looks the row up by the item's own
+        id.
+
+        An answer that is neither "approve" nor "reject" is not an
+        answer this stage acts on: the item keeps waiting, exactly as
+        it did before.
+
+        Args:
+            item: The item the approval is about.
+
+        Returns:
+            The answer that was given, or ``None`` when nobody answered.
+        """
+        registry = self._registry()
+        decision_id = registry.decision_id_of(item.id)
+        if not decision_id:
+            return None
+
+        decision = registry.decision_by_id(decision_id)
+        if decision is None:
+            return None
+        if str(getattr(decision, "source", "")) != POSTPROCESS_APPROVAL_SOURCE:
+            # Not an approval question.  An ordinary human question has
+            # its own answers ("proceed" / "stop"), and they say nothing
+            # about running a command.
+            return None
+
+        answer = getattr(decision, "answer", None)
+        if answer is None:
+            return None
+        return str(answer)
+
+    def _record_rejection(self, item: SpecItem, *, attempt: int) -> None:
+        """Record an item a human rejected.
+
+        The command is not run, and no wait is created: a "no" is an
+        answer, not a question.  The item fails — the requirement was
+        not met — and the report says *why*, so a reader knows the
+        failure was a decision and not a broken command.
+
+        Args:
+            item: The item that was rejected.
+            attempt: The attempt the item was on.
+        """
+        self._verdicts[item.id] = Verdict(
+            item_id=item.id,
+            passed=False,
+            evidence_excerpt=REJECTED_EXCERPT,
+            reason=REJECTED_REASON,
+        )
+        self._audits[item.id] = _empty_audit(item)
+        mark(
+            self._plan_id,
+            item.id,
+            "failed",
             attempts=attempt,
             spec_sha256=self._frozen.spec_sha256,
         )
@@ -884,19 +1054,33 @@ class PostProcessOrchestrator:
         }
         return self._judge(asked, [evidence], **kwargs)
 
-    def _execute(self, item: SpecItem) -> Any:
+    def _execute(
+        self,
+        item: SpecItem,
+        *,
+        approved_command: Optional[List[str]] = None,
+    ) -> Any:
         """Run one item through the executor.
 
         The executor is the only component that runs a command, and it
         answers in one of two ways: with the evidence and the audit
         triple, or with a :class:`NeedsApproval` — an action that is
         legal but needs a human before it may run.
+
+        The approval a human gave is handed over when there is one: the
+        executor does not ask a second time for an action that was
+        already approved.  An executor that does not take the keyword —
+        a test double, mostly — is called the way it always was.
         """
         runner = getattr(self._executor, "run_item", None)
         if callable(runner):
+            if approved_command and _accepts_keyword(runner, "approved_command"):
+                return runner(item, approved_command=approved_command)
             return runner(item)
         execute = getattr(self._executor, "execute", None)
         if callable(execute):
+            if approved_command and _accepts_keyword(execute, "approved_command"):
+                return execute(item, approved_command=approved_command)
             return execute(item)
         raise TypeError(
             "the executor must offer run_item(item) or execute(item); "
@@ -939,15 +1123,33 @@ class PostProcessOrchestrator:
         wait when its deadline passes.  It never answers: a question
         nobody answered stays unanswered, and the stage parks the item
         rather than deciding it.
+
+        The waiting row names the pull request the request is about —
+        its number and its link — and says that it is an approval, so
+        a human reading the waiting rows is told which pull request
+        they are being asked about (architecture decision points R5
+        and R6).  A command that names no pull request leaves both of
+        them empty; the wait is created either way.
         """
+        reference = extract_pr_ref(approval.command)
+        pr_number = reference["pr_number"] if reference is not None else None
+        pr_url = reference["pr_url"] if reference is not None else None
         record: Dict[str, Any] = {
             "type": "approval",
             "question": approval.question,
             "command": list(approval.command),
+            "source": POSTPROCESS_APPROVAL_SOURCE,
+            "pr_number": pr_number,
+            "pr_url": pr_url,
         }
         registry = self._registry()
         try:
-            registry.create_approval_request(_as_mapping(item), approval)
+            registry.create_approval_request(
+                _as_mapping(item),
+                approval,
+                pr_number=pr_number,
+                pr_url=pr_url,
+            )
         except WaitError:
             # No store behind the registry: the wait lives in the
             # progress file, which is where the panel reads it from.

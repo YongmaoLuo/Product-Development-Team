@@ -10,10 +10,12 @@ waiting plan from another.
 So the read model grew a **waiting list** and the terminal plan area
 grew a **terminal summary**:
 
-1. **The waiting row is a closed shape.**  Eight keys, always the same
-   eight: the plan, the item, the kind of wait, the question, the
+1. **The waiting row is a closed shape.**  Eleven keys, always the same
+   eleven: the plan, the item, the kind of wait, the question, the
    deadline, the time left, whether the wait can still be extended and
-   how many times it has been.  A row that carried a ninth key would be
+   how many times it has been, plus the three review fields — the
+   source the wait was asked under, the pull request's number and its
+   URL.  A row that carried a twelfth key would be
    a field the panel cannot draw.
 2. **The time left is an integer.**  It is counted against the tick's
    own clock, and a deadline that has passed answers zero — never a
@@ -26,8 +28,9 @@ grew a **terminal summary**:
    database: the snapshot is what everybody reads, and a read that
    shells out or opens a connection is a read that can block the tick.
 
-The seven-key shape is asserted exactly — not as a subset.  The sixth
-key became the seventh on purpose (the waiting list), and a subset
+The nine-key shape is asserted exactly — not as a subset.  The sixth
+key became the seventh on purpose (the waiting list), the eighth is the
+parked list and the ninth the stopping list, and a subset
 assertion would let the next key in without anybody deciding to add
 it.
 """
@@ -142,19 +145,21 @@ def _write_report(plans_dir: Path, plan_id: str = "p1") -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# 1. The shape is closed — seven keys, and the waiting row's eight
+# 1. The shape is closed — nine keys, and the waiting row's eleven
 # ---------------------------------------------------------------------------
 
 
 def test_snapshot_has_eight_keys() -> None:
-    """The read model carries exactly eight keys.
+    """The read model carries exactly nine keys.
 
     The seventh is ``waiting`` — added on purpose, because the panel
     could not show what the operator was waiting for.  The eighth is
     ``parked`` — the plans stopped for want of provider capacity, which
-    hold no slot and are in no line.  The set is compared exactly and
-    not as a subset: a subset assertion would let the next key in
-    without anybody deciding to add it.
+    hold no slot and are in no line.  The ninth is ``stopping`` — the
+    commands the scheduler has accepted and not answered yet, so a
+    plan that is on its way to a stop is visible before it is stopped.
+    The set is compared exactly and not as a subset: a subset assertion
+    would let the next key in without anybody deciding to add it.
     """
     result = build(_state())
 
@@ -166,17 +171,19 @@ def test_snapshot_has_eight_keys() -> None:
         "running",
         "waiting",
         "parked",
+        "stopping",
         "generated_at",
     }
 
 
 def test_waiting_rows_are_closed_shape() -> None:
-    """A waiting row carries exactly the eight keys the panel draws.
+    """A waiting row carries exactly the eleven keys the panel draws.
 
     The row names the plan and the item, says what kind of wait it is
-    and what it is asking, and answers the two questions the operator
+    and what it is asking, answers the two questions the operator
     asks of a countdown: how long is left, and can it still be pushed
-    out.
+    out — and carries the three review fields: the source the wait was
+    asked under and the pull request it is about.
     """
     result = build(_state(waits=[_waiting_row("p1")]))
 
@@ -190,10 +197,13 @@ def test_waiting_rows_are_closed_shape() -> None:
         "remaining_seconds",
         "extendable",
         "extensions_count",
+        "source",
+        "pr_number",
+        "pr_url",
     }
-    # The eight keys are the module's own declaration, not a copy of
+    # The eleven keys are the module's own declaration, not a copy of
     # them written out here: a copy would keep passing after the row
-    # grew a ninth key.
+    # grew a twelfth key.
     assert set(result["waiting"][0]) == set(WAITING_KEYS)
 
 
