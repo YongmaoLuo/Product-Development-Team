@@ -125,6 +125,18 @@ CI_ARTIFACT_FIELDS: FrozenSet[str] = frozenset({
     "junit_available",
     "junit_unavailable_reason",
     "junit_stale_reports_removed",
+    # 2026-11-20: the junit annotation of **this** round — whether it
+    # produced a junit report at all, what to say when it produced none
+    # ("本轮未产出 junit"), and why an earlier round's report could not
+    # be cleaned up.  These three keys are written by the runner's own
+    # junit evidence, so the contract has to allow them; without them
+    # the runner rejects its own artifact.  They are spelled out
+    # literally (see the module docstring): a key assembled from a
+    # constant is invisible to the derivation that keeps the contract
+    # and the producer equal.
+    "junit_fresh",
+    "junit_note",
+    "junit_stale_cleanup_error",
     "failed_cases",
     "schema_issues",
     # The declaration this verdict was based on: which exit codes mean

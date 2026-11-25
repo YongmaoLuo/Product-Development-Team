@@ -630,6 +630,21 @@ SIGNAL_GATE_NOT_EXECUTABLE = "gate_not_executable"
 #: runner and the contract drift apart.
 FAILURE_IDENTITY_FIELD = "failure_identity"
 
+#: 2026-11-14（合并 origin/main@ecc5d9ee 时留下的缺口）：CI artifact 的契约
+#: （:mod:`ci_artifact` 的 ``CI_ARTIFACT_FIELDS``）是**从本文件的源码推导**
+#: 出来的 —— 本文件写进 evidence 的每一个键都必须在契约的允许集合里，
+#: 否则 runner 会拒绝自己的 artifact（见上面 ``FAILURE_IDENTITY_FIELD``
+#: 的说明，以及 ``tests/unit/test_ci_artifact_schema.py`` 的钉住测试）。
+#:
+#: 本分支在 junit 证据上多写了三个键：``junit_fresh``（本轮是否产出了
+#: junit）、``junit_note``（"本轮未产出 junit"）、``junit_stale_cleanup_error``
+#: （上一轮遗留报告清理失败的原因）。**2026-11-20：契约的允许集合已经补上
+#: 这三个键**（``ci_artifact.py`` 里以字面量写出），这个缺口到此关闭 ——
+#: runner 写出的 artifact 现在能通过它自己的契约。
+#:
+#: 注意：这三个键在下面是**字面量**写的，不是从常量拼出来的 —— 契约的
+#: 推导认不出用常量拼出来的键。
+
 #: The lines that carry a lane's conclusion. A gate run that is killed
 #: mid-way still has to answer "which lanes finished, and what did they
 #: say" — and the answer is in these lines, not in the tail of the
@@ -780,6 +795,19 @@ REAP_POLL_SECONDS = 0.25
 #: deletion because it could not be removed is older than the gate
 #: start all the same.
 JUNIT_MTIME_SLACK_SECONDS = 1.0
+
+#: How much slack a junit report gets before it counts as "not written
+#: by this round".  The filesystem's timestamp granularity is not exact
+#: and the runner's clock is not the gate's clock, so a report written a
+#: fraction of a second before the runner took its timestamp is still
+#: this round's report.  One second is wider than any of that.
+#:
+#: It is the **same width** as :data:`JUNIT_MTIME_SLACK_SECONDS` — one
+#: rule, one number: the two names are the same bound seen from the
+#: two sides that need it (the reader that filters and the writer that
+#: clears), and two numbers that happen to be equal today would drift
+#: apart tomorrow.
+JUNIT_FRESHNESS_TOLERANCE_SECONDS = JUNIT_MTIME_SLACK_SECONDS
 
 #: 结构性收窄标记 —— 一条 ``ci_entry`` 命中任何一个，说明它指的不是"整仓"，
 #: 而是"某个测试子集"。``full_ci`` 的职责是整仓门禁，收窄过的入口属于
@@ -2309,51 +2337,99 @@ def _junit_count(suite: ET.Element, attribute: str, fallback: int) -> int:
         return fallback
 
 
-def _clear_stale_junit_reports(junit_dir: Optional[Path]) -> List[str]:
-    """Take the reports of an earlier round out of the junit directory.
+def clear_stale_junit_reports(junit_dir: Optional[Path]) -> Optional[str]:
+    """Delete the per-phase junit reports a *previous* round left behind.
 
-    The directory of a VP is reused across rounds -- it holds this VP's
-    audit copy as well -- so the reports the last round wrote are still
-    there when the next round starts.  A report that belongs to an
-    earlier round is not evidence about this one: read as if it were,
-    it names cases this round never ran, and the repair loop then goes
-    and fixes a failure that is not there (2026-11-08: a whole repair
-    round was built out of reports six days old, and the gate it was
-    meant to fix was green).
+    The junit directory is reused across rounds — the runner only
+    creates it (``mkdir(exist_ok=True)``) — so the reports a gate wrote
+    a week ago are still lying in it.  The evidence reader globs
+    ``phase-*.xml``, so a round whose gate died before writing a report
+    of its own would read the old ones and judge the deliverable by
+    them: on 2026-11-09 ``VP-025`` exited 3 after 0.04 s and the
+    verdict still carried 11517 cases and 23 failures from seven days
+    earlier.
 
-    So the reports go before the gate runs.  What is in the directory
+    A report that belongs to an earlier round is not evidence about
+    this one: read as if it were, it names cases this round never ran,
+    and the repair loop then goes and fixes a failure that is not
+    there (2026-11-08: a whole repair round was built out of reports
+    six days old, and the gate it was meant to fix was green).  So the
+    reports go before the gate runs — what is in the directory
     afterwards was written by this run.
+
+    Only the ``phase-*.xml`` files are deleted: the audit copy
+    (``ci_output.json``) and anything else in the directory are not
+    ours to touch.
+
+    ``None`` comes back when the directory was cleared (or when there
+    was nothing to clear); the first error comes back otherwise.  The
+    caller records it and carries on — a cleanup that failed must not
+    change a verdict.
     """
-    removed: List[str] = []
     if junit_dir is None:
-        return removed
+        return None
+    directory = Path(junit_dir)
     try:
-        reports = list(junit_dir.glob("phase-*.xml"))
-    except OSError as exc:  # noqa: BLE001 - evidence must not break a verdict
+        reports = sorted(directory.glob("phase-*.xml"))
+    except OSError as exc:  # noqa: BLE001 - a stuck directory is not a verdict
         logger.warning(
             "[ci_runner] could not list the stale junit reports in %s: %s",
-            junit_dir, exc,
+            directory, exc,
         )
-        return removed
-    for path in reports:
-        if _junit_phase_number(path) is None:
-            # Not one of ours by name: it is not read either, and it is
-            # not ours to delete.
-            continue
+        return f"{type(exc).__name__}: {exc}"
+
+    error: Optional[str] = None
+    for report in reports:
         try:
-            path.unlink()
-        except OSError as exc:  # noqa: BLE001 - a stale report is not fatal
+            report.unlink()
+        except OSError as exc:  # noqa: BLE001 - one stuck file, the rest go
             logger.warning(
                 "[ci_runner] could not remove the stale junit report %s: %s",
-                path, exc,
+                report, exc,
             )
+            if error is None:
+                error = f"{report.name}: {type(exc).__name__}: {exc}"
+    return error
+
+
+def _stale_junit_report_names(junit_dir: Optional[Path]) -> List[str]:
+    """The names of the reports an earlier round left in the directory.
+
+    The names are read **before** the cleanup, because afterwards there
+    is nothing left to read: what is gone is what the cleanup took,
+    and the difference between the two is what the reader is told
+    (see :func:`_removed_junit_reports`).
+    """
+    if junit_dir is None:
+        return []
+    try:
+        return sorted(
+            path.name for path in Path(junit_dir).glob("phase-*.xml")
+        )
+    except OSError:  # noqa: BLE001 - evidence must not break a verdict
+        return []
+
+
+def _removed_junit_reports(
+    junit_dir: Optional[Path], candidates: List[str],
+) -> List[str]:
+    """The candidates that are gone now — the ones the cleanup took.
+
+    A candidate that is still there was **not** removed: either the
+    cleanup could not unlink it, or it was never ours to take.  Either
+    way it is not reported as removed — the evidence says what happened,
+    not what was meant to happen.
+    """
+    if junit_dir is None:
+        return []
+    directory = Path(junit_dir)
+    removed: List[str] = []
+    for name in candidates:
+        try:
+            if not (directory / name).exists():
+                removed.append(name)
+        except OSError:  # noqa: BLE001 - evidence must not break a verdict
             continue
-            logger.warning(
-                "[ci_runner] could not remove the stale junit report %s: %s",
-                path, exc,
-            )
-            continue
-        removed.append(path.name)
     return removed
 
 
@@ -2384,7 +2460,9 @@ def _clear_stale_gate_result(result_dir: Optional[Path]) -> Optional[str]:
     return path.name
 
 
-def _junit_written_since(path: Path, since: float) -> bool:
+def _junit_written_since(
+    path: Path, since: float,
+) -> Tuple[bool, Optional[str]]:
     """Whether *path* was written after the gate started.
 
     A report that predates the gate belongs to an earlier round: the
@@ -2394,19 +2472,25 @@ def _junit_written_since(path: Path, since: float) -> bool:
     that stores an mtime with one-second resolution rounds it **down**
     and would otherwise reject a report written a fraction of a second
     after the gate started.
+
+    The second element of the answer is the reason when the answer is
+    "no" **and** the reason is that the timestamp could not be read: a
+    report that cannot be dated cannot be shown to be this round's, and
+    the reader has to be able to say so out loud rather than drop the
+    report silently.  Evidence must never raise.
     """
     try:
         mtime = path.stat().st_mtime
-    except OSError:  # noqa: BLE001 - a report that cannot be dated is not read
-        return False
-    return mtime >= since - JUNIT_MTIME_SLACK_SECONDS
+    except OSError as exc:  # noqa: BLE001 - a report that cannot be dated is not read
+        return False, f"{path.name}: {type(exc).__name__}: {exc}"
+    return mtime >= since - JUNIT_MTIME_SLACK_SECONDS, None
 
 
 def _read_junit_evidence(
     junit_dir: Optional[Path],
     *,
+    not_before: Optional[float] = None,
     since: Optional[float] = None,
-
 ) -> Dict[str, Any]:
     """The per-phase junit evidence a gate run left behind.
 
@@ -2416,9 +2500,24 @@ def _read_junit_evidence(
     the exit code, and a report that cannot be parsed must not be able
     to disturb it.
 
+    ``not_before`` is the moment the gate started (wall clock).  The
+    junit directory is reused across rounds, so a report that is older
+    than that belongs to a round that has already ended — and a round
+    that has already ended cannot say anything about this one.  Such a
+    report is skipped: it is not this round's evidence, and reading it
+    would turn "the machine could not decide" into "the deliverable is
+    broken" (2026-11-09, ``VP-025``).  A report whose timestamp cannot
+    be read is skipped the same way and named in ``junit_error`` — it
+    cannot be shown to be this round's, and evidence must never raise.
+
+    ``since`` is the same bound under the name the runner used before
+    it: both are accepted, and ``not_before`` wins when both are
+    given.  The bound is optional — a reader that does not know when
+    the gate started reads what it finds.
+
     Whether the reports are **available** is an observed fact, not a
     guess about the entry: the directory was emptied before the gate
-    started (:func:`_clear_stale_junit_reports`), so what is in it
+    started (:func:`clear_stale_junit_reports`), so what is in it
     afterwards is what this run wrote.  Reports in it → available; no
     reports in it → not available, with a reason.  A gate that ran the
     whole-repo gate somewhere else leaves its reports there, and this
@@ -2430,12 +2529,6 @@ def _read_junit_evidence(
     called: the entry is the project's to choose, and a name the
     framework recognises would be a name it would also mis-recognise
     somewhere else.
-
-    Only the reports **this round** wrote are read.  The directory is
-    reused across rounds, so what is found in it may belong to a run
-    that has already been graded; *since* is the instant the gate
-    started, and a report older than that says nothing about the run
-    being graded.
     """
     evidence: Dict[str, Any] = {
         "junit_phases": [],
@@ -2475,7 +2568,13 @@ def _read_junit_evidence(
         evidence["junit_error"] = f"{type(exc).__name__}: {exc}"
         return evidence
 
-    if since is not None:
+    # The bound the reports are measured against: the moment the gate
+    # started.  ``not_before`` is the name the reader knows it by;
+    # ``since`` is the same bound under the name the runner used
+    # before it.
+    bound = not_before if not_before is not None else since
+    errors: List[str] = []
+    if bound is not None:
         # A report this round did not write is not this round's
         # evidence: the directory is reused across rounds, so what is
         # found there may belong to a run that has already been graded.
@@ -2483,10 +2582,20 @@ def _read_junit_evidence(
         # so "this run produced no report" is a statement about this
         # run even when a report of an earlier round survived the
         # deletion that precedes it.
-        reports = [
-            path for path in reports
-            if _junit_written_since(path, since)
-        ]
+        fresh: List[Path] = []
+        for path in reports:
+            written, reason = _junit_written_since(path, bound)
+            if reason is not None:
+                # A report whose timestamp cannot be read cannot be
+                # shown to be this round's — and it says so, instead of
+                # going missing without a word.
+                errors.append(reason)
+                continue
+            if written:
+                fresh.append(path)
+        reports = fresh
+        if errors:
+            evidence["junit_error"] = "; ".join(errors)
 
     if not reports:
         # Nothing in the directory the run started from an empty one:
@@ -2502,7 +2611,6 @@ def _read_junit_evidence(
 
     phases: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
-    errors: List[str] = []
 
     for path in reports:
         phase = _junit_phase_number(path)
@@ -3082,6 +3190,7 @@ def run_ci_verification(
     # registry above; the junit directory joins it on the same dict, so
     # the one subprocess sees both.
     junit_dir: Optional[Path] = None
+    stale_junit_error: Optional[str] = None
     gate_result_dir: Optional[Path] = None
     if artifact_dir is not None:
         candidate = Path(artifact_dir) / vp_id
@@ -3098,6 +3207,15 @@ def run_ci_verification(
             )
         else:
             junit_dir = candidate
+            # 2026-11-09: the directory is reused across rounds, so the
+            # reports of a previous round are still in it.  The gate
+            # writes its own reports on top, and a gate that dies before
+            # writing any would leave the reader looking at the old ones
+            # — which is how a gate that exited 3 after 0.04 s ended up
+            # with a verdict read out of a week-old report.  Clear them
+            # before the gate runs, so whatever is there afterwards is
+            # this round's.
+            #
             gate_result_dir = candidate
             # The directory is named after the verification point, so it
             # is the **same** directory round after round.  What an
@@ -3115,7 +3233,14 @@ def run_ci_verification(
     # is reused across rounds -- and they are not evidence about this
     # run.  They go before the gate starts, so that whatever is in the
     # directory afterwards was written by this run.
-    stale_reports = _clear_stale_junit_reports(junit_dir)
+    #
+    # The names are read **before** the cleanup, because afterwards there
+    # is nothing left to read: what is gone is what the cleanup took,
+    # and the difference between the two is what the evidence says.
+    stale_candidates = _stale_junit_report_names(junit_dir)
+    stale_junit_error = clear_stale_junit_reports(junit_dir)
+    stale_removed = _removed_junit_reports(junit_dir, stale_candidates)
+
     # Same reasoning for the verdict file: a verdict an earlier round
     # wrote there says nothing about this round, and reading it would
     # grade this round by the last round's news.
@@ -3126,11 +3251,13 @@ def run_ci_verification(
             "round", stale_gate_result,
         )
 
-    # The instant the gate starts.  A junit report written before it
-    # belongs to an earlier round: the directory is reused, so its
-    # presence says nothing about the run being graded.
-    junit_since = time.time()
-
+    # The moment the gate starts, in wall clock.  Everything the gate
+    # writes after this is this round's; everything older is a leftover
+    # from a round that is over.  The cleanup above removes the leftovers
+    # when it can — but it can fail (a directory that cannot be written
+    # to, a file that cannot be unlinked), and then the reader has to be
+    # able to tell the two apart on its own.
+    gate_started_wall = time.time()
 
     try:
         try:
@@ -3246,6 +3373,12 @@ def run_ci_verification(
     }
     if error:
         evidence["error"] = error
+    if stale_junit_error:
+        # 2026-11-09: the cleanup of the previous round's junit reports
+        # failed.  That is a fact about the bookkeeping, not about the
+        # deliverable — it is recorded here and the verdict stays what
+        # the gate's exit code said it was.
+        evidence["junit_stale_cleanup_error"] = stale_junit_error
 
     # The structured verdict, when the contract asked for one.  The
     # keys are there either way: a reader has to be able to tell "the
@@ -3275,13 +3408,33 @@ def run_ci_verification(
     # And only the reports **this round** wrote are read: the
     # directory is reused across rounds, so a report an earlier round
     # left there says nothing about the run being graded.
-    junit_evidence = _read_junit_evidence(junit_dir, since=junit_since)
+    junit_evidence = _read_junit_evidence(
+        junit_dir, not_before=gate_started_wall,
+    )
     evidence.update(junit_evidence)
-    if stale_reports:
+    # Did this round produce a report at all?  The answer is what tells
+    # "nothing failed" apart from "nothing was measured" — and it is
+    # answered by the reports themselves, not by the cleanup having
+    # succeeded.
+    #
+    # The answer is read out of the **phases the reader could read**,
+    # not out of ``junit_available``: a report that exists but cannot be
+    # parsed (a malformed one, a zero-byte one) is not a report this
+    # round produced — the reader caught the error, recorded it in
+    # ``junit_error`` and moved on, so the round has no phase at all.
+    #
+    # The two keys answer two different questions, and both can be true
+    # at once: ``junit_available`` says a report **file** was there (the
+    # upstream meaning, unchanged here), ``junit_fresh`` says this round
+    # **read a phase** out of it.  A malformed report is exactly the case
+    # where the file was there and it said nothing.
+    junit_fresh = bool(junit_evidence.get("junit_phases"))
+    evidence["junit_fresh"] = junit_fresh
+    if stale_removed:
         # The reports of an earlier round that were in the way.  They
         # are named so a reader can see that this run started from a
         # clean directory rather than from somebody else's evidence.
-        evidence["junit_stale_reports_removed"] = sorted(stale_reports)
+        evidence["junit_stale_reports_removed"] = sorted(stale_removed)
     # The host's own account of itself, lifted to the top level of the
     # evidence: an operator reading the artifact has to be able to see
     # *why* this machine's verdict is worth less than a quiet one's.
@@ -3405,6 +3558,39 @@ def run_ci_verification(
         tail = stderr_tail.strip() or stdout_tail.strip()
         if tail:
             result.reasons.append(f"输出尾部：{tail[-600:]}")
+
+    # 2026-11-10: the verdict is decided; now the evidence is made to
+    # match it.
+    #
+    # Two situations leave the junit evidence without a meaning, and in
+    # both of them the evidence must not carry a failure:
+    #
+    # * **the round was not decided** — the gate could not tell whether
+    #   the code is broken.  There is no failure to point at, so there is
+    #   no failure fingerprint to leave behind.  A fingerprint here would
+    #   make the repair loop treat an undecidable round as a defect it
+    #   has already seen — and would make the *next* round's early stop
+    #   fire on a verdict that was never made.
+    # * **this round produced no report** — the failures in the evidence
+    #   (if any) are not this round's failures, so they are not
+    #   failures at all as far as this verdict is concerned.  The note
+    #   says so out loud, because "no failures" and "nothing was
+    #   measured" must not read the same.
+    #
+    # The note is the whole of the annotation the plan asked for: the
+    # evidence says in words that the run measured nothing, so a reader
+    # does not have to guess whether the empty list means "passed" or
+    # "not measured".
+    #
+    # It runs **before** the failure identity is computed below, so the
+    # identity is read out of the evidence that was made to match the
+    # verdict — an undecidable round leaves no case-level identity
+    # behind, which is the whole point of the annotation.
+    if result.status == STATUS_INCONCLUSIVE or not junit_fresh:
+        evidence["junit_phases"] = []
+        evidence["junit_failures"] = []
+        evidence["failed_cases"] = []
+        evidence["junit_note"] = "本轮未产出 junit"
 
     # 2026-11-04: the machine-written identity of this run.  It is set
     # after the verdict, because only the verdict knows whether there
