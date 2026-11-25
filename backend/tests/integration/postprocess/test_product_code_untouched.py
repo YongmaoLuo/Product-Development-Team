@@ -113,7 +113,12 @@ class RecordingRun:
         return list(self.calls)
 
 
-def _item(item_id: str, command: Optional[List[str]] = None) -> SpecItem:
+def _item(
+    item_id: str,
+    command: Optional[List[str]] = None,
+    *,
+    target: str = "origin",
+) -> SpecItem:
     """一条要求书条目 —— 形状与 ``postprocess.spec.SpecItem`` 一致。"""
     return SpecItem(
         id=item_id,
@@ -122,7 +127,7 @@ def _item(item_id: str, command: Optional[List[str]] = None) -> SpecItem:
         acceptance_predicate={"kind": "exit_code", "equals": 0},
         evidence_requirement={"kind": "exit_code"},
         external=True,
-        target="origin",
+        target=target,
         required=True,
         wait={"type": "none"},
     )
@@ -786,6 +791,7 @@ def book_item(
     *,
     command: Optional[List[str]] = None,
     predicate: Optional[Mapping[str, Any]] = None,
+    target: str = "origin",
 ) -> Dict[str, Any]:
     """要求书里的一条 —— 架构声明的七个键，外加对外条目的 argv。
 
@@ -793,6 +799,7 @@ def book_item(
         item_id: 条目的 id。
         command: 条目声明的 argv。
         predicate: 条目的判据；默认是「退出码为 0」。
+        target: 条目对外作用的标的。
 
     Returns:
         那一条，作为要求书写下的形状。
@@ -806,7 +813,7 @@ def book_item(
         ),
         "evidence_requirement": {"kind": "exit_code"},
         "external": True,
-        "target": "origin",
+        "target": target,
         "required": True,
         "wait": {"type": "none"},
     }
@@ -1220,3 +1227,262 @@ def test_the_orchestrator_passes_an_upstream_merge_item(
     assert report["terminal_status"] == "completed", report["terminal_status"]
     assert entry["verdict"] == "PASS", entry
     assert (repo / "backend" / "upstream.py").is_file(), "合并没把上游内容带进来"
+
+
+# ---------------------------------------------------------------------
+# 声明的 squash 条目
+# ---------------------------------------------------------------------
+
+#: 收尾要求书里声明 squash 的那一条命令 —— 逐字匹配。
+DECLARED_SQUASH: List[str] = ["git", "reset", "--soft", "origin/main"]
+
+
+def _make_squash_scenario(repo: Path) -> str:
+    """把仓摆成「分支上有一条改产品代码的提交」的样子。
+
+    收尾阶段压扁（squash）的前提就是这个形状：分支上有提交，于是
+    ``git reset --soft origin/main`` 会把那条提交变成**暂存区里的改动** ——
+    porcelain 报出来的那批条目，正是这条压扁条目要做的事。
+
+    ``origin/main`` 指向基线提交（产品代码还是基线那一份），所以压扁之后
+    分支上的产品代码改动全部落在暂存区里。
+
+    Args:
+        repo: 仓的目录。
+
+    Returns:
+        基线提交的 sha。
+    """
+    base = _git(repo, "rev-parse", "HEAD").strip()
+    _commit_file(repo, "backend/agent.py", "VALUE = 2\n", "feature change")
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "update-ref",
+            "refs/remotes/origin/main",
+            base,
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return base
+
+
+def _reset_soft(repo: Path, ref: str) -> subprocess.CompletedProcess:
+    """在仓里真的跑一次 ``git reset --soft {ref}``。
+
+    Args:
+        repo: 仓的目录。
+        ref: 要退回去的 ref。
+
+    Returns:
+        完成的进程结果。
+    """
+    return subprocess.run(
+        ["git", "reset", "--soft", ref],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _porcelain(repo: Path) -> str:
+    """仓里当前的 ``git status --porcelain`` 原文。"""
+    return _git(repo, "status", "--porcelain", "--untracked-files=all")
+
+
+def test_a_declared_squash_item_may_stage_the_product_diff(tmp_path):
+    """声明的 squash 条目（``git reset --soft origin/main``）—— 不抛。
+
+    这一条按定义就是把分支上的 diff 放进暂存区：porcelain 报出那批
+    ``M `` 条目正是它要做的事，产物由紧随其后的 commit 条目提交。守卫
+    若在这里判红，收尾阶段就永远走不到提交那一步。
+
+    用例里断言 porcelain **确实**变了 —— 否则这条用例可能是空的（没造出
+    暂存状态，守卫本来就不会抛）。
+    """
+    repo = _make_repo(tmp_path / "repo")
+    _make_squash_scenario(repo)
+    item = _item("squash-to-main-base", DECLARED_SQUASH, target="origin/main")
+
+    with product_diff_guard(item, repo=repo):
+        _reset_soft(repo, "origin/main")
+
+    porcelain = _porcelain(repo)
+    assert "backend/agent.py" in porcelain, porcelain
+    assert porcelain.startswith("M "), porcelain
+
+
+def test_a_squash_item_with_another_target_is_still_a_violation(tmp_path):
+    """argv 与 target 都不是 ``origin/main`` 的压扁条目 —— 仍然判红。
+
+    豁免是逐字匹配那一条声明的 squash 命令的窄豁免，不是「凡是
+    ``git reset --soft`` 都放行」。
+    """
+    repo = _make_repo(tmp_path / "repo")
+    _make_squash_scenario(repo)
+    item = _item(
+        "squash-to-other",
+        ["git", "reset", "--soft", "otherbranch"],
+        target="otherbranch",
+    )
+
+    with pytest.raises(ProductCodeModified) as excinfo:
+        with product_diff_guard(item, repo=repo):
+            _reset_soft(repo, "origin/main")
+
+    assert "backend/agent.py" in excinfo.value.paths, excinfo.value.paths
+
+
+@pytest.mark.parametrize("base", ["otherbranch", "origin/release"])
+def test_a_squash_item_to_another_base_is_still_a_violation(tmp_path, base):
+    """压扁到别的基线（argv 与 target 一致，但不是 ``origin/main``）—— 仍然判红。
+
+    认的基线只有 ``origin/main`` 一个 —— 与「声明的上游合并」同形：那条
+    也只认 ``origin/main``，合到别处的 merge 照样判红。
+    """
+    repo = _make_repo(tmp_path / "repo")
+    _make_squash_scenario(repo)
+    item = _item(
+        "squash-to-other-base",
+        ["git", "reset", "--soft", base],
+        target=base,
+    )
+
+    with pytest.raises(ProductCodeModified) as excinfo:
+        with product_diff_guard(item, repo=repo):
+            _reset_soft(repo, "origin/main")
+
+    assert "backend/agent.py" in excinfo.value.paths, excinfo.value.paths
+
+
+def test_a_squash_item_whose_target_disagrees_with_its_argv_is_still_a_violation(
+    tmp_path,
+):
+    """argv 的第四段与条目自己的 ``target`` 不一致 —— 仍然判红。
+
+    识别是「argv 逐字等于 ``git reset --soft {target}``」：只有 argv 与
+    target 互相对得上才算那一条声明的 squash。
+    """
+    repo = _make_repo(tmp_path / "repo")
+    _make_squash_scenario(repo)
+    item = _item(
+        "squash-mismatched-target",
+        DECLARED_SQUASH,
+        target="otherbranch",
+    )
+
+    with pytest.raises(ProductCodeModified) as excinfo:
+        with product_diff_guard(item, repo=repo):
+            _reset_soft(repo, "origin/main")
+
+    assert "backend/agent.py" in excinfo.value.paths, excinfo.value.paths
+
+
+def test_a_declared_squash_item_that_rewrites_product_code_is_still_a_violation(
+    tmp_path,
+):
+    """声明的 squash 条目**真的改写了产品文件内容** —— 仍然判红。
+
+    ``git reset --soft`` 不碰文件内容，所以内容判据（哈希比对）照旧有效：
+    豁免只放得住 porcelain 那一判据，放不住内容改动。
+    """
+    repo = _make_repo(tmp_path / "repo")
+    _make_squash_scenario(repo)
+    item = _item("squash-to-main-base", DECLARED_SQUASH, target="origin/main")
+
+    with pytest.raises(ProductCodeModified) as excinfo:
+        with product_diff_guard(item, repo=repo):
+            _reset_soft(repo, "origin/main")
+            (repo / "backend" / "agent.py").write_text(
+                "VALUE = 99\n", encoding="utf-8"
+            )
+
+    assert "backend/agent.py" in excinfo.value.paths, excinfo.value.paths
+
+
+def test_a_declared_squash_item_hiding_a_rewrite_is_still_a_violation(tmp_path):
+    """porcelain 报不出来的那次改写（``assume-unchanged``）—— 仍然判红。
+
+    这一条把「豁免只放得住 porcelain 判据」钉死：这里 porcelain 是空的，
+    唯一能抓住改动的就是产品代码哈希判据 —— 它必须还在。
+    """
+    repo = _make_repo(tmp_path / "repo")
+    _make_squash_scenario(repo)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "update-index",
+            "--assume-unchanged",
+            "backend/agent.py",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    item = _item("squash-to-main-base", DECLARED_SQUASH, target="origin/main")
+
+    with pytest.raises(ProductCodeModified) as excinfo:
+        with product_diff_guard(item, repo=repo):
+            (repo / "backend" / "agent.py").write_text(
+                "VALUE = 99\n", encoding="utf-8"
+            )
+
+    assert _porcelain(repo) == "", _porcelain(repo)
+    assert "backend/agent.py" in excinfo.value.paths, excinfo.value.paths
+
+
+def test_the_orchestrator_does_not_halt_on_a_declared_squash_item(
+    tmp_path: Path,
+    plan_dir: Path,
+) -> None:
+    """生产入口上：收尾阶段不再停在压扁那一条上，后面的条目照跑。
+
+    真的 git、真的临时仓、真的编排器、真的执行器（不注入桩）—— 豁免是在
+    生产路径上生效的，不只是守卫单测里成立。
+
+    编排器在**产品代码被改**的那一刻停下整轮；这一条压扁之后 porcelain
+    报出的那批条目正是它要做的事，所以整轮不该停在这里 —— 后面那条
+    (``git status``) 必须真的跑过。
+
+    压扁那一条自己的裁决仍是 FAIL：``git reset --soft`` 不打印任何东西，
+    判定器要「退出码 + 输出」才算证据充分（那是
+    ``backend/postprocess/judge.py`` 的另一条判据，不在这次改动里）。
+    本用例要钉的是**守卫没有开火**：证据摘录里没有 porcelain 原文。
+    """
+    repo = _make_repo(tmp_path / "repo")
+    _make_squash_scenario(repo)
+    write_book(
+        plan_dir,
+        [
+            book_item(
+                "squash-to-main-base",
+                command=DECLARED_SQUASH,
+                target="origin/main",
+            ),
+            book_item("inspect-staged", command=STATUS_COMMAND),
+        ],
+    )
+    executor = CommandRunner(freeze(load_spec(plan_dir)), workspace=repo)
+    orchestrator = PostProcessOrchestrator(
+        PLAN_ID,
+        plan_dir=plan_dir,
+        executor=executor,
+        sink=FakeNotifier(),
+    )
+
+    report = orchestrator.start()
+
+    squash = next(
+        e for e in report["items"] if e["id"] == "squash-to-main-base"
+    )
+    after = next(e for e in report["items"] if e["id"] == "inspect-staged")
+    assert "git status --porcelain" not in squash["evidence_excerpt"], (
+        "守卫把声明的压扁条目判成了产品代码越界：%r" % (squash,)
+    )
+    assert after["verdict"] == "PASS", after
+    assert "backend/agent.py" in _porcelain(repo), _porcelain(repo)

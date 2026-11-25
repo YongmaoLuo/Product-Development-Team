@@ -154,6 +154,17 @@
   指纹；散文（`first_error_line`）只在没有载荷可哈希时才参与
   （`backend/verification/failure_fingerprint.py`）。
 
+- **声明的 squash 条目可以暂存产品代码 diff。**
+  `backend/postprocess/executor.py` 认出声明的 squash 条目
+  （`git reset --soft origin/main`，逐字匹配，且条目自己的 `target` 必须
+  与之一致），让这一条跳过产品代码守卫的 porcelain 判据：把分支 diff
+  放进暂存区正是这一条要做的事，产物由紧随其后的 commit 条目提交。
+  **内容判据不变** —— `reset --soft` 不碰文件内容，产品代码路径下的
+  sha256 比对照旧能抓到真正的内容改动；这一条执行期间真的改写了产品
+  文件，照样判红。**其他条目的裁决没有任何变化**：压扁到别的基线、
+  `git reset --mixed` / `--hard`，以及任何写下产品代码的条目，都还是
+  原来那个判法。
+
 
 
 ## [0.1.2] - 2026-10-07
