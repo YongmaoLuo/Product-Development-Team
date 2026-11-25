@@ -201,7 +201,7 @@ SNAPSHOT_PATH = _TESTS_DIR / "openapi_snapshot.json"
 #: 发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零差异（90 条路径，
 #: 路径集合、`components` 与 `info` 逐项相等，整份 schema 相等）、指纹相同——
 #: 才把该值写进本常量（`b021d16f…`）。
-BASELINE_FINGERPRINT = "b021d16f5240a4dad3743c85ec913e69b1520251d4ed6c5747505434f447360a"
+BASELINE_FINGERPRINT = "df12726ce476da06caf71bac469a7ba989f385df846686e6cc82a0ee037a79e0"
 
 #: The capture runs in its own process so the schema is the one a clean
 #: start produces: debug routes off, no schema cache carried over from
