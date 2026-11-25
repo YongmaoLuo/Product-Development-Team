@@ -235,6 +235,25 @@ half the readers never see.*
   `--hard`, and any entry that writes product code are judged as
   before.
 
+- **A Phase-2 gate layer that was deferred over a Phase-1 conclusion is
+  re-decided against that conclusion's final state, and it runs in the same
+  round once its blocker turns green.** `backend/verification_executor.py`
+  keeps the deferred gate layer in the round's verdict ledger — the ledger
+  is the truth about "this round a gate layer was deferred and has not run
+  yet" — so a layer deferred while its blocker was still `BLOCKED` is found
+  again even when the executor is rebuilt or the process is replaced, and
+  the deferral reason is re-worded to name the blocker that blocks *now*:
+  a reason never keeps naming a blocker that has already turned green.
+  `backend/verification_agent.py` re-decides and dispatches those layers at
+  the round's close — after the last thing that can still change a
+  conclusion, and before the report is built — so a blocker that turns green
+  later in the round still lets the gate layer run in that same round. A
+  blocker that is still `FAILED` or `BLOCKED`, or has no conclusion at all,
+  keeps the layer deferred exactly as before. **A verdict did change**: a
+  round whose gate layer stayed deferred over a stale Phase-1 conclusion
+  used to be reported as `SKIPPED`, and now carries the gate's own
+  conclusion.
+
 
 
 ## [0.1.2] - 2026-10-07

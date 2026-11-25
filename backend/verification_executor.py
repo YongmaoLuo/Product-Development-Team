@@ -4432,6 +4432,62 @@ class VerificationExecutor(BaseExecutor):
                 return
         self._deferred_gate_layers.append(list(layer))
 
+    def _deferred_gate_layers_in_ledger(self) -> List[List[Dict[str, Any]]]:
+        """本轮账本里**被门禁延后**的层 —— 账本是真相，内存表只是缓存。
+
+        2026-11-25（缺陷：门禁按过期结论延后）：``_deferred_gate_layers`` 是
+        **进程内**的表。执行器重建（续跑、换进程、重启）之后它是空的，而本轮
+        账本里那条 DEFERRED 还在 —— 「这一轮有一层被门禁延后、还没跑」这件
+        事必须由**账本**记着，不能只活在内存里。
+
+        门禁只按 Phase 1 的**最终结论**放行，所以那一层必须在**本轮**真正
+        派发出去。账本里那条由门禁写下的 DEFERRED（``evidence.gate``）就是
+        「还有一层没跑」的真相：重算路径按它把那一层找回来。
+
+        只认门禁自己写下的那条（``evidence.gate == verification_phase_2``）：
+        ``_ensure_current_round_entries`` 补的「本轮未产生结论（未被派发）」
+        是另一回事 —— 那一层不是被门禁挡下的，它只是没被叫起来跑；把它当成
+        「被门禁延后」会让轮次收口去派发一层本轮压根没打算跑的关卡。
+
+        每个全量关卡**各占一层**（见 :meth:`_build_execution_layers`），所以
+        一条 DEFERRED 条目对应一层。
+        """
+        current = self._current_round_bucket()
+        if not current:
+            return []
+        layers: List[List[Dict[str, Any]]] = []
+        for item in self._build_items_from_plan():
+            if not is_final_gate(item):
+                continue
+            item_id = self._derive_item_id(item)
+            verdict = current.get(item_id)
+            if not isinstance(verdict, dict):
+                continue
+            if str(verdict.get("status") or "") != "DEFERRED":
+                continue
+            evidence = verdict.get("evidence")
+            if not isinstance(evidence, dict):
+                continue
+            if str(evidence.get("gate") or "") != "verification_phase_2":
+                continue
+            layers.append([item])
+        return layers
+
+    def _discover_deferred_gate_layers(self) -> None:
+        """把账本里本轮被门禁延后的层并进内存表。
+
+        内存表 (``_deferred_gate_layers``) 只在**本进程**里活着；账本
+        (``_verdicts_by_round``) 才是这一轮的事实。执行器重建之后内存表是
+        空的 —— 于是「被延后的那一层还没跑」这件事就没人记得了，重算路径
+        也就不再派发它。那条 DEFERRED 会带着**当时那一瞬**的理由留在账本里
+        （「Phase 1 的 VP-001 结论为 BLOCKED」，而 VP-001 早已 PASSED），
+        整轮因此被算成 SKIPPED（2026-11-25 实测两例）。
+
+        所以：每次重算之前先按**账本**把被延后的层找回来。
+        """
+        for layer in self._deferred_gate_layers_in_ledger():
+            self._register_deferred_gate_layer(layer)
+
     def _recheck_deferred_gate_reasons(self) -> None:
         """前提变了就刷新延后理由。
 
@@ -4442,8 +4498,23 @@ class VerificationExecutor(BaseExecutor):
         刷新是必要的：延后理由落在报告与状态里，点名一个当前已经不成立的
         结论状态（阻塞者早已 PASSED，理由还写着「结论为 FAILED」）就是撒谎。
         理由要么是**本轮最终的**阻塞者状态，要么在前提消失后不再存在。
+
+        2026-11-25（缺陷：门禁按过期结论延后）：两处补齐。
+
+        1. **先按账本把被延后的层找回来**（:meth:`_discover_deferred_gate_layers`）：
+           内存表是进程内的，执行器重建之后它是空的 —— 而账本里那条 DEFERRED
+           还在。没找回来就没人记得「这一层还没跑」，它也就永远不会被派发。
+
+        2. **前提消失时理由不许留在旧阻塞者身上**：阻塞者翻绿之后，那条
+           DEFERRED 若还写着「Phase 1 的 VP-001 结论为 BLOCKED」，它就是在
+           撒谎（VP-001 已经 PASSED）。派发会顶掉它，但派发也可能来不及
+           （轮次已经收口）—— 所以理由当场改口成「前提已消失」。
         """
-        if self._in_deferred_recheck or not self._deferred_gate_layers:
+        if self._in_deferred_recheck:
+            return
+        # 账本是真相：内存表丢了（执行器重建 / 换进程）也要把它找回来。
+        self._discover_deferred_gate_layers()
+        if not self._deferred_gate_layers:
             return
         self._in_deferred_recheck = True
         try:
@@ -4452,6 +4523,15 @@ class VerificationExecutor(BaseExecutor):
                 if not reason:
                     # 前提没了 —— 派发由 :meth:`rerun_deferred_gate_layers`
                     # 负责（它要 await，不能在同步路径上做）。
+                    #
+                    # 但理由不能留在旧阻塞者身上：那条 DEFERRED 还在账本里，
+                    # 它会进报告。改口成「前提已消失」—— 派发成功后这条会被
+                    # 真结论顶掉，派发没赶上时它至少不撒谎。
+                    self._mark_layer_deferred(
+                        layer,
+                        "Phase 2 关卡延后：阻塞前提已消失（本轮待派发）",
+                        refresh=True,
+                    )
                     continue
                 # refresh=True —— 这条本轮 DEFERRED 是本方法自己写的，
                 # 重算它正是目的：理由必须改口成**当前**的阻塞者。
