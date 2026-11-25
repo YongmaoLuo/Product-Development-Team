@@ -9371,6 +9371,52 @@ class Orchestrator:
         )
         return [str(vp_id) for vp_id in applied]
 
+    def _close_round_gate_layers(self, executor: Any) -> List[str]:
+        """Round close: re-decide the deferred gate layers, and run them.
+
+        The gate is decided by Phase 1's **final** conclusion, so the
+        decision belongs to the round's close — not to the moment the
+        layer was short-circuited.  A blocker that turns green after
+        the executor's own close (a verdict corrected later in the
+        round, a re-checked evidence verdict) must still let the layer
+        run **this round**: ``DEFERRED`` says "this layer has not run
+        yet", and a layer that never runs is a gate that was never
+        asked (2026-11-25, two production rounds whose green
+        deliverable was reported as SKIPPED because the deferred gate
+        quoted a stale ``BLOCKED`` reason).
+
+        The dispatch itself is the executor's
+        :meth:`VerificationExecutor.rerun_deferred_gate_layers` — one
+        implementation of "deferred means not yet run", used by the
+        round's close and by this one.
+
+        Never raises: this runs next to ``executor.run`` in a
+        ``finally``; an exception here would replace the round's own
+        exception and hide the real failure.
+
+        Args:
+            executor: The executor that ran the round — the holder of
+                the verdict table and of the deferred-layer list.
+
+        Returns:
+            The ids of the gate layers that were really dispatched.
+        """
+        if executor is None:
+            return []
+        rerun = getattr(executor, "rerun_deferred_gate_layers", None)
+        if rerun is None:  # pragma: no cover - defensive
+            return []
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return list(asyncio.run(rerun()))
+        # A loop is already running (e.g. a pytest-asyncio test): the
+        # same accommodation ``executor.run`` gets a few lines above.
+        import nest_asyncio  # type: ignore
+
+        nest_asyncio.apply()
+        return list(asyncio.run(rerun()))
+
     def _recheck_deferred_evidence(
         self, vp_id: str, method: str, verdict: dict,
         vp: Optional[dict] = None,
@@ -14359,6 +14405,32 @@ class Orchestrator:
                 except Exception:
                     logger.exception(
                         "[verification_evidence] round-end flush failed",
+                    )
+                # 2026-11-25（缺陷：门禁按过期结论延后）：轮次**收口**在这里，
+                # 不在 ``executor.run`` 里面。
+                #
+                # 执行器自己的收口（``_run_round`` 末尾）跑在挂起核对重跑
+                # **之前**：那一刻之后，这一轮的结论还可能被改写（改判、
+                # 挂起核对的结果）。于是「阻塞者在本轮后续翻绿」这件事，
+                # 执行器收口时还看不见 —— 被延后的那一层就此带着**当时那一瞬**
+                # 的理由留在账本里（「Phase 1 的 VP-001 结论为 BLOCKED」，
+                # 而 VP-001 早已 PASSED），整轮被算成 SKIPPED。
+                #
+                # 门禁只按 Phase 1 的**最终结论**放行：所以轮次收口时要把
+                # 被延后的关卡层按最终结论再判一次 —— 阻塞者已经终态成功的，
+                # 那一层必须在本轮真正跑起来（派发语义见
+                # ``VerificationExecutor.rerun_deferred_gate_layers``）。
+                #
+                # 位置承重：必须在 ``_flush_deferred_evidence_checks`` **之后**
+                # （那是本轮最后一件能改写结论的事）、在
+                # ``_build_execution_results_from_executor`` **之前**（报告要
+                # 看到真结论）。
+                try:
+                    self._close_round_gate_layers(executor)
+                except Exception:
+                    logger.exception(
+                        "[verification_executor] round-close gate dispatch "
+                        "failed",
                     )
             # What the round actually reached, measured inside the
             # runner. This is the observable that replaces the width:
