@@ -32,6 +32,9 @@ What is pinned here
   neither a key too many nor a key too few, and the set is derived
   from the producer rather than copied here, so this file does not
   become the third copy of the contract it exists to prevent;
+* the three junit keys this branch writes are allowed **as literals** —
+  a key moved behind a constant is invisible to the derivation, so it
+  would silently stop being allowed;
 * a real artifact the runner writes obeys the contract.
 """
 
@@ -221,6 +224,82 @@ def test_the_allowed_set_is_exactly_what_the_producer_writes():
     """
     produced = _produced_evidence_keys()
     assert CI_ARTIFACT_FIELDS == produced
+
+
+def _literal_allowed_keys() -> set:
+    """The keys that are written out **literally** in the allowed set.
+
+    The allowed set is spelled out literally, because the producer's
+    keys are **derived** from the runner's source: a key assembled from
+    a constant (``"junit_" + "fresh"``) is invisible to that
+    derivation, so it can never enter the contract — and a contract
+    that does not allow a key the producer writes makes the runner
+    reject its own artifact.
+
+    This reads the allowed set out of ``ci_artifact.py``'s own source
+    and keeps only the keys that are spelled out in it, so a key that
+    was ever moved behind a constant stops counting as allowed here.
+    """
+    source = (BACKEND_DIR / "ci_artifact.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    literals = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        else:
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "CI_ARTIFACT_FIELDS"
+            for target in targets
+        ):
+            continue
+        if not (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "frozenset"
+            and value.args
+            and isinstance(value.args[0], ast.Set)
+        ):
+            continue
+        literals.append({
+            element.value
+            for element in value.args[0].elts
+            if isinstance(element, ast.Constant) and isinstance(element.value, str)
+        })
+
+    assert len(literals) == 1, (
+        "the allowed set is written down exactly once: "
+        f"{len(literals)} assignments to CI_ARTIFACT_FIELDS"
+    )
+    return literals[0]
+
+
+def test_the_junit_evidence_keys_are_allowed_as_literals():
+    """The three junit keys this branch writes are allowed — written out.
+
+    ``junit_fresh`` (whether this round produced a junit report),
+    ``junit_note`` ("this round produced none") and
+    ``junit_stale_cleanup_error`` (why an earlier round's report could
+    not be cleaned up) are the keys the runner writes on the junit
+    evidence.  The contract has to allow them, or the runner rejects
+    its own artifact.
+
+    They are pinned as **literals** on purpose: the allowed set is
+    derived from the producer's source, so a key spelled out through a
+    constant is invisible to that derivation and would quietly stop
+    being allowed — which is the exact failure this pins.
+    """
+    allowed = _literal_allowed_keys()
+    for key in ("junit_fresh", "junit_note", "junit_stale_cleanup_error"):
+        assert key in allowed, (
+            f"{key!r} is written by the runner and has to be allowed "
+            f"literally; the allowed literals are {sorted(allowed)}"
+        )
 
 
 def test_a_real_artifact_obeys_the_contract(tmp_path):
