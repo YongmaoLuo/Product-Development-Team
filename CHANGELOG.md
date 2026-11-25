@@ -74,6 +74,17 @@ languages on purpose: the CI gate reads one string out of both
 changelogs, and a section that exists in only one of them is a section
 half the readers never see.*
 
+- **A gate that could not answer no longer cites the previous round's
+  junit.** `backend/verification_ci_runner.py` decides freshness from the
+  report's own timestamp and fails the gate INCONCLUSIVE when this round
+  wrote none, instead of attaching a stale report from an earlier round as
+  its evidence; stale reports are cleared first, and a cleanup failure is
+  recorded rather than swallowed. `backend/verification_plan_delta.py`
+  recognises the script names inside a command (including Chinese
+  punctuation and absolute paths), so a command that only moved to another
+  script is no longer read as "no change". **No verdict changed**: a gate
+  that really passed still passes, and one that really failed still fails.
+
 - **A paused plan is only stopped when its processes really are.** The
   repair-round pause in `backend/verification_loop.py` reads the plan's
   process ledger after the stop and reports `pause_kill_incomplete` when
