@@ -71,6 +71,7 @@ from verification.failure_triage import (
 # cause moved. It is a pure function: the loop's bookkeeping must be
 # reproducible from the record alone.
 from verification.failure_fingerprint import (
+    advance_same_fingerprint_run,
     failure_fingerprint,
     fingerprint_rule,
 )
@@ -224,6 +225,34 @@ def _known_rule_id(value: Any) -> Optional[str]:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
+
+
+def _parse_same_fingerprint_runs(raw: Any) -> Dict[str, int]:
+    """The consecutive-run counts a payload carries, as ``{vp_id: n}``.
+
+    The payload's ``same_fingerprint_runs`` key is **optional** — a
+    payload written before the counter existed simply does not have it,
+    and that is not an error: the reader returns an empty map and the
+    loop keeps its old behaviour.
+
+    A count that cannot be read is dropped rather than repaired: a
+    half-written counter is not evidence about anything. Only a
+    non-negative ``int`` is a count — ``True`` is not a count (it is a
+    bool, and ``bool`` is a subclass of ``int``), and a negative count
+    never happened.
+    """
+    out: Dict[str, int] = {}
+    if not isinstance(raw, dict):
+        return out
+    for vp_id, value in raw.items():
+        if not isinstance(vp_id, str) or not vp_id:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int):
+            continue
+        if value < 0:
+            continue
+        out[vp_id] = value
+    return out
 
 
 #: The fence that carries a **declaration** in a report.
@@ -494,6 +523,23 @@ REASON_CRITERION_REPLACED = "criterion_replaced"
 #: against.
 STOP_REASON_MAX_ATTEMPTS = "same_failure_repeated_after_max_attempts"
 
+#: How many times the **same** failure fingerprint may buy a repair task
+#: before the point stops being handed to the repair model.
+#:
+#: 2026-11-09 (arch decision point 3): a point whose failure fingerprint
+#: did not move has been reworked to no effect — VP-004 was repaired eight
+#: times and VP-008/VP-009 seven times each, every round a new repair task
+#: for a defect nobody re-read. The counter is the number of repairs that
+#: already happened, so the budget is "two repair rounds with the same
+#: fingerprint, then stop asking the model".
+#:
+#: The count comes from the same-fingerprint streak
+#: (:attr:`VerificationOrchestrator._same_fingerprint_runs`), which the
+#: round persists — so the budget survives the fresh orchestrator every
+#: round is built with. A point whose fingerprint *changed* is a different
+#: failure and starts the budget again.
+_MAX_SAME_FINGERPRINT_REPAIRS = 2
+
 #: The source a question asked from the verification side carries.
 #:
 #: The verification loop waits for the questions it recognises by this
@@ -561,6 +607,32 @@ TERMINAL_OPTIONS = (
 #: round runs again, and if it fails the same way the plan is asked
 #: again (once per round attempt).
 TERMINAL_DEFAULT_OPTION = "rerun_this_round"
+
+#: The answers a same-fingerprint question offers.
+#:
+#: 2026-11-09 (arch decision point 3): a point whose **same** failure
+#: fingerprint survived two repair rounds stops being handed to the
+#: repair model.  The model is not making progress on it, so the only
+#: thing left is a human's word — and there are exactly two words:
+#:
+#: * ``repair_again`` — the point is worth fixing after all; a human
+#:   takes it on (or the operator reopens the budget);
+#: * ``void_the_point`` — the point is retired: the defect it names is
+#:   not the one worth fixing.
+#:
+#: There is no third answer on purpose: "keep repairing it with the
+#: model" is the thing this question exists to stop.
+SAME_FINGERPRINT_OPTIONS = ("repair_again", "void_the_point")
+
+#: The answer a same-fingerprint question falls back to when nobody
+#: replies.
+#:
+#: The conservative reading: a point the repair model could not move
+#: after two rounds on the same fingerprint is *not* proof that the
+#: deliverable is fine — but retiring it keeps the plan's own promise
+#: (its acceptance criteria) intact, while re-repairing it burns the
+#: rounds the points that can move are waiting for.
+SAME_FINGERPRINT_DEFAULT_OPTION = "void_the_point"
 
 #: The statuses that are **not** a failure.
 #:
@@ -1659,6 +1731,20 @@ class VerificationOrchestrator:
                 tracking_payload.get("failure_fingerprint_rules")
             )
         )
+        # 2026-11-09: ``{vp_id: n}`` — how many rounds in a row the SAME
+        # fingerprint has repeated. The pair above can only say "the
+        # root cause did not move between the last two rounds"; a
+        # repair-retry ceiling needs the whole streak ("the same root
+        # cause survived two rounds of repair"), and the streak has to
+        # survive the fresh orchestrator every round builds — so it is
+        # read from the same payload, in the same read, as everything
+        # else. A payload without the key is a legacy payload: it
+        # loads, and the streaks are simply unknown.
+        self._same_fingerprint_runs: Dict[str, int] = (
+            _parse_same_fingerprint_runs(
+                tracking_payload.get("same_fingerprint_runs")
+            )
+        )
         self._current_repair_tasks: List[Dict] = []
         self._waiting_for_user = False
         # 2026-10-22 (triage): the semantic judge that names the nature of
@@ -1821,6 +1907,31 @@ class VerificationOrchestrator:
     def _failure_fingerprint_rules(self, value: Any) -> None:
         self.__dict__["_failure_fingerprint_rules"] = dict(value or {})
 
+    @property
+    def _same_fingerprint_runs(self) -> Dict[str, int]:
+        """The consecutive same-fingerprint streak of each point.
+
+        Stored in the instance dictionary and read through this
+        property, for the same reason as :attr:`_failure_fingerprints`:
+        an orchestrator built **without** ``__init__`` reads an empty
+        map instead of raising ``AttributeError``. A round must not die
+        on a missing bookkeeping attribute — a missing streak means "we
+        do not know how long this has repeated", which is exactly what
+        a legacy payload says too.
+
+        The map is **replaced**, never mutated in place: the round
+        writes a fresh map every time it records a round.
+        """
+        runs = self.__dict__.get("_same_fingerprint_runs")
+        if runs is None:
+            runs = {}
+            self.__dict__["_same_fingerprint_runs"] = runs
+        return runs
+
+    @_same_fingerprint_runs.setter
+    def _same_fingerprint_runs(self, value: Any) -> None:
+        self.__dict__["_same_fingerprint_runs"] = dict(value or {})
+
     def _read_loop_tracking_payload(self) -> Dict[str, Any]:
         """The tracking file's raw payload — ``{}`` when it is not there.
 
@@ -1972,6 +2083,21 @@ class VerificationOrchestrator:
             payload["failure_fingerprint_rules"] = {
                 vp_id: list(pair)
                 for vp_id, pair in sorted(self._failure_fingerprint_rules.items())
+            }
+        # 2026-11-09: the consecutive same-fingerprint streak rides along
+        # with them — how many rounds in a row one exact root cause has
+        # survived. The pair can only compare two adjacent rounds; a
+        # repair-retry ceiling needs the whole streak, and the next
+        # round's fresh orchestrator can only continue it if it is on
+        # disk. The key is written only when there is a streak to
+        # record, for the same reason the fingerprint key is: an empty
+        # map carries no information, and a payload without the key is
+        # exactly the legacy shape — which the reader already
+        # tolerates.
+        if self._same_fingerprint_runs:
+            payload["same_fingerprint_runs"] = {
+                vp_id: int(count)
+                for vp_id, count in sorted(self._same_fingerprint_runs.items())
             }
         path = self._loop_tracking_path()
         tmp = path.with_name(path.name + ".tmp")
@@ -2366,12 +2492,21 @@ class VerificationOrchestrator:
         more has no fingerprint to carry, and a stale one would make the
         next round compare against a failure that has already been
         fixed.
+
+        The same replacement rule applies to the consecutive-run count
+        (``{vp_id: n}``): a point that stopped failing has no streak to
+        carry, so the streak map is rebuilt from this round's points
+        only. The count itself comes from the previous round's *current*
+        fingerprint slot — the same slot the pair carries — so the two
+        views can never disagree about which round is which.
         """
         previous = self._failure_fingerprints
         previous_rules = self._failure_fingerprint_rules
+        previous_runs = dict(self._same_fingerprint_runs)
         current = self._round_fingerprint_records(report)
         pairs: Dict[str, List[Optional[str]]] = {}
         rule_pairs: Dict[str, List[Optional[str]]] = {}
+        runs: Dict[str, int] = {}
         for vp_id, record in current.items():
             if vp_id in void_vp_ids:
                 # A voided point is not a failure of the deliverable —
@@ -2380,12 +2515,22 @@ class VerificationOrchestrator:
                 continue
             prior = previous.get(vp_id) or []
             fp_prev = prior[1] if len(prior) == 2 else None
-            pairs[vp_id] = [fp_prev, record["fingerprint"]]
+            fp_curr = record["fingerprint"]
+            pairs[vp_id] = [fp_prev, fp_curr]
             prior_rules = previous_rules.get(vp_id) or []
             rule_prev = prior_rules[1] if len(prior_rules) == 2 else None
             rule_pairs[vp_id] = [rule_prev, record["rule"]]
+            # How many rounds in a row this exact fingerprint has
+            # repeated. A point that failed for the first time starts
+            # at 1; a changed fingerprint starts a new streak at 1; a
+            # point with no fingerprint this round counts 0 (we cannot
+            # judge, so we do not judge).
+            runs[vp_id] = advance_same_fingerprint_run(
+                previous_runs.get(vp_id, 0), fp_prev, fp_curr,
+            )
         self._failure_fingerprints = pairs
         self._failure_fingerprint_rules = rule_pairs
+        self._same_fingerprint_runs = runs
         return pairs
 
     # ------------------------------------------------------------------
@@ -2665,6 +2810,14 @@ class VerificationOrchestrator:
         the classification is newer than most verdicts, and "nobody said
         otherwise" has always meant "repair it".
 
+        2026-11-09 (arch decision point 3): even the class that buys a
+        repair task stops buying one once the **same** failure
+        fingerprint has been repaired
+        :data:`_MAX_SAME_FINGERPRINT_REPAIRS` times.  Such a point is
+        recorded in ``deferred`` as ``blocked`` — it reaches no repair
+        model, and a human is asked to decide whether the point is
+        repaired by hand or voided.
+
         Returns:
             ``(repairable, deferred)``. ``repairable`` holds the
             records that may become repair tasks; ``deferred`` holds
@@ -2712,6 +2865,64 @@ class VerificationOrchestrator:
                 deferred.append(record)
                 continue
             if disposition == Disposition.RETRY_COUNTED:
+                # 2026-11-09 (arch decision point 3): the same failure
+                # fingerprint may only buy so many repair tasks.  A
+                # fingerprint that has not moved across two repair
+                # rounds is a defect the repair model is not making
+                # progress on — handing it to the model again is how
+                # VP-004 was repaired eight times.  The point is
+                # recorded as **blocked** and left to a human; it is
+                # not repaired and it is not silently dropped.
+                vp_id = str(vp.get("id") or "")
+                try:
+                    run = int(self._same_fingerprint_runs.get(vp_id, 0) or 0)
+                except (TypeError, ValueError):
+                    # A counter nobody can read is a counter nobody
+                    # can judge on: fall back to the old behaviour
+                    # rather than blocking a point on a bad number.
+                    run = 0
+                if run - 1 >= _MAX_SAME_FINGERPRINT_REPAIRS:
+                    blocked_record: Dict[str, Any] = {
+                        "id": vp_id,
+                        "failure_class": failure_class,
+                        "disposition": Disposition.ESCALATE_COUNTED,
+                        "reason": (
+                            f"同一指纹已修 {run - 1} 次，仍以同一指纹失败："
+                            f"不再派修复实现任务（BLOCKED，需人决策）"
+                        ),
+                        "operator_action": "decide_repair_or_void",
+                        "same_fingerprint_runs": run,
+                        "blocked": True,
+                    }
+                    # 2026-11-09 (arch decision point 3): a blocked
+                    # point that nobody is asked about is a point that
+                    # nobody decides about — the record says "needs a
+                    # human" and the round carries on regardless.  The
+                    # question goes through the one path that writes
+                    # decisions (``hitl.service.create_decision``), so
+                    # the auto-loop's wait
+                    # (``verification_loop._wait_for_open_verification_decisions``)
+                    # actually stops at the next round's entrance.
+                    blocked_record["decision_id"] = self._ask_a_human_about(
+                        vp, failure_class, round_number,
+                        question=(
+                            f"验证点 {vp_id} 的失败指纹连续 {run} 轮未变，"
+                            f"同一指纹已修 {run - 1} 次；"
+                            f"不再自动派修复实现任务，请决定下一步"
+                        ),
+                        options=list(SAME_FINGERPRINT_OPTIONS),
+                        default_option=SAME_FINGERPRINT_DEFAULT_OPTION,
+                        audit_event=(
+                            "verification_same_fingerprint_decision_failed"
+                        ),
+                    )
+                    deferred.append(blocked_record)
+                    logger.warning(
+                        "[Repair] round %s: %s blocked on the same "
+                        "fingerprint after %s repairs",
+                        round_number, vp_id, run - 1,
+                    )
+                    continue
                 repairable.append(vp)
                 continue
             record: Dict[str, Any] = {

@@ -75,6 +75,9 @@ FAILURE_CLASS = "criterion_defect"
 #: The recorded failure text — quotable verbatim by the judge.
 ACTUAL_RESULT = "AssertionError: the response schema was rejected"
 
+#: The recorded failure text of the second point — a genuine defect.
+OTHER_ACTUAL_RESULT = "AssertionError: expected 200, got 500"
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -321,8 +324,23 @@ def _criterion_conclusion(method="api_test", title="the fixed criterion"):
     )
 
 
-def _report():
-    """A round report: the broken criterion and a genuine defect."""
+def _report(
+    actual_result=ACTUAL_RESULT,
+    evidence=ACTUAL_RESULT,
+    other_actual_result=OTHER_ACTUAL_RESULT,
+    other_evidence=OTHER_ACTUAL_RESULT,
+):
+    """A round report: the broken criterion and a genuine defect.
+
+    The prose of either failure can be replaced per round, and the
+    defaults are the texts every other round uses. The prose is not
+    decoration: the **failure fingerprint** is computed from it (there
+    is no machine-written failing set in this scenario), so a round that
+    records different evidence is a round with a different root cause —
+    and the same-fingerprint repair budget starts counting again from
+    one. The failure **class** is what the decision key counts on, so
+    it is never changed here.
+    """
     return {
         "overall_status": "FAILED",
         "verification_results": [
@@ -330,15 +348,15 @@ def _report():
                 "id": VP_ID,
                 "status": "FAILED",
                 "failure_class": FAILURE_CLASS,
-                "actual_result": ACTUAL_RESULT,
-                "evidence": ACTUAL_RESULT,
+                "actual_result": actual_result,
+                "evidence": evidence,
             },
             {
                 "id": OTHER_VP_ID,
                 "status": "FAILED",
                 "failure_class": "deliverable_defect",
-                "actual_result": "AssertionError: expected 200, got 500",
-                "evidence": "AssertionError: expected 200, got 500",
+                "actual_result": other_actual_result,
+                "evidence": other_evidence,
             },
         ],
     }
@@ -388,7 +406,22 @@ def test_confirm_obsoletes_and_replaces(
 
     _run_round(orchestrator, _report(), round_number=1)
     _run_round(orchestrator, _report(), round_number=2)
-    result = _run_round(orchestrator, _report(), round_number=3)
+    # Round 3 records failure evidence that differs from the earlier
+    # rounds, so the same-fingerprint repair budget does not pre-occupy
+    # this round: the other point's root cause moved, so it starts its
+    # own budget at one instead of being blocked as the third repeat.
+    result = _run_round(
+        orchestrator,
+        _report(
+            other_actual_result=(
+                "AssertionError: the endpoint answered 503 instead of 200"
+            ),
+            other_evidence=(
+                "AssertionError: the endpoint answered 503 instead of 200"
+            ),
+        ),
+        round_number=3,
+    )
 
     assert len(judge.calls) == 1, "the threshold buys exactly one triage call"
 
@@ -593,7 +626,22 @@ def test_triage_exception_never_obsoletes(
 
     _run_round(orchestrator, _report(), round_number=1)
     _run_round(orchestrator, _report(), round_number=2)
-    result = _run_round(orchestrator, _report(), round_number=3)
+    # Round 3 records failure evidence that differs from the earlier
+    # rounds, so the same-fingerprint repair budget does not pre-occupy
+    # this round: the failure's root cause moved, so it starts its own
+    # budget at one instead of being blocked as the third repeat.
+    result = _run_round(
+        orchestrator,
+        _report(
+            actual_result=(
+                "AssertionError: the response schema was rejected a second time"
+            ),
+            evidence=(
+                "AssertionError: the response schema was rejected a second time"
+            ),
+        ),
+        round_number=3,
+    )
 
     assert len(judge.calls) == 1, "the threshold was reached — the judge was asked"
 

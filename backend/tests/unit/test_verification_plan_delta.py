@@ -1288,3 +1288,88 @@ def test_the_dispatch_guard_also_refuses_a_hollow_full_ci_point() -> None:
     assert any("ci_entry" in gap for gap in gaps), (
         f"the gap must name the missing field; got {gaps!r}"
     )
+
+
+def test_apply_delta_rejects_full_ci_addition_with_an_inconsistent_entry() -> None:
+    """入口与验收文本对不上 —— 连号都拿不到（2026-11-09，VP-025）。
+
+    以前这种形式冲突静默通过：``vp_definition_gaps`` 只看"是不是非空字符串"，
+    于是 VP-025 那条入口写着绝对路径的 ``scripts/ci_gha.sh``、验收文本点名的
+    却是 ``run_tests.sh`` 的判据照样拿号落进计划 —— 跑起来才发现入口跑的
+    不是验收文本说的那件事。
+
+    与"缺 ci_entry"同级：定义不完整就不该占号（占了号却不落进计划的占位，
+    就是分配账本上的一个洞）。
+    """
+    from verification_plan_delta import apply_delta, parse_delta_payload
+
+    plan = _plan(_vp("VP-001"))
+    delta = parse_delta_payload({
+        "add": [{
+            "title": "整仓门禁全量跑绿", "reason": "PRD 第4节的整仓验收",
+            "verification_method": "full_ci",
+            "verification_phase": 2,
+            "ci_entry": "bash /abs/scripts/ci_gha.sh",
+            "expected_result": "run_tests.sh 全绿",
+        }],
+        "obsolete": [],
+    }, plan)
+
+    summary = apply_delta(plan, delta, round_number=2)
+
+    assert summary["added"] == [], (
+        "an entry that contradicts the criterion cannot be executed, so it "
+        f"must not land in the plan; got {summary!r}"
+    )
+    assert [vp["id"] for vp in plan["verification_points"]] == ["VP-001"], (
+        "an inconsistent addition must not consume a VP id"
+    )
+    assert summary["allocated_vp_ids"] == [], (
+        "the id ledger must not record an id that was never handed out"
+    )
+    assert len(summary["rejected_definitionless"]) == 1, (
+        f"the rejection must leave a trace; got "
+        f"{summary['rejected_definitionless']!r}"
+    )
+    gaps = summary["rejected_definitionless"][0]["gaps"]
+    assert any("repo-relative" in gap for gap in gaps), (
+        f"the rejection must say the entry is not repo-relative; got {gaps!r}"
+    )
+    assert any("run_tests.sh" in gap for gap in gaps), (
+        f"the rejection must name the script the entry does not run; got "
+        f"{gaps!r}"
+    )
+
+
+def test_a_repo_relative_entry_covering_the_named_script_still_lands() -> None:
+    """正向锚点：入口说得清时，这条新增照旧拿号落进计划。
+
+    新规则不许把合法的判据也拒掉 —— 拒掉合法的增量，计划就永远长不出
+    该长的验证点。
+    """
+    from verification_plan_delta import apply_delta, parse_delta_payload
+
+    plan = _plan(_vp("VP-001"))
+    delta = parse_delta_payload({
+        "add": [{
+            "title": "整仓门禁全量跑绿", "reason": "PRD 第4节的整仓验收",
+            "verification_method": "full_ci",
+            "verification_phase": 2,
+            "ci_entry": "bash scripts/run_tests.sh",
+            "expected_result": "run_tests.sh 全绿",
+        }],
+        "obsolete": [],
+    }, plan)
+
+    summary = apply_delta(plan, delta, round_number=2)
+
+    assert len(summary["added"]) == 1, (
+        f"a consistent full_ci addition is runnable; got {summary!r}"
+    )
+    new_vp = plan["verification_points"][-1]
+    assert new_vp["ci_entry"] == "bash scripts/run_tests.sh", (
+        "the declared entry must survive the delta"
+    )
+    assert new_vp["expected_result"] == "run_tests.sh 全绿", (
+        "the declared criterion must survive the delta"
+    )
