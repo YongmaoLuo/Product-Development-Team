@@ -91,6 +91,7 @@ __all__ = [
     "FINGERPRINT_LENGTH",
     "FINGERPRINT_RULE_IDENTITY",
     "FINGERPRINT_RULE_LEGACY",
+    "advance_same_fingerprint_run",
     "canonical_fingerprint_input",
     "normalized_failed_assertions",
     "failure_fingerprint",
@@ -499,6 +500,65 @@ def _known_rule(value: Any) -> Optional[str]:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
+
+
+def advance_same_fingerprint_run(
+    previous_run: int,
+    fingerprint_prev: Optional[str],
+    fingerprint_curr: Optional[str],
+) -> int:
+    """How many rounds in a row has this exact fingerprint repeated?
+
+    The fingerprint pair (``[prev, curr]``) answers "did the root cause
+    move between the last two rounds". This answers the question one
+    step further out: "how many rounds in a row has the SAME root cause
+    survived?" — which is what a repair-retry ceiling needs, and which
+    the pair alone cannot express.
+
+    It is a pure function for the same reason the fingerprint is: the
+    loop's bookkeeping must be recomputable from the record alone, and
+    the counter has to survive the fresh orchestrator every round builds
+    (the count lives in the tracking file, not in the instance).
+
+    Args:
+        previous_run: How many consecutive rounds the previous
+            fingerprint has already repeated. ``0`` when nothing is
+            known yet.
+        fingerprint_prev: The fingerprint of the previous round.
+            ``None`` / empty means "we do not know".
+        fingerprint_curr: The fingerprint of this round. ``None`` /
+            empty means "we cannot judge".
+
+    Returns:
+        The new consecutive count:
+
+        * ``0`` — this round has no fingerprint, so nothing can be
+          judged. This is deliberately *not* ``1``: a missing
+          fingerprint must never read as "the same failure again", and
+          a count of 0 can never reach a ceiling.
+        * ``1`` — the first round this fingerprint is seen, or the
+          fingerprint changed since the previous round (a new root
+          cause starts its own count).
+        * ``previous + 1`` — the same fingerprint as the previous round.
+    """
+    if not fingerprint_curr:
+        # No fingerprint this round: we cannot judge, so we do not
+        # judge. 0 never reaches a ceiling.
+        return 0
+    if not fingerprint_prev:
+        # First round we see this fingerprint — it starts at 1.
+        return 1
+    if fingerprint_prev != fingerprint_curr:
+        # The root cause moved: a new fingerprint starts its own count.
+        return 1
+    try:
+        carried = int(previous_run or 0)
+    except (TypeError, ValueError):
+        carried = 0
+    # ``max(1, ...)`` is the floor: a counter that was 0, negative or
+    # unreadable must still produce a positive step, never a
+    # non-positive one.
+    return max(1, carried) + 1
 
 
 

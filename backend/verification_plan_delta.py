@@ -70,10 +70,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
+import shlex
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
 from utils import atomic_io
 from verification_phases import PHASE_CORE, PHASE_FINAL_GATE
@@ -107,6 +109,51 @@ REPLACEMENT_FOR_FIELD = "replacement_for"
 ALLOCATED_IDS_KEY = "allocated_vp_ids"
 
 _ID_RE = re.compile(r"^VP-(\d+)$")
+
+#: 命令行里"看起来是脚本"的 token（``*.sh`` / ``*.py``）。
+#:
+#: 2026-11-09（VP-025）：判据的**入口**与**验收文本**要能对上，判据就得
+#: 认得出"这条命令里提到了哪个脚本"。认脚本只认**后缀**（``.sh`` / ``.py``），
+#: 路径里的目录分隔符与连字符都算路径的一部分（``scripts/run_tests.sh`` 是
+#: 一个 token，不是三个）。
+#:
+#: 2026-11-24（VP-005）：这个正则**在 token 内部找**脚本路径（``finditer``），
+#: 不是拿它去**匹配整个 token**（``match``）。中文标点会粘在 token 上 ——
+#: 前缀匹配只看得见「run_ci.sh」这一段，看不见后面的「，全绿」，于是认出来的
+#: 脚本名被撑大；反过来 token 前面带中文标点时前缀匹配整个落空，点名的脚本
+#: 被静默漏认。
+_SCRIPT_TOKEN_RE = re.compile(r"[A-Za-z0-9_./-]+\.(?:sh|py)\b")
+
+#: ``vp_definition_gaps`` 每一条 gap 的**机器可读标识**。
+#:
+#: 2026-11-24（VP-005）：以前每条 gap 只有一句中文散文，消费方要靠匹配关键字
+#: 区分"缺入口"与"入口写死了路径" —— 文案一改，判据就跟着失效，而失效的
+#: 方向通常是"悄悄不再报"。现在每条 gap 以自己的 code 开头：散文是给人读的
+#: 那一半（它可以改），code 是给机器读的那一半（它不动）。
+VP_DEFINITION_GAP_CODE_MISSING_TITLE = "vp_definition_gap_code_missing_title"
+VP_DEFINITION_GAP_CODE_UNSUPPORTED_METHOD = (
+    "vp_definition_gap_code_unsupported_method"
+)
+VP_DEFINITION_GAP_CODE_API_TEST_ASSERTION = (
+    "vp_definition_gap_code_api_test_assertion"
+)
+VP_DEFINITION_GAP_CODE_CI_ENTRY_MISSING = "vp_definition_gap_code_ci_entry_missing"
+VP_DEFINITION_GAP_CODE_CI_ENTRY_ABSOLUTE_PATH = (
+    "vp_definition_gap_code_ci_entry_absolute_path"
+)
+VP_DEFINITION_GAP_CODE_CI_ENTRY_SCRIPT_MISMATCH = (
+    "vp_definition_gap_code_ci_entry_script_mismatch"
+)
+
+#: 全部 gap code —— 供"每条 gap 都带一个已知 code"这类自检用。
+VP_DEFINITION_GAP_CODES: FrozenSet[str] = frozenset({
+    VP_DEFINITION_GAP_CODE_MISSING_TITLE,
+    VP_DEFINITION_GAP_CODE_UNSUPPORTED_METHOD,
+    VP_DEFINITION_GAP_CODE_API_TEST_ASSERTION,
+    VP_DEFINITION_GAP_CODE_CI_ENTRY_MISSING,
+    VP_DEFINITION_GAP_CODE_CI_ENTRY_ABSOLUTE_PATH,
+    VP_DEFINITION_GAP_CODE_CI_ENTRY_SCRIPT_MISMATCH,
+})
 
 #: 增量新增的条目里，**原样**搬进新 VP 的可选字段（骨架之外的判据载荷）。
 #:
@@ -268,6 +315,88 @@ def next_vp_id(
     return f"VP-{candidate:03d}"
 
 
+def _command_tokens(command: str) -> List[str]:
+    """把一条命令拆成 token（分词失败时退回空白切分）。
+
+    ``shlex.split`` 在引号不配对时抛 :class:`ValueError` —— 一条写歪的
+    ``ci_entry`` 不该把整条判据的检查带崩，所以退回空白切分：切得糙一点，
+    但**不抛**。
+    """
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return command.split()
+
+
+def _gap(code: str, prose: str) -> str:
+    """一条 gap：``<code>: <中文散文>``。
+
+    code 是**机器可读**的那一半（消费方靠它区分 gap 种类），散文是给人读的
+    那一半。散文可以改，code 不动 —— 判据"变了就悄悄失效"这条毛病出在散文
+    上，不在 code 上。
+    """
+    return f"{code}: {prose}"
+
+
+def _script_fragments(command: str) -> List[str]:
+    """命令里提到的脚本**片段**（去重保序）。
+
+    认的是 token **内部**的脚本路径，不是整个 token：
+
+    * 脚本名后面粘着中文标点时（``run_ci.sh，全绿``），拿整个 token 取
+      basename 得到的是「run_ci.sh，全绿」—— 与验收文本里的「run_ci.sh」
+      不相等，一条完全合法的判据被误报成"入口没跑那个脚本"；
+    * token 前面带中文标点时（``0：scripts/run_tests.sh``），前缀匹配整个
+      落空 —— 点名的脚本被静默漏认，真缺口永远不报。
+
+    漏报比误报更难发现：误报会被人看见（操作者会照着它改），漏报只会让
+    一条对不上的判据安静地通过。
+
+    ``VAR=脚本`` 这种写法也归在这里：脚本名在 ``=`` 后面，而 ``=`` 不在正则
+    的字符类里，片段自然就是等号之后那截路径。
+    """
+    fragments: List[str] = []
+    for token in _command_tokens(command):
+        for match in _SCRIPT_TOKEN_RE.finditer(token):
+            fragment = match.group(0)
+            if fragment not in fragments:
+                fragments.append(fragment)
+    return fragments
+
+
+def _script_names(command: str) -> List[str]:
+    """命令里提到的脚本名（basename，去重保序）。
+
+    取 basename 是因为判据比的是**脚本身份**而不是它的写法：入口写
+    ``scripts/run_tests.sh``、验收文本写 ``run_tests.sh``，说的是同一件事。
+    """
+    names: List[str] = []
+    for fragment in _script_fragments(command):
+        name = PurePosixPath(fragment).name
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _absolute_script_tokens(command: str) -> List[str]:
+    """命令里以绝对路径出现的脚本片段。
+
+    只看**脚本**：入口里那条绝对路径可能是环境而不是判据本身
+    （``ln -sfn /opt/shared/venv backend/.venv``，VP-022 冻结入口里就有这条）——
+    把它算成"入口写死了路径"是假话，而假话比没有话更贵。
+
+    报出去的是**片段本身**（``/abs/run_ci.sh``），不是它所在的整个 token：
+    ``SCRIPT=/abs/run_ci.sh`` 的片段是那条路径，token 是赋值。
+    """
+    tokens: List[str] = []
+    for fragment in _script_fragments(command):
+        if not os.path.isabs(os.path.expanduser(fragment)):
+            continue
+        if fragment not in tokens:
+            tokens.append(fragment)
+    return tokens
+
+
 def vp_definition_gaps(vp: Dict[str, Any]) -> List[str]:
     """这条 VP 还差什么才能算一条**完整**的定义（空列表 = 完整）。
 
@@ -296,6 +425,23 @@ def vp_definition_gaps(vp: Dict[str, Any]) -> List[str]:
     口径与 ``verification_ci_runner.validate_vp`` 一致：入口必须是一个
     **非空字符串**（空串、纯空白、非字符串都算没给）。
 
+    2026-11-09（VP-025）：入口**给了**还不够，它还得**说得清**。两条
+    **形式**规则（都不猜语义）：
+
+    * ``ci_entry`` 里的脚本必须是 **repo-relative** —— 绝对路径是某台机器上
+      的路径，换个 checkout 就指向别的东西；
+    * ``expected_result`` 点名的脚本（``*.sh`` / ``*.py``）必须出现在
+      ``ci_entry`` 的脚本集合里 —— 入口跑的不是验收文本说的那件事时，
+      "跑绿了"证明不了任何东西。
+
+    ``expected_result`` 没点名任何脚本时只查第一条：没有点名就没有"漏掉"
+    可言，硬凑一个缺口就是假话。
+
+    2026-11-24（VP-005）：gap 本身也得**机器可读**。每条 gap 以自己的 code
+    开头（``VP_DEFINITION_GAP_CODE_*``），散文跟在后面：消费方靠 code 区分
+    gap 种类，不靠猜中文关键字 —— 文案一改，判据就跟着失效，而失效的方向
+    通常是"悄悄不再报"。
+
     只读词汇表，不改任何东西 —— VP 的声明字段不可变：判据写错或缺失时由
     操作者重新表达，执行器不替它发明。
     """
@@ -304,13 +450,17 @@ def vp_definition_gaps(vp: Dict[str, Any]) -> List[str]:
     gaps: List[str] = []
     title = str(vp.get("title") or "").strip()
     if not title:
-        gaps.append("缺少 title（没有标题就没有判据）")
+        gaps.append(_gap(
+            VP_DEFINITION_GAP_CODE_MISSING_TITLE,
+            "缺少 title（没有标题就没有判据）",
+        ))
     method = str(vp.get("verification_method") or "").strip()
     if method not in SUPPORTED_METHODS:
-        gaps.append(
+        gaps.append(_gap(
+            VP_DEFINITION_GAP_CODE_UNSUPPORTED_METHOD,
             f"verification_method {method or '(missing)'} 不在 "
-            f"{list(SUPPORTED_METHODS)} 里"
-        )
+            f"{list(SUPPORTED_METHODS)} 里",
+        ))
     # 2026-11-09（repair-18）：本文件与 base 合并时，两侧改的是这一段 ——
     # ``api_test`` 的断言载荷检查来自本分支，``full_ci`` 的 ``ci_entry``
     # 检查来自 base。冲突按「两侧意图都保留」解决，于是两条检查挂在同一
@@ -325,10 +475,36 @@ def vp_definition_gaps(vp: Dict[str, Any]) -> List[str]:
         # ``ci_entry_missing`` 口径保持一致。
         entry = vp.get("ci_entry")
         if not isinstance(entry, str) or not entry.strip():
-            gaps.append(
+            gaps.append(_gap(
+                VP_DEFINITION_GAP_CODE_CI_ENTRY_MISSING,
                 "full_ci 必须给出 ci_entry"
-                "（整仓门禁的判定依据就是这条入口的退出码）"
-            )
+                "（整仓门禁的判定依据就是这条入口的退出码）",
+            ))
+        else:
+            # 2026-11-09（VP-025）：入口**跑的是什么**与验收文本**说的是什么**
+            # 必须对得上，否则这条判据"跑绿了"证明的根本不是它声称的那件事。
+            #
+            # VP-025 的入口写的是绝对路径的 ``scripts/ci_gha.sh``（GHA 派发器，
+            # 路径写死在那台机器上），验收文本点名的却是 ``grep_guard.sh`` 与
+            # ``run_tests.sh``。以前这里只校验"是不是非空字符串"，于是这种形式
+            # 冲突静默通过 —— 定义被判完整，跑起来才发现入口对不上。
+            for token in _absolute_script_tokens(entry):
+                gaps.append(_gap(
+                    VP_DEFINITION_GAP_CODE_CI_ENTRY_ABSOLUTE_PATH,
+                    "full_ci 的 ci_entry 必须是 repo-relative"
+                    f"（不能是绝对路径）：{token}",
+                ))
+            entry_names = set(_script_names(entry))
+            expected = vp.get("expected_result")
+            expected_text = expected if isinstance(expected, str) else ""
+            for name in _script_names(expected_text):
+                if name in entry_names:
+                    continue
+                gaps.append(_gap(
+                    VP_DEFINITION_GAP_CODE_CI_ENTRY_SCRIPT_MISMATCH,
+                    "full_ci 的 ci_entry 未包含 expected_result 点名的脚本 "
+                    f"{name}（ci_entry={entry}）",
+                ))
     return gaps
 
 
@@ -390,7 +566,10 @@ def _api_test_assertion_gaps(vp: Dict[str, Any]) -> List[str]:
             continue
         reason = json_path_root_error(assertion.get("json_path"))
         if reason is not None:
-            gaps.append(f"assertions[{index}].{reason}")
+            gaps.append(_gap(
+                VP_DEFINITION_GAP_CODE_API_TEST_ASSERTION,
+                f"assertions[{index}].{reason}",
+            ))
     return gaps
 
 

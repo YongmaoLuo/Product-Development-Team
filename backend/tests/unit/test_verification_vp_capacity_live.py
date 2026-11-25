@@ -74,6 +74,20 @@ from verification_agent import (  # noqa: E402
 #: artefact. Short enough that the whole file stays in the seconds.
 VP_SEC = 0.05
 
+#: How many verification points one round of the re-entry scenario runs.
+#: The round's rendezvous is armed by the last one of them.
+ROUND_VP_COUNT = 12
+
+#: How long an admitted VP waits for the round's last VP to arrive.
+#:
+#: Bounded on purpose: a round that never reaches its full width has to
+#: come back as **this file's own assertion failing**, not as a worker
+#: that was killed for running out of time. It therefore has to stay well
+#: under the single-test budget in ``backend/pytest.ini`` (300s) — and a
+#: budget that is exceeded takes the whole worker with it, which is a
+#: broken measurement rather than a failed one.
+RENDEZVOUS_SEC = 10.0
+
 
 class _ConcurrencyProbe:
     """How many verification points were inside the runner at once.
@@ -329,12 +343,37 @@ class TestTheRepairRoundRunsAsWideAsTheFirst:
         peaks = {}
         current = {"round": None}
         live = {"n": 0, "peak": 0}
+        rendezvous = {"event": None}
 
         async def _probed_run_single_vp(self, vp):
             live["n"] += 1
             live["peak"] = max(live["peak"], live["n"])
             try:
-                await asyncio.sleep(VP_SEC)
+                # An explicit rendezvous, not a sleep. What this test
+                # measures is how many VPs were inside the runner at the
+                # same moment; a sleep measures the scheduler instead —
+                # and on a busy machine the scheduler is what decides
+                # the answer. So every admitted VP waits until the last
+                # one of the plan has arrived: the peak is then the
+                # width by construction, and a width that collapsed
+                # shows up as this file's own assertion failing rather
+                # than as a worker that was killed for running out of
+                # time.
+                event = rendezvous.get("event")
+                if event is None:
+                    await asyncio.sleep(VP_SEC)
+                else:
+                    if live["n"] >= ROUND_VP_COUNT:
+                        event.set()
+                    try:
+                        await asyncio.wait_for(
+                            event.wait(), timeout=RENDEZVOUS_SEC,
+                        )
+                    except asyncio.TimeoutError:
+                        # The round never reached its full width. The
+                        # existing assertions are what report that, so
+                        # the wait ends here instead of hanging.
+                        pass
                 # FAILED, not PASSED, on purpose: the re-entry runs with
                 # ``resume=True``, and ``BaseExecutor.run`` skips VPs that
                 # already carry a terminal *success*. A green round 1
@@ -363,7 +402,7 @@ class TestTheRepairRoundRunsAsWideAsTheFirst:
         project_dir = tmp_path / "proj"
         project_dir.mkdir()
         _wire_loop_fakes(
-            monkeypatch, tmp_path, plan_id, plan_dir, current,
+            monkeypatch, tmp_path, plan_id, plan_dir, current, rendezvous,
         )
 
         current["round"] = 1
@@ -388,7 +427,8 @@ class TestTheRepairRoundRunsAsWideAsTheFirst:
         )
 
 
-def _wire_loop_fakes(monkeypatch, tmp_path, plan_id, plan_dir, current):
+def _wire_loop_fakes(monkeypatch, tmp_path, plan_id, plan_dir, current,
+                     rendezvous):
     """Enough of ``_run_auto_verification_loop_inner``'s world to re-enter.
 
     The loop itself is production code and is not touched. What is
@@ -396,6 +436,10 @@ def _wire_loop_fakes(monkeypatch, tmp_path, plan_id, plan_dir, current):
     tool, the state database (a temp one -- never ``.pdt/state.db``), the
     repair *execution* (which would spawn a subprocess), and the two
     bookkeeping helpers that ask what the repair path left behind.
+
+    ``rendezvous`` carries the round's rendezvous event: a fresh one is
+    armed when each round starts, so the probe of one round waits for
+    that round's last verification point and not for the other one's.
     """
     from state_machine.db.connection import open as open_db
     from state_machine.db.schema import migrate
@@ -430,7 +474,7 @@ def _wire_loop_fakes(monkeypatch, tmp_path, plan_id, plan_dir, current):
 
     monkeypatch.setattr(
         VerificationAgent, "generate_verification_plan",
-        lambda self: _plan(12),
+        lambda self: _plan(ROUND_VP_COUNT),
     )
     monkeypatch.setattr(
         VerificationAgent, "_preflight_service_freshness",
@@ -516,6 +560,11 @@ def _wire_loop_fakes(monkeypatch, tmp_path, plan_id, plan_dir, current):
 
     def _tag_round(self, round_number=1, resume=False):
         current["round"] = round_number
+        # The round's rendezvous: the probe waits for the last of the
+        # plan's verification points to arrive, so the measured width
+        # is the width and not the scheduler's mood. Armed per round, so
+        # one round's arrival cannot release the other one's waiters.
+        rendezvous["event"] = asyncio.Event()
         return real_start(self, round_number=round_number, resume=resume)
 
     monkeypatch.setattr(VerificationAgent, "run_full_verification", _tag_round)
