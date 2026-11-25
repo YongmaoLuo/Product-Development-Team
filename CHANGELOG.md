@@ -227,8 +227,8 @@ half the readers never see.*
   `target` has to agree with it) and lets that one entry skip the
   porcelain criterion of the product-code guard: staging the branch diff
   is exactly what the entry is for, and the entry that follows it
-  commits the result. **The content criterion is unchanged** — `reset
-  --soft` does not touch file contents, so the sha256 comparison over
+  commits the result. **The content criterion is unchanged** —
+  `reset --soft` does not touch file contents, so the sha256 comparison over
   the product-code paths still catches a real content change, and a
   rewrite during that entry is still red. **No verdict changed for any
   other entry**: a squash onto another base, a `git reset --mixed` or
