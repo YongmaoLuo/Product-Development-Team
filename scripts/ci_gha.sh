@@ -213,7 +213,7 @@ fi
 printf 'ci_gha: branch=%s\n' "${branch}"
 
 # ---------------------------------------------------------------------------
-# 2. push HEAD to a throw-away probe branch
+# 2. push the current tree to a throw-away probe branch
 # ---------------------------------------------------------------------------
 
 # The probe branch carries the 8-character short SHA, so two concurrent
@@ -226,12 +226,59 @@ branch_slug="${branch//\//-}"
 probe="ci-probe/${branch_slug}-${sha8}"
 printf 'ci_gha: probe branch=%s\n' "${probe}"
 
+# The gate judges the *current tree*, not the branch history.
+#
+# The probe branch is therefore not HEAD: it is a single commit built
+# from HEAD's tree with ``git commit-tree``.  Two consequences, both
+# wanted:
+#
+#   * the branch history is not published.  Pushing a ref here runs the
+#     repository's pre-push hook, which scans every commit of the pushed
+#     ref that is not on a remote yet -- with the probe at HEAD that
+#     meant the whole local branch history, so a gate run could be
+#     blocked by an old commit the current tree no longer contains.
+#   * every lane runs on the very same tree, because the tree is the
+#     only thing the probe carries.
+#
+# History checks are not lost, they live where they belong: the
+# pre-push hook guards the real pushes of a branch, and the
+# ``commit-range-privacy`` job of ci.yml runs on ``pull_request``
+# events.  The gate dispatches ``workflow_dispatch``, which never runs
+# that job -- so the gate's own subject is the tree it is judging.
+#
+# The probe commit hangs off a parent that is already on the remote
+# (``origin/main``, with ``origin/HEAD`` as the fallback).  For a ref
+# that is new on the remote the hook scans ``<probe> --not --remotes``,
+# so a parent reachable from any ``refs/remotes/*`` is excluded and the
+# scan covers the probe commit alone -- the net change of the current
+# tree against the base.
+#
+# The parent cannot be left out.  A parentless probe commit is a root
+# commit, and then the whole tree reads as added lines: gitleaks hits
+# the test fixtures that main has been publishing for a long time
+# (14 findings, measured) and the hook rejects the push, so the gate
+# could never push its probe branch at all.  The parent is what keeps
+# the scan on the *change* instead of on the *tree*.
+probe_tree="$(git rev-parse "HEAD^{tree}" 2>/dev/null || true)"
+if [ -z "${probe_tree}" ]; then
+    die_inconclusive "cannot resolve the tree of HEAD"
+fi
+probe_parent="$(git rev-parse --verify --quiet "origin/main^{commit}" \
+    || git rev-parse --verify --quiet "origin/HEAD^{commit}" || true)"
+if [ -z "${probe_parent}" ]; then
+    die_inconclusive "cannot resolve a remote-tracking base commit for the probe"
+fi
+probe_commit="$(git commit-tree "${probe_tree}" -p "${probe_parent}" -m "ci probe ${sha8}" 2>/dev/null || true)"
+if [ -z "${probe_commit}" ]; then
+    die_inconclusive "cannot build the probe commit"
+fi
+
 # Idempotent clean-up: drop a leftover probe branch of the same name
 # (same HEAD, e.g. a re-run) before creating it again.
 git push origin --delete "${probe}" >/dev/null 2>&1 || true
 
 push_out=""
-if ! push_out="$(git push origin "HEAD:refs/heads/${probe}" 2>&1)"; then
+if ! push_out="$(git push origin "${probe_commit}:refs/heads/${probe}" 2>&1)"; then
     printf 'ci_gha: push of the probe branch failed:\n%s\n' "${push_out}" >&2
     emit_gate "FAILED" "1"
     exit 1

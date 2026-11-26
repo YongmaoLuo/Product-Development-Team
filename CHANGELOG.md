@@ -254,6 +254,23 @@ half the readers never see.*
   used to be reported as `SKIPPED`, and now carries the gate's own
   conclusion.
 
+- **The whole-repo gate judges the current tree, not the branch
+  history.** `scripts/ci_gha.sh` used to push HEAD itself to its
+  throw-away probe branch, and pushing a ref runs the repository's
+  pre-push hook, which scans every commit of the pushed ref that is not
+  on a remote yet — so an old commit in the branch history that the
+  current tree no longer contains could keep the gate from pushing its
+  probe branch at all, and the gate went red without a lane ever
+  having run. The probe branch now points at a single commit built from
+  the tree of HEAD and parented on `origin/main`, so the hook scans the
+  net change of the current tree against the base, and the branch
+  history never enters the scan range. The history checks are not lost:
+  the pre-push hook guards the real pushes of a branch, and ci.yml's
+  `commit-range-privacy` job runs on pull requests — the gate dispatches
+  `workflow_dispatch`, which never runs that job. **No verdict
+  changed**: the gate still answers 0 / 1 / 3 exactly as before; what it
+  pushes is what changed.
+
 
 
 ## [0.1.2] - 2026-10-07
