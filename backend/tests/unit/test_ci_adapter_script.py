@@ -312,18 +312,35 @@ def test_classify_accepts_the_gh_run_view_payload_shape():
 # 4. the gate's answer, driven through a fake ``gh``
 # ---------------------------------------------------------------------------
 
-#: A fake ``git``: the gate only asks it for the repository root, the
-#: branch and the short SHA, and pushes a probe branch it later drops.
+#: A fake ``git``: the gate asks it for the repository root, the branch,
+#: the short SHA, the tree of HEAD and the remote-tracking base commit,
+#: builds the probe commit with ``commit-tree`` and pushes the probe
+#: branch it later drops.  The two log files record what the gate
+#: actually asked for, so a test can read the refspec off the push
+#: instead of guessing it.
 FAKE_GIT = """#!/usr/bin/env bash
 case "${1:-}" in
     rev-parse)
-        case "${2:-}" in
-            --show-toplevel) printf '%s\\n' "${FAKE_GIT_ROOT}" ;;
-            --abbrev-ref) printf 'probe-branch\\n' ;;
-            *) printf 'deadbeef\\n' ;;
-        esac
+        # The gate asks for several different things through rev-parse and
+        # the flags sit in front of the argument (``--verify --quiet
+        # origin/main^{commit}``), so every argument is looked at.
+        for arg in "$@"; do
+            case "${arg}" in
+                --show-toplevel) printf '%s\\n' "${FAKE_GIT_ROOT}"; exit 0 ;;
+                --abbrev-ref) printf 'probe-branch\\n'; exit 0 ;;
+                'HEAD^{tree}') printf 'faketree0001\\n'; exit 0 ;;
+                'origin/main^{commit}') printf 'basecommit0001\\n'; exit 0 ;;
+                'origin/HEAD^{commit}') printf 'basecommit0001\\n'; exit 0 ;;
+            esac
+        done
+        printf 'deadbeef\\n'
+        ;;
+    commit-tree)
+        printf '%s\\n' "$*" >> "${FAKE_GIT_TREE_LOG}"
+        printf 'probecommit0001\\n'
         ;;
     push)
+        printf '%s\\n' "$*" >> "${FAKE_GIT_PUSH_LOG}"
         ;;
 esac
 exit 0
@@ -413,6 +430,11 @@ def _run_gate(tmp_path: Path, attempts: dict[str, dict]) -> tuple[subprocess.Com
     state = {"run_id": "424242", "reruns": 0, "attempts": attempts}
     state_path.write_text(json.dumps(state), encoding="utf-8")
 
+    #: What the fake ``git`` was asked to push, one line per push.
+    push_log = tmp_path / "git-push.log"
+    #: What the fake ``git`` was asked to build, one line per commit-tree.
+    tree_log = tmp_path / "git-tree.log"
+
     git_path = bin_dir / "git"
     git_path.write_text(FAKE_GIT, encoding="utf-8")
     git_path.chmod(0o755)
@@ -424,6 +446,8 @@ def _run_gate(tmp_path: Path, attempts: dict[str, dict]) -> tuple[subprocess.Com
     env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
     env["FAKE_GIT_ROOT"] = str(repo)
     env["FAKE_GH_STATE"] = str(state_path)
+    env["FAKE_GIT_PUSH_LOG"] = str(push_log)
+    env["FAKE_GIT_TREE_LOG"] = str(tree_log)
 
     result = subprocess.run(
         [BASH, str(CI_GHA)],
@@ -713,3 +737,161 @@ def test_ci_gha_retries_cancelled_jobs():
     content = CI_GHA.read_text(encoding="utf-8")
     assert "rerun" in content, "the gate must retry the cancelled jobs"
     assert "--job" in content, "the retry must address the cancelled job itself"
+
+
+# ---------------------------------------------------------------------------
+# 7. the probe branch carries the tree, not the branch history
+# ---------------------------------------------------------------------------
+#
+# The gate judges the *current tree*.  It used to push HEAD itself, which
+# meant the pre-push hook -- the one that scans every commit of the
+# pushed ref that is not on a remote yet -- had to scan the whole local
+# branch history, and a gate run could be blocked by an old commit that
+# the current tree no longer contains.
+#
+# So the probe branch now points at a single commit built from HEAD's
+# tree with ``git commit-tree``, and that commit hangs off a parent
+# that is already on the remote.  The branch history is not published,
+# every lane runs on the same tree, and the history checks stay where
+# they belong: the pre-push hook for the real pushes of a branch, and
+# ci.yml's ``commit-range-privacy`` job for pull requests (the gate
+# dispatches ``workflow_dispatch``, which never runs that job).
+#
+# What is pinned here:
+#
+#   * the push target is a commit-tree commit, not HEAD;
+#   * that commit is built from the tree of HEAD and hangs off a parent
+#     that is already on the remote (``origin/main``, with
+#     ``origin/HEAD`` as the fallback);
+#   * the probe branch name is still ``ci-probe/<branch_slug>-<sha8>``;
+#   * the red path still leaves the gate through ``emit_gate "FAILED" "1"``
+#     (the verdict itself is pinned by the tests of section 4 above).
+#
+# Why the parent matters: for a ref that is new on the remote the
+# pre-push hook scans ``<probe> --not --remotes``, so a parent that is
+# reachable from any ``refs/remotes/*`` is excluded and the scan covers
+# the probe commit alone -- the net change of the current tree against
+# the base.  A *parentless* probe commit is a root commit, and then the
+# whole tree reads as added lines: gitleaks hits the test fixtures main
+# has been publishing for a long time (14 findings, measured) and the
+# hook rejects the push -- the gate could never push its probe branch.
+
+
+def test_gate_pushes_a_probe_commit_built_from_the_current_tree(tmp_path):
+    """The probe branch is a tree-only commit, not the branch history."""
+    attempts = {
+        "1": _attempt("success", [_job("Unit tests (unit-00)", "success", 13)])
+    }
+    result, _ = _run_gate(tmp_path, attempts)
+    assert result.returncode == 0, (
+        f"the gate must be green, got {result.returncode}: {result.stdout}{result.stderr}"
+    )
+
+    # The probe commit is built from the tree of HEAD, once.
+    tree_calls = (tmp_path / "git-tree.log").read_text(encoding="utf-8").splitlines()
+    assert len(tree_calls) == 1, (
+        f"the gate must build exactly one probe commit, got {tree_calls}"
+    )
+    assert tree_calls[0].startswith("commit-tree faketree0001 "), (
+        "the probe commit must be built from the tree of HEAD: " + tree_calls[0]
+    )
+
+    # And that commit -- not HEAD -- is what the probe branch is pushed to.
+    pushes = (tmp_path / "git-push.log").read_text(encoding="utf-8").splitlines()
+    creating = [line for line in pushes if "refs/heads/ci-probe/" in line]
+    assert len(creating) == 1, f"the gate must push the probe branch once: {pushes}"
+    assert "probecommit0001:refs/heads/ci-probe/probe-branch-deadbeef" in creating[0], (
+        "the probe branch must be pushed from the tree-only commit: " + creating[0]
+    )
+    assert "HEAD:refs/heads" not in "\n".join(pushes), (
+        f"the probe branch must not be pushed from HEAD: {pushes}"
+    )
+
+
+def test_probe_commit_hangs_off_the_remote_base_commit(tmp_path):
+    """The probe commit has the remote base as its parent.
+
+    A parentless probe commit is a root commit, and the hook's scan of
+    it reads the whole tree as added lines -- which hits the fixtures
+    main has been publishing for a long time and blocks the push.
+    """
+    attempts = {
+        "1": _attempt("success", [_job("Unit tests (unit-00)", "success", 13)])
+    }
+    result, _ = _run_gate(tmp_path, attempts)
+    assert result.returncode == 0, (
+        f"the gate must be green, got {result.returncode}: {result.stdout}{result.stderr}"
+    )
+
+    tree_calls = (tmp_path / "git-tree.log").read_text(encoding="utf-8").splitlines()
+    assert len(tree_calls) == 1, (
+        f"the gate must build exactly one probe commit, got {tree_calls}"
+    )
+    probe_call = tree_calls[0]
+    assert " -p basecommit0001 " in probe_call, (
+        "the probe commit must hang off the remote base commit: " + probe_call
+    )
+    # The parent is the remote-tracking base, never HEAD: a HEAD parent
+    # would put the whole local branch history back into the scan range.
+    assert "-p deadbeef" not in probe_call, (
+        "the probe commit must not hang off HEAD: " + probe_call
+    )
+
+
+def test_probe_branch_name_is_unchanged(tmp_path):
+    """The probe branch is still ``ci-probe/<branch_slug>-<sha8>``."""
+    attempts = {
+        "1": _attempt("success", [_job("Unit tests (unit-00)", "success", 13)])
+    }
+    result, _ = _run_gate(tmp_path, attempts)
+    assert result.returncode == 0, (
+        f"the gate must be green, got {result.returncode}: {result.stdout}{result.stderr}"
+    )
+    assert "ci_gha: probe branch=ci-probe/probe-branch-deadbeef" in result.stdout, (
+        "the probe branch name must stay ci-probe/<branch_slug>-<sha8>: " + result.stdout
+    )
+    pushes = (tmp_path / "git-push.log").read_text(encoding="utf-8").splitlines()
+    assert any("ci-probe/probe-branch-deadbeef" in line for line in pushes), (
+        f"the probe branch must be pushed under its ci-probe name: {pushes}"
+    )
+
+
+def test_ci_gha_builds_the_probe_commit_with_commit_tree():
+    """The probe commit comes from ``git commit-tree``, parented on the base."""
+    content = CI_GHA.read_text(encoding="utf-8")
+    assert "commit-tree" in content, "the probe commit must be built with git commit-tree"
+    assert '"HEAD:refs/heads/${probe}"' not in content, (
+        "the probe branch must not be pushed from HEAD"
+    )
+    # The parent is the remote-tracking base, resolved before the commit
+    # is built, and HEAD is never used as the parent.
+    assert 'origin/main^{commit}' in content, (
+        "the probe commit must hang off the remote base commit"
+    )
+    assert 'origin/HEAD^{commit}' in content, (
+        "the probe commit needs a fallback when origin/main is missing"
+    )
+    for line in content.splitlines():
+        stripped = line.strip()
+        if "commit-tree" in stripped and not stripped.startswith("#"):
+            assert '-p "${probe_parent}"' in stripped, (
+                "the probe commit must be built with the base as its parent: " + stripped
+            )
+
+
+def test_ci_gha_fails_inconclusive_when_the_base_commit_is_missing():
+    """No remote-tracking base -> the gate says inconclusive, it does not push."""
+    content = CI_GHA.read_text(encoding="utf-8")
+    assert (
+        'die_inconclusive "cannot resolve a remote-tracking base commit for the probe"'
+        in content
+    ), "the gate must refuse to build a parentless probe commit"
+
+
+def test_ci_gha_still_drops_the_probe_branch_when_it_fails():
+    """The failure path is unchanged: the gate still goes red with exit 1."""
+    content = CI_GHA.read_text(encoding="utf-8")
+    assert 'emit_gate "FAILED" "1"' in content
+    assert 'git push origin --delete "${probe}"' in content, (
+        "the probe branch must still be dropped after the run"
+    )
