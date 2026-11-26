@@ -3,15 +3,17 @@
 背景
 ----
 验证分支在 PRD 审完之后产出的是**计划书**（``verification-plan.md``），不是
-任务清单（``tasks.json``）。这个端点是那条路上的唯一入口，它得自己守住三道门：
+任务清单（``tasks.json``）。这个端点是那条路上的唯一入口，它得自己守住两道门：
 
-* **产物不冲突** —— 目录里已经有 ``tasks.json`` 时，这个 plan 要走的是开发
-  分支。框架不替人猜意图，也不替人删文件：409 ``artifact_conflict`` 把两个
-  产物的**相对路径**交回去，由操作者裁决。
-* **PRD 已审完** —— 还有 pending 条目时 409 ``prd_review_incomplete``：没审完
-  的 PRD 不值得花一次模型调用。
+* **PRD 审核面** —— 审核面读得懂、但还有 pending 条目时 409
+  ``prd_review_incomplete``：没审完的 PRD 不值得花一次模型调用。
 * **文档合法** —— 模型给的文档不满足十章节契约时 422，且**不落盘**：非法文档
   留在磁盘上只会变成下一个读它的人踩的坑。
+
+「产物不冲突」那道门**已经删掉了**（PRD 决策点 2）：任务清单与计划书共存是
+合法的 —— 目录里已有 ``tasks.json`` 的 plan 照样能生成计划书，而它的相位不变。
+门 2 的三态判定（审核面缺失 / 读得懂但没审完 / 读不出来）在
+``test_verification_plan_generate_fastpath.py`` 里。
 
 契约之外还钉住两条：计划不存在 → 404；PRD 整条 skip 也算审完（验证分支的
 最小 PRD 允许 skip —— 这条边正是任务 15 的专用入口存在的理由）。
@@ -235,6 +237,29 @@ def _baseline_of(plan_dir: Path) -> Optional[Dict[str, Any]]:
     return recorded if isinstance(recorded, dict) else None
 
 
+def _assert_payload_has_no_local_path(text: str, *paths: Path) -> None:
+    """响应载荷里不许出现本机绝对路径。
+
+    扫四样东西：
+
+    * ``paths`` 里点名的目录（本机的计划目录、基线仓库目录）—— 逐字比对；
+    * ``/Users/`` 与 ``/home/`` 两个**用户目录字面量** —— 抓「回显了别的绝对
+      路径」这种逐字比对抓不到的漏法。
+
+    为什么**不**写死 ``/tmp/``：macOS 上 pytest 的 ``tmp_path`` 落在
+    ``/private/var/folders/...`` 下，写死 ``/tmp/`` 会得到一条恒真断言 ——
+    恒真的断言等于没钉。
+    """
+    for path in paths:
+        assert str(path) not in text, (
+            "载荷里不许出现本机绝对路径 %s；实际响应：%s" % (path, text)
+        )
+    for literal in ("/Users/", "/home/"):
+        assert literal not in text, (
+            "载荷里不许出现用户目录字面量 %s；实际响应：%s" % (literal, text)
+        )
+
+
 # ---------------------------------------------------------------------------
 # 1. 合法上下文 → 200，落盘，进「计划书待审」
 # ---------------------------------------------------------------------------
@@ -269,47 +294,96 @@ def test_generate_creates_doc_and_enters_review(
 
 
 # ---------------------------------------------------------------------------
-# 2. 产物冲突 → 409，不删文件、不写盘、不迁移阶段
+# 2. 共存（目录里已有 tasks.json）→ 200，相位不变
 # ---------------------------------------------------------------------------
 
 
-def test_generate_rejects_tasks_json_conflict(
+def test_dev_generate_returns_200_not_409(
     make_plan,
+    upstream_repo: Path,
     scripted_tool: _ScriptedTool,
 ) -> None:
-    """目录里已有 ``tasks.json`` → 409 ``artifact_conflict``。
+    """目录里已有 ``tasks.json`` → 200，**不是** 409。
 
-    响应里给出**两个**产物的相对路径，文件一个都不删，mtime 不变；被拒绝的
-    请求不写盘、不迁移阶段、也不调用模型。
+    这是原「共存即冲突」用例（``test_generate_rejects_tasks_json_conflict``，
+    断言 409 + ``error == "artifact_conflict"``）的**改写版**：共存是合法的
+    （PRD 决策点 2），任务清单与计划书可以同时留在一个 plan 目录里，生成
+    计划书不再被当成冲突。
+
+    旧用例断言过的东西逐条翻译过来：
+
+    * ``409 artifact_conflict`` → ``200``，载荷里没有 ``artifact_conflict``；
+    * 载荷里不许出现计划目录的绝对路径 → ``document_path`` 是**相对路径**；
+    * 任务清单不许被这次调用改动 → ``tasks.json`` 字节不变。
+
+    相位也不变：生成计划书是**可选附加动作**，开发分支的相位是开发流程
+    自己的事，生成与否都不影响它。
+
+    （测试设计文档里这条用例叫 ``test_dev_branch_generate_200_without_phase_change``；
+    同一个契约，这里按修复单点名的用例名收口。）
     """
-    plan_id, plan_dir = make_plan(with_tasks=True)
+    plan_id, plan_dir = make_plan(with_tasks=True, phase="queued")
+    scripted_tool.document = _valid_doc(upstream_repo)
     tasks_path = plan_dir / TASKS
-    mtime_before = tasks_path.stat().st_mtime_ns
+    tasks_before = tasks_path.read_bytes()
+    phase_before = _phase_of(plan_dir)
 
     resp = client.post(
         f"/api/verification-plan/{plan_id}/generate",
         json={"feedback": None},
     )
 
-    assert resp.status_code == 409, resp.text
+    assert resp.status_code == 200, resp.text
+    assert "artifact_conflict" not in resp.text, (
+        "共存是合法的，生成计划书不该再报产物冲突；实际响应：%s" % resp.text
+    )
     body = resp.json()
-    assert body["error"] == "artifact_conflict"
-    assert body["artifacts"] == [TASKS, PLAN_DOC], (
-        "响应里必须给出两个产物的相对路径；实际是 %r" % (body.get("artifacts"),)
+    assert set(body) == {"plan_id", "document_path", "current_phase"}, body
+    assert body["plan_id"] == plan_id
+    assert body["document_path"] == PLAN_DOC, (
+        "文档路径必须是**相对路径**；实际是 %r" % body["document_path"]
     )
-    assert TASKS in body["existing_artifacts"]
     assert str(plan_dir) not in resp.text, (
-        "响应不许泄露本机绝对路径；实际响应：%s" % resp.text
+        "载荷里不许出现计划目录的绝对路径；实际响应：%s" % resp.text
+    )
+    assert body["current_phase"] == phase_before, (
+        "开发分支的相位不许因为生成计划书而改变；实际是 %r" % body["current_phase"]
     )
 
-    # 文件没被删，mtime 没变。
-    assert tasks_path.exists()
-    assert tasks_path.stat().st_mtime_ns == mtime_before
+    # 计划书落盘，任务清单一个字节都没动。
+    assert (plan_dir / PLAN_DOC).exists()
+    assert tasks_path.read_bytes() == tasks_before
+    assert _phase_of(plan_dir) == phase_before
 
-    # 没写盘、没迁移阶段、没调用模型。
-    assert not (plan_dir / PLAN_DOC).exists()
-    assert _phase_of(plan_dir) == PRD_REVIEW_PHASE
-    assert scripted_tool.prompts == []
+
+def test_dev_branch_generate_does_not_start_execution(
+    make_plan,
+    upstream_repo: Path,
+    scripted_tool: _ScriptedTool,
+    state_db_reader,
+) -> None:
+    """生成计划书**不启动执行**：执行器没被拉起来，路由行的相位也没变。
+
+    「生成是可选附加动作」这条设计原则的落点：它写一份文档，仅此而已。
+    启动执行是另一个端点的事。
+    """
+    plan_id, plan_dir = make_plan(with_tasks=True, phase="queued")
+    scripted_tool.document = _valid_doc(upstream_repo)
+
+    resp = client.post(
+        f"/api/verification-plan/{plan_id}/generate",
+        json={"feedback": None},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert plan_id not in server._execution_state, (
+        "生成计划书不许拉起执行器"
+    )
+    routing = state_db_reader.routing(plan_id)
+    assert routing is not None
+    assert routing["current_phase"] == "queued", (
+        "路由行的相位不许被生成动作改写；实际是 %r" % routing["current_phase"]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +393,7 @@ def test_generate_rejects_tasks_json_conflict(
 
 def test_generate_rejects_pending_prd(
     make_plan,
+    upstream_repo: Path,
     scripted_tool: _ScriptedTool,
 ) -> None:
     """PRD 还有 pending 条目 → 409 ``prd_review_incomplete``。
@@ -335,6 +410,10 @@ def test_generate_rejects_pending_prd(
     assert resp.status_code == 409, resp.text
     body = resp.json()
     assert body["error"] == "prd_review_incomplete"
+    assert not any("path" in str(key) for key in body), (
+        "错误载荷里不许出现路径字段；实际键：%r" % sorted(body)
+    )
+    _assert_payload_has_no_local_path(resp.text, plan_dir, upstream_repo)
 
     assert not (plan_dir / PLAN_DOC).exists()
     assert _phase_of(plan_dir) == PRD_REVIEW_PHASE
@@ -364,6 +443,10 @@ def test_generate_invalid_doc_returns_422_without_write(
     body = resp.json()
     assert body["error"] == "verification_plan_invalid"
     assert body["errors"], "必须逐条给出违规"
+    assert not any("path" in str(key) for key in body), (
+        "错误载荷里不许出现路径字段；实际键：%r" % sorted(body)
+    )
+    _assert_payload_has_no_local_path(resp.text, plan_dir, upstream_repo)
 
     assert not (plan_dir / PLAN_DOC).exists(), "非法文档不许落盘"
     assert _phase_of(plan_dir) == PRD_REVIEW_PHASE
@@ -394,6 +477,11 @@ def test_generate_without_recorded_baseline_returns_422(
 
     assert resp.status_code == 422, resp.text
     assert resp.json()["error"] == "baseline_missing"
+    body = resp.json()
+    assert not any("path" in str(key) for key in body), (
+        "错误载荷里不许出现路径字段；实际键：%r" % sorted(body)
+    )
+    _assert_payload_has_no_local_path(resp.text, plan_dir, upstream_repo)
     assert not (plan_dir / PLAN_DOC).exists()
     assert _phase_of(plan_dir) == PRD_REVIEW_PHASE
     assert scripted_tool.prompts == []
@@ -405,13 +493,27 @@ def test_generate_without_recorded_baseline_returns_422(
 
 
 def test_generate_unknown_plan_returns_404() -> None:
-    """计划不存在 → 404。"""
+    """计划不存在 → 404。
+
+    载荷里只有 ``plan_id``：连**没找到的那个目录**的路径也不许回显 ——
+    404 的 ``detail`` 说的是「Plan not found」，不是「/本机/哪里 没有这个
+    目录」。
+    """
     resp = client.post(
         "/api/verification-plan/there-is-no-such-plan/generate",
         json={"feedback": None},
     )
 
     assert resp.status_code == 404, resp.text
+    body = resp.json()
+    assert not any("path" in str(key) for key in body), (
+        "错误载荷里不许出现路径字段；实际键：%r" % sorted(body)
+    )
+    _assert_payload_has_no_local_path(
+        resp.text,
+        server.PLANS_DIR,
+        server.PLANS_DIR / "there-is-no-such-plan",
+    )
 
 
 # ---------------------------------------------------------------------------

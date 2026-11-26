@@ -202,10 +202,25 @@ from verification_round_scope import (  # noqa: E402
     normalise_prefix,
     record_round_scope,
 )
-# 2026-10-25（验证分支输入路径）：分支判定只有一个判据 ——
-# plan 目录里躺着的是验证计划书还是任务清单。判定收敛在
-# ``plan_artifacts`` 里（纯函数、只读目录、每次重算），这里只消费结果。
-from plan_artifacts import is_verification_branch  # noqa: E402
+# 2026-10-25（验证分支输入路径）：判定收敛在 ``plan_artifacts`` 里
+# （纯函数、只读目录、每次重算），这里只消费结果。
+#
+# 2026-11-12（消费语义由来源决定）：分派的第一条件是**来源**
+# （``resolve_plan_source()``），不是分支（``is_verification_branch()``）。
+#
+# 两个判据回答的是**两个不同的问题**，取值互相独立：
+#
+# * 来源（:func:`plan_artifacts.resolve_plan_source`）回答「验证轮该消费哪一份
+#   计划」：计划书在 → ``REVIEWED``（真源是人审的计划书，机器计划是它的派生
+#   物）；只有机器计划 → ``MACHINE_ONLY``（沿用既有的磁盘复用语义）；两者都
+#   没有 → ``NONE``（走既有的 LLM Phase-1 生成路径）。
+# * 分支（:func:`plan_artifacts.detect`）回答「这条 plan 走哪条路」。
+#
+# 用分支当第一条件时，**共存目录**（``tasks.json`` + ``verification-plan.md``）
+# 会被判成开发分支，于是已审阅的那份计划落进开发复用路径：方法归一化把计划书
+# 里人写的验证方法判成退休方法、范围按任务清单重算、增量评估把计划原子改写回
+# 盘上 —— 审核过的东西在这一趟被换掉，而没有任何一步会告诉操作者。
+from plan_artifacts import PlanSource, resolve_plan_source  # noqa: E402
 # 2026-11-09（计划去重 R3）：验证计划**生成后、落盘前**跑一次重复检测 ——
 # 有重复组就把报告写到计划目录里并 WARNING。检测是**只读**的：不改计划里
 # 任何验证点的编号与内容，是否删除由人或后续任务决定。
@@ -1195,6 +1210,33 @@ def _render_evidence_for_prompt(
     else:
         rendered = str(evidence or "")
     return _truncate_annotated(rendered, limit)
+
+
+def _evidence_mapping(evidence: Any) -> Optional[Dict[str, Any]]:
+    """A VP's recorded evidence as a mapping, or ``None``.
+
+    The evidence reaches the report layer in two shapes: a **dict**
+    (the verdict's own evidence) and a **string** (the Phase 2 envelope
+    flattens it — see
+    :meth:`Orchestrator._enrich_evidence_with_address`, which keeps the
+    evidence a string because the judgment prompt slices it).  A string
+    that is not JSON carries no machine-readable field, so it is
+    ``None`` here rather than an empty mapping: "there is no evidence to
+    read" and "the evidence is empty" are different facts, and only the
+    first one may be treated as a missing verdict.
+    """
+    if isinstance(evidence, dict):
+        return evidence
+    if isinstance(evidence, str):
+        text = evidence.strip()
+        if not text:
+            return None
+        try:
+            loaded = json.loads(text)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        return loaded if isinstance(loaded, dict) else None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -6073,10 +6115,18 @@ class Orchestrator:
         """
         Phase 1: Generate verification plan from PRD/arch/test documents.
 
-        验证分支不走生成路径（2026-10-25）：那条路上读的是审核过的验证计划书
-        翻译出来、并且过了等价门禁的机器计划 JSON —— 验证回路对它只有「读出
-        来并校验」一件事。读不出来就报错（见
-        :meth:`_load_verification_branch_plan`）。
+        走哪条路由**来源**决定（2026-11-12）——
+        :func:`plan_artifacts.resolve_plan_source` 判出来的三态互斥，且由磁盘
+        状态唯一决定：
+
+        * ``REVIEWED``（计划书在）→ 只读加载盘上那份机器计划（见
+          :meth:`_load_verification_branch_plan`）：不退回 LLM、不做增量评估、
+          不做方法归一化、不按任务清单重算范围，这一趟只读不写。
+        * ``MACHINE_ONLY``（只有机器计划）→ 既有的磁盘复用语义。
+        * ``NONE``（两者都没有）→ 既有的 LLM Phase-1 生成路径。
+
+        已审阅的计划书那条路早于本次改动就存在（2026-10-25，当时只覆盖纯验证
+        分支）；2026-11-12 把判据从**分支**换成**来源**，于是共存目录也走它。
 
         Args:
             retry_llm: Number of retries for LLM calls
@@ -6088,7 +6138,24 @@ class Orchestrator:
         # 的 —— 它是审核过的计划书翻译出来、逐条比对过的一份 JSON。生成它会
         # 把审核过的那批验证点换成一批谁都没审过的，而没有任何一步会告诉
         # 操作者这件事发生过。所以验证分支直接读盘上那份。
-        if is_verification_branch(self.plan_dir):
+        #
+        # 2026-11-12（消费语义由来源决定）：判据从**分支**换成**来源**。
+        #
+        # 旧判据 ``is_verification_branch()`` 只认「目录里**只有**计划书」，
+        # 于是共存目录（``tasks.json`` + ``verification-plan.md``）落到下面
+        # 那条开发复用路径上：方法归一化把计划书里人写的验证方法判成退休方法
+        # （每一条验证点都变成"不验"）、``covers_paths`` 按任务清单重算（审核
+        # 过的执行范围被改写）、增量评估把计划**原子改写**回盘上 —— 审核过的
+        # 东西在这一趟被换掉。
+        #
+        # 现在按来源分派，三条路互斥，且由磁盘状态唯一决定：
+        #
+        # * ``REVIEWED`` —— 计划书在（机器计划在不在都一样）：只读加载器。
+        #   计划书是**真源**，机器计划是它的派生物；这一趟只读不写。
+        # * ``MACHINE_ONLY`` —— 只有机器计划：既有的磁盘复用语义（下面那条）。
+        # * ``NONE`` —— 两者都没有：既有的 LLM Phase-1 生成路径。
+        source = resolve_plan_source(self.plan_dir)
+        if source is PlanSource.REVIEWED:
             return self._load_verification_branch_plan()
 
         print("[Verification] Phase 1: Generating verification plan...")
@@ -6603,21 +6670,28 @@ class Orchestrator:
         return self._generate_minimal_plan(documents)
 
     def _load_verification_branch_plan(self) -> dict:
-        """验证分支的机器计划：读盘上那一份，校验它，**不问模型**。
+        """已审阅计划的机器计划：读盘上那一份，校验它，**不问模型**。
+
+        服务的是**来源**判定为 ``REVIEWED`` 的目录（2026-11-12）：计划书在 ——
+        机器计划在不在都一样。计划书是**真源**，机器计划是它的派生物，验证回路
+        对它的职责只有「读出来并校验」一件事。
 
         与开发分支的「磁盘复用」路径相比，只有三处不同，其余处理一致：
 
         * **不退回 LLM** —— 读不出来 / 校验不过一律抛错；
         * **不做增量评估**（``_maybe_evaluate_plan_delta``）—— 增量条目是
-          「这轮多了什么任务」的产物，而任务清单是开发分支的产物；验证分支
-          没有任务清单，凭空加出来的验证点也不在审核过的计划书里；
+          「这轮多了什么任务」的产物，而任务清单是开发分支的产物；已审阅的
+          那份凭空加出来的验证点不在审核过的计划书里；
         * **不做方法归一化**（``_normalize_legacy_methods``）—— 那一趟是为
           「模型生成的计划」准备的：模型用的是框架的方法词表
           （``api_test`` / ``code_review`` / …），词表外的方法说明它是早就
-          退休的方法。而验证分支的机器计划里，方法字段是**计划书里人写的
+          退休的方法。而已审阅的机器计划里，方法字段是**计划书里人写的
           自由文本**（"单元测试" / "以手工核验为主"），它与框架词表之间的
           映射是另一件事。拿退休检查去处理它，会把审核过的每一条验证点都
           标成 ``obsolete`` —— 验证回路于是"跑完了"，一条也没验。
+
+        范围（``covers_paths``）也**不按任务清单重算**：审核过的执行范围是
+        审核过的一部分，重算等于用任务清单改写它。
 
         盘上那份**原样留着**：它是审核过的产物，这一趟只读不写。
 
@@ -9832,6 +9906,107 @@ class Orchestrator:
                 marked_result["status"] = "BLOCKED"
             marked.append(marked_result)
         return marked
+
+    # -----------------------------------------------------------------------
+    # The verdict of an api_test point (2026-11-12, VP-014)
+    # -----------------------------------------------------------------------
+    #
+    # An ``api_test`` verification point is graded by the framework,
+    # deterministically: the request goes out, every declared assertion
+    # is evaluated, and the verdict is the assertions' verdict.  The
+    # Phase 3 judgment LLM never sees that — it sees a summary — and it
+    # may write the point down as FAILED even though every assertion
+    # passed.
+    #
+    # That is what happened to VP-014 of the plan this fix came from:
+    # the executor
+    # evaluated five assertions, all five passed, the round log's
+    # ``api_test_executed`` event said PASSED — and the report said
+    # FAILED, with an ``actual_result`` that described the successful
+    # run.  The artifact contradicted its own evidence, and a report
+    # that contradicts itself is not a verdict (PRD 验收④ asks for a
+    # *trustworthy* judgment, not just a produced one).
+    #
+    # :meth:`_restore_executor_api_test_verdicts` gives the executor the
+    # last word on those points — and only on those.
+
+    @staticmethod
+    def _restore_executor_api_test_verdicts(
+        report_data: dict, execution_results: dict,
+    ) -> Tuple[dict, List[str]]:
+        """Give the executor the last word on ``api_test`` points.
+
+        The rules, and why each one is what it is:
+
+          * **only ``api_test`` points.**  The framework graded them,
+            so the framework's verdict is the one about the
+            assertions.  ``code_review`` keeps the judgment LLM's
+            FAILED: that method reads the diff, which the executor
+            never sees, so the LLM may know something the executor does
+            not — and throwing that away would throw away exactly the
+            finding the method exists to produce.
+          * **the executor's verdict must be ``PASSED``.**  A point the
+            executor failed is a broken contract; nothing here restores
+            it.
+          * **the evidence must show that assertions were evaluated and
+            none of them failed** (``assertions_passed`` non-empty,
+            ``assertions_failed`` empty).  Without that the executor's
+            PASSED says nothing about the assertions, and restoring on
+            it would be a guess.
+
+        Returns the report and the ids of the entries it rewrote, so
+        the caller can re-derive the round's verdict — and only then.
+        """
+        methods_by_id: Dict[str, str] = {}
+        for vp in execution_results.get("verification_points", []) or []:
+            if not isinstance(vp, dict):
+                continue
+            vp_id = str(vp.get("id") or "")
+            if not vp_id:
+                continue
+            method = str(
+                vp.get("verification_method") or vp.get("method") or ""
+            )
+            if method:
+                methods_by_id[vp_id] = method
+
+        executor_by_id: Dict[str, dict] = {}
+        for entry in execution_results.get("execution_results", []) or []:
+            if isinstance(entry, dict):
+                executor_by_id[str(entry.get("id") or "")] = entry
+
+        restored: List[str] = []
+        for vr in report_data.get("verification_results", []) or []:
+            if not isinstance(vr, dict):
+                continue
+            vp_id = str(vr.get("id") or "")
+            if methods_by_id.get(vp_id) != "api_test":
+                continue
+            if str(vr.get("status") or "") != "FAILED":
+                continue
+            executor_entry = executor_by_id.get(vp_id)
+            if not isinstance(executor_entry, dict):
+                continue
+            if str(executor_entry.get("status") or "") != "PASSED":
+                continue
+            evidence = _evidence_mapping(executor_entry.get("evidence"))
+            if evidence is None:
+                continue
+            passed = evidence.get("assertions_passed")
+            if not isinstance(passed, (list, tuple)) or not passed:
+                # No assertion was evaluated — the executor's PASSED is
+                # not a statement about the assertions.
+                continue
+            failed = evidence.get("assertions_failed")
+            if failed is not None and (
+                not isinstance(failed, (list, tuple)) or len(failed) > 0
+            ):
+                # The evidence names a failed assertion: the contract
+                # broke, and that is the claim the reader has to see.
+                continue
+            vr["status"] = "PASSED"
+            restored.append(vp_id)
+        return report_data, restored
 
     # -----------------------------------------------------------------------
     # The failure class of a report entry (2026-11-03, infra-vs-defect)
@@ -13743,6 +13918,53 @@ class Orchestrator:
                     report_data["overall_status"] = _derive_overall_status(
                         report_data.get("verification_results", [])
                     )
+
+                # 2026-11-12 (VP-014): an api_test point is graded by the
+                # framework — the request goes out, every declared
+                # assertion is evaluated, and the verdict is the
+                # assertions' verdict.  The judgment LLM only sees a
+                # summary of that, and it wrote VP-014 down as FAILED
+                # even though the executor had evaluated five assertions
+                # and every one of them had passed (``assertions_failed``
+                # empty, ``assertions_passed`` non-empty) — the report
+                # then contradicted its own evidence.
+                #
+                # The executor gets the last word on those points, and
+                # only on those: a ``code_review`` point keeps the
+                # judgment LLM's FAILED, because that method reads the
+                # diff the executor never sees.
+                #
+                # This runs **independently** of the PARTIAL gate above:
+                # that gate only fires when the executor had no FAILED at
+                # all, and the round that produced VP-014 had one — so
+                # waiting for that gate would leave the bug in place.
+                report_data, restored_api_vps = (
+                    self._restore_executor_api_test_verdicts(
+                        report_data, execution_results,
+                    )
+                )
+                if restored_api_vps:
+                    # The round's verdict comes from the entries (R4), so
+                    # it is re-derived from the corrected list — by the
+                    # same derivation the accounting layer uses.
+                    report_data["overall_status"] = _derive_overall_status(
+                        report_data.get("verification_results", [])
+                    )
+                    for restored_id in restored_api_vps:
+                        # The audit line is best-effort: a report that
+                        # cannot be written because the round log is
+                        # closed would lose its verdict entirely.
+                        try:
+                            self._safe_log_freshness_event(
+                                restored_id,
+                                "api_test_verdict_restored",
+                                {
+                                    "vp_id": restored_id,
+                                    "reason": "executor_assertions_all_passed",
+                                },
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
 
                 # 2026-11-03 (infra-vs-defect): the failure class of
                 # every entry.  The judgment LLM's output schema has no

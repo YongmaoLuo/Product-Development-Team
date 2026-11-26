@@ -29,11 +29,9 @@ from framework import clock as _framework_clock
 from config_paths import resolve_plans_dir, resolve_state_db_path
 from phase_vocabulary import log_deprecated_ready, normalize_waiting_phase
 from plan_artifacts import (
-    BRANCH_CONFLICT,
     BRANCH_DEV,
     BRANCH_VERIFICATION,
     PLAN_DOC_FILENAME,
-    ArtifactConflictError,
     detect,
 )
 from plan_mode import MODE_PRODUCTION, mode_from_flags, resolve_mode
@@ -1275,19 +1273,16 @@ class PlanState:
         路径：它给出的必须是现行词汇，否则一条刚建出来、还没落 routing 行的
         计划会带着旧词进入系统。
 
-        Raises:
-            ArtifactConflictError: both ``tasks.json`` and
-                ``verification-plan.md`` are present. Which one the plan
-                meant is a question only a human can answer, so the
-                framework refuses to guess instead of picking one.
+        2026-11-09: 共存（``tasks.json`` 与 ``verification-plan.md`` 同时存在）
+        **不是冲突** —— 按「任务优先」的主分支语义，它就是一条开发分支的
+        计划，只不过额外带着一份计划书（附加产物）。产物判定的输出域因此是
+        ``dev`` / ``verification`` / ``empty`` 三个取值，共存落在 ``dev``
+        上，走第 1 条规则推断为 ``queued``。这里曾经有一条「两者都在就抛
+        ``ArtifactConflictError``」的分支：它要求人先裁决「这条 plan 到底想
+        干什么」，而共存合法之后，裁决已经在「任务优先」这条规则里了 ——
+        留着它只会让读者以为框架还在替人择一。
         """
         artifacts = detect(self.plan_dir)
-        if artifacts.branch == BRANCH_CONFLICT:
-            raise ArtifactConflictError(
-                (artifacts.tasks_path, artifacts.plan_doc_path),
-                expected=None,
-                actual=artifacts.branch,
-            )
         if artifacts.branch == BRANCH_DEV:
             return "queued"
         if artifacts.branch == BRANCH_VERIFICATION:

@@ -26,6 +26,23 @@ at 2am.
   * :func:`running_server` — a real FastAPI instance on a kernel-assigned
     port, with its own plans tree, its own state database and the scripted
     LLM switched on in its environment.
+  * :func:`make_verification_plan` / :func:`make_dev_plan` — the two plan
+    builders the verification-branch cases work with, together with the two
+    instruments those cases need: :func:`cas_spy` records every phase
+    transition the CAS attempts, and :func:`no_worker_thread` keeps the
+    worker the pipeline spawns after the CAS from running.
+  * :func:`build_plan_doc` / :data:`CANONICAL_PLAN_DOC` — one plan document,
+    the same bytes every time, and the machine plan that goes with it
+    (:func:`build_machine_plan`).
+
+The fixtures live here rather than in the module that first needed them
+---------------------------------------------------------------------
+pytest resolves a fixture in the namespace of the module that *asks* for it,
+so a fixture defined in a test module is invisible to every other module.
+The four verification-branch fixtures used to live in
+``tests/api/test_start_verification_cas.py``; the only way for another case
+to use them was to copy them, and a copy is a copy that drifts.  They live
+here so that the next case imports them.
 
 The rule the module enforces
 ----------------------------
@@ -49,6 +66,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -64,7 +82,8 @@ _REPO_ROOT = _BACKEND_DIR.parent
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
-from verification_plan_doc import PLAN_DOC_FILENAME  # noqa: E402
+from verification_plan_doc import PLAN_DOC_FILENAME, parse_plan_doc  # noqa: E402
+from verification_plan_review import extract_items, record_action  # noqa: E402
 from verification_workspace import (  # noqa: E402
     WORKSPACE_ROOT_ENV,
     Baseline,
@@ -73,26 +92,38 @@ from verification_workspace import (  # noqa: E402
 )
 
 __all__ = [
+    "CANONICAL_ITEM_COUNT",
+    "CANONICAL_PLAN_DOC",
+    "CANONICAL_REPO_DIR",
     "CHILD_BACKEND_DIR_ENV",
+    "MACHINE_PLAN",
     "PLAN_ID",
     "PR_NUMBER",
     "PR_REF",
     "PRD_FILENAME",
+    "REVIEW_PHASE",
     "MinimalPrd",
     "RunningServer",
     "ScriptedLlm",
     "UpstreamRepo",
     "VerificationPlan",
     "assert_no_leftover_resources",
+    "build_machine_plan",
     "build_plan_doc",
     "build_scripted_llm",
     "build_upstream_repo",
+    "cas_spy",
     "child_bootstrap_dir",
     "clear_verification_registries",
     "detect_leftover_resources",
+    "hermetic_env",
+    "make_dev_plan",
+    "make_verification_plan",
     "minimal_prd",
+    "no_worker_thread",
     "reclaim_and_verify",
     "reclaim_verification_resources",
+    "record_routing_row",
     "remove_worktree",
     "running_server",
     "scripted_llm",
@@ -217,8 +248,13 @@ def build_upstream_repo(path: Path) -> UpstreamRepo:
     The content is written as bytes rather than as text: ``Path.write_text``
     translates the newlines, and a translated newline is a different tree
     and therefore a different SHA on another platform.
+
+    The directory is rebuilt from scratch on every call: the repository is a
+    temporary product, and building it on top of a previous run's tree
+    leaves the two commits with nothing to commit.
     """
     repo = Path(path)
+    shutil.rmtree(repo, ignore_errors=True)
     repo.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         ["git", "init", "--quiet", str(repo)],
@@ -282,8 +318,17 @@ class MinimalPrd:
         return str(self.path)
 
 
+#: The repository the canonical plan document names in its baseline line.
+#:
+#: A fixed path on purpose.  The canonical document has to be byte-identical
+#: on every call and on every machine -- a document whose bytes depend on
+#: the directory it happened to be built in cannot be compared with anything
+#: -- so it cannot name the directory it happens to live in.
+CANONICAL_REPO_DIR: Path = Path("/tmp/repo")
+
+
 def build_plan_doc(
-    repo_dir: Path,
+    repo_dir: Optional[Path] = None,
     pr_number: int = PR_NUMBER,
     ref: str = PR_REF,
 ) -> str:
@@ -293,7 +338,15 @@ def build_plan_doc(
     point of the fixture is a document that is *already* valid: the
     structure check is the model boundary's job, and a fixture that failed
     it would turn every run into a formatting exercise.
+
+    Called without arguments it returns the **canonical** document: the
+    same bytes on every call, with the baseline naming
+    :data:`CANONICAL_REPO_DIR`.  Called with a repository it names that
+    repository instead -- the scripted-LLM fixture needs a document that
+    points at the repository it is about to verify.
     """
+    if repo_dir is None:
+        repo_dir = CANONICAL_REPO_DIR
     baseline_line = f"baseline: repo={repo_dir} ref={ref} pr={pr_number}"
     return f"""## 被验证对象
 
@@ -381,6 +434,85 @@ def build_scripted_llm(
         build_plan_doc(repo_dir, pr_number, ref), encoding="utf-8"
     )
     return script_dir
+
+
+# ---------------------------------------------------------------------------
+# The canonical plan document
+# ---------------------------------------------------------------------------
+
+#: The canonical plan document: one document, the same bytes every time.
+#:
+#: A case that needs "a valid verification plan document" takes this one
+#: rather than writing its own.  A second copy of the document is a copy
+#: that drifts: it drifts the moment the first one is edited, and the drift
+#: shows up as a gate that disagrees with the fixture rather than as the
+#: fixture that is out of date.
+CANONICAL_PLAN_DOC: str = build_plan_doc()
+
+
+def build_machine_plan(doc: str) -> Dict[str, Any]:
+    """The machine plan that is equivalent to ``doc``.
+
+    Why the machine plan is **derived** rather than written out
+    -----------------------------------------------------------
+    The ``/start`` pipeline only translates a plan document into a machine
+    plan when the machine plan is *not* on disk, and translating it means
+    asking the model once, synchronously, inside the request thread.  A
+    test must not do that: the answer would depend on whichever provider
+    the host happens to have, and the call would block the request thread.
+
+    So the machine plan is derived from the document here, and the
+    derivation is checked against the translator's own equivalence gate.
+    The gate compares four dimensions -- the verification point ids, the
+    criterion ids, the execution scope and the evidence ids -- so a
+    derived plan cannot drift away from its document: when the document
+    changes, the plan changes with it.  A plan written out as a constant
+    would drift the moment the document's wording changed, and the drift
+    would show up as ``422 verification_plan_equivalence_failed``, which
+    reads like a production bug rather than an out-of-date fixture.
+    """
+    from verification_plan_translator import validate_equivalence
+
+    parsed = parse_plan_doc(doc)
+    verification_points: List[Dict[str, Any]] = []
+    for item in parsed.items:
+        verification_points.append(
+            {
+                "id": item.id,
+                "title": item.title,
+                "verification_method": item.method,
+                "related_prd_criteria": "；".join(
+                    f"{cid}: {text}" for cid, text in item.criteria.items()
+                ),
+                "expected_result": (
+                    f"{', '.join(item.evidence.keys())} | {item.expected_result}"
+                ),
+            }
+        )
+    machine_plan: Dict[str, Any] = {
+        "services": [],
+        "verification_points": verification_points,
+    }
+
+    divergences = validate_equivalence(parsed, machine_plan)
+    assert not divergences, (
+        "the derived machine plan is not equivalent to its document: "
+        + "；".join(
+            f"{d.dimension}/{d.item_id}: {d.detail}" for d in divergences
+        )
+    )
+    return machine_plan
+
+
+#: The machine plan that goes with :data:`CANONICAL_PLAN_DOC`.
+MACHINE_PLAN: Dict[str, Any] = build_machine_plan(CANONICAL_PLAN_DOC)
+
+#: How many review items the canonical plan document carries: the five
+#: plan-level items plus one per verification point.  The count is derived
+#: rather than written down, because the review items come from the
+#: document -- a count that was written down would be one more number to
+#: keep in step with it.
+CANONICAL_ITEM_COUNT: int = len(extract_items(parse_plan_doc(CANONICAL_PLAN_DOC)))
 
 
 # ---------------------------------------------------------------------------
@@ -1101,3 +1233,293 @@ def running_server(
             pass
         if server in _SERVERS:
             _SERVERS.remove(server)
+
+
+# ---------------------------------------------------------------------------
+# The verification-branch fixtures
+# ---------------------------------------------------------------------------
+
+#: The phase a verification-branch plan waits in while its plan document is
+#: under review.  It is the source phase the ``/start`` CAS accepts when the
+#: verification branch is ready, and the phase a plan built by
+#: :func:`make_verification_plan` sits in.
+REVIEW_PHASE: str = "verification_plan_review"
+
+
+class _Plan:
+    """A plan: its id and its directory."""
+
+    def __init__(self, plan_id: str, plan_dir: Path):
+        self.plan_id = plan_id
+        self.plan_dir = plan_dir
+
+
+def record_routing_row(
+    plan_id: str,
+    *,
+    phase: str,
+    verification: Dict[str, Any],
+) -> None:
+    """Write the ``plan_routing`` row the way production does.
+
+    The baseline lives in the routing row's ``verification`` column, so the
+    fixture writes it through the repository layer rather than through a
+    hand-made file -- the reader under test must find it where the freeze
+    step puts it.  The column's only writer is
+    ``RoutingRepository.write_verification_baseline``.
+
+    The four lifecycle keys in ``verification`` have no home left: they
+    belong to the authoritative ``plan_verification`` table, and this
+    plan has not started a round, so that row does not exist yet.
+    """
+    from config_paths import resolve_state_db_path
+    from state_machine.db.connection import open as open_db
+    from state_machine.db.schema import migrate
+    from state_machine.repositories.routing_repository import (
+        RoutingRepository,
+    )
+
+    conn = open_db(resolve_state_db_path())
+    try:
+        migrate(conn)
+        repo = RoutingRepository(conn)
+        repo.write_plan_state(
+            plan_id,
+            phase=phase,
+            completed_phases=[],
+            review_rounds={},
+            flags={},
+            last_updated=None,
+        )
+        baseline = verification.get("baseline")
+        if baseline is not None:
+            repo.write_verification_baseline(
+                plan_id,
+                baseline,
+                verification.get("baseline_doc_sha256", ""),
+            )
+    finally:
+        conn.close()
+
+
+def _hermetic_plans_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    """Point the plans tree, the state DB and the workspace root at ``tmp_path``.
+
+    ``PDT_PLANS_DIR`` gives every resolver the same view; ``server.PLANS_DIR``
+    is patched as well because ``server._plan_dir`` reads the module global.
+
+    ``PDT_VERIFICATION_WORKSPACE_ROOT`` also points at ``tmp_path``: the
+    verification workspace (worktree) defaults to a directory under the
+    operator's own home -- that is **one shared place** for the whole
+    session.  Two cases that use the same plan id would
+    collide on the same worktree path, and the second one would report
+    ``409`` (workspace conflict) instead of walking the pipeline.  One
+    workspace root per case removes the collision.
+
+    The server module is imported here rather than at the top of the file:
+    this module is imported by the suite's conftest, and importing the whole
+    application at that point would read the environment before the case
+    had a chance to make it hermetic.
+    """
+    import server
+
+    plans_dir = tmp_path / "plans"
+    plans_dir.mkdir(parents=True, exist_ok=True)
+    workspace_root = tmp_path / "verification-workspaces"
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(server, "PLANS_DIR", plans_dir)
+    monkeypatch.setenv("PDT_PLANS_DIR", str(plans_dir))
+    monkeypatch.setenv("PDT_STATE_DB_PATH", str(tmp_path / "state.db"))
+    monkeypatch.setenv("PDT_VERIFICATION_WORKSPACE_ROOT", str(workspace_root))
+    return plans_dir
+
+
+@pytest.fixture
+def hermetic_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The plans tree of this case, isolated from every other one.
+
+    A case that builds a plan directory of its own asks for this: the
+    directory it gets back is the one the plan belongs in.
+    """
+    return _hermetic_plans_dir(tmp_path, monkeypatch)
+
+
+def _machine_plan_filename() -> str:
+    """The name the machine plan has inside a plan directory.
+
+    Read from the route that writes it rather than written down here: a
+    second copy of the filename is a copy that drifts, and a drift means
+    the pipeline does not find the file it was given.
+    """
+    from routes.verification import MACHINE_PLAN_FILENAME
+
+    return MACHINE_PLAN_FILENAME
+
+
+@pytest.fixture
+def make_verification_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    upstream_repo: UpstreamRepo,
+    plan_sqlite_seeder,
+):
+    """Build a verification-branch plan; every dimension ready unless broken."""
+    counter = {"n": 0}
+    plans_dir = _hermetic_plans_dir(tmp_path, monkeypatch)
+
+    def _make(
+        *,
+        review_complete: bool = True,
+        baseline_overrides: Optional[Dict[str, Any]] = None,
+        ref_moved: bool = False,
+    ) -> _Plan:
+        counter["n"] += 1
+        plan_id = f"verify-plan-cas-{counter['n']}"
+        plan_dir = plans_dir / plan_id
+        plan_dir.mkdir(parents=True)
+        (plan_dir / "verification-plan.md").write_bytes(
+            CANONICAL_PLAN_DOC.encode("utf-8")
+        )
+        # The machine plan: the one equivalent to the plan document.  It is
+        # on disk already, so the ``/start`` pipeline reads it from there
+        # instead of asking the model -- that is the whole of "does not
+        # hang".
+        (plan_dir / _machine_plan_filename()).write_text(
+            json.dumps(MACHINE_PLAN, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        for index in range(CANONICAL_ITEM_COUNT):
+            record_action(plan_dir, index, "accept")
+        if not review_complete:
+            # One item back to pending -- the review is incomplete.
+            record_action(plan_dir, 3, "reset")
+
+        baseline = {
+            "repo_dir": str(upstream_repo.repo),
+            "ref": PR_REF,
+            "commit_sha": upstream_repo.head_sha(),
+            "pr_number": PR_NUMBER,
+        }
+        if baseline_overrides:
+            baseline.update(baseline_overrides)
+
+        record_routing_row(
+            plan_id,
+            phase=REVIEW_PHASE,
+            verification={
+                "status": "pending",
+                "round": 0,
+                "max_rounds": 3,
+                "stop_reason": None,
+                "baseline": baseline,
+            },
+        )
+
+        project_dir = plan_dir / "project"
+        project_dir.mkdir()
+        plan_sqlite_seeder(
+            plan_dir,
+            plan_id,
+            phase=REVIEW_PHASE,
+            project_dir=str(project_dir),
+        )
+
+        if ref_moved:
+            # The PR head moved -- the baseline has drifted away from the
+            # commit the routing row records.
+            upstream_repo.git("update-ref", PR_REF, "HEAD~1")
+
+        return _Plan(plan_id, plan_dir)
+
+    return _make
+
+
+@pytest.fixture
+def make_dev_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    plan_sqlite_seeder,
+):
+    """Build a development-branch plan (``tasks.json`` is there), phase ``executing``."""
+    counter = {"n": 0}
+    plans_dir = _hermetic_plans_dir(tmp_path, monkeypatch)
+
+    def _make() -> _Plan:
+        counter["n"] += 1
+        plan_id = f"dev-plan-cas-{counter['n']}"
+        plan_dir = plans_dir / plan_id
+        plan_dir.mkdir(parents=True)
+        (plan_dir / "tasks.json").write_text(
+            '{"tasks": []}', encoding="utf-8"
+        )
+
+        record_routing_row(
+            plan_id,
+            phase="executing",
+            verification={
+                "status": "pending",
+                "round": 0,
+                "max_rounds": 3,
+                "stop_reason": None,
+            },
+        )
+
+        project_dir = plan_dir / "project"
+        project_dir.mkdir()
+        plan_sqlite_seeder(
+            plan_dir,
+            plan_id,
+            phase="executing",
+            project_dir=str(project_dir),
+        )
+        return _Plan(plan_id, plan_dir)
+
+    return _make
+
+
+class _NoOpThread:
+    """A thread stand-in that never runs its target."""
+
+    def __init__(self, target=None, daemon=None, *args, **kwargs):
+        self._target = target
+        self._target_args = kwargs.pop("args", ())
+        self._target_kwargs = kwargs.pop("kwargs", {})
+
+    def start(self) -> None:
+        return None
+
+    def join(self, timeout=None) -> None:
+        return None
+
+    def is_alive(self) -> bool:
+        return False
+
+
+@pytest.fixture
+def no_worker_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the verification worker from running.
+
+    ``/start`` spawns the worker *after* the CAS; these cases are about the
+    CAS, and the worker would drive the whole verification loop.
+    """
+    monkeypatch.setattr(threading, "Thread", _NoOpThread)
+
+
+@pytest.fixture
+def cas_spy(monkeypatch: pytest.MonkeyPatch) -> List[Tuple[str, tuple, str]]:
+    """Record every ``try_mark_phase`` call's source-phase tuple."""
+    from state_machine.repositories.routing_repository import RoutingRepository
+
+    calls: List[Tuple[str, tuple, str]] = []
+    original = RoutingRepository.try_mark_phase
+
+    def _spy(self, plan_id, expected_phases, new_phase, substage=None):
+        calls.append((plan_id, tuple(expected_phases), new_phase))
+        return original(self, plan_id, expected_phases, new_phase, substage)
+
+    monkeypatch.setattr(RoutingRepository, "try_mark_phase", _spy)
+    return calls

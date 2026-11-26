@@ -656,6 +656,33 @@ def _wait_for_status(
     )
 
 
+def _wait_for_file(path: Path, *, timeout: float = POLL_BOUND_SEC) -> bool:
+    """Block until ``path`` exists.  Whether it exists is the answer.
+
+    The pause checkpoint and the decision it belongs to live in two
+    different stores: the decision in SQLite, the checkpoint in the plan
+    directory.  The strict timeout settles the decision first and writes
+    the checkpoint after it, so a case that reads the decision over HTTP
+    can see ``paused`` a moment before the checkpoint lands.  Asserting
+    the file the instant the status says ``paused`` is a race against
+    the write — and a race is a test that fails only under load.
+
+    The wait is bounded, and the file's existence when the wait gives up
+    is the answer.
+
+    Existence is also completeness: the checkpoint is written by
+    ``atomic_write_json``, which writes a sibling tempfile and
+    ``os.replace``s it into place, so a reader that sees the path never
+    reads a half-written document.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(POLL_INTERVAL_SEC)
+    return path.exists()
+
+
 def _ask(base_url: str, plan_id: str) -> Dict[str, Any]:
     """Ask the plan's question through the real HTTP route."""
     status, body = _post_json(
@@ -823,9 +850,10 @@ def test_strict_expires_to_paused(tmp_path):
         # The pause is written down, and it names the question that
         # caused it — the resume path finds the question through it.
         checkpoint_path = backend.plans_dir / plan_id / PAUSE_CHECKPOINT_FILENAME
-        assert checkpoint_path.exists(), (
+        assert _wait_for_file(checkpoint_path), (
             "a strict timeout must leave a pause checkpoint; without one "
-            "the resume path has nothing to pick the round up from"
+            "the resume path has nothing to pick the round up from; "
+            f"server log tail:\n{_tail(backend.log_path)}"
         )
         checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
         assert checkpoint["reason"] == "hitl_strict_timeout", (
@@ -934,11 +962,15 @@ def test_auto_vs_strict_pair(tmp_path):
             f"answer is {strict['answer']!r}"
         )
 
-        checkpoint = json.loads(
-            (
-                backend.plans_dir / strict_id / PAUSE_CHECKPOINT_FILENAME
-            ).read_text(encoding="utf-8")
+        pair_checkpoint_path = (
+            backend.plans_dir / strict_id / PAUSE_CHECKPOINT_FILENAME
         )
+        assert _wait_for_file(pair_checkpoint_path), (
+            "a strict timeout must leave a pause checkpoint; without one "
+            "the resume path has nothing to pick the round up from; "
+            f"server log tail:\n{_tail(backend.log_path)}"
+        )
+        checkpoint = json.loads(pair_checkpoint_path.read_text(encoding="utf-8"))
         assert checkpoint["reason"] == "hitl_strict_timeout"
         assert checkpoint["decision_id"] == strict_decision["decision_id"]
 

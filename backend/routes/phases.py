@@ -29,7 +29,18 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple, Any, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 from decision_point_adder import ArchDecisionPointAdder, PRDDecisionPointAdder, TestDecisionPointAdder
 from arch_generator import ArchGenerator, ArchHardGateError
 from arch_refiner import ArchRefiner
@@ -2120,18 +2131,29 @@ def get_tasks(plan_id: str):
 # 验证分支：计划书生成入口
 # ---------------------------------------------------------------------------
 #
-# 验证分支在 PRD 审完之后产出的是**计划书**（``verification-plan.md``），不是
-# 任务清单（``tasks.json``）。这个端点是那条路上的唯一入口。
+# 验证计划书（``verification-plan.md``）是**任务清单生成之后**的一个可选附加
+# 动作（PRD 决策点 2）：正式流程与快速通道都通过这个入口产出它，生成与否
+# 不影响 plan 的正常阶段推进。
 #
-# 它守住三道门，每道门都在**写盘之前**：
+# 它守住三道门 + 一道基线门，每一道都在**写盘之前**：
 #
-#   1. **产物冲突** —— 目录里已有 ``tasks.json`` → 409 ``artifact_conflict``。
-#      响应里给出两个产物的**相对路径**（不泄露本机绝对路径），并且不删任何
-#      文件：「这个 plan 到底要执行开发任务、还是要按计划书直接验证」只有人
-#      能回答，框架不替人猜，也不替人删。
-#   2. **PRD 未审完** → 409 ``prd_review_incomplete``。没审完的 PRD 不值得
-#      花一次模型调用。
-#   3. **阶段不匹配** → 409 ``stage_mismatch``。
+#   0. **基线门** —— 两条分支都保留，而且**先判**：基线是计划书的内容契约
+#      （文档里的 ``baseline:`` 行必须与计划状态里记录的那份一致），缺基线 →
+#      422 ``baseline_missing``，且不落盘。它的结论既不依赖分支也不依赖审核
+#      面，所以它在两条分支上必须是同一个答案 —— 别的门不许顶掉它。
+#   1. **PRD 审核面** —— 四态判定（:func:`_verification_prd_state`）。审核面
+#      **存在、读得懂、但还有没解决的决策点**（``pending``）→ 409
+#      ``prd_review_incomplete``，载荷带 ``review_readable=true`` 与没解决的
+#      决策点清单；审核面**存在但读不出来**（``unreadable``）→ 409
+#      ``prd_review_incomplete`` + ``review_readable=false``；审核面**根本
+#      不存在**（``absent``，快速通道导入的 plan 只有任务清单，没有 PRD）→
+#      这道门不适用，放行；审核面**都审完了**（``resolved``）→ 放行。
+#   2. **阶段不匹配** → 409 ``stage_mismatch``。这道门**只属于纯验证分支**：
+#      开发分支的 plan 生成计划书是附加动作，不改它的相位。
+#
+# 「产物冲突」这道门**已经没有了**：任务清单与计划书共存是合法的（共存按
+# 「任务优先」归开发分支，计划书是附加产物），所以目录里已有 ``tasks.json``
+# 不再是这个入口的拒绝理由。
 #
 # 生成的文档不满足十章节契约 → 422，且**不落盘**（生成器先校验、后落盘）。
 #
@@ -2177,26 +2199,71 @@ def _verification_required_prd_indices(
     return {raw.get("index") for raw in raw_items if isinstance(raw, dict)}
 
 
-def _verification_prd_pending(plan_dir: Path) -> Optional[List[Any]]:
-    """PRD 审核里还没解决的决策点序号。
+#: PRD 审核面的四态判定结果。
+#:
+#: ``absent`` —— 盘上既没有 ``prd.json`` 也没有 ``review.json``：没有审核面
+#: 可言，这道门**不适用**（快速通道导入的 plan 只有任务清单，没有 PRD）。
+#: ``pending`` —— 审核面读得懂，但还有决策点没解决。
+#: ``resolved`` —— 审核面读得懂，且每一条决策点都已经解决。
+#: ``unreadable`` —— 审核面在盘上但读不出来：按未解决处理，**不**降级成
+#: ``absent`` —— 一份损坏（或缺一半）的审核文件不能变成绕过审阅的后门。
+PRD_GATE_ABSENT = "absent"
+PRD_GATE_PENDING = "pending"
+PRD_GATE_RESOLVED = "resolved"
+PRD_GATE_UNREADABLE = "unreadable"
 
-    这是 :func:`verification_plan_review.prd_is_resolved` 的**路由侧镜像**，
-    唯一的一处不同是 skip 的语义：那个函数按**分支**区分（验证分支认 skip、
-    开发分支只认 accepted），而这个端点只服务验证分支，所以这里一律按
-    「accepted 或 skipped 算已解决」判断 —— 这正是 prd.md 的要求：最小 PRD
-    的每一条决策点 accept **或** skip 之后才能生成计划书。
 
-    为什么要镜像而不是直接调那个函数：它按「目录里有没有计划书」判断分支，
-    而计划书正是**这个端点**要生成的 —— 调它的时候分支还没落地，skip 会被
-    当成没解决。两处的判据（哪些决策点必须被审过、什么状态算已解决）逐字
-    一致，所以镜像不会给出与它不同的答案。
+class _PrdReviewState(NamedTuple):
+    """门 2 的判定结果：PRD 审核面的四态 + 还剩哪些决策点没解决。
 
-    返回 ``None`` 表示「判不出来」（审核文件缺失 / 损坏）——按未解决处理；
-    返回空列表表示全部已解决。
+    Attributes:
+        state: 四态取值（:data:`PRD_GATE_ABSENT` / :data:`PRD_GATE_PENDING`
+            / :data:`PRD_GATE_RESOLVED` / :data:`PRD_GATE_UNREADABLE`）。
+        pending: 还没解决的决策点序号；只有 ``pending`` 态有内容。
     """
-    review = _read_json_object(plan_dir / PRD_REVIEW_FILENAME)
+
+    state: str
+    pending: List[Any]
+
+
+def _verification_prd_state(plan_dir: Path) -> Tuple[str, List[Any]]:
+    """PRD 审核面的四态判定。
+
+    返回 ``(state, pending)``：``state`` ∈ {``absent``, ``pending``,
+    ``resolved``, ``unreadable``}，``pending`` 只在 ``pending`` 态里有内容。
+
+    四态互斥，而各自的判据是**不同的东西**：
+
+    * ``absent`` —— ``prd.json`` 与 ``review.json`` 都不在盘上。没有审核面就
+      没有「还没审完」这回事，这道门不适用（快速通道的 plan 就是这种）。
+    * ``pending`` —— 审核面读得懂，但还有决策点没解决；``pending`` 给出还剩
+      哪几条。
+    * ``resolved`` —— 审核面读得懂，且每一条决策点都已经解决。
+    * ``unreadable`` —— 审核面在盘上但读不出来（``review.json`` 字节非法，
+      或者只有 ``prd.json``、审核文件根本不在），或者 ``prd.json`` 在却损坏
+      因而判不出「哪些决策点必须被审过」。按未解决处理，**不**降级成
+      ``absent``。
+
+    返回值是 ``(state, pending)`` 二元组：``state`` 是上面四个取值之一，
+    ``pending`` 只在 ``pending`` 态里有内容。
+
+    「哪些决策点算已解决」的口径与
+    :func:`verification_plan_review.prd_is_resolved` 一致（accepted 或
+    skipped 算已解决）：这是验证分支的最小 PRD 允许整条 skip 的那条口径。
+    分支语义（开发分支只认 accepted）由相位边上的
+    :meth:`plan_state.PlanState.start_verification_plan_generation` 把关 ——
+    那条边只走纯验证分支。
+    """
+    prd_path = plan_dir / PRD_FILENAME
+    review_file = plan_dir / PRD_REVIEW_FILENAME
+    if not prd_path.exists() and not review_file.exists():
+        return _PrdReviewState(PRD_GATE_ABSENT, [])
+
+    review = _read_json_object(review_file)
     if review is None:
-        return None
+        # 审核面在盘上但读不出来（或只有 prd.json、审核文件根本不在）。
+        return _PrdReviewState(PRD_GATE_UNREADABLE, [])
+
     raw_items = review.get("items")
     if not isinstance(raw_items, list):
         raw_items = []
@@ -2206,14 +2273,17 @@ def _verification_prd_pending(plan_dir: Path) -> Optional[List[Any]]:
             statuses[raw.get("index")] = str(raw.get("status") or STATUS_PENDING)
     required = _verification_required_prd_indices(plan_dir, raw_items)
     if required is None:
-        return None
+        # ``prd.json`` 在但损坏 —— 判不出「哪些决策点必须被审过」。
+        return _PrdReviewState(PRD_GATE_UNREADABLE, [])
     pending = [
         index
         for index in required
         if statuses.get(index) not in RESOLVED_STATUSES
     ]
     pending.sort(key=repr)
-    return pending
+    if pending:
+        return _PrdReviewState(PRD_GATE_PENDING, pending)
+    return _PrdReviewState(PRD_GATE_RESOLVED, [])
 
 
 def _plan_generation_target_allowed(phase: str) -> bool:
@@ -2228,6 +2298,28 @@ def _plan_generation_target_allowed(phase: str) -> bool:
     allowed.update(VERIFICATION_PHASE_TRANSITIONS.get(phase, []))
     allowed.update(DEDICATED_PHASE_TRANSITIONS.get(phase, []))
     return "tasks_generation" in allowed
+
+
+def _plan_dir_inside_plans_root(plan_dir: Path) -> bool:
+    """计划目录必须落在计划根之内（**解析符号链接之后**）。
+
+    ``validate_plan_id`` 挡的是**字符串**形态的穿越：``../x``、
+    ``/etc/passwd``、``a/../../b`` —— 它们的 id 本身不合法，校验器直接拒。
+
+    符号链接形态它挡不住：``escape-link`` 是一个完全合法的 id，可它指向的
+    目录在计划根之外。字符串合法就意味着校验器放行，于是「目录在根外」这件
+    事只能由**解析之后**的包含性检查来挡 —— 少了那一道，一个合法的 id 就
+    足以把写入引到根外。
+
+    两边都解析：计划根本身也可能是个符号链接（临时目录在某些平台上是），
+    只解析一边会把合法的 plan 判成越界。
+    """
+    try:
+        root = Path(_server.PLANS_DIR).resolve()
+        resolved = Path(plan_dir).resolve()
+    except OSError:
+        return False
+    return resolved == root or root in resolved.parents
 
 
 def _recorded_baseline(state: Any) -> Optional[Dict[str, Any]]:
@@ -2266,7 +2358,41 @@ def generate_verification_plan(plan_id: str, req: _server.RefineRequest = None):
             ``verification_plan_invalid``（生成的文档不满足十章节契约，且
             没有落盘）；504（生成超时）。
     """
+    # 上面那段 docstring 是**已发布的 OpenAPI 描述**：端点 docstring 逐字进入
+    # ``app.openapi()``，改它就是改对外契约，而对外契约的基线
+    # （``backend/tests/api/openapi_snapshot.json`` 与 ``test_openapi_unchanged.py``
+    # 里的 ``BASELINE_FINGERPRINT``）不在本任务的改动清单里 —— 所以这里保持
+    # 逐字不变，把**真实**的门写在这里。改 docstring 的正确做法是：连基线
+    # 一起重取（删快照文件重跑该测试 + 更新指纹），两者同一个提交。
+    #
+    # 真实的门（PRD 决策点 2：计划书是任务清单之后的**可选附加动作**）：
+    #
+    #   0. **基线门** —— 两条分支都保留：缺基线 → 422 ``baseline_missing``，
+    #      且不落盘。基线是计划书的内容契约，不是分支门禁，所以它**先判**：
+    #      它的结论在两条分支上必须是同一个答案。
+    #   1. **PRD 审核面四态**（:func:`_verification_prd_state`）—— 缺席
+    #      （盘上没有审核面）→ 这道门不适用，放行；读得懂但还有没解决的决策点
+    #      → 409 ``prd_review_incomplete``，载荷带 ``review_readable=true``
+    #      与 ``pending``；读不出来 → 409 ``prd_review_incomplete`` +
+    #      ``review_readable=false``；读得懂且都审完了 → 放行。
+    #      「目录里已有 ``tasks.json`` 就 409 ``artifact_conflict``」那道门
+    #      **已经删掉了**：共存合法，计划书是附加产物。
+    #   2. **阶段门只属纯验证分支** —— 开发分支生成计划书不改它的相位。
+    #
+    # 入口的第一道门是 **plan id 本身**：字符串形态的穿越由共享校验器挡下，
+    # 符号链接形态由解析之后的包含性检查挡下。两道都在**碰文件系统之前**，
+    # 所以一个被拒的请求不会在盘上留下任何东西。
+    plan_id = _server._validated_plan_id(plan_id)
     plan_dir = _server._plan_dir(plan_id)
+    if not _plan_dir_inside_plans_root(plan_dir):
+        raise HTTPException(
+            400,
+            {
+                "error": "Invalid plan id",
+                "detail": "plan id 指向的目录不在计划根目录之内。",
+                "plan_id": plan_id,
+            },
+        )
     if not plan_dir.exists():
         raise HTTPException(
             404,
@@ -2277,61 +2403,29 @@ def generate_verification_plan(plan_id: str, req: _server.RefineRequest = None):
             },
         )
 
-    # 门 1 —— 产物不冲突。``tasks.json`` 在场说明这个 plan 要走开发分支，
-    # 而验证分支的产物是计划书。框架不替人择一，也不删任何文件：两个产物
-    # 的**相对路径**交回去，由操作者裁决。
+    # 产物判定：目录里有 ``tasks.json`` → 开发分支（两类产物共存时也按
+    # 「任务优先」归这里 —— 计划书是**附加产物**，不是冲突）。判定来自
+    # :func:`plan_artifacts.detect`（唯一入口）。
     #
-    # 载荷与其它四个调用点逐字相同（共用 ``routes.plans`` 里的构造器）。那里
-    # 的导入是**函数内**的：路由模块之间在模块级互相导入会绕成环（``server``
-    # 在文件底部才导入它们），函数内导入是在请求到达时求值，那时一切都已加载
-    # 完毕。
-    from routes.plans import artifact_conflict_payload
-
+    # 「产物冲突」那道门**已经删掉了**：共存是合法的，所以目录里已有
+    # ``tasks.json`` 不再是这个入口的拒绝理由（PRD 决策点 2：验证计划书是
+    # 任务清单之后的一个可选附加动作）。
     artifacts = detect(plan_dir)
-    if artifacts.tasks_path is not None:
-        raise HTTPException(
-            409,
-            artifact_conflict_payload(plan_id, artifacts),
-        )
+    dev_branch = artifacts.tasks_path is not None
 
-    # 门 2 —— PRD 已审完（accepted 或 skipped 都算已解决）。
-    pending = _verification_prd_pending(plan_dir)
-    if pending is None or pending:
-        raise HTTPException(
-            409,
-            {
-                "error": "prd_review_incomplete",
-                "detail": (
-                    "PRD 审核还没解决：最小 PRD 的每一条决策点都要 accept 或 "
-                    "skip，才能生成验证计划书。"
-                ),
-                "plan_id": plan_id,
-                # 判不出来时是空的 —— 那是「读不懂」，不是「还有几条没审」。
-                "pending": list(pending) if pending else [],
-                "review_readable": pending is not None,
-            },
-        )
-
-    # 门 3 —— 阶段能进计划书生成。
     state = _server.PlanState(plan_dir)
     current_phase = state.get_current_phase()
-    if not _plan_generation_target_allowed(current_phase):
-        raise HTTPException(
-            409,
-            {
-                "error": "stage_mismatch",
-                "reason": "stage_mismatch",
-                "detail": (
-                    f"当前阶段 {current_phase} 不能进计划书生成；PRD 审完之后"
-                    "（prd_review）才生成计划书。"
-                ),
-                "plan_id": plan_id,
-                "current_phase": current_phase,
-            },
-        )
 
-    # 基线：只从计划状态里读。这个端点没有基线参数，注入进来的基线字段
-    # 不会、也不允许改变这里读到的那一份。
+    # 基线门 —— 两条分支都保留，而且**先判**。
+    #
+    # 基线只从计划状态里读：这个端点没有基线参数，注入进来的基线字段不会、
+    # 也不允许改变这里读到的那一份。缺基线时没有第二条路可走 —— 只能拒绝，
+    # 不能就地编一个（计划书的 ``baseline:`` 行必须与已记录的基线一致）。
+    #
+    # 为什么排在另外两道门**前面**：基线门的结论既不依赖分支，也不依赖审核
+    # 面，所以它在两条分支上必须是同一个答案 —— 先判还保证它不会被别的门顶
+    # 掉。门 1 当初就顶掉过它（VP-010：共存 plan 缺基线时请求停在产物冲突门
+    # 上，穿不到基线门）：一个不属于这条分支的门不该替基线门回答。
     baseline = _recorded_baseline(state)
     if baseline is None:
         raise HTTPException(
@@ -2354,6 +2448,64 @@ def generate_verification_plan(plan_id: str, req: _server.RefineRequest = None):
             "pr": baseline.get("pr_number"),
         },
     }
+
+    # 门 2 —— PRD 审核面四态。
+    #
+    # * ``pending``（读得懂，但还有没解决的决策点）→ 409，载荷说清「读得懂，
+    #   但没审完」。
+    # * ``unreadable``（审核面在，但读不出来）→ 409，载荷说清「读不出来」。
+    # * ``absent``（盘上根本没有审核面）→ 这道门不适用，放行。
+    # * ``resolved``（读得懂，且都审完了）→ 放行。
+    prd_state, prd_pending = _verification_prd_state(plan_dir)
+    if prd_state == PRD_GATE_UNREADABLE:
+        raise HTTPException(
+            409,
+            {
+                "error": "prd_review_incomplete",
+                "detail": (
+                    "PRD 审核面读不出来：审核文件在盘上但解析不了，按未解决处理"
+                    "——一份损坏的审核文件不能当成审完了。"
+                ),
+                "plan_id": plan_id,
+                # 读不懂的时候没有「还有几条没审」这回事：那是空的。
+                "pending": [],
+                "review_readable": False,
+            },
+        )
+    if prd_state == PRD_GATE_PENDING:
+        raise HTTPException(
+            409,
+            {
+                "error": "prd_review_incomplete",
+                "detail": (
+                    "PRD 审核还没解决：最小 PRD 的每一条决策点都要 accept 或 "
+                    "skip，才能生成验证计划书。"
+                ),
+                "plan_id": plan_id,
+                "pending": list(prd_pending),
+                "review_readable": True,
+            },
+        )
+
+    # 门 3 —— 阶段门**只属于纯验证分支**。
+    #
+    # 开发分支的 plan 生成计划书是一个附加动作：它的相位是开发流程自己的事，
+    # 生成与否都不改（PRD 决策点 2）。纯验证分支则相反 —— 计划书就是它这个
+    # 分支的产物，生成完要停在「计划书待审」等人审，所以相位门留着。
+    if not dev_branch and not _plan_generation_target_allowed(current_phase):
+        raise HTTPException(
+            409,
+            {
+                "error": "stage_mismatch",
+                "reason": "stage_mismatch",
+                "detail": (
+                    f"当前阶段 {current_phase} 不能进计划书生成；PRD 审完之后"
+                    "（prd_review）才生成计划书。"
+                ),
+                "plan_id": plan_id,
+                "current_phase": current_phase,
+            },
+        )
 
     coding_tool = _server.create_coding_tool(cwd=_coding_tool_cwd(plan_id, plan_dir), scene="tasks_generation")
     try:
@@ -2398,25 +2550,30 @@ def generate_verification_plan(plan_id: str, req: _server.RefineRequest = None):
             },
         )
 
-    # 阶段推进：专用入口（PRD skip 的那条边）→ 「计划书待审」。
+    # 阶段推进：**只发生在纯验证分支**。
     #
     # 顺序有讲究：文档先落盘，阶段后推进。专用入口判「PRD 是否已解决」时
     # 按分支区分 skip 的语义 —— 目录里有了计划书，验证分支才算落地，skip
     # 这时才算数。文档没落盘之前调它，整条 skip 的 PRD 会被误判成没审完。
-    try:
-        state.start_verification_plan_generation()
-        state.transition_to("verification_plan_review")
-    except ValueError as exc:
-        raise HTTPException(
-            409,
-            {
-                "error": "stage_mismatch",
-                "reason": "stage_mismatch",
-                "detail": str(exc),
-                "plan_id": plan_id,
-                "current_phase": state.get_current_phase(),
-            },
-        )
+    #
+    # 开发分支**不**推进相位：计划书对它是一个附加动作，生成与否都不改它
+    # 正常流程的相位（PRD 决策点 2）。把开发分支的 plan 推进到「计划书待审」
+    # 会把它从开发流程里摘走 —— 那不是「附加」，那是「改道」。
+    if not dev_branch:
+        try:
+            state.start_verification_plan_generation()
+            state.transition_to("verification_plan_review")
+        except ValueError as exc:
+            raise HTTPException(
+                409,
+                {
+                    "error": "stage_mismatch",
+                    "reason": "stage_mismatch",
+                    "detail": str(exc),
+                    "plan_id": plan_id,
+                    "current_phase": state.get_current_phase(),
+                },
+            )
 
     return {
         "plan_id": plan_id,
