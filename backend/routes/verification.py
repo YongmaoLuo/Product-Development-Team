@@ -47,8 +47,10 @@ from verification_buckets import (
 
 # ``plan_artifacts`` 是叶子模块（只依赖 pathlib / typing），所以这里可以安全地
 # 模块级导入 —— 判定「这条 plan 走哪条分支」只有一个入口，见
-# :func:`plan_artifacts.detect`。
-from plan_artifacts import BRANCH_CONFLICT, detect
+# :func:`plan_artifacts.detect`；机器计划的文件名也只有一处定义，见
+# :data:`plan_artifacts.MACHINE_PLAN_FILENAME`（本模块保留同名别名，调用点
+# 不变，但「这个文件叫什么」不再有两份抄写）。
+from plan_artifacts import BRANCH_VERIFICATION, MACHINE_PLAN_FILENAME, detect
 
 # ``bounded_log`` 是叶子模块（只依赖 os / threading / pathlib / typing），所以这里可以
 # 安全地模块级导入 —— 轮转副本的命名规则只有一份实现，读侧与写侧不可能漂移。
@@ -715,7 +717,7 @@ def _verification_status_from_db(plan_id: str) -> dict:
 
     plan_dir = _server._plan_dir(plan_id)
     verification_points = []
-    plan_file = plan_dir / "verification_plan.json"
+    plan_file = plan_dir / MACHINE_PLAN_FILENAME
     if plan_file.exists():
         try:
             verification_points = json.loads(plan_file.read_text(encoding="utf-8")).get("verification_points", [])
@@ -809,7 +811,7 @@ def _get_verification_status(plan_id: str) -> dict:
     plan_dir = _server._plan_dir(plan_id)
     verification_points = []
     if plan_dir.exists():
-        plan_file = plan_dir / "verification_plan.json"
+        plan_file = plan_dir / MACHINE_PLAN_FILENAME
         if plan_file.exists():
             try:
                 with open(plan_file, "r", encoding="utf-8") as f:
@@ -1096,9 +1098,18 @@ def _verification_review_ready(plan_dir: Path) -> bool:
 # PR head 在模型思考期间移动是完全现实的事。所以漂移校验有两次 —— 放行前那次
 # （不白花一次模型调用）与物化前那次（权威的那次）。两次之间隔着的就是那次
 # 模型调用。
+#
+# 2026-11-12：这条管线拆成两段，两段的**分派依据不同** ——
+#
+# * 「计划准备」（翻译 + 等价校验）由**来源**决定：计划书在（``REVIEWED``）
+#   时两条分支同等对待。开发分支上审过的计划书同样要变成可消费的机器计划，
+#   同样要与盘上那一份逐条相等；
+# * 「验证对象准备」（漂移校验 → 物化 worktree → 注册 ``project_dir``）由
+#   **分支**决定：只有纯验证分支、且审核完备时才做 —— 那三步是为「验证一个
+#   PR 对象」服务的，开发分支的验证跑在自己的目录里。
 
-#: 验证分支的机器计划：验证回路读的那一份（与验证 agent 写出的同名同格式）。
-MACHINE_PLAN_FILENAME = "verification_plan.json"
+# 机器计划的文件名（``verification_plan.json``）由 :mod:`plan_artifacts` 统一
+# 定义、在本模块顶部导入 —— 这里不再另抄一份，避免两份常量漂开。
 
 
 def _verification_branch_prelude(
@@ -1107,36 +1118,190 @@ def _verification_branch_prelude(
     *,
     review_ready: bool,
 ) -> Optional[JSONResponse]:
-    """验证分支的前奏：把「能开始验证」这件事做完，再让循环跑起来。
+    """验证轮启动的前奏：把「能开始验证」这件事做完，再让循环跑起来。
+
+    前奏分两段，**分派依据不同**：
+
+    * **计划准备**（:func:`_prepare_machine_plan`）由**来源**决定 ——
+      :func:`plan_artifacts.resolve_plan_source` 判出 ``REVIEWED``（计划书在）
+      时执行，两条分支同等对待。计划书是人审的真源，机器计划是它的派生物，
+      两者必须逐条等价；这份「等价」与走哪条路无关，所以开发分支上同样要
+      过这道门禁。
+    * **验证对象准备**（:func:`_materialise_verification_workspace`：基线漂移
+      校验 → 物化 worktree → 注册 ``project_dir``）由**分支**决定 —— 只有纯
+      验证分支、且审核完备时才做。开发分支的验证跑在自己的目录里，不是跑在
+      被验证对象的 worktree 里。
+
+    2026-11-12：这段以前按分支分派（``detect() != verification`` 就整段跳
+    过），于是开发分支永远走不到翻译与等价性门禁 —— 盘上的机器计划与当前计
+    划书对不上时，启动会一路走到相位拒绝（409 ``stage_mismatch``），把「审过
+    的东西和要验的东西不是同一批」这件事藏起来。
 
     Args:
         plan_id: plan id。
         plan_dir: plan 目录。
         review_ready: 「验证分支已就绪」（审核完备 + 基线与 ref 一致）。不就绪
-            的计划不进这条管线 —— 它的答案由既有的 409 ``stage_mismatch`` 给出，
-            不新增错误码。
+            的纯验证分支不进「验证对象准备」这一段 —— 它的答案由既有的 409
+            ``stage_mismatch`` 给出，不新增错误码。
 
     Returns:
         ``None`` 表示放行（继续既有循环）；``JSONResponse`` 表示中止（4xx）。
     """
-    from plan_artifacts import BRANCH_VERIFICATION, detect
+    from plan_artifacts import (
+        PlanSource,
+        detect,
+        resolve_plan_source,
+    )
 
     artifacts = detect(plan_dir)
-    if artifacts.branch != BRANCH_VERIFICATION:
-        # 开发分支（以及产物冲突、目录为空）完全走原路径：不建 worktree、
-        # 不改写 project_dir、也不问模型。产物冲突的 409 映射由产物判定那条
-        # 线负责 —— 本任务只按 ``detect`` 返回的 branch 分流。
-        return None
+    verification_branch = artifacts.branch == BRANCH_VERIFICATION
 
-    if not review_ready:
+    if verification_branch and not review_ready:
         # 审核不完备 / 基线与 ref 对不上 → 交给既有的 409 ``stage_mismatch``。
         return None
 
-    failure = _prepare_machine_plan(plan_id, plan_dir)
-    if failure is not None:
-        return failure
+    if resolve_plan_source(plan_dir) is PlanSource.REVIEWED:
+        # 计划准备：翻译 + 等价性门禁。门禁失败按既有语义回 422
+        # ``verification_plan_equivalence_failed`` 并带 ``divergences``，**不
+        # 落盘**、不回退到 LLM 自动生成 —— 审过的东西和要验的东西不是同一批
+        # 时，这件事必须硬失败并说清楚差在哪。
+        failure = _prepare_machine_plan(plan_id, plan_dir)
+        if failure is not None:
+            return failure
+
+    if not verification_branch:
+        # 开发分支（以及目录为空）走原路径：不建 worktree、不改写
+        # project_dir、也不做基线漂移校验。
+        return None
 
     return _materialise_verification_workspace(plan_id, plan_dir)
+
+
+#: 计划书的体积上限（字节）。1 MiB 足够装下一份人写的计划书，而「读一份
+#: 无限大的文件」在生产里没有意义 —— 它只会把一次请求变成一次内存炸弹。
+MAX_PLAN_DOC_BYTES: int = 1 << 20
+
+#: 计划书里单行的长度上限（字符）。一行上万字符说明这份文档不是给人看的，
+#: 多半是别的东西被写进了计划书的位置。
+MAX_PLAN_DOC_LINE_CHARS: int = 10_000
+
+
+def _code_fences_balanced(text: str) -> bool:
+    """代码围栏的个数是不是偶数。
+
+    围栏成对是 markdown 的基本约定；个数是单数说明这份文档里套着半个代码
+    块 —— 读它的人（和读它的模型）看到的边界是乱的。
+    """
+    fences = sum(
+        1 for line in text.splitlines() if line.strip().startswith("```")
+    )
+    return fences % 2 == 0
+
+
+def _read_plan_doc(
+    plan_id: str,
+    plan_dir: Path,
+) -> Tuple[Optional[str], Optional[JSONResponse]]:
+    """读计划书，并把「读不出来 / 不是合法文本 / 大得离谱」变成 4xx。
+
+    计划书是**不可信输入**：它由模型写、由人审，落到盘上之后又被当成真源
+    读回来。所以这一段挡的不是「写得对不对」，而是**读**的那几种坏法：文件读
+    不出来、不是合法 UTF-8、体积失控、单行失控、代码围栏不成对。
+
+    错误体里**不出现路径**：异常原文会把本机的绝对路径（连盘符带文件名）
+    一起抄出去，而错误体会被贴进卡片、贴进日志、发给运维。
+
+    Returns:
+        ``(正文, 失败响应)``。两者恰有一个是 ``None``。
+    """
+    from plan_artifacts import PLAN_DOC_FILENAME
+
+    doc_path = plan_dir / PLAN_DOC_FILENAME
+    try:
+        raw = doc_path.read_bytes()
+    except OSError:
+        return None, JSONResponse(
+            status_code=422,
+            content={
+                "error": "verification_plan_invalid",
+                "detail": "验证计划书读不出来（文件不存在或不可读）。",
+                "plan_id": plan_id,
+            },
+        )
+
+    if len(raw) > MAX_PLAN_DOC_BYTES:
+        return None, JSONResponse(
+            status_code=422,
+            content={
+                "error": "verification_plan_invalid",
+                "detail": (
+                    f"验证计划书太大（超过 {MAX_PLAN_DOC_BYTES} 字节上限）。"
+                ),
+                "plan_id": plan_id,
+            },
+        )
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, JSONResponse(
+            status_code=422,
+            content={
+                "error": "verification_plan_invalid",
+                "detail": "验证计划书不是合法的 UTF-8 文本。",
+                "plan_id": plan_id,
+            },
+        )
+
+    if any(len(line) > MAX_PLAN_DOC_LINE_CHARS for line in text.splitlines()):
+        return None, JSONResponse(
+            status_code=422,
+            content={
+                "error": "verification_plan_invalid",
+                "detail": (
+                    f"验证计划书里有一行过长（超过 {MAX_PLAN_DOC_LINE_CHARS} "
+                    "字符上限）。"
+                ),
+                "plan_id": plan_id,
+            },
+        )
+
+    if not _code_fences_balanced(text):
+        return None, JSONResponse(
+            status_code=422,
+            content={
+                "error": "verification_plan_invalid",
+                "detail": "验证计划书的代码围栏不成对。",
+                "plan_id": plan_id,
+            },
+        )
+
+    return text, None
+
+
+def _publish_machine_plan(path: Path, payload: Dict[str, Any]) -> None:
+    """把机器计划**原子地**发布到 ``path``。
+
+    先写同目录下的临时文件，再改名：改名是原子的，所以读的人看到的要么是
+    旧的那一份、要么是完整的新的一份，绝不会是半个 JSON —— 而半个 JSON 比
+    没有更糟：它读得出来、看着像一份计划，于是验证轮去验一份不存在的计划。
+
+    崩在半路时临时文件被删掉，目标文件保持原样。
+
+    Raises:
+        OSError: 写入或改名失败（调用方把它变成一个结构化的失败）。
+    """
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    tmp_path = path.with_name(path.name + ".tmp")
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _prepare_machine_plan(plan_id: str, plan_dir: Path) -> Optional[JSONResponse]:
@@ -1152,22 +1317,12 @@ def _prepare_machine_plan(plan_id: str, plan_dir: Path) -> Optional[JSONResponse
     Returns:
         ``None`` 表示机器计划就绪（已落盘）；``JSONResponse`` 表示中止。
     """
-    from plan_artifacts import PLAN_DOC_FILENAME
     from verification_plan_doc import StructureError, parse_plan_doc
     from verification_plan_translator import validate_equivalence
 
-    doc_path = plan_dir / PLAN_DOC_FILENAME
-    try:
-        text = doc_path.read_text(encoding="utf-8")
-    except OSError as exc:
-        return JSONResponse(
-            status_code=422,
-            content={
-                "error": "verification_plan_invalid",
-                "detail": f"验证计划书读不出来：{exc}",
-                "plan_id": plan_id,
-            },
-        )
+    text, failure = _read_plan_doc(plan_id, plan_dir)
+    if failure is not None:
+        return failure
 
     try:
         parsed = parse_plan_doc(text)
@@ -1215,10 +1370,21 @@ def _prepare_machine_plan(plan_id: str, plan_dir: Path) -> Optional[JSONResponse
 
     if not existed:
         # 只有管线**自己**译出来的那一份才写盘：盘上已有的那一份原样留着。
-        machine_plan_path.write_text(
-            json.dumps(machine_plan, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        #
+        # 落盘是**原子**的（先写临时文件，再改名）：崩在半路时目标文件要么
+        # 是旧的、要么根本不存在，绝不会是半个 JSON。写失败是一个**服务端**
+        # 的故障（不是文档非法），所以答案是 500 —— 422 在这里会说谎。
+        try:
+            _publish_machine_plan(machine_plan_path, machine_plan)
+        except OSError:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": "verification_plan_write_failed",
+                    "detail": "机器计划落盘失败（文件系统拒绝了这次写入）。",
+                    "plan_id": plan_id,
+                },
+            )
 
     return None
 
@@ -1239,12 +1405,21 @@ def _machine_plan_for(
     if machine_plan_path.exists():
         try:
             loaded = json.loads(machine_plan_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
+        except OSError:
             return None, JSONResponse(
                 status_code=422,
                 content={
                     "error": "verification_plan_invalid",
-                    "detail": f"盘上的机器计划读不出来：{exc}",
+                    "detail": "盘上的机器计划读不出来（文件不可读）。",
+                    "plan_id": plan_id,
+                },
+            )
+        except ValueError:
+            return None, JSONResponse(
+                status_code=422,
+                content={
+                    "error": "verification_plan_invalid",
+                    "detail": "盘上的机器计划不是合法的 JSON。",
                     "plan_id": plan_id,
                 },
             )
@@ -1464,8 +1639,13 @@ def _persist_auto_loop_crash(plan_id: str, exc: BaseException) -> None:
 
     落盘失败不能外抛 —— 这一段跑在 verification 线程里，抛出去只
     会换一个地方炸，而内存里的 failed 已经是运维看得见的事实了。
+
+    落盘的**原因**只有异常类型，不含异常原文：原文里常常带着绝对路径
+    （读的是哪个文件、哪个目录），而这一句会被写进终态、贴进卡片、发给
+    运维。完整的栈在日志里（``_run_auto_loop_with_crash_persistence`` 记的
+    那条 ``logger.exception``），排查时从日志看，不从终态看。
     """
-    reason = f"auto_loop_crash: {exc}"
+    reason = f"auto_loop_crash: {type(exc).__name__}"
     state = _server._verification_state.get(plan_id)
     if state:
         state.update({
@@ -1604,24 +1784,26 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
     except ArchivedPlanError:
         return JSONResponse(status_code=410, content={"error": "archived"})
 
-    # 产物门禁（五个调用点之一）。
+    # 产物判定（五个调用点之一）。
     #
-    # 两类产物（``tasks.json`` / ``verification-plan.md``）同时存在时，这条 plan
-    # 到底走哪条分支**还没人裁决**。这时候**不能进 CAS**：CAS 成功就是阶段推进，
-    # 阶段一动就把人的裁决权抹掉了 —— 框架替人择一，正是这条门禁要防的事。
+    # 2026-11-13（任务 7）：这里原来有一道「产物冲突 → 409
+    # ``artifact_conflict``」的门禁 —— 两类产物同时存在时「没人裁决」，所以
+    # 不许进 CAS。共存合法之后（:func:`plan_artifacts.detect` 按「任务优先」
+    # 把「任务清单 + 计划书」归入 ``dev`` 分支），``detect`` 的输出域里**没有**
+    # ``conflict`` 了 —— 那道门禁于是永远不会触发。
     #
-    # 判定来自 :func:`plan_artifacts.detect`（唯一入口）；错误语义与其它四个
-    # 调用点逐字相同。载荷构造器住在 ``routes.plans``（状态接口与列表的所在地），
-    # 那里是**函数内**导入的：路由模块之间在模块级互相导入会绕成环（``server``
-    # 在文件底部才导入它们），函数内导入是在请求到达时求值，那时一切都已加载。
-    from routes.plans import artifact_conflict_payload
-
+    # 清理它不是为了改行为（行为从来没变过），而是为了让「验证启动不再被产物
+    # 门拦」这件事在**源码里**看得见：留着它，下一个读代码的人会以为启动仍然
+    # 会被产物状态拦下，而真相是这条 plan 走哪条路由**验证流水线自己的门**
+    # 决定 —— 开发分支要求开发任务先完成（CAS 的源阶段仍是 ``executing``），
+    # 纯验证分支要求审核完备（见 :func:`_verification_review_ready`）。
     artifacts = detect(plan_dir)
-    if artifacts.branch == BRANCH_CONFLICT:
-        return JSONResponse(
-            status_code=409,
-            content=artifact_conflict_payload(plan_id, artifacts),
-        )
+
+    # 只有**纯验证分支**才把 ``verification_plan_review`` 加进 CAS 的源阶段
+    # 集合。共存目录的主分支是开发分支，所以它拿不到那个额外源阶段 ——
+    # 开发任务没做完时 ``/start`` 仍然是 409 ``stage_mismatch``，
+    # **不跳过执行**。
+    _verification_branch = artifacts.branch == BRANCH_VERIFICATION
 
     # --- round budget resolution (2026-09-20) ---------------------------
     # An explicit ``max_rounds`` in the body wins — that is the supported
@@ -1932,7 +2114,21 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
             # keeps the old source set — so it still answers the
             # existing ``409 stage_mismatch`` instead of a new error
             # code.
-            + (("verification_plan_review",) if _review_ready else ())
+            #
+            # 2026-11-13 (task 7): that extra source phase belongs to
+            # the **pure verification branch** only. The branch is
+            # decided here, from the one artefact judgement
+            # (``detect``), instead of being implied by the readiness
+            # predicate: a coexisting directory is a development branch
+            # (``detect`` answers ``dev`` for "task list + plan doc"),
+            # so it never gets ``verification_plan_review`` — its
+            # development tasks still have to be finished before a
+            # verification round may start.
+            + (
+                ("verification_plan_review",)
+                if (_verification_branch and _review_ready)
+                else ()
+            )
             # 2026-11-23: the scheduler requeues a stopped plan to
             # ``queued`` before it admits it again, so an interrupted
             # verification round that is resumed through the scheduler
@@ -2854,11 +3050,11 @@ def reset_verification(
     # the VP list is a different decision from discarding the round's
     # outputs, and it is the one that recycles VP ids. Default off.
     if req.clear_verification_plan:
-        target = plan_dir / "verification_plan.json"
+        target = plan_dir / MACHINE_PLAN_FILENAME
         if target.exists():
             try:
                 target.unlink()
-                removed.append("verification_plan.json")
+                removed.append(MACHINE_PLAN_FILENAME)
             except OSError:
                 _server.logger.exception("[reset] unlink failed %s", target)
 
@@ -3891,7 +4087,7 @@ def _verification_progress_body(
     # itself uses ``vps`` in its in-memory plan. Accept both so the
     # endpoint works for plans from either pipeline.
     plan_vps: List[dict] = []
-    plan_file = plan_dir / "verification_plan.json"  # noqa: F841 — used below
+    plan_file = plan_dir / MACHINE_PLAN_FILENAME  # noqa: F841 — used below
     if plan_file.exists():
         try:
             with open(plan_file, "r", encoding="utf-8") as f:
@@ -4298,7 +4494,7 @@ def _load_vp_splits_for_progress(plan_id: str) -> List[Dict[str, Any]]:
     """
     out: List[Dict[str, Any]] = []
     seen: set = set()
-    plan_file = _server._plan_dir(plan_id) / "verification_plan.json"
+    plan_file = _server._plan_dir(plan_id) / MACHINE_PLAN_FILENAME
     try:
         if plan_file.exists():
             with open(plan_file, "r", encoding="utf-8") as f:
@@ -4628,7 +4824,10 @@ def get_verification_repair_tasks(plan_id: str):
 _REPORT_FILENAME = "verification_report.json"
 
 #: The plan's VP list — the universe a round's verdicts are drawn from.
-_VP_PLAN_FILENAME = "verification_plan.json"
+#:
+#: The filename itself is :data:`plan_artifacts.MACHINE_PLAN_FILENAME`, imported
+#: at the top of this module. It used to be copied here as
+#: ``_VP_PLAN_FILENAME``, which gave "what is this file called" two answers.
 
 
 def _load_report(plan_dir: Path) -> Dict[str, Any]:
@@ -4681,7 +4880,7 @@ def _round_vp_ids(
     seen = set()
     try:
         with open(
-            Path(plan_dir) / _VP_PLAN_FILENAME, "r", encoding="utf-8",
+            Path(plan_dir) / MACHINE_PLAN_FILENAME, "r", encoding="utf-8",
         ) as f:
             plan_data = json.load(f)
     except (OSError, ValueError, UnicodeDecodeError):

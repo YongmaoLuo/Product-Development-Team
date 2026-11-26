@@ -2,14 +2,17 @@
 
 为什么要有这组测试
 ------------------
-"这次要产出哪类产物"只有四个答案：``dev`` / ``verification`` / ``conflict``
-/ ``empty``。判定一旦漂了，症状出现在很远的地方：某个入口看到两类产物自己
-挑了一个，另一个入口报错，第三个入口推断出错误阶段 —— 而且每条路径单独看
-都"能跑"。
+"这次要产出哪类产物"只有三个答案：``dev`` / ``verification`` / ``empty``。
+判定一旦漂了，症状出现在很远的地方：某个入口看到两类产物自己挑了一个，
+另一个入口报错，第三个入口推断出错误阶段 —— 而且每条路径单独看都"能跑"。
 
 所以这里穷举 ``tasks.json`` × ``verification-plan.md`` 的 2×2 存在组合，
 而不是抽一个样例。门禁谓词（``require_branch`` / ``is_verification_branch``）
 也按同一组组合验证：判定是纯函数，读一次和读一万次必须是同一个答案。
+
+两类产物**同时存在**不再判为冲突：按「任务优先」的主分支语义它是 ``dev``，
+计划书作为附加产物由 ``plan_doc_path`` 暴露 —— 这条契约的完整钉法见
+``tests/unit/test_plan_artifact_coexistence.py``。
 
 所有用例都用 ``tmp_path`` 真实落盘，不 mock 文件系统 —— 被测的就是
 "文件在不在"。
@@ -34,6 +37,7 @@ from plan_artifacts import (  # noqa: E402
     is_verification_branch,
     require_branch,
 )
+from tests.fixtures.plan_artifacts_fixture import snapshot  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -41,11 +45,12 @@ TASKS = "tasks.json"
 PLAN_DOC = "verification-plan.md"
 
 #: ``(tasks.json 存在, verification-plan.md 存在) → 期望分支``。
-#: 2×2 是判定函数的完整输入域 —— 四行就是全部。
+#: 2×2 是判定函数的完整输入域 —— 四行就是全部。两类产物同时存在时主分支是
+#: ``dev``（计划书是附加产物，不是冲突）。
 TRUTH_TABLE = [
     (True, False, "dev"),
     (False, True, "verification"),
-    (True, True, "conflict"),
+    (True, True, "dev"),
     (False, False, "empty"),
 ]
 
@@ -118,17 +123,23 @@ def test_detect_is_recomputed_not_cached(tmp_path: Path) -> None:
     assert detect(tmp_path).branch == "dev"
 
     _write(tmp_path / PLAN_DOC, "# 验证计划书")
-    assert detect(tmp_path).branch == "conflict"
+    coexist = detect(tmp_path)
+    assert coexist.branch == "dev"
+    assert coexist.plan_doc_path == tmp_path / PLAN_DOC
 
 
 def test_detect_does_not_write_into_the_plan_dir(tmp_path: Path) -> None:
-    """判定是纯读函数：不得在 plan 目录里留下任何东西。"""
+    """判定是纯读函数：不得在 plan 目录里留下任何东西。
+
+    快照必须带上每个文件的 sha256：只看文件名会放过一次「改写字节再还原
+    mtime」的写入 —— 文件名与 mtime 都没变，字节变了。
+    """
     _make_plan_dir(tmp_path, tasks_exists=True)
-    before = sorted(p.name for p in tmp_path.iterdir())
+    before = snapshot(tmp_path)
 
     detect(tmp_path)
 
-    assert sorted(p.name for p in tmp_path.iterdir()) == before
+    assert snapshot(tmp_path) == before
 
 
 def test_artifact_set_is_immutable(tmp_path: Path) -> None:
@@ -143,7 +154,7 @@ def test_artifact_set_is_immutable(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# require_branch()：期望分支匹配则返回，不匹配 / 冲突则抛错
+# require_branch()：期望分支匹配则返回，不匹配则抛错
 # ---------------------------------------------------------------------------
 
 
@@ -176,20 +187,34 @@ def test_require_branch_rejects_mismatch_in_the_other_direction(tmp_path: Path) 
     assert excinfo.value.paths == (tmp_path / TASKS,)
 
 
-def test_require_branch_rejects_conflict(tmp_path: Path) -> None:
-    """两类产物同时存在 → 抛错，且两个路径都留在异常里（不自动择一）。"""
+def test_require_branch_rejects_mismatch_on_coexist(tmp_path: Path) -> None:
+    """两类产物同时存在 → 主分支是 ``dev``；要求 ``verification`` 抛错。
+
+    共存合法，但门禁没失效：期望与实际不符时仍要拦住，两个产物路径都留在
+    异常里（不自动择一）。
+    """
     _make_plan_dir(tmp_path, tasks_exists=True, plan_doc_exists=True)
 
     with pytest.raises(ArtifactConflictError) as excinfo:
-        require_branch(tmp_path, "dev")
+        require_branch(tmp_path, "verification")
 
     assert set(excinfo.value.paths) == {tmp_path / TASKS, tmp_path / PLAN_DOC}
+
+
+def test_require_branch_accepts_dev_on_coexist(tmp_path: Path) -> None:
+    """共存目录要求 ``dev`` 必须放行 —— 共存不是冲突。"""
+    _make_plan_dir(tmp_path, tasks_exists=True, plan_doc_exists=True)
+
+    artifacts = require_branch(tmp_path, "dev")
+
+    assert artifacts.branch == "dev"
+    assert artifacts.plan_doc_path == tmp_path / PLAN_DOC
 
 
 def test_require_branch_rejects_conflict_even_when_conflict_is_expected(
     tmp_path: Path,
 ) -> None:
-    """冲突永远不可被"要求"—— 即使期望值写的就是 conflict。"""
+    """``conflict`` 不再是合法期望值 —— 要求它一律抛错。"""
     _make_plan_dir(tmp_path, tasks_exists=True, plan_doc_exists=True)
 
     with pytest.raises(ArtifactConflictError):
@@ -217,7 +242,7 @@ def test_artifact_conflict_error_carries_paths_and_message(tmp_path: Path) -> No
     _make_plan_dir(tmp_path, tasks_exists=True, plan_doc_exists=True)
 
     with pytest.raises(ArtifactConflictError) as excinfo:
-        require_branch(tmp_path, "dev")
+        require_branch(tmp_path, "verification")
 
     error = excinfo.value
     assert len(error.paths) == 2
@@ -240,7 +265,7 @@ def test_is_verification_branch_mapping(
     plan_doc_exists: bool,
     expected_branch: str,
 ) -> None:
-    """只有 verification 分支为真；conflict 不算 verification。"""
+    """只有 verification 分支为真；共存（dev）不算 verification。"""
     _make_plan_dir(tmp_path, tasks_exists, plan_doc_exists)
 
     assert is_verification_branch(tmp_path) is (expected_branch == "verification")

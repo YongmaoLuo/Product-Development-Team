@@ -539,7 +539,11 @@ def test_dev_branch_does_not_create_worktree(
     monkeypatch,
     no_worker_thread,
 ) -> None:
-    """开发分支 → 不建 worktree，``project_dir`` 不动，也不问模型。"""
+    """开发分支（**无计划书**）→ 不建 worktree，``project_dir`` 不动，也不问模型。
+
+    「无计划书」是这个前提的一部分：有计划书时开发分支同样要过翻译与等价性
+    门禁（见本文件最后一节），那时候问一次模型是**该发生**的事。
+    """
     plan = make_dev_plan()
     tool = _ScriptedTool()
     _use_tool(monkeypatch, tool)
@@ -589,4 +593,46 @@ def test_baseline_drift_during_translation_returns_409(
     )
     assert _routing_phase(plan.plan_id) == REVIEW_PHASE, (
         "循环没启动，阶段没推进"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6. 开发分支 + 计划书：复用盘上的机器计划
+# ---------------------------------------------------------------------------
+
+
+def test_dev_branch_reuses_existing_machine_plan_without_asking_model(
+    make_dev_plan,
+    workspace_root,
+    monkeypatch,
+    no_worker_thread,
+) -> None:
+    """开发分支 + 计划书 + 盘上机器计划 → 复用它，不问模型，不改写它。
+
+    盘上已有的机器计划是上一轮管线写下的产物：它被**逐条**与当前计划书比对
+    —— 计划书改了，比对就会报出差异。所以这里不需要重新翻译：重新翻译等于
+    用模型的新答案覆盖审过的结果。
+    """
+    plan = make_dev_plan()
+    (plan.plan_dir / "verification-plan.md").write_bytes(
+        CANONICAL_MD.encode("utf-8")
+    )
+    plan.machine_plan_path.write_text(
+        json.dumps(MACHINE_PLAN_JSON, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    before = plan.machine_plan_path.read_bytes()
+    tool = _ScriptedTool()
+    _use_tool(monkeypatch, tool)
+
+    resp = client.post(f"/api/verification/{plan.plan_id}/start")
+
+    assert resp.status_code == 200, resp.text
+    assert not tool.prompts, "盘上已有机器计划时不再问模型"
+    assert plan.machine_plan_path.read_bytes() == before, (
+        "盘上那一份原样留着，不被改写"
+    )
+    assert not (workspace_root / plan.plan_id).exists(), "开发分支不建 worktree"
+    assert _project_dir(plan.plan_id) == str(plan.project_dir), (
+        "project_dir 没被改写"
     )

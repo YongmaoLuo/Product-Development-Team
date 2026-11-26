@@ -31,7 +31,6 @@ import server as _server
 # 模块级导入 —— 判定「这条 plan 走哪条分支」只有一个入口，见
 # :func:`plan_artifacts.detect`。
 from plan_artifacts import (  # noqa: E402
-    BRANCH_CONFLICT,
     PLAN_DOC_FILENAME,
     TASKS_FILENAME,
     ArtifactSet,
@@ -66,72 +65,95 @@ _PLAN_DOC_REVIEW_PHASE = "verification_plan_review"
 
 
 # ---------------------------------------------------------------------------
-# 产物冲突：五个调用点共用的错误语义
+# 产物判定：读路径共用的错误语义与载荷
 # ---------------------------------------------------------------------------
 #
-# 一个 plan 目录里可能同时躺着两类互斥的产物：``tasks.json``（开发分支）与
-# ``verification-plan.md``（验证分支）。两类都在时，「这条 plan 到底想干什么」
-# **只有人能回答** —— 框架替它择一，等于替用户做决定；框架直接拒绝，至少把
-# 两条路都交回去，由操作者裁决。
+# 一个 plan 目录里可能同时躺着两类产物：``tasks.json``（开发分支）与
+# ``verification-plan.md``（验证分支）。**两者共存不是冲突** —— 按「任务
+# 优先」的主分支语义，这条 plan 就是一条开发分支的计划，只不过额外带着一份
+# 计划书（附加产物）。
 #
 # 判定收敛在 :func:`plan_artifacts.detect` 这一个纯函数里（任务 1）。这里收的是
-# **判定结果的消费者**：五个调用点（任务生成、单计划状态、计划书生成、
-# ``/start``、计划列表）都接上它，冲突时给出**逐字相同**的 409
-# ``artifact_conflict``。漏接一个，某个入口就会自己择一个把事情做下去。
+# **判定结果的消费者**：单计划状态与计划列表把**主分支**和**两份产物的相对
+# 名**交回去；方向不对的生成入口给出 409 ``artifact_conflict``。
+#
+# 共存是**单向**的，两个方向各归各位：计划书生成**放行**（计划书是任务清单
+# 之后的可选附加动作，PRD 决策点 2），任务生成**被拒**（目录里已有计划书时
+# 不再写任务清单 —— 不把一条纯验证分支的计划改造成开发分支）。所以任务生成
+# 入口的这个 409 描述的是「**反向生成被拒**」，不再是「两类产物互斥」。
+#
+# 错误码字符串 ``artifact_conflict`` **保留**：它是既有 API 契约的一部分，
+# 调用方拿它识别「产物状态不符」这一类回答。
 #
 # 响应体里只有 plan 的**相对名**（``tasks.json`` / ``verification-plan.md``）：
 # 调用方拿它去自己的 plan 目录里找文件，不必知道服务器把 plan 放在哪 ——
 # 绝对路径既泄露本机布局，也让响应在别的机器上不可用。
 
-#: 产物冲突的机器可读错误码（五个调用点共用一个字符串）。
+#: 产物状态不符的机器可读错误码（两个生成入口共用一个字符串）。
 ARTIFACT_CONFLICT_ERROR = "artifact_conflict"
 
-#: 冲突时交回去的两个产物：**相对名**，不是路径。
+#: 载荷里交回去的两个产物：**相对名**，不是路径。
 CONFLICT_ARTIFACTS: Tuple[str, ...] = (TASKS_FILENAME, PLAN_DOC_FILENAME)
-
-#: 列表里冲突计划的桶。列表是集合接口 —— 它不能为了一个 plan 把整张列表变成
-#: 409（那会让侧栏对所有其它 plan 一起失明），所以它用这个桶表达同一件事。
-CONFLICT_BUCKET = "conflict"
 
 
 def artifact_conflict_payload(
     plan_id: str,
     artifacts: "ArtifactSet",
 ) -> Dict[str, Any]:
-    """从判定结果拼出 409 响应体（五个调用点逐字相同）。
+    """从判定结果拼出 409 响应体（两个生成入口逐字相同）。
 
     Args:
         plan_id: plan id。
         artifacts: :func:`plan_artifacts.detect` 的判定结果。
 
     Returns:
-        响应体字典。``artifacts`` 是**两个**候选产物的相对名（冲突时两个都在），
+        响应体字典。``artifacts`` 是**两个**候选产物的相对名，
         ``existing_artifacts`` 是盘上**实际存在**的那几个，``branch`` 是判定出的
-        分支。三个字段都不含绝对路径。
+        主分支。三个字段都不含绝对路径。
     """
-    existing = [
-        name
-        for name, path in (
-            (TASKS_FILENAME, artifacts.tasks_path),
-            (PLAN_DOC_FILENAME, artifacts.plan_doc_path),
-        )
-        if path is not None
-    ]
-    if artifacts.branch == BRANCH_CONFLICT:
+    existing = _artifact_names(artifacts)
+    has_tasks = artifacts.tasks_path is not None
+    has_plan_doc = artifacts.plan_doc_path is not None
+    if has_tasks and has_plan_doc:
+        # 共存：**合法**。构造器拿不到「是哪个入口在问」这条信息 —— 文案一旦
+        # 说「这个入口却要生成 X」，对另一个调用者来说那句话就是假的。所以这里
+        # 说**规则**，不说「这个入口」。
+        #
+        # 共存是**单向**的，而且两个方向各归各位：计划书生成**放行**（计划书
+        # 是任务清单之后的可选附加动作，PRD 决策点 2），任务生成**被拒**（目录
+        # 里已有计划书时不再写任务清单）。文案不许把放行的那一侧也说成被拒 ——
+        # 「已有任务清单时不再写计划书」是一句假话。
         detail = (
             "这个 plan 目录里同时存在开发任务清单（tasks.json）与验证计划书"
-            "（verification-plan.md）：两条分支互斥，而「这条 plan 到底想干什么」"
-            "只有人能回答。框架不替你择一，也不删除任何文件 —— 由操作者裁决"
-            "保留哪一个。"
+            "（verification-plan.md）：共存本身是合法的（主分支是开发分支，"
+            "任务优先），验证计划书是任务清单之后的可选附加动作（生成计划书"
+            "这个方向是放行的）；被拒的方向只有一个 —— 目录里已有计划书时不再"
+            "写任务清单（不把一条纯验证分支的计划改造成开发分支）—— 框架不"
+            "替你择一，也不删除任何文件 —— 由操作者裁决。"
+        )
+    elif has_plan_doc:
+        # 只有计划书：这个载荷只可能被**任务生成**入口触发（计划书生成入口在
+        # 只有计划书时是放行的），所以这里可以说死方向。
+        detail = (
+            "这个 plan 目录里已经有验证计划书（verification-plan.md），"
+            "它属于验证分支；这个入口却要生成开发任务清单 —— 反向生成被拒："
+            "框架不替你择一，也不删除任何文件 —— 由操作者裁决。"
+        )
+    elif has_tasks:
+        # 只有任务清单：这个载荷只可能被**计划书生成**入口触发（任务生成入口
+        # 在只有任务清单时是放行的），方向同样可以说死。
+        detail = (
+            "这个 plan 目录里已经有开发任务清单（tasks.json），"
+            "它属于开发分支；这个入口却要生成验证计划书 —— 反向生成被拒："
+            "框架不替你择一，也不删除任何文件 —— 由操作者裁决。"
         )
     else:
+        # 盘上两类产物都没有：两个生成入口都不会走到这里，但载荷构造器不
+        # 假设调用方守规矩 —— 说不知道，比说谎好。
         detail = (
-            "这个 plan 已经有 %s，它属于%s；另一条分支的产物与它互斥。"
-            "框架不替你择一，也不删除任何文件 —— 由操作者裁决保留哪一个。"
-            % (
-                "、".join(existing),
-                "开发分支" if TASKS_FILENAME in existing else "验证分支",
-            )
+            "这个 plan 目录里既没有开发任务清单（tasks.json），也没有验证计划书"
+            "（verification-plan.md）—— 产物判定说它不属于任何一条分支："
+            "框架不替你择一，也不删除任何文件 —— 由操作者裁决。"
         )
     return {
         "error": ARTIFACT_CONFLICT_ERROR,
@@ -141,6 +163,23 @@ def artifact_conflict_payload(
         "existing_artifacts": existing,
         "branch": artifacts.branch,
     }
+
+
+def _artifact_names(artifacts: "ArtifactSet") -> List[str]:
+    """判定结果里**实际存在**的产物，相对名。
+
+    两类产物的相对名是这份载荷对外的全部信息：调用方拿它去自己的 plan 目录
+    里找文件，不必知道服务器把 plan 放在哪。顺序固定（任务清单在前、计划书
+    在后），所以两个读者对同一条 plan 看到的顺序一样。
+    """
+    return [
+        name
+        for name, path in (
+            (TASKS_FILENAME, artifacts.tasks_path),
+            (PLAN_DOC_FILENAME, artifacts.plan_doc_path),
+        )
+        if path is not None
+    ]
 
 
 def _stable_phase_label(phase: Optional[str]) -> Optional[str]:
@@ -1281,11 +1320,9 @@ def _build_plan_status(plan_id: str) -> Any:
     the one default that must never exist is the parked one, because it
     is global.
 
-    Raises:
-        HTTPException: 409 ``artifact_conflict`` —— 目录里两类产物同时存在。
-            「这条 plan 到底想干什么」还没人裁决时，状态快照是不能给的：给出
-            一个阶段就是替人择一。判定来自 :func:`plan_artifacts.detect`，
-            五个调用点共用同一套错误语义。
+    2026-11-09: 快照**不再**因为「目录里两类产物同时存在」而拒绝。共存不是
+    冲突 —— 按「任务优先」的主分支语义，这条 plan 就是一条开发分支的计划，
+    只不过额外带着一份计划书。给出一个阶段不是替人择一，判定里已经有答案了。
     """
     from dataclasses import replace
 
@@ -1297,13 +1334,6 @@ def _build_plan_status(plan_id: str) -> Any:
         is_runtime_phase,
         resolve_phase,
     )
-
-    artifacts = detect(_server._plan_dir(plan_id))
-    if artifacts.branch == BRANCH_CONFLICT:
-        raise HTTPException(
-            409,
-            artifact_conflict_payload(plan_id, artifacts),
-        )
 
     v_status = ""
     v_round = 0
@@ -1984,6 +2014,13 @@ def _plan_status_payload(plan_id: str) -> Dict[str, Any]:
     # （它多做一件事：任务计数永远在场），main 的两个键加在上面。
     payload["current_phase"] = payload.get("phase", "")
     payload["current_phase_label"] = _phase_label(payload.get("phase"))
+    # 2026-11-09: 产物判定的事实也进载荷 —— **主分支**与**盘上实际存在的两份
+    # 产物的相对名**。共存不是冲突：主分支是 dev（任务优先），计划书是附加
+    # 产物。计划列表给的是同一份判定（:func:`plan_artifacts.detect`），两个
+    # 读者不许对同一条 plan 给出两个答案。
+    artifacts = detect(_server._plan_dir(plan_id))
+    payload["branch"] = artifacts.branch
+    payload["artifacts"] = _artifact_names(artifacts)
     for key, handler in (
         ("summary", _plan_summary_section),
         ("execution", _server.get_execution_progress),
@@ -2045,13 +2082,14 @@ def _base_status_payload(plan_id: str) -> Dict[str, Any]:
         # store that could not answer.
         raise
     except HTTPException:
-        # A deliberate refusal is not a failure to degrade either.  The
-        # snapshot raises 409 ``artifact_conflict`` when the plan
-        # directory holds both products of two branches: "what this
-        # plan is for" has not been decided by a human yet, and handing
-        # back a phase — or degrading the phase to the empty default —
-        # would be deciding it for them.  The five call points share
-        # this error semantics, so the refusal travels up unchanged.
+        # A deliberate refusal is not a failure to degrade either.  If
+        # the snapshot ever refuses on purpose, the refusal travels up
+        # unchanged — degrading it into the empty default would turn
+        # "I cannot say" into a claim.
+        #
+        # 2026-11-09: 这条分支曾经专门接住 409 ``artifact_conflict``
+        # （目录里两类产物同时存在 → 状态快照不给）。共存合法之后，那个
+        # 拒绝已经不存在了：主分支由「任务优先」定下来，状态快照给得出来。
         raise
     except Exception:
         # The snapshot is built from several stores and one of them may
@@ -3161,6 +3199,24 @@ def _list_plans_body(
             )
     routing_rows = renderable_rows
 
+    # -- the row order is the plan id, and only the plan id --------------
+    # The listing's order is a **contract**: the frontend renders the rows
+    # the way they arrive and never sorts them itself ("the order is the
+    # listing's own" — ``frontend/app.js``).  A contract needs a stable
+    # basis, and the database's row order is not one: ``plan_routing`` is
+    # read back ``updated_at`` DESC, so the same set of plans written in a
+    # different order produces a different listing, and a caller that
+    # addresses a row by index addresses the wrong plan.
+    #
+    # Sorting here — after the renderable-id filter, before any row is
+    # rendered — makes the order a function of the plan ids alone, and it
+    # makes the two read paths (the state database and the directory
+    # fallback) agree: the fallback already walks the directory in name
+    # order, so both now answer with the same listing.
+    routing_rows = sorted(
+        routing_rows, key=lambda row: str(row.get("plan_id") or "")
+    )
+
     # Bulk-fetch execution rows for every non-archived plan_id.
     new_plan_ids = [
         r["plan_id"] for r in routing_rows if not r.get("archived")
@@ -3185,10 +3241,13 @@ def _list_plans_body(
         plan_dir = _server._plan_dir(plan_id)
         is_archived = bool(row.get("archived"))
 
-        # 产物冲突：两类产物同时存在 → 这个 plan 到底走哪条分支，**还没人
-        # 裁决**。判定来自 :func:`plan_artifacts.detect`（唯一入口）。
+        # 产物判定：这条 plan 走哪条分支、盘上有哪些产物。判定来自
+        # :func:`plan_artifacts.detect`（唯一入口）。
+        #
+        # 2026-11-09: 共存（两类产物同时存在）**不是冲突** —— 主分支是 dev
+        # （任务优先），计划书是附加产物。列表曾经把这种 plan 丢进 ``conflict``
+        # 桶，现在没有了：条目给出主分支与两份产物的相对名。
         artifacts = detect(plan_dir)
-        conflicted = artifacts.branch == BRANCH_CONFLICT
 
         has_interview = (plan_dir / "interview.json").exists() if plan_dir.exists() else False
         has_prd = (
@@ -3473,12 +3532,6 @@ def _list_plans_body(
                 "tasks": has_tasks,
             }
 
-        # 冲突桶盖过阶段桶 / 启发式桶：分支还没人裁决时，那些桶都是在替人择一。
-        # 归档计划保留「archived」桶 —— 它的生命周期已经结束，那里的冲突是历史，
-        # 不是待办（载荷照样带上，信息不丢）。
-        if conflicted and not is_archived:
-            status = CONFLICT_BUCKET
-
         # Human-readable fields.  For archived plans use the
         # requirement_first_line captured at archive-scan time;
         # for new plans, derive from the on-disk interview.json
@@ -3569,12 +3622,12 @@ def _list_plans_body(
         # which data source produced it, and which plans root that
         # source read.
         entry.update(provenance)
-        if conflicted:
-            # 列表这一层的 409：与其它四个调用点**逐字相同**的载荷，挂在条目
-            # 上。集合接口不能整张列表变 409，所以这里是「桶 + 载荷」。
-            entry["artifact_conflict"] = artifact_conflict_payload(
-                plan_id, artifacts,
-            )
+        # 产物判定的事实也进条目：**主分支**与**盘上实际存在的产物的相对名**。
+        # 共存不是冲突 —— 主分支是 dev（任务优先），计划书是附加产物，两份产物
+        # 的相对名都在这里。状态接口给的是同一份判定，两个读者不许对同一条
+        # plan 给出两个答案。
+        entry["branch"] = artifacts.branch
+        entry["artifacts"] = _artifact_names(artifacts)
         plans.append(entry)
     return plans, provenance
 
