@@ -2480,15 +2480,25 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # NEGATIVE CONTROLS (P0-1, P0-3)
+  # NEGATIVE CONTROLS (P0-1, P0-3, P0 plan source)
   #
   # ``scripts/negctl_p0_1.sh`` and ``scripts/negctl_p0_3.sh`` are the
-  # negative controls for the P0-1 and P0-3 fixes. A behavioural suite
-  # shows that a fix works; only the control shows that the bug was
-  # there. Each control reads the PRE-FIX source out of git and asserts
-  # that the shape the fix removed really existed — so a green suite
-  # measures a difference that existed to begin with, rather than a
-  # difference between two versions of the same code.
+  # negative controls for the P0-1 and P0-3 fixes, and
+  # ``scripts/negctl_p0_plan_source.sh`` is the control for the plan source
+  # (run twice: once against the verification prelude boundary, once
+  # against the coexistence end-to-end test). A behavioural suite shows that
+  # a fix works; only the control shows that the bug was there. The first
+  # two controls read the PRE-FIX source out of git and assert that the
+  # shape the fix removed really existed — so a green suite measures a
+  # difference that existed to begin with, rather than a difference between
+  # two versions of the same code. The third turns the product's own switch
+  # off (the plan source is pinned to ``NONE``, so the reviewed document
+  # cannot be translated) and asserts that the suite notices — so a green
+  # suite measures the behaviour it claims to measure.
+  #
+  # The job's *name* still says "(P0-1, P0-3)": it is the required status
+  # check in the branch protection rules, and renaming it would leave the
+  # protection pointing at a check that no longer exists.
   #
   # They are a job of their own for two reasons. A control that only runs
   # on the machine of the person who wrote it proves nothing to anybody
@@ -2529,7 +2539,7 @@ jobs:
     # matrix on a tree whose unit lane has not been shown to be green.
     needs: unit-tests
     # A cap, like every other test lane in this workflow (the unit
-    # shards get 40, the keychain E2E gets 20). The controls run two
+    # shards get 40, the keychain E2E gets 20). The controls run four
     # pytest suites of their own, so this job is a test lane, and an
     # uncapped test lane is the failure mode this repository has already
     # paid for: the job runs until GitHub cancels it at ~45 minutes with
@@ -2537,9 +2547,9 @@ jobs:
     # waits out the whole of it. The cap turns a wedge into a red job
     # that says so.
     #
-    # 20 minutes is the install plus both suites with room to spare:
-    # the suites are 4 and 7 tests, and the expensive part of the job
-    # is `uv sync`, which the uv cache above keeps at a couple of
+    # 20 minutes is the install plus all four suites with room to spare:
+    # the suites are 4, 7, 1 and 9 tests, and the expensive part of the
+    # job is `uv sync`, which the uv cache above keeps at a couple of
     # seconds once it is warm.
     timeout-minutes: 20
     steps:
@@ -2598,6 +2608,26 @@ jobs:
         env:
           P0_3_PREFIX_REV: "1daa2ddd757a3ecaa50c3989942e760409a49143"
         run: bash scripts/negctl_p0_3.sh
+
+      # The third control, for the plan source: it pins the plan source to
+      # NONE (the reviewed document can no longer be translated) and
+      # requires the suite to turn red. A suite that stays green with the
+      # product's own switch off measures nothing about the product — it
+      # measures the absence of a complaint.
+      #
+      # It is run twice, against two suites, because the same claim is
+      # pinned at two levels and each level has its own way of going
+      # wrong. The prelude control sees the prelude's own side effects (how
+      # many times the translator was asked, whether the machine plan
+      # landed); the end-to-end control sees what the round actually
+      # consumed — a document the round read is not the same thing as a
+      # document the round used. Two steps, so a failure in one does not
+      # hide the other.
+      - name: Negative control P0 plan source (prelude boundary)
+        run: bash scripts/negctl_p0_plan_source.sh
+
+      - name: Negative control P0 plan source (coexistence end-to-end)
+        run: bash scripts/negctl_p0_plan_source.sh --e2e
 
   # ---------------------------------------------------------------------------
   # NIGHTLY REGRESSION — daily cron, blocks release on failure

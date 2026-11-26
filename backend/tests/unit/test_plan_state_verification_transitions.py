@@ -9,8 +9,9 @@
 
 四个容易写反的地方
 ------------------
-1. **判定顺序**：``tasks.json`` 先于计划书；两者同时存在是**冲突**（框架不替人
-   猜意图），必须抛 :class:`plan_artifacts.ArtifactConflictError`。
+1. **判定顺序**：``tasks.json`` 先于计划书；两者同时存在**不是冲突** —— 按
+   「任务优先」，共存就是一条开发分支的计划（计划书只是附加产物），推断为
+   ``queued``。
 2. **前缀排除**：``transition_to`` 的执行门禁判据是 ``phase.startswith("verification")``。
    新阶段的名字以 ``verification`` 开头，不排除就会被自己拦下 ——
    ``tasks_generation → verification_plan_review`` 在「计划书刚写完」这一步就抛
@@ -22,7 +23,7 @@
 钉住的东西
 ----------
 * ``test_infer_phase_order`` —— 四类目录的推断结果（queued / 审核阶段 / 原结果），
-  以及两类产物同时存在时的冲突报错；
+  以及两类产物同时存在时的共存推断（任务优先，落在 ``queued``）；
 * ``test_verification_plan_json_is_not_doc`` —— VP 清单不触发审核阶段；
 * ``test_prefix_exclusion_allows_review_phase`` —— 前缀排除只排除新阶段；
 * ``test_phase_label_stable`` —— 新阶段的稳定标签是「计划书待审」。
@@ -44,7 +45,6 @@ _BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
-from plan_artifacts import ArtifactConflictError  # noqa: E402
 from plan_state import (  # noqa: E402
     PHASE_LABELS,
     PHASE_TRANSITIONS,
@@ -109,7 +109,7 @@ def _vp_manifest(plan_dir: Path) -> None:
 
 
 def test_infer_phase_order(tmp_path):
-    """四类目录 → queued / 审核阶段 / 原结果；两类产物同时存在 → 冲突。"""
+    """四类目录 → queued / 审核阶段 / 原结果；两类产物同时存在 → 共存按任务优先。"""
     # (1) 只有 ``tasks.json`` —— 开发分支，既有判定不变。
     dev_dir = _make_plan_dir(tmp_path, "dev-only")
     (dev_dir / "tasks.json").write_text("{}", encoding="utf-8")
@@ -137,12 +137,14 @@ def test_infer_phase_order(tmp_path):
         "空目录的推断结果必须与改动前逐字一致"
     )
 
-    # (5) 两类产物同时存在 —— 冲突，拒绝猜测意图。
-    conflict_dir = _make_plan_dir(tmp_path, "conflict")
-    (conflict_dir / "tasks.json").write_text("{}", encoding="utf-8")
-    _plan_doc(conflict_dir)
-    with pytest.raises(ArtifactConflictError):
-        PlanState(conflict_dir)
+    # (5) 两类产物同时存在 —— **不是冲突**：按「任务优先」，共存就是一条
+    #     开发分支的计划（计划书只是附加产物），落在 ``queued``。
+    coexist_dir = _make_plan_dir(tmp_path, "coexist")
+    (coexist_dir / "tasks.json").write_text("{}", encoding="utf-8")
+    _plan_doc(coexist_dir)
+    assert PlanState(coexist_dir).get_current_phase() == "queued", (
+        "tasks.json 与 verification-plan.md 共存时按任务优先推断为 queued"
+    )
 
 
 def test_verification_plan_json_is_not_doc(tmp_path):

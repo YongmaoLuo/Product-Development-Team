@@ -18,7 +18,11 @@
 契约
 ----
   * auto-loop 崩溃 → ``_persist_verification_terminal(plan_id, "failed",
-    reason)`` 被调用**一次**，``reason`` 是 ``f"auto_loop_crash: {exc}"``；
+    reason)`` 被调用**一次**，``reason`` 是
+    ``f"auto_loop_crash: {type(exc).__name__}"`` —— 只有**异常类型**，
+    不含异常原文：原文里常带绝对路径（读的是哪个文件、哪个目录），
+    而这一句会被写进终态、贴进卡片、发给运维。完整的栈在日志里，
+    排查时从日志看，不从终态看；
   * 同一个 reason **逐字符**出现在内存 ``stop_reason`` 里 —— 落盘的
     和内存说的必须是同一件事（两套拼写会让事后复盘对不上）；
   * 落盘自己抛异常 → 被吞掉，函数不外抛（这段跑在 verification
@@ -111,7 +115,7 @@ def test_crash_persists_failed_terminal(monkeypatch, plan_dir, project_dir):
 
     rv._run_auto_loop_with_crash_persistence("p", plan_dir, project_dir, 4, None, 1)
 
-    persist.assert_called_once_with("p", "failed", "auto_loop_crash: boom")
+    persist.assert_called_once_with("p", "failed", "auto_loop_crash: RuntimeError")
 
 
 def test_persisted_reason_matches_memory(monkeypatch, plan_dir, project_dir):
@@ -124,8 +128,12 @@ def test_persisted_reason_matches_memory(monkeypatch, plan_dir, project_dir):
     persisted_reason = persist.call_args[0][2]
     memory_reason = server_mod._verification_state["p"]["stop_reason"]
     assert memory_reason == persisted_reason
-    assert persisted_reason == "auto_loop_crash: boom"
+    assert persisted_reason == "auto_loop_crash: RuntimeError"
     assert server_mod._verification_state["p"]["verification_status"] == "failed"
+    # 脱敏契约钉在单元层：异常原文（这里带的是文件路径）不进终态、不进卡片。
+    assert "boom" not in persisted_reason, (
+        f"终态 reason 泄漏了异常原文：{persisted_reason!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +151,7 @@ def test_persist_failure_does_not_reraise(monkeypatch, plan_dir, project_dir):
 
     # 内存那一半仍然写进去了（先改内存、再落盘）。
     assert server_mod._verification_state["p"]["verification_status"] == "failed"
-    assert server_mod._verification_state["p"]["stop_reason"] == "auto_loop_crash: boom"
+    assert server_mod._verification_state["p"]["stop_reason"] == "auto_loop_crash: RuntimeError"
 
 
 def test_clean_run_does_not_persist(monkeypatch, plan_dir, project_dir):
@@ -167,7 +175,7 @@ def test_missing_memory_state_still_persists(monkeypatch, plan_dir, project_dir)
 
     rv._run_auto_loop_with_crash_persistence("p", plan_dir, project_dir, 4, None, 1)
 
-    persist.assert_called_once_with("p", "failed", "auto_loop_crash: boom")
+    persist.assert_called_once_with("p", "failed", "auto_loop_crash: RuntimeError")
 
 
 def test_wrapper_forwards_arguments_to_auto_loop(monkeypatch, plan_dir, project_dir):

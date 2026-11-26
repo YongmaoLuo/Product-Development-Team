@@ -41,9 +41,9 @@ operator's panel shows.
 The thread
 ----------
 ``/start`` spawns the verification worker.  Here the worker is a shell
-that never runs its target (the ``no_worker_thread`` fixture, borrowed
-from the CAS suite next door): the round must not really run, and the
-round's *record* is what is under test.
+that never runs its target (the ``no_worker_thread`` fixture, from the
+shared module): the round must not really run, and the round's *record*
+is what is under test.
 
 ``auto_fix=False`` is what puts that record in place.  The default
 (``auto_fix=True``) defers the initialisation of the in-memory record
@@ -101,13 +101,15 @@ import verification_cancel  # noqa: E402
 
 from plan_scheduler.facts import VERIFICATION_STALE_SECONDS  # noqa: E402
 
-# The fixtures are borrowed from the CAS suite next door: the plan it
-# builds is a real verification-branch plan (a real git baseline, a real
-# machine plan on disk, a real review on disk), and that is what
-# ``/start`` needs to be let through its CAS.  Importing the fixtures
-# rather than copying them keeps the two suites describing one plan.
-from backend.tests.api.test_start_verification_cas import (  # noqa: E402
-    git_repo,
+# The fixtures come from the shared module: the plan it builds is a real
+# verification-branch plan (a real git baseline, a real machine plan on
+# disk, a real review on disk), and that is what ``/start`` needs to be let
+# through its CAS.  Importing the fixtures rather than copying them keeps
+# the two suites describing one plan — and the shared module is where the
+# fixtures live, because pytest resolves a fixture in the namespace of the
+# module that *asks* for it, so a fixture living in a sibling test module
+# is not importable at all.
+from tests.fixtures.verification_mode import (  # noqa: E402
     hermetic_env,
     make_verification_plan,
     no_worker_thread,
