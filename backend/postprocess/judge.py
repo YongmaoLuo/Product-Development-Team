@@ -24,10 +24,20 @@ Evidence that cannot decide anything decides **FAIL**:
 
 * no evidence records at all;
 * a record that never reported an exit code;
-* a record whose two output streams are both empty.
+* a record whose two output streams are both empty — for the kinds whose
+  decision rests on the command's output.
 
-A record with no output is not a record of anything — it is the absence
-of a record — and the absence of evidence is not evidence of success.
+The first two hold for every kind: a record with no exit code is not a
+record of anything, and the absence of evidence is not evidence of
+success.  The third is **kind-dependent**, because not every kind reads
+the output.  ``exit_code``, ``file_exists`` and ``git_diff_empty`` are
+decided from the exit code and the diff, so for those kinds a record
+that reported an exit code is usable **even when it printed nothing** —
+a command that succeeds silently (``git fetch origin``, ``git reset
+--soft origin/main``) prints nothing by nature, and demanding output
+would fail exactly the commands that succeeded.  ``stdout_contains``,
+``regex_match`` and ``external_status_equals`` still need output: there
+is nothing to match an empty stream against.
 
 The truth table
 ---------------
@@ -76,7 +86,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Mapping, Optional, Sequence, Tuple
 
 from postprocess.models import Verdict
 from postprocess.notify import redact
@@ -111,6 +121,21 @@ _KIND_ALIASES: Dict[str, str] = {
 #: Long output is clipped from the right, so the excerpt stays a
 #: contiguous slice of what the command printed.
 EXCERPT_LIMIT: int = 500
+
+#: The predicate kinds whose decision rests on the exit code alone.
+#:
+#: These kinds read the exit code (and, for ``file_exists`` and
+#: ``git_diff_empty``, the world they describe) — they never read the
+#: command's output.  So for them a record that reported an exit code
+#: **is** the evidence, output or no output: a command that succeeds
+#: silently prints nothing, and a record that printed nothing is exactly
+#: what a silent success looks like.  Demanding output here would fail
+#: the commands that worked.
+_EXIT_CODE_ONLY_KINDS: FrozenSet[str] = frozenset({
+    "exit_code",
+    "file_exists",
+    "git_diff_empty",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -202,16 +227,34 @@ def _excerpt(record: Any) -> str:
     return ""
 
 
-def _is_usable(record: Any) -> bool:
-    """Whether a record carries evidence a decision can rest on.
+def _is_usable(record: Any, canonical_kind: str) -> bool:
+    """Whether a record carries evidence this predicate kind can rest on.
 
-    A record qualifies when it reported an exit code **and** printed
-    something.  Both halves matter: an exit code without output says
-    only that a process ended, and output without an exit code says only
-    that some text was produced.
+    What "usable" means depends on the kind, because different kinds read
+    different fields of the record:
+
+    * For the kinds that decide on the exit code alone — ``exit_code``,
+      ``file_exists``, ``git_diff_empty`` — a record that reported an
+      exit code is usable **even when it printed nothing**.  Those kinds
+      never read the output, so the exit code is the whole of their
+      evidence; and a command that succeeds silently prints nothing, so
+      requiring output here would fail exactly the commands that
+      succeeded.
+    * For the kinds that read the command's output — ``stdout_contains``,
+      ``regex_match`` — and for ``external_status_equals``, a record
+      qualifies when it reported an exit code **and** printed something.
+      Both halves matter there: there is nothing to match an empty stream
+      against, and output without an exit code says only that some text
+      was produced.
+
+    In every case a record that never reported an exit code is not
+    usable: that is the absence of evidence, and it is not evidence of
+    success.
     """
     if _read(record, "exit_code", None) is None:
         return False
+    if canonical_kind in _EXIT_CODE_ONLY_KINDS:
+        return True
     for name in ("stdout", "stderr"):
         if str(_read(record, name, "") or "").strip():
             return True
@@ -367,8 +410,9 @@ def judge(
     Returns:
         A :class:`~postprocess.models.Verdict`.  It says FAIL whenever
         the evidence cannot decide — no records, a record without an exit
-        code, a record that printed nothing, a predicate kind this judge
-        does not know — and it never raises.
+        code, a record that printed nothing where the kind reads the
+        output, a predicate kind this judge does not know — and it never
+        raises.
     """
     item_id = str(_read(item, "id", "") or "")
 
@@ -400,7 +444,7 @@ def judge(
             reason="no evidence records for this item",
         )
 
-    usable = [record for record in records if _is_usable(record)]
+    usable = [record for record in records if _is_usable(record, canonical)]
     if not usable:
         return Verdict(
             item_id=item_id,
