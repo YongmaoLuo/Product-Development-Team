@@ -17,9 +17,13 @@ pins four contracts:
    reverse.  Only a judge that actually looks satisfies both.
 
 2. **Evidence sufficiency.**  Evidence that cannot decide anything decides
-   **FAIL**: no records at all, a record without an exit code, a record
-   whose two output streams are both empty.  A stage that lets a missing
-   exit code pass is a stage that passes on nothing having run.
+   **FAIL**: no records at all, a record without an exit code, and — for
+   the kinds that read the command's output — a record whose two output
+   streams are both empty.  A stage that lets a missing exit code pass is
+   a stage that passes on nothing having run.  What counts as sufficient
+   depends on the kind, because a command that succeeds silently prints
+   nothing: for the kinds decided on the exit code alone, an exit code
+   with no output is the whole of the evidence.
 
 3. **A self-report is not evidence.**  A record that carries a "the work is
    done" field but no command output fails — the judge reads command
@@ -201,9 +205,14 @@ def test_record_without_exit_code_must_fail():
 
 
 def test_record_without_any_output_must_fail():
-    """A record whose two output streams are empty is not evidence."""
+    """A record whose two output streams are empty is not evidence.
+
+    For a kind that reads the command's output there is nothing to
+    match an empty stream against, so such a record decides nothing and
+    decides FAIL.
+    """
     verdict = judge(
-        _item({"kind": "exit_code", "equals": 0}),
+        _item({"kind": "stdout_contains", "literal": "ok"}),
         [_evidence(stdout="", stderr="")],
     )
 
@@ -216,7 +225,7 @@ def test_conclusion_field_is_ignored_and_fails():
     record = _evidence(stdout="", stderr="")
     record.conclusion = "done"
 
-    verdict = judge(_item({"kind": "exit_code", "equals": 0}), [record])
+    verdict = judge(_item({"kind": "stdout_contains", "literal": "ok"}), [record])
 
     assert verdict.passed is False
     assert verdict.evidence_excerpt == ""
@@ -235,7 +244,7 @@ def test_a_mapping_evidence_with_a_self_report_field_also_fails():
         "conclusion": "done",
     }
 
-    verdict = judge(_item({"kind": "exit_code", "equals": 0}), [mapping])
+    verdict = judge(_item({"kind": "stdout_contains", "literal": "ok"}), [mapping])
 
     assert verdict.passed is False
 
@@ -261,6 +270,131 @@ def test_the_latest_attempt_decides():
 
     assert verdict.passed is True
     assert verdict.evidence_excerpt == "ok"
+
+
+# ---------------------------------------------------------------------------
+# A command that succeeds silently: the exit code is the whole evidence.
+# ---------------------------------------------------------------------------
+
+
+def test_exit_code_zero_passes_when_the_command_printed_nothing():
+    """Exit code 0 with empty streams passes — a silent success is a success."""
+    verdict = judge(
+        _item({"kind": "exit_code", "equals": 0}),
+        [_evidence(exit_code=0, stdout="", stderr="")],
+    )
+
+    assert verdict.passed is True
+    assert verdict.reason == "exit_code 0 == 0"
+    assert verdict.evidence_excerpt == ""
+
+
+def test_exit_code_nonzero_fails_when_the_command_printed_nothing():
+    """Exit code 1 with empty streams still fails — and says why."""
+    verdict = judge(
+        _item({"kind": "exit_code", "equals": 0}),
+        [_evidence(exit_code=1, stdout="", stderr="")],
+    )
+
+    assert verdict.passed is False
+    assert verdict.reason == "exit_code 1 != 0"
+
+
+def test_a_silent_fetch_origin_is_evidence():
+    """The real case: ``git fetch origin`` prints nothing when it works.
+
+    It exits 0 and says nothing at all, so a judge that demands output
+    would call the successful fetch a failure.
+    """
+    record = EvidenceRecord(
+        item_id="fetch-origin",
+        command=["git", "fetch", "origin"],
+        exit_code=0,
+        stdout="",
+        stderr="",
+        git_diff="",
+    )
+
+    verdict = judge(_item({"kind": "exit_code"}, "fetch-origin"), [record])
+
+    assert verdict.passed is True
+    assert verdict.reason == "exit_code 0 == 0"
+
+
+def test_stdout_contains_still_needs_the_command_output():
+    """A kind that matches the output cannot decide on an empty stream."""
+    verdict = judge(
+        _item({"kind": "stdout_contains", "literal": "pushed"}),
+        [_evidence(exit_code=0, stdout="", stderr="")],
+    )
+
+    assert verdict.passed is False
+    assert verdict.evidence_excerpt == ""
+
+
+def test_regex_match_still_needs_the_command_output():
+    """The same for the kind that matches a pattern against a stream."""
+    verdict = judge(
+        _item({"kind": "regex_match", "pattern": r"pr-\d+ merged"}),
+        [_evidence(exit_code=0, stdout="", stderr="")],
+    )
+
+    assert verdict.passed is False
+    assert verdict.evidence_excerpt == ""
+
+
+def test_file_exists_passes_when_the_command_printed_nothing(tmp_path):
+    """``file_exists`` is decided from the path, not from the output."""
+    target = tmp_path / "release-notes.md"
+    target.write_text("notes\n", encoding="utf-8")
+
+    verdict = judge(
+        _item({"kind": "file_exists", "path": str(target)}),
+        [_evidence(exit_code=0, stdout="", stderr="")],
+    )
+
+    assert verdict.passed is True
+
+
+def test_git_diff_empty_passes_when_the_command_printed_nothing():
+    """An empty diff is the evidence — and it is exactly an empty string."""
+    verdict = judge(
+        _item({"kind": "git_diff_empty"}),
+        [_evidence(exit_code=0, stdout="", stderr="", git_diff="")],
+    )
+
+    assert verdict.passed is True
+    assert verdict.reason == "the observed product-code diff is empty"
+
+
+def test_external_status_equals_still_needs_the_command_output():
+    """The external-status kind is unchanged: it wants output too."""
+    verdict = judge(
+        _item({"kind": "external_status_equals", "equals": "merged"}),
+        [_evidence(exit_code=0, stdout="", stderr="", external_status="merged")],
+    )
+
+    assert verdict.passed is False
+    assert verdict.evidence_excerpt == ""
+
+
+def test_a_record_without_an_exit_code_is_never_usable():
+    """No exit code is no evidence — whatever the kind, whatever the output."""
+    silent = judge(
+        _item({"kind": "exit_code", "equals": 0}),
+        [_evidence(exit_code=None, stdout="", stderr="")],
+    )
+
+    assert silent.passed is False
+    assert silent.evidence_excerpt == ""
+
+    noisy = judge(
+        _item({"kind": "stdout_contains", "literal": "ok"}),
+        [_evidence(exit_code=None, stdout="ok", stderr="")],
+    )
+
+    assert noisy.passed is False
+    assert noisy.evidence_excerpt == ""
 
 
 # ---------------------------------------------------------------------------
