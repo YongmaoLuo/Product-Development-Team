@@ -20,6 +20,13 @@ machine may execute, stops being what grants the read.
 
 ### Added
 
+- **A pre-generated verification plan coexists with the task list, and is
+  consumed as written.** A plan directory that carried
+  `verification_plan.json` beside `tasks.json` lost one of the two along
+  the way. `backend/plan_artifacts.py` now keeps both artifacts, the plan
+  routes serve both, and the verification round consumes the
+  pre-generated plan instead of generating its own.
+
 - **The scheduler panel has a 「收尾」 section of its own.** A plan that is
   being finished holds no slot and waits for no capacity, so it was in
   neither the queue nor the running list, and an operator could not see
