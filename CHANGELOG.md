@@ -221,6 +221,20 @@ half the readers never see.*
   prose (`first_error_line`) takes part only when there is no payload to
   hash (`backend/verification/failure_fingerprint.py`).
 
+- **A declared squash step may stage the product diff.**
+  `backend/postprocess/executor.py` recognises the declared squash entry
+  (`git reset --soft origin/main`, matched verbatim, and the entry's own
+  `target` has to agree with it) and lets that one entry skip the
+  porcelain criterion of the product-code guard: staging the branch diff
+  is exactly what the entry is for, and the entry that follows it
+  commits the result. **The content criterion is unchanged** —
+  `reset --soft` does not touch file contents, so the sha256 comparison over
+  the product-code paths still catches a real content change, and a
+  rewrite during that entry is still red. **No verdict changed for any
+  other entry**: a squash onto another base, a `git reset --mixed` or
+  `--hard`, and any entry that writes product code are judged as
+  before.
+
 - **A Phase-2 gate layer that was deferred over a Phase-1 conclusion is
   re-decided against that conclusion's final state, and it runs in the same
   round once its blocker turns green.** `backend/verification_executor.py`

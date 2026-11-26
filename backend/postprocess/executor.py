@@ -98,6 +98,8 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ALLOWED_BINARIES",
+    "DECLARED_SQUASH_COMMAND",
+    "DECLARED_SQUASH_TARGET",
     "FINISHING_ARTIFACT_ROOT",
     "MONEY_MARKERS",
     "PRODUCT_CODE_PATHS",
@@ -184,6 +186,21 @@ FINISHING_ARTIFACT_ROOT: str = "plans"
 #: --no-ff``、``git -c x=y merge origin/main`` 都不算 —— 那些不是
 #: 「合上游主干的这一条」。
 UPSTREAM_MERGE_COMMAND: Tuple[str, ...] = ("git", "merge", "origin/main")
+
+#: 收尾要求书里声明的 **squash（压扁）** 命令前缀 —— 逐字匹配，不做宽判据。
+#:
+#: 这一条命令（``git reset --soft {target}``）按定义就会把分支上的改动
+#: 放进暂存区：暂存区一变，``git status --porcelain`` 就报出一批新的条目
+#: —— 那正是这条压扁条目**要做的事**，不是越界。紧随其后的 commit 条目
+#: 提交它们。
+#:
+#: 刻意**逐字匹配**：``--mixed`` / ``--hard``、别的 target、多余参数都
+#: 不算 —— 那些不是「把分支 diff 放进暂存区」的那一条。
+DECLARED_SQUASH_COMMAND: Tuple[str, ...] = ("git", "reset", "--soft")
+
+#: 声明的 squash 条目压扁到的基线 —— 与声明的上游合并同形（那条也只认
+#: ``origin/main``）。别的基线不是「声明的那一条」。
+DECLARED_SQUASH_TARGET: str = "origin/main"
 
 
 class CommandRejected(Exception):
@@ -939,6 +956,7 @@ class _WorkingTree:
         allowed: Sequence[str],
         *,
         skip_product_hashes: bool = False,
+        skip_porcelain: bool = False,
     ) -> List[str]:
         """这段时间里被碰到的越界路径。
 
@@ -975,19 +993,29 @@ class _WorkingTree:
                 **第 1 条判据（porcelain 越界路径）不受影响**：一次干净
                 完成的合并不留 porcelain 改动；合并冲突未完成、或合并
                 之后又手工改了文件，都会留下 porcelain 改动，照样判红。
+            skip_porcelain: 跳过第 1 条判据（porcelain 越界路径）。只给
+                「声明的 squash 条目」用：``git reset --soft {target}``
+                按定义就是把分支上的 diff 放进暂存区，于是 porcelain 报出
+                一批新的条目 —— 那是这条条目**要做的事**，不是越界；紧随
+                其后的 commit 条目提交它们。
+                **第 2 条判据（产品代码哈希）不受影响**：``reset --soft``
+                不碰文件内容，哈希判据照旧能抓到真正的内容改动 ——
+                内容越界仍然判红。
 
         Returns:
             越界路径，已排序去重；没有越界时是空列表。
         """
         before_changed = set(before.changed)
         tracked_any = set(before.tracked) | set(self.tracked)
-        out_of_scope = [
-            path
-            for path in self.changed
-            if path not in before_changed
-            and not _within(path, allowed)
-            and (path in tracked_any or _protected_new_path(path, allowed))
-        ]
+        out_of_scope: List[str] = []
+        if not skip_porcelain:
+            out_of_scope = [
+                path
+                for path in self.changed
+                if path not in before_changed
+                and not _within(path, allowed)
+                and (path in tracked_any or _protected_new_path(path, allowed))
+            ]
         if skip_product_hashes:
             return sorted(set(out_of_scope))
         rewritten = [
@@ -1023,6 +1051,13 @@ def product_diff_guard(
     合入上游必然会改动产品代码路径下的文件，那是上游的改动。porcelain
     那一判据原样保留：冲突未完成的合并、合并之后的手工改动照样判红。
 
+    **另一条窄豁免**：条目若正是「声明的 squash 条目」（``git reset
+    --soft {target}``，逐字匹配，见 :func:`_is_declared_squash`），则跳过
+    porcelain 那一判据 —— 这一条按定义就是把分支 diff 放进暂存区，
+    porcelain 报出的那批条目正是它要做的事，产物由紧随其后的 commit
+    条目提交。**产品代码哈希判据原样保留** —— ``reset --soft`` 不碰文件
+    内容，哈希判据照旧能抓到真正的内容改动：内容越界仍然判红。
+
     Args:
         item: 要求书条目 —— 它的 id 进异常消息，指得回是哪一条越界。
         repo: 被校验的仓库；不给就是当前工作目录。
@@ -1047,6 +1082,13 @@ def product_diff_guard(
     # 原样保留 —— 合并冲突未完成、或者合并之后又手工改了文件，都会留下
     # porcelain 改动，照样判红。
     skip_product_hashes = _is_upstream_merge(item)
+    # 「声明的 squash 条目」豁免第 1 条判据（porcelain 越界路径）。
+    # ``git reset --soft {target}`` 按定义就是把分支上的 diff 放进暂存区 ——
+    # porcelain 报出的那批条目正是这条条目要做的事，产物由紧随其后的
+    # commit 条目提交。第 2 条判据（产品代码哈希）**原样保留** ——
+    # ``reset --soft`` 不碰文件内容，哈希判据照旧能抓到真正的内容改动，
+    # 内容越界仍然判红。
+    skip_porcelain = _is_declared_squash(item)
 
     try:
         yield
@@ -1060,11 +1102,17 @@ def product_diff_guard(
             item_id,
             cause=failure,
             skip_product_hashes=skip_product_hashes,
+            skip_porcelain=skip_porcelain,
         )
         raise
 
     _raise_if_modified(
-        root, before, allowed, item_id, skip_product_hashes=skip_product_hashes
+        root,
+        before,
+        allowed,
+        item_id,
+        skip_product_hashes=skip_product_hashes,
+        skip_porcelain=skip_porcelain,
     )
 
 
@@ -1094,6 +1142,47 @@ def _is_upstream_merge(item: Any) -> bool:
     return argv == UPSTREAM_MERGE_COMMAND
 
 
+def _is_declared_squash(item: Any) -> bool:
+    """这一条是不是「声明的 squash 条目」。
+
+    判据是**精确 argv 匹配**：四段 ``("git", "reset", "--soft", target)``，
+    且第四段逐字等于条目自己的 ``target``（``target`` 非空）。
+
+    这一条按定义就是把分支上的 diff 放进暂存区 —— porcelain 报出的那批
+    条目正是它要做的事，所以它豁免 porcelain 判据（见
+    :meth:`_WorkingTree.touched`）；产品代码哈希判据照旧。
+
+    只认这一种形状：``--mixed`` / ``--hard``、别的 target、多余参数一律
+    不算 —— 那些不是「把分支 diff 放进暂存区」的那一条（``--hard`` 甚至
+    会动文件内容，哈希判据得留着）。
+
+    认的基线只有 :data:`DECLARED_SQUASH_TARGET` 一个 —— 与「声明的上游
+    合并」同形（那条也只认 ``origin/main``）。别的基线不是「声明的那
+    一条」，压扁到那儿的人得自己把话说清楚。
+
+    条目的形状可以是 dataclass（``SpecItem``）也可以是映射 —— 两种都认。
+
+    Args:
+        item: 要求书条目。
+
+    Returns:
+        ``True`` 表示这一条就是那一条声明的 squash 命令。
+    """
+    command = _field(item, "command")
+    if command is None or isinstance(command, (str, bytes)):
+        return False
+    try:
+        argv = tuple(str(token) for token in command)
+    except TypeError:
+        return False
+    target = _text_field(item, "target")
+    if not target.strip():
+        return False
+    if target != DECLARED_SQUASH_TARGET:
+        return False
+    return argv == DECLARED_SQUASH_COMMAND + (target,)
+
+
 def _raise_if_modified(
     root: Path,
     before: _WorkingTree,
@@ -1102,6 +1191,7 @@ def _raise_if_modified(
     cause: Optional[BaseException] = None,
     *,
     skip_product_hashes: bool = False,
+    skip_porcelain: bool = False,
 ) -> None:
     """条目跑完之后，工作区被改了就抛。
 
@@ -1113,13 +1203,18 @@ def _raise_if_modified(
         cause: 条目自己的异常（有的话，守卫的异常从它派生）。
         skip_product_hashes: 跳过产品代码哈希判据 —— 只给声明的上游合并
             用，语义见 :meth:`_WorkingTree.touched`。
+        skip_porcelain: 跳过 porcelain 判据 —— 只给声明的 squash 条目用，
+            语义见 :meth:`_WorkingTree.touched`。
 
     Raises:
         ProductCodeModified: 出现了越界改动。
     """
     after = _WorkingTree.capture(root)
     touched = after.touched(
-        before, allowed, skip_product_hashes=skip_product_hashes
+        before,
+        allowed,
+        skip_product_hashes=skip_product_hashes,
+        skip_porcelain=skip_porcelain,
     )
     if not touched:
         return
