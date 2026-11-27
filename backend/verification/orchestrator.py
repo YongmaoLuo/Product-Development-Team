@@ -255,6 +255,24 @@ def _parse_same_fingerprint_runs(raw: Any) -> Dict[str, int]:
     return out
 
 
+def _parse_unjudged_streak(raw: Any) -> int:
+    """The unjudged-round streak a payload carries, as a count.
+
+    2026-11-27.  The payload's ``unjudged_streak`` key is **optional** —
+    a payload written before the counter existed simply does not have
+    it, and that is not an error: the reader returns ``0`` and the round
+    asks its question the way it always did.
+
+    A count that cannot be read is **not** repaired: a half-written
+    counter is not evidence about anything.  Only a non-negative ``int``
+    is a count — ``True`` is not a count (it is a bool, and ``bool`` is
+    a subclass of ``int``), and a negative count never happened.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return 0
+    return max(0, raw)
+
+
 #: The fence that carries a **declaration** in a report.
 #:
 #: Only a block whose info string is exactly ``json`` is read. A
@@ -522,6 +540,21 @@ REASON_CRITERION_REPLACED = "criterion_replaced"
 #: the triage's verdict carries is the code the machine compares
 #: against.
 STOP_REASON_MAX_ATTEMPTS = "same_failure_repeated_after_max_attempts"
+
+#: The reason a round's **terminal decision record** carries when the
+#: round could not be judged at all.
+#:
+#: 2026-11-27.  The round produced no verdict about the deliverable: a
+#: point's outcome could not be read (``UNKNOWN``) or a gate ran out of
+#: budget (``INCONCLUSIVE``).  The round stops the chain and asks a human
+#: what happens next — the sidecar next to the plan says **why** the
+#: question was asked, and this is that sentence.
+#:
+#: This word lives in the **sidecar**, not in the chain's stop-reason
+#: vocabulary: the round's own ``stop_reason`` stays ``None`` (the
+#: verdict is the ``status``, and the state machine's vocabulary is
+#: closed — see ``_judged_nothing_cycle_result``).
+STOP_REASON_VERDICT_UNAVAILABLE = "verdict_unavailable"
 
 #: How many times the **same** failure fingerprint may buy a repair task
 #: before the point stops being handed to the repair model.
@@ -954,6 +987,19 @@ def _undefined_vp_operator_action(vp_ids: Any) -> Optional[str]:
 #: machinery behind it — into the orchestrator's import time.
 STATUS_INCONCLUSIVE = "INCONCLUSIVE"
 
+#: The verdict a point carries when its outcome could **not be read**.
+#:
+#: 2026-11-27.  The report layer writes it when a point's result has no
+#: status of its own (``verification_agent``'s report builder falls back
+#: to it), so the point was never actually looked at: the round has no
+#: verdict about that point, and — like ``INCONCLUSIVE`` — no verdict
+#: about the deliverable either.
+#:
+#: Spelled here rather than imported for the same reason as
+#: :data:`STATUS_INCONCLUSIVE`: reading a round must not drag the agent
+#: (and the model machinery behind it) into the import time.
+STATUS_UNKNOWN = "UNKNOWN"
+
 
 def _round_judged_nothing(report: Mapping, failed_count: int) -> bool:
     """Did this round judge anything at all?
@@ -968,7 +1014,10 @@ def _round_judged_nothing(report: Mapping, failed_count: int) -> bool:
     * a gate that ran out of its budget is ``INCONCLUSIVE`` (since
       2026-10-31) — a gate that ran out of time did not prove the
       deliverable defective, it proved the *gate* ran out of time,
-      which is a statement about the run, not about the product.
+      which is a statement about the run, not about the product;
+    * a point whose outcome could not be read at all is ``UNKNOWN``
+      (since 2026-11-27) — the round never got to look at that point,
+      so it has no verdict about it either.
 
     Before this question existed, such a round fell into the failure
     path: nothing was broken, so there was nothing to repair — but the
@@ -1008,7 +1057,36 @@ def _round_judged_nothing(report: Mapping, failed_count: int) -> bool:
             return True
         if status == STATUS_INCONCLUSIVE:
             return True
+        if status == STATUS_UNKNOWN:
+            return True
         if _entry_is_environment_blocked(entry):
+            return True
+    return False
+
+
+def _round_has_unknown_verdict(report: Mapping) -> bool:
+    """Did this round carry a point whose outcome could not be read?
+
+    2026-11-27.  A point whose status is ``UNKNOWN`` was never looked
+    at: the run produced no outcome for it, so the round has no verdict
+    about that point -- and none about the deliverable either.  It is
+    the same kind of "no verdict" an ``INCONCLUSIVE`` gate produces, and
+    it is read the same way: **of the round's own entries**, never of the
+    derived verdict, so a round with no entry at all keeps passing.
+
+    Args:
+        report: The round's report.
+
+    Returns:
+        ``True`` when the round carries an ``UNKNOWN`` point.
+    """
+    entries = report.get("verification_results")
+    if not isinstance(entries, (list, tuple)):
+        return False
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        if str(entry.get("status") or "") == STATUS_UNKNOWN:
             return True
     return False
 
@@ -1042,6 +1120,43 @@ def _round_needs_operator_decision(report: Mapping) -> bool:
         if str(entry.get("status") or "") == STATUS_INCONCLUSIVE:
             return True
     return False
+
+
+def _round_unjudged_vp_ids(report: Mapping) -> List[str]:
+    """The points of this round that produced **no verdict**.
+
+    2026-11-27.  The two statuses that mean "nobody could read this
+    point's outcome": ``UNKNOWN`` (the outcome could not be read at
+    all) and ``INCONCLUSIVE`` (the gate ran out of budget).  They are
+    the points the operator's answer is about, and they are the points
+    the *revise the criterion* answer obsoletes — so they are handed to
+    the terminal decision's record as the failed points of the round.
+
+    The ids are read off the entries' own ``id`` (the report's spelling
+    of a verification point's id), with ``vp_id`` as the fallback for a
+    report that spells it that way.  An entry with no id at all names
+    nothing, so it is skipped rather than given a made-up id.
+
+    Args:
+        report: The round's report.
+
+    Returns:
+        The ids, in the order the report lists them, without repeats.
+    """
+    entries = report.get("verification_results")
+    ids: List[str] = []
+    if not isinstance(entries, (list, tuple)):
+        return ids
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        status = str(entry.get("status") or "")
+        if status not in (STATUS_UNKNOWN, STATUS_INCONCLUSIVE):
+            continue
+        vp_id = str(entry.get("id") or entry.get("vp_id") or "").strip()
+        if vp_id and vp_id not in ids:
+            ids.append(vp_id)
+    return ids
 
 
 def _round_budget_exhausted_in(report: Mapping) -> Optional[str]:
@@ -1745,6 +1860,16 @@ class VerificationOrchestrator:
                 tracking_payload.get("same_fingerprint_runs")
             )
         )
+        # 2026-11-27: ``n`` — how many rounds in a row the chain could
+        # not be judged at all (a point's outcome could not be read, or
+        # a gate ran out of budget).  The streak has to survive the fresh
+        # orchestrator every round builds — so it is read from the same
+        # payload, in the same read, as everything else.  A payload
+        # without the key is a legacy payload: it loads, and the streak
+        # is simply zero.
+        self._unjudged_streak: int = _parse_unjudged_streak(
+            tracking_payload.get("unjudged_streak")
+        )
         self._current_repair_tasks: List[Dict] = []
         self._waiting_for_user = False
         # 2026-10-22 (triage): the semantic judge that names the nature of
@@ -2055,6 +2180,11 @@ class VerificationOrchestrator:
                 if count > 0
             },
             "last_round": int(self._last_round),
+            # 2026-11-27: how many rounds in a row the chain could not be
+            # judged at all.  It rides along with the counts — the same
+            # file, the same write, the same read — because the streak
+            # has to survive the fresh orchestrator every round builds.
+            "unjudged_streak": int(self._unjudged_streak),
         }
         # 2026-10-27: the fingerprints ride along with the counts — the
         # same file, the same write, the same read. They are what tells
@@ -2940,10 +3070,133 @@ class VerificationOrchestrator:
             deferred.append(record)
         return repairable, deferred
 
+    def _ask_the_operator_about_the_unjudged_round(
+        self,
+        *,
+        report: Dict[str, Any],
+        round_number: int,
+        unjudged_unknown: bool,
+        unjudged_inconclusive: bool,
+        result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Ask the operator what happens after a round that could not be judged.
+
+        2026-11-27.  A round that could not be judged stopped the chain
+        and asked **nobody**: the plan sat there with a verdict nobody
+        could produce, and the only trace of it was a status.  This is
+        the question that closes that hole — the same two answers the
+        terminal branch offers (``rerun this round`` / ``revise the
+        criterion``), because they are the two things a person can
+        decide about a round that produced no verdict.
+
+        **How often it is asked.**  The first two unjudged rounds are
+        asked with the ordinary ``auto`` mode: the question carries a
+        default answer, so a round nobody answers falls back to
+        *rerun this round* — the plan carries on by itself.  From the
+        third unjudged round on the question is asked **strictly**: no
+        default answer and no deadline, so only a person can settle it.
+        The chain has been stuck for three rounds by then; letting the
+        clock answer for the fourth would be the system answering on
+        the operator's behalf.
+
+        **One question at a time.**  A question that is already waiting
+        for an answer is not asked again — the person in front of it has
+        one question to answer, not two.
+
+        **A question that cannot be asked is not a failed round.**  The
+        decision may not be created (the store may be gone, the request
+        may be refused); the round then keeps the exit it had, and the
+        chain stops as it did before.
+
+        Parameters
+        ----------
+        report:
+            The round's report — read for the points that produced no
+            verdict.
+        round_number:
+            Which round raised the question.
+        unjudged_unknown:
+            Whether the round carried a point whose outcome could not
+            be read.
+        unjudged_inconclusive:
+            Whether the round carried a gate that ran out of budget.
+        result:
+            The round's exit — returned with the two flags the question
+            sets.
+
+        Returns:
+            The round's exit, with ``waiting_for_user`` and
+            ``needs_operator_decision`` set when a question is waiting.
+        """
+        if self._waiting_for_a_human_answer():
+            # Somebody is already in front of a question of this plan's.
+            result["waiting_for_user"] = True
+            return result
+
+        # The third unjudged round in a row waits for a person.
+        strict = self._unjudged_streak > 2
+        budget = _round_budget_exhausted_in(report)
+        sentences: List[str] = []
+        if unjudged_unknown:
+            sentences.append(
+                f"verification round {round_number} could not be judged: "
+                "at least one point's outcome could not be read (UNKNOWN)."
+            )
+        if unjudged_inconclusive:
+            sentences.append(
+                f"verification round {round_number} could not be judged: a "
+                f"gate ran out of budget in {budget or 'an unnamed phase'}."
+            )
+        question = " ".join(sentences) + " Choose how to proceed."
+
+        try:
+            decision_id = self._ask_a_human_about(
+                round_number=round_number,
+                question=question,
+                options=list(TERMINAL_OPTIONS),
+                default_option=None if strict else TERMINAL_DEFAULT_OPTION,
+                vp_id=None,
+                check_open_question=False,
+                require_answer=strict,
+                audit_event="verification_unjudged_decision_failed",
+            )
+        except Exception as exc:  # noqa: BLE001 — a question is not a verdict
+            print(
+                f"[Verification] round {round_number}: the operator could "
+                f"not be asked about the unjudged round "
+                f"({type(exc).__name__}: {exc}) — the round stops as before"
+            )
+            return result
+
+        if not decision_id:
+            # No question was created (the store may be gone, the
+            # request may be refused).  The round keeps the exit it had.
+            return result
+
+        # The decision is the row the loop waits on; the sidecar is what
+        # the answer's execution reads (the points to revise, the reason
+        # the round stopped).  The analysis is ``None``: this question
+        # carries no judge's reading of a failure scene — there was no
+        # failure scene, there was no verdict.
+        self._record_terminal_decision_session(
+            decision_id=decision_id,
+            analysis=None,
+            report=report,
+            round_number=round_number,
+            failed_vp_ids=_round_unjudged_vp_ids(report),
+            stop_reason=(
+                STOP_REASON_VERDICT_UNAVAILABLE if unjudged_unknown else ""
+            ),
+        )
+        result["waiting_for_user"] = True
+        result["needs_operator_decision"] = True
+        return result
+
     def _ask_a_human_about(
         self, vp=None, failure_class=None, round_number=0, *,
         question=None, options=None, default_option=None,
         vp_id=_VP_ID_FROM_POINT, check_open_question=True,
+        require_answer=False,
         audit_event="verification_out_of_scope_decision_failed",
     ) -> str:
         """Put a check to a human, and report the question.
@@ -2990,6 +3243,19 @@ class VerificationOrchestrator:
         check_open_question:
             Whether an open question about the point suppresses a
             second one. ``False`` asks regardless.
+        require_answer:
+            Whether the question waits for a **person** or for the clock.
+            ``False`` — the default — is the behaviour every caller had
+            before this argument existed: the plan's configuration
+            decides the mode and the timeout, and an ``auto`` question
+            nobody answered in time falls back to its default answer.
+
+            ``True`` says the question has to be answered **explicitly**:
+            the decision is built ``strict`` (no fallback answer) and
+            without a deadline, so the expiry sweep never settles it on
+            the clock's behalf — only a human answering it does.  A
+            strict question has no default answer, so ``default_option``
+            is left as the caller gave it (``None``).
         audit_event:
             The audit event written when the question could not be
             created.
@@ -3031,7 +3297,11 @@ class VerificationOrchestrator:
             )
         if options is None:
             options = list(OUT_OF_SCOPE_OPTIONS)
-        if default_option is None:
+        if default_option is None and not require_answer:
+            # The out-of-scope fallback answer is the default of the
+            # *out-of-scope* question, so it is only ever filled in for
+            # that question.  A strict question (``require_answer``) has
+            # no fallback answer at all: ``None`` stays ``None``.
             default_option = OUT_OF_SCOPE_DEFAULT_OPTION
 
         request = DecisionRequest(
@@ -3045,7 +3315,9 @@ class VerificationOrchestrator:
             default_option=default_option,
         )
         try:
-            decision = create_decision(request, self.plan_dir)
+            decision = create_decision(
+                request, self.plan_dir, require_answer=require_answer,
+            )
         except Exception as exc:  # noqa: BLE001 — a question is not a verdict
             # A decision that could not be created must not take the
             # round down with it: the failure is still recorded, still
@@ -6260,6 +6532,18 @@ class VerificationOrchestrator:
             self._previous_failed_ids = None
             self._consecutive_same_failure_rounds = 0
             self._last_round = round_number
+            # 2026-11-27: the round could not be judged, and two of the
+            # ways it could not be judged are the ones only a person can
+            # answer: a point's outcome could not be read (``UNKNOWN``)
+            # or a gate ran out of budget (``INCONCLUSIVE``).  The
+            # streak counts how many rounds in a row the chain has been
+            # in that state; it rides along with the rest of the loop
+            # tracking, so it survives the fresh orchestrator every
+            # round builds.
+            unjudged_unknown = _round_has_unknown_verdict(report)
+            unjudged_inconclusive = _round_needs_operator_decision(report)
+            if unjudged_unknown or unjudged_inconclusive:
+                self._unjudged_streak += 1
             self._save_loop_tracking()
             budget_exhausted_in = _round_budget_exhausted_in(report)
             if budget_exhausted_in:
@@ -6273,7 +6557,29 @@ class VerificationOrchestrator:
                     f"[Verification] round {round_number}: the environment "
                     f"took this round out — no verdict, nothing to repair"
                 )
-            return _judged_nothing_cycle_result(report)
+            result = _judged_nothing_cycle_result(report)
+            if unjudged_unknown or unjudged_inconclusive:
+                # 2026-11-27: the round asks the operator what happens
+                # next.  Before this, an unjudged round stopped the
+                # chain and asked **nobody** — the plan sat there with a
+                # verdict nobody could produce and nobody was asked
+                # about.
+                result = self._ask_the_operator_about_the_unjudged_round(
+                    report=report,
+                    round_number=round_number,
+                    unjudged_unknown=unjudged_unknown,
+                    unjudged_inconclusive=unjudged_inconclusive,
+                    result=result,
+                )
+            return result
+
+        # 2026-11-27: the round is not one of the unjudged rounds above,
+        # so the unjudged streak ends here: the chain is back on its
+        # feet, and the next unjudged round starts counting again.  The
+        # write happens only when the streak actually changes.
+        if self._unjudged_streak:
+            self._unjudged_streak = 0
+            self._save_loop_tracking()
 
         # 2026-11-03 (arch decision point 3 — 基础设施未解决就停，不进迭代):
         # a round whose failures are all **exhausted infra terminals**.
