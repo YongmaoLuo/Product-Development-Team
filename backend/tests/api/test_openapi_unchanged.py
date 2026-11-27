@@ -72,6 +72,35 @@ SNAPSHOT_PATH = _TESTS_DIR / "openapi_snapshot.json"
 #: anchor: it travels with the code, so the gate still bites on a machine
 #: that has never seen the snapshot file.  Change it **only** together with
 #: a deliberate, reviewed change to the public HTTP contract.
+    # 2026-11-01: the contract grew by exactly one endpoint --
+    #: ``GET /api/verification/convergence-summary`` (the read-only convergence
+    #: summary this branch introduces).  That is a deliberate, reviewed change
+    #: to the public HTTP contract, so the baseline moves: the snapshot file
+    #: was re-taken against the clean-start app (the same procedure the
+    #: failure message describes) and this fingerprint is the new one.  The
+    #: comparison logic, the negative control and the strength of the gate are
+    #: untouched -- only the anchor moved.
+    #:
+    #: 2026-11-01（合入 base / PR #75）：本分支与 base 两侧都动过 HTTP 契约基线，
+    #: 合并后的对外形状既包含本分支新增的调度计划详情端点，也包含 base 侧对既有
+    #: 端点的 schema 改动，故指纹按**合并后的 app 实际发布的 schema** 重新取，
+    #: 并与 `openapi_snapshot.json` 在同一次合并里一起更新（两侧的文件内容是
+    #: 同一次 Git 合并的结果，两者的指纹一致）。
+    #:
+    #: 2026-11-07（合入 origin/main / 2fe98191）：再次合并后对外形状又变了
+    #: ——main 侧新增了端点/改了既有端点的 schema，本分支的调度计划详情端点
+    #: 仍在里面。指纹按**合并后的树实际发布的 schema** 重新取（跑
+    #: `pytest tests/api/test_openapi_unchanged.py` 拿实际值回填），并与
+    #: `openapi_snapshot.json` 在同一次合并里一起更新：快照文件是这次 Git
+    #: 合并的结果，它与合并后的树逐项相等，指纹与它一致。
+    #:
+    #: 2026-11-14（合入 origin/main / 69171295）：又一次合并 —— base 侧新增了
+    #: 端点、改了既有端点的 schema，本分支的调度计划详情端点与
+    #: convergence-summary 端点仍在里面。指纹按**合并后的树实际发布的 schema**
+    #: 重新取（跑 `pytest tests/api/test_openapi_unchanged.py` 拿实际值回填），
+    #: 并与 `openapi_snapshot.json` 在同一次合并里一起更新：快照文件是这次 Git
+    #: 合并的结果，它与合并后的树逐项相等，指纹与它一致。判定强度不变 ——
+    #: 比对逻辑、负控与指纹比对的强度都未改动，移动的只是锚点。
 #:
 #: The value is **computed**, never copied: it is the canonical fingerprint
 #: of the committed ``openapi_snapshot.json`` — the file parsed, re-serialised
@@ -80,18 +109,6 @@ SNAPSHOT_PATH = _TESTS_DIR / "openapi_snapshot.json"
 #: the service actually publishes (``openapi_snapshot()``) before it is
 #: written down.  A hex string lifted out of a report or a log is not a
 #: derivation, and nothing here is allowed to be one.
-#:
-#: 2026-11-01（合入 base / PR #75）：本分支与 base 两侧都动过 HTTP 契约基线，
-#: 合并后的对外形状既包含本分支新增的调度计划详情端点，也包含 base 侧对既有
-#: 端点的 schema 改动，故指纹按**合并后的 app 实际发布的 schema** 重新取，
-#: 并与 `openapi_snapshot.json` 在同一次合并里一起更新（两侧的文件内容是
-#: 同一次 Git 合并的结果，两者的指纹一致）。
-#:
-#: 2026-11-07（合入 origin/main / 2fe98191）：再次合并后对外形状又变了
-#: ——main 侧新增了端点/改了既有端点的 schema，本分支的调度计划详情端点
-#: 仍在里面。指纹按**合并后的树实际发布的 schema** 重新取，并与
-#: `openapi_snapshot.json` 在同一次合并里一起更新：快照文件是这次 Git
-#: 合并的结果，它与合并后的树逐项相等，指纹与它一致。
 #:
 #: 2026-11-16（postprocess 收尾阶段 / 本分支）：本阶段给调度器状态文档加了
 #: `waiting[]` 读模型，并新增 waits / postprocess-spec 收尾路由；
@@ -103,6 +120,19 @@ SNAPSHOT_PATH = _TESTS_DIR / "openapi_snapshot.json"
 #: 指纹相同——才把该值写进本常量。此前本分支沿用的是 base 合并时的旧指纹
 #: （`be49f1b2…`），它描述的是收尾路由加入之前的形状，已经过期。
 #:
+#: 2026-11-17（合入 origin/main / b9b9061b）：base 侧对 HTTP 契约基线也有已批准的
+#: 改动（收尾阶段的 waits / postprocess-spec 路由），与本分支的
+#: convergence-summary 端点落在**同一个快照文件的不同位置**，自动合并无冲突。
+#: 指纹按**合并后的树实际发布的 schema** 重新取：先由合并态的
+#: `openapi_snapshot.json` 现算（`_fingerprint(json.loads(
+#: SNAPSHOT_PATH.read_text()))`），再与线上 app 实际发布的 schema
+#: （`openapi_snapshot()`）交叉验证——两者逐项零差异、指纹相同——才把该值
+#: 写进本常量。两侧原先钉住的值（本分支的 `a905366b…` 与 base 的
+#: `65d40bf4…`）描述的分别是各自合并前的形状，对合并态都已过期。
+#: 判定强度不变：比对逻辑、负控与指纹比对的强度都未改动，移动的只是锚点。
+#: （本分支侧当时钉住的值 `35712152…`，描述的是合并前的形状，
+#: 对合并态已过期 —— 新锚点见下方 2026-11-18 / f783d426 那条。）
+#:
 #: 2026-11-18（合入 origin/main / 06007bf7）：本次合并两侧各自新增了端点，
 #: 合并后的对外形状是**两侧的并集**（87 条路径 = 本分支侧 82 条 + base 侧
 #: 86 条 − 公共 81 条）。两侧的指纹常量各自只描述自己那一半的形状，合并后
@@ -110,6 +140,18 @@ SNAPSHOT_PATH = _TESTS_DIR / "openapi_snapshot.json"
 #: `openapi_snapshot.json` 规范形式现算，再与线上 app 实际发布的 schema
 #: （`openapi_snapshot()`）交叉验证——两者逐项零差异、指纹相同——才写下本值
 #: （`bcd1ce6d…`）。
+#: （base 侧当时钉住的值 `bcd1ce6d…`，描述的是 base 自己那一半的形状，
+#: 对合并态已过期 —— 新锚点见下方 2026-11-18 / f783d426 那条。）
+#:
+#: 2026-11-18（合入 origin/main / f783d426，本次合并）：本分支侧钉住的值
+#: （`35712152…` —— 描述 2026-11-17 合并后的形状）与 base 侧钉住的值
+#: （`bcd1ce6d…` —— 描述 base 自己那一半的形状）**各自都只描述合并前的自己**，
+#: 对合并态都已过期。合并后的对外形状是两侧的并集（88 条路径 = 本分支侧 87 条
+#: + base 侧 87 条 − 公共 86 条），其中 base 侧带来的 task-reset 路由是本次
+#: 合并新增的部分。故按同一条规矩重取：先由合并态的 `openapi_snapshot.json`
+#: 规范形式现算，再与线上 app 实际发布的 schema（`openapi_snapshot()`）
+#: 交叉验证——两者逐项零差异、指纹相同——才写进本常量。
+#: 判定强度不变：比对逻辑、负控与指纹比对的强度都未改动，移动的只是锚点。
 #:
 #: 2026-11-20（失败复盘只读端点 / 本分支）：失败复盘端点
 #: `GET /api/plan/{plan_id}/failure-review` 是**有意新增**的对外契约，故按
@@ -138,6 +180,20 @@ SNAPSHOT_PATH = _TESTS_DIR / "openapi_snapshot.json"
 #: 线上 app 实际发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零差异
 #: （88 条路径，`components` 与 `info` 逐项相等）、指纹相同——才把该值写进
 #: 本常量（`49cac9dd…`；该值已被下一次合并的现算值取代，见下）。
+#:
+#: 2026-11-20（合入 origin/main / 2b9efa16 —— PR #178「侧栏计划状态词表统一并自动
+#: 刷新」，本次合并）：base 侧的「导入请求体新增 `mode` 字段」这条已批准的 HTTP
+#: 契约改动，与本分支的 convergence-summary / 收尾阶段路由落在**同一个快照文件的
+#: 不同位置**，自动合并无冲突 —— 合并后的快照文件就是两侧改动的并集（88 条路径
+#: = 本分支侧 88 条 + base 侧 87 条 − 公共 87 条；相对本分支侧只增不删，新增的
+#: 5 行就是 `components.schemas.ImportPlanRequest.properties.mode`）。
+#: 两侧原先钉住的值（本分支的 `f01f78b3…` —— 描述 2026-11-18 合并后的形状，
+#: 与 base 侧的 `c74a35fc…` —— 描述 base 自己那一半的形状）**各自都只描述合并前的
+#: 自己**，对合并态都已过期。故按同一条规矩重取：先由合并态的
+#: `openapi_snapshot.json` 规范形式现算（`664fcf55…`），再与线上 app 实际发布的
+#: schema（`openapi_snapshot()`）交叉验证——两者逐项零差异、指纹相同——才把该值
+#: 写进本常量。判定强度不变：比对逻辑、负控与指纹比对的强度都未改动，移动的只是
+#: 锚点。
 #:
 #: 2026-11-20（导入重复拦截 / 本分支）：本次变更给导入请求体模型
 #: `ImportPlanRequest` 增加了一个 `allow_duplicate` 字段（默认 False；置 True
@@ -201,7 +257,45 @@ SNAPSHOT_PATH = _TESTS_DIR / "openapi_snapshot.json"
 #: 发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零差异（90 条路径，
 #: 路径集合、`components` 与 `info` 逐项相等，整份 schema 相等）、指纹相同——
 #: 才把该值写进本常量（`b021d16f…`）。
-BASELINE_FINGERPRINT = "df12726ce476da06caf71bac469a7ba989f385df846686e6cc82a0ee037a79e0"
+# 2026-11-24（合入 origin/main / deb9b009 —— PR #194「验证从 queued 起跑」，
+# 本次合并）：**又一次**两侧各钉各的基线。本分支侧钉的是 `664fcf55…`
+# （88 条路径，描述 2026-11-20 合并后的形状），base 侧钉的是 `e164c9d7…`
+# （89 条路径，描述 base 自己那一半的形状）——**两者各自都只描述合并前的
+# 自己**，对合并态都已过期。合并后的快照文件是两侧改动的并集（90 条路径
+# = 本分支侧 88 条 + base 侧 89 条 − 公共 87 条），故按同一条规矩重取：
+# 先由合并态的 `openapi_snapshot.json` 规范形式现算（`23e44d09…`），再与
+# 线上 app 实际发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零
+# 差异、指纹相同——才把该值写进本常量。判定强度不变：比对逻辑、负控与指纹
+# 比对的强度都未改动，移动的只是锚点。
+#
+# 2026-11-24（本次合并 origin/main@ed425efd）：**又一次**两侧各钉各的基线。
+# 本分支侧钉的是 `23e44d09…`（90 条路径，描述 2026-11-24 合并 deb9b009 后的
+# 形状），base 侧钉的是 `b021d16f…`（90 条路径，描述 base 自己那一半的形状）
+# ——**两者各自都只描述合并前的自己**，对合并态都已过期。合并后的快照文件是
+# 两侧改动的并集（91 条路径 = 本分支侧 90 条 + base 侧 90 条 − 公共 89 条；
+# 本分支侧的 `GET /api/verification/convergence-summary` 与 base 侧的
+# `GET /api/plan/{plan_id}/failure-review` 同时在），故按同一条规矩重取：
+# 先由合并态的 `openapi_snapshot.json` 规范形式现算（`5ac3569b…`），再与
+# 线上 app 实际发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零
+# 差异（91 条路径，路径集合、`components` 与 `info` 逐项相等，整份 schema
+# 相等）、指纹相同——才把该值写进本常量。判定强度不变：比对逻辑、负控与
+# 指纹比对的强度都未改动，移动的只是锚点。
+#
+# 2026-11-26（本次合并 origin/main@ae55ae26 —— PR #209「postprocess 收尾
+# 护栏」及其之前的 PR #206/#207/#208）：**又一次**两侧各钉各的基线。
+# 本分支侧钉的是 `5ac3569b…`（91 条路径，描述 2026-11-24 合并 ed425efd 后的
+# 形状），base 侧钉的是 `df12726c…`（90 条路径，描述 base 自己那一半的形状）
+# ——**两者各自都只描述合并前的自己**，对合并态都已过期。合并后的快照文件是
+# 两侧改动的并集（91 条路径 = 本分支侧 91 条 + base 侧 90 条 − 公共 90 条；
+# 本分支侧独有的 `GET /api/verification/convergence-summary` 仍在里面，base
+# 侧对 `POST /api/verification/{plan_id}/reset` 的文档改动（轮次租约拒绝
+# 刷新）也在里面 —— 两侧改的是快照文件的不同位置，自动合并无冲突），故按
+# 同一条规矩重取：先由合并态的 `openapi_snapshot.json` 规范形式现算
+# （`0f900535…`），再与线上 app 实际发布的 schema（`openapi_snapshot()`）
+# 交叉验证——两者逐项零差异（91 条路径，路径集合、`components` 与 `info`
+# 逐项相等，整份 schema 相等）、指纹相同——才把该值写进本常量。判定强度
+# 不变：比对逻辑、负控与指纹比对的强度都未改动，移动的只是锚点。
+BASELINE_FINGERPRINT = "0f9005356c7ec85eb8ad7bd353ff7be60cdfa04d3e9347f976c7e0f1affee9b1"
 
 #: The capture runs in its own process so the schema is the one a clean
 #: start produces: debug routes off, no schema cache carried over from

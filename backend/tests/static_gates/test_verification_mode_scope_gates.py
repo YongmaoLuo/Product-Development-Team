@@ -1102,6 +1102,34 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # `extra_env` 实参；本分支的「修复轮退出事件的单一写入器 `_repair_exit_writer` +
     # 回收器按 `repair_executor` 角色分序回收」加的是 `role` 实参。两者互不覆盖，
     # 故两边都保留；文件内容因此再次变化，按本 gate 的既定流程重新钉住合并后的文件。
+    # 2026-11-01：因「修复批次收口统一走分类器」把修复轮的两条互不相干的判定
+    # （退出码非零 / 退出码为零但仍有 pending）合并成一次 `classify_repair_outcome`
+    # 调用，并新增 `_repair_batch_stop_reason` / `_repair_batch_counts` 两个纯读辅助
+    # 函数，改动本文件；`_count_unfinished_tasks` 只多了一个 `strict` 关键字参数
+    # （默认值 `False`，既有调用点的行为一字未变）。改动是纯增量：未改动任何既有
+    # 分支，未改动任何相位名与 park 状态；按本 gate 的既定流程把冻结基线移动到
+    # 本分支的批准态哈希。
+    # 这仍然是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的
+    # 范围、sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑
+    # 照样红。
+    # 2026-11-01（task-8）：因「未排空的修复批次有界重派而非终止」改动本文件 ——
+    # 新增 `_REPAIR_NOT_DRAINED_REASON_PREFIX` / `_REPAIR_NEVER_DRAINED_REASON_PREFIX`
+    # 两个停止原因前缀与纯读判定 `_is_repair_not_drained_reason`，并把
+    # `_make_repair_on_complete` 里「读到未排空就写 `loop_stopped`」的分支改成
+    # 「有界重派 executor」（上界仍是既有的 `_MAX_REPAIR_NOT_DRAINED_GUARDS`，
+    # 只有该上界触发时才写 `loop_stopped` / `repair_never_drained:`）。
+    # 本分支 §1（UNKNOWN 推导）与 §2（修复批次收口分类）此前已分别改动本文件，
+    # 上一次重钉即由 §2 触发；本次重钉是 §2 之后本文件再次变化的唯一增量。
+    # 未改动任何相位名、任何 park 状态、任何既有分支的判定内容；按本 gate 的既定
+    # 流程把冻结基线移动到本分支的批准态哈希。
+    # 这仍然是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的
+    # 范围、sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑
+    # 照样红。
+    #
+    # 2026-11-01（合入 PR #75 / base）：base 侧对 `backend/verification_loop.py` 的改动
+    # （`_repair_exit_writer` + 回收器按 `repair_executor` 角色分序回收）已随 base 合入，
+    # 合并后该文件的内容与本条哈希一致，故本条哈希在本次合并后保持不变。
+    #
     # 2026-11-02：因本轮修复的两条要求改动本文件，按本 gate 的既定流程重新钉住哈希：
     #   * §3「没测出东西的轮次不占编号」—— `_round_release_reason` /
     #     `_release_unverified_round` / `_round_verification_entries`；
@@ -1258,6 +1286,28 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的
     # 范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
     # 任何再编辑照样红。
+    # 2026-11-13：自上一版基线（f1cf3409 合并 origin/main 之后的状态）以来，
+    # 本文件只有两处已批准的改动，合并解决本身没有改动它：
+    # b77e91cb（2026-11-11）「让修复批次的结局只认一张分类表」——`_run()` 改调
+    # `_repair_batch_stop_reason`，删掉自拼 stop_reason 的原始判据（+136/-103）；
+    # ea2970c1（2026-11-12）「层 B：关停打断的轮次不再被第二个判决写者写成
+    # failed」（+235/-4）。这两笔此前改了文件却没有重新钉哈希，于是本 gate 报出
+    # 「实际内容 98de11b1… 与钉住的 a3534a15… 不符」。
+    # 另加本任务（2026-11-13 合并验收）的一处改动：`verification_loop.py:363` 的
+    # 返回注解 `Optional["RepairOutcome"]` 悬空（ruff F821）。修法是加一个
+    # `if TYPE_CHECKING:` 分支导入 `RepairOutcome` —— 模块已有
+    # `from __future__ import annotations`，注解运行期不求值，因此**没有**在模块级
+    # import verification（那会闭合 server ↔ verification 的循环，见
+    # `_repair_batch_stop_reason` 里的注释）。本任务只加了这一处 typing 导入，
+    # 没有任何判定逻辑改动。
+    # 按本 gate 的既定流程把冻结基线前移到本分支的批准态哈希。
+    # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的
+    # 范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
+    # 任何再编辑照样红。
+    #
+    # 2026-11-13（base 侧）：base 分支已批准的「轮次实例身份」改动落在
+    # `verification_loop.py` 上 ——
+    #
     # 2026-11-13：合并 origin/main 时 ``backend/verification_loop.py`` 两侧都改过
     # ——本分支删掉了镜像写函数 ``_update_plan_state_to_terminal`` 及其调用点
     # （镜像列不再是验证状态的生产写入点，权威行取代它），main 侧则带来了
@@ -1299,6 +1349,21 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # （仍是 `frontend/app.js` / `frontend/style.css` / `backend/verification_loop.py`
     # 这三个，一个不多一个不少）与 sha256 逐字节比对的强度都不变，该文件此后仍被
     # 逐字节钉住，任何再编辑照样红。
+    # 2026-11-14：base 分支（base drift 轮次复用与审计、服务放置复用自家实例）的
+    # 已批准改动同样落在 `verification_loop.py`；与上面「轮次实例身份」的改动
+    # 合并后，冻结基线前移到**合并态**哈希。判定强度不变：仍是逐字节 sha256 比对。
+    #
+    # 2026-11-14（本轮合并 316b360a）：把 base 合进本分支时，两侧各自的冻结基线
+    # 同时指向 `verification_loop.py`，而合并后的文件内容是**第三种**——base 的
+    # 「轮次实例身份 / base drift 轮次复用 / 服务放置复用自家实例」改动，加上本分支的
+    # 「修复批次分类表 / 关停打断的轮次 / TYPE_CHECKING 导入」改动，再加上合并解决
+    # 本身（`_on_repair_complete` 的 docstring 同时保留两侧的意图）。两侧原来的哈希
+    # （本分支的 2745b83d… 与 base 的 1275d125…）都对不上合并态，按同一套流程把冻结
+    # 基线前移到**合并态**哈希 d1da1dfe…。判定强度不变：仍是逐字节 sha256 比对，
+    # 被钉文件仍是 `frontend/app.js` / `frontend/style.css` /
+    # `backend/verification_loop.py` 这三个，一个不多一个不少；该文件此后仍被逐字节
+    # 钉住，任何再编辑照样红。
+    #
     # 2026-11-14：再次合并 origin/main（980249a5，PR #154「轮次实例服务所有权改用
     # 每次实例 UUID」）—— 这一次 ``backend/verification_loop.py`` 两侧仍然都改过：
     # 本分支继续删镜像写函数，main 侧带来上面那整套「轮次实例身份」改动。
@@ -1412,6 +1477,32 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 范围（仍是 `frontend/app.js` / `frontend/style.css` / `backend/verification_loop.py`
     # 这三个，一个不多一个不少）与 sha256 逐字节比对的强度都不变，该文件此后仍被
     # 逐字节钉住，任何再编辑照样红。
+    #
+    # 2026-11-16（本轮合并 78ffdddc）：再次把 base（origin/main@78ffdddc）合进
+    # 本分支，两侧这次的冻结基线又同时指向 `verification_loop.py`，合并后的文件
+    # 内容仍然是**第三种**——base 的「停放不等于失败」（`_plan_parked_for_quota` /
+    # `_park_verification_round_for_quota`）加上本分支的「修复批次分类表」
+    # （`_repair_batch_stop_reason` 一张分类表出结局），再加上合并解决本身
+    # （修复轮退出的判定保留本分支的统一分类器，同时把 base 的
+    # 「验证轮停放写入行与运行时旁路文件」这一调用折进分类器判出的停放分支）。
+    # 两侧原来的哈希（本分支的 d1da1dfe… 与 base 的 bda62e8b…）都对不上合并态，
+    # 按同一套流程把冻结基线前移到**合并态**哈希 c2b7a4c3…。判定强度不变：仍是
+    # 逐字节 sha256 比对，被钉文件仍是 `frontend/app.js` / `frontend/style.css` /
+    # `backend/verification_loop.py` 这三个，一个不多一个不少；该文件此后仍被逐字节
+    # 钉住，任何再编辑照样红。
+    #
+    # 2026-11-17（合入 origin/main / b9b9061b）：再次把 base 合进本分支，两侧的
+    # 冻结基线又同时指向 `verification_loop.py`，合并后的文件内容仍然是**第三种**
+    # ——base 的「收尾阶段」（`_start_postprocess` / `_settle_postprocess_phase` /
+    # `_postprocess_notification_sink`，以及 `_handle_passed_round` 里的收尾门控）
+    # 加上本分支的「修复批次分类表 / 关停打断的轮次 / TYPE_CHECKING 导入」改动，
+    # 再加上合并解决本身。两侧原先钉住的值（本分支的 c2b7a4c3… 与 base 的
+    # c3cc3314…）描述的都是各自合并前的字节，对合并态都已过期；按同一套流程
+    # （`sha256(file bytes)`）把冻结基线前移到**本次合并态**哈希 b97036af…。
+    # 判定强度不变：仍是逐字节 sha256 比对，被钉文件仍是 `frontend/app.js` /
+    # `frontend/style.css` / `backend/verification_loop.py` 这三个，一个不多一个
+    # 不少；该文件此后仍被逐字节钉住，任何再编辑照样红。
+
     # 2026-11-16（本次合并 origin/main@78ffdddc，7 个新提交）：``backend/verification_loop.py``
     # 两侧**又都改过** —— 本分支继续删镜像写函数 ``_update_plan_state_to_terminal``
     # （权威行取代它），base 侧带来 2026-11-15 的「停放不等于失败」（PRD R1：
@@ -1462,6 +1553,23 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 位置**，互不覆盖，故两边都保留；文件内容因此再次变化，按本 gate 的既定流程把
     # 冻结基线前移到**合并态**哈希（`shasum -a 256` 实测值）。
     # 表内条目集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
+    #
+    # 2026-11-19（本次合入 origin/main@021565b9 —— PR #174「收敛验证轮：轮次释放、
+    # 心跳存活与修复认领」）：base 侧与本分支的改动落在同一个文件的**同一处** ——
+    # 修复轮退出的判定。本分支的判定走一张分类表（`_repair_batch_stop_reason`：结局
+    # 由 pending / failed 的工作事实出，退出码只作旁证），base 侧的判定分「关停打断」
+    # 与「退出码」两种写法。合并解决把两侧的意图都留下：
+    #   * 结局仍由那张分类表出 —— 工作事实（`pending_remains` / `repair_failed`）压过
+    #     退出码，两侧的重派与「未排空」判据一字未动；
+    #   * base 的「被关停打断的那一轮没有自己的结论」接在分类表之外，作为独立分支
+    #     （`interrupted_by_shutdown`），不写终局结论；
+    #   * base 的退出码取证（`_repair_stop_reason`：`repair_non_zero_exit:<n>` /
+    #     `repair_signal:<n>`）只在分类表判出 `gate_red` **且**退出码为负（信号死亡）
+    #     时改写**理由**，不改结局 —— 描述变了，事实没变。
+    # 文件内容因此再次变化，按本 gate 的既定流程把冻结基线前移到**合并态**哈希
+    # （`shasum -a 256` 实测值）。表内条目集合与断言强度不变：被钉文件的范围不变、
+    # sha256 仍逐字节比对，该文件此后仍被逐字节钉住，任何再编辑照样红。
+
     # 2026-11-19：本分支已批准的「失败复盘旁路宣告」改动落在
     # `verification_loop.py` 上 —— 在 `_persist_verification_terminal()` 里，
     # 终态判定（`_chain_ending`）算出之后、第 2 步 routing CAS 之前，加一段
@@ -1490,6 +1598,19 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 实测值）。这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、
     # 被钉文件的范围与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，
     # 任何再编辑照样红。
+
+    # 2026-11-20（本次合入 origin/main@2b9efa16 —— PR #178「侧栏计划状态词表统一并
+    # 自动刷新」，本次合并）：base 侧与本分支又同时改动了 `verification_loop.py` ——
+    # base 侧把修复执行完成后的 `passed` 出口接到收尾判定点 `_handle_passed_round`，
+    # 本分支的「修复批次分类表 / 轮次归还 / 崩溃不盖终局相位」改动落在同一文件的
+    # **不同位置**（`TYPE_CHECKING` 导入、`_count_unfinished_tasks(strict=...)`、
+    # `_repair_batch_stop_reason` 分类表等），两侧的改动**互不覆盖**，Git 自动合并
+    # 把两侧的意图都保留：合并后的文件相对 base 侧仍保有本分支的分类表与轮次归还，
+    # 相对本分支侧仍保有 base 的 `_handle_passed_round` 出口。
+    # 文件内容因此再次变化，按本 gate 的既定流程把冻结基线前移到**合并态**哈希
+    # （`shasum -a 256` 实测值 `cf3a2fa0…`）。表内条目集合与断言强度不变：被钉文件的
+    # 范围不变、sha256 仍逐字节比对，该文件此后仍被逐字节钉住，任何再编辑照样红。
+
     # 2026-11-20（合入 origin/main / 2b9efa16）：两侧都改动了本文件，且改动落在
     # **不同位置**（本分支侧的失败复盘旁路宣告与宣告时机 vs base 侧的通过出口走
     # 收尾判定点），自动合并无冲突，两侧的意图都保留；文件内容因此再次变化，按本
@@ -1535,6 +1656,75 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 流程把冻结基线前移到本分支的批准态哈希：这是「移动冻结」而不是
     # 「放松门禁」—— 断言（mismatched == []）、被钉文件的范围与 sha256 逐字节
     # 比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-24（本次合并 origin/main@deb9b009 —— PR #194「验证从 queued 起跑」，
+    # 本次合并）：``backend/verification_loop.py`` 两侧**又都改过** ——
+    # base 侧带来「验证从 queued 起跑」等已批准改动（收尾阶段的可续跑入口
+    # ``resume_postprocess``、「有失败项、却 0 条修复任务 → 交人工裁定」的
+    # ``FAILURES_WITHOUT_REPAIR_TASKS_STOP_REASON``、``_start_postprocess``、
+    # ``_handle_passed_round`` 等），本分支继续删镜像写函数
+    # ``_update_plan_state_to_terminal``（权威行取代它）。
+    # 合并后的文件内容与两侧各自的冻结基线（本分支的 ``cf3a2fa0…`` 与 base 的
+    # ``6c43e4e8…``）都不同，因此按本 gate 的既定流程把冻结基线前移到**合并态**
+    # 哈希（``shasum -a 256`` 实测值 ``e44c224c…``）。
+    # 前移之前已核对：两侧的改动都还在，没有互相抵消 ——
+    #   * base 侧：``resume_postprocess`` / ``FAILURES_WITHOUT_REPAIR_TASKS_STOP_REASON``
+    #     / ``_start_postprocess`` / ``_handle_passed_round`` /
+    #     ``_new_round_instance_token`` / ``_claim_round_instance_ownership`` /
+    #     ``_release_handover_service_owner`` / ``_end_round_instance`` /
+    #     ``mark_round_blocked`` / ``_terminal_write_ends_the_chain`` /
+    #     ``SERVICE_OWNER_CLAIM_REFUSED_STOP_REASON`` / ``_plan_parked_for_quota``
+    #     均在位；
+    #   * 本分支：镜像写函数 ``_update_plan_state_to_terminal`` 仍然整体消失（该文件里
+    #     0 处引用），权威行仍由 ``_persist_verification_terminal`` 写；本分支的
+    #     ``_repair_batch_stop_reason`` 分类表、``_release_unverified_round``、
+    #     ``_dead_phase_may_be_stamped`` 与 ``TYPE_CHECKING`` 导入同样在位。
+    # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的范围
+    # 与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    #
+    # 2026-11-24（本次合并 origin/main@deb9b009 的收尾修复）：base 合入的
+    # 「镜像列唯一写者」判据要求删掉合并态里残留的那处裸镜像写 ——
+    # 恢复路径 ``_clear_shutdown_interrupted_terminal`` 原来还会把
+    # ``plan_routing.verification`` 读出来再写回（把它重置成
+    # ``{status: pending, stop_reason: None}``）。镜像列自 arch 决策点 3 起
+    # 已退役为状态来源，只承载冻结基线，唯一写者是
+    # ``RoutingRepository.write_verification_baseline``；而那个 helper 写回的
+    # 两个 lifecycle 键恰恰是镜像列已经不再承载的东西。删掉的是镜像那一半，
+    # 权威那一半（把 ``plan_verification`` 行放回 ``pending``、清掉 ``results``）
+    # 原样保留 —— 恢复流程真正依赖的正是它。
+    # 文件字节因此变化，按本 gate 的既定流程把冻结基线前移到改完之后的实测哈希
+    # （``shasum -a 256``）。这是「移动冻结」而不是「放松门禁」：断言
+    # （mismatched == []）、被钉文件的集合（3 个键）与条目数、sha256 逐字节
+    # 比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-23（合入 origin/main / deb9b009）：两侧都改动了本文件，且改动落在
+    # **不同位置**（本分支在 `_persist_verification_terminal` 里加了失败复盘的终态
+    # 宣告 `announce_failure`，base 侧改的是收尾阶段的续跑入口与相位事件），自动合并
+    # 无冲突，两侧的意图都保留；文件内容因此再次变化，按本 gate 的既定流程把冻结
+    # 基线前移到**合并态**哈希（`shasum -a 256` 实测值，不是抄来的）。表内条目集合与
+    # 断言强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
+    # 2026-11-24（本次合并 origin/main@ed425efd）：两侧**又都改过**
+    # `backend/verification_loop.py` —— base 侧带来「失败复盘旁路宣告」及其
+    # 「宣告必须在终态写入之后」的时机改动（`announce_failure`），本分支带来
+    # 「修复批次分类表 / 轮次归还 / 崩溃不盖终局相位」这一组改动。两侧的改动
+    # 落在**不同位置**，自动合并无冲突，两侧的意图都保留。
+    # 合并后的文件内容与两侧各自的冻结基线（本分支的 ``50af7691…`` 与 base 的
+    # ``b62532a5…``）都不同，因此按本 gate 的既定流程把冻结基线前移到**合并态**
+    # 哈希（``shasum -a 256`` 实测值 ``338d6ea3…``）。
+    # 前移之前已核对：两侧的改动都还在，没有互相抵消 ——
+    #   * base 侧：``announce_failure`` 仍在 ``_persist_verification_terminal`` 里
+    #     （宣告在终态写入之后），``resume_postprocess`` /
+    #     ``FAILURES_WITHOUT_REPAIR_TASKS_STOP_REASON`` / ``_start_postprocess`` /
+    #     ``_handle_passed_round`` / ``_new_round_instance_token`` /
+    #     ``_claim_round_instance_ownership`` / ``_release_handover_service_owner`` /
+    #     ``_end_round_instance`` / ``mark_round_blocked`` /
+    #     ``_terminal_write_ends_the_chain`` /
+    #     ``SERVICE_OWNER_CLAIM_REFUSED_STOP_REASON`` / ``_plan_parked_for_quota``
+    #     均在位；
+    #   * 本分支：``_repair_batch_stop_reason`` 分类表、``_release_unverified_round``、
+    #     ``_dead_phase_may_be_stamped`` 与 ``TYPE_CHECKING`` 导入同样在位；镜像写
+    #     函数 ``_update_plan_state_to_terminal`` 仍然整体消失（该文件里 0 处引用），
+    #     权威行仍由 ``_persist_verification_terminal`` 写。
+    # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的范围
+    # 与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
     # 2026-11-23（repair-03）：本分支的暂停/恢复改动落在 `verification_loop.py` 上
     # （暂停意图先落库、再停机；停机未落地时以 `pause_kill_incomplete` 结束），
     # repair-03 又把该文件里一处带归属形状的注释改写成系统视角的措辞（只改注释、
@@ -1548,8 +1738,61 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 无冲突，**两侧的意图都保留**；文件内容因此再次变化，按本 gate 的既定流程把
     # 冻结基线前移到**合并态**哈希（`shasum -a 256` 实测值，不是抄来的）。表内条目
     # 集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
+    # 2026-11-25（本次合并 origin/main@a0b28e74 —— PR #205「scheduler pause UX」，
+    # 本次合并）：``backend/verification_loop.py`` 两侧**又都改过**，而且改在
+    # **同一处** —— 修复轮退出的判定（`_run_repair_execution_async` 里写终局结论的
+    # 那个分支），所以这一次是**真冲突**，逐块解决的结果如下：
+    #   * base 侧带来「暂停/恢复」的终局判定：暂停意图先落库、再停机；停机落地了
+    #     这一轮以 ``stopped`` / ``paused`` 收尾（意图在终态写盘之后才清），停机
+    #     **没**落地则以 ``pause_kill_incomplete`` 收尾（计划还在跑，相位不动，
+    #     意图留着给下一轮）。
+    #   * 本分支带来「修复批次分类表」：这一轮的结局由
+    #     ``_repair_batch_stop_reason`` 一张表出（工作事实压过退出码），停放态原样
+    #     保留，崩溃不盖终局相位。
+    # 合并解决把两侧的意图都留下：**暂停判定在前**（它回答的是「这一轮是不是被
+    # 暂停的」——暂停既不是崩溃也不是批次结论），不是暂停的那一轮才交给分类表；
+    # 而**被信号打死的这一轮由死因命名**（``repair_signal:<n>``，base 侧的取证
+    # 措辞 —— 分类表自己对 ``gate_red`` 那一类早就是这么写的），但结局仍然是
+    # 分类表的结局 —— 工作事实照样记在 ``repair_unfinished_tasks`` /
+    # ``should_continue`` 里，没有被措辞吃掉。
+    # 前移之前已核对：两侧的改动都还在，没有互相抵消 ——
+    #   * base 侧：``_pause_surviving_pids`` / ``read_pause_intent`` /
+    #     ``clear_pause_intent`` 的用法、``pause_kill_incomplete``、
+    #     ``_pause_honoured``、``announce_failure``、``resume_postprocess`` /
+    #     ``FAILURES_WITHOUT_REPAIR_TASKS_STOP_REASON`` / ``_start_postprocess``
+    #     / ``_handle_passed_round`` / ``_new_round_instance_token`` /
+    #     ``_claim_round_instance_ownership`` / ``_release_handover_service_owner``
+    #     / ``_end_round_instance`` / ``mark_round_blocked`` /
+    #     ``_terminal_write_ends_the_chain`` /
+    #     ``SERVICE_OWNER_CLAIM_REFUSED_STOP_REASON`` / ``_plan_parked_for_quota``
+    #     均在位；
+    #   * 本分支：``_repair_batch_stop_reason`` 分类表、``_repair_batch_counts``、
+    #     ``_count_unfinished_tasks``、``_release_unverified_round``、
+    #     ``_dead_phase_may_be_stamped`` 与 ``TYPE_CHECKING`` 导入同样在位；镜像写
+    #     函数 ``_update_plan_state_to_terminal`` 仍然整体消失（该文件里 0 处引用），
+    #     权威行仍由 ``_persist_verification_terminal`` 写。
+    # 合并后的文件内容与两侧各自的冻结基线（本分支的 ``338d6ea3…`` 与 base 的
+    # ``d1c9cbc7…``）都不同，因此按本 gate 的既定流程把冻结基线前移到**合并态**
+    # 哈希（``shasum -a 256`` 实测值 ``59721fcd…``）。
+    # （前移之后静态门禁 ``test_no_pr_number_in_sources`` 又指出合并说明的注释里
+    # 写了 PR 号 —— 源码注释里不留 PR 号是该门禁的规矩，所以注释再改一次，
+    # 冻结基线跟着再前移一次；改的仍然只是注释。）
+    # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的范围
+    # 与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    #
+    # 2026-11-26：已批准的「修复批次的结局收进一张分类表」改动落在
+    # `verification_loop.py` 上 —— `_repair_batch_stop_reason` 现在同时产出**死因**
+    # （进程被信号打死这件事，它是一个过程事实），返回值从三元组扩为四元组
+    # `(stop_reason, pending, outcome, death)`；调用点只**抄**分类表的结论，不再按
+    # 退出码自己拼第二个理由，死因改记在自己的字段 `repair_death` 里。
+    # 改这一处的理由：分类表判出的「还有活没干完」原本会被退出码的措辞盖住，
+    # 而唯一读那个理由的重派入口只认 `repair_batch_not_drained:` 前缀 —— 一个
+    # pending 的修复任务因此成了「终止验证」而不是「下一轮继续的理由」。
+    # 按本 gate 的既定流程把冻结基线前移到本分支的批准态哈希（`shasum -a 256`
+    # 实测值 `4b114d48…`）。表内条目集合与条目数不变、断言强度不变：被钉文件的
+    # 范围不变、sha256 仍逐字节比对，该文件此后仍被逐字节钉住，任何再编辑照样红。
     "backend/verification_loop.py": (
-        "d1c9cbc7290e5bd59632a3f51da47292c4b8e4a3d4d1abbbd71f8debc4bcfab6"
+        "4b114d480e1117109c0ee1a3cbfe33f144659e3382bfd951e29aa24d95772741"
     ),
 }
 

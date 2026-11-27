@@ -101,6 +101,7 @@ from verification_subagent import (
     DEFAULT_FAILURE_CLASS_SOURCE,
     DETERMINISTIC_FAILURE_CLASS_SOURCE,
     INFRA_FAILURE_CLASS,
+    VERDICT_UNKNOWN,
     VerificationSubAgent,
     Verdict,
 )
@@ -3163,6 +3164,7 @@ def _derive_overall_status(entries: Any) -> str:
       * a FAILED entry          -> ``FAILED``
       * a PARTIAL entry         -> ``PARTIAL``
       * a DEFERRED entry, an
+        UNKNOWN entry, an
         environment-blocked one, an infra-unresolved one, or an
         INCONCLUSIVE one
                                  -> ``SKIPPED``
@@ -3172,6 +3174,17 @@ def _derive_overall_status(entries: Any) -> str:
     it makes the round **unjudged**, and an unjudged round says
     ``SKIPPED``.  A plain ``SKIPPED`` is not that: it is a point the
     round did not need to ask, and it leaves the verdict alone.
+
+    An UNKNOWN entry joins the unjudged tier for the same reason a
+    DEFERRED entry does.  ``VERDICT_UNKNOWN`` is what the sub-agent
+    writes when its answer was not a verdict at all: the point
+    established **nothing** about the deliverable — it did not pass and
+    it did not fail.  Filing such a point as FAILED would charge the
+    deliverable for the sub-agent's own malfunction, and reading it as
+    "otherwise" would count a point nobody judged as a point that
+    passed.  It is read from the shared constant
+    :data:`verification_subagent.VERDICT_UNKNOWN`, so the verdict has
+    one spelling shared with the layer that writes it.
 
     The infra terminal (2026-11-03) joins the unjudged tier for the
     same reason a DEFERRED entry does: the point carries no verdict
@@ -3204,6 +3217,7 @@ def _derive_overall_status(entries: Any) -> str:
         statuses.append(str(status))
         if (
             str(status) == "DEFERRED"
+            or str(status) == VERDICT_UNKNOWN
             or str(status) == STATUS_INCONCLUSIVE
             or _entry_is_environment_blocked(entry)
             or _entry_is_infrastructure_unresolved(entry)
@@ -4764,6 +4778,373 @@ def _restore_inconclusive_verdicts(
         if str(d.get("verification_point_id")) not in inconclusive_ids
     ]
     # 轮次的结论由**同一份**派生算出来（:func:`_derive_overall_status`），
+    # 不由判定层那句摘要算 —— 条目才是证据。
+    report_data["overall_status"] = _derive_overall_status(report_results)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# "本轮没拿到结论" is not a code failure (2026-11-18, VP-032)
+# ---------------------------------------------------------------------------
+#
+# 2026-11-18 incident (VP-032): the round produced
+# **no conclusion at all** — the progress log carried no pytest summary
+# line and no exit status could be derived — and the report filed that
+# round as ``FAILED`` with the *defaulted* class ``deliverable_defect``.
+# That class is the one that buys a repair task, so the plan sent a
+# repair after a deliverable nobody had found anything wrong with.
+#
+# The framework already has the right word for it: ``UNKNOWN`` means
+# "this attempt produced no verdict" and it enters **no** bucket (see
+# ``verification_buckets``).  What was missing is the report layer
+# recognising its own sentence — "未产生任何结论 / no conclusion" — and
+# giving the entry that identity instead of inventing a failure.
+#
+# Two edges keep the rule from washing a real defect:
+#
+#   * an entry that states a **deliverable defect** is left alone;
+#   * an entry the **executor** concluded on is left alone — the ledger
+#     is the authority on "did this run produce a verdict".
+#
+# 2026-11-19 (VP-045): the rule over-reached, because its vocabulary held
+# **two** families of sentence.  "这一轮没有拿到结论" says *this round
+# reached no verdict*; "须重跑 / no verdict / must be re-run" says *run
+# it again* — which is what one says **after** a verdict.  A ledger that
+# said only "须重跑" was therefore washed into ``UNKNOWN``, and the
+# ``deliverable_defect`` classification that buys the repair task went
+# with it.  The two families now live in two constants, and an entry
+# that states the deliverable's defect **in its own words** ("断言缺失 /
+# 行为不符 / 实现缺失") is recognised as a conclusion as well.
+
+#: The sentences that say a round produced **no conclusion**.  Chinese
+#: and English spellings, because the judgment LLM writes in both.
+#:
+#: The set is deliberately a **constant**: the marker vocabulary is
+#: policy, and policy that lives in one call site is policy that drifts.
+#:
+#: Only sentences that *plainly* say "this round reached no verdict"
+#: belong here.  "须重跑 / no verdict / must be re-run" say something
+#: else — they say **run it again**, which is what one does **after** a
+#: verdict — so they live in :data:`RE_RUN_MARKERS` and never trigger
+#: the restore (VP-045, 2026-11-19).
+NO_CONCLUSION_MARKERS: Tuple[str, ...] = (
+    # 中文
+    "未产生任何结论",
+    "没有产生任何结论",
+    "没有拿到结论",
+    "未拿到结论",
+    "没能下结论",
+    "未能下结论",
+    "无法下结论",
+    "没有得到结论",
+    "未产生结论",
+    "没有结论",
+    "无退出码可推导",
+    "没有退出码可推导",
+    # English
+    "no conclusion",
+    "no conclusive",
+    "could not conclude",
+    "cannot conclude",
+    "did not produce a conclusion",
+    "no exit status can be derived",
+    "no pytest summary line",
+)
+
+#: The sentences that say **"run it again"** — not "this round reached
+#: no conclusion".
+#:
+#: They are a **different family**: the round concluded (the deliverable
+#: is incomplete) and the next round is due.  Reading them as "no
+#: conclusion" washed the executor's verdict into ``UNKNOWN`` and threw
+#: away the ``deliverable_defect`` classification that buys the repair
+#: task (VP-045, 2026-11-19).  They are kept as a constant so the
+#: vocabulary is visible — but they never trigger the restore.
+RE_RUN_MARKERS: Tuple[str, ...] = (
+    "须重跑",
+    "需重跑",
+    "需要重跑",
+    "no verdict",
+    "must be re-run",
+    "needs to be re-run",
+    "has to be re-run",
+)
+
+#: The sentences that say the **deliverable** is at fault.  A round that
+#: says one of these *did* conclude something — the rule below must not
+#: wash it.
+#:
+#: The vocabulary has to name the **deliverable**, not merely a
+#: mismatch: "断言缺失 / 行为不符 / 实现缺失" are the deliverable's
+#: defects said plainly, and a round that says one of them *did*
+#: conclude (VP-045, 2026-11-19).  The generic words ("不符 /
+#: 不一致 / 失败 / 缺失") are **not** markers on their own — "退出码与
+#: 预期不符" describes the environment, not the deliverable, and
+#: reading it as a defect would keep the 2026-11-18 round red.
+DELIVERABLE_DEFECT_MARKERS: Tuple[str, ...] = (
+    # 中文
+    "交付物缺陷",
+    "交付物坏了",
+    "缺陷",
+    "断言缺失",
+    "断言不存在",
+    "断言未通过",
+    "断言不符",
+    "断言失败",
+    "行为不符",
+    "行为不一致",
+    "实现缺失",
+    "未实现",
+    "功能缺失",
+    "功能不符",
+    # English
+    "deliverable defect",
+    "deliverable_defect",
+    "broken deliverable",
+    "product defect",
+    "code defect",
+    "assertion missing",
+    "assertion failed",
+    "assertion mismatch",
+    "assertion not satisfied",
+    "behaviour mismatch",
+    "behavior mismatch",
+    "implementation missing",
+    "not implemented",
+)
+
+#: The negations that turn a defect sentence into its opposite.
+#:
+#: "依规不登记为交付物缺陷，但须重跑" is the 2026-11-18 evidence verbatim:
+#: it names the defect vocabulary and says the opposite.  A naive
+#: substring match reads it as a defect claim, and then the round stays
+#: a code failure — which is the whole bug.
+#:
+#: ``未`` is deliberately **not** in the list: in Chinese it usually
+#: negates the *verb* in front of the noun ("未能复现该缺陷" — the
+#: defect could not be reproduced — is a defect claim, not the denial of
+#: one).  Leaving it out costs a rare denial ("未发现缺陷"); taking it
+#: in would wash real defects, which is the far more expensive error.
+_NEGATION_PATTERN = re.compile(
+    r"(不|没|非|"
+    r"\b(?:not|no|never|cannot|without|isn't|aren't|wasn't|weren't|doesn't|don't)\b)",
+    re.IGNORECASE,
+)
+
+#: The clause boundaries.  A negation in **another** clause does not
+#: negate this phrase: "该修复不完整，交付物缺陷仍在" is a defect claim,
+#: and the "不" in it belongs to the clause before the comma.
+_CLAUSE_BOUNDARY = re.compile(r"[，,、；;。.!！?？\n]")
+
+#: How far back the negation is looked for.  Long enough for the
+#: English "not a deliverable defect" and for the Chinese "不登记为交付物缺陷".
+_NEGATION_LOOKBACK = 8
+
+
+def _entry_text(entry: Mapping[str, Any]) -> str:
+    """Every prose field of one report entry, joined into one text.
+
+    The judgment LLM spreads its sentence over several fields
+    (``actual_result`` / ``evidence`` / ``reasons``), and the marker
+    vocabulary has to be read against all of them — the 2026-11-18
+    round put "未产生任何结论" in ``actual_result`` and "no conclusion"
+    in ``evidence``.
+
+    :param entry: One report entry (or one ledger entry).
+    :return: The joined text; ``""`` when the entry says nothing.
+    """
+    if not isinstance(entry, Mapping):
+        return ""
+    parts: List[str] = []
+    for key in (
+        "actual_result",
+        "evidence",
+        "reason",
+        "reasons",
+        "detail",
+        "details",
+        "summary",
+    ):
+        value = entry.get(key)
+        if isinstance(value, (list, tuple)):
+            parts.extend(str(item) for item in value if item)
+        elif value:
+            parts.append(str(value))
+    return "\n".join(parts)
+
+
+def _contains_marker(text: str, markers: Iterable[str]) -> bool:
+    """Does ``text`` contain any of ``markers``?  Case-insensitive.
+
+    :param text: The text to read.
+    :param markers: The marker phrases.
+    :return: ``True`` when at least one marker occurs.
+    """
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(str(marker).lower() in lowered for marker in markers)
+
+
+def _negated_before(lowered: str, at: int) -> bool:
+    """Is the phrase at ``at`` negated by what comes right before it?
+
+    The negation has to be **in the same clause**: the last clause
+    boundary in front of the phrase cuts the window, so "该修复不完整，
+    交付物缺陷仍在" keeps its defect claim (the "不" belongs to the
+    previous clause) while "依规不登记为交付物缺陷" loses it.
+
+    :param lowered: The lower-cased text.
+    :param at: Where the marker phrase starts.
+    :return: ``True`` when a negation governs the phrase.
+    """
+    prefix = lowered[:at]
+    cut = 0
+    for boundary in _CLAUSE_BOUNDARY.finditer(prefix):
+        cut = boundary.end()
+    window = prefix[max(cut, at - _NEGATION_LOOKBACK):at]
+    return bool(_NEGATION_PATTERN.search(window))
+
+
+def _claims_deliverable_defect(text: str) -> bool:
+    """Does this text state that the **deliverable** is at fault?
+
+    Negation-aware: "依规不登记为交付物缺陷" says the opposite, and a
+    naive substring match would read it as a defect claim — which would
+    keep a "no conclusion" round filed as a code failure, i.e. the
+    2026-11-18 bug.
+
+    Two rules make the reading exact enough:
+
+      * the **longest** marker decides its phrase — "交付物缺陷" is one
+        phrase, and the bare "缺陷" inside it is part of that same
+        phrase, not a second claim to judge on its own;
+      * a negation counts only when it sits right in front of the
+        marker, in the marker's own clause ("不登记为交付物缺陷").
+
+    :param text: The text to read.
+    :return: ``True`` when at least one **unnegated** defect marker
+        occurs.
+    """
+    if not text:
+        return False
+    lowered = text.lower()
+    # Longest first: the longer marker covers the shorter one inside it.
+    markers = sorted(
+        DELIVERABLE_DEFECT_MARKERS, key=lambda m: len(str(m)), reverse=True,
+    )
+    decided: List[Tuple[int, int]] = []
+    for marker in markers:
+        needle = str(marker).lower()
+        start = 0
+        while True:
+            at = lowered.find(needle, start)
+            if at == -1:
+                break
+            start = at + 1
+            span_end = at + len(needle)
+            if any(begin <= at and span_end <= end for begin, end in decided):
+                # A longer marker already judged this phrase.
+                continue
+            decided.append((at, span_end))
+            if not _negated_before(lowered, at):
+                return True
+    return False
+
+
+def _restore_no_conclusion_verdicts(
+    report_data: Dict[str, Any],
+    execution_results: Mapping[str, Any],
+) -> bool:
+    """把「本轮没拿到结论」的条目还原成 ``UNKNOWN``（不是失败）。
+
+    判定层（Phase 3 的 LLM）的词表里没有 UNKNOWN —— 它只有 PASSED /
+    FAILED / SKIPPED / PARTIAL —— 所以一轮**什么都没验出来**的时候，
+    它只能猜一个 FAILED，而 FAILED 带着默认的 ``deliverable_defect``
+    落进报告，买下一条去修一个没人验过的东西的任务（2026-11-18 的
+    VP-032 就是这样长出一条针对交付物的修复任务的）。
+
+    还原的判定顺序是**五步**（VP-045 要求这个顺序是可检查的）：
+
+      ① 条目不是 ``FAILED`` → 跳过（只有被判失败的条目才可能是
+         「被误判成失败」的那一条）；
+      ② 条目**自述交付物缺陷** → 跳过（它说了交付物有毛病，说明它
+         是有结论的；保持 FAILED 与它原来的分类）；
+      ③ 条目没命中强「没拿到结论」标记 → 跳过（它没说这一轮没结论）；
+      ④ 账本 status=FAILED 时：账本**自述交付物缺陷** → 跳过；账本
+         文案**没命中**强标记 → 跳过 —— 执行器跑完了、给了裁决，
+         那就是结论，不许洗；
+      ⑤ 其余才还原成 ``UNKNOWN`` / ``infra`` / ``deterministic``。
+
+    这里的「强标记」是 :data:`NO_CONCLUSION_MARKERS`：只收**明说没
+    拿到结论**的句子。「须重跑 / no verdict / must be re-run」那一族
+    （:data:`RE_RUN_MARKERS`）说的是「再跑一遍」—— 那是有结论**之后**
+    的动作，不是「这一轮没有结论」，因此不触发还原。
+
+    还原做三件事：状态回 ``UNKNOWN``，类落成 ``infra`` /
+    ``deterministic``，以及把这一条从需求偏离里摘掉（一条「偏离」是
+    对交付物的判决，而这一条没有判决可下）。轮次的结论随后由
+    :func:`_derive_overall_status` 重推 —— 一轮「没判」是 ``SKIPPED``，
+    不是 ``FAILED``。
+
+    Returns:
+        是否改动了任何一条。
+    """
+    report_results = report_data.get("verification_results")
+    if not isinstance(report_results, list):
+        return False
+
+    ledger = {
+        str(er.get("id") or "").strip(): er
+        for er in ((execution_results or {}).get("execution_results") or [])
+        if isinstance(er, dict)
+    }
+
+    restored = False
+    restored_ids: Set[str] = set()
+    for entry in report_results:
+        if not isinstance(entry, dict):
+            continue
+        # ① 只有 FAILED 的条目才可能被误判成失败。
+        if str(entry.get("status") or "").strip().upper() != "FAILED":
+            continue
+        text = _entry_text(entry)
+        # ② 条目自己说了交付物的毛病 → 它是有结论的，不许洗成 UNKNOWN。
+        if _claims_deliverable_defect(text):
+            continue
+        # ③ 条目没有**明说**本轮没拿到结论 → 没触发条件，不许动它。
+        if not _contains_marker(text, NO_CONCLUSION_MARKERS):
+            continue
+        vp_id = str(entry.get("id") or "").strip()
+        source = ledger.get(vp_id)
+        if source is not None and str(
+            source.get("status") or ""
+        ).strip().upper() == "FAILED":
+            ledger_text = _entry_text(source)
+            # ④ 账本自己判了失败 —— 它要么说的是交付物的毛病（那是
+            #    结论），要么根本没提「没拿到结论」（那也是结论：执行器
+            #    跑完了，给了裁决）。两种都不许洗。
+            if _claims_deliverable_defect(ledger_text):
+                continue
+            if not _contains_marker(ledger_text, NO_CONCLUSION_MARKERS):
+                continue
+        # ⑤ 到这里才是「这一轮确实没拿到结论」。
+        entry["status"] = VERDICT_UNKNOWN
+        entry["failure_class"] = INFRA_FAILURE_CLASS
+        entry["failure_class_source"] = DETERMINISTIC_FAILURE_CLASS_SOURCE
+        restored = True
+        if vp_id:
+            restored_ids.add(vp_id)
+
+    if not restored:
+        return False
+
+    report_data["verification_results"] = report_results
+    report_data["requirement_deviations"] = [
+        d for d in (report_data.get("requirement_deviations") or [])
+        if str(d.get("verification_point_id")) not in restored_ids
+    ]
+    # 轮次的结论由**同一份**派生算出来（:func:`_derive_overall_status），
     # 不由判定层那句摘要算 —— 条目才是证据。
     report_data["overall_status"] = _derive_overall_status(report_results)
     return True
@@ -9018,6 +9399,30 @@ class Orchestrator:
             self._defer_evidence_check(vp_id, vp, verdict, method)
             return verdict
 
+        # 2026-11-19（VP-043 根因）：本轮之前写的产物**不是本轮的结论**。
+        # 验证点的产物目录跨轮复用，框架读到的那个文件可能是上一次尝试
+        # 留下的 —— 拿它跟当前的树逐条比对，比出来的是"树动了"，不是
+        # "交付物坏了"。那一轮就是这样把一份 PASSED 记成了 FAILED，并
+        # 归档成交付物缺陷。
+        #
+        # 所以产物早于本轮起点时，本轮就**没有拿到结论**：结论保留（没有
+        # 结论可核对，就没有可改判的东西），依据记为 unavailable，事件
+        # 留档。形状与上面的树突变守卫同构 —— 不新造状态、不加第二套
+        # 机制。
+        stale = self._stale_evidence_artifact(vp_id, method, vp)
+        if stale is not None:
+            self._safe_log_freshness_event(
+                vp_id, "evidence_check_stale_artifact",
+                {
+                    "method": method,
+                    "artifact": stale.get("artifact"),
+                    "artifact_mtime": stale.get("mtime"),
+                    "round_started_at": stale.get("round_started_at"),
+                    "status": (verdict or {}).get("status"),
+                },
+            )
+            return verdict
+
         try:
             from verification_evidence import apply_to_verdict
         except Exception as exc:  # pragma: no cover - defensive
@@ -9126,6 +9531,46 @@ class Orchestrator:
                 },
             )
         return checked if checked is not None else verdict
+
+    def _stale_evidence_artifact(
+        self, vp_id: str, method: str, vp: Optional[dict] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """The artifact this attempt would be judged on, when it is older
+        than the attempt itself.
+
+        The sibling of :meth:`_tree_mutated_since_baseline`, on the time
+        axis instead of the content axis: both answer "can this check
+        still be trusted?", and both answer "no" by refusing to judge
+        rather than by producing a verdict nobody can reproduce
+        (2026-11-19, VP-043).
+
+        ``None`` — "there is nothing to say" — when the round's start
+        cannot be determined (the caller keeps the behaviour it had
+        before this rule existed), when the artifact is current, or when
+        the probe itself fails.
+        """
+        round_started_at = getattr(self, "_round_started_at", None)
+        if not round_started_at:
+            return None
+        try:
+            from verification_evidence import stale_artifact_finding
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "[verification_evidence] unavailable (%s); skipping the "
+                "staleness probe for %s", exc, vp_id,
+            )
+            return None
+        try:
+            return stale_artifact_finding(
+                method, self.plan_dir, vp_id, vp=vp,
+                round_started_at=round_started_at,
+            )
+        except Exception:  # pragma: no cover - the probe never raises
+            logger.exception(
+                "[verification_evidence] staleness probe failed for %s",
+                vp_id,
+            )
+            return None
 
     def _tree_mutated_since_baseline(self) -> bool:
         """Has the working tree moved away from the round's baseline?
@@ -9512,15 +9957,43 @@ class Orchestrator:
         check that lost the point would fall back to the browser
         contract and judge a deterministic PASSED FAILED for a file it
         was never going to write.
+
+        The round's start travels with it too (2026-11-19, VP-043): the
+        flush runs at the end of the round, and by then the artifact may
+        be a *previous* attempt's — the same staleness rule that guards
+        the in-round check has to guard the round-end one, or the flush
+        would reintroduce the false FAILED the guard just prevented.
         """
         apply_fn = _resolve_apply_to_verdict()
         if apply_fn is None:  # pragma: no cover - defensive
             return None
+        round_started_at = getattr(self, "_round_started_at", None)
         try:
             checked = apply_fn(
                 verdict, method, self.plan_dir, self.project_dir, vp_id,
                 vp=vp,
+                round_started_at=round_started_at,
             )
+        except TypeError as exc:
+            if "round_started_at" not in str(exc):
+                logger.exception(
+                    "[verification_evidence] deferred check crashed for %s",
+                    vp_id,
+                )
+                return None
+            # A check that predates the parameter (a stub, or an older
+            # build): run it the way it was always run.
+            try:
+                checked = apply_fn(
+                    verdict, method, self.plan_dir, self.project_dir, vp_id,
+                    vp=vp,
+                )
+            except Exception:
+                logger.exception(
+                    "[verification_evidence] deferred check crashed for %s",
+                    vp_id,
+                )
+                return None
         except Exception:
             logger.exception(
                 "[verification_evidence] deferred check crashed for %s",
@@ -9529,9 +10002,41 @@ class Orchestrator:
             return None
         if checked is None:
             return None
+        self._log_stale_evidence_check(vp_id, method, verdict, checked)
         if vp is None:
             return checked
         return self._apply_subject_check(vp, checked)
+
+    def _log_stale_evidence_check(
+        self, vp_id: str, method: str, verdict: dict, checked: dict,
+    ) -> None:
+        """Record a re-check that could not run because the artifact is old.
+
+        The verdict is **not** touched: the sub-agent's conclusion is
+        kept, and the operator gets an event saying the conclusion was
+        never checked — the same shape as the inconclusive event the
+        tree-mutation path leaves behind.
+        """
+        if not isinstance(checked, dict):
+            return
+        evidence = checked.get("evidence")
+        record = evidence.get("evidence_check") if isinstance(
+            evidence, dict,
+        ) else None
+        if not isinstance(record, dict):
+            return
+        if record.get("reason") != "stale_artifact":
+            return
+        self._safe_log_freshness_event(
+            vp_id, "evidence_check_stale_artifact",
+            {
+                "method": method,
+                "artifact": record.get("artifact"),
+                "round_started_at": record.get("round_started_at"),
+                "status": (verdict or {}).get("status"),
+                "phase": "round_end_flush",
+            },
+        )
 
     def _log_inconclusive_evidence_check(
         self, vp_id: str, method: str, verdict: dict,
@@ -10076,6 +10581,16 @@ class Orchestrator:
             backfill copies what the executor said; it does not invent
             a verdict for a point the executor has no verdict for.  Such
             an entry keeps every field it came with.
+          * **an UNKNOWN entry is ``infra``, not a defect.**
+            ``UNKNOWN`` is what the sub-agent writes when its answer was
+            not a verdict at all — the point established **nothing**
+            about the deliverable.  It is not a failure, and the
+            default class would file it as one: ``deliverable_defect``
+            is the class that buys a repair task, so a round that
+            produced no verdict would send a repair after a product
+            nobody had found anything wrong with (2026-11-18, VP-032).
+            The class is ``infra`` and the source is ``deterministic``
+            — the rule earned it, nobody said it.
 
         2026-11-04: the executor's ``failed_assertions`` is backfilled
         into the report entry **as well**.  The report is what the next
@@ -10110,14 +10625,27 @@ class Orchestrator:
             if not entry_id:
                 continue
             executor_entries.setdefault(entry_id, result)
-        if not executor_entries:
-            return report_data
 
         for entry in report_results:
             if not isinstance(entry, dict):
                 continue
             entry_id = str(entry.get("id") or "").strip()
             if not entry_id:
+                continue
+            if str(entry.get("status") or "").strip().upper() == VERDICT_UNKNOWN:
+                # 「没验出结论」不是对交付物的判决 —— 它的类是 ``infra``，
+                # 来源是这条规则本身（``deterministic``），不是执行器说的。
+                #
+                # 2026-11-18（VP-032）：这一条曾经以 FAILED + 默认的
+                # ``deliverable_defect`` 落盘，于是凭空买下一条修复任务。
+                # 执行器的类**不**覆盖它：执行器没判出结论时，它的投影
+                # 落下来的类也是默认的缺陷类 —— 那正是这条要挡的东西。
+                #
+                # 这一段不看账本：账本为空时（LLM 判定的方法本来就没有
+                # 执行器裁决）它同样要成立，所以它跑在下面那条
+                # 「没有账本条目就跳过」之前。
+                entry["failure_class"] = INFRA_FAILURE_CLASS
+                entry["failure_class_source"] = DETERMINISTIC_FAILURE_CLASS_SOURCE
                 continue
             source = executor_entries.get(entry_id)
             if source is None:
@@ -12760,10 +13288,12 @@ class Orchestrator:
         sub_agent_class = self._verification_subagent_class()
         sub_agent = sub_agent_class(
             method=method,
-            # 2026-09-14: 2 retries + initial try = 3
-            # total attempts, hard cap. Beyond that the VP goes to
-            # repair / split instead of re-running the suite again.
-            max_retries=2,
+            # 2026-11-01: 1 retry + initial try = 2 total attempts,
+            # hard cap (PRD §1: "判定解析失败时先重试一次（重新要一次
+            # 判定）；仍失败才降级为『判定不可用』"). Beyond that the VP
+            # goes to repair / split instead of re-running the suite
+            # again.
+            max_retries=1,
             model_complexity=model_complexity,
             scene="verification",
             plan_id=self.plan_dir.name,
@@ -13905,6 +14435,18 @@ class Orchestrator:
                 #
                 # 还原函数自己重推 overall_status（同一份派生：条目才是证据）。
                 _restore_inconclusive_verdicts(report_data, execution_results)
+
+                # 2026-11-18（VP-032）：一轮**什么都没验出来**的时候，
+                # 判定层只能猜一个 FAILED —— 它的词表里没有 UNKNOWN。
+                # FAILED 带着默认的 ``deliverable_defect`` 落进报告，
+                # 于是凭空买下一条去修一个没人验过的东西的任务。
+                #
+                # 这一层按条目自己的话（「未产生任何结论 / no
+                # conclusion」）把它还原成 ``UNKNOWN`` —— 框架早就有
+                # 这个词，它不进任何桶，也不触发 Phase 2 的 DEFERRED
+                # 连锁。执行器真判过失败的条目不在此列（负控见
+                # :func:`_restore_no_conclusion_verdicts`）。
+                _restore_no_conclusion_verdicts(report_data, execution_results)
 
                 if not any(s == "FAILED" for s in execution_verdicts.values()):
                     for vr in report_data.get("verification_results", []):

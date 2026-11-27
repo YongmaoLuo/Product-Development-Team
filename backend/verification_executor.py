@@ -107,6 +107,7 @@ from verification_buckets import (
     BUCKET_DEFERRED,
     BUCKET_FAILED,
     BUCKET_SKIPPED,
+    STATUS_UNKNOWN,
     bucket_for_status,
     derive_index_buckets,
 )
@@ -161,9 +162,21 @@ logger = logging.getLogger(__name__)
 #: class is the post-LLM collector and the contract is symmetric with
 #: what the orchestrator reports to the judgment phase).
 #:
-#: ``INCONCLUSIVE`` (2026-11-10) is the sixth word, and it is the CI
-#: gate's own: a gate that ran out of its budget did not decide, so it
-#: did not prove the deliverable defective
+#: ``UNKNOWN`` is permitted for the same reason, and it is *not* an
+#: alias of ``FAILED``: it means "no verdict was reached" (the
+#: sub-agent's answer could not be parsed and the retry budget ran
+#: out). A verdict in that state says nothing about the deliverable, so
+#: the executor must carry it through untouched — it rejects every
+#: status outside this tuple (:meth:`_validate_verdict`) and *rewrites*
+#: a rejected verdict into ``FAILED`` (:meth:`_run_single_vp`), which
+#: would file a VP nobody managed to check as a code defect. Such a
+#: verdict lands in **no** bucket at all (see
+#: :func:`verification_buckets.bucket_for_status`): it is neither a
+#: success nor a failure, and folding it into either one is a lie.
+#:
+#: ``INCONCLUSIVE`` (2026-11-10) is the other new word, and it is the
+#: CI gate's own: a gate that ran out of its budget did not decide, so
+#: it did not prove the deliverable defective
 #: (``verification_ci_runner.STATUS_INCONCLUSIVE``).  The schema used to
 #: reject it, and ``_run_single_vp`` turns a rejected verdict into
 #: ``FAILED`` with an **empty** evidence dict — so the gate's "I could
@@ -172,7 +185,8 @@ logger = logging.getLogger(__name__)
 #: found.  The word belongs in the ledger; what the round does with it
 #: is the report layer's and the orchestrator's business.
 ALLOWED_STATUSES = (
-    "PASSED", "FAILED", "SKIPPED", "BLOCKED", "DEFERRED", "INCONCLUSIVE",
+    "PASSED", "FAILED", "SKIPPED", "BLOCKED", "DEFERRED", "UNKNOWN",
+    "INCONCLUSIVE",
 )
 
 #: Required keys for a valid verdict payload. The contract is
@@ -957,6 +971,11 @@ class VerificationExecutor(BaseExecutor):
         self._gate_of_layer: List[Optional[Dict[str, Any]]] = []
         #: 最近一次门禁拦截的理由，写进 DEFERRED 的 reasons 便于操作者定位。
         self._gate_block_reason: str = ""
+        #: 最近一次门禁拦截的**上游状态**。``UNKNOWN`` 表示上游「没验出结论」
+        #: —— 下游记 ``UNKNOWN``（判定不可用）；其余（``FAILED`` /
+        #: ``BLOCKED`` / 尚未产生结论）表示「确知要等下一轮」—— 下游记
+        #: ``DEFERRED``（本轮延后）。见 :meth:`_select_blocking_candidate`。
+        self._gate_block_status: str = ""
 
         # 2026-11-06（门禁重算）：本轮被延后的 Phase 2 关卡**层**。
         #
@@ -1756,7 +1775,7 @@ class VerificationExecutor(BaseExecutor):
 
             {
                 "status":   one of "PASSED", "FAILED", "SKIPPED", "BLOCKED",
-                            "DEFERRED", "INCONCLUSIVE",
+                            "DEFERRED", "UNKNOWN", "INCONCLUSIVE",
                 "reasons":  List[str],
                 "evidence": dict,
                 ...        # any extra keys are ignored
@@ -2646,7 +2665,11 @@ class VerificationExecutor(BaseExecutor):
             vp_id=item_id,
             retired=self._plan_retired_vps(),
         )
-        if bucket is None and status not in ALLOWED_STATUSES:
+        if (
+            bucket is None
+            and status != STATUS_UNKNOWN
+            and status not in ALLOWED_STATUSES
+        ):
             # 未知 status：沿用历史 else 分支的合约 —— 归入失败桶。写侧刚刚
             # 亲手写下这条裁决，落进「哪儿都不是」等于这个 VP 永远没人修。
             #
@@ -2654,6 +2677,16 @@ class VerificationExecutor(BaseExecutor):
             #  那种失败刻意不进任何桶，见 ``verification_buckets`` 的 retired
             #  规则 —— 为一个没人要的判据生产失败会污染失败统计与修复任务的
             #  输入。）
+            #
+            # 2026-11-01（任务 3）：``UNKNOWN`` **显式豁免**于这条兜底。
+            # 「UNKNOWN 不得折算成失败」（arch 决策点 1）是这条分支的
+            # 对立面：它是对交付物**什么都没说**的那条裁决，折算成失败
+            # 等于给一个没人验过的判据凭空生产一个修复任务。
+            #
+            # 豁免写在**改写点本身**（而不是靠「UNKNOWN 恰好也在
+            # ``ALLOWED_STATUSES`` 里」）：白名单是 schema 的事，以后增删
+            # 状态时，这条豁免不能跟着静默失效 —— 否则 UNKNOWN 会被悄悄折算
+            # 回失败，正是这条契约要防的事。
             bucket = BUCKET_FAILED
         self._place_in_bucket(item_id, bucket)
         # Mirror into BaseExecutor's in-memory fields.（``_place_in_bucket``
@@ -4154,8 +4187,16 @@ class VerificationExecutor(BaseExecutor):
         status = verdict.get("status")
         return str(status) if status is not None else None
 
-    def _blocking_gate_reason(self) -> str:
-        """返回第一条阻断 Phase 2 的理由；全部通过则返回空串。
+    def _blocking_gate_candidates(self) -> List[Tuple[str, Optional[str]]]:
+        """Phase 1 侧所有阻断项：``(理由, 上游状态)``。
+
+        状态为 ``None`` 表示「尚未产生结论」。理由的措辞与
+        :meth:`_blocking_gate_reason` 一致 —— 后者现在只是这份清单里
+        **被选中**的那一条。
+
+        为什么要收成清单而不是直接返回一条理由：下游要记 ``DEFERRED``
+        还是 ``UNKNOWN``，取决于上游是「确知失败」还是「没验出结论」。
+        只留一条理由字符串，这条信息就丢了。
 
         判据统一为"该关卡之前的一切都已终态成功"：Phase 1 的 VP 以及
         ``phase_order`` 更小的关卡。于是"E2E 必须等 Nightly 通过"不需要
@@ -4165,6 +4206,7 @@ class VerificationExecutor(BaseExecutor):
         「本轮」二字 —— 读不到本轮结论时**报未知**，不拿旧轮的结论顶替。
         """
         round_known = self._explicit_round() is not None
+        candidates: List[Tuple[str, Optional[str]]] = []
         for vp in self._plan_points():
             if not isinstance(vp, dict) or is_final_gate(vp):
                 continue
@@ -4178,15 +4220,21 @@ class VerificationExecutor(BaseExecutor):
             status = self._terminal_status_of(vp_id)
             if status is None:
                 if round_known:
-                    return f"Phase 1 的 {vp_id} 本轮尚未产生结论"
-                return f"Phase 1 的 {vp_id} 尚未产生结论"
-            if status not in _TERMINAL_SUCCESS_STATUSES:
-                return f"Phase 1 的 {vp_id} 结论为 {status}"
-        return ""
+                    candidates.append(
+                        (f"Phase 1 的 {vp_id} 本轮尚未产生结论", None)
+                    )
+                else:
+                    candidates.append(
+                        (f"Phase 1 的 {vp_id} 尚未产生结论", None)
+                    )
+            elif status not in _TERMINAL_SUCCESS_STATUSES:
+                candidates.append((f"Phase 1 的 {vp_id} 结论为 {status}", status))
+        return candidates
 
-    def _gate_predecessor_reason(
-        self, gate_order: Optional[int],
-    ) -> str:
+    def _gate_predecessor_candidates(
+        self,
+        gate_order: Optional[int],
+    ) -> List[Tuple[str, Optional[str]]]:
         """该关卡之前是否有更早的关卡未通过。
 
         Phase 2 的关卡按 ``phase_order`` 串行，所以一个关卡要问的是"排在
@@ -4201,8 +4249,9 @@ class VerificationExecutor(BaseExecutor):
         :meth:`_vp_is_not_dispatched`：门禁的前置集合 = 执行器实际派发的
         工作集。
         """
+        candidates: List[Tuple[str, Optional[str]]] = []
         if gate_order is None:
-            return ""
+            return candidates
         earlier = [
             vp for vp in self._plan_points()
             if isinstance(vp, dict) and is_final_gate(vp)
@@ -4213,10 +4262,95 @@ class VerificationExecutor(BaseExecutor):
             vp_id = vp.get("id")
             status = self._terminal_status_of(vp_id)
             if status is None:
-                return f"更早的全量关卡 {vp_id} 尚未执行"
-            if status not in _TERMINAL_SUCCESS_STATUSES:
-                return f"更早的全量关卡 {vp_id} 结论为 {status}"
-        return ""
+                candidates.append((f"更早的全量关卡 {vp_id} 尚未执行", None))
+            elif status not in _TERMINAL_SUCCESS_STATUSES:
+                candidates.append(
+                    (f"更早的全量关卡 {vp_id} 结论为 {status}", status)
+                )
+        return candidates
+
+    @staticmethod
+    def _select_blocking_candidate(
+        candidates: List[Tuple[str, Optional[str]]],
+    ) -> Tuple[str, Optional[str]]:
+        """在所有阻断项里挑一条：**确知失败 / 被阻断的优先于 UNKNOWN**。
+
+        2026-11-01（任务 4）：上游「没验出结论」（``UNKNOWN``）与上游
+        「确知失败」（``FAILED``）对下游的意义完全不同 ——
+
+        * ``FAILED`` / ``BLOCKED`` / 尚未产生结论 → 下游 ``DEFERRED``
+          （本轮延后，下轮真跑）；
+        * ``UNKNOWN`` → 下游 ``UNKNOWN``（判定不可用）。把它记成「延后」
+          等于假装「已知它失败、只是这轮没跑」，而真相是连它会不会失败都
+          不知道（arch 决策点 3）。
+
+        所以同层同时有 FAILED 与 UNKNOWN 时取 FAILED 那条：确知失败优先于
+        「不知道」。没有阻断项时返回 ``("", None)``。
+        """
+        definite = [c for c in candidates if c[1] != STATUS_UNKNOWN]
+        unknown = [c for c in candidates if c[1] == STATUS_UNKNOWN]
+        for reason, status in definite + unknown:
+            return reason, status
+        return "", None
+
+    def _blocking_gate_reason(self) -> str:
+        """返回第一条阻断 Phase 2 的理由；全部通过则返回空串。
+
+        判据统一为"该关卡之前的一切都已终态成功"：Phase 1 的 VP 以及
+        ``phase_order`` 更小的关卡。于是"E2E 必须等 Nightly 通过"不需要
+        单独规则——它天然被同一条判据覆盖。
+
+        2026-11-01（任务 4）：理由从 :meth:`_blocking_gate_candidates` 这份
+        清单里**选中**，而不是取计划顺序上的第一条 ——「确知失败」优先于
+        「没验出结论」（见 :meth:`_select_blocking_candidate`）。
+
+        2026-11-13：这是 Phase 1 那份清单的「只回理由」视图；关卡判定本身
+        走 :meth:`_blocking_gate_decision`（理由与状态同源）。
+        """
+        reason, _status = self._select_blocking_candidate(
+            self._blocking_gate_candidates()
+        )
+        return reason
+
+    def _gate_predecessor_reason(
+        self,
+        gate_order: Optional[int],
+    ) -> str:
+        """该关卡之前是否有更早的关卡未通过。
+
+        2026-11-13：这是「更早关卡」那份清单的「只回理由」视图；关卡判定
+        本身走 :meth:`_blocking_gate_decision`（理由与状态同源）。
+        """
+        reason, _status = self._select_blocking_candidate(
+            self._gate_predecessor_candidates(gate_order)
+        )
+        return reason
+
+    def _blocking_gate_decision(
+        self,
+        gate_order: Optional[int],
+    ) -> Tuple[str, Optional[str]]:
+        """这个关卡层当前的阻塞判定：``(理由, 上游状态)``。
+
+        **单一来源**：Phase 1 的阻断项与更早关卡的阻断项合成**一份**候选
+        清单，由 :meth:`_select_blocking_candidate` 一次选中 —— 理由和状态
+        必须同源，否则会写出「理由说 UNKNOWN、状态说 FAILED」这种自相矛盾
+        的组合（下游到底记「不可用」还是「延后」就全看运气了）。
+
+        两份清单合并**之后**再选，是为了让「确知失败优先于没验出结论」这条
+        判据跨清单生效：Phase 1 出一条 UNKNOWN、更早的关卡出一条 FAILED 时，
+        下游该记「延后」（确实有上游失败了），而不是「不可用」。
+
+        2026-11-13：这条 helper 是 :meth:`_should_short_circuit_layer` 与
+        :meth:`_gate_block_reason_for` 共同的唯一入口。此前合并把「理由」
+        留在只回字符串的 :meth:`_gate_block_reason_for` 里，而
+        :meth:`_should_short_circuit_layer` 去读一个从未被赋值的局部名
+        ``status`` —— 每拦下一个关卡就抛 ``NameError``，整轮执行被中止。
+        """
+        return self._select_blocking_candidate(
+            self._blocking_gate_candidates()
+            + self._gate_predecessor_candidates(gate_order)
+        )
 
     def _should_short_circuit_layer(
         self,
@@ -4234,6 +4368,11 @@ class VerificationExecutor(BaseExecutor):
         一切已终态成功**，于是 Nightly 没过时紧随其后的 E2E 自然被拦下。
 
         Phase 1 的层之间**不**短路（历史行为：验证从不短路下游层）。
+
+        2026-11-01（任务 4）：拦下时**同时**记下上游状态
+        （``self._gate_block_status``）——「上游确知失败」与「上游没验出
+        结论」对下游要记的终态不同（``DEFERRED`` vs ``UNKNOWN``），只留
+        一条理由字符串会丢掉这条信息。
         """
         next_idx = layer_idx + 1
         phases = getattr(self, "_phase_of_layer", [])
@@ -4243,9 +4382,11 @@ class VerificationExecutor(BaseExecutor):
             return False
 
         gate = self._gate_of_layer[next_idx] if self._gate_of_layer else None
-        reason = self._gate_block_reason_for(gate)
+        gate_order = infer_phase_order(gate) if isinstance(gate, dict) else None
+        reason, status = self._blocking_gate_decision(gate_order)
         if reason:
             self._gate_block_reason = reason
+            self._gate_block_status = status or ""
             return True
         return False
 
@@ -4254,7 +4395,7 @@ class VerificationExecutor(BaseExecutor):
         layer: List[Dict[str, Any]],
         reason: str,
     ) -> None:
-        """被门禁拦下的层：Phase 2 记 ``DEFERRED``，其余沿用 ``SKIPPED``。
+        """被门禁拦下的层：Phase 2 记 ``DEFERRED`` / ``UNKNOWN``，其余沿用 ``SKIPPED``。
 
         ``DEFERRED`` 与 ``SKIPPED`` 的区别是本节重点：SKIPPED 在现有实现里
         是"终态成功"，会进 ``completed_set`` 而在后续轮次被跳过；被延后的
@@ -4267,12 +4408,30 @@ class VerificationExecutor(BaseExecutor):
         """
         if layer and all(is_final_gate(item) for item in layer):
             detail = self._gate_block_reason or reason
+            # ``getattr``：执行器也可能被绕过 ``__init__`` 造出来（既有测试
+            # 就是这么干的），那时这个新字段压根不存在。
+            block_status = getattr(self, "_gate_block_status", "")
+            if block_status == STATUS_UNKNOWN or (
+                self._reason_marks_unknown(detail)
+            ):
+                self._mark_layer_unknown(layer, f"Phase 2 关卡不可用：{detail}")
+                return
             self._mark_layer_deferred(
                 layer, f"Phase 2 关卡延后：{detail}",
             )
             self._register_deferred_gate_layer(layer)
             return
         self._mark_layer_skipped(layer, reason)
+
+    @staticmethod
+    def _reason_marks_unknown(detail: str) -> bool:
+        """理由文本本身是否在说「上游结论是 UNKNOWN」。
+
+        兜底用：:meth:`_short_circuit_layer` 也可能被**直接**调用（理由由
+        调用方给定），此时没有 ``_gate_block_status`` 可读。措辞由本模块
+        自己生成（``... 结论为 {status}``），模板固定，所以认得出来。
+        """
+        return f"结论为 {STATUS_UNKNOWN}" in detail
 
     def _has_verdict_in_current_round(self, vp_id: str) -> bool:
         """这个验证点**本轮**有没有结论。
@@ -4393,6 +4552,68 @@ class VerificationExecutor(BaseExecutor):
             if item_id not in self._deferred_vps:
                 self._deferred_vps.append(item_id)
         self._gate_block_reason = ""
+        self._gate_block_status = ""
+
+    def _mark_layer_unknown(
+        self,
+        layer: List[Dict[str, Any]],
+        reason: str,
+    ) -> None:
+        """把整层 Phase 2 VP 标为 ``UNKNOWN``（判定不可用，不是延后）。
+
+        与 :meth:`_mark_layer_deferred` 的区别：``DEFERRED`` 说「已知上游
+        失败、等它修好再跑」，``UNKNOWN`` 说「这一轮没拿到结论」。后者对
+        交付物什么都没说，所以它**不得**进任何桶（见
+        :func:`verification_buckets.bucket_for_status`），尤其不得进
+        ``_deferred_vps`` —— 被延后的关卡语义是「已知会失败、等上游修好」。
+
+        不进任何桶的副作用（与 ``DEFERRED`` 一致）是下一轮它仍会真跑 ——
+        「不可用」的关卡不能因为这一轮没结论就永远不再执行。
+
+        2026-11-13（轮次作用域 · UNKNOWN）：判重是「**本轮**已有裁决」，
+        不是「这条验证点有裁决」—— 与 :meth:`_mark_layer_deferred` 对齐。
+
+        原来的判据（``item_id in self._verdicts``）是**跨轮**的，而
+        ``_verdicts`` 每个验证点只留最新一条（跨轮继承靠它）：上一轮那条
+        DEFERRED 躺在里面，于是这一轮更准确的「不可用」整段空转 —— 本轮
+        账本里一条结论都没有，收尾闸再把它补成 DEFERRED（「本轮未产生
+        结论」），「上游没验出结论」又被说成了「本轮延后」。
+
+        与 ``_mark_layer_deferred`` 一样，**本轮真跑出来的结论**不许被一条
+        「不可用」顶掉；但本轮那条 ``DEFERRED`` / ``UNKNOWN`` **允许**重写 ——
+        同一轮里先写下的「延后」不得挡住随后更准确的「不可用」。
+        """
+        for item in layer:
+            item_id = self._derive_item_id(item)
+            existing = self._current_round_bucket().get(item_id)
+            if (
+                isinstance(existing, dict)
+                and str(existing.get("status") or "")
+                not in ("DEFERRED", STATUS_UNKNOWN)
+            ):
+                # 本轮真跑出来的结论：不许被一条「不可用」顶掉。
+                continue
+            verdict = {
+                "status": STATUS_UNKNOWN,
+                "reasons": [reason],
+                "evidence": {"gate": "verification_phase_2"},
+                "actual_result": reason,
+            }
+            try:
+                self.record_verdict(item_id, verdict)
+            except Exception:  # noqa: BLE001 — 记录失败也不能让整轮崩掉
+                # 2026-11-05: 兜底也走 :meth:`_store_verdict` —— 直接写
+                # ``_verdicts`` 会漏掉轮次表，本轮视图（``_current_round_
+                # verdicts``）就看不见这条结论。
+                self._store_verdict(item_id, self._stamp_round(verdict))
+                self._save_state()
+            # UNKNOWN 不进任何桶：它对交付物什么都没说 —— 既不是失败，
+            # 也不是「延后」。显式写一遍，免得它留在 ``_deferred_vps`` 里
+            # （``record_verdict`` 走的是同一条分桶规则，这里是不依赖它
+            # 的第二道保证）。
+            self._place_in_bucket(item_id, None)
+        self._gate_block_reason = ""
+        self._gate_block_status = ""
 
     # ------------------------------------------------------------------
     # Gate recheck (2026-11-06)
@@ -4409,17 +4630,34 @@ class VerificationExecutor(BaseExecutor):
     # ``_deferred_gate_layers`` 里，前提一变就重算 —— 还在就刷新理由，
     # 没了就把那一层真正派发出去。
 
+    def _gate_block_decision_for(
+        self,
+        gate: Any,
+    ) -> Tuple[str, Optional[str]]:
+        """这个关卡层当前的阻塞判定：``(理由, 上游状态)``。
+
+        与 :meth:`_should_short_circuit_layer` **同源** —— 两处各写一份，
+        迟早漂移成「短路时拦的是 A，重算时算的是 B」。
+
+        2026-11-13：理由**与状态**必须一起拿。只拿理由会把「上游没验出
+        结论」（``UNKNOWN``）和「上游确知失败」（``FAILED``）混成同一件事：
+        重算那条路于是把「判定不可用」也写成了「延后」（arch 决策点 3）。
+        """
+        gate_order = infer_phase_order(gate) if isinstance(gate, dict) else None
+        return self._blocking_gate_decision(gate_order)
+
     def _gate_block_reason_for(self, gate: Any) -> str:
         """这个关卡层当前的阻塞理由（空串 = 无阻塞，可以放行）。
 
         与 :meth:`_should_short_circuit_layer` 用的是**同一份**判据 ——
         两处各写一份，迟早漂移成「短路时拦的是 A，重算时算的是 B」。
+
+        2026-11-13：理由取自 :meth:`_blocking_gate_decision` —— 与短路那条
+        路同一个入口，不再另走一条只回字符串的通道。要**状态**的那条路
+        走 :meth:`_gate_block_decision_for`。
         """
-        gate_order = infer_phase_order(gate) if isinstance(gate, dict) else None
-        return (
-            self._blocking_gate_reason()
-            or self._gate_predecessor_reason(gate_order)
-        )
+        reason, _status = self._gate_block_decision_for(gate)
+        return reason
 
     def _register_deferred_gate_layer(
         self,
@@ -4499,6 +4737,11 @@ class VerificationExecutor(BaseExecutor):
         结论状态（阻塞者早已 PASSED，理由还写着「结论为 FAILED」）就是撒谎。
         理由要么是**本轮最终的**阻塞者状态，要么在前提消失后不再存在。
 
+        2026-11-13（状态同源）：重算不只拿**理由**，还拿**状态** ——
+        上游是 ``UNKNOWN``（没验出结论）时这一层是「不可用」，不是「延后」
+        （arch 决策点 3）。只拿理由时它照样写 DEFERRED，于是「判定不可用」
+        被说成了「本轮延后」，并且把这一层塞回 ``_deferred_vps``。
+
         2026-11-25（缺陷：门禁按过期结论延后）：两处补齐。
 
         1. **先按账本把被延后的层找回来**（:meth:`_discover_deferred_gate_layers`）：
@@ -4519,7 +4762,7 @@ class VerificationExecutor(BaseExecutor):
         self._in_deferred_recheck = True
         try:
             for layer in list(self._deferred_gate_layers):
-                reason = self._gate_block_reason_for(layer[0])
+                reason, status = self._gate_block_decision_for(layer[0])
                 if not reason:
                     # 前提没了 —— 派发由 :meth:`rerun_deferred_gate_layers`
                     # 负责（它要 await，不能在同步路径上做）。
@@ -4531,6 +4774,12 @@ class VerificationExecutor(BaseExecutor):
                         layer,
                         "Phase 2 关卡延后：阻塞前提已消失（本轮待派发）",
                         refresh=True,
+                    )
+                    continue
+                if status == STATUS_UNKNOWN or self._reason_marks_unknown(reason):
+                    # 上游「没验出结论」→ 这一层是「不可用」，不是「延后」。
+                    self._mark_layer_unknown(
+                        layer, f"Phase 2 关卡不可用：{reason}",
                     )
                     continue
                 # refresh=True —— 这条本轮 DEFERRED 是本方法自己写的，
@@ -4595,8 +4844,16 @@ class VerificationExecutor(BaseExecutor):
             if not layer:
                 continue
             layer_id = self._derive_item_id(layer[0])
-            reason = self._gate_block_reason_for(layer[0])
+            reason, status = self._gate_block_decision_for(layer[0])
             if reason:
+                if status == STATUS_UNKNOWN or self._reason_marks_unknown(reason):
+                    # 上游「没验出结论」→ 这一层是「不可用」，不是「延后」。
+                    # 这一层**留在** ``_deferred_gate_layers`` 里：UNKNOWN
+                    # 不是终态，前提消失后它仍要补跑。
+                    self._mark_layer_unknown(
+                        layer, f"Phase 2 关卡不可用：{reason}",
+                    )
+                    continue
                 # 还在被挡着：理由刷新（点名当前的阻塞者）。
                 # refresh=True —— 这条本轮 DEFERRED 是本方法自己写的，
                 # 重算它正是目的：理由必须改口成**当前**的阻塞者。

@@ -91,6 +91,7 @@ from typing import (
     Any,
     Dict,
     List,
+    Mapping,
     MutableMapping,
     Optional,
     Sequence,
@@ -111,6 +112,7 @@ import kill_audit as _kill_audit
 # The identity probe — the same reading the executor's spawn record and
 # the reaper's own check use. One identity rule, not two: the record
 # written here has to be the one the check can match.
+from process_identity import executable_identity as _executable_identity
 from process_identity import CREATE_TIME_TOLERANCE
 from process_identity import probe as probe_process_identity
 
@@ -174,6 +176,12 @@ _REAL_POPEN = subprocess.Popen
 
 #: The real ``subprocess.run``, captured at import time.
 #:
+#: Replacing it is how a caller hands a probe a *table* instead of
+#: asking the machine for one, and that is a request the probe
+#: answers.  It is not the same door as :data:`_REAL_POPEN`: this one
+#: hands over the answer, while replacing the ``Popen`` class would
+#: take over the observation itself.
+#:
 #: A fake installed for ``subprocess.run`` is a legitimate seam: it
 #: answers the probe with a fixture instead of asking the operating
 #: system.  The manager honours such a fake — and uses it *only* when
@@ -206,6 +214,11 @@ def _run_probe(
     the probe's *answer*, and an answer is a legitimate thing to fake.
     The two seams cannot be confused: the fake replaces the whole call,
     the recorder replaces only the spawn.
+
+    A probe never raises, and it says *why* it could not answer: the
+    failure is logged at debug level here, because the caller only
+    ever sees ``None`` and would otherwise have to guess whether the
+    tool was missing, refused, or slow.
     """
     runner = subprocess.run
     if runner is not _REAL_RUN:
@@ -216,7 +229,8 @@ def _run_probe(
                 text=True,
                 timeout=timeout,
             )
-        except Exception:  # noqa: BLE001 - a probe is best-effort
+        except Exception as exc:  # noqa: BLE001 - a probe is best-effort
+            logger.debug("[service_manager] %s failed: %s", argv, exc)
             return None
         return (
             int(getattr(completed, "returncode", 0) or 0),
@@ -231,7 +245,8 @@ def _run_probe(
             stdin=subprocess.DEVNULL,
             text=True,
         )
-    except Exception:  # noqa: BLE001 - a probe is best-effort
+    except Exception as exc:  # noqa: BLE001 - a probe is best-effort
+        logger.debug("[service_manager] %s failed: %s", argv, exc)
         return None
     try:
         out, err = completed.communicate(timeout=timeout)
@@ -244,8 +259,10 @@ def _run_probe(
             completed.communicate(timeout=timeout)
         except Exception:  # noqa: BLE001 - pragma: no cover
             pass
+        logger.debug("[service_manager] %s timed out", argv)
         return None
-    except Exception:  # noqa: BLE001 - a probe is best-effort
+    except Exception as exc:  # noqa: BLE001 - a probe is best-effort
+        logger.debug("[service_manager] %s failed: %s", argv, exc)
         return None
     return (
         int(getattr(completed, "returncode", 0) or 0),
@@ -387,6 +404,120 @@ _READY_POLL_INTERVAL = 0.1
 #: bound that grows without end turns a service that will never come up
 #: into a wait that never ends.
 _READY_TIMEOUT_MAX_FACTOR = 3.0
+
+# ---------------------------------------------------------------------------
+# What this host can measure
+# ---------------------------------------------------------------------------
+#
+# A wall-clock budget written on an idle machine is a budget written
+# for the wrong machine.  The gate that runs this code measures the
+# host it runs on (see ``scripts/run_tests.sh``: five short sleeps, the
+# median against a threshold) and hands the answer over in the
+# environment, so a service that is slow to come up because the host
+# is slow is not mistaken for a service that is slow to come up
+# because it is broken.
+#
+# The factor below is the host's answer expressed as a multiplier: 1.0
+# means "this host keeps time", 3.9 means "a second here takes four
+# seconds".  Every budget in this module is multiplied by it.
+#
+# The host is **not** measured in-process.  A busy machine stretches
+# every sleep it is given — measured on a loaded host: 0.02s of sleep
+# taking 0.45s — and a budget that follows the machine's own noise
+# is a budget nobody can predict and a suite that never finishes.  The
+# measurement is somebody else's job (the gate's), and this module
+# only reads the answer.
+
+
+#: The environment variable that carries the host's timing factor.
+#:
+#: The gate measures it and exports it to the code it runs.  It is the
+#: first source of truth: a measurement beats a guess.
+HOST_TIMING_SKEW_ENV = "PDT_HOST_TIMING_SKEW"
+
+#: The environment variable that carries the gate's verdict: can this
+#: host measure wall-clock time at all?  ``"0"``, ``"false"`` and
+#: ``"no"`` mean "no"; anything else — including an unset variable —
+#: means the host did not say otherwise.
+HOST_TIMING_MEASURABLE_ENV = "PDT_HOST_TIMING_MEASURABLE"
+
+#: The factor used for a host that says it cannot measure wall-clock
+#: and gives no number of its own.  It is deliberately generous: a
+#: budget that is too short fails a service that is healthy, and that
+#: is the more expensive mistake.
+HOST_UNMEASURABLE_SKEW = 8.0
+
+#: The ceiling on the factor.  A budget that grows without bound is a
+#: budget that hangs, and a gate that hangs is worse than a gate that
+#: fails.
+MAX_HOST_TIMING_SKEW = 8.0
+
+#: The factor below which the host is taken to keep time: a host that
+#: stretches a sleep by less than this is not the reason a budget ran
+#: out.
+HOST_TIMING_FLOOR = 1.2
+
+
+def host_timing_skew(environ: Optional[Mapping[str, str]] = None) -> float:
+    """The factor a wall-clock budget has to be multiplied by here.
+
+    Two sources, in the order they are trusted:
+
+    1. the gate's measurement, handed over in the environment — a
+       measurement beats a guess;
+    2. the gate's verdict — a host that says it cannot measure
+       wall-clock at all gets the generous factor.
+
+    A host that says nothing gets ``1.0``: its budgets are the
+    declared ones, unchanged.
+    """
+    env = os.environ if environ is None else environ
+
+    raw = str(env.get(HOST_TIMING_SKEW_ENV, "") or "").strip()
+    if raw:
+        try:
+            measured = float(raw)
+        except (TypeError, ValueError):
+            measured = 0.0
+        if measured > 0:
+            if measured < HOST_TIMING_FLOOR:
+                # The host keeps time; a stretch this small is not the
+                # reason a budget ran out.
+                return 1.0
+            return max(1.0, min(measured, MAX_HOST_TIMING_SKEW))
+
+    verdict = str(env.get(HOST_TIMING_MEASURABLE_ENV, "") or "").strip().lower()
+    if verdict in ("0", "false", "no"):
+        return HOST_UNMEASURABLE_SKEW
+
+    return 1.0
+
+
+def readiness_budget_seconds(
+    seconds: float, environ: Optional[Mapping[str, str]] = None,
+) -> float:
+    """The wall-clock budget for a wait of *seconds* on this host.
+
+    The declared budget is the budget on a host that keeps time; this
+    is the budget on *this* one.
+    """
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return 0.0
+    if value <= 0:
+        return value
+    return value * host_timing_skew(environ)
+
+
+def _scaled_poll_interval() -> float:
+    """The readiness poll interval, stretched for this host.
+
+    Capped: a poll that waits longer than the poll interval of a host
+    that keeps time buys nothing, because the thing being waited for
+    is not going to arrive faster than the host asks.
+    """
+    return min(_READY_POLL_INTERVAL * host_timing_skew(), _READY_POLL_INTERVAL)
 
 #: Markers that make a log line look like a real failure. Matching is
 #: case-sensitive on purpose: a summary line such as ``0 errors`` must
@@ -905,6 +1036,16 @@ class ServiceRuntime:
     #: record, so an operator can read the cause without re-running the
     #: round.
     failure_reason: str = ""
+    #: The thread that watches the child process (see
+    #: :func:`_start_process_watcher`).  It is kept so a stop can wait
+    #: for it to end: the watcher ends when the process it watches is
+    #: gone, and a stop that returns before that has not finished
+    #: stopping the service.  The thread it leaves behind outlives the
+    #: round that started it, and writes the exit into whatever the
+    #: environment points at by then.
+    watcher: Optional[threading.Thread] = field(
+        default=None, repr=False, compare=False,
+    )
     #: Every port this runtime tried (2026-10-25, repair-r1-29).  A
     #: relocation that failed tries three of them; the address event
     #: stream records every one, so "where did this port come from" is
@@ -1028,6 +1169,13 @@ class ServiceRuntime:
             cwd=cwd,
             owner_pid=int(owner_pid),
             owner_role="backend",
+            # The identity of the executable, written down next to the
+            # spelling: the launcher rewrites ``argv[0]`` after the
+            # exec, so the spelling alone is not something the live
+            # process can be compared against.
+            argv0_alias=(
+                _executable_identity(cmdline[0]) if cmdline else ""
+            ),
         )
     @property
     def dead(self) -> bool:
@@ -1373,16 +1521,16 @@ def _process_groups_table_via_ps() -> Optional[Dict[int, Tuple[int, int]]]:
     A ``ps`` that exits non-zero but still printed something readable
     is parsed all the same: what it printed is the truth about the
     machine, and the exit code only says the output is incomplete.
+
+    The census runs through the **real** ``Popen`` (see
+    :data:`_REAL_POPEN`): it is an observation point, and an
+    observation point a fixture can replace is not one.
     """
-    try:
-        completed = subprocess.run(
-            ["ps", "-axo", "pid=,ppid=,pgid="],
-            capture_output=True, text=True, timeout=10, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+    output = _run(["ps", "-axo", "pid=,ppid=,pgid="], timeout=10)
+    if output is None:
         return None
     table: Dict[int, Tuple[int, int]] = {}
-    for line in (completed.stdout or "").splitlines():
+    for line in output.splitlines():
         fields = line.split()
         if len(fields) < 3:
             continue
@@ -1721,7 +1869,9 @@ def _detached_pgid_of(pid: int) -> Optional[int]:
     separation, and record nothing rather than record the caller's
     group.
     """
-    deadline = time.monotonic() + _DETACHED_PGID_TIMEOUT_SECONDS
+    deadline = time.monotonic() + readiness_budget_seconds(
+        _DETACHED_PGID_TIMEOUT_SECONDS
+    )
     while True:
         pgid = _process_group_of(pid)
         if pgid is None:
@@ -1731,6 +1881,18 @@ def _detached_pgid_of(pid: int) -> Optional[int]:
             # It leads its own group now, so the separation has happened.
             return pgid
         if time.monotonic() >= deadline:
+            # The separation did not happen in time.  The answer is a
+            # **failure**, not a fallback: the only group this pid is
+            # known to be in is the caller's own, and recording that
+            # would hand the next stop a group whose members include
+            # the backend that asked for the service.  So nothing is
+            # recorded, and the stop that reads it degrades to the
+            # individual pids.
+            logger.warning(
+                "[service_manager] pid=%s did not become a process-group "
+                "leader within %.1fs; recording no group",
+                pid, _DETACHED_PGID_TIMEOUT_SECONDS,
+            )
             return None
         time.sleep(0.01)
 
@@ -1817,7 +1979,22 @@ def _spawn_anchor(pid: int) -> Optional[float]:
 
 
 def _run(argv: Sequence[str], timeout: int = 10) -> Optional[str]:
-    """Best-effort subprocess helper; never raises."""
+    """Best-effort subprocess helper; never raises.
+
+    The command is run through the **real** ``Popen``, captured at
+    import time (:data:`_REAL_POPEN`).  A census is an observation
+    point, and an observation point a fixture can replace is not one:
+    the census would vanish from the record of what the run spawned,
+    and a census nobody saw is a census that hid a second process.
+
+    ``subprocess.run`` stays the door for a caller that has *replaced*
+    it: such a caller is asking for a table rather than for the
+    machine, and that request is answered.
+
+    The spawn itself is :func:`_run_probe`, which is what keeps it out
+    of the sight of a test that replaced ``subprocess.Popen`` to watch
+    the product's own service spawn.
+    """
     result = _run_probe(list(argv), timeout=timeout)
     if result is None:
         logger.debug("[service_manager] %s could not be run", argv)
@@ -2620,6 +2797,66 @@ def _ambient_round_token() -> str:
     return str(context.get("round_token") or "")
 
 
+#: How long a stop waits for the service's watcher to end.
+#:
+#: The watcher ends when the process it watches is gone, so this is the
+#: time a service is given to leave after its port is free.  It is
+#: scaled by the host's timing skew (see
+#: :func:`readiness_budget_seconds`): a backend that is shutting down
+#: on a loaded host takes seconds, and a wait that is shorter than the
+#: shutdown only moves the failure to the caller -- the thread the wait
+#: was for outlives the round either way.
+_WATCHER_WAIT_SECONDS = 10.0
+
+#: How long a stop waits for the watcher to end **after** it escalated
+#: to SIGKILL.  A killed process is gone at once; this is only the time
+#: the watcher needs to notice and write the exit down.
+_WATCHER_SETTLE_SECONDS = 5.0
+
+
+def _wait_for_watcher(runtime: Any, timeout: Optional[float] = None) -> bool:
+    """Wait for the service's watcher to end.
+
+    Returns True when the watcher has ended -- or when there was none to
+    wait for -- and False when it was still running when the wait gave
+    up.
+
+    The watcher ends when the process it watches is gone.  A stop that
+    returns before that has not finished stopping the service, and the
+    thread it leaves behind outlives the round that started it: it
+    writes the exit into whatever the environment points at by then,
+    which is how one round's teardown breaks an unrelated one.
+
+    ``timeout`` is a **declared** budget: it is scaled by the host's
+    timing skew, because a shutdown on a loaded host takes seconds and a
+    wait that is shorter than the shutdown only moves the failure to the
+    caller.  The wait is bounded either way.  A process that refuses to
+    leave is a fact the caller has to hear about, not a reason to hang
+    the stop.
+    """
+    watcher = getattr(runtime, "watcher", None)
+    if watcher is None:
+        return True
+    try:
+        if not watcher.is_alive():
+            return True
+    except Exception:  # noqa: BLE001 - a handle that cannot be asked
+        return True
+    declared = _WATCHER_WAIT_SECONDS if timeout is None else timeout
+    try:
+        budget = readiness_budget_seconds(declared)
+    except (TypeError, ValueError):
+        budget = 0.0
+    try:
+        watcher.join(max(0.0, float(budget)))
+    except RuntimeError:  # pragma: no cover - a thread we may not join
+        return True
+    try:
+        return not watcher.is_alive()
+    except Exception:  # noqa: BLE001 - a handle that cannot be asked
+        return True
+
+
 def _service_is_gone(runtime: ServiceRuntime) -> bool:
     """Has the service's process actually gone?
 
@@ -2824,6 +3061,9 @@ def stop_service(
         "stopped after SIGKILL" if result["port_free"]
         else f"port {runtime.port} still held after SIGKILL"
     )
+    # The process is gone after a SIGKILL, but the watcher that says so
+    # is a thread: it ends a moment later, and the stop waits for it.
+    _wait_for_watcher(runtime, _WATCHER_SETTLE_SECONDS)
     return result
 
 
@@ -3009,7 +3249,7 @@ def data_plane_evidence(
         status_code, raw = http_probe(
             SERVICE_HOST, int(port), DATA_PLANE_PROBE_PATH,
             headers={REQUEST_HEADER: REQUEST_HEADER_VALUE},
-            timeout=timeout,
+            timeout=readiness_budget_seconds(timeout),
         )
     except Exception as exc:  # noqa: BLE001 - a probe never raises
         # The endpoint could not be reached.  That is not a verdict on
@@ -3122,12 +3362,21 @@ def _port_is_answering(port: int) -> bool:
     :func:`service_freshness.wait_for_ready` refuses them: the
     backend's own ports are never "ready" for a service to be
     answered on.
+
+    The connect is given this host's budget for :data:`_PORT_CONNECT_TIMEOUT`
+    rather than that number outright: the declared budget is the budget
+    on a host that keeps time, and this is the budget on *this* one
+    (see :func:`readiness_budget_seconds`).  On a host that keeps time
+    the two are the same number, and on a host that has admitted it
+    runs slow the question is given the same wall-clock room to be
+    answered that it would be given there.
     """
     if int(port) in PROTECTED_PORTS:
         return False
     try:
         with socket.create_connection(
-            (SERVICE_HOST, int(port)), timeout=_PORT_CONNECT_TIMEOUT
+            (SERVICE_HOST, int(port)),
+            timeout=readiness_budget_seconds(_PORT_CONNECT_TIMEOUT),
         ):
             return True
     except OSError:
@@ -3150,7 +3399,7 @@ def _service_is_answering(decl: ServiceDeclaration) -> bool:
 
     try:
         status_code, _body = http_probe_url(
-            decl.health_url, timeout=3,
+            decl.health_url, timeout=readiness_budget_seconds(3),
         )
         return 200 <= status_code < 400
     except Exception:  # noqa: BLE001 - any failure means "not yet"
@@ -3235,8 +3484,13 @@ def wait_until_ready(
     The boolean answer to :func:`_wait_ready_with_evidence`, with the
     evidence it reached published for the caller that started the
     service (see :func:`_take_data_plane`).
+
+    ``timeout_seconds`` is a **declared** budget: it is what the
+    caller asked for, and it is measured against this host before the
+    wait runs on it (see :func:`readiness_budget_seconds`).
     """
-    ready, evidence = _wait_ready_with_evidence(decl, timeout_seconds)
+    budget = readiness_budget_seconds(timeout_seconds) if timeout_seconds else None
+    ready, evidence = _wait_ready_with_evidence(decl, budget)
     _remember_data_plane(decl.port, evidence)
     return ready
 
@@ -3507,8 +3761,13 @@ def wait_until_ready_with_evidence(
 
     See :func:`_wait_ready_with_evidence`; this is the same wait with
     its evidence handed back instead of published.
+
+    ``timeout_seconds`` is a **declared** budget, and it is measured
+    against this host before the wait runs on it (see
+    :func:`readiness_budget_seconds`).
     """
-    return _wait_ready_with_evidence(decl, timeout_seconds)
+    budget = readiness_budget_seconds(timeout_seconds) if timeout_seconds else None
+    return _wait_ready_with_evidence(decl, budget)
 
 
 def _adaptive_ready_timeout(declared: float) -> float:
@@ -3590,9 +3849,17 @@ def _wait_ready_with_evidence(
     Returns ``(ready, evidence)``.  The evidence is what the caller
     records, so "it came up" and "it came up serving data" stay two
     separately readable facts.
+
+    ``timeout_seconds`` is the **budget** the wait runs on — the
+    declared timeout already measured against this host by the caller
+    (see :func:`readiness_budget_seconds`).  ``None`` means "no budget
+    was given", and the declaration's own timeout is measured here
+    instead.
     """
     timeout = (
-        decl.ready_timeout_seconds if timeout_seconds is None else timeout_seconds
+        float(timeout_seconds)
+        if timeout_seconds is not None
+        else readiness_budget_seconds(decl.ready_timeout_seconds)
     )
     started = time.monotonic()
     # The wall clock is the *bound*, not the verdict: inside it, the
@@ -3644,7 +3911,7 @@ def _wait_ready_with_evidence(
         if time.monotonic() >= deadline:
             evidence.waited_seconds = time.monotonic() - started
             return False, evidence
-        time.sleep(_READY_POLL_INTERVAL)
+        time.sleep(_scaled_poll_interval())
 
 
 def _relocate_service(
@@ -8469,6 +8736,16 @@ def _start_process_watcher(
         # No watcher means no watcher to wait for.
         done.set()
         return None
+    # The runtime keeps the handle, so a stop can wait for the watcher to
+    # end (see :func:`_wait_for_watcher`).  A watcher nobody can wait for
+    # is a thread that outlives the round that started it.
+    try:
+        runtime.watcher = thread
+    except Exception:  # noqa: BLE001 - a runtime that refuses the field
+        logger.debug(
+            "[service_manager] the runtime of %s kept no watcher handle",
+            runtime.name,
+        )
     return thread
 
 

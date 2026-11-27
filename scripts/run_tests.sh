@@ -47,11 +47,32 @@ fi
 # Activate the virtual environment
 source "$VENV_PATH/bin/activate"
 
-# The pytest binary the phases below run. It defaults to the ``pytest`` on
-# PATH — which the activation above has just pointed at this project's venv
-# — and an explicit value wins, so a caller can aim a run at another binary
-# (a stub, in a negative control) without editing this script.
-PYTEST_BIN="${PYTEST_BIN:-pytest}"
+# The pytest binary the phases below run.
+#
+# It is **this checkout's** venv: ``$VENV_PATH/bin/pytest``, whose shebang
+# is this checkout's own interpreter (``$VENV_PATH/bin/python``).  It used
+# to default to the ``pytest`` on PATH — which is whatever the activation
+# above, or the caller's PATH, put first — and the gate's own evidence
+# showed what that costs: the pytest header named the interpreter of
+# **another checkout**'s venv
+# (``.../product-development-team/backend/.venv/bin/python``) while the
+# rootdir was this checkout's ``backend``.  A suite run by another tree's
+# interpreter is that tree's suite, not this one's.
+#
+# An explicit value still wins, so a caller can aim a run at another
+# binary (a stub, in a negative control) without editing this script.
+if [ -z "${PYTEST_BIN:-}" ]; then
+    PYTEST_BIN="$VENV_PATH/bin/pytest"
+    if [ ! -x "$PYTEST_BIN" ]; then
+        echo "Error: pytest not found at $PYTEST_BIN"
+        echo "Create the virtual environment from the lockfile with:"
+        echo "  uv sync --project backend"
+        echo ""
+        echo "That installs pytest into backend/.venv at the version"
+        echo "backend/uv.lock pins."
+        exit 1
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # The spawn registry: what this run started, so this run can give it back
@@ -665,6 +686,96 @@ run_host_probe() {
     return "$rc"
 }
 
+# ---------------------------------------------------------------------------
+# The host's verdict, handed to the code the gate runs
+# ---------------------------------------------------------------------------
+# The probe above answers "can this host measure wall-clock time at all?".
+# That answer is worth nothing to the code the gate runs unless the code
+# can see it: a readiness budget written for an idle machine is a budget
+# written for the wrong machine, and the round-4 gate is what showed it —
+# on that host a 50 ms sleep took 194 ms, so every service that came up
+# "not ready" was measured against a clock that does not keep time.
+#
+# So the verdict is exported into the environment of every phase:
+#
+#   PDT_HOST_TIMING_MEASURABLE   1 or 0 — can the host measure time at all
+#   PDT_HOST_TIMING_SKEW         the factor a wall-clock budget has to be
+#                                multiplied by on this host (1.00 = it
+#                                keeps time)
+#
+# The code under test reads them (``service_manager.host_timing_skew``),
+# so the budget it runs on is the budget this host can actually honour.
+#
+# The measurement is taken **before each phase**, not once for the whole
+# run: what the budget has to survive is the load *while the phase runs*,
+# and a host that was idle when the gate started is busy by the time the
+# second phase starts.  It is taken by ``run_phase`` itself, so every
+# phase that runs is measured — a measurement written by hand at each
+# phase's call site is one the next phase added to the gate forgets.
+
+#: The sleep the probe measures, in seconds.  The factor is the measured
+#: sleep divided by this.
+HOST_TIMING_SAMPLE_SECONDS=0.05
+
+#: The ceiling on the factor.  A budget that grows without bound is a
+#: budget that hangs, and a gate that hangs is worse than a gate that
+#: fails.
+HOST_TIMING_MAX_SKEW=8.00
+
+# The factor the measured sleep implies: how many seconds this host
+# spends on a second.  A host that keeps time gets 1.00.
+host_timing_factor() {
+    awk -v measured="$1" -v sample="$HOST_TIMING_SAMPLE_SECONDS" \
+        -v ceiling="$HOST_TIMING_MAX_SKEW" \
+        'BEGIN { f = measured / sample; if (f < 1.0) f = 1.0; if (f > ceiling) f = ceiling; printf "%.2f", f }'
+}
+
+# The verdict, as the gate last measured it.
+host_measurable=1
+host_probe_note="not measured (no phase ran)"
+host_timing_skew="1.00"
+
+# Measure the host and tell the code that is about to run.
+measure_host_timing() {
+    local probe_output=""
+    local probe_rc=0
+    local probe_measured=""
+    local probe_loadavg=""
+    local probe_factor=""
+    probe_output="$(run_host_probe)" || probe_rc=$?
+    probe_measured="${probe_output#* }"
+    probe_measured="${probe_measured%% *}"
+    probe_loadavg="$(probe_loadavg_of "$probe_output")"
+    # The factor is handed down **whether or not the host can measure
+    # time**: the verdict says whether a wall-clock *assertion* means
+    # anything here, while the factor says how long a second takes —
+    # and the budget needs the second one.  On the host that failed the
+    # round-4 gate the measured sleep was 194 ms, so a second there
+    # takes four, and a budget written for one second has to be
+    # written for four.
+    probe_factor="$(host_timing_factor "$probe_measured")"
+    export PDT_HOST_TIMING_SKEW="$probe_factor"
+    host_timing_skew="$probe_factor"
+    if [ "$probe_rc" -ne 0 ]; then
+        host_measurable=0
+        host_probe_note="the host cannot measure wall-clock (sleep(0.05)=${probe_measured}s, loadavg=${probe_loadavg}, factor=${probe_factor})"
+        export PDT_HOST_TIMING_MEASURABLE=0
+    else
+        host_probe_note="OK (sleep(0.05)=${probe_measured}s, loadavg=${probe_loadavg}, factor=${probe_factor})"
+        export PDT_HOST_TIMING_MEASURABLE=1
+    fi
+    printf 'host timing probe: %s\n' "$host_probe_note"
+}
+
+# The load average the probe reported — everything after the measured
+# sleep.  "OK 0.194 42.29" gives "42.29"; the forced verdict gives
+# "0.00 (forced)".
+probe_loadavg_of() {
+    local rest="${1#* }"
+    printf '%s' "${rest#* }"
+}
+
+
 # Run the three phases, capturing each phase's own exit code.
 #
 # Every phase runs even when an earlier one failed: the PRD's "no
@@ -848,6 +959,23 @@ run_phase() {
         return "$BUDGET_GONE_EXIT_CODE"
     fi
     remaining=$(printf '%d.%03d' $((remaining_ms / 1000)) $((remaining_ms % 1000)))
+    # Measure the host **before this phase starts**, and hand the
+    # verdict to the code the phase is about to run: the budget a phase
+    # runs on has to survive the load *while the phase runs*, and a host
+    # that was idle when the gate started is busy by the time the second
+    # phase starts.
+    #
+    # The measurement lives here, inside the phase runner, and not at
+    # the call sites of the phases: a measurement written by hand at
+    # each call site is a measurement the next phase added to the gate
+    # will forget.  The wall-clock phase ran unmeasured for exactly that
+    # reason — the calls that existed sat at the call sites of the
+    # first two phases, and the third phase had none.
+    #
+    # It is measured after the budget check above, because a phase that
+    # does not run needs no measurement: nothing is going to run on the
+    # budget it would have been given.
+    measure_host_timing
     # errexit off for the call below, so a failing phase is *captured*
     # instead of aborting the script; ``-u`` and ``pipefail`` stay on.
     set -euo pipefail +e
@@ -874,7 +1002,7 @@ budget_exhausted=0
 exhausted_phase=""
 
 # ---------------------------------------------------------------------------
-# The host measurability probe — once, before every phase
+# The host measurability probe — once, before the first phase
 # ---------------------------------------------------------------------------
 #
 # The probe runs **before the first phase**, not before the wall-clock

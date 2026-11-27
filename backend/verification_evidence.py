@@ -87,6 +87,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
@@ -131,6 +132,27 @@ _LINE_TOLERANCE = 2
 #: artifact, and *which* one is decided by the declared sub-class (see
 #: :func:`_uses_ci_output_contract`).
 EVIDENCE_REQUIRED_METHODS = ("code_review", "ui_validation", "e2e")
+
+#: The kind of an issue that says "this artifact was not written by the
+#: attempt being judged" (2026-11-19, VP-043).
+#:
+#: It is **not** a defect of the deliverable.  A verification point's
+#: artifact directory is reused across rounds, so the file the framework
+#: finds may have been written by an *earlier* attempt.  Comparing that
+#: file against the current tree tells you the tree moved — it says
+#: nothing about the deliverable.  So the check reports the artifact as
+#: stale instead of judging it, and a verdict resting on it is kept:
+#: there was no conclusion to verify, so there is nothing to downgrade
+#: it to (a FAILED nobody can reproduce is worse than an unverified
+#: PASSED).
+STALE_ARTIFACT_KIND = "stale_artifact"
+
+#: The shape of the ISO-8601 UTC stamps the framework writes
+#: (``YYYY-MM-DDTHH:MM:SSZ``).  Only this shape is compared against a
+#: file's mtime — a stamp in another shape is treated as "no stamp",
+#: which leaves the caller with the behaviour it had before the
+#: parameter existed.
+_ISO_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 #: The fields a point uses to declare an executable entry: ``full_ci``
 #: points declare ``ci_entry``, command-kind ``e2e`` points declare
@@ -500,9 +522,143 @@ def _verify_ci_output(directory: Path, vp_id: str) -> List[EvidenceIssue]:
     return []
 
 
+# ---------------------------------------------------------------------------
+# Freshness — is the artifact this attempt is judged on *its* artifact?
+# ---------------------------------------------------------------------------
+#
+# 2026-11-19（VP-043）：一个验证点的产物目录是**跨轮复用**的。于是框架
+# 核对依据时读到的那个文件，可能是**上一次尝试**写的 —— 拿它跟当前的树
+# 逐条比对，比对出来的是"树动了"，不是"交付物坏了"。
+#
+# 那一轮就是这样翻车的：本轮 04:14:34Z 开工，``VP-043`` 的
+# ``citations.json`` 写于 09:14（本地，比本轮早三个小时），而之后的一次
+# 提交把被引用的那一行整体下移了 72 行。框架拿这份旧产物比对当前的树，
+# 判 ``citations[12]`` 是 ``snippet_mismatch``，于是一份 PASSED 被改判
+# FAILED，并被归档成"交付物缺陷"。
+#
+# 计划 §1 说得很直白：判定不可用（这次没有拿到结论）不得记成 FAILED。
+# 框架自己拿错了判定依据，不等于交付物坏了。所以旧产物**不参与**判定：
+# 它被报告成 ``stale_artifact``，结论保留，依据记为 unavailable。
+
+
+def _parse_iso_utc(value: Any) -> Optional[datetime]:
+    """Parse an ISO-8601 UTC stamp of the shape the framework writes.
+
+    ``None`` for anything else — a stamp in another shape is not a
+    cutoff.  Dropping evidence on the strength of a cutoff nobody can
+    parse would be dropping evidence without grounds, so an unreadable
+    stamp leaves the caller exactly where it was.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not _ISO_UTC_RE.match(text):
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc,
+        )
+    except ValueError:
+        return None
+
+
+def evidence_artifact_path(
+    method: str, plan_dir: Path, vp_id: str,
+    vp: Optional[Dict[str, Any]] = None,
+) -> Optional[Path]:
+    """The artifact file this method's evidence contract reads.
+
+    ``None`` for a method that owes no artifact.  Which artifact it is
+    is decided by the **declared** sub-class, exactly as the check
+    itself decides (:func:`_uses_ci_output_contract`): the browser face
+    of ``e2e`` owes a checkpoint, the command face owes the runner's
+    audit copy.
+    """
+    if method not in EVIDENCE_REQUIRED_METHODS:
+        return None
+    directory = artifact_dir_for(plan_dir, vp_id)
+    if method == "code_review":
+        return directory / CITATIONS_FILENAME
+    if _uses_ci_output_contract(method, vp):
+        return directory / CI_OUTPUT_FILENAME
+    if method in ("ui_validation", E2E_METHOD):
+        return directory / CHECKPOINTS_FILENAME
+    return None
+
+
+def stale_artifact_finding(
+    method: str, plan_dir: Path, vp_id: str,
+    vp: Optional[Dict[str, Any]] = None,
+    round_started_at: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Was the artifact written before the round that is judging it?
+
+    Returns ``None`` — "there is nothing to say" — when:
+
+      * there is no round start to compare against, or it is in a shape
+        the framework does not write (the caller keeps the behaviour it
+        had before this rule existed);
+      * the method owes no artifact;
+      * the artifact does not exist — a missing artifact is
+        ``missing_artifact``'s business, and it has always been a
+        downgrade;
+      * the artifact is at least as new as the round's start.
+
+    Otherwise a finding with the artifact's path, its mtime and the
+    round's start — the three facts an operator needs to see why the
+    check did not judge anything.
+    """
+    started = _parse_iso_utc(round_started_at)
+    if started is None:
+        return None
+    try:
+        path = evidence_artifact_path(method, plan_dir, vp_id, vp)
+    except Exception:  # pragma: no cover - defensive
+        logger.warning(
+            "[verification_evidence] could not resolve the artifact for %s",
+            vp_id, exc_info=True,
+        )
+        return None
+    if path is None or not path.is_file():
+        return None
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    written = datetime.fromtimestamp(mtime, timezone.utc)
+    if written >= started:
+        return None
+    return {
+        "artifact": str(path),
+        "mtime": written.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "round_started_at": str(round_started_at).strip(),
+    }
+
+
+def stale_artifact_issue(
+    method: str, plan_dir: Path, vp_id: str,
+    vp: Optional[Dict[str, Any]] = None,
+    round_started_at: Optional[str] = None,
+) -> Optional[EvidenceIssue]:
+    """The staleness finding as an :class:`EvidenceIssue` (``None`` when
+    there is nothing to report)."""
+    finding = stale_artifact_finding(
+        method, plan_dir, vp_id, vp=vp, round_started_at=round_started_at,
+    )
+    if finding is None:
+        return None
+    return EvidenceIssue(
+        STALE_ARTIFACT_KIND,
+        f"{finding['artifact']} 的写入时间 {finding['mtime']} 早于本轮起点 "
+        f"{finding['round_started_at']} —— 这份产物不是本轮写的，"
+        f"本次没有拿到结论",
+    )
+
+
 def verify_evidence(
     method: str, plan_dir: Path, project_dir: Path, vp_id: str,
     vp: Optional[Dict[str, Any]] = None,
+    round_started_at: Optional[str] = None,
 ) -> List[EvidenceIssue]:
     """Verify the artifact ``method`` is required to produce.
 
@@ -510,6 +666,14 @@ def verify_evidence(
     **which** ``e2e`` sub-class this is.  It is optional: a bare call
     knows nothing about the sub-class and applies the browser contract,
     which is the one that holds by default.
+
+    ``round_started_at`` is the attempt's start stamp (ISO-8601 UTC).
+    When it is given, an artifact written **before** it belongs to an
+    earlier attempt: it is reported as ``stale_artifact`` and the tree
+    is never consulted (2026-11-19, VP-043 — see
+    :func:`stale_artifact_finding` for why a stale artifact says
+    nothing about the deliverable).  Without it the check is exactly
+    what it always was.
 
     Returns ``[]`` for methods with no evidence contract (``api_test``
     carries its own, inline, in :mod:`verification_api_runner`).
@@ -523,6 +687,13 @@ def verify_evidence(
 
     directory = artifact_dir_for(plan_dir, vp_id)
     try:
+        stale = stale_artifact_issue(
+            method, plan_dir, vp_id, vp=vp,
+            round_started_at=round_started_at,
+        )
+        if stale is not None:
+            return [stale]
+
         if method == "code_review":
             payload = _read_json(directory / CITATIONS_FILENAME)
             if payload is None:
@@ -568,6 +739,7 @@ def apply_to_verdict(
     project_dir: Path,
     vp_id: str,
     vp: Optional[Dict[str, Any]] = None,
+    round_started_at: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Downgrade a PASSED whose stated basis cannot be verified.
 
@@ -583,6 +755,14 @@ def apply_to_verdict(
     owe different artifacts.  A bare call knows no VP and applies the
     browser contract.
 
+    ``round_started_at`` is the attempt's start stamp (ISO-8601 UTC).
+    An artifact written before it belongs to an earlier attempt, so the
+    verdict is **not** downgraded: there was no conclusion to check, and
+    a FAILED nobody can reproduce is worse than an unverified PASSED.
+    The verdict keeps its status and records the state of the check
+    (``state='unavailable'``) with the artifact and the round's start
+    (2026-11-19, VP-043).
+
     Returns ``verdict`` unchanged when the status is not PASSED or the
     evidence holds up.
     """
@@ -591,9 +771,19 @@ def apply_to_verdict(
     if str(verdict.get("status")) != "PASSED":
         return verdict
 
-    issues = verify_evidence(method, plan_dir, project_dir, vp_id, vp=vp)
+    issues = verify_evidence(
+        method, plan_dir, project_dir, vp_id, vp=vp,
+        round_started_at=round_started_at,
+    )
     if not issues:
         return verdict
+
+    if all(issue.kind == STALE_ARTIFACT_KIND for issue in issues):
+        # The basis is not checkable — it is not *wrong*.  The conclusion
+        # stands; what changes is the record of why it was not verified.
+        return _mark_evidence_unavailable(
+            verdict, method, plan_dir, vp_id, vp, round_started_at,
+        )
 
     details = [f"[{i.kind}] {i.detail}" for i in issues]
     verdict = dict(verdict)
@@ -613,6 +803,36 @@ def apply_to_verdict(
     }
     verdict["evidence"] = evidence
     return verdict
+
+
+def _mark_evidence_unavailable(
+    verdict: Dict[str, Any],
+    method: str,
+    plan_dir: Path,
+    vp_id: str,
+    vp: Optional[Dict[str, Any]],
+    round_started_at: Optional[str],
+) -> Dict[str, Any]:
+    """Record that the basis could not be checked — without changing it.
+
+    The verdict keeps its status and its reasons.  What is added is the
+    state of the check: the artifact that could not be used, why, and
+    the attempt it was supposed to belong to.
+    """
+    artifact = evidence_artifact_path(method, plan_dir, vp_id, vp)
+    evidence = verdict.get("evidence")
+    evidence = dict(evidence) if isinstance(evidence, dict) else (
+        {"original_evidence": evidence}
+    )
+    evidence["evidence_check"] = {
+        "state": "unavailable",
+        "reason": STALE_ARTIFACT_KIND,
+        "artifact": str(artifact) if artifact is not None else None,
+        "round_started_at": round_started_at,
+    }
+    updated = dict(verdict)
+    updated["evidence"] = evidence
+    return updated
 
 
 # ---------------------------------------------------------------------------

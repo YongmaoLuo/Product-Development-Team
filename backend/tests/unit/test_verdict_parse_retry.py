@@ -23,10 +23,12 @@ The contract pinned here
     (L2) and logs a ``verdict_parse_retry`` event per retry;
   * a retry that succeeds produces that attempt's verdict — a garble
     followed by a good payload is a PASSED, not a FAILED;
-  * a budget that ran out on malfunctions ends as a hard FAILED
+  * a budget that ran out on **verdict-parse** malfunctions ends as
+    ``UNKNOWN`` — "no verdict was reached", not "the code is broken" —
     classified ``infra`` (the attempt malfunctioned, the deliverable is
     not implicated) with the source ``deterministic`` (the class was
-    derived by rule, not read off a claim).
+    derived by rule, not read off a claim).  A budget that ran out on
+    **transport** malfunctions still ends as a hard FAILED.
 
 The negative control (``# NEGCTL-P0-1-BEGIN`` / ``# NEGCTL-P0-1-END``)
 lives in the production source: the block between the two markers is
@@ -49,6 +51,7 @@ if str(_BACKEND_DIR) not in sys.path:
 
 import verification_subagent as _verification_subagent  # noqa: E402
 from verification_subagent import (  # noqa: E402
+    VERDICT_UNKNOWN,
     VerificationSubAgent,
     VerdictParseError,
 )
@@ -177,11 +180,13 @@ async def test_parse_error_retries_then_passes(tmp_path):
 
 @pytest.mark.asyncio
 async def test_exhausted_marks_infra(tmp_path):
-    """Every attempt garbled → hard FAILED, classified ``infra``.
+    """Every attempt garbled → ``UNKNOWN``, classified ``infra``.
 
     The attempt malfunctioned; the deliverable is not implicated, and
     the class is marked ``deterministic`` because it was derived by rule
-    rather than read off a claim.
+    rather than read off a claim.  The verdict itself is ``UNKNOWN``: a
+    garbled answer says nothing about the deliverable, so it must not be
+    filed as a code failure.
     """
     log_path = tmp_path / "vp.log"
     sub = VerificationSubAgent(method="code_review", max_retries=1)
@@ -201,9 +206,9 @@ async def test_exhausted_marks_infra(tmp_path):
         f"the budget is max_retries + 1 attempts; the tool was called "
         f"{tool.calls} times"
     )
-    assert verdict.verdict == "FAILED", (
-        f"an exhausted budget is a hard FAILED, never a SKIPPED; got "
-        f"{verdict.verdict!r}"
+    assert verdict.verdict == VERDICT_UNKNOWN, (
+        f"an exhausted parse budget means 'no verdict was reached', not "
+        f"'the code is broken'; got {verdict.verdict!r}"
     )
     assert verdict.failure_class == "infra", (
         f"the attempt malfunctioned, so the class is infra; got "

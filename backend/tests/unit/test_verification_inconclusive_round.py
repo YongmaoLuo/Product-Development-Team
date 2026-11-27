@@ -390,14 +390,35 @@ def test_the_executor_schema_accepts_an_inconclusive_verdict(tmp_path):
     assert executor._validate_verdict(verdict) is None
 
 
-def test_the_executor_schema_still_rejects_an_unknown_status(tmp_path):
-    """The negative control: the schema was widened by one word, not opened."""
+def test_the_executor_schema_still_rejects_a_status_outside_the_vocabulary(
+    tmp_path,
+):
+    """The negative control: the schema was widened by one word, not opened.
+
+    2026-11-27: ``UNKNOWN`` used to be *outside* the vocabulary — that
+    is what this control used to prove.  The branch has since made
+    ``UNKNOWN`` a legitimate verdict status (it is the verdict for
+    "the upstream never reached a conclusion"), so that word no longer
+    separates the schema from an open door: it is now **inside** the
+    vocabulary, and the control has to move to the word that is still
+    outside it.  What the control pins is unchanged — the schema knows
+    a fixed list of words, and a word that is not on it is rejected.
+    """
     from verification_executor import VerdictSchemaError
 
     executor = _make_executor(tmp_path)
+
+    assert executor._validate_verdict(
+        {"status": "UNKNOWN", "reasons": [], "evidence": {}}
+    ) is None, (
+        "UNKNOWN is a legitimate verdict status now: the schema has to "
+        "accept it, and the control has to look for a word outside the "
+        "vocabulary instead"
+    )
+
     with pytest.raises(VerdictSchemaError):
         executor._validate_verdict(
-            {"status": "UNKNOWN", "reasons": [], "evidence": {}}
+            {"status": "MYSTERY", "reasons": [], "evidence": {}}
         )
 
 

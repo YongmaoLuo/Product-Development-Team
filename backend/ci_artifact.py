@@ -111,6 +111,13 @@ CI_ARTIFACT_FIELDS: FrozenSet[str] = frozenset({
     "spawned_processes_all_given_back",
     "budget_exhausted_in",
     "gate_elapsed_seconds",
+    # 2026-11-14: what the host the gate ran on could measure -- the
+    # readings behind ``host_measurable``.  A verdict made on a host
+    # that cannot keep time is a verdict about a different machine than
+    # one made on a host that can, and the reader has to be able to
+    # tell them apart.  The producer writes the key literally (see the
+    # module docstring above), so the contract has to know that name.
+    "host_timing",
     "verifier_source",
     "error",
     "host_measurable",

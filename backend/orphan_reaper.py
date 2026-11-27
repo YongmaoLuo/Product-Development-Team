@@ -204,6 +204,7 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    Union,
 )
 
 try:  # POSIX only.  Without it there is no singleton (see ``acquire_lock``).
@@ -243,6 +244,16 @@ logger = logging.getLogger(__name__)
 
 #: The real ``subprocess.Popen``, captured at import time.
 #:
+#: The census is an **observation point**, and an observation point a
+#: fixture can replace is not one: replacing the module-level
+#: ``subprocess.Popen`` takes the census with it, and the process the
+#: spawn path derives vanishes from the record -- which is how a
+#: census came to be read as "the service spawned twice".
+#:
+#: Capturing ``subprocess.run`` would not be enough: it looks ``Popen``
+#: up in the ``subprocess`` module when it is called, so the class
+#: itself is what has to be captured.
+#:
 #: A test replaces ``subprocess.Popen`` with a recorder to watch the
 #: product's own spawns — that is how the shape of a service start is
 #: asserted.  The reaper's **probes** must not be seen by such a
@@ -257,6 +268,12 @@ logger = logging.getLogger(__name__)
 _REAL_POPEN = subprocess.Popen
 
 #: The real ``subprocess.run``, captured at import time.
+#:
+#: Replacing it is how a caller hands the census a *table* instead of
+#: asking the machine for one, and that is a request the census
+#: answers.  It is not the same door as :data:`_REAL_POPEN`: this one
+#: hands over the answer, while replacing the ``Popen`` class would
+#: take over the observation itself.
 #:
 #: A fake installed for ``subprocess.run`` is a legitimate seam: it
 #: answers the probe with a fixture instead of asking the operating
@@ -599,6 +616,14 @@ def _run_probe(
     (``tests/unit/test_orphan_reaper_procs.py`` fakes it to pin the
     parsers against a fixture).  The two seams cannot be confused: the
     fake replaces the whole call, the recorder replaces only the spawn.
+
+    A census never raises.  Everything that can go wrong on the way to
+    an answer -- a missing tool, a spawn that is refused, a call that
+    times out, a fake that throws -- is reported as ``None`` instead of
+    unwinding the caller, because the caller is often the spawn path
+    and an exception there loses the registration of a service that is
+    running.  A census that cannot be taken is *unknown*, and unknown
+    is not a reason to lose the record.
     """
     runner = subprocess.run
     if runner is not _REAL_RUN:
@@ -610,7 +635,7 @@ def _run_probe(
                 timeout=timeout,
                 env=env,
             )
-        except (OSError, subprocess.SubprocessError):
+        except Exception:  # noqa: BLE001 - a census never raises
             return None
         return (
             int(getattr(completed, "returncode", 0) or 0),
@@ -626,7 +651,16 @@ def _run_probe(
             env=env,
             text=True,
         )
-    except (OSError, subprocess.SubprocessError, ValueError):
+    except Exception:  # noqa: BLE001 - a census never raises
+        # The narrow ``except (OSError, subprocess.SubprocessError)``
+        # this replaces let anything else through -- and the thing that
+        # replaces it is a *census*, which is asked for on paths where
+        # the answer is a nicety.  An exception that escapes here does
+        # not skip the census: it unwinds the caller that asked for it,
+        # and the caller is often the spawn path, whose registration is
+        # then lost entirely -- the service is running and nothing knows
+        # it.  A census that cannot be taken is *unknown*, and unknown
+        # is not a reason to lose the record.
         return None
     try:
         out, err = completed.communicate(timeout=timeout)
@@ -637,10 +671,10 @@ def _run_probe(
             pass
         try:
             completed.communicate(timeout=timeout)
-        except (OSError, subprocess.SubprocessError):  # pragma: no cover
+        except Exception:  # noqa: BLE001 - pragma: no cover
             pass
         return None
-    except (OSError, subprocess.SubprocessError):  # pragma: no cover
+    except Exception:  # noqa: BLE001 - a census never raises
         return None
     return (
         int(getattr(completed, "returncode", 0) or 0),
@@ -658,13 +692,12 @@ def _ps_start_epoch(pid: int) -> Optional[str]:
     output is the English, fixed-width form regardless of the locale
     the reaper itself runs in.
     """
-    env = dict(os.environ)
-    env["LC_ALL"] = "C"
-    env["LANG"] = "C"
-    result = _run_probe(
-        [_ps_binary(), "-o", "lstart=", "-p", str(pid)],
-        timeout=5,
-        env=env,
+    # The probe is spawned through :func:`_run_probe` -- which
+    # :func:`_run_tool` reaches -- so it never goes through whatever
+    # ``subprocess.Popen`` currently names, and it runs under the C
+    # locale the parser below reads.
+    result = _run_tool(
+        [_ps_binary(), "-o", "lstart=", "-p", str(pid)], timeout=5.0,
     )
     if result is None:
         return None
@@ -741,35 +774,122 @@ def _ps_start_epochs(pids: Sequence[int]) -> Optional[Dict[int, str]]:
     return epochs
 
 
+#: The machine's boot time in epoch seconds, as ``/proc`` reports it.
+#:
+#: It does not change while the machine is up, so it is read once.
+_BOOT_TIME: Optional[float] = None
+
+
+def _boot_time() -> Optional[float]:
+    """Return the machine's boot time in epoch seconds, or ``None``.
+
+    ``/proc`` counts a process' start in clock ticks *since boot*, so
+    turning that count into a time needs the boot time.  Where there
+    is no ``/proc`` there is no boot time either, and the answer has
+    to come from somewhere else.
+    """
+    global _BOOT_TIME
+    if _BOOT_TIME is not None:
+        return _BOOT_TIME
+    try:
+        with open("/proc/stat", "rb") as handle:
+            for raw in handle:
+                if raw.startswith(b"btime "):
+                    _BOOT_TIME = float(raw.split()[1])
+                    return _BOOT_TIME
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _proc_start_epoch_seconds(pid: int) -> Optional[str]:
+    """Return ``pid``'s start time in epoch seconds, from ``/proc`` alone.
+
+    ``/proc`` counts a process' start in clock ticks *since boot*, and
+    a tick count is not a time: read as one, it puts the process in
+    1970.  The boot time turns the ticks into the time they stand for,
+    and the answer is the instant the process started -- to the second,
+    which is the resolution ``ps -o lstart=`` has too.
+
+    ``None`` when ``/proc`` cannot say: there is no such process, or
+    no boot time to read the ticks against.
+    """
+    ticks = _proc_start_ticks(pid)
+    if ticks is None:
+        return None
+    boot = _boot_time()
+    try:
+        hz = os.sysconf("SC_CLK_TCK")
+    except (AttributeError, ValueError, OSError):
+        hz = 0
+    if boot is None or not hz:
+        return None
+    try:
+        return str(int(boot + float(ticks) / float(hz)))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _epoch_start_seconds(pid: int) -> Optional[str]:
+    """Return ``pid``'s start time in epoch seconds, or ``None``.
+
+    This is **the** ruler of this module: the reading a process is
+    registered on, the reading the reaper compares a record against,
+    and the reading the owner marker carries.  A record written in one
+    unit and compared against another is a mismatch, and a mismatch is
+    read as "somebody else's process" -- so the run would leave its own
+    service running.
+
+    On Linux it comes from ``/proc`` alone -- the boot time plus the
+    tick count -- so no subprocess is involved; where there is no
+    ``/proc`` the ``ps`` census answers, to the second.
+    """
+    return _proc_start_epoch_seconds(pid) or _ps_start_epoch(pid)
+
+
 def process_start_epoch(pid: Optional[int] = None) -> str:
-    """Return a stable identifier for *when* ``pid`` started.
+    """Return a stable identifier for *when* ``pid* started.
 
     The value is derived from the operating system, not from the
     environment, so an observer that computes it for a live pid gets
     the same string the process itself recorded.  That is what makes
     pid reuse detectable.
 
-    An empty string means "could not be determined" — the platform
+    It is in **epoch seconds**.  The platform's own reading is a tick
+    count since boot on Linux and whole seconds elsewhere, and a
+    reading in the platform's own unit is a reading nobody else in
+    this module can compare against: the registry records epoch
+    seconds, the reaper compares epoch seconds, and the owner marker
+    carries epoch seconds.  One ruler, so that a record and a reading
+    of the same instant are recognised as the same instant.
+
+    This module imports the standard library only, so the ``ps`` census
+    is the only portable reader here.  A census is a second process,
+    and that is why the *caller* of the spawn path hands its own
+    reading in (see :func:`register_spawned_process`): the spawn path
+    does not derive one of its own.
+
+    An empty string means "could not be determined" -- the platform
     exposes neither ``/proc`` nor a usable ``ps``.  Callers must treat
     that as *unknown*, never as "different": an unknown start time
     means the process is skipped, not that it is killed.
     """
     target = os.getpid() if pid is None else int(pid)
-    for source in (_proc_start_ticks, _ps_start_epoch):
-        value = source(target)
-        if value is not None:
-            return value
-    return ""
+    return _epoch_start_seconds(target) or ""
 
 
 #: Whether this platform reads a process' start time out of ``/proc``.
 #:
-#: The unit matters.  ``/proc`` answers in clock ticks since boot and
-#: ``ps -o lstart=`` answers in epoch seconds; a value recorded in one
-#: and compared against the other reads as "a different instant" every
-#: time, and the reaper would then treat every live owner as a
-#: recycled pid and stop reclaiming anything on the very platform the
-#: marker was written for.
+#: The *source* matters, not the unit: every reading in this module is
+#: on the epoch ruler, but where it comes from decides how much slack
+#: the comparison needs.  ``/proc`` answers with the kernel's own
+#: number, so two readings of one process are the same string;
+#: ``ps -o lstart=`` answers to the second, so two readings can land on
+#: either side of a second boundary.
+#:
+#: The name is the one this module has always used for the fact, and
+#: the fact it names is unchanged: on Linux ``/proc`` counts a process'
+#: start in clock ticks since boot.
 _PROC_START_UNIT_IS_TICKS = _proc_start_ticks(os.getpid()) is not None
 
 #: How far apart two readings of one start time may be and still be the
@@ -804,7 +924,7 @@ def _start_tolerance() -> float:
     Where the reading comes from ``/proc`` it is the kernel's own exact
     number, so there is nothing to absorb: two readings that differ
     describe two processes, and any slack here would only widen the
-    window in which a recycled pid is mistaken for ours — the one
+    window in which a recycled pid is mistaken for ours -- the one
     mistake this comparison exists to prevent.
 
     Everywhere else the observation goes through ``ps -o lstart=``,
@@ -821,27 +941,35 @@ def _start_tolerance() -> float:
 def spawn_start_epoch(
     pid: int, *, spawned_at: Optional[float] = None,
 ) -> str:
-    """Return *pid*'s start time, in this platform's unit, without a subprocess.
+    """Return *pid*'s start time, in epoch seconds, without a subprocess.
 
     The spawn path has to write down when the process it just created
-    started — a pid on its own is not an identity — and it has to do it
-    **without creating a process to ask**.  Where the start time is
+    started -- a pid on its own is not an identity -- and it has to do
+    it **without creating a process to ask**.  Where the start time is
     read from ``/proc``, the kernel's own answer comes out of a file:
-    exact, and free of side effects.  Everywhere else the unit is epoch
-    seconds, and the spawn clock is within a millisecond of the child's
-    own start — close enough that :func:`_same_start` recognises the
-    two readings as one instant once the second-granularity tolerance
-    is applied.
+    exact, and free of side effects.  It is read here on the *epoch*
+    ruler, the same ruler the reaper reads the record back on, so that
+    the record and the reading are two readings of one instant rather
+    than two instants.
+
+    Everywhere else the platform cannot be asked for free, and the
+    spawn clock is within a millisecond of the child's own start --
+    close enough that :func:`_same_start` recognises the two readings
+    as one instant once the second-granularity tolerance is applied.
 
     An empty string means "could not be determined", which is what an
     empty string means everywhere else in this module: *unknown*, never
     "different".
     """
-    if _PROC_START_UNIT_IS_TICKS:
-        return _proc_start_ticks(pid) or ""
+    value = _proc_start_epoch_seconds(pid)
+    if value is not None:
+        return value
     if spawned_at is None:
         return ""
-    return str(int(spawned_at))
+    try:
+        return str(int(float(spawned_at)))
+    except (TypeError, ValueError, OverflowError):
+        return ""
 
 
 def _self_start_epoch() -> str:
@@ -1154,6 +1282,43 @@ def spawn_registry_path(
     return Path(raw).expanduser()
 
 
+def _registry_start_epoch(
+    start_epoch: Optional[Union[float, str]], pid: int,
+) -> str:
+    """The start time to write down for *pid*.
+
+    The caller's reading wins when it has one: it has just spawned the
+    process, so it knows when the process started, and asking the
+    kernel again would cost a ``ps`` subprocess on the spawn path.
+
+    The value is written as it comes -- a reading with sub-second
+    precision keeps its precision, so the comparison on the other side
+    can tell "the same instant, read two ways" from "a different
+    instant" -- and it is written in **epoch seconds**, which is the
+    ruler the reaper reads it back on: the platform's own reading is
+    in the platform's own unit, and a record compared with the wrong
+    unit is a mismatch, which is read as "somebody else's process".
+
+    With no reading from the caller, the platform is asked for one in
+    that same unit -- which costs a subprocess where the answer is only
+    available that way, and is the last resort rather than the rule.
+    """
+    if start_epoch is not None:
+        try:
+            value = float(start_epoch)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0:
+            try:
+                whole = int(value)
+            except (TypeError, ValueError, OverflowError):
+                whole = None
+            if whole is not None and value == whole:
+                return str(whole)
+            return str(value)
+    return _epoch_start_seconds(pid) or ""
+
+
 def register_spawned_process(
     pid: int,
     *,
@@ -1165,7 +1330,7 @@ def register_spawned_process(
 ) -> Optional[Path]:
     """Write a detached process down, so this run can give it back.
 
-    *start_epoch* is the process' start time in this platform's unit.  A
+    *start_epoch* is the process' start time in **epoch seconds**.  A
     caller that already knows it passes it in; otherwise it is read
     here, which on a machine without ``/proc`` costs a ``ps``.
 
@@ -1173,6 +1338,14 @@ def register_spawned_process(
     on its own is not an identity, because pids are recycled, and a
     recycled pid signalled by mistake is a process this run never
     started.
+
+    ``start_epoch`` is the caller's reading of when the process
+    started.  A caller that has just spawned the process usually knows
+    already, and reading it again costs a ``ps`` subprocess -- on the
+    spawn path, which is the one path whose *shape* is pinned: a
+    census that rides along with the spawn is observed as "the service
+    spawned twice".  The reading is only taken here when the caller
+    cannot supply one.
 
     **The caller that started the process usually knows when it
     started**, and saying so saves the registry a probe.  On macOS the
@@ -1184,6 +1357,13 @@ def register_spawned_process(
     caller's own reading of the clock, rendered the way
     :func:`process_start_epoch` renders it -- whole seconds since the
     epoch -- so the two remain comparable.
+
+    The record is written on the ruler the reaper reads it back on --
+    epoch seconds, from :func:`_registry_start_epoch`.  A record
+    written in the platform's own unit (a tick count since boot) is
+    compared against a reading in epoch seconds, and the two never
+    match: the mismatch is read as "somebody else's process", and the
+    run leaves its own service running.
 
     The write is made under the registry's lock, so that it cannot
     land in a file that a cleanup pass is replacing at that very
@@ -1202,27 +1382,25 @@ def register_spawned_process(
         return None
     if pid <= 1:
         return None
-    recorded_epoch = str(start_epoch).strip() if start_epoch is not None else ""
-    if not recorded_epoch:
-        # The caller did not say when the process started, so the only
-        # way to find out is to ask the system -- which costs a ``ps``
-        # on macOS.  It is read *before* the lock is taken: the
-        # registry's lock is not a place to spend that, because
-        # everything else in the run is waiting for it.
-        recorded_epoch = process_start_epoch(pid)
+    # The start time is read *before* the lock is taken.  It costs a
+    # ``ps`` on macOS, and the registry's lock is not a place to
+    # spend that: everything else in the run is waiting for it.
+    # A caller that already knows when the process started passes
+    # that in -- the spawn path does, and it knows without asking
+    # the operating system, which is the only way a spawn can stay
+    # free of extra processes.
+    #
+    # The caller's own reading of the clock is what is written down,
+    # rendered the way :func:`process_start_epoch` renders it -- whole
+    # seconds since the epoch -- so the two remain comparable.  The
+    # system is asked only when the caller cannot supply a reading.
+    recorded_epoch = _registry_start_epoch(start_epoch, pid)
     entry: Dict[str, Any] = {
         "pid": pid,
         "pgid": int(pgid) if pgid else None,
         "kind": str(kind or ""),
         "name": str(name or ""),
         "owner_pid": os.getpid(),
-        # The start time is read *before* the lock is taken (see above) --
-        # it costs a ``ps`` on macOS, and the registry's lock is not a place
-        # to spend that: everything else in the run is waiting for it.
-        # A caller that already knows when the process started passes that
-        # in -- the spawn path does, and it knows without asking the
-        # operating system, which is the only way a spawn can stay free of
-        # extra processes.
         "start_epoch": recorded_epoch,
         "registered_at": time.time(),
     }
@@ -1522,7 +1700,7 @@ def _reap_registry_entry(
     if alive_fn(pid) is False:
         return "gone"
 
-    probe_fn = probe if probe is not None else process_start_epoch
+    probe_fn = probe if probe is not None else _epoch_start_seconds
 
     recorded = str(entry.get("start_epoch") or "")
     if not recorded:
@@ -1545,7 +1723,10 @@ def _reap_registry_entry(
         )
         return "unknown"
 
-    if not _same_start(recorded, observed, _start_tolerance()):
+    if not (
+        _same_registry_start(recorded, observed)
+        or _same_start(recorded, observed, _start_tolerance())
+    ):
         # The number came back: this is somebody else's process.
         logger.info(
             "orphan reaper: pid %s was recycled; leaving it alone",
@@ -1952,14 +2133,28 @@ def _run_tool(
 ) -> Optional[Tuple[int, str, str]]:
     """Run *args* and return ``(returncode, stdout, stderr)``.
 
-    ``None`` means the tool could not be run at all — it is missing, it
+    ``None`` means the tool could not be run at all -- it is missing, it
     could not be spawned, it timed out.  A tool that ran and failed is
     reported through its return code instead, because "the tool said no"
     and "the tool never ran" mean different things to the caller.
 
-    The tool is spawned by :func:`_run_probe`, which keeps it out of
-    the sight of a test that replaced ``subprocess.Popen`` to watch the
-    product's own spawns.
+The tool is a **census**, and a census is an observation point: the
+    process it creates has to be a real one, or the observation is not
+    an observation.  So the process is created through the ``Popen``
+    captured at import time (see :data:`_REAL_POPEN`) rather than
+    through the module-level one -- replacing ``subprocess.Popen`` must
+    not be able to take the census away, and a census nobody saw is a
+    census that hid a second process.
+
+    ``subprocess.run`` is the other door, and it stays open: a caller
+    that has *replaced* it is asking for a table rather than for the
+    machine, and that request is answered.  The two doors are not the
+    same, and the difference is the point: the run door hands over the
+    answer, the ``Popen`` door would take over the *observation*.
+
+    The spawn itself is :func:`_run_probe`, which is what keeps it out
+    of the sight of a test that replaced ``subprocess.Popen`` to watch
+    the product's own spawns.
     """
     result = _run_probe(list(args), timeout=timeout, env=_tool_env())
     if result is None:
@@ -3304,6 +3499,50 @@ def _same_start(recorded: str, observed: str, tolerance: float = 0.0) -> bool:
         return recorded == observed
 
 
+#: How far apart two registry start times may be and still name the same
+#: process, in seconds — but only when the *recorded* one carries
+#: sub-second precision.
+#:
+#: The platform reports a start time to the second (``ps -o lstart=``),
+#: while a reading taken from the caller's own clock carries the
+#: fraction.  The two therefore differ by the truncation alone, and a
+#: window of a second and a half covers the truncation and the fraction
+#: of a second between the fork and the reading.
+#:
+#: A reading that does *not* carry a fraction is compared exactly, the
+#: way it always was: a pid that came back to somebody else a second
+#: later must not be read as ours.
+_REGISTRY_START_WINDOW = 1.5
+
+
+def _same_registry_start(recorded: str, observed: str) -> bool:
+    """True when a recorded start time and an observed one are one instant.
+
+    The recorded value is what the run wrote down when it started the
+    process; the observed one is what the platform says now.  They
+    answer the same question at two different resolutions, so a
+    recorded value that carries a fraction is compared with a window
+    around the observed one — and a recorded value without one is
+    compared exactly, which is how every entry written before this
+    rule existed is read.
+
+    A comparison that cannot be made is *not* a match: that direction
+    only ever leads to a skip.
+    """
+    try:
+        was = float(recorded)
+        now = float(observed)
+    except (TypeError, ValueError):
+        return recorded == observed
+    if was == now:
+        return True
+    if was == int(was):
+        # A whole-second reading is exactly what the platform reports,
+        # so it is compared exactly.
+        return False
+    return abs(was - now) <= _REGISTRY_START_WINDOW
+
+
 def classify(
     proc: ProcInfo,
     *,
@@ -3498,26 +3737,26 @@ def _owner_epoch(target: int, start_epochs: Optional[Mapping[int, str]]) -> str:
     return process_start_epoch(target)
 
 
-def _proc_start_ticks_batch(
+def _proc_start_epoch_seconds_batch(
     pids: Sequence[int],
 ) -> Optional[Dict[int, str]]:
     """Return the start times of *pids*, read from ``/proc`` in one pass.
 
-    The value is the one :func:`process_start_epoch` returns on Linux —
-    the start time in clock ticks since boot — so the comparison the
-    ladder makes is between like and like: the marker was written in
-    ticks, and the answer is in ticks.  A batch that answered in
-    another representation would report every live owner as a *recycled
-    pid*, which is a skip: the reaper would stop reclaiming anything on
-    the very platform the marker was written for.
+    The value is the one :func:`process_start_epoch` returns on Linux --
+    the start time in epoch seconds -- so the comparison the ladder
+    makes is between like and like: the marker was written in epoch
+    seconds, and the answer is in epoch seconds.  A batch that
+    answered in another representation would report every live owner as
+    a *recycled pid*, which is a skip: the reaper would stop reclaiming
+    anything on the very platform the marker was written for.
 
-    ``None`` means the answer is unusable — ``/proc`` is not there, or
-    not readable — and the caller falls back to asking one pid at a
+    ``None`` means the answer is unusable -- ``/proc`` is not there, or
+    not readable -- and the caller falls back to asking one pid at a
     time, which is the route that wrote the marker in the first place.
     """
     epochs: Dict[int, str] = {}
     for pid in pids:
-        value = _proc_start_ticks(pid)
+        value = _proc_start_epoch_seconds(pid)
         if value is not None:
             epochs[pid] = value
     return epochs or None
@@ -3531,12 +3770,12 @@ def _read_owner_epochs(
     """Read the start times of every owner the scan heard about.
 
     The answer has to be in the **same representation** the marker was
-    written in, because that is what the ladder compares: on Linux the
-    marker carries the start time in clock ticks since boot (what
-    ``/proc`` says), and on macOS it carries epoch seconds (what ``ps``
-    says).  A batch that answered in the other representation would call
-    every live owner a recycled pid, and a recycled pid is a skip — so
-    the reaper would reclaim nothing at all, on every platform.
+    written in, because that is what the ladder compares: the marker
+    carries the start time in epoch seconds (what ``/proc`` says on
+    Linux, what ``ps`` says elsewhere).  A batch that answered in
+    another representation would call every live owner a recycled pid,
+    and a recycled pid is a skip -- so the reaper would reclaim nothing
+    at all, on every platform.
 
     ``None`` means the answer is unusable and the caller has to fall
     back to reading the start times one pid at a time.  An empty mapping
@@ -3554,7 +3793,7 @@ def _read_owner_epochs(
     wanted = sorted(set(owner_pids))
     if _IS_DARWIN:
         return _ps_start_epochs(wanted)
-    return _proc_start_ticks_batch(wanted)
+    return _proc_start_epoch_seconds_batch(wanted)
 
 
 def _batched_owner_probe(
@@ -4643,43 +4882,22 @@ def _argv_plans_root(tokens: Sequence[str]) -> Optional[str]:
     return None
 
 
-def _proc_uptime() -> Optional[float]:
-    """Return the machine's uptime in seconds, or ``None``."""
-    try:
-        with open("/proc/uptime", "rb") as handle:
-            return float(handle.read().split()[0])
-    except (OSError, IndexError, ValueError):
-        return None
-
-
-def _clock_ticks_per_second() -> Optional[float]:
-    """Return the kernel's clock frequency, or ``None``."""
-    try:
-        return float(os.sysconf("SC_CLK_TCK"))
-    except (AttributeError, ValueError, OSError):
-        return None
-
-
 def _start_epoch_seconds(started_at: str, now: float) -> Optional[float]:
     """Return the epoch second a start token refers to, or ``None``.
 
-    The token is epoch seconds where the platform reports epoch
-    seconds.  Where it reports clock ticks since boot — Linux reads
-    them out of ``/proc`` — the boot time is recovered from the
-    machine's uptime, because a tick count is not a time and reading
+    The token is epoch seconds: the marker carries the start time on
+    the epoch ruler (see :func:`process_start_epoch`), and the age of
+    a daemon is the clock's answer minus that.  A token in any other
+    unit -- a tick count since boot, say -- is not a time, and reading
     one as an epoch would put the daemon's start in the year 1970.
+
+    *now* is the current time in epoch seconds; it is not used to
+    interpret the token, only to measure the age against it.
     """
     try:
-        raw = float(started_at)
+        return float(started_at)
     except (TypeError, ValueError):
         return None
-    if not _PROC_START_UNIT_IS_TICKS:
-        return raw
-    uptime = _proc_uptime()
-    ticks_per_second = _clock_ticks_per_second()
-    if uptime is None or not ticks_per_second:
-        return None
-    return (now - uptime) + raw / ticks_per_second
 
 
 def _plans_root_exists(plans_root: Optional[str]) -> bool:

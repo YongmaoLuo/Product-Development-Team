@@ -14,7 +14,16 @@ for the late-binding rule that governs every extracted module.
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Iterable, List, Optional, Tuple, Any
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Any,
+)
 from collections import deque
 from pathlib import Path
 from datetime import datetime, timezone
@@ -27,6 +36,18 @@ import subprocess
 import threading
 import time
 import uuid
+
+if TYPE_CHECKING:  # pragma: no cover - a typing-only import
+    # 2026-11-13: the return annotation of ``_repair_batch_stop_reason``
+    # names ``RepairOutcome``.  The class lives in
+    # ``verification.repair_outcome``, and importing it at module level
+    # would close the ``server`` -> ``verification`` cycle that the
+    # lazy import inside ``_repair_batch_stop_reason`` exists to avoid
+    # (see the comment there).  The module has
+    # ``from __future__ import annotations``, so the annotation is never
+    # evaluated at runtime and the name only has to exist for the
+    # checker.
+    from verification.repair_outcome import RepairOutcome
 
 # 2026-10-29: the base-drift check's own vocabulary.  The round the
 # check blocked carries ``stop_reason`` = the check's event name for the
@@ -188,7 +209,12 @@ def _verification_event_logger(plan_dir: Path):
         return None
 
 
-def _count_unfinished_tasks(plan_id: str, tasks_file: Path) -> Dict[str, int]:
+def _count_unfinished_tasks(
+    plan_id: str,
+    tasks_file: Path,
+    *,
+    strict: bool = False,
+) -> Dict[str, int]:
     """Cross-check tasks.json against the runtime task_progress overlay.
 
     Returns counts of tasks whose status cannot be treated as terminal
@@ -215,6 +241,13 @@ def _count_unfinished_tasks(plan_id: str, tasks_file: Path) -> Dict[str, int]:
     "could not read tasks.json" and the caller should treat that as
     "no unfinished tasks detected" — a plan with no readable tasks
     has nothing to fail to run.
+
+    ``strict=True`` turns "could not look" into an exception instead of
+    a zero count.  The default (degrade to zeros) is right for a caller
+    that only asks "is there unfinished work?" — but it is wrong for a
+    caller that has to *classify* what the batch did: "looked and found
+    nothing" and "could not look" are different verdicts, and only the
+    first one supports a claim.
     """
     out = {"total": 0, "pending_or_unstarted": 0, "failed": 0}
 
@@ -232,6 +265,8 @@ def _count_unfinished_tasks(plan_id: str, tasks_file: Path) -> Dict[str, int]:
                 static_ids.add(tid)
                 static_status[tid] = str(t.get("status") or "").lower()
     except Exception:
+        if strict:
+            raise
         return out
     out["total"] = len(static_ids)
     if not static_ids:
@@ -252,6 +287,8 @@ def _count_unfinished_tasks(plan_id: str, tasks_file: Path) -> Dict[str, int]:
         finally:
             conn.close()
     except Exception:
+        if strict:
+            raise
         # State machine not on disk yet — treat every static task as
         # pending (matches the pre-#3.8 behaviour).
         runtime = {}
@@ -337,6 +374,163 @@ def _count_unfinished_tasks(plan_id: str, tasks_file: Path) -> Dict[str, int]:
             continue  # superseded by its breakdown children
         out["failed"] += 1
     return out
+
+
+def _repair_batch_counts(plan_id: str, tasks_file: Path) -> Optional[Dict[str, int]]:
+    """The pending / failed counts of a finished repair batch.
+
+    ``None`` means "could not look": the runtime overlay is missing,
+    corrupt, or its rows cannot be decoded.  "Looked and found
+    nothing" and "could not look" are different verdicts, and only the
+    first one supports a claim about what the batch did — so the count
+    is read *strictly* here (the shared helper degrades to zeros by
+    default, which is right for a caller that only asks "is there
+    unfinished work?").
+
+    Never raises: an unreadable overlay must not take the repair round
+    down with it.
+    """
+    try:
+        return _count_unfinished_tasks(plan_id, tasks_file, strict=True)
+    except Exception:  # noqa: BLE001 — the round must survive this
+        _server.logger.exception(
+            "[repair_async] could not read the task rows plan=%s", plan_id,
+        )
+        return None
+
+
+def _repair_batch_stop_reason(
+    plan_id: str,
+    tasks_file: Path,
+    returncode: Optional[int],
+    round_n: Optional[int] = None,
+) -> Tuple[Optional[str], int, Optional["RepairOutcome"], Optional[str]]:
+    """What a finished repair batch ended as.
+
+    Returns ``(stop_reason, pending, outcome, death)``: the reason
+    string the caller records, the number of repair tasks still
+    queued, the :class:`verification.repair_outcome.RepairOutcome`
+    itself — so the caller can record the outcome's own flags
+    (``repair_failed`` / ``should_continue``) next to the reason
+    instead of re-deriving them from the string — and the death, when
+    the executor was killed by a signal.
+
+    ``outcome`` is ``None`` when no classified verdict could be
+    produced at all (the rows could not be read).  ``death`` is
+    ``None`` when the executor did not die by a signal.  The two are
+    reported side by side because they are facts about two different
+    things: the DEATH is about the PROCESS, the ending is about the
+    BATCH.  Neither may overwrite the other.
+
+    2026-11-01: ONE classifier for the whole batch.  The repair path
+    used to make TWO independent judgements — "the executor exited
+    non-zero" and "the executor exited 0 but repair tasks are still
+    queued" — and each wrote its own reason string.  The two facts are
+    independent, so neither string could be read as the other: a caller
+    could not tell "there is still work to run" (retry) from "the gate
+    is red and re-running buys nothing" (stop).  The two need opposite
+    responses.
+
+    2026-11-26: the DEATH is not a third judgement either.  It used to
+    be spelled over the outcome's reason, which collapsed the four
+    outcomes into one — and the reader that asks "is there work left?"
+    (the bounded redispatch) keys off the ``repair_batch_not_drained:``
+    spelling, so a death written over it meant a pending repair task
+    ended the verification chain instead of being the reason to run the
+    next round.  The death is now a value of its own, recorded by the
+    caller in its own field; the reason stays the table's.
+
+    :func:`verification.repair_outcome.classify_repair_outcome` splits
+    the batch into four outcomes, and this helper is the one place that
+    maps them onto the state the rest of the backend reads:
+
+    * ``(None, 0, <drained>, None)`` — the batch DRAINED: exit code 0,
+      nothing queued, nothing failed.  The round completed.
+    * ``("repair_batch_not_drained:<n>_pending", n, <pending>, <death>)``
+      — work was LEFT.
+    * ``("repair_task_failed", 0, <repair_failed>, <death>)`` — a
+      repair task itself broke.
+    * ``("repair_gate_red", 0, <gate_red>, None)`` — the executor
+      exited non-zero and no repair task failed: the code is still
+      wrong.  A **signal** death (a negative return code) is the one
+      case where the reason names the death instead —
+      ``("repair_signal:15", 0, <gate_red>, "repair_signal:15")`` —
+      because ``gate_red`` claims the batch ran, and a killing cannot
+      support that claim.  See :func:`_repair_stop_reason`.
+    * ``("repair_non_zero_exit", 0, None, <death>)`` — the rows could
+      not be read, so no classified verdict is supportable.  The
+      unclassified reason is the honest answer; it never raises.  The
+      count here is **unknown, not zero**: ``0`` means "no pending
+      count could be produced", and the log line above says why.
+    """
+    # A return code that is not an int means the executor was killed
+    # before it could report one — that is NOT a clean exit, and the
+    # classifier has to be told so.
+    rc = returncode if isinstance(returncode, int) else -1
+    # The DEATH is a fact about the PROCESS, not about the batch: only
+    # a signal death has one to report, and it is reported BESIDE the
+    # outcome, never on top of it.
+    death = _repair_stop_reason(rc) if rc < 0 else None
+
+    counts = _repair_batch_counts(plan_id, tasks_file)
+    if counts is None:
+        _server.logger.error(
+            "[repair_async] repair batch verdict unavailable plan=%s "
+            "rc=%s — falling back to the unclassified reason",
+            plan_id, returncode,
+        )
+        return "repair_non_zero_exit", 0, None, death
+
+    # Imported lazily: ``verification`` pulls in the whole phase
+    # package, and ``server`` imports this module — a module-level
+    # import would close that cycle.
+    from verification.repair_outcome import classify_repair_outcome
+
+    pending = int(counts.get("pending_or_unstarted", 0) or 0)
+    failed = int(counts.get("failed", 0) or 0)
+    outcome = classify_repair_outcome(
+        rc,
+        pending_count=pending,
+        failed_task_count=failed,
+    )
+
+    if outcome.kind == "pending_remains":
+        _server.logger.warning(
+            "[repair_async] executor exited %s but %d repair task(s) never "
+            "reached a terminal success state plan=%s round=%s — the batch "
+            "did not drain",
+            rc, pending, plan_id, round_n,
+        )
+    elif outcome.kind != "drained":
+        _server.logger.warning(
+            "[repair_async] repair batch ended as %s plan=%s round=%s "
+            "rc=%s stop_reason=%s",
+            outcome.kind, plan_id, round_n, rc, outcome.stop_reason,
+        )
+
+    stop_reason = outcome.stop_reason
+    if outcome.kind == "gate_red" and rc < 0:
+        # 2026-11-19 (base side, merged in): a **signal** death is a fact
+        # the four kinds cannot carry.  The kinds say what happened to the
+        # BATCH; "the executor was SIGTERMed" happened to the PROCESS, and
+        # ``gate_red`` claims the batch ran and the code is still wrong —
+        # a claim a killing cannot support.  So the reason names the
+        # death instead (see :func:`_repair_stop_reason`).
+        #
+        # Only the DESCRIPTION changes.  The verdict — the kind, the
+        # flags, the count — is still the classifier's, and the status is
+        # still ``failed`` either way.  A work fact always outranks the
+        # death: ``pending_remains`` and ``repair_failed`` keep their own
+        # reasons, because the readers that ask "is there work left?"
+        # key off those spellings, and a killing would hide them.
+        stop_reason = death
+        _server.logger.warning(
+            "[repair_async] repair executor was killed by a signal "
+            "plan=%s round=%s rc=%s stop_reason=%s",
+            plan_id, round_n, rc, stop_reason,
+        )
+
+    return stop_reason, pending, outcome, death
 
 
 def _are_all_unfinished_blocked_by_failed_upstream(
@@ -787,6 +981,189 @@ def _requeue_shutdown_interrupted_verification(plan_id: str, plan_dir: Path) -> 
             "[verification_recovery] requeue failed plan=%s", plan_id)
 
 
+#: The verification statuses the shutdown path stamps a checkpoint for
+#: (``server._VERIFICATION_IN_FLIGHT_STATUSES``: ``running``,
+#: ``repairing`` and ``rerunning``) PLUS the terminal status a second
+#: verdict writer leaves behind when the shutdown interrupts the round
+#: (2026-11-13, VP-027).
+#:
+#: The fourth word is not an in-flight status: the checkpoint was
+#: written while the round WAS in flight, and the writer that was
+#: racing the shutdown stamped ``failed`` over it afterwards.  The
+#: checkpoint still proves the round was interrupted, so the plan goes
+#: back to the queue rather than staying failed.
+_VERIFICATION_SHUTDOWN_REQUEUE_STATUSES = frozenset(
+    {"running", "repairing", "rerunning", "failed"}
+)
+
+
+def _verification_run_started_at(plan_id: str) -> Optional[str]:
+    """The start stamp of the verification run that owns ``plan_id`` now.
+
+    The shutdown checkpoint is evidence for a run that was still going
+    when the server went down, and "still going" is decided by
+    comparing the checkpoint's ``paused_at`` with the run's own start
+    stamp.  The stamp lives in the in-memory entry while the round is
+    alive, and in the ``plan_verification`` row once it is not, so both
+    are read — the row is the fallback for a writer that outlived the
+    process that started the round.
+
+    ``None`` when neither place has one: the checkpoint then cannot be
+    proven fresh, and the caller must treat the round as crashed rather
+    than as interrupted (the conservative direction -- see
+    :func:`shutdown_checkpoint.is_shutdown_interrupted`).
+    """
+    state = _server._verification_state.get(plan_id)
+    if isinstance(state, dict):
+        started_at = state.get("started_at")
+        if started_at:
+            return started_at
+    try:
+        record = _server._load_verification_runtime_state(plan_id)
+    except Exception:  # noqa: BLE001 -- an unreadable record is "unknown"
+        _server.logger.exception(
+            "[verification_shutdown] the run's start stamp could not be "
+            "read plan=%s", plan_id,
+        )
+        record = None
+    if isinstance(record, dict):
+        return record.get("started_at")
+    return None
+
+
+def _verification_shutdown_interrupted(
+    plan_id: str, plan_dir: Optional[Path] = None,
+) -> bool:
+    """Was this verification round interrupted by the server going down?
+
+    The evidence is the shutdown checkpoint the shutdown path writes for
+    every plan that was still in flight
+    (``backend/shutdown_checkpoint.py``).  The predicate is one-sided: it
+    says yes only to a shutdown it can PROVE -- the right kind, the
+    shutdown reason, and a checkpoint that is not older than the run's
+    start stamp.  "Cannot prove it" means "the work died", which is the
+    other recovery path, so an unreadable checkpoint answers False.
+
+    Never raises: this runs on the write path, where an exception would
+    cost the plan its verdict.
+    """
+    from shutdown_checkpoint import is_shutdown_interrupted
+
+    if plan_dir is None:
+        try:
+            plan_dir = _server._plan_dir(plan_id)
+        except Exception:  # noqa: BLE001 -- a bad plan id names no round
+            return False
+    try:
+        return bool(is_shutdown_interrupted(
+            plan_dir,
+            kind="verification",
+            run_started_at=_verification_run_started_at(plan_id),
+        ))
+    except Exception:  # noqa: BLE001 -- an unreadable checkpoint is no proof
+        _server.logger.exception(
+            "[verification_shutdown] the checkpoint could not be read "
+            "plan=%s; treating the round as crashed",
+            plan_id,
+        )
+        return False
+
+
+def _refuse_shutdown_interrupted_terminal(plan_id: str, status: str) -> bool:
+    """Refuse a terminal verdict the shutdown has already invalidated.
+
+    2026-11-13 (VP-027): the server went down under this round, and a
+    writer that was still running stamped ``failed`` over it.  That
+    failure is not the round's verdict -- the round was INTERRUPTED --
+    and writing it says the round failed when it never finished.  The
+    same commit then carries two opposite verdicts: the real one from
+    the round that was running, and this one from the writer that was
+    racing the shutdown.
+
+    One round has one verdict, so the write is refused and the plan
+    goes back to the queue instead -- the round is verified again, and
+    the round that is still running owns the outcome.
+
+    Only the FAILURE verdict is refused.  A round that finished before
+    the server went down has a verdict worth keeping, and a pass that
+    is thrown away is a real result lost.
+
+    Returns True when the write was refused (the caller must return
+    without writing), False when the verdict may land.
+    """
+    if status == "passed":
+        return False
+    try:
+        plan_dir = _server._plan_dir(plan_id)
+    except Exception:  # noqa: BLE001 -- a bad plan id names no round
+        return False
+    if not _verification_shutdown_interrupted(plan_id, plan_dir):
+        return False
+    _server.logger.warning(
+        "[verification_terminal] REFUSED plan=%s status=%s -- the server "
+        "went down under this round; the plan goes back to the queue "
+        "instead of being failed",
+        plan_id, status,
+    )
+    _requeue_shutdown_interrupted_verification(plan_id, plan_dir)
+    return True
+
+
+def _clear_shutdown_interrupted_terminal(plan_id: str) -> None:
+    """Take the erroneous terminal verdict off a shutdown-interrupted round.
+
+    A second verdict writer stamped ``failed`` on a round the shutdown
+    had already interrupted.  The plan goes back to ``queued`` (the
+    requeue), and the verdict it carries has to go with it:
+
+    * the row is put back to ``pending`` -- the state a plan waits in
+      before a round starts -- so no reader believes the round failed;
+    * the terminal envelope (``results``) is dropped with it, because
+      ``repair_stale_terminal_state`` re-derives the status from that
+      envelope on every read and would put the ``failed`` straight
+      back;
+    * the ``plan_routing.verification`` mirror is **not** touched.  The
+      column was retired as a state source by arch decision point 3
+      (2026-11-04): it carries the frozen baseline and nothing else,
+      and its one and only writer is
+      ``RoutingRepository.write_verification_baseline``.  This path used
+      to reset the column's ``status`` / ``stop_reason`` lifecycle keys
+      -- exactly the two keys the column no longer carries -- so
+      writing it here both resurrected a second answer to "what is this
+      plan's verdict?" and would have overwritten the frozen baseline.
+
+    Best-effort: a plan whose row cannot be written back is still
+    requeued, and a failure here must not cost the rest of the recovery
+    its sweep.
+    """
+    try:
+        from state_machine.db.connection import open as _open_db
+        from state_machine.db.schema import migrate as _migrate
+
+        conn = _open_db(_server._state_db_path())
+        try:
+            _migrate(conn)
+            now = datetime.now().isoformat()
+            # The row is only cleared while it STILL says "failed": a
+            # verdict a legitimate writer landed in the meantime is not
+            # this helper's to take back.
+            conn.execute(
+                "UPDATE plan_verification SET verification_status = 'pending', "
+                "verification_stop_reason = NULL, results = NULL, "
+                "updated_at = ? WHERE plan_id = ? "
+                "AND verification_status = 'failed'",
+                (now, plan_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        _server.logger.exception(
+            "[verification_shutdown] the erroneous terminal could not be "
+            "cleared plan=%s", plan_id,
+        )
+
+
 def _recover_verification_states(plans_dir: Path) -> None:
     """Restore ``_verification_state[plan_id]`` from disk on startup.
 
@@ -824,11 +1201,16 @@ def _recover_verification_states(plans_dir: Path) -> None:
         if data is None:
             continue
         status = data.get("verification_status")
-        # The same three words the writer side stamps a checkpoint for.
-        # A status outside them says nothing about a verification round
-        # that was in flight, so it is not a shutdown candidate.
+        # The same three words the writer side stamps a checkpoint for,
+        # plus the terminal a SECOND verdict writer can leave behind
+        # when the shutdown interrupts the round (2026-11-13, VP-027):
+        # the checkpoint was written while the round was in flight, and
+        # the writer that was racing the shutdown stamped "failed" over
+        # it afterwards.  A status outside them says nothing about a
+        # verification round that was in flight, so it is not a
+        # shutdown candidate.
         shutdown_interrupted = (
-            status in {"running", "repairing", "rerunning"}
+            status in _VERIFICATION_SHUTDOWN_REQUEUE_STATUSES
             and is_shutdown_interrupted(
                 plan_dir,
                 kind="verification",
@@ -837,6 +1219,12 @@ def _recover_verification_states(plans_dir: Path) -> None:
         )
         if shutdown_interrupted:
             _requeue_shutdown_interrupted_verification(plan_dir.name, plan_dir)
+            if status == "failed":
+                # The erroneous terminal has to go WITH the requeue: a
+                # row that still says "failed" is what the next boot
+                # re-matches (the checkpoint is still fresh), so the
+                # plan would be requeued again and again, for ever.
+                _clear_shutdown_interrupted_terminal(plan_dir.name)
             if status != "running":
                 # A non-running round never had an in-memory entry, so
                 # the requeue is the whole recovery action for it.
@@ -5122,6 +5510,12 @@ def _run_repair_execution_async(
         state["started_at"] = datetime.now().isoformat()
         state["ended_at"] = None
         state["stop_reason"] = None
+        # The death of THIS round: it is written by the failed-round
+        # branch when the executor was killed by a signal, and it is
+        # reset here so a previous round's death cannot be read as this
+        # one's (the state dict is keyed by plan_id and survives across
+        # rounds).
+        state["repair_death"] = None
         state["process"] = None
         # ``_source`` distinguishes repair subprocess from main execution
         # subprocess in watchdog / status / card rendering paths. Both
@@ -5286,104 +5680,80 @@ def _run_repair_execution_async(
                 #
                 # The return code itself is recorded unconditionally.
                 state["executor_returncode"] = process.returncode
-                if process.returncode == 0:
-                    # 2026-09-11 plan v11: set the watchdog-friendly
-                    # "finished cleanly" flag BEFORE any subsequent state
-                    # mutation, mirroring the main execution path's fix
-                    # for the same race window.
-                    state["executor_finished_cleanly"] = True
-                    # ------------------------------------------------------------
-                    # 2026-10-11: a 0 return code means "the subprocess did
-                    # not crash", nothing more. The repair path used to read
-                    # it as "the repair round is done", which is false
-                    # whenever the executor bailed out early: ``agent.py``
-                    # hits ``No schedulable micro-layer found`` and just
-                    # ``break``s — no exception, no non-zero exit. That
-                    # wrote ``exec_status='completed'`` with
-                    # ``stop_reason IS NULL`` for a round whose repair
-                    # tasks were still ``pending`` and would never run.
-                    #
-                    # So cross-check the authoritative runtime overlay the
-                    # same way the main execution path does
-                    # (``routes/execution.py`` → ``_count_unfinished_tasks``).
-                    # That helper had exactly one caller — the main path —
-                    # and the repair path was the blind spot.
-                    # ------------------------------------------------------------
-                    _unfinished = _count_unfinished_tasks(plan_id, tasks_file)
-                    _left = int(_unfinished.get("pending_or_unstarted", 0) or 0)
-                    if _left > 0 and _repair_parked_for_quota(tasks_file):
-                        # 2026-11-02: the executor parked the plan for
-                        # quota — every provider ran out of capacity — and
-                        # exited 0.  The leftover repair tasks are not
-                        # "work that failed to happen": nobody COULD run
-                        # them.  Recording that as a failure told the
-                        # operator their plan was broken when the only
-                        # thing that had happened was that the providers
-                        # ran dry, so the round is PARKED instead, under
-                        # the same word the main execution path parks
-                        # under (``plan_status.QUOTA_WAIT_PHASE``).
-                        #
-                        # Accounting only, exactly like the failure branch
-                        # below: the unfinished rows stay as they are
-                        # (``pending`` / ``in_progress`` / ``failed``) and
-                        # are NOT marked ``skipped``.  ``skipped`` is a
-                        # terminal SUCCESS status that unlocks downstream
-                        # under ``agent.is_dependency_ready``, so it would
-                        # let a downstream task start without the
-                        # upstream's output.
-                        state["status"] = QUOTA_WAIT_PHASE
-                        state["stop_reason"] = QUOTA_WAIT_PHASE
-                        state["repair_unfinished_tasks"] = _left
-                        # 2026-11-15 (arch decision R1 — 停放态原样保留):
-                        # the EXECUTION side is parked above; the
-                        # VERIFICATION side is parked here.  Without it
-                        # the ``plan_verification`` row keeps saying
-                        # ``running`` and no snapshot is written, so the
-                        # round this plan stopped at is unknowable and
-                        # the resume has no round to pick up.
-                        _park_verification_round_for_quota(
-                            plan_id, int(state.get("round") or 0),
-                        )
-                        _server.logger.warning(
-                            "[repair_async] executor exited 0 with %d repair "
-                            "task(s) still pending because every provider ran out "
-                            "of quota plan=%s round=%s — parking the plan, not "
-                            "failing it",
-                            _left, plan_id, state.get("round"),
-                        )
-                    elif _left > 0:
-                        # Accounting only. The unfinished rows stay exactly
-                        # as they are (``pending`` / ``in_progress`` /
-                        # ``failed``) — they genuinely did not run and are
-                        # genuinely not entitled to run behind a failed
-                        # upstream.
-                        #
-                        # In particular this does NOT mark them ``skipped``.
-                        # The main path's ``partial_completion`` branch does,
-                        # and copying that here would be a real weakening of
-                        # the dependency contract: ``skipped`` is a terminal
-                        # SUCCESS status that unlocks downstream under
-                        # ``agent.is_dependency_ready``, so labelling a task
-                        # "blocked behind a failed upstream" as skipped would
-                        # let its downstream start without the upstream's
-                        # output. Only the status and stop_reason are written.
-                        state["status"] = "failed"
-                        state["stop_reason"] = (
-                            f"repair_exited_with_unfinished_tasks:{_left}"
-                        )
-                        state["repair_unfinished_tasks"] = _left
-                        _server.logger.warning(
-                            "[repair_async] executor exited 0 but %d "
-                            "repair task(s) never reached a terminal "
-                            "success state plan=%s round=%s — recording "
-                            "failure instead of completion",
-                            _left, plan_id, state.get("round"),
-                        )
-                    else:
-                        state["status"] = "completed"
-                        state["stop_reason"] = None
-                    state["ended_at"] = datetime.now().isoformat()
-                elif _server._shutdown_interrupted(plan_id):
+                # 2026-09-11 plan v11: set the watchdog-friendly
+                # "finished cleanly" flag BEFORE any subsequent state
+                # mutation, mirroring the main execution path's fix
+                # for the same race window.  Explicit True or False, not
+                # "leave it alone": the state dict is keyed by plan_id and
+                # survives across rounds, so a previous round's ``True``
+                # would otherwise linger here and keep the watchdog
+                # yielding over this crash.
+                state["executor_finished_cleanly"] = (
+                    process.returncode == 0
+                )
+                # ------------------------------------------------------------
+                # 2026-11-01: ONE verdict for the whole batch.
+                #
+                # A 0 return code means "the subprocess did not crash",
+                # nothing more.  The repair path used to read it as "the
+                # repair round is done", which is false whenever the
+                # executor bailed out early: ``agent.py`` hits
+                # ``No schedulable micro-layer found`` and just
+                # ``break``s — no exception, no non-zero exit.  That
+                # wrote ``exec_status='completed'`` with
+                # ``stop_reason IS NULL`` for a round whose repair
+                # tasks were still ``pending`` and would never run.
+                #
+                # So the runtime overlay is cross-checked the same way
+                # the main execution path does (``routes/execution.py``
+                # → ``_count_unfinished_tasks``) and BOTH exits — the
+                # zero one and the non-zero one — are judged by ONE
+                # classifier
+                # (:func:`verification.repair_outcome.classify_repair_outcome`,
+                # reached through :func:`_repair_batch_stop_reason`).
+                # The outcome it produces is what lands in the state:
+                # work was LEFT (``repair_batch_not_drained``), a repair
+                # task broke (``repair_task_failed``), or the gate is
+                # still red (``repair_gate_red``).
+                #
+                # There is no second judgement here that could disagree
+                # with it, so the four outcomes cannot overwrite each
+                # other: the old "pending > 0 writes one reason, rc != 0
+                # writes another" pair of branches is gone, and what is
+                # left only READS the outcome.
+                #
+                # A killing is not a judgement either — it is a fact
+                # about the PROCESS — so it is recorded in its own field
+                # (``repair_death``) instead of being spelled over the
+                # outcome's reason.  Spelling it there used to hide the
+                # work fact the redispatch reads.
+                #
+                # Accounting only. The unfinished rows stay exactly
+                # as they are (``pending`` / ``in_progress`` /
+                # ``failed``) — they genuinely did not run and are
+                # genuinely not entitled to run behind a failed
+                # upstream.
+                #
+                # In particular this does NOT mark them ``skipped``.
+                # The main path's ``partial_completion`` branch does,
+                # and copying that here would be a real weakening of
+                # the dependency contract: ``skipped`` is a terminal
+                # SUCCESS status that unlocks downstream under
+                # ``agent.is_dependency_ready``, so labelling a task
+                # "blocked behind a failed upstream" as skipped would
+                # let its downstream start without the upstream's
+                # output. Only the status and stop_reason are written.
+                # ------------------------------------------------------------
+                #
+                # 2026-11-19 (base side, merged in): a round the server's
+                # own shutdown ended has NO verdict of its own.  The
+                # verdict is the next boot's, and everything that would
+                # write one — the exit verdict below and the re-entry
+                # callback after it — stands down together.
+                if (
+                    process.returncode != 0
+                    and _server._shutdown_interrupted(plan_id)
+                ):
                     # The server is on its way out and it is what killed
                     # the repair executor.  A "repair_non_zero_exit"
                     # verdict would say the repair crashed, and it would
@@ -5391,10 +5761,10 @@ def _run_repair_execution_async(
                     # phase; the next boot parks the plan from the
                     # checkpoint instead.
                     #
-                    # Nothing is written: the run did not end, the server
-                    # did, and a record that still says "running" must
-                    # not carry an ``ended_at`` — that field is what
-                    # tells "still working" from "over".
+                    # No verdict is written: the run did not end, the
+                    # server did.  The record keeps saying "running",
+                    # and the checkpoint on disk is what the next boot
+                    # parks the plan from.
                     _server.logger.info(
                         "[repair_async] server is shutting down; plan=%s "
                         "is left for the restart to park",
@@ -5410,34 +5780,56 @@ def _run_repair_execution_async(
                     # boot's to start.
                     interrupted_by_shutdown = True
                 else:
-                    # Explicit False, not "leave it alone": the state
-                    # dict is keyed by plan_id and survives across
-                    # rounds, so a previous round's ``True`` would
-                    # otherwise linger here and keep the watchdog
-                    # yielding over this crash.
-                    state["executor_finished_cleanly"] = False
-                    # 2026-11-20 (arch decision R1 — 暂停必须停在
-                    # stopped): a pause that was ASKED FOR is not a
-                    # failure.  The exit code cannot tell the two
-                    # apart — the SIGTERM the pause's own kill sends
-                    # looks exactly like a crash — so the intent on
-                    # disk is what decides it.
+                    # ------------------------------------------------------------------
+                    # 2026-11-25 (base merge origin/main@a0b28e74 — the
+                    # scheduler pause UX): TWO verdicts live here, and BOTH
+                    # of them are kept.
                     #
-                    # The intent is READ, never assumed: a torn or
+                    # base side (2026-11-20): the PAUSE.  A pause that was ASKED
+                    # FOR is not a failure: the exit code cannot tell the two
+                    # apart — the SIGTERM the pause's own kill sends looks
+                    # exactly like a crash — so the intent on disk is what
+                    # decides it.  The intent is READ, never assumed: a torn or
                     # reasonless file reads as no intent (see
-                    # :func:`pause_state.read_pause_intent`), so a
-                    # damaged file cannot turn a crash into a pause.
-                    # No intent → the round failed, exactly as before.
+                    # :func:`pause_state.read_pause_intent`), so a damaged file
+                    # cannot turn a crash into a pause.
+                    #
+                    # branch side: the CLASSIFIER.  The batch's ending is ONE
+                    # verdict, produced by :func:`_repair_batch_stop_reason`:
+                    # the work facts (work LEFT / a repair task broke) outrank
+                    # the exit code, and a quota-starved round is PARKED, not
+                    # failed.
+                    #
+                    # The pause check comes FIRST: it answers "was this round
+                    # PAUSED?", and a pause is neither a crash nor a batch
+                    # verdict — it is the operator's own stop.  Only a round
+                    # that is NOT a pause is judged by the classifier.
+                    #
+                    # The check only applies to a round that did NOT end
+                    # cleanly (exit code 0).  base's pause branch sat in the
+                    # ``else`` of ``if returncode == 0``, so a round the
+                    # executor finished on its own is the classifier's to
+                    # judge, and a pause intent left on disk is not re-read as
+                    # a verdict about it.
+                    #
+                    # ``executor_finished_cleanly`` needs nothing here: it is
+                    # written above as ``process.returncode == 0``, which is
+                    # exactly base's explicit ``False`` for this branch.
+                    # ------------------------------------------------------------------
                     from pause_state import read_pause_intent
 
-                    if read_pause_intent(plan_dir) is not None:
+                    _pause_intent = (
+                        read_pause_intent(plan_dir)
+                        if process.returncode != 0
+                        else None
+                    )
+                    if _pause_intent is not None:
                         _surviving = _pause_surviving_pids(plan_dir)
                         if _surviving:
                             # The kill did not land: the plan is still
-                            # running, so it is NOT stopped and its
-                            # phase stays where it is.  The reason says
-                            # why — a pause was requested and the pause
-                            # did not take.
+                            # running, so it is NOT stopped and its phase
+                            # stays where it is.  The reason says why — a
+                            # pause was requested and the pause did not take.
                             _pause_kill_incomplete = True
                             state["stop_reason"] = "pause_kill_incomplete"
                             _server.logger.warning(
@@ -5445,21 +5837,121 @@ def _run_repair_execution_async(
                                 plan_id, _surviving,
                             )
                         else:
-                            # The tree is gone: the pause is honoured
-                            # and the round ends as ``stopped`` — the
-                            # status a resume can pick up.  The intent
-                            # is cleared once that status is on disk.
+                            # The tree is gone: the pause is honoured and the
+                            # round ends as ``stopped`` — the status a resume
+                            # can pick up.  The intent is cleared once that
+                            # status is on disk.
                             state["status"] = "stopped"
                             state["stop_reason"] = "paused"
                             _pause_honoured = True
+                        # A paused round is not a batch verdict: it neither
+                        # failed a repair task nor left work behind.  Both
+                        # flags are written EXPLICITLY — the state dict is
+                        # keyed by plan_id and survives across rounds, so a
+                        # previous round's ``True`` would otherwise linger
+                        # here and be read as this round's verdict.
+                        state["repair_failed"] = False
+                        state["should_continue"] = False
                     else:
-                        state["status"] = "failed"
-                        # The reason says HOW the round ended — an exit
-                        # code the executor chose, or a signal that
-                        # killed it.  See :func:`_repair_stop_reason`.
-                        state["stop_reason"] = _repair_stop_reason(
-                            process.returncode
+                        (
+                            _stop_reason, _pending, _outcome, _death,
+                        ) = _repair_batch_stop_reason(
+                            plan_id, tasks_file, process.returncode,
+                            state.get("round"),
                         )
+                        if _outcome is None:
+                            # The rows could not be read, so no classified
+                            # verdict is supportable — and no positive claim is
+                            # made about the batch either: it neither failed a
+                            # repair task nor left work behind, because nobody
+                            # could tell.
+                            state["repair_failed"] = False
+                            state["should_continue"] = False
+                        else:
+                            # The outcome's own flags travel with the reason:
+                            # ``repair_failed`` says a repair task ITSELF broke,
+                            # ``should_continue`` says work was LEFT — the reason
+                            # to run the NEXT round, not to stop the chain.
+                            state["repair_failed"] = _outcome.repair_failed
+                            state["should_continue"] = _outcome.should_continue
+                        if _stop_reason is None:
+                            # The batch DRAINED: exit code 0, nothing queued,
+                            # nothing failed.  The round completed.
+                            state["status"] = "completed"
+                            state["stop_reason"] = None
+                            state["repair_unfinished_tasks"] = 0
+                        elif _pending > 0 and _repair_parked_for_quota(tasks_file):
+                            # 2026-11-02: the executor parked the plan for
+                            # quota — every provider ran out of capacity — and
+                            # exited 0.  The leftover repair tasks are not
+                            # "work that failed to happen": nobody COULD run
+                            # them.  Recording that as a failure told the
+                            # operator their plan was broken when the only
+                            # thing that had happened was that the providers
+                            # ran dry, so the round is PARKED instead, under
+                            # the same word the main execution path parks
+                            # under (``plan_status.QUOTA_WAIT_PHASE``).
+                            #
+                            # The marker is the executor's OWN decision about
+                            # THIS round — it clears a stale one at the start of
+                            # every run — so it is evidence, not a leftover.
+                            #
+                            # Accounting only, exactly like the failure branch
+                            # below: the unfinished rows stay as they are
+                            # (``pending`` / ``in_progress`` / ``failed``) and
+                            # are NOT marked ``skipped``.  ``skipped`` is a
+                            # terminal SUCCESS status that unlocks downstream
+                            # under ``agent.is_dependency_ready``, so it would
+                            # let a downstream task start without the
+                            # upstream's output.
+                            state["status"] = QUOTA_WAIT_PHASE
+                            state["stop_reason"] = QUOTA_WAIT_PHASE
+                            state["repair_unfinished_tasks"] = _pending
+                            # 2026-11-15 (arch decision R1 — 停放态原样保留):
+                            # the EXECUTION side is parked above; the
+                            # VERIFICATION side is parked here.  Without it
+                            # the ``plan_verification`` row keeps saying
+                            # ``running`` and no snapshot is written, so the
+                            # round this plan stopped at is unknowable and
+                            # the resume has no round to pick up.
+                            _park_verification_round_for_quota(
+                                plan_id, int(state.get("round") or 0),
+                            )
+                            _server.logger.warning(
+                                "[repair_async] executor exited %s with %d repair "
+                                "task(s) still pending because every provider ran out "
+                                "of quota plan=%s round=%s — parking the plan, not "
+                                "failing it",
+                                process.returncode, _pending, plan_id,
+                                state.get("round"),
+                            )
+                        else:
+                            # Work was left, a repair task broke, or the gate is
+                            # still red — the classifier's verdict, verbatim.
+                            state["status"] = "failed"
+                            # The OUTCOME is the classification table's, word
+                            # for word: the kind, the flags and the pending
+                            # count say what happened to the BATCH (work
+                            # left, a repair task broke, the gate is red).
+                            #
+                            # The DEATH is a fact about the PROCESS, so it
+                            # is recorded in its own field instead of being
+                            # spelled over the outcome's reason.  It used to
+                            # be spelled over it, and that hid the one fact
+                            # the chain acts on: the redispatch that asks
+                            # "is there work left?" reads the
+                            # ``repair_batch_not_drained:`` spelling, so a
+                            # death written there turned a pending repair
+                            # task into the end of the verification chain
+                            # instead of the reason to run the next round.
+                            #
+                            # Both facts are kept, and neither is allowed to
+                            # overwrite the other: the reason says what the
+                            # batch did, the death says what killed the
+                            # executor.
+                            state["stop_reason"] = _stop_reason
+                            state["repair_death"] = _death
+                            state["repair_unfinished_tasks"] = _pending
                 # A parked round is not over — ``ended_at`` stays None so
                 # the readers that ask "did this run end?" are not told
                 # it did.  Every other outcome (completed, failed) ends
@@ -5806,6 +6298,15 @@ def _persist_verification_terminal(
             "verdict is not the plan's to accept",
             plan_id, status, stop_reason, round_token,
         )
+        return
+
+    # 2026-11-13 (VP-027): the server went down under this round.  A
+    # writer that was racing the shutdown must not stamp a failure
+    # over it -- the round was interrupted, it did not fail.  The
+    # refusal comes before the first write, so nothing lands: no
+    # ``plan_verification`` verdict, no ``plan_routing`` phase change,
+    # no ``KIND_PLAN_CLOSED``.  The plan goes back to the queue instead.
+    if _refuse_shutdown_interrupted_terminal(plan_id, status):
         return
 
     # 2026-09-07: Top-level entry log — operators need a single
@@ -6404,6 +6905,48 @@ def _dead_end_terminal(
 #: refusing to re-verify" — the degenerate shape where repair never
 #: converges and the chain would otherwise be re-dispatched forever.
 _MAX_REPAIR_NOT_DRAINED_GUARDS = 3
+
+#: 2026-11-01 — the prefix of the stop reason that means "the repair
+#: batch did not drain": work was LEFT behind.
+#:
+#: 2026-11-01 (task 8): this used to be indistinguishable from a
+#: verdict.  The post-repair callback saw any stop reason plus a
+#: non-empty queue and wrote ``loop_stopped`` — so ONE pending task
+#: killed the whole verification round.  But "there is still work" is
+#: not a verdict: it is the reason to run the NEXT round.  The repair
+#: path now classifies its own ending (see
+#: :func:`verification.repair_outcome.classify_repair_outcome`), and the
+#: only reason that speaks about draining is this one.  Everything else
+#: (``repair_gate_red`` / ``repair_task_failed``) talks about the CODE,
+#: not about the queue.
+#:
+#: The terminal literal of this family is ``repair_never_drained`` —
+#: written only when the bounded redispatch below gives up.
+_REPAIR_NOT_DRAINED_REASON_PREFIX = "repair_batch_not_drained:"
+
+#: 2026-11-01 — the terminal stop reason of the undrained family: the
+#: batch never drained, not even after the bounded redispatch gave it
+#: every chance.  Written ONCE, when the guard trips.
+_REPAIR_NEVER_DRAINED_REASON_PREFIX = "repair_never_drained:"
+
+
+def _is_repair_not_drained_reason(stop_reason: Optional[str]) -> bool:
+    """True when the stop reason says the repair batch did not drain.
+
+    "Did not drain" means work was LEFT behind — the batch has to be
+    run again.  It is not a verdict about the code, so it is never
+    written as a terminal verdict: the post-repair callback re-dispatches
+    the executor instead (see :func:`_make_repair_on_complete`).
+
+    The check is on the PREFIX, not on equality: the reason carries
+    the pending count (``repair_batch_not_drained:1_pending``) and the
+    undrained family is segmented, so it can never be enumerated in a
+    fixed set.
+    """
+    return isinstance(stop_reason, str) and stop_reason.startswith(
+        _REPAIR_NOT_DRAINED_REASON_PREFIX,
+    )
+
 
 #: 2026-10-13 — how many times a ``failed`` repair task may be revived
 #: before it is abandoned for good.
@@ -7712,6 +8255,13 @@ def _record_verification_terminal(
         )
         return
 
+    # 2026-11-13 (VP-027): the server went down under this round.  The
+    # refusal happens HERE, before the in-memory state is touched: the
+    # in-memory ``_verification_state[plan_id]`` is the PLAN's state,
+    # and an interrupted round has no verdict to stamp onto it.
+    if _refuse_shutdown_interrupted_terminal(plan_id, status):
+        return
+
     v_state = _server._verification_state.get(plan_id)
     if v_state:
         v_state["verification_status"] = status
@@ -7816,6 +8366,13 @@ def _record_round_verdict_persist(
             "its verdict is not the plan's to accept",
             plan_id, status, stop_reason, round_token,
         )
+        return
+
+    # 2026-11-13 (VP-027): the server went down under this round.  This
+    # writer records the ROUND's verdict, so a round the shutdown
+    # interrupted must not leave a failure behind either — the plan
+    # goes back to the queue instead.
+    if _refuse_shutdown_interrupted_terminal(plan_id, normalized_status):
         return
     try:
         from state_machine.db.connection import open as _open_db
@@ -11008,6 +11565,51 @@ def _build_repair_round_entry(
     return entry
 
 
+# ---------------------------------------------------------------------------
+# The post-repair re-entry (2026-10-11 / 2026-11-01)
+# ---------------------------------------------------------------------------
+#
+# 2026-10-11: the repair path cross-checks the runtime overlay before
+# calling a 0 return code a completion (see the
+# ``repair_exited_with_unfinished_tasks`` branch).  The post-repair
+# callback is the consumer of that fact.  Previously the return code was
+# turned into one log line and dropped, and the callback went on to
+# ``start_verification_cycle(..., resume=True)`` no matter what — so a
+# round whose repair executor bailed out at the first micro-layer was
+# immediately followed by a fresh verification of code that was never
+# repaired.  Each such round re-measures the same untouched tree, so the
+# VP it re-measures is guaranteed to fail again and buy the next one — a
+# loop that spends its whole round budget without ever touching the
+# defect.
+#
+# 2026-11-01: WHAT THAT FIRST FIX GOT WRONG.  It read ANY stop reason
+# plus a non-empty queue as "the repair never drains" and wrote
+# ``loop_stopped`` — so a single pending task killed the whole
+# verification round, and the plan's verdict became "the loop stopped"
+# instead of "the code is wrong".  One task out of three is not a
+# reason to give up: it is the reason to run the remaining work.
+#
+# The repair path now classifies the ending of the batch itself (see
+# :func:`verification.repair_outcome.classify_repair_outcome`), and the
+# two situations it can end in need opposite answers:
+#
+#   * the batch did NOT DRAIN (the reason says
+#     ``repair_batch_not_drained:``) and work is still queued → the
+#     executor is RE-DISPATCHED, up to
+#     :data:`_MAX_REPAIR_NOT_DRAINED_GUARDS` times.  No terminal is
+#     written: the chain is still running, and the next callback gets
+#     another chance to drain the batch.  Only when that bound trips
+#     does the chain stop — with ``loop_stopped`` and a reason of its
+#     own (``repair_never_drained:<reason>:<n>x``), which is the ONLY
+#     terminal literal of that family.
+#   * the batch ended for any other reason (``repair_gate_red`` /
+#     ``repair_task_failed``) → that is a verdict about the CODE, not
+#     about the queue.  The chain continues with the next verification
+#     round, and the guard is not touched: it counts UNDRAINED stops,
+#     and a gate-red stop is not one.
+#
+# The bound is deliberately separate from the round budget: it bounds
+# "repair never drains", not "too many verification rounds".
 def _make_repair_on_complete(
     plan_id: str,
     project_dir: Path,
@@ -11117,14 +11719,18 @@ def _make_repair_on_complete(
         genuinely be fixed and we shouldn't auto-loop-stop on
         the fresh set's first occurrence.
 
-        2026-10-11: a fourth branch, checked first — if the repair
-        path recorded ``repair_exited_with_unfinished_tasks:N``
-        and repair work is still queued, the chain stops with
-        ``loop_stopped`` instead of starting another
-        verification round. Bounded by its own
-        :data:`_MAX_REPAIR_NOT_DRAINED_GUARDS` counter, which is
-        unrelated to the round budget: this bounds "repair never
-        drains", not "too many verification rounds".
+        2026-10-11 / 2026-11-01: a fourth branch, checked first — if the
+        repair path recorded an UNDRAINED stop reason
+        (``repair_batch_not_drained:``) and repair work is still
+        queued, the executor is RE-DISPATCHED instead of starting
+        another verification round.  The redispatch is bounded by
+        :data:`_MAX_REPAIR_NOT_DRAINED_GUARDS`; only when that bound
+        trips does the chain stop (``loop_stopped`` /
+        ``repair_never_drained:...``).  The other stop reasons
+        (``repair_gate_red`` / ``repair_task_failed``) are verdicts
+        about the CODE, not about the queue — they fall through to the
+        normal re-entry.  See the module comment above
+        :func:`_make_repair_on_complete`.
 
         2026-11-13: the re-entry is a round INSTANCE of its own; see
         :func:`_make_repair_on_complete`.
@@ -11137,6 +11743,19 @@ def _make_repair_on_complete(
         _instance_token = ""
         _instance_plan_dir: Optional[Path] = None
         _instance_terminal = False
+
+        # 2026-11-27: a round the watchdog declared dead must not wake
+        # up and start work — the zombie-round contract in
+        # tests/unit/test_zombie_terminal_refusal.py says every waker
+        # asks ``is_invalidated`` first.  ``round_token`` is empty on
+        # the ``/start`` resume path, and the check returns False then.
+        if _round_is_invalidated(plan_id, round_token):
+            _server.logger.warning(
+                "[Auto-Verification] repair completion for a round that "
+                "was declared dead — not re-entering verification "
+                "plan=%s round=%s", plan_id, round_token,
+            )
+            return
 
         _server.logger.info(
             "[Auto-Verification] Repair execution finished plan=%s "
@@ -11159,28 +11778,15 @@ def _make_repair_on_complete(
             pass
 
         # ------------------------------------------------------------------
-        # 2026-10-11 — do not re-verify over an undrained repair batch.
+        # 2026-11-01 — an undrained repair batch is NOT a verdict, it is
+        # a piece of work left behind: the executor is re-dispatched
+        # (bounded), not the chain stopped.  The full account is in the
+        # module comment above :func:`_make_repair_on_complete`.
         #
-        # ``_run_repair_execution_async`` now cross-checks the runtime
-        # overlay before calling a 0 return code a completion (see the
-        # ``repair_exited_with_unfinished_tasks`` branch). This is the
-        # consumer of that fact. Previously the return code was turned
-        # into one log line and dropped, and the callback went on to
-        # ``start_verification_cycle(..., resume=True)`` no matter
-        # what — so a round whose repair executor bailed out at the
-        # first micro-layer was immediately followed by a fresh
-        # verification of code that was never repaired. Each such round
-        # re-measures the same untouched tree, so the VP it
-        # re-measures is guaranteed to fail again and buy the
-        # next one — a loop that spends its whole round budget
-        # without ever touching the defect.
-        #
-        # Two signals must agree before we stop, so a benign
-        # bookkeeping hiccup cannot strand a plan:
-        #   1. the repair path recorded an unfinished-task stop
-        #      reason, AND
-        #   2. ``_get_pending_repair_tasks`` still finds queued
-        #      repair work.
+        # Two signals must agree before the batch is re-dispatched, so a
+        # benign bookkeeping hiccup cannot strand a plan: the repair
+        # path recorded an UNDRAINED stop reason, AND
+        # ``_get_pending_repair_tasks`` still finds queued repair work.
         # ------------------------------------------------------------------
         _repair_stop_reason = _repair_path_stop_reason(plan_id)
         if _repair_stop_reason:
@@ -11196,37 +11802,52 @@ def _make_repair_on_complete(
                 # guard: a park that did not happen must not look like
                 # one that did.
             _still_pending = _get_pending_repair_tasks(plan_id)
-            if _still_pending:
+            if (
+                _still_pending
+                and _is_repair_not_drained_reason(_repair_stop_reason)
+            ):
                 _guard_hits = _bump_repair_not_drained_guard(plan_id)
                 if _guard_hits >= _MAX_REPAIR_NOT_DRAINED_GUARDS:
+                    # The batch had every chance and still did not
+                    # drain.  NOW the chain stops — and it stops with a
+                    # reason of its own (``repair_never_drained``), not
+                    # with the reason of the batch that never drained.
                     _reason = (
-                        f"repair_never_drained:"
+                        f"{_REPAIR_NEVER_DRAINED_REASON_PREFIX}"
                         f"{_repair_stop_reason}:"
                         f"{_guard_hits}x"
                     )
-                else:
-                    _reason = (
-                        f"repair_batch_not_drained:"
-                        f"{_repair_stop_reason}:"
-                        f"{len(_still_pending)}_pending"
+                    _server.logger.error(
+                        "[Auto-Verification] repair batch never drained "
+                        "— stopping the chain plan=%s: %d repair task(s) "
+                        "still pending after %d redispatch(es) "
+                        "(repair stop_reason=%s)",
+                        plan_id, len(_still_pending), _guard_hits,
+                        _repair_stop_reason,
                     )
-                _server.logger.error(
-                    "[Auto-Verification] repair round did not "
-                    "drain — NOT starting the next verification "
-                    "round plan=%s: %d repair task(s) still "
-                    "pending (repair stop_reason=%s, guard hit "
-                    "%d/%d). Re-verifying now would only "
-                    "re-measure unrepaired code and buy a known "
-                    "FAIL.",
-                    plan_id, len(_still_pending),
-                    _repair_stop_reason, _guard_hits,
-                    _MAX_REPAIR_NOT_DRAINED_GUARDS,
+                    _record_terminal("loop_stopped", _reason)
+                    return
+                # There is still work to do, so DO IT: the executor is
+                # re-dispatched instead of writing a terminal verdict.
+                _server.logger.warning(
+                    "[Auto-Verification] repair batch did not drain — "
+                    "re-dispatching the repair executor plan=%s: %d "
+                    "repair task(s) still pending (repair stop_reason=%s, "
+                    "guard hit %d/%d)",
+                    plan_id, len(_still_pending), _repair_stop_reason,
+                    _guard_hits, _MAX_REPAIR_NOT_DRAINED_GUARDS,
                 )
-                _record_terminal("loop_stopped", _reason)
+                _server._run_repair_execution_async(
+                    plan_id, project_dir, tool=tool,
+                    on_complete=_on_repair_complete,
+                )
                 return
-            # The overlay disagrees with the reason string — the
-            # queue is empty after all. Reset the guard and fall
-            # through to the normal re-entry.
+            # Either the overlay disagrees with the reason string — the
+            # queue is empty after all — or the reason is a verdict
+            # about the code (``repair_gate_red`` /
+            # ``repair_task_failed``).  Neither is a reason to stop the
+            # chain: reset the guard and fall through to the normal
+            # re-entry, which verifies the next round.
             _clear_repair_not_drained_guard(plan_id)
         else:
             _clear_repair_not_drained_guard(plan_id)

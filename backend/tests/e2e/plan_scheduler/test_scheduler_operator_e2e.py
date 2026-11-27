@@ -314,10 +314,18 @@ what the line looks like now, and what is running.
 The requests the panel's buttons issue are intercepted on the way out,
 so the report can say whether they carried the request guard's header.
 The commands the case issues itself are recorded the same way, with
-the headers the request really carried.
+the headers the request really carried.  The read model is read
+through the same session as well, at the same moment, so the panel and
+the API can be compared without the clock moving between the two
+reads.  The moment the model behind the panel was made is reported
+too, as ``panel_generated_at``: two readings taken at two moments may
+differ by the time between them, and the case needs to know that time
+to say whether they really do.  ``read_gap_seconds`` is that time — the
+distance between the two moments the two models were made — and
+``client_read_gap_seconds`` is the distance the client travelled
+between the two reads.
 
-The read model is read through the same session as well, and the two
-readings are taken one after the other with nothing costly in
+The two readings are taken one after the other with nothing costly in
 between: the screenshot of the scheduler view is taken **after** both,
 because a screenshot is evidence and not an input.  A screenshot in
 between would move the clock between the two readings — and the case's
@@ -345,6 +353,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from playwright.sync_api import Error, sync_playwright
@@ -366,6 +375,41 @@ from tests.e2e.plan_scheduler.test_scheduler_operator_e2e import (
 
 GUARD_HEADER = "x-pdt-request"
 GUARD_VALUE = "1"
+
+
+def stamp_seconds(text):
+    """The moment a stamp names, in seconds since the epoch.
+
+    The panel and the read model both carry the moment their model
+    was made, in one format: UTC, to the second.  A stamp that cannot
+    be read is no stamp, and says nothing.
+    """
+    raw = str(text or "").strip()
+    if not raw or raw == "—":
+        return None
+    try:
+        moment = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.timestamp()
+
+
+def model_gap_seconds(panel_stamp, api_stamp):
+    """How far apart the two readings were made.
+
+    The panel's answer was drawn from a model the server made at one
+    moment; the read model's answer was made at another.  The two
+    stamps are those two moments, so their distance is how far apart
+    the readings were — and how far apart the two answers may be,
+    because a clock that moved in between moves the number it counts.
+    """
+    panel_made = stamp_seconds(panel_stamp)
+    api_made = stamp_seconds(api_stamp)
+    if panel_made is None or api_made is None:
+        return None
+    return abs(api_made - panel_made)
 
 
 def browser_executable():
@@ -733,12 +777,25 @@ with sync_playwright() as driver:
     ).json()
 
     page.wait_for_timeout(1000)
+
+    # The moment the model behind the panel was made.  The panel draws
+    # it, so it is read from the panel — the panel's own answer, not a
+    # reading of the clock by this script.
+    read_started = time.monotonic()
+
     if parity:
         # The panel is given the time to draw the read model it was
         # fed: the rows on the screen have to belong to that model
         # before they are compared with it.
         running, panel_state = _wait_for_panel_parity(page, served_states)
+        # The panel has just drawn that model, so the stamp it carries
+        # now is that model's own moment.
+        panel_stamp = page.inner_text("#scheduler-view-generated-at").strip()
     else:
+        # The moment the model behind the panel was made is read
+        # **before** the rows: the stamp is never newer than the rows
+        # it goes with.
+        panel_stamp = page.inner_text("#scheduler-view-generated-at").strip()
         # The number of the answers the server gave the panel is counted
         # **before** the panel is read: an answer that lands during the
         # reading was never fed to the panel, so it is not among the
@@ -761,7 +818,16 @@ with sync_playwright() as driver:
 
     # The read model, read through the same session, straight after the
     # panel was read: the two readings are one moment apart, because
-    # nothing that costs time comes between them.
+    # nothing that costs time comes between them — except what a case
+    # asks for on purpose.
+    #
+    # A case may hold the two readings apart on purpose, to ask what a
+    # slow host does to the comparison.  The number of seconds comes
+    # from the environment; it is a seam for the case, not a knob an
+    # operator has.
+    held_apart = float(os.environ.get("PDT_PANEL_READ_GAP_SECONDS", "0") or 0)
+    if held_apart > 0:
+        time.sleep(held_apart)
     api_state = page.request.get(
         url.rstrip("/") + STATE_PATH,
         headers={GUARD_HEADER: GUARD_VALUE},
@@ -771,6 +837,13 @@ with sync_playwright() as driver:
     # How far apart the two readings are: the interval in which the
     # clock may have moved between them.
     read_gap = round(api_read_at - panel_read_at, 3)
+
+    # How far the client travelled between the two reads, and how far
+    # apart the two *models* were: the second is the answer that
+    # counts, because the panel may be drawing a model that is older
+    # than the read that fetched it.
+    client_gap = time.monotonic() - read_started
+    model_gap = model_gap_seconds(panel_stamp, api_state.get("generated_at"))
 
     # The read model is sampled **again**, on the far side of the
     # panel's own reading: the sample taken before the panel was read
@@ -830,6 +903,10 @@ with sync_playwright() as driver:
         "queue": queue,
         "running": running,
         "api": api_state,
+        "panel_generated_at": panel_stamp,
+        "api_generated_at": api_state.get("generated_at"),
+        "read_gap_seconds": model_gap,
+        "client_read_gap_seconds": client_gap,
         "api_before": api_state_before,
         "api_after": api_state_after,
         "api_window_sec": round(api_after_at - api_before_at, 3),
@@ -1107,7 +1184,7 @@ def _duration_seconds(text: str) -> Tuple[Optional[int], int]:
     return total, slack
 
 
-def _panel_clock(row: Dict[str, Any]) -> int:
+def _panel_clock(carried: Dict[str, Any]) -> int:
     """The clock the panel draws for a running row, in seconds.
 
     The panel draws the **plan** clock — ``running_sec``, the time
@@ -1115,7 +1192,10 @@ def _panel_clock(row: Dict[str, Any]) -> int:
     clock — ``elapsed_sec``, the time since the slot was acquired —
     when the plan clock is missing.  The two are not two readings of
     the same fact: the slot clock starts again at zero whenever the
-    scheduler restarts, and the plan clock does not.
+    scheduler restarts, and the plan clock does not.  The comparison
+    has to be made against the same number the panel chose: the slot
+    clock is a different fact, and the distance between the two facts
+    is not the distance between the two readings.
 
     The fallback is nullish, and it has to be: a plan that started a
     moment ago has a plan clock of ``0``, and a falsy test would throw
@@ -1125,12 +1205,24 @@ def _panel_clock(row: Dict[str, Any]) -> int:
     (``frontend/app.js``: ``item.running_sec ?? item.elapsed_sec``),
     so the comparison reads the clock the panel drew.
     """
-    running = row.get("running_sec")
+    running = carried.get("running_sec")
     if running is None:
-        return int(row["elapsed_sec"])
-    return int(running)
+        running = carried.get("elapsed_sec")
+    return int(running or 0)
 
 
+def _elapsed_bound(report: Dict[str, Any]) -> float:
+    """How far apart the two readings' durations may be, in seconds.
+
+    The bound is the distance between the two moments the two models
+    were made — the driver reports it — and two seconds more for the
+    rounding on both sides: the stamps are written to the second and
+    the durations are whole seconds.  Two seconds is the floor: on a
+    box that answers at once, that is what the two readings may differ
+    by.
+    """
+    gap = float(report.get("read_gap_seconds") or 0.0)
+    return max(2.0, gap + 2.0)
 def _clock_readings(row: Dict[str, Any]) -> List[int]:
     """The clocks a running row carries, in seconds.
 
@@ -2617,6 +2709,15 @@ def test_panel_and_api_parity(world):
     #   reading.  A constant tolerance only holds on a host that
     #   measures time the way it was written down — which is how a
     #   case that is green on a quiet machine goes red on a busy one.
+    #
+    # The tolerance is the distance between the two reads, and not a
+    # number somebody picked: two readings taken at two moments may
+    # differ by the time between them, and a host slow enough to make
+    # the panel and the API answer seconds apart must not turn that
+    # into a red test.  The bound is the measured gap — see
+    # ``_elapsed_bound`` — and the case that holds the two readings
+    # apart on purpose is what keeps it honest.
+    elapsed_bound = _elapsed_bound(report)
     panel_state = report["panel_state"]
     assert panel_state is not None, (
         "the driver did not report the read model the panel was fed; the "
@@ -2801,7 +2902,13 @@ def test_panel_and_api_parity(world):
     # readings) ahead of it: further apart than that is not one clock
     # read twice, it is two different facts.
     fresh_by_plan = {str(row["plan_id"]): row for row in state["running"]}
-    bound = _panel_parity_bound(report["read_gap"], 0)
+    # Two rules say how far apart two readings of one clock may be: the
+    # panel's own — one poll period plus the gap between the two
+    # readings — and the case's own, the measured distance between the
+    # two models the readings were made from (see ``_elapsed_bound``).
+    # The larger of the two is the bound: a bound smaller than either of
+    # them would refuse a reading the other one allows.
+    bound = max(_panel_parity_bound(report["read_gap"], 0), elapsed_bound)
     for carried in served_running:
         plan_id = str(carried.get("plan_id"))
         fresh_row = fresh_by_plan.get(plan_id)
@@ -2843,6 +2950,79 @@ def test_panel_and_api_parity(world):
         screenshot = SCREEN_DIR / name
         assert screenshot.is_file(), f"{screenshot} was not written"
         assert screenshot.stat().st_size > 0, f"{screenshot} is empty"
+
+
+def test_the_panel_and_the_read_model_agree_when_they_are_read_seconds_apart(
+    world, monkeypatch,
+):
+    """Two readings taken seconds apart are still two readings of one server.
+
+    The panel draws how long a running plan has been running, and the
+    read model carries the same fact in seconds.  The two are read at
+    two moments, so they may differ — but they may not differ by more
+    than the time that passed between the two reads.  That is what the
+    bound has to be: the gap, and not a number somebody picked on a box
+    that answers in a millisecond.
+
+    A host slow enough to make the panel and the API answer seconds
+    apart must not turn that into a red test.  The case asks for the
+    two readings to be held apart on purpose, so the bound is measured
+    against a gap that really happened — and the case fails if the
+    driver cannot say how far apart the two readings were, because a
+    bound that cannot be measured is a bound somebody guessed.
+    """
+    monkeypatch.setenv("PDT_PANEL_READ_GAP_SECONDS", "6")
+    report = world.drive([])
+
+    panel = {str(row[0]): str(row[1]) for row in report["running"]}
+    assert panel, "the panel drew no running plans"
+
+    differences: Dict[str, Tuple[int, int]] = {}
+    for carried in report["api"]["running"]:
+        plan_id = str(carried["plan_id"])
+        drawn, slack = _duration_seconds(panel[plan_id])
+        assert drawn is not None, (
+            f"the panel draws {panel[plan_id]!r} for {plan_id!r}, which is "
+            f"not a duration"
+        )
+        differences[plan_id] = (abs(drawn - _panel_clock(carried)), slack)
+
+    assert differences, "the read model carried no running plans"
+    for plan_id, (difference, _slack) in differences.items():
+        assert difference > 2.0, (
+            f"the two readings for {plan_id!r} differ by {difference}s; they "
+            f"were not made seconds apart, so this case is not testing what "
+            f"it says it is"
+        )
+
+    gap = report.get("read_gap_seconds")
+    assert gap is not None, (
+        "the driver does not report how far apart the two readings were; "
+        "the panel and the read model cannot be compared without it"
+    )
+    client_gap = report.get("client_read_gap_seconds")
+    assert client_gap is not None, (
+        "the driver does not report how far it travelled between the two "
+        "reads; the panel and the read model cannot be compared without it"
+    )
+    assert client_gap >= 6.0, (
+        f"the driver says it travelled {client_gap}s between the two reads; "
+        f"the case asked for six"
+    )
+    assert gap >= 5.0, (
+        f"the driver says the two models were made {gap}s apart; the case "
+        f"asked for six"
+    )
+    bound = _elapsed_bound(report)
+    assert bound > 2.0, (
+        f"the bound is {bound}s, and the two readings were {gap}s apart; a "
+        f"bound that does not follow the gap is a number somebody picked"
+    )
+    for plan_id, (difference, slack) in differences.items():
+        assert difference <= bound + slack, (
+            f"the panel and the read model differ by {difference}s for "
+            f"{plan_id!r}, and the two readings were {gap}s apart"
+        )
 
 
 def test_queue_survives_kill9(world):

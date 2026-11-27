@@ -17,14 +17,21 @@ took effect.
 Contract pinned here:
   * a parse failure re-raises out of ``_execute_attempt`` and is
     retried until the malfunction budget is exhausted (3 attempts with
-    the default ``max_retries=2``);
+    an explicit ``max_retries=2``);
   * every attempt writes one ``verdict_parse_error``; every retry
     writes one ``verdict_parse_retry``;
   * every ``attempt_started`` carries ``max_attempts == 3``;
-  * the synthesized FAILED verdict says the verdict was *unparseable*
-    — it is not dressed up as "max retries exhausted", because an
-    unparseable verdict and a transport failure are different
-    malfunctions and the operator needs to tell them apart.
+  * the synthesized verdict is ``UNKNOWN`` — "no verdict was reached",
+    not a code failure — and it says the verdict was *unparseable*; it
+    is not dressed up as "max retries exhausted", because an unparseable
+    verdict and a transport failure are different malfunctions and the
+    operator needs to tell them apart.
+
+2026-11-01 (PRD §1): the DEFAULT budget is one retry, not two. The
+cases below that drive 3 attempts ask for ``max_retries=2``
+EXPLICITLY; ``test_default_budget_is_initial_plus_one_retry`` pins
+the default construction — 2 total attempts, 1 ``verdict_parse_retry``,
+UNKNOWN, reason saying "after 2 attempts".
 """
 
 from __future__ import annotations
@@ -36,7 +43,7 @@ from typing import Any, Dict, List
 
 import pytest
 
-from verification_subagent import VerificationSubAgent
+from verification_subagent import VERDICT_UNKNOWN, VerificationSubAgent
 
 
 class _EmptyTool:
@@ -104,10 +111,12 @@ async def _run_until_budget_exhausted(
         project_dir=None,
     )
 
-    # The run must end as a FAILED verdict — a parse failure is never
-    # allowed to escape as anything else.
-    assert verdict.verdict == "FAILED", (
-        f"an unparseable verdict must synthesize FAILED; got "
+    # The run must end as UNKNOWN — "no verdict was reached". It must
+    # not end as FAILED: a parse failure says nothing about the
+    # deliverable, and filing it as a code failure manufactures a fix
+    # task for a deliverable nobody ever managed to check.
+    assert verdict.verdict == VERDICT_UNKNOWN, (
+        f"an unparseable verdict must synthesize UNKNOWN; got "
         f"{verdict.verdict!r}"
     )
     return tool, log_path
@@ -172,7 +181,7 @@ async def test_attempt_started_uses_max_attempts_3(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_final_reason_says_unparseable(tmp_path, monkeypatch):
-    """The synthesized FAILED verdict must name the malfunction it was
+    """The synthesized UNKNOWN verdict must name the malfunction it was
     built from: the verdict was unparseable. It must NOT reuse the
     transport-failure wording ("max retries exhausted"), because the
     two are different failures and the operator has to be able to tell
@@ -192,7 +201,7 @@ async def test_final_reason_says_unparseable(tmp_path, monkeypatch):
     )
 
     reasons = list(verdict.reasons)
-    assert reasons, "the synthesized FAILED verdict must carry a reason"
+    assert reasons, "the synthesized UNKNOWN verdict must carry a reason"
 
     joined = " | ".join(reasons)
     assert "verdict unparseable after 3 attempts" in joined, (
@@ -202,4 +211,56 @@ async def test_final_reason_says_unparseable(tmp_path, monkeypatch):
     assert "max retries exhausted" not in joined, (
         f"an unparseable verdict must not be reported as an exhausted "
         f"transport budget; got {reasons}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_default_budget_is_initial_plus_one_retry(tmp_path, monkeypatch):
+    """The DEFAULT construction must spend exactly TWO attempts — the
+    initial try plus ONE retry — before degrading to "verdict
+    unavailable" (UNKNOWN).
+
+    2026-11-01 (PRD §1): "判定解析失败时先重试一次（重新要一次判定）；
+    仍失败才降级为『判定不可用』". The default budget used to be
+    ``max_retries=2`` (3 attempts: 3 tool calls, 3 ``verdict_parse_error``
+    records, 2 ``verdict_parse_retry`` records, reason "unparseable
+    after 3 attempts") — one retry more than the PRD asks for."""
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+    tool = _EmptyTool()
+    sub = VerificationSubAgent(method="code_review")  # DEFAULT budget
+    log_path = tmp_path / "vp.log"
+
+    verdict = await sub._self_heal_loop(
+        vp_node={"id": "VP-011", "title": "default-budget parse failure"},
+        coding_tool=tool,
+        settings_path=str(tmp_path / "settings.json"),
+        log_path=log_path,
+        project_dir=None,
+    )
+
+    assert tool.calls == 2, (
+        f"the default budget must be the initial try plus ONE retry "
+        f"(2 attempts); query_json was called {tool.calls} times"
+    )
+
+    errors = _events(log_path, "verdict_parse_error")
+    retries = _events(log_path, "verdict_parse_retry")
+    assert len(errors) == 2, (
+        f"expected 2 verdict_parse_error events (one per attempt); got "
+        f"{len(errors)}"
+    )
+    assert len(retries) == 1, (
+        f"expected exactly 1 verdict_parse_retry event (one retry); got "
+        f"{len(retries)}"
+    )
+
+    assert verdict.verdict == VERDICT_UNKNOWN, (
+        f"an unparseable verdict must degrade to UNKNOWN; got "
+        f"{verdict.verdict!r}"
+    )
+    joined = " | ".join(verdict.reasons)
+    assert "after 2 attempts" in joined, (
+        f"the reason must say the verdict was unparseable after 2 "
+        f"attempts; got {verdict.reasons}"
     )

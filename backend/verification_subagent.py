@@ -519,7 +519,8 @@ FAILURE_RECORD_FILENAME = "failure.json"
 # ---------------------------------------------------------------------------
 #
 # 2026-11-06（VP-015 根因 · 层二「卡死恢复」）。恢复路径以前只认
-# ``/tmp/vp_<id>_progress.log`` —— 那条路径的设计前提是"卡死的 attempt
+# 进度日志（``_progress_log_path`` 算出来的那条，2026-11-18 起按计划
+# 隔离）—— 那条路径的设计前提是"卡死的 attempt
 # 是一个跑 pytest 的进程"。浏览器腿（``e2e`` / ``ui_validation``）永远
 # 不写那个文件：它的产出是 ``vp_artifacts/<vp_id>/checkpoints.json`` 加
 # 一个 ``evidence/`` 目录。于是框架去一个浏览器腿永远不会写的地方要
@@ -656,6 +657,98 @@ class _GraceReservedClock:
         return self._inner.is_parked
 
 
+# ---------------------------------------------------------------------------
+# The progress-log path (2026-11-18, VP-032)
+# ---------------------------------------------------------------------------
+#
+# 2026-11-18 (VP-032): the tee path was the **global**
+# ``/tmp/vp_<id>_progress.log``.  A verification-point id is only unique
+# *inside its plan*, so two plans that both had a ``VP-032`` wrote the
+# same file — the second run clobbered the first one's, and the
+# framework's stuck-agent summarizer read the *other* plan's output and
+# concluded "this round produced no conclusion".
+#
+# The path is therefore **plan-scoped**, and it is computed by exactly
+# one function (:func:`_progress_log_path`) so that the path the prompt
+# names and the path the summarizer reads are the same path by
+# construction — two spellings of one convention is how the reader ended
+# up on somebody else's file in the first place.
+
+#: The placeholder the templates carry where the concrete progress-log
+#: path belongs.  The framework replaces it before the prompt is
+#: dispatched (see :meth:`VerificationSubAgent._system_instruction`).
+PROGRESS_LOG_PLACEHOLDER = "<PROGRESS_LOG>"
+
+#: The same, for the junit-xml side-channel path.
+JUNIT_XML_PLACEHOLDER = "<JUNIT_XML>"
+
+
+def _plan_path_token(value: Any) -> str:
+    """A filesystem-safe token for a **plan** id.
+
+    The plan id keeps its case: two plans may differ only in case
+    (``Plan-Alpha`` vs ``plan-alpha``), and folding
+    them together would put them back into one file — the very bug this
+    path shape exists to kill.  Everything else that is not safe in a
+    filename becomes ``_``.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", text)
+
+
+def _vp_path_token(value: Any) -> str:
+    """A filesystem-safe token for a **verification-point** id.
+
+    Lowercased, with the dashes turned into underscores — the same
+    shape as ``verification_loop._normalized_vp_token`` (``VP-032`` →
+    ``vp_032``) and as the tee/junit paths ``vp_split`` writes.  The
+    framework's /tmp artifact globs and its ``pgrep`` patterns match on
+    that token, so keeping it means the files this path names stay
+    visible to the liveness probe and to the orphan reaper.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+
+
+def _progress_log_path(plan_id: Any, vp_id: Any) -> str:
+    """The progress log path of one verification point in one plan.
+
+    ``/tmp/vp_{plan}_{vp}_progress.log`` — plan-scoped, so two plans
+    that share a vp id never share a file.
+
+    Without a plan id the path drops the plan segment
+    (``/tmp/vp_{vp}_progress.log``) — the shape the framework used
+    before the plan scoping, kept for the plans that run without one.
+
+    :param plan_id: The plan the verification point belongs to.
+    :param vp_id: The verification point's id.
+    :return: The absolute path of the progress log.
+    """
+    vp_token = _vp_path_token(vp_id) or "unknown"
+    plan_token = _plan_path_token(plan_id)
+    if not plan_token:
+        return f"/tmp/vp_{vp_token}_progress.log"
+    return f"/tmp/vp_{plan_token}_{vp_token}_progress.log"
+
+
+def _junit_xml_path(plan_id: Any, vp_id: Any) -> str:
+    """The junit-xml side-channel path — plan-scoped, like the log.
+
+    :param plan_id: The plan the verification point belongs to.
+    :param vp_id: The verification point's id.
+    :return: The absolute path of the junit-xml file.
+    """
+    vp_token = _vp_path_token(vp_id) or "unknown"
+    plan_token = _plan_path_token(plan_id)
+    if not plan_token:
+        return f"/tmp/vp_{vp_token}.xml"
+    return f"/tmp/vp_{plan_token}_{vp_token}.xml"
+
+
 # Shared rule applied to every verification sub-agent (added 2026-09-07
 # after two consecutive rounds were killed by the verification
 # watchdog: long pytest runs produced no log writes for 15+ minutes,
@@ -692,11 +785,11 @@ _TIME_BUDGET_AND_PROGRESS_BLOCK = (
     "while they run. The orchestrator watches sub-agent activity for\n"
     "freshness — your job is to keep something emitting.\n"
     "  - pytest: always use `-v` AND pipe through `tee` to a file, e.g.\n"
-    "      `pytest -v tests/ 2>&1 | tee /tmp/vp_<id>_progress.log`\n"
+    "      `pytest -v tests/ 2>&1 | tee <PROGRESS_LOG>`\n"
     "    Each test item then prints live as\n"
     "    `tests/x.py::test_y PASSED` and a small watcher loop can\n"
     "    `tail -n 1` the file every 60-120 s.\n"
-    "  - pytest: also consider `--junit-xml=/tmp/vp_<id>.xml` for a\n"
+    "  - pytest: also consider `--junit-xml=<JUNIT_XML>` for a\n"
     "    machine-readable side-channel.\n"
     "  - cargo build/test: add `--verbose`; crate-level progress lines\n"
     "    stream continuously.\n"
@@ -704,10 +797,10 @@ _TIME_BUDGET_AND_PROGRESS_BLOCK = (
     "    in a separate `while kill -0 $PID` loop, read NEW output from\n"
     "    the tee'd file and append a `progress` entry. A working\n"
     "    pattern:\n"
-    "      pytest -v tests/ 2>&1 | tee /tmp/vp_progress.log &\n"
+    "      pytest -v tests/ 2>&1 | tee <PROGRESS_LOG> &\n"
     "      PID=$!\n"
     "      while kill -0 $PID 2>/dev/null; do\n"
-    "        tail -n 1 /tmp/vp_progress.log | grep -E '::' | tail -n 1\n"
+    "        tail -n 1 <PROGRESS_LOG> | grep -E '::' | tail -n 1\n"
     "        sleep 90\n"
     "      done\n"
     "    Each tick produces a `progress` entry whose payload is\n"
@@ -762,11 +855,12 @@ _BROWSER_EVIDENCE_PROGRESS_BLOCK = (
     "For every checkpoint you record, append one line to the progress\n"
     "file the framework reads:\n"
     "    echo \"checkpoint <n>/<total> <passed|failed>: <selector> -> "
-    "<actual>\" >> /tmp/vp_<id>_progress.log\n"
-    "(<id> is this verification point's id — the same path the\n"
-    "TIME-BUDGET block above uses.) The generic progress channel is\n"
-    "blind for a browser walk: without these lines the framework sees\n"
-    "an empty log and cannot tell a finished walk from a hung one.\n\n"
+    "<actual>\" >> <PROGRESS_LOG>\n"
+    "(the path above is this verification point's OWN progress log —\n"
+    "the same one the TIME-BUDGET block above uses.) The generic\n"
+    "progress channel is blind for a browser walk: without these lines\n"
+    "the framework sees an empty log and cannot tell a finished walk\n"
+    "from a hung one.\n\n"
     "Rule B3 — return the verdict the moment the required checkpoints\n"
     "are recorded.\n"
     "As soon as every checkpoint this verification point asks for is\n"
@@ -980,9 +1074,11 @@ class VerificationSubAgent:
         method: The verification method name. Must be one of the
             values in ``MethodTemplateRegistry.supported_methods()``.
         max_retries: Maximum number of retries on transient failure.
-            2026-09-14: default 2 — total attempts
-            including the first try is capped at 3. Beyond that the VP
-            must go to repair / split, not burn more full-suite runs.
+            2026-11-01: default 1 — total attempts
+            including the first try is capped at 2 (PRD §1: "判定解析失败
+            时先重试一次（重新要一次判定）；仍失败才降级为『判定不可用』").
+            Beyond that the VP must go to repair / split, not burn more
+            full-suite runs.
         model_complexity: Hint for which model tier to use. Free-form
             string so downstream model-routing code can interpret it
             (e.g. "simple" / "medium" / "complex"). Default "simple".
@@ -991,7 +1087,7 @@ class VerificationSubAgent:
     """
 
     method: str
-    max_retries: int = 2
+    max_retries: int = 1
     model_complexity: str = "simple"
     # 2026-09-13 provider routing: the workflow scene this VP's LLM
     # calls route through (``verification`` — at least medium tier).
@@ -1062,6 +1158,46 @@ class VerificationSubAgent:
         # ``wall_clock_cap()`` 读得到它自己声明的 ``timeout_seconds`` ——
         # 调用点不必把节点一路传下去。
         self._active_vp_node: Optional[Dict[str, Any]] = None
+
+    # ------------------------------------------------------------------
+    # _system_instruction() — the prompt's concrete paths
+    # ------------------------------------------------------------------
+
+    def _system_instruction(self, vp_node: Dict[str, Any]) -> str:
+        """The system prompt for this attempt, with the concrete paths.
+
+        2026-11-18 (VP-032): the progress-log path used to be a **bare
+        template** in the prompt (``/tmp/vp_<id>_progress.log``).  A
+        verification-point id is only unique inside its plan, so that
+        path was a **global** file: two plans that both had a ``VP-032``
+        wrote the same one, and the framework read the other plan's
+        output.
+
+        The template now carries a placeholder and **this** method
+        substitutes the plan-scoped concrete path.  The path the
+        summarizer reads comes from the same helper
+        (:func:`_progress_log_path`), so writer and reader cannot drift
+        apart again.
+
+        :param vp_node: The verification point this attempt runs for.
+        :return: The system prompt, with every path resolved.
+        """
+        instruction = self.template
+        if (
+            PROGRESS_LOG_PLACEHOLDER not in instruction
+            and JUNIT_XML_PLACEHOLDER not in instruction
+        ):
+            return instruction
+        vp_id = vp_node.get("id") if isinstance(vp_node, dict) else None
+        instruction = instruction.replace(
+            PROGRESS_LOG_PLACEHOLDER,
+            _progress_log_path(self.plan_id, vp_id),
+        )
+        instruction = instruction.replace(
+            JUNIT_XML_PLACEHOLDER,
+            _junit_xml_path(self.plan_id, vp_id),
+        )
+        return instruction
 
     # ------------------------------------------------------------------
     # wall_clock_cap() — the budget THIS attempt may spend
@@ -1428,9 +1564,9 @@ class VerificationSubAgent:
     #      (delegated to SettingsJsonBuilder).
     #   2. Invoke the coding tool to attempt the verification. The
     #      ``max_retries + 1`` total attempts cover the initial try
-    #      plus the retry budget — the budget exists for ATTEMPT
-    #      MALFUNCTIONS (verdict-parse garble, watchdog kill, transport
-    #      error), not for verdicts.
+    #      plus the retry budget (default: 1 retry → 2 attempts) — the
+    #      budget exists for ATTEMPT MALFUNCTIONS (verdict-parse
+    #      garble, watchdog kill, transport error), not for verdicts.
     #   3. On a clean FAILED verdict (the sub-agent produced a
     #      well-formed verdict with real evidence), RETURN IT — no
     #      retry, no self-heal. A verification agent is an observer,
@@ -1713,14 +1849,21 @@ class VerificationSubAgent:
         """Run the self-heal retry loop, returning the final Verdict.
 
         Total attempts = ``max_retries + 1`` (one initial try + N
-        retries), and the budget exists ONLY for attempt malfunctions
-        (verdict-parse garble, watchdog kill, transport error). A clean
+        retries; the default budget is N=1, so 2 attempts — PRD §1 asks
+        for exactly one retry before the verdict degrades to
+        "unavailable"), and the budget exists ONLY for attempt
+        malfunctions (verdict-parse garble, watchdog kill, transport
+        error). A clean
         FAILED verdict is returned immediately — no retry, no
         self-heal (2026-09-15 the verifier is an
         observer; a finding is not a malfunction to retry away). The
         loop short-circuits on BLOCKED (no retry) and, when the budget
-        is exhausted by malfunctions, synthesizes a FAILED verdict
-        from the last error.
+        is exhausted by malfunctions, synthesizes a verdict from the
+        last error: a transport failure stays a FAILED, while a
+        verdict that could not be parsed becomes ``UNKNOWN`` — the
+        verification point never got to establish anything, and
+        filing that as a code failure charges the deliverable for the
+        environment's malfunction (2026-11-01).
 
         2026-11-08（依据契约自愈）：还有一种情况既不是 finding 也不是
         malfunction —— **依据产物不完整**。子 agent 交了 PASSED，但它写出
@@ -1744,9 +1887,14 @@ class VerificationSubAgent:
         # an operator must not be sent to the provider when the
         # sub-agent is the one that answered nonsense.
         last_error_is_parse_error = False
+        # The payload of the LAST parse failure — the sub-agent's own
+        # answer, kept so the "no verdict could be reached" verdict
+        # can still be reviewed against what was actually said.
+        last_parse_raw_output: str = ""
         # 2026-09-14: the watchdog-kill bonus slot is
         # REMOVED — total attempts is now a hard ``max_retries + 1``
-        # (initial try + 2 retries = 3). The old ``+1`` reserved slot
+        # (initial try + 1 retry = 2 with the default budget; a caller
+        # may still ask for more). The old ``+1`` reserved slot
         # let a VP burn up to 5 full-suite runs (observed live: VP-023
         # burned ~100 min of pytest per round). Watchdog kills now
         # consume the normal retry budget like any other failure; a VP
@@ -1825,18 +1973,28 @@ class VerificationSubAgent:
                 # failure is auditable, but we do NOT feed the parse
                 # error into _self_heal (that path is for code
                 # defects, not for protocol garbles).
-                last_error = f"VerdictParseError: {e}"
+                #
+                # 2026-11-01: the reason keeps the parse error's OWN
+                # message (no "VerdictParseError:" prefix — the reason
+                # already says the verdict was unparseable, and the
+                # type is what the attempt log records), and the raw
+                # output of this attempt is kept for the verdict that
+                # will be synthesized if the budget runs out.
+                last_error = str(e)
                 last_error_is_parse_error = True
+                last_parse_raw_output = str(
+                    getattr(e, "raw_output", "") or ""
+                )
                 self._write_log(log_path, "verdict_parse_error", {
                     "attempt": attempt_no,
-                    "error": last_error,
+                    "error": f"VerdictParseError: {e}",
                     # The raw payload the sub-agent produced rides along
                     # on the exception (see ``_execute_attempt``'s
                     # parse-error arm); the message itself is the
                     # fallback for an error raised elsewhere.
-                    "raw_output_head": str(
-                        getattr(e, "raw_output_head", "") or (str(e) or "")
-                    )[:400],
+                    "raw_output_head": (
+                        last_parse_raw_output[:400] or (str(e) or "")
+                    ),
                 })
                 if attempt_no < self.max_retries:
                     # Bounded exponential backoff: 1s, 2s, 4s, ...
@@ -1871,6 +2029,17 @@ class VerificationSubAgent:
                 # ``watchdog_kill_count=0`` on the next attempt. The
                 # only state that must survive is the retry-used flag.
                 self._watchdog_retry_used = True
+                # 2026-11-14 (VP-010): the kill is a PROCESS-class
+                # malfunction — the sub-agent never handed over a verdict
+                # at all, so the budget was eaten by the kill, not by the
+                # verdict protocol. Record it as the last error and CLEAR
+                # the parse flag: the exhausted-verdict synthesis below
+                # reads the LAST malfunction, and a sticky parse flag left
+                # over from an earlier attempt made a watchdog kill land
+                # as UNKNOWN (blaming a stale, unrelated parse error)
+                # instead of FAILED (naming this kill).
+                last_error = str(e)
+                last_error_is_parse_error = False
                 self._write_log(log_path, "sub_agent_kill_retry", {
                     "vp_id": vp_node.get("id", "unknown"),
                     "attempt": attempt_no,
@@ -1907,6 +2076,15 @@ class VerificationSubAgent:
                     log_path=log_path,
                     artifact_dir=e.artifact_dir or artifact_dir,
                     terminated=e.terminated,
+                    # 2026-11-19 (VP-045): the summarizer must know when
+                    # this attempt started — otherwise it cannot tell
+                    # this attempt's output from an earlier attempt's,
+                    # and it grades the earlier one.
+                    attempt_started_at=e.started_at,
+                    # 2026-11-24（本次合并 origin/main@ed425efd）：base 侧还要求
+                    # 知道被测树在哪 —— 汇总器的工具名要在**产生日志的那棵树**里
+                    # 跑，`cwd` 缺省会跑在后台服务自己的工作目录（另一份检出）。
+                    # 两个参数互不相干，都留下。
                     project_dir=project_dir,
                 )
                 # Whatever the summarizer returns is treated as the
@@ -1993,7 +2171,7 @@ class VerificationSubAgent:
         # The budget ran out on ATTEMPT MALFUNCTIONS (a clean FAILED
         # verdict never reaches this point — it returns above). Per PRD
         # decision point 3 (zero-tolerance for skipping), we never
-        # coerce this to SKIPPED; it's a hard FAILED.
+        # coerce this to SKIPPED.
         #
         # 2026-11-08（依据契约自愈）：如果手上已经有一份「依据不合格」的
         # PASSED，而它后面的重试都出了故障，那么交回这一份才是诚实的 ——
@@ -2010,15 +2188,35 @@ class VerificationSubAgent:
         # exhausted" on a parse failure would send them to the
         # provider when the sub-agent is the one that answered
         # nonsense.
+        #
+        # 2026-11-01: the two malfunctions also get DIFFERENT verdicts.
+        # A transport failure stays a FAILED — nothing ran, and that is
+        # a hard failure of the attempt. An unparseable verdict is
+        # ``UNKNOWN``: the verification point never established
+        # anything about the deliverable, so recording it as FAILED
+        # files a code failure that was never observed (measured
+        # 2026-10-23: a sub-agent answering a JSON array instead of an
+        # object made one untested VP FAILED, and that false FAILED
+        # cascaded two more VPs into DEFERRED). The raw output rides
+        # along so the verdict stays reviewable.
         if last_error_is_parse_error:
             exhausted_reason = (
                 f"verdict unparseable after {attempt} attempts: "
                 f"{last_error or 'unknown error'}"
             )
+            raw_output = last_parse_raw_output[:400]
+            exhausted_evidence = (
+                [f"raw_output: {raw_output}"]
+                if raw_output
+                else ["raw_output: <empty>"]
+            )
+            exhausted_verdict = VERDICT_UNKNOWN
         else:
             exhausted_reason = (
                 f"max retries exhausted: {last_error or 'unknown error'}"
             )
+            exhausted_evidence = []
+            exhausted_verdict = "FAILED"
         # 2026-10-22 (P0-1): the class is ``infra`` and the source is
         # ``deterministic``. The attempts malfunctioned (a verdict-parse
         # garble, a watchdog kill, a transport error) and nothing was
@@ -2031,9 +2229,9 @@ class VerificationSubAgent:
         # ``deliverable_defect`` and land exactly where the confusion
         # starts.
         return Verdict(
-            verdict="FAILED",
+            verdict=exhausted_verdict,
             reasons=[exhausted_reason],
-            evidence=[],
+            evidence=exhausted_evidence,
             model_complexity=self.model_complexity,
             failure_class=INFRA_FAILURE_CLASS,
             failure_class_source=DETERMINISTIC_FAILURE_CLASS_SOURCE,
@@ -2134,6 +2332,13 @@ class VerificationSubAgent:
         before the dispatch starts; a caller that does not supply one
         gets a fresh handle of its own.
         """
+        # 2026-11-19 (VP-045): when this attempt began.  The recovery
+        # inputs the stuck route hands to the summarizer (the tee'd
+        # progress log, the evidence artifact directory) are reused
+        # across rounds, so this timestamp is the only thing that can
+        # say whether what the summarizer is about to read was written
+        # by THIS attempt.
+        attempt_started_at = time.time()
         # 2026-11-06（VP-015 根因 · 层一）：本次 attempt 的 VP 节点记在
         # 实例上，``wall_clock_cap()`` 因此读得到它自己声明的
         # ``timeout_seconds`` —— 调用点不必把节点一路传下去。
@@ -2363,7 +2568,11 @@ class VerificationSubAgent:
                 # 墙钟上限，否则它永远触发不了，"无进展就终止"就等于没有。
                 query_kwargs: Dict[str, Any] = {
                     "prompt": prompt,
-                    "system_instruction": self.template,
+                    # 2026-11-18（VP-032）：派发的是**算好的**系统提示词
+                    # —— 里面的进度日志路径已经换成本计划本验证点的具体
+                    # 路径（``_system_instruction``）。裸模板曾经让两个
+                    # 计划的同名 VP 写同一个文件。
+                    "system_instruction": self._system_instruction(vp_node),
                     "timeout": self._silence_window_seconds(),
                 }
                 excluded: List[str] = [
@@ -2421,7 +2630,7 @@ class VerificationSubAgent:
                 # 2026-09-08: the OUTER cap fired — the flat 1-hour
                 # budget elapsed without a verdict. Route to the
                 # **stuck-agent summarizer** (a fresh LLM call with no
-                # tools that reads /tmp/vp_<id>_progress.log and
+                # tools that reads this attempt's progress log and
                 # returns verdict JSON) instead of bouncing up to the
                 # generic HardTimeoutError → split path. Splitting a
                 # test_command that's already COMPLETE in its log
@@ -2430,10 +2639,15 @@ class VerificationSubAgent:
                 # pytest if it thought the run was flaky — we only
                 # step in if it didn't return a verdict at all.
                 vp_id_log = vp_node.get("id", "unknown")
-                # Conventional tee path the user-prompt instructs the
-                # sub-agent to use. Empty string means pytest never
-                # ran — summarizer degrades to FAILED with that note.
-                output_file = f"/tmp/vp_{vp_id_log}_progress.log"
+                # The tee path the user-prompt instructs the sub-agent
+                # to use. Empty string means pytest never ran —
+                # summarizer degrades to FAILED with that note.
+                #
+                # 2026-11-18（VP-032）：这条路径**按计划隔离**，而且由
+                # **同一个 helper** 算出来（``_progress_log_path``）——
+                # 提示词里写的那条路径与这里读的那条必须是同一条，
+                # 否则读侧会读到别的计划的同名文件。
+                output_file = _progress_log_path(self.plan_id, vp_id_log)
                 # The budget is the work this call was allowed, not the
                 # wall time it happened to span: a call that sat on a
                 # closed quota window for a week still only ever gets an
@@ -2556,6 +2770,10 @@ class VerificationSubAgent:
                     output_file=output_file,
                     artifact_dir=artifact_dir,
                     terminated=terminated,
+                    # 2026-11-19 (VP-045): carry the attempt's start
+                    # time — it is what lets the summarizer tell this
+                    # attempt's output from an earlier attempt's.
+                    started_at=attempt_started_at,
                 )
                 # Whether the in-flight dispatch was actually ended —
                 # the log below says so, so an operator can tell "the
@@ -2726,6 +2944,11 @@ class VerificationSubAgent:
                 # attempt log keeps the forensic trail the inline
                 # verdict used to carry in ``evidence``.
                 e.raw_output_head = raw[:400]
+                if not getattr(e, "raw_output", ""):
+                    # The parse layer attaches the payload it refused;
+                    # this is the fallback for an error raised
+                    # elsewhere (the raw text is what we have there).
+                    e.raw_output = raw
                 raise
             # NEGCTL-P0-1-END
         finally:
@@ -3207,6 +3430,135 @@ class VerificationSubAgent:
             failure_class_source=DETERMINISTIC_FAILURE_CLASS_SOURCE,
         )
 
+    def _stale_recovery_inputs(
+        self,
+        output_file: Optional[str],
+        artifact_dir: Optional[Path],
+        attempt_started_at: Optional[float],
+        vp_node: Optional[Dict[str, Any]] = None,
+    ) -> List[Tuple[Path, float]]:
+        """The recovery inputs THIS attempt did not write.
+
+        2026-11-19 (VP-045): the stuck route's recovery inputs are
+        reused across rounds — the tee'd progress log and the evidence
+        artifact directory.  An input whose mtime predates the attempt
+        belongs to an EARLIER attempt, and reading it as this attempt's
+        output is how a summarizer that never read one line of this
+        round's output came to answer "PASSED" — which the framework
+        then checked against a stale citations.json and filed as a
+        broken deliverable.
+
+        Both places the artifact is read from are checked: the
+        ``artifact_dir`` this attempt was handed, and the
+        ``evidence_artifact_dir`` the VP node names (the browser leg's
+        artifact branch reads the latter).
+
+        Only an input that EXISTS can be stale: a missing input is not
+        evidence of anything, and the "no output at all" branch still
+        owns that case.
+
+        ``attempt_started_at`` is ``None`` when the caller could not say
+        when the attempt started — then nothing is stale, and the
+        current behaviour stands.
+        """
+        if attempt_started_at is None:
+            return []
+        candidates: List[Path] = []
+        if output_file:
+            candidates.append(Path(output_file))
+        directories: List[Path] = []
+        if artifact_dir is not None:
+            directories.append(Path(artifact_dir))
+        if vp_node is not None:
+            evidence_dir = str(
+                vp_node.get("evidence_artifact_dir") or ""
+            ).strip()
+            if evidence_dir:
+                directories.append(Path(evidence_dir))
+        seen: set = set()
+        for directory in directories:
+            candidate = directory / CHECKPOINTS_FILENAME
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(candidate)
+        stale: List[Tuple[Path, float]] = []
+        for candidate in candidates:
+            try:
+                mtime = candidate.stat().st_mtime
+            except OSError:
+                # Missing (or unreadable) input — not a stale one.
+                continue
+            if mtime < attempt_started_at:
+                stale.append((candidate, mtime))
+        return stale
+
+    def _stale_input_verdict(
+        self,
+        stale_inputs: List[Tuple[Path, float]],
+        attempt_started_at: float,
+        vp_id: str,
+        output_file: Optional[str],
+        artifact_dir: Optional[Path],
+        terminated: bool,
+        log_path: Path,
+    ) -> "Verdict":
+        """The verdict for "the input is not this attempt's output".
+
+        It is UNKNOWN, not FAILED: the verification point established
+        NOTHING about the deliverable — the same words the repo already
+        uses for a verdict it could not parse.  A FAILED here is a
+        verdict nobody earned; it files a broken deliverable and
+        cascades into Phase 2's DEFERRED chain.
+
+        The class is infra, and deterministic: the framework read the
+        wrong file — the deliverable did nothing wrong.
+        """
+        reasons: List[str] = []
+        for path, mtime in stale_inputs:
+            reasons.append(
+                "stuck sub-agent: the summarizer's input "
+                f"{str(path)!r} was written at mtime={mtime:.3f}, "
+                f"before this attempt started at "
+                f"attempt_started_at={attempt_started_at:.3f} — it "
+                "belongs to an earlier attempt, so this attempt "
+                "established nothing about the deliverable"
+            )
+        if terminated:
+            reasons.append(self._termination_disclosure(
+                "the input this verdict could not use is not a claim "
+                "that the deliverable produced no result"
+            ))
+        first_path, first_mtime = stale_inputs[0]
+        self._write_log(log_path, "summarizer_stale_input", {
+            "vp_id": vp_id,
+            "attempt_started_at": attempt_started_at,
+            "path": str(first_path),
+            "mtime": first_mtime,
+            "output_file": str(output_file) if output_file else None,
+            "artifact_dir": (
+                str(artifact_dir) if artifact_dir is not None else None
+            ),
+            "stale_inputs": [
+                {"path": str(path), "mtime": mtime}
+                for path, mtime in stale_inputs
+            ],
+            "terminated": terminated,
+        })
+        return Verdict(
+            verdict=VERDICT_UNKNOWN,
+            reasons=reasons,
+            evidence=[
+                f"{path}: mtime={mtime:.3f} "
+                f"(attempt_started_at={attempt_started_at:.3f})"
+                for path, mtime in stale_inputs
+            ],
+            model_complexity=self.model_complexity,
+            failure_class=INFRA_FAILURE_CLASS,
+            failure_class_source=DETERMINISTIC_FAILURE_CLASS_SOURCE,
+        )
+
     async def _summarize_vp_result(
         self,
         vp_node: Dict[str, Any],
@@ -3215,6 +3567,10 @@ class VerificationSubAgent:
         log_path: Path,
         artifact_dir: Optional[Path] = None,
         terminated: bool = False,
+        # 2026-11-24（本次合并 origin/main@ed425efd）：两个参数是两侧各自新增的，
+        # 互不相干 —— `attempt_started_at` 是本分支的「本次尝试从什么时候开始」
+        # （新鲜度判据），`project_dir` 是 base 的「被测树在哪」。两个都留下。
+        attempt_started_at: Optional[float] = None,
         project_dir: Optional[Path] = None,
     ) -> "Verdict":
         """Decide a stuck attempt's verdict — from its artifact first.
@@ -3242,6 +3598,13 @@ class VerificationSubAgent:
             timeout is not a broken deliverable, and an unclassified
             one used to be filed as one.
 
+        ``attempt_started_at`` (2026-11-19, VP-045) says when this
+        attempt began.  Both recovery inputs are reused across rounds,
+        so without it a summarizer can read an EARLIER attempt's output
+        and answer for this one.  When an input predates the attempt,
+        the verdict is UNKNOWN — this attempt established nothing — and
+        the input is not read at all.
+
         Why a fresh agent instead of re-running the original:
         ``_self_heal_loop`` could in principle retry the original
         sub-agent, but the original is structured to RUN pytest and
@@ -3256,6 +3619,26 @@ class VerificationSubAgent:
         summarizer produces one JSON object and exits.
         """
         vp_id = str(vp_node.get("id", "unknown"))
+
+        # 2026-11-19 (VP-045)：恢复输入是**跨轮复用**的 —— 进度日志与
+        # 产物目录每轮都写同一个位置。先判新鲜度：早于本次 attempt 的
+        # 输入不是本次尝试的输出，读它就是在替别人作答。
+        stale_inputs = self._stale_recovery_inputs(
+            output_file=output_file,
+            artifact_dir=artifact_dir,
+            attempt_started_at=attempt_started_at,
+            vp_node=vp_node,
+        )
+        if stale_inputs:
+            return self._stale_input_verdict(
+                stale_inputs=stale_inputs,
+                attempt_started_at=float(attempt_started_at),
+                vp_id=vp_id,
+                output_file=output_file,
+                artifact_dir=artifact_dir,
+                terminated=terminated,
+                log_path=log_path,
+            )
 
         # 2026-11-06（层二）：恢复输入按顺序取，先到先得 ——
         # (a) checkpoints.json，(b) evidence/ 目录清单，(c) 旧的 pytest tee
@@ -3615,6 +3998,12 @@ class VerificationSubAgent:
             f"Priority: {vp_node.get('priority', 'medium')}",
             f"Expected result: {vp_node.get('expected_result', '')}",
         ]
+        # 2026-11-18（VP-032）：进度日志的**具体**路径。提示词里必须点名
+        # 一个真实路径，而不是模板 —— 模板到了子 agent 手里会变成一个
+        # 猜出来的路径，于是两个计划的同名 VP 写同一个文件。
+        progress_log_path = _progress_log_path(
+            self.plan_id, vp_node.get("id"),
+        )
         # 2026-11-02（任务 8）：可写范围必须在**写之前**就摆在子 agent 眼前。
         # 护栏只在写下去之后才拒绝它 —— 那时候重试预算已经烧掉一次，而被验证
         # 仓库的工作区可能已经被改过。
@@ -3700,9 +4089,9 @@ class VerificationSubAgent:
             "verification log has no fresh writes for >~15 min. If what you "
             "are about to do would exceed ~5 min of silent wall-clock time, "
             "structure it so observable progress is emitted continuously — "
-            "pipe through `tee` to a stable path (e.g. `/tmp/"
-            "<vp_id>_progress.log`) and, where the framework exposes it, "
-            "append `progress` events to the sub-agent log via "
+            "pipe through `tee` to the progress log this prompt names "
+            f"(e.g. `{progress_log_path}`) and, where the framework exposes "
+            "it, append `progress` events to the sub-agent log via "
             "`_write_log(log_path, 'progress', {...})`. Each progress event "
             "MUST carry real observed data (current item, completed/total "
             "counts, last log line) — never an empty heartbeat. See the "
@@ -4096,8 +4485,9 @@ class StuckAgentError(Exception):
     before the outer cap elapsed.
 
     Per the 2026-09-08: the first sub-agent's context (the
-    tee'd log file at the conventional ``/tmp/vp_<id>_progress.log``
-    path) is handed to a fresh summarizer LLM call with **no tools**
+    tee'd log file at the path ``_progress_log_path`` computes — the
+    same, plan-scoped path the prompt named) is handed to a fresh
+    summarizer LLM call with **no tools**
     that reads the log and returns a structured verdict. The first
     agent is allowed to re-run pytest if it suspects flakiness; the
     summarizer only steps in when the first agent never produced a
@@ -4127,6 +4517,14 @@ class StuckAgentError(Exception):
         killed: Whether the in-flight dispatch was actually ended when
             the outer cap fired (2026-11-10).  ``False`` means there
             was nothing to kill, or the kill could not be attempted.
+        started_at: When this attempt began (epoch seconds, 2026-11-19,
+            VP-045).  The recovery inputs — the tee'd progress log and
+            the evidence artifact directory — are REUSED across rounds,
+            so this is the only thing that can say whether what the
+            summarizer is about to read was written by THIS attempt.
+            ``None`` means "unknown" — the caller could not say when
+            the attempt started, and the summarizer then keeps the
+            behaviour it always had.
     """
 
     def __init__(
@@ -4137,6 +4535,7 @@ class StuckAgentError(Exception):
         output_file: Optional[str] = None,
         artifact_dir: Optional[Path] = None,
         terminated: bool = False,
+        started_at: Optional[float] = None,
     ):
         self.elapsed = elapsed
         self.threshold = threshold
@@ -4144,6 +4543,9 @@ class StuckAgentError(Exception):
         self.output_file = output_file
         self.artifact_dir = artifact_dir
         self.terminated = terminated
+        # 2026-11-19 (VP-045)：本次 attempt 的开始时刻。默认 None ——
+        # 既有构造点不带它，行为不变。
+        self.started_at = started_at
         # 2026-11-10 — the outer cap ends the in-flight dispatch
         # before it raises; this carries the answer ("was there
         # something to kill?") to the log that reports the routing.
@@ -4683,6 +5085,17 @@ class VerdictParseError(ValueError):
     a SKIPPED value.
     """
 
+    #: The payload the sub-agent actually answered, kept on the error
+    #: so a parse failure stays reviewable. The message says WHY the
+    #: payload was refused; this says WHAT it was — and only this one
+    #: cannot be reconstructed from the message afterwards.
+    #:
+    #: Empty when the error was raised without a payload in hand. The
+    #: attribute exists on the class (rather than being set per
+    #: instance) so a caller may read it without guarding for its
+    #: absence.
+    raw_output: str = ""
+
 
 #: The failure class a verdict carries when nothing earned a different
 #: one — the class that *counts*. Mirrors
@@ -4723,6 +5136,25 @@ INFRA_FAILURE_CLASS = "infra"
 #: malfunction would be filed as a broken deliverable — exactly the
 #: confusion the four failure classes exist to prevent.
 DETERMINISTIC_FAILURE_CLASS_SOURCE = "deterministic"
+
+#: The verdict a verification point carries when **no verdict could be
+#: reached at all** — the sub-agent's answer could not be parsed as a
+#: Verdict, and the malfunction budget ran out before a parseable
+#: answer arrived.
+#:
+#: It is deliberately NOT ``FAILED``. A VP that never got to test
+#: anything has established nothing about the deliverable under
+#: verification, and filing it as a code failure charges the
+#: deliverable for the environment's malfunction. Measured
+#: 2026-10-23 (round 4 of one supervisor plan): a
+#: sub-agent answered a JSON *array* instead of an object, the parse
+#: failed, and one VP that had tested nothing was filed as ``FAILED``;
+#: that false FAILED then cascaded two more VPs into ``DEFERRED``.
+#:
+#: Spelled as a literal for the same reason as
+#: :data:`DEFAULT_FAILURE_CLASS`: the value travels through JSON
+#: verdict records and database columns, so it is a plain string.
+VERDICT_UNKNOWN = "UNKNOWN"
 
 
 def _canonical_verdict_text(text: str) -> str:
@@ -4875,6 +5307,25 @@ def parse_verdict(subagent_output: Dict[str, Any]) -> str:
     return normalized
 
 
+def _reject_verdict_payload(message: str, payload: str) -> "VerdictParseError":
+    """A parse error that carries the payload it refused.
+
+    The message says WHY the payload was rejected; the raw output says
+    WHAT the sub-agent actually answered. Only the second one cannot be
+    reconstructed from the first afterwards, and a parse failure that
+    kept only the reason would leave nobody able to tell a garbled
+    stream from a wrong-shaped answer.
+
+    2026-11-01: the raw output rides along on the error because the
+    caller has to be able to report it — a verdict that says "no
+    verdict could be reached" is only actionable if the payload that
+    could not be read is still there to look at.
+    """
+    error = VerdictParseError(message)
+    error.raw_output = payload
+    return error
+
+
 def parse_verdict_to_dataclass(raw_output: str) -> "Verdict":
     """JSON-string entry point returning a :class:`Verdict` dataclass.
 
@@ -4905,27 +5356,36 @@ def parse_verdict_to_dataclass(raw_output: str) -> "Verdict":
     try:
         data = json.loads(raw_output)
     except json.JSONDecodeError as e:
-        raise VerdictParseError(f"Invalid JSON: {e}") from e
+        # Nothing decoded — the text IS the raw output.
+        raise _reject_verdict_payload(f"Invalid JSON: {e}", str(raw_output or "")) from e
 
     if not isinstance(data, dict):
-        raise VerdictParseError(
-            f"top-level JSON must be an object, got {type(data).__name__}"
+        raise _reject_verdict_payload(
+            f"top-level JSON must be an object, got {type(data).__name__}",
+            str(data),
         )
 
-    verdict_str = parse_verdict(data)
+    try:
+        verdict_str = parse_verdict(data)
+    except VerdictParseError as e:
+        if not getattr(e, "raw_output", ""):
+            e.raw_output = str(data)
+        raise
 
     raw_reasons = data.get("reasons", [])
     if not isinstance(raw_reasons, list):
-        raise VerdictParseError(
-            f"'reasons' must be a list, got {type(raw_reasons).__name__}"
+        raise _reject_verdict_payload(
+            f"'reasons' must be a list, got {type(raw_reasons).__name__}",
+            str(data),
         )
 
     if "evidence" not in data:
-        raise VerdictParseError("missing required field: 'evidence'")
+        raise _reject_verdict_payload("missing required field: 'evidence'", str(data))
     evidence = data["evidence"]
     if not isinstance(evidence, list):
-        raise VerdictParseError(
-            f"'evidence' must be a list, got {type(evidence).__name__}"
+        raise _reject_verdict_payload(
+            f"'evidence' must be a list, got {type(evidence).__name__}",
+            str(data),
         )
 
     # The failure classification the payload claims, and the quote it

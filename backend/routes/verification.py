@@ -52,6 +52,11 @@ from verification_buckets import (
 # 不变，但「这个文件叫什么」不再有两份抄写）。
 from plan_artifacts import BRANCH_VERIFICATION, MACHINE_PLAN_FILENAME, detect
 
+# ``verification.convergence_metrics`` 是叶子模块（只依赖 datetime / typing），
+# 所以这里可以安全地模块级导入 —— 收敛率的判定表只有一份：端点只负责取数与
+# 转交，不重写口径。两份口径早晚会漂。
+from verification.convergence_metrics import summarize
+
 # ``bounded_log`` 是叶子模块（只依赖 os / threading / pathlib / typing），所以这里可以
 # 安全地模块级导入 —— 轮转副本的命名规则只有一份实现，读侧与写侧不可能漂移。
 from bounded_log import rotated_log_paths
@@ -3283,6 +3288,86 @@ def reset_rounds(plan_id: str, req: _server.ResetRoundsRequest):
         # plan's cap, i.e. unchanged.
         "new_max_rounds": original_max_rounds,
     }
+
+
+#: ``recent_n`` 的上限：未收敛清单是给人看的清单 —— 超过 100 条没人看，
+#: 而它会实实在在地把响应体撑大。这是这条端点唯一的容量约束。
+MAX_RECENT_N = 100
+
+
+@router.get("/api/verification/convergence-summary")
+def convergence_summary(window_days: int = 30, recent_n: int = 10):
+    """回答运维唯一关心的那个问题：「现在收敛率多少？」
+
+    取数与口径是分开的：这里只从 ``plan_verification`` 读出四列
+    （``plan_id`` / ``verification_status`` / ``verification_stop_reason`` /
+    ``updated_at``），分类与汇总交给 :func:`summarize`。判定表只有一份，
+    两份口径早晚会漂。
+
+    **只读**：这条端点不写 ``plan_verification``、不触发执行、不调用 LLM。
+    它是「读现在」，不是「做点什么」—— 一旦它顺手刷新了 ``updated_at``，
+    下一次再量的时候窗口的起点就被自己挪走了，数字会随「看」的次数而变。
+
+    路由的位置：``backend/server.py`` 在文件末尾挂了 frontend 的 catch-all
+    （``@app.get("/{path:path}")``），而路由匹配是**先注册先得**。本端点属于
+    ``routes.verification`` 路由器，而那个路由器被 include 在 catch-all
+    之前 —— 所以它轮得到自己。它同时注册在本路由器里那些带 ``{plan_id}``
+    的路由之前，是多一道保险：将来若有人加一条 ``GET /api/verification/{id}``，
+    这条字面量路径仍然是先匹配的那个。
+
+    参数
+    ----
+    ``window_days``
+        统计窗口（天），默认 30。``<= 0`` → 400：0 天或负数天的窗口回答不了
+        「这段时间里收敛了几个」；与其给一个看起来像答案的数字，不如说清楚
+        这个参数不成立。
+    ``recent_n``
+        未收敛清单最多保留多少条，默认 10，上限 100。超上限 → 400。
+
+    返回
+    ----
+    :func:`summarize` 的整个 dict，外加回显的 ``window_days`` ——
+    「rate 是 0.5」得说清楚是「这 30 天里的 0.5」。
+    """
+    if window_days <= 0:
+        raise HTTPException(400, {
+            "error": "invalid_window_days",
+            "detail": (
+                "window_days must be a positive number of days, "
+                f"got {window_days}."
+            ),
+        })
+    if recent_n > MAX_RECENT_N:
+        raise HTTPException(400, {
+            "error": "invalid_recent_n",
+            "detail": f"recent_n must be <= {MAX_RECENT_N}, got {recent_n}.",
+        })
+
+    conn, _routing, _verification = _open_verification_state()
+    try:
+        raw_rows = conn.execute(
+            "SELECT plan_id, verification_status, verification_stop_reason, "
+            "updated_at FROM plan_verification"
+        ).fetchall()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    rows: List[Dict[str, Any]] = [
+        {
+            "plan_id": r[0],
+            "verification_status": r[1],
+            "verification_stop_reason": r[2],
+            "updated_at": r[3],
+        }
+        for r in raw_rows
+    ]
+
+    summary = summarize(rows, window_days=window_days, recent_n=recent_n)
+    summary["window_days"] = window_days
+    return summary
 
 
 @router.get("/api/verification/{plan_id}/status")

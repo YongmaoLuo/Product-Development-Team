@@ -13,7 +13,7 @@ History:
     has nothing to heal without corrupting verification independence.
 
 New contract pinned here:
-  * default construction -> max_retries == 2 (the budget still
+  * default construction -> max_retries == 1 (the budget still
     exists, but only for attempt malfunctions);
   * clean FAILED verdict -> exactly ONE ``_execute_attempt`` call, NO
     ``_self_heal``, verdict returned unchanged (no "max retries
@@ -21,9 +21,16 @@ New contract pinned here:
   * watchdog kill still consumes the normal budget, but a subsequent
     FAILED verdict short-circuits the loop (kill + FAILED = 2 calls);
   * verdict-parse garble / transport errors retry with the budget and
-    carry ``max_attempts == 3`` in the attempt_started audit trail;
+    carry ``max_attempts == 3`` in the attempt_started audit trail
+    when the caller asks for an explicit ``max_retries=2``;
   * budget exhaustion by malfunctions synthesizes a FAILED verdict
     from the last error (never SKIPPED).
+
+2026-11-01 (PRD §1): "判定解析失败时先重试一次" — the DEFAULT
+budget is ONE retry, not two. The default construction therefore
+spends 2 total attempts (initial try + 1 retry). The cases below that
+drive 3 attempts pass ``max_retries=2`` EXPLICITLY; they pin the
+mechanism (a caller may still buy a bigger budget), not the default.
 """
 
 from __future__ import annotations
@@ -54,13 +61,23 @@ def _failed_verdict() -> Verdict:
 
 
 @pytest.mark.asyncio
-async def test_default_retry_budget_is_initial_plus_two(tmp_path):
-    """Default construction: max_retries == 2 → up to 3 total attempts
-    for ATTEMPT MALFUNCTIONS (the budget itself is unchanged)."""
+async def test_default_retry_budget_is_initial_plus_one(tmp_path):
+    """Default construction: max_retries == 1 → up to 2 total attempts
+    for ATTEMPT MALFUNCTIONS (the initial try plus ONE retry).
+
+    2026-11-01 (PRD §1): "判定解析失败时先重试一次（重新要一次判定）；
+    仍失败才降级为『判定不可用』". One retry is the contract — the
+    default budget is ``max_retries=1``, so the whole budget is
+    2 attempts. It used to be ``max_retries=2`` (3 attempts), which
+    spent two retries where the PRD asked for one."""
     sub = VerificationSubAgent(method="code_review")
-    assert sub.max_retries == 2, (
-        f"malfunction retry budget: initial + 2 retries; got "
+    assert sub.max_retries == 1, (
+        f"malfunction retry budget: initial + 1 retry; got "
         f"max_retries={sub.max_retries}"
+    )
+    assert sub.max_retries + 1 == 2, (
+        f"the default budget must allow exactly 2 total attempts "
+        f"(initial try + 1 retry); got {sub.max_retries + 1}"
     )
 
 

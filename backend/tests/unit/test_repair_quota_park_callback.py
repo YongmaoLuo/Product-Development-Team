@@ -31,10 +31,13 @@ Contract pinned here
   ``_execution_state[plan_id]["status"]`` field CANNOT be that
   evidence — the runner writes it before it fires this callback, so
   trusting it would skip the park entirely.
-* If the marker is gone (or the park itself fails), the callback falls
-  back to the EXISTING undrained-repair guard, verbatim:
-  ``loop_stopped`` + ``repair_batch_not_drained:waiting_for_quota:N``.
-  A park that could not happen must not look like a park that did.
+* If the marker is gone (or the park itself fails), the callback must
+  NOT park and must NOT treat the quota reason as an undrained batch:
+  ``waiting_for_quota`` is not a ``repair_batch_not_drained:`` reason,
+  so the undrained-repair guard is CLEARED, the repair executor is NOT
+  re-dispatched, and the chain continues with the next verification
+  round.  A park that could not happen must not look like a park that
+  did — and it must not look like an undrained batch either.
 """
 
 from __future__ import annotations
@@ -253,16 +256,39 @@ def test_quota_stop_reason_parks_without_terminal(monkeypatch, tmp_path):
 def test_quota_reason_without_marker_falls_back_to_guard(
     monkeypatch, tmp_path,
 ):
-    """A park that could not happen falls back to the existing guard.
+    """A park that could not happen is neither a park nor an undrained batch.
 
     The marker is gone from ``tasks.json``, so there is nothing to park
-    on.  The callback must behave EXACTLY as it did before: the
-    undrained-repair guard decides, and the chain stops with
-    ``loop_stopped`` + the undrained reason.
+    on.  The callback must NOT park the plan — and it must not mistake
+    the quota reason for an undrained batch either: ``waiting_for_quota``
+    is not a ``repair_batch_not_drained:`` reason, so the undrained
+    guard is CLEARED, the repair executor is NOT re-dispatched, and the
+    chain continues with the next verification round.
+
+    The chain's OWN decision (the round budget) is what stops it here,
+    and that verdict must be the only terminal written.
     """
     plan_id = "p-repair-quota-no-marker"
     _seed_plan(tmp_path, plan_id, quota_marker=False)
     _parked_state(plan_id)
+
+    # The guard is seeded NON-ZERO on purpose: the quota reason is not
+    # an undrained stop, so the guard must be CLEARED — neither bumped
+    # nor left where it was.
+    verification_loop._repair_not_drained_guard[plan_id] = 1
+
+    # The repair re-dispatch must not happen: nothing was left behind
+    # by an undrained batch.
+    redispatch = MagicMock()
+    monkeypatch.setattr(server, "_run_repair_execution_async", redispatch)
+
+    # Cut the normal re-entry at its FIRST decision point — the round
+    # budget.  Everything past it (a fresh verification round) is not
+    # what this contract is about; the budget verdict is the one the
+    # callback is allowed to write here.
+    monkeypatch.setattr(
+        verification_loop, "_plan_next_round", lambda _row: (1, 1, True),
+    )
 
     record_terminal = MagicMock()
     monkeypatch.setattr(
@@ -274,16 +300,40 @@ def test_quota_reason_without_marker_falls_back_to_guard(
             plan_id, tmp_path,
         )
         callback(0)
+        guard_after = verification_loop._repair_not_drained_guard.get(
+            plan_id, 0,
+        )
     finally:
         verification_loop._repair_not_drained_guard.pop(plan_id, None)
 
+    # The quota reason never reached the undrained-batch branch.
+    assert redispatch.call_count == 0, (
+        "a quota reason is not an undrained batch — the repair executor "
+        f"must not be re-dispatched ({redispatch.call_args_list!r})"
+    )
+
+    # The guard was cleared, not bumped and not left behind.
+    assert guard_after == 0, (
+        "the undrained guard counts UNDRAINED stops — a quota reason is "
+        f"not one of them, so the guard must be cleared (got {guard_after})"
+    )
+
+    # The plan was NOT parked: a park that could not happen must not
+    # look like a park that did.
+    assert _disk_phase(plan_id) != QUOTA_WAIT_PHASE
+    summary = _exec_summary(plan_id)
+    assert summary is not None, "no plan_execution row was written"
+    assert summary["exec_status"] != QUOTA_WAIT_PHASE
+
+    # The ONLY terminal is the re-entry's own round-budget verdict —
+    # neither ``repair_batch_not_drained`` nor ``repair_never_drained``.
     # ``round_token`` names the verification round the verdict belongs
     # to.  It is forwarded verbatim by ``_record_terminal`` (2026-11-01);
     # this callback was built without one, so it is the empty round.
     record_terminal.assert_called_once_with(
         plan_id,
         "loop_stopped",
-        "repair_batch_not_drained:waiting_for_quota:2_pending",
+        "max_rounds_reached",
         round_token="",
     )
 
@@ -399,11 +449,17 @@ def test_park_is_idempotent_when_disk_phase_already_parked(
 def test_quota_reason_when_park_raises_falls_back_to_guard(
     monkeypatch, tmp_path,
 ):
-    """A park that raises falls back to the existing guard.
+    """A park that raises is neither a park nor an undrained batch.
 
     The park is best-effort.  When it blows up, the callback must not
-    swallow the failure and call the round parked — it falls through to
-    the undrained-repair guard, exactly as it did before.
+    swallow the failure and call the round parked — and it must not
+    fall through to the undrained-batch branch either: the reason on
+    record is still the quota one, so the undrained guard is CLEARED,
+    the repair executor is NOT re-dispatched, and the chain continues
+    with the next verification round.
+
+    The chain's OWN decision (the round budget) is what stops it here,
+    and that verdict must be the only terminal written.
     """
     plan_id = "p-repair-quota-park-raises"
     _seed_plan(tmp_path, plan_id, quota_marker=True)
@@ -416,6 +472,24 @@ def test_quota_reason_when_park_raises_falls_back_to_guard(
 
     monkeypatch.setattr(execution_routes, "_enter_quota_wait", _boom)
 
+    # The guard is seeded NON-ZERO on purpose: the quota reason is not
+    # an undrained stop, so the guard must be CLEARED — neither bumped
+    # nor left where it was.
+    verification_loop._repair_not_drained_guard[plan_id] = 1
+
+    # The repair re-dispatch must not happen: nothing was left behind
+    # by an undrained batch.
+    redispatch = MagicMock()
+    monkeypatch.setattr(server, "_run_repair_execution_async", redispatch)
+
+    # Cut the normal re-entry at its FIRST decision point — the round
+    # budget.  Everything past it (a fresh verification round) is not
+    # what this contract is about; the budget verdict is the one the
+    # callback is allowed to write here.
+    monkeypatch.setattr(
+        verification_loop, "_plan_next_round", lambda _row: (1, 1, True),
+    )
+
     record_terminal = MagicMock()
     monkeypatch.setattr(
         server, "_record_verification_terminal", record_terminal,
@@ -426,15 +500,39 @@ def test_quota_reason_when_park_raises_falls_back_to_guard(
             plan_id, tmp_path,
         )
         callback(0)
+        guard_after = verification_loop._repair_not_drained_guard.get(
+            plan_id, 0,
+        )
     finally:
         verification_loop._repair_not_drained_guard.pop(plan_id, None)
 
+    # The quota reason never reached the undrained-batch branch.
+    assert redispatch.call_count == 0, (
+        "a quota reason is not an undrained batch — the repair executor "
+        f"must not be re-dispatched ({redispatch.call_args_list!r})"
+    )
+
+    # The guard was cleared, not bumped and not left behind.
+    assert guard_after == 0, (
+        "the undrained guard counts UNDRAINED stops — a quota reason is "
+        f"not one of them, so the guard must be cleared (got {guard_after})"
+    )
+
+    # The plan was NOT parked: a park that could not happen must not
+    # look like a park that did.
+    assert _disk_phase(plan_id) != QUOTA_WAIT_PHASE
+    summary = _exec_summary(plan_id)
+    assert summary is not None, "no plan_execution row was written"
+    assert summary["exec_status"] != QUOTA_WAIT_PHASE
+
+    # The ONLY terminal is the re-entry's own round-budget verdict —
+    # neither ``repair_batch_not_drained`` nor ``repair_never_drained``.
     # ``round_token`` names the verification round the verdict belongs
     # to.  It is forwarded verbatim by ``_record_terminal`` (2026-11-01);
     # this callback was built without one, so it is the empty round.
     record_terminal.assert_called_once_with(
         plan_id,
         "loop_stopped",
-        "repair_batch_not_drained:waiting_for_quota:2_pending",
+        "max_rounds_reached",
         round_token="",
     )

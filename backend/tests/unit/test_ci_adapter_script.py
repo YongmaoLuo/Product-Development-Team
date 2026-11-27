@@ -25,6 +25,18 @@ contradicts the script's own header, which promises exit 3 for
 "environment, queueing, network or timeout -- not a code fault", and it
 punishes the code for the machine's mood.
 
+On top of that this module pins what the gate *publishes*.  The gate
+runs on a real CI runner by pushing a throw-away probe branch, so the
+tree under test has to reach GitHub somehow -- but only the tree may
+travel.  Pushing ``HEAD`` would publish the whole local history of the
+checkout, including the historical snapshots that the commit-range
+privacy scan exists to reject, and it would break the repository's own
+rule that a push to the public remote carries one or two commits.  So
+the probe branch carries a synthetic commit instead: ``HEAD``'s tree,
+byte for byte, with a single parent.  The module pins that shape both
+offline (``--probe-commit``) and end to end, against a local bare
+remote -- no network, no docker, no CI run is involved.
+
 The classification now lives in ``scripts/ci_gha_verdict.sh``: a library
 of pure functions, sourced by the gate, that read the run's job list and
 say whether the red verdict is a *code* failure or an *infrastructure*
@@ -739,6 +751,234 @@ def test_ci_gha_retries_cancelled_jobs():
     assert "--job" in content, "the retry must address the cancelled job itself"
 
 
+# ---------------------------------------------------------------------------
+# what the gate publishes: the tree under test, not the local history
+# ---------------------------------------------------------------------------
+
+
+def _git(repo: Path, *args: str) -> str:
+    """Run ``git`` in ``repo`` and return its trimmed stdout."""
+    result = subprocess.run(
+        ["git", *args],
+        capture_output=True,
+        text=True,
+        cwd=str(repo),
+        timeout=60,
+    )
+    assert result.returncode == 0, (
+        f"git {' '.join(args)} failed in {repo} (exit {result.returncode}): "
+        f"{result.stderr.strip()}"
+    )
+    return result.stdout.strip()
+
+
+def _git_rc(repo: Path, *args: str) -> int:
+    """Run ``git`` in ``repo`` and return its exit code."""
+    return subprocess.run(
+        ["git", *args],
+        capture_output=True,
+        text=True,
+        cwd=str(repo),
+        timeout=60,
+    ).returncode
+
+
+def _make_repo_with_history(repo: Path) -> tuple[str, str]:
+    """Create a repository with two commits; return ``(base_sha, head_sha)``.
+
+    The second commit is the work in progress: it is what the gate is
+    asked to check, and it is the commit that must *not* travel to the
+    remote.
+    """
+    subprocess.run(
+        ["git", "init", "-q", str(repo)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    # The hooks directory is named explicitly: a machine that points
+    # ``core.hooksPath`` somewhere else would otherwise run a hook this
+    # test did not install.
+    _git(repo, "config", "core.hooksPath", str(repo / ".git" / "hooks"))
+    identity = (
+        "-c", "user.name=Test",
+        "-c", "user.email=test@example.invalid",
+        "-c", "commit.gpgsign=false",
+    )
+    (repo / "a.txt").write_text("a\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, *identity, "commit", "-qm", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+    (repo / "b.txt").write_text("b\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, *identity, "commit", "-qm", "wip")
+    head = _git(repo, "rev-parse", "HEAD")
+    return base, head
+
+
+def test_probe_commit_carries_the_head_tree_and_one_parent(tmp_path):
+    """``--probe-commit`` builds the commit the probe branch publishes.
+
+    The probe has to carry the tree under test and nothing else: one
+    commit, one parent, and none of the local work-in-progress history.
+    The mode is offline -- it touches no remote and needs no ``gh``.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    base, head = _make_repo_with_history(repo)
+
+    result = subprocess.run(
+        ["bash", str(CI_GHA), "--probe-commit", base],
+        capture_output=True,
+        text=True,
+        cwd=str(repo),
+        timeout=60,
+    )
+    assert result.returncode == 0, (
+        f"--probe-commit exited {result.returncode}: {result.stderr.strip()}"
+    )
+    probe = result.stdout.strip()
+    assert len(probe) == 40 and set(probe) <= set("0123456789abcdef"), (
+        f"--probe-commit did not print a commit SHA: {probe!r}"
+    )
+
+    # the tree under test travels unchanged
+    assert _git(repo, "rev-parse", f"{probe}^{{tree}}") == _git(
+        repo, "rev-parse", "HEAD^{tree}"
+    )
+    # the probe has exactly one parent: the base that was named
+    assert _git(repo, "rev-parse", f"{probe}^") == base
+    # it publishes exactly one commit ...
+    assert _git(repo, "rev-list", "--count", probe, "--not", base) == "1"
+    # ... and the work-in-progress commit does not travel with it
+    assert probe != head
+    assert _git_rc(repo, "merge-base", "--is-ancestor", head, probe) == 1
+
+
+#: A stand-in for the ``gh`` CLI: enough of it for the gate to reach a
+#: verdict without a network.  ``gh workflow run`` succeeds, ``gh run
+#: list`` reports one run, and ``gh run view`` reports that run as
+#: completed and successful.
+#:
+#: 2026-11-24（合入 origin/main@deb9b009）：这个名字原先与 base 侧的同名
+#: 常量撞车 —— base 侧也有一份 ``FAKE_GH``（Python 写的、按状态文件驱动，
+#: 用来把「一条 lane 真跑了并失败」「一个 job 从未被 runner 领走」这些
+#: 情形喂给 gate）。两侧各加各的，Git 的文本合并看不见「同名顶层常量」
+#: 这种冲突，于是合并结果里出现了**两个** ``FAKE_GH``：后定义的那份（就是
+#: 这一份）会把前一份整个遮住，base 侧的三条 gate 用例因此读到的是这个
+#: 只知道「completed success」的替身，而不是它们自己那份能演失败情形的
+#: 替身 —— 判据被悄悄换掉了（合并前 base 侧 24 条全绿，合并后 3 条红）。
+#: 两侧的意图都保留，但名字必须分开：base 那份仍叫 ``FAKE_GH``（它定义在
+#: 前面，base 侧的代码一个字未动），这一份改名 ``FAKE_GH_PROBE`` —— 它只
+#: 服务于下面那条「推的是 commit、不是历史」的用例，而那条用例根本不看
+#: CI 判决，只要 gate 跑完并给出结论即可。
+FAKE_GH_PROBE = """#!/usr/bin/env bash
+case "${1:-}" in
+    workflow)
+        exit 0
+        ;;
+    run)
+        case "${2:-}" in
+            list)
+                echo "424242"
+                exit 0
+                ;;
+            view)
+                case "$*" in
+                    *"--json jobs"*) exit 0 ;;
+                    *"--json status,conclusion"*) echo "completed success"; exit 0 ;;
+                esac
+                exit 0
+                ;;
+        esac
+        exit 0
+        ;;
+esac
+exit 0
+"""
+
+
+def test_ci_gha_pushes_the_commit_not_the_history(tmp_path):
+    """The probe branch must publish the tree, not the local history.
+
+    The gate gets the tree under test onto a CI runner by pushing a
+    throw-away branch.  What that push publishes is the whole point: it
+    must be ``HEAD``'s tree on a single synthetic commit, never the local
+    history that sits behind ``HEAD``.  This runs the real script against
+    a local bare remote -- no network -- and reads back what the push
+    actually published.
+    """
+    work = tmp_path / "work"
+    bare = tmp_path / "bare.git"
+    work.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "--bare", str(bare)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    base, head = _make_repo_with_history(work)
+    _git(work, "remote", "add", "origin", str(bare))
+    # ``origin/main`` exists and is an ancestor of HEAD, so the gate finds
+    # a merge base and the probe gets a parent.
+    _git(work, "push", "-q", "origin", f"{base}:refs/heads/main")
+    _git(work, "fetch", "-q", "origin")
+
+    # The pre-push hook records what the push publishes.  It is installed
+    # after the setup push, so the log holds the gate's push and nothing
+    # else.
+    push_log = tmp_path / "push-refs.txt"
+    hook = work / ".git" / "hooks" / "pre-push"
+    hook.write_text(
+        '#!/usr/bin/env bash\ncat >> "$PDT_PROBE_PUSH_LOG"\n', encoding="utf-8"
+    )
+    hook.chmod(0o755)
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake_gh = bindir / "gh"
+    fake_gh.write_text(FAKE_GH_PROBE, encoding="utf-8")
+    fake_gh.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env.get('PATH', '')}"
+    env["PDT_PROBE_PUSH_LOG"] = str(push_log)
+
+    result = subprocess.run(
+        ["bash", str(CI_GHA)],
+        capture_output=True,
+        text=True,
+        cwd=str(work),
+        env=env,
+        timeout=300,
+    )
+    assert result.returncode == 0, (
+        f"ci_gha.sh exited {result.returncode}: {result.stderr.strip()}"
+    )
+    assert "gate: PASSED" in result.stdout, result.stdout
+
+    lines = [
+        line
+        for line in push_log.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("(delete)")
+    ]
+    assert len(lines) == 1, f"expected exactly one push, got {lines!r}"
+    fields = lines[0].split()
+    pushed = fields[1]
+    remote_ref = fields[2]
+
+    assert remote_ref.startswith("refs/heads/ci-probe/"), remote_ref
+    # the published commit is not HEAD: the local history does not travel
+    assert pushed != head
+    # the tree under test does travel, unchanged
+    assert _git(bare, "rev-parse", f"{pushed}^{{tree}}") == _git(
+        work, "rev-parse", "HEAD^{tree}"
+    )
+    # and it is a single commit on top of the merge base
+    assert _git(bare, "rev-parse", f"{pushed}^") == base
+    assert _git(bare, "rev-list", "--count", pushed, "--not", base) == "1"
+    # the work-in-progress commit itself was never published
+    assert _git_rc(bare, "cat-file", "-e", f"{head}^{{commit}}") != 0
 # ---------------------------------------------------------------------------
 # 7. the probe branch carries the tree, not the branch history
 # ---------------------------------------------------------------------------

@@ -45,6 +45,7 @@ import json
 import sys
 import threading
 from pathlib import Path
+from typing import Optional
 
 import pytest
 from tests.app_source import find_def
@@ -218,6 +219,20 @@ def test_run_actually_uses_open_db():
 @pytest.fixture
 def isolated_server(tmp_path, monkeypatch):
     """Wire ``server`` to a hermetic plan dir + state.db and neutral seams."""
+    server, plan_id, project_dir, plan_dir, calls, fake = _isolate_server(
+        tmp_path, monkeypatch, returncode=0,
+    )
+    yield server, plan_id, project_dir, calls, fake
+    server._execution_state.pop(plan_id, None)
+
+
+def _isolate_server(tmp_path, monkeypatch, *, returncode: int):
+    """The isolated server, with an executor that exits with *returncode*.
+
+    ``returncode=0`` is the clean success path; anything else is the
+    executor dying — which is the path the shutdown checkpoint has to
+    be able to interrupt.
+    """
     import server
 
     plan_id = "handoff-plan"
@@ -245,6 +260,7 @@ def isolated_server(tmp_path, monkeypatch):
         lambda *a, **k: {"total": 1, "pending_or_unstarted": 0, "failed": 0},
     )
     fake = _FakeProcess()
+    fake.returncode = returncode
     monkeypatch.setattr(
         server,
         "_spawn_executor_subprocess",
@@ -259,7 +275,34 @@ def isolated_server(tmp_path, monkeypatch):
     )
 
     server._execution_state.pop(plan_id, None)
-    yield server, plan_id, project_dir, calls, fake
+    return server, plan_id, project_dir, plan_dir, calls, fake
+
+
+@pytest.fixture
+def isolated_dead_server(tmp_path, monkeypatch):
+    """The isolated server, with an executor that was killed by a signal.
+
+    ``-15`` is what a shutdown leaves behind: the executor is in the
+    server's tree, and the tree is signalled.
+    """
+    server, plan_id, project_dir, plan_dir, calls, fake = _isolate_server(
+        tmp_path, monkeypatch, returncode=-15,
+    )
+    yield server, plan_id, project_dir, plan_dir, calls, fake
+    server._execution_state.pop(plan_id, None)
+
+
+@pytest.fixture
+def isolated_exited_server(tmp_path, monkeypatch):
+    """The isolated server, with an executor that exited with code 1.
+
+    A positive exit code is the executor's *own* failure — it ran and
+    failed, rather than being killed.
+    """
+    server, plan_id, project_dir, plan_dir, calls, fake = _isolate_server(
+        tmp_path, monkeypatch, returncode=1,
+    )
+    yield server, plan_id, project_dir, plan_dir, calls, fake
     server._execution_state.pop(plan_id, None)
 
 
@@ -328,4 +371,339 @@ def test_auto_verification_fires_even_if_status_persist_fails(
     assert calls, (
         "the auto-verification hand-off was skipped when the exec_status "
         "persist raised"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 3. The watcher asks the shutdown checkpoint before it writes a verdict
+# ---------------------------------------------------------------------------
+#
+# The watcher is a **second** writer of a terminal verdict.  The startup
+# recovery scan asks the shutdown checkpoint before it calls a dead
+# executor a crash; the watcher did not, and the watcher is the earlier
+# one — it sees the executor die the moment the shutdown kills the
+# tree, while the scan only sees it a boot later.  So the watcher wrote
+# "failed" first, and the plan came back from the restart as a failed
+# run instead of a queued one.  ``failed`` is terminal: no phase
+# transition leaves it, and no scheduler waits on it.
+#
+# The rule these pins hold: **every writer of a terminal failure asks
+# the checkpoint first**, and the answer it gets is the same answer the
+# recovery scan gets.
+
+
+def _read_execution_row(db_path: Path, plan_id: str) -> dict:
+    """The durable row, as the API would read it."""
+    from state_machine.db.connection import open as open_db
+    from state_machine.repositories.execution_repository import (
+        ExecutionRepository,
+    )
+
+    conn = open_db(db_path)
+    try:
+        row = ExecutionRepository(conn).summary(plan_id)
+    finally:
+        conn.close()
+    assert row is not None, f"no execution row for {plan_id!r}"
+    return row
+
+
+def test_a_shutdown_interrupted_run_is_parked_not_failed(
+    isolated_dead_server, tmp_path, reclaim_workers
+):
+    """The executor died because the server went down: the run is parked.
+
+    The verdict of an interrupted run is "stopped" with the phase
+    "queued" — the work was interrupted, not broken, and somebody may
+    pick it up again.  "failed" is terminal and in nobody's waiting set.
+    """
+    server, plan_id, project_dir, plan_dir, calls, fake = isolated_dead_server
+
+    server.start_execution(
+        plan_id,
+        server.StartExecutionRequest(project_dir=str(project_dir)),
+    )
+
+    # The checkpoint is written while the run is live: it says "the
+    # server went down under *this* run", and a checkpoint older than
+    # the run says nothing about it.
+    from pause_state import write_pause_checkpoint
+    from shutdown_checkpoint import SHUTDOWN_STOP_REASON
+
+    write_pause_checkpoint(
+        plan_dir, kind="execution", reason=SHUTDOWN_STOP_REASON,
+    )
+
+    fake.release()
+    stuck = reclaim_workers()
+    assert not stuck, (
+        f"the execution monitor still runs after the release: {stuck!r}"
+    )
+
+    row = _read_execution_row(tmp_path / "state.db", plan_id)
+    assert row["exec_status"] == "stopped", (
+        "a run the server took down was written down as "
+        f"{row['exec_status']!r}; it should be parked as 'stopped'"
+    )
+    assert row["stop_reason"] == SHUTDOWN_STOP_REASON, (
+        f"the parked run does not say why it was parked: "
+        f"{row['stop_reason']!r}"
+    )
+    state = server._execution_state.get(plan_id) or {}
+    assert state.get("status") == "stopped", (
+        f"this process' memory disagrees with the row: {state.get('status')!r}"
+    )
+
+
+def test_a_run_that_died_on_its_own_is_still_failed(
+    isolated_exited_server, tmp_path, reclaim_workers
+):
+    """The negative control: no checkpoint means the work died, so it failed.
+
+    Without this, "always park" would pass the test above — and would
+    hide every real crash.
+
+    The reason carries the number that ended the run: the exit code
+    here, so the row says ``non_zero_exit:1`` and not a bare
+    ``non_zero_exit``.  An operator reading the row cannot tell exit 1
+    from exit 7 otherwise, and the two do not call for the same
+    response.
+    """
+    server, plan_id, project_dir, plan_dir, calls, fake = isolated_exited_server
+
+    server.start_execution(
+        plan_id,
+        server.StartExecutionRequest(project_dir=str(project_dir)),
+    )
+    fake.release()
+    stuck = reclaim_workers()
+    assert not stuck, (
+        f"the execution monitor still runs after the release: {stuck!r}"
+    )
+
+    row = _read_execution_row(tmp_path / "state.db", plan_id)
+    assert row["exec_status"] == "failed", (
+        f"an executor that died on its own was written down as "
+        f"{row['exec_status']!r}; without a checkpoint it is a crash"
+    )
+    assert row["stop_reason"] == "non_zero_exit:1", (
+        f"the failed run does not say why it failed: {row['stop_reason']!r}"
+    )
+
+
+def test_a_signalled_run_with_no_checkpoint_is_still_failed(
+    isolated_dead_server, tmp_path, reclaim_workers
+):
+    """The other negative control: a signalled executor, no checkpoint.
+
+    The signal is not the evidence.  A shutdown signsalled executor and
+    a crash that killed the executor look the same from here — the
+    difference is the checkpoint, and without one the run failed.
+
+    The reason names the signal that ended it — ``signal:15`` for the
+    SIGTERM this run was given — so the row says what killed it rather
+    than only that it died.
+    """
+    server, plan_id, project_dir, plan_dir, calls, fake = isolated_dead_server
+
+    server.start_execution(
+        plan_id,
+        server.StartExecutionRequest(project_dir=str(project_dir)),
+    )
+    fake.release()
+    stuck = reclaim_workers()
+    assert not stuck, (
+        f"the execution monitor still runs after the release: {stuck!r}"
+    )
+
+    row = _read_execution_row(tmp_path / "state.db", plan_id)
+    assert row["exec_status"] == "failed", (
+        f"a signalled executor without a checkpoint was written down as "
+        f"{row['exec_status']!r}"
+    )
+    assert row["stop_reason"] == "signal:15", (
+        f"the failed run does not say why it failed: {row['stop_reason']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 4) The restart finishes a park that the dying server left half done
+# ---------------------------------------------------------------------------
+#
+# The park is **two** writes: the execution row (``stopped`` /
+# ``server_shutdown``) and the plan's phase (``queued``).  The writer is
+# the server that is going down — the shutdown kills the executor's
+# tree, and the executor's watcher is the thread that notices — and that
+# watcher is a **daemon** thread, so the interpreter is free to stop it
+# between the two writes.
+#
+# On the real e2e story (``tests/e2e/
+# test_shutdown_checkpoint_e2e.py``): the row landed (``plan_execution.
+# updated_at`` moved to the second the tree was killed) and the phase
+# did not (``plan_routing.updated_at`` stayed on the start).  The
+# restart then found a row that said ``stopped`` — a verdict, not a live
+# run — and walked past it, because the recovery only parks a row that
+# still says ``running``.  The plan came back claiming to be
+# ``executing``, and ``executing`` is in nobody's waiting set: the
+# scheduler never picked it up again.
+#
+# So the restart has to **finish** the park.  The row's own
+# ``stop_reason`` says a park happened (``server_shutdown`` is written
+# by the park and by nothing else), and the plan's phase says whether
+# that park finished.
+
+
+def _seed_parked_plan(
+    db_path: Path,
+    plan_id: str,
+    *,
+    phase: str,
+    exec_status: str,
+    stop_reason: str,
+    exec_pid: Optional[int] = None,
+) -> None:
+    """Seed the two rows a park leaves behind — one of them half written."""
+    from state_machine.db.connection import open as open_db
+    from state_machine.db.schema import migrate
+
+    conn = open_db(db_path)
+    try:
+        migrate(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO plan_routing "
+            "(plan_id, substage, current_phase, version, completed_phases, "
+            " review_rounds, flags, verification, last_updated, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                plan_id, None, phase, 1, "[]", "{}", "{}",
+                json.dumps(
+                    {"status": "pending", "round": 0, "max_rounds": 3,
+                     "stop_reason": None}
+                ),
+                "2026-11-02T00:00:00Z", "2026-11-02T00:00:00Z",
+            ),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO plan_execution (plan_id, attempt_count, "
+            "project_dir, stop_reason, task_progress, next_run_at, card_state, "
+            "flags, exec_pid, exec_status, started_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                plan_id, 0, str(db_path.parent / "project"), stop_reason,
+                json.dumps({"tasks": {}}), None, "{}", "{}",
+                exec_pid, exec_status, "2026-11-02T00:00:00+00:00",
+                "2026-11-02T00:00:01Z",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _read_routing_phase(db_path: Path, plan_id: str) -> Optional[str]:
+    """The phase the plan is in, as the routing row says it."""
+    from state_machine.db.connection import open as open_db
+
+    conn = open_db(db_path)
+    try:
+        cur = conn.execute(
+            "SELECT current_phase FROM plan_routing WHERE plan_id = ?",
+            (plan_id,),
+        )
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    return row[0] if row is not None else None
+
+
+def _run_the_recovery(plans_dir: Path) -> None:
+    """Run the boot-time recovery scan over *plans_dir*."""
+    from routes.execution import _recover_execution_states
+
+    _recover_execution_states(plans_dir)
+
+
+def test_the_restart_finishes_a_park_the_dying_server_left_half_done(tmp_path):
+    """判据-3: a plan the shutdown interrupted comes back as ``queued``.
+
+    The row says the run was parked by a shutdown, and the plan is
+    still in the phase a running execution owns — the two halves of the
+    park disagree, because the process that wrote the first half was
+    killed before it wrote the second.  The restart finishes the park.
+    """
+    from shutdown_checkpoint import SHUTDOWN_STOP_REASON
+
+    plan_id = "half-parked-plan"
+    plans_dir = tmp_path / "plans"
+    (plans_dir / plan_id).mkdir(parents=True)
+    db_path = _make_state_db(tmp_path)
+
+    _seed_parked_plan(
+        db_path, plan_id,
+        phase="executing",
+        exec_status="stopped",
+        stop_reason=SHUTDOWN_STOP_REASON,
+    )
+
+    _run_the_recovery(plans_dir)
+
+    phase = _read_routing_phase(db_path, plan_id)
+    assert phase == "queued", (
+        "the restart did not finish the park: the plan is stranded in "
+        f"{phase!r}, and a plan in that phase is in nobody's waiting set"
+    )
+
+
+def test_a_run_that_failed_on_its_own_is_not_requeued_by_the_restart(tmp_path):
+    """The negative control: a crash is not an interruption.
+
+    Without this, "re-queue every stopped plan" would pass the test
+    above — and would resurrect every plan that actually crashed.
+    """
+    plan_id = "crashed-plan"
+    plans_dir = tmp_path / "plans"
+    (plans_dir / plan_id).mkdir(parents=True)
+    db_path = _make_state_db(tmp_path)
+
+    _seed_parked_plan(
+        db_path, plan_id,
+        phase="executing",
+        exec_status="failed",
+        stop_reason="non_zero_exit",
+    )
+
+    _run_the_recovery(plans_dir)
+
+    phase = _read_routing_phase(db_path, plan_id)
+    assert phase == "executing", (
+        f"the restart re-queued a plan that crashed: {phase!r}"
+    )
+
+
+def test_a_plan_that_moved_on_is_not_requeued_by_the_restart(tmp_path):
+    """The other negative control: a finished plan stays finished.
+
+    The parked row is old news and the phase is the plan's current
+    state: a plan that has moved on since the park owns its own phase,
+    and re-queueing it would resurrect work that already completed.
+    """
+    from shutdown_checkpoint import SHUTDOWN_STOP_REASON
+
+    plan_id = "finished-plan"
+    plans_dir = tmp_path / "plans"
+    (plans_dir / plan_id).mkdir(parents=True)
+    db_path = _make_state_db(tmp_path)
+
+    _seed_parked_plan(
+        db_path, plan_id,
+        phase="completed",
+        exec_status="stopped",
+        stop_reason=SHUTDOWN_STOP_REASON,
+    )
+
+    _run_the_recovery(plans_dir)
+
+    phase = _read_routing_phase(db_path, plan_id)
+    assert phase == "completed", (
+        f"the restart re-queued a plan that had already finished: {phase!r}"
     )

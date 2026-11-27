@@ -2784,9 +2784,28 @@ class TestCoverage:
         assert "no company labels" in evidence_str or "0 nodes" in evidence_str
 
     def test_execute_ui_validation_failed_when_subprocess_unparseable(self, verification_agent, mock_coding_tool):
-        """UI validation: FAILED (NOT SKIPPED) when subprocess returns non-JSON.
+        """UI validation: UNKNOWN (NOT PASSED, NOT SKIPPED) when the sub-agent's
+        answer cannot be parsed as a verdict.
 
-        This is critical — silently SKIPPED would let bad UI ship."""
+        The test's *name* still says "failed" — it is the historical name
+        of this case, kept so the node ID stays stable for anyone
+        selecting it by name.  What the case asserts today is the
+        corrected semantics below.
+
+        The verdict output was not compliant, so the run established
+        **nothing** about the deliverable — the sub-agent never got to
+        test the UI.  Recording that as ``FAILED`` charges the
+        deliverable for the environment's malfunction, which is the
+        mistake this distinction exists to stop, so the verdict is
+        ``UNKNOWN``.
+
+        ``UNKNOWN`` is not a silent pass either: it is neither ``PASSED``
+        nor ``SKIPPED``, so the anti-silent-skip property this case
+        guards is intact — the point is only that the *reason* it did
+        not pass is "no conclusion was reached", not "the UI is broken".
+        The reason and the raw output ride along so a reviewer can see
+        why no conclusion was reached.
+        """
         verification_agent.start_verification_round(1)
         vp = {
             "id": "VP-MUMBLE",
@@ -2796,7 +2815,15 @@ class TestCoverage:
         }
         mock_coding_tool.query_json.return_value = "I could not find a browser binary."
         result = verification_agent._execute_verification_point(vp)
-        assert result["status"] == "FAILED"
+        assert result["status"] == "UNKNOWN"
+        # The reason must say the verdict was unparseable — not that the
+        # UI failed.
+        assert "unparseable" in str(result.get("actual_result", "")), result.get(
+            "actual_result",
+        )
+        # The raw output travels with the verdict, so the record stays
+        # reviewable.
+        assert "raw_output:" in str(result.get("evidence", "")), result.get("evidence")
 
     def test_execute_ui_validation_skipped_without_reasons_is_failed(self, verification_agent, mock_coding_tool):
         """UI validation: SKIPPED verdict without reasons → FAILED (anti-silent-skip)."""
