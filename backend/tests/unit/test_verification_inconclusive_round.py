@@ -52,6 +52,12 @@ The interface contract
 ``_judged_nothing_cycle_result(report)`` is the single source of the
 judged-nothing exit — ``check_cycle_conditions`` returns it verbatim.
 
+2026-11-27: the exit is still the single source of the judged-nothing
+exit, but ``check_cycle_conditions`` now **asks the operator** when the
+round could not be judged (an ``UNKNOWN`` outcome, or the
+``INCONCLUSIVE`` gate), so the returned exit carries the two flags an
+asked question sets on top of it.
+
 On the way in, ``verification_executor.ALLOWED_STATUSES`` gains the
 word; ``verification_buckets.bucket_for_status`` files it next to
 DEFERRED (never next to FAILED — the failed bucket is the repair task's
@@ -253,7 +259,15 @@ def test_the_cycle_result_of_a_deferred_round_asks_nobody():
 
 
 def test_the_orchestrator_returns_the_same_exit(tmp_path):
-    """``check_cycle_conditions`` is the judged-nothing exit's only source."""
+    """``check_cycle_conditions`` is the judged-nothing exit's only source.
+
+    2026-11-27: the round asked the operator what happens next (the
+    unjudged round's question), so the exit carries the two flags an
+    asked question sets — ``waiting_for_user`` and
+    ``needs_operator_decision``.  Everything **else** is still the
+    judged-nothing exit, verbatim: the same keys, the same values, and
+    no repair task.
+    """
     from verification.orchestrator import VerificationOrchestrator
 
     plan_dir = tmp_path / "plans" / "test-plan"
@@ -283,7 +297,11 @@ def test_the_orchestrator_returns_the_same_exit(tmp_path):
         orch.start_verification_cycle(round_number=1)
         result = orch.check_cycle_conditions(_inconclusive_report())
 
-    assert result == _judged_nothing_cycle_result(_inconclusive_report()), result
+    expected = _judged_nothing_cycle_result(_inconclusive_report())
+    # The asked question is the one difference between the two exits.
+    assert result.pop("waiting_for_user") is True, result
+    assert expected.pop("waiting_for_user") is False, expected
+    assert result == expected, result
     assert result["repair_tasks"] == [], result
     assert result["needs_operator_decision"] is True, result
     assert result["budget_exhausted_in"] == "unit", result

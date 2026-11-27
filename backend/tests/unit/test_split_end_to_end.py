@@ -164,6 +164,7 @@ def orch(tmp_path, monkeypatch):
     o._current_repair_tasks = []
     o._current_vp_splits = []
     o._waiting_for_user = False
+    o._unjudged_streak = 0
     o.logger = None
 
     class _Gen:
