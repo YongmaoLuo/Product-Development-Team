@@ -81,6 +81,13 @@ languages on purpose: the CI gate reads one string out of both
 changelogs, and a section that exists in only one of them is a section
 half the readers never see.*
 
+- **A deferred full gate runs at the round's close once its blocker is
+  green.** `backend/verification_executor.py` re-reads the round's own
+  ledger before the close rerun, so a gate layer the process-local table
+  forgot (a rebuilt executor, a resumed round) is still dispatched; the
+  ledger's reason is kept when the executor cannot see the blocking
+  verdict. A gate that was never asked is no longer reported as a skip.
+
 - **A gate that could not answer no longer cites the previous round's
   junit.** `backend/verification_ci_runner.py` decides freshness from the
   report's own timestamp and fails the gate INCONCLUSIVE when this round

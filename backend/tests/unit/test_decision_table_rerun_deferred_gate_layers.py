@@ -44,7 +44,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 #: The backend package root — this file lives at ``backend/tests/unit/``.
 _BACKEND_DIR = Path(__file__).resolve().parents[2]
@@ -127,9 +127,28 @@ class _ExecutorStub:
 
     # -- what the method under test calls ---------------------------------
 
+    def _discover_deferred_gate_layers(self) -> None:
+        """Bring the deferred layers back from the ledger.
+
+        The stub's deferred layers *are* its ledger (it has no store of
+        its own), so there is nothing to bring back — the method under
+        test may call this, and the stub answers honestly: the layers it
+        starts from are the ones the ledger knows about.
+        """
+        return None
+
     def _gate_block_reason_for(self, gate: Any) -> str:
         """The reason this layer is still blocked (empty = it may run)."""
         return self.block_reason
+
+    def _reason_names_a_verdict(self, reason: str) -> bool:
+        """Whether the reason names a verdict that really exists.
+
+        Mirrors :meth:`VerificationExecutor._reason_names_a_verdict`: a
+        reason that says "尚未" says the executor cannot *see* the
+        blocking verdict.
+        """
+        return "尚未" not in reason
 
     def _mark_layer_deferred(
         self,
@@ -163,6 +182,28 @@ class _FailingExecutorStub(_ExecutorStub):
         raise RuntimeError("this item blew up")
 
 
+class _LedgerOnlyBlockedExecutorStub(_ExecutorStub):
+    """A stand-in whose layer **only the ledger** knows about.
+
+    The memory table is empty when the round close starts; the ledger still
+    holds the deferral, so the discovery brings the layer back.  The
+    executor cannot see the blocking verdict ("尚未产生结论"), so the reason
+    already in the ledger ("结论为 BLOCKED") is more accurate than anything
+    the executor could recompute — it must be left alone.
+    """
+
+    #: The reason a rebuilt executor computes when it cannot see the
+    #: blocking verdict.
+    _BLIND_REASON = "Phase 1 的 VP-001 本轮尚未产生结论"
+
+    def __init__(self) -> None:
+        super().__init__(self._BLIND_REASON, [])
+
+    def _discover_deferred_gate_layers(self) -> None:
+        """Bring the deferred layer back from the ledger."""
+        self._deferred_gate_layers.append([{"id": "L1"}])
+
+
 class _UnstartableExecutorStub(_ExecutorStub):
     """A stand-in whose dispatch cannot even be started."""
 
@@ -184,6 +225,9 @@ _STUB_DISPATCHABLE = _ExecutorStub("", [_LAYER_ONE])
 _STUB_BLOCKED = _ExecutorStub(_BLOCK_REASON, [_LAYER_ONE])
 #: The layer has no items to run.
 _STUB_EMPTY_LAYER = _ExecutorStub("", [_LAYER_EMPTY])
+#: The layer is known to the ledger only, and is still blocked by a verdict
+#: this executor cannot see.
+_STUB_LEDGER_ONLY_BLOCKED = _LedgerOnlyBlockedExecutorStub()
 
 
 #: The table itself (§4.2).  Every row names a judgment value, and the
@@ -202,6 +246,11 @@ CASES = [
     Case(
         id="empty-layer-skipped",
         inputs=(_STUB_EMPTY_LAYER, None),
+        expected=[],
+    ),
+    Case(
+        id="ledger-only-layer-kept-with-its-ledger-reason",
+        inputs=(_STUB_LEDGER_ONLY_BLOCKED, None),
         expected=[],
     ),
 ]
@@ -384,6 +433,177 @@ def test_a_dispatch_that_cannot_start_does_not_break_the_round(caplog) -> None:
     assert len(_dispatch_failures(caplog)) == 1, (
         "a dispatch that could not start is a failure of the dispatch "
         "itself, and it has to be recorded as one"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The ledger is the truth: a gate layer the memory table forgot still runs
+# ---------------------------------------------------------------------------
+#
+# 2026-11-27 (``20261116-K-Magic-DNS``, round 1): the two Phase 2 full gates
+# (VP-017 / VP-018) were deferred by the gate at ~11:13 with the reason
+# "Phase 2 关卡延后：Phase 1 的 VP-001 结论为 BLOCKED".  VP-001 turned green
+# later that round (PASSED at 12:04) — and the two gates were **never
+# dispatched at all** (no ``vp_start`` event for them in the round's log),
+# while the report still carried the DEFERRED entry with the *stale* BLOCKED
+# reason.
+#
+# The break is not in the judgment (the gate is only released by Phase 1's
+# final conclusion) but in **where the deferred layer is remembered**:
+# ``_deferred_gate_layers`` lives in the process, the ledger
+# (``_verdicts_by_round``) is the round's truth.  The round close runs on a
+# **rebuilt** executor (resume / new process / restart), so its in-memory
+# table is empty — and ``rerun_deferred_gate_layers`` used to consult *only*
+# that table.  "This layer has not run yet" was therefore forgotten at the
+# one moment that could still act on it.
+
+
+def _gate_plan() -> Dict[str, Any]:
+    """A minimal plan: one Phase 1 VP and one Phase 2 full gate."""
+    return {
+        "vps": [
+            {
+                "id": "VP-001",
+                "method": "automated_test",
+                "title": "vp VP-001",
+                "expected_result": "通过",
+                "test_command": "pytest tests/VP-001.py",
+            },
+            {
+                "id": "VP-GATE",
+                "method": "automated_test",
+                "title": "全量 Nightly CI",
+                "expected_result": "通过",
+                "test_command": "pytest tests/VP-GATE.py",
+                "verification_phase": 2,
+                "phase_order": 1,
+            },
+        ]
+    }
+
+
+def _round_executor(
+    plan: Dict[str, Any],
+    tmp_path: Path,
+    verdicts: Dict[str, str],
+    *,
+    round_no: Optional[int] = 1,
+):
+    """An executor whose runner answers ``verdicts[vp_id]``.
+
+    Two executors built on the same ``tmp_path`` share one ``plan_dir``,
+    so the second one reads back what the first one wrote — that is how a
+    round continuation sees the earlier part of the same round (and how
+    the process-local deferred-layer table is lost while the ledger
+    survives).
+    """
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    calls: List[str] = []
+
+    async def runner(vp: Dict[str, Any]) -> Dict[str, Any]:
+        vp_id = vp["id"]
+        calls.append(vp_id)
+        return {
+            "status": verdicts.get(vp_id, "PASSED"),
+            "reasons": [f"{vp_id} stub"],
+            "evidence": {},
+        }
+
+    executor = VerificationExecutor(
+        verification_plan=plan,
+        plan_id="plan-ledger-gate",
+        plan_dir=plan_dir,
+        sub_agent_runner=runner,
+        verif_repo=None,
+        round_no=round_no,
+    )
+    return executor, calls
+
+
+def test_the_round_close_reruns_a_gate_layer_only_the_ledger_knows(
+    tmp_path: Path,
+) -> None:
+    """A deferred gate layer the memory table forgot is still re-run at the close.
+
+    The production sequence (2026-11-27, ``20261116-K-Magic-DNS`` round 1):
+
+    1. Phase 1's VP-001 is BLOCKED → the Phase 2 gate layer is deferred:
+       the ledger gets the ``DEFERRED`` entry with
+       ``evidence.gate == "verification_phase_2"``;
+    2. VP-001 turns green (its verdict is rewritten to PASSED);
+    3. the **round close** runs — on a rebuilt executor, whose process-local
+       deferred-layer table is empty while the ledger still holds the
+       deferral;
+    4. the gate layer must really run in this round, and its DEFERRED entry
+       must be superseded by a real conclusion.
+
+    Without step 3 consulting the ledger, the layer is silently dropped:
+    the round ends with a gate that was never asked, and the report keeps
+    the DEFERRED entry — with a reason that names a blocker which is
+    already green.
+    """
+    plan = _gate_plan()
+
+    # 1. The blocker is BLOCKED → the gate layer is deferred.
+    first, first_calls = _round_executor(
+        plan, tmp_path, {"VP-001": "BLOCKED"}, round_no=1,
+    )
+    asyncio.run(first.run(max_parallel=1))
+    assert "VP-GATE" not in first_calls, (
+        "the gate must not run while the blocker is still blocked"
+    )
+    assert first._verdicts["VP-GATE"]["status"] == "DEFERRED", (
+        "the deferred gate layer must leave a DEFERRED entry in the ledger"
+    )
+    assert first._verdicts["VP-GATE"]["evidence"] == {
+        "gate": "verification_phase_2",
+    }, (
+        "the DEFERRED entry has to be the one the gate itself wrote — it is "
+        "what tells the round close that this layer has not run yet"
+    )
+
+    # 2. The blocker turns green.
+    first.record_verdict(
+        "VP-001",
+        {"status": "PASSED", "reasons": ["重试通过"], "evidence": {}},
+    )
+
+    # 3. The round close — on a rebuilt executor: the ledger is still
+    #    there, the process-local table is not.
+    second, second_calls = _round_executor(plan, tmp_path, {}, round_no=1)
+    assert second._deferred_gate_layers == [], (
+        "the process-local deferred-layer table is empty after the rebuild: "
+        "nobody in this process remembers that the gate layer has not run"
+    )
+    assert second._current_round_bucket()["VP-GATE"]["status"] == "DEFERRED", (
+        "the ledger still holds the deferral — it is the round's truth"
+    )
+    assert second._verdicts["VP-001"]["status"] == "PASSED", (
+        "the blocker is green in this executor's view"
+    )
+
+    dispatched = asyncio.run(second.rerun_deferred_gate_layers())
+
+    # 4. The layer really ran, in this round.
+    assert dispatched == ["VP-GATE"], (
+        "the round close has to dispatch the gate layer the ledger says has "
+        f"not run yet; it dispatched {dispatched!r}"
+    )
+    assert "VP-GATE" in second_calls, (
+        "the gate layer's items have to actually run, not just be reported"
+    )
+    assert second._verdicts["VP-GATE"]["status"] == "PASSED", (
+        "the re-run has to produce a real conclusion — a DEFERRED left "
+        "behind reads as 'this round never asked'"
+    )
+    assert not [
+        entry
+        for entry in second._current_round_bucket().values()
+        if isinstance(entry, dict)
+        and str(entry.get("status") or "") == "DEFERRED"
+    ], (
+        "the DEFERRED entry has to be superseded by the real conclusion"
     )
 
 
