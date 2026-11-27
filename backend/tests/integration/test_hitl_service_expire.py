@@ -421,7 +421,138 @@ def test_expire_survives_an_unreadable_row(
 
 
 # ---------------------------------------------------------------------------
-# 3. The scheduling gate
+# 3. The default action is carried out
+# ---------------------------------------------------------------------------
+
+
+class _Recorder:
+    """A stand-in for the terminal executor; it only remembers calls."""
+
+    def __init__(self) -> None:
+        self.calls: List[Dict[str, Any]] = []
+
+    def __call__(
+        self,
+        *,
+        plan_id: str,
+        decision_id: str,
+        option: Any,
+        note: str,
+        plan_dir: Any,
+        record: Any,
+    ) -> None:
+        self.calls.append(
+            {
+                "plan_id": plan_id,
+                "decision_id": decision_id,
+                "option": option,
+                "note": note,
+                "plan_dir": plan_dir,
+                "record": record,
+            }
+        )
+
+
+def _terminal_decision(
+    plan_dir: Path,
+    plan_id: str,
+    store: HitlStore,
+) -> Decision:
+    """A terminal decision whose sidecar names it."""
+    from verification import terminal_decision_session
+
+    created = service.create_decision(
+        _request(
+            plan_id=plan_id,
+            options=["rerun_this_round", "revise_criterion"],
+            default_option="revise_criterion",
+        ),
+        plan_dir,
+        store=store,
+        now=NOW,
+    )
+    record = terminal_decision_session.build_record(
+        decision_id=created.decision_id,
+        plan_id=plan_id,
+    )
+    terminal_decision_session.save(plan_dir, record)
+    return created
+
+
+@pytest.mark.integration
+def test_expire_carries_out_the_default_terminal_action(
+    plan_dir: Path, plan_id: str, store: HitlStore
+) -> None:
+    """A defaulted *terminal* decision still gets its action carried out.
+
+    The clock is an answerer like any other: the ``default_option`` of
+    a terminal decision names an **action** (close the plan, reset the
+    round, revise the criterion), and an action that is never carried
+    out leaves the plan exactly where the human would have changed it
+    — the round stays failed and the criterion stays in force.
+
+    The sweep is the only thing that can carry it out: the terminal
+    round asked its question, the round returned, and no waiter is
+    left to wake up.  So the same action a human's answer would have
+    carried out has to be carried out here, exactly once, with the
+    ``default_option`` as the option.
+    """
+    _write_config(plan_dir)
+    created = _terminal_decision(plan_dir, plan_id, store)
+    recorder = _Recorder()
+
+    assert (
+        service.expire_due(
+            now=_past_deadline(created), store=store, execution=recorder
+        )
+        == 1
+    )
+
+    assert len(recorder.calls) == 1
+    call = recorder.calls[0]
+    assert call["option"] == "revise_criterion"
+    assert call["plan_id"] == plan_id
+    assert call["decision_id"] == created.decision_id
+    assert Path(call["plan_dir"]) == resolve_plans_dir() / plan_id
+
+
+@pytest.mark.integration
+def test_expire_does_not_dispatch_an_ordinary_default(
+    plan_dir: Path, plan_id: str, store: HitlStore, monkeypatch: Any
+) -> None:
+    """An ordinary defaulted decision dispatches nothing.
+
+    Without a terminal sidecar there is no action to carry out: the
+    decision was an ordinary question, and the scheduling gate opens by
+    itself once the row is ``defaulted`` (the gate is computed from
+    the status).  Dispatching anything here would run a plan's
+    ordinary default as if it were a terminal action.
+
+    The default hand-off to the executor is what is watched here, so
+    the assertion is on the production path itself rather than on an
+    injected stand-in.
+    """
+    _write_config(plan_dir)
+    created = service.create_decision(
+        _request(
+            plan_id=plan_id,
+            options=["rerun_this_round", "revise_criterion"],
+            default_option="revise_criterion",
+        ),
+        plan_dir,
+        store=store,
+        now=NOW,
+    )
+    recorder = _Recorder()
+    monkeypatch.setattr(service, "_dispatch_terminal_execution", recorder)
+
+    assert service.expire_due(now=_past_deadline(created), store=store) == 1
+
+    assert recorder.calls == []
+
+
+# ---------------------------------------------------------------------------
+# 4. The scheduling gate
 # ---------------------------------------------------------------------------
 
 
