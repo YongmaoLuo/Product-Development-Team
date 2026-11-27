@@ -65,16 +65,19 @@ rate = 2 / 4 = **0.5**
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -297,6 +300,94 @@ def _publish_durable_copy(primary: Path, destination: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# provider_order 的本地 stub
+# ---------------------------------------------------------------------------
+#
+# 服务的 lifespan 会走 ``server._lifespan`` → ``load_providers()`` →
+# ``provider_order.load_fallback_order()``，而那条链**只**问 CC Switch 的
+# ``/api/providers``（``provider_order._PROVIDERS_PATH``），**没有第二个来源**
+# 可以回退 —— 问不到就抛 ``ProviderOrderError``，启动直接失败。
+#
+# CC Switch 是另一个程序，本仓不起它：一台干净的机器上没有它，于是服务死在
+# **环境**上而不是**代码**上。这条用例要验的是收敛汇总端点，不是「这台机器
+# 上碰巧跑着 CC Switch」。
+#
+# 所以这里起一个最小的本地 stub：对 ``GET /api/providers`` 回答 200 +
+# ``{"providers": []}``。空链是一个**合法答案**（CC Switch 说「我一个
+# provider 都没有」），``server.load_providers`` 遇到空链会降级成「没有
+# provider，照样起来」。这条用例用 ``PDT_LLM_MODE=scripted``，不需要真
+# provider。
+#
+# 接法是仓库里既有的那一个：把 ``PDT_PROVIDER_ORDER_API_URL`` 指过去 ——
+# 那个变量是 API base 的**最高优先级**来源
+# （``provider_order._API_BASE_ENV_VARS``）。同一个做法见
+# ``backend/tests/e2e/test_provider_quota_wake_end_to_end.py``。
+
+#: 正在跑的 stub 服务、它的 base url、它的线程。``None`` = 没起。
+_PROVIDER_STUB: Optional[ThreadingHTTPServer] = None
+_PROVIDER_STUB_BASE_URL: Optional[str] = None
+_PROVIDER_STUB_THREAD: Optional[threading.Thread] = None
+
+
+class _ProviderStubHandler(BaseHTTPRequestHandler):
+    """只回答 provider 列表的那个 handler。"""
+
+    def do_GET(self) -> None:  # noqa: N802 —— BaseHTTPRequestHandler 的命名
+        path = self.path.split("?", 1)[0]
+        if path != "/api/providers":
+            self.send_error(404)
+            return
+        body = json.dumps({"providers": []}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args: object) -> None:
+        """别把访问日志混进 pytest 的输出里。"""
+
+
+def _start_provider_stub() -> str:
+    """起那个 provider stub，返回它的 base url。幂等。
+
+    端口是 ``0`` —— 让内核挑一个当下没人占的端口，于是这个 stub 不会
+    跟机器上的任何东西撞车（也不用去赌某个固定端口是空的）。
+    """
+    global _PROVIDER_STUB, _PROVIDER_STUB_BASE_URL, _PROVIDER_STUB_THREAD
+    if _PROVIDER_STUB is not None and _PROVIDER_STUB_BASE_URL:
+        return _PROVIDER_STUB_BASE_URL
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ProviderStubHandler)
+    thread = threading.Thread(
+        target=server.serve_forever,
+        name="pdt-provider-order-stub",
+        daemon=True,
+    )
+    thread.start()
+    host, port = server.server_address[0], server.server_address[1]
+    _PROVIDER_STUB = server
+    _PROVIDER_STUB_BASE_URL = f"http://{host}:{port}"
+    _PROVIDER_STUB_THREAD = thread
+    return _PROVIDER_STUB_BASE_URL
+
+
+def _stop_provider_stub() -> None:
+    """把 stub 停下。幂等 —— 没起过也调它不会出事。"""
+    global _PROVIDER_STUB, _PROVIDER_STUB_BASE_URL, _PROVIDER_STUB_THREAD
+    server, thread = _PROVIDER_STUB, _PROVIDER_STUB_THREAD
+    _PROVIDER_STUB = None
+    _PROVIDER_STUB_BASE_URL = None
+    _PROVIDER_STUB_THREAD = None
+    if server is None:
+        return
+    server.shutdown()
+    server.server_close()
+    if thread is not None:
+        thread.join(timeout=10)
+
+
+# ---------------------------------------------------------------------------
 # 服务进程
 # ---------------------------------------------------------------------------
 
@@ -343,6 +434,13 @@ def _server_env() -> Dict[str, str]:
     inherited = env.get("PYTHONPATH", "")
     if inherited:
         pythonpath.append(inherited)
+    stub_base = _PROVIDER_STUB_BASE_URL
+    if not stub_base:
+        raise AssertionError(
+            "the provider-order stub is not running; without it the service "
+            "would ask CC Switch on its default port and die in the lifespan "
+            "for an environment reason instead of a code one"
+        )
     env.update(
         {
             "PDT_STATE_DB_PATH": str(STATE_DB),
@@ -353,6 +451,7 @@ def _server_env() -> Dict[str, str]:
             "PDT_LLM_MODE": "scripted",
             "PDT_DISABLE_FALSIFIABILITY_PROBE": "1",
             "PDT_ALLOWED_HOSTS": "127.0.0.1",
+            "PDT_PROVIDER_ORDER_API_URL": stub_base,
             "PYTHONPATH": os.pathsep.join(pythonpath),
         }
     )
@@ -559,8 +658,12 @@ def test_convergence_summary_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None
         f"would answer from somebody else's server and this case would "
         f"certify a chain it never started"
     )
-    proc = _start_server()
+    # stub 必须先于服务起来：服务一启动就会问 CC Switch 要 provider 链，
+    # 那时候 stub 得已经在那儿回答了。
+    _start_provider_stub()
+    proc: Optional[subprocess.Popen] = None
     try:
+        proc = _start_server()
         _wait_for_health(proc)
         assert proc.poll() is None, (
             f"the server this case started is already gone "
@@ -590,7 +693,9 @@ def test_convergence_summary_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None
             finally:
                 browser.close()
     finally:
-        _stop_server(proc)
+        if proc is not None:
+            _stop_server(proc)
+        _stop_provider_stub()
 
     # --- 服务确实回答了，且回答的是 JSON ---------------------------------
     assert isinstance(answer, dict), f"the page answered with {answer!r}"
