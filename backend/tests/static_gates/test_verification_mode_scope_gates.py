@@ -1791,8 +1791,14 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 按本 gate 的既定流程把冻结基线前移到本分支的批准态哈希（`shasum -a 256`
     # 实测值 `4b114d48…`）。表内条目集合与条目数不变、断言强度不变：被钉文件的
     # 范围不变、sha256 仍逐字节比对，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    #
+    # 2026-11-27：死轮次的 repair 回调在 `_on_repair_complete` 最前面加了一道
+    # `_round_is_invalidated(plan_id, round_token)` 守卫 —— watchdog 已判死的轮次
+    # 醒来后不再开始新一轮，兑现 `test_zombie_terminal_refusal.py` 的契约：每个
+    # 可能唤醒轮次的入口都要先问 `is_invalidated`。按同一既定流程把冻结基线前移到
+    # 本次批准态哈希（`shasum -a 256` 实测值 `5f2ef1fc…`）。断言强度同样不变。
     "backend/verification_loop.py": (
-        "4b114d480e1117109c0ee1a3cbfe33f144659e3382bfd951e29aa24d95772741"
+        "5f2ef1fc6f7e7039ae752932619cf46a6cfa792b1378f818005d69f7ad1bf23d"
     ),
 }
 
