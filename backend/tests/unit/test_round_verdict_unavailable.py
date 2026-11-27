@@ -312,7 +312,14 @@ def test_the_orchestrator_returns_the_same_exit(tmp_path):
         orch.start_verification_cycle(round_number=1)
         result = orch.check_cycle_conditions(report)
 
-    assert result == _judged_nothing_cycle_result(report), result
+    # 2026-11-27: an unjudged round now asks the operator what happens
+    # next (the question the terminal branch used to be the only source
+    # of), so the exit says a question is waiting — the rest of the
+    # judged-nothing exit is unchanged.
+    expected = _judged_nothing_cycle_result(report)
+    expected["waiting_for_user"] = True
+    expected["needs_operator_decision"] = True
+    assert result == expected, result
     assert result["stop_reason"] == VERDICT_UNAVAILABLE, result
     assert result["environment_blocked"] is False, result
     assert result["repair_tasks"] == [], result
