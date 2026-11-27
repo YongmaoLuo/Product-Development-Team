@@ -381,7 +381,7 @@ def test_a_judged_round_resets_the_unjudged_streak(
         orch = _orchestrator(temp_plan_dir, temp_project_dir, mock_coding_tool)
         _run_round(orch, _passed_report())
 
-    assert _tracking(temp_plan_dir)["unjudged_streak"] == 0, _tracking(
+    assert _tracking(temp_plan_dir).get("unjudged_streak", 0) == 0, _tracking(
         temp_plan_dir
     )
 

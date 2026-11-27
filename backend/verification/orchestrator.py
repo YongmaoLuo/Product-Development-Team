@@ -2180,12 +2180,20 @@ class VerificationOrchestrator:
                 if count > 0
             },
             "last_round": int(self._last_round),
-            # 2026-11-27: how many rounds in a row the chain could not be
-            # judged at all.  It rides along with the counts — the same
-            # file, the same write, the same read — because the streak
-            # has to survive the fresh orchestrator every round builds.
-            "unjudged_streak": int(self._unjudged_streak),
         }
+        # 2026-11-27: how many rounds in a row the chain could not be
+        # judged at all. It rides along with the counts — the same file,
+        # the same write, the same read — because the streak has to
+        # survive the fresh orchestrator every round builds.
+        #
+        # The key is written only when there is a streak to record, for
+        # the same reason the fingerprint key is: an empty (zero) count
+        # carries no information, and a payload without the key is
+        # exactly the legacy shape — which the reader already tolerates.
+        # So a plan that has never had an unjudged round writes the file
+        # it has always written.
+        if self._unjudged_streak:
+            payload["unjudged_streak"] = int(self._unjudged_streak)
         # 2026-10-27: the fingerprints ride along with the counts — the
         # same file, the same write, the same read. They are what tells
         # "the same failure again" (the count) apart from "a different
