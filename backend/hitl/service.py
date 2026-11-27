@@ -199,6 +199,7 @@ from typing import (
 )
 
 from config_paths import resolve_plans_dir, resolve_state_db_path
+from framework.ids import validate_plan_id
 from hitl.models import Decision, DecisionMode, DecisionRequest, DecisionStatus
 from hitl.store import HitlStore
 from hitl.terminal_decision_port import default_port, resolve_tool_cwd
@@ -1363,6 +1364,7 @@ def expire_due(
     now: Optional[datetime] = None,
     *,
     store: Optional[HitlStore] = None,
+    execution: Optional[Callable[..., Any]] = None,
 ) -> int:
     """Resolve the ``auto`` decisions whose deadline has passed.
 
@@ -1372,6 +1374,12 @@ def expire_due(
     ``strict`` question is not touched — there is no substitute for a
     human — and neither is an ``unroutable`` one: nobody was asked, so
     the backend must not answer on their behalf.
+
+    A **terminal** decision is answered by the clock like any other
+    one: its ``default_option`` names an *action*, and the action is
+    carried out here — see :func:`_carry_out_default`.  Without that,
+    the clock would record an answer nobody acts on and the plan would
+    stay exactly where the answer was meant to change it.
 
     The function is **idempotent**.  The store's compare-and-set only
     moves ``pending`` rows, so the second sweep finds nothing left to
@@ -1387,6 +1395,12 @@ def expire_due(
         so a test can assert an expiry without waiting for one.
     store:
         The store to write through.  One is opened for the call when
+        not given.
+    execution:
+        The callable that carries a terminal action out.  The clock is
+        an answerer like any other, so the action the ``default_option``
+        names is carried out exactly as a human's answer would carry it
+        out.  The default hand-off to the executor is used when it is
         not given.
 
     Returns
@@ -1422,7 +1436,72 @@ def expire_due(
                 continue
             if opened.mark_defaulted(decision.decision_id):
                 migrated += 1
+                # The compare-and-set above has a single winner, so the
+                # default action is carried out exactly once.
+                _carry_out_default(
+                    decision, store=opened, execution=execution
+                )
         return migrated
+
+
+def _carry_out_default(
+    decision: Decision,
+    *,
+    store: HitlStore,
+    execution: Optional[Callable[..., Any]] = None,
+) -> None:
+    """Carry out the default action of a decision the clock answered.
+
+    The clock's answer is an answer like any other, so the action it
+    names is carried out the way a human's answer would carry it out:
+    the plan's terminal record tells whether the answer names an
+    *action* at all, and a decision whose plan has no such record is
+    an ordinary one — the scheduling gate opens by itself once the row
+    is ``defaulted``, and there is nothing to dispatch.
+
+    Nothing here raises.  The sweep runs on the heartbeat, and one
+    broken record must not stop the next sweep from running: a plan
+    whose directory cannot be resolved, a sidecar that cannot be read
+    and an executor that raises are all recorded and left behind.
+    """
+    try:
+        plan_dir = resolve_plans_dir() / validate_plan_id(decision.plan_id)
+    except Exception as exc:  # noqa: BLE001 - a sweep must not fail
+        logger.warning(
+            "hitl default action: plan=%s decision=%s has no plan "
+            "directory (%s)",
+            decision.plan_id,
+            decision.decision_id,
+            exc,
+        )
+        return
+
+    record = _terminal_record(plan_dir)
+    if record is None or not _is_terminal_record(record, decision):
+        # Not a terminal decision: nothing to carry out.
+        return
+
+    dispatcher = (
+        execution if execution is not None else _dispatch_terminal_execution
+    )
+    try:
+        dispatcher(
+            plan_id=decision.plan_id,
+            decision_id=decision.decision_id,
+            option=decision.default_option,
+            note="",
+            plan_dir=plan_dir,
+            record=record,
+        )
+    except Exception as exc:  # noqa: BLE001 - an answer must not fail
+        logger.exception(
+            "hitl default action: plan=%s decision=%s could not be "
+            "dispatched (%s)",
+            decision.plan_id,
+            decision.decision_id,
+            exc,
+        )
+        _audit_execution_failure(store, decision, decision.default_option, exc)
 
 
 def heartbeat_decision(
