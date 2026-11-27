@@ -24,8 +24,10 @@ contract each:
      'evidence': {...}})`` returns silently — no exception.
 
   3. ``test_validate_verdict_rejects_invalid_status``
-     ``_validate_verdict({'status': 'UNKNOWN', ...})`` raises
-     :class:`ValueError` (the schema-error subclass).
+     ``_validate_verdict({'status': 'NOT_A_STATUS', ...})`` raises
+     :class:`ValueError` (the schema-error subclass).  (``UNKNOWN``
+     used to be the example of an invalid status; it is a real status
+     now — "no verdict was reached" — so the schema accepts it.)
 
   4. ``test_collect_verdicts_returns_all``
      After recording verdicts for 3 VPs via
@@ -223,18 +225,18 @@ def test_validate_verdict_rejects_invalid_status(
 
     The task spec input is::
 
-        bad = {'status': 'UNKNOWN', 'reasons': [], 'evidence': {}}
+        bad = {'status': 'NOT_A_STATUS', 'reasons': [], 'evidence': {}}
         pytest.raises(ValueError): executor._validate_verdict(bad)
     """
     executor = _make_executor(sample_plan, tmp_plan_dir, mock_runner)
 
-    bad = {"status": "UNKNOWN", "reasons": [], "evidence": {}}
+    bad = {"status": "NOT_A_STATUS", "reasons": [], "evidence": {}}
 
     with pytest.raises(ValueError) as excinfo:
         executor._validate_verdict(bad)
     # Sanity: the error names the offending status so debugging is
     # possible without re-running with a debugger.
-    assert "UNKNOWN" in str(excinfo.value)
+    assert "NOT_A_STATUS" in str(excinfo.value)
     assert "status" in str(excinfo.value)
 
 

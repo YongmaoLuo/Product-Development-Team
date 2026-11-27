@@ -13,16 +13,27 @@ on disk".  The OTHER branch — no marker, work still pending — must keep
 behaving exactly as it did before the fix:
 
 * the repair runner records ``status='failed'`` and
-  ``stop_reason='repair_exited_with_unfinished_tasks:N'``;
-* the post-repair callback does NOT park the plan: it takes the
-  undrained-repair guard, writes ``loop_stopped`` with
-  ``repair_batch_not_drained:<reason>:<n>_pending`` and bumps its
-  counter by exactly ONE.
+  ``stop_reason='repair_batch_not_drained:<n>_pending'`` — the batch
+  did not drain, so work was LEFT behind;
+* the post-repair callback does NOT park the plan: an undrained batch
+  is work left behind, not a verdict about the code, so the callback
+  RE-DISPATCHES the repair executor and writes NO terminal at all.
+  Only when the bounded guard trips does the chain stop, and then with
+  a reason of its own — ``repair_never_drained:<reason>:<n>x``.
 
 This file is that negative control.  It pins the shape of the non-quota
 path so that a future change cannot "helpfully" park every undrained
 round, rename either reason, or let the FIRST callback trip the
 ``repair_never_drained`` threshold.
+
+The wording in this file's NAME is historical
+---------------------------------------------
+``repair_exited_with_unfinished_tasks`` is how the repair path USED to
+spell "the batch did not drain".  It now classifies its own ending (see
+``verification.repair_outcome.classify_repair_outcome``) and writes
+``repair_batch_not_drained:<n>_pending`` instead.  Only the STRING
+changed: the behaviour pinned here — the bounded re-dispatch, and the
+single terminal that only the bound may write — is the contract.
 
 The chain it covers
 -------------------
@@ -244,8 +255,12 @@ def test_no_marker_keeps_repair_exited_with_unfinished_tasks(
     The executor exited 0 and two repair tasks are still pending.  There
     is no quota marker on disk, so nothing about this round says "the
     providers ran dry" — the round genuinely did not drain, and the
-    pre-existing wording for that is
-    ``repair_exited_with_unfinished_tasks:N``.
+    wording for that is ``repair_batch_not_drained:<n>_pending``.
+
+    (This test's NAME still says ``repair_exited_with_unfinished_tasks``
+    — that is the historical spelling of the same fact.  The name is
+    kept so the node id stays selectable; the string it names is not
+    what the runner writes any more.)
 
     The quota-park fix must not swallow this branch: if it did, every
     undrained repair round would be reported as parked and the operator
@@ -266,7 +281,7 @@ def test_no_marker_keeps_repair_exited_with_unfinished_tasks(
 
     state = _run_repair(monkeypatch, tmp_path, plan_id, db_path, returncode=0)
 
-    assert state["stop_reason"] == "repair_exited_with_unfinished_tasks:2"
+    assert state["stop_reason"] == "repair_batch_not_drained:2_pending"
     assert state["status"] == "failed"
     assert state["repair_unfinished_tasks"] == 2
     assert state["executor_finished_cleanly"] is True
@@ -290,16 +305,22 @@ def test_no_marker_keeps_repair_exited_with_unfinished_tasks(
 def test_callback_records_loop_stopped_with_undrained_reason(
     monkeypatch, tmp_path, db_path,
 ):
-    """Without a quota marker the callback still stops the chain.
+    """An undrained batch is re-dispatched; only the BOUND stops the chain.
 
-    The repair path recorded ``repair_exited_with_unfinished_tasks:2``
-    and the repair queue still holds two pending tasks.  The callback
-    must therefore take the undrained-repair guard: bump its counter
-    by ONE, write ``loop_stopped`` with the
-    ``repair_batch_not_drained:<reason>:<n>_pending`` reason, and stop.
+    The repair path recorded ``repair_batch_not_drained:2_pending`` and
+    the repair queue still holds two pending tasks.  That reason says
+    "there is still work to run" — it is NOT a verdict about the code,
+    so the callback must NOT write a terminal: it re-dispatches the
+    repair executor and lets the chain continue.
 
-    It must NOT park the plan: ``waiting_for_quota`` is the word for
-    "the providers ran dry", and nobody said that here.
+    The re-dispatch is BOUNDED (``_MAX_REPAIR_NOT_DRAINED_GUARDS``).
+    The FIRST callback may not trip the threshold, and the chain stops
+    only on the last permitted hit — and then with a reason of its own
+    (``repair_never_drained:<reason>:<n>x``), so the batch's own reason
+    is never mistaken for a verdict about the code.
+
+    It must NOT park the plan either: ``waiting_for_quota`` is the word
+    for "the providers ran dry", and nobody said that here.
     """
     plan_id = "p-nc"
     _seed_plan(
@@ -326,28 +347,61 @@ def test_callback_records_loop_stopped_with_undrained_reason(
     with server._execution_state_lock:
         server._execution_state[plan_id] = {
             "_source": "repair_execution",
-            "stop_reason": "repair_exited_with_unfinished_tasks:2",
+            "stop_reason": "repair_batch_not_drained:2_pending",
         }
+
+    # The re-dispatch is a stand-in: this test pins what the callback
+    # DOES, and the real executor would spawn a subprocess.
+    redispatch = MagicMock(return_value={"status": "started"})
+    monkeypatch.setattr(server, "_run_repair_execution_async", redispatch)
 
     with patch("server._record_verification_terminal") as terminal:
         callback = verification_loop._make_repair_on_complete(plan_id, tmp_path)
+
+        # 1st undrained stop: work is LEFT behind → run it again.  No
+        # terminal may be written: the chain is still running.
         callback(0)
+        assert terminal.call_count == 0, (
+            "an undrained batch is work left behind, not a verdict — "
+            f"no terminal may be written yet ({terminal.call_args_list!r})"
+        )
+        assert redispatch.call_count == 1, (
+            "the undrained batch must be re-dispatched — the queued work "
+            "still has to run"
+        )
+        assert verification_loop._repair_not_drained_guard[plan_id] == 1
 
-    assert terminal.call_count == 1, (
-        "expected exactly one terminal verdict, got "
-        f"{terminal.call_args_list!r}"
-    )
-    assert terminal.call_args.args == (
-        plan_id,
-        "loop_stopped",
-        "repair_batch_not_drained:repair_exited_with_unfinished_tasks:2:2_pending",
-    )
+        # 2nd undrained stop: still below the bound → same answer.
+        callback(0)
+        assert terminal.call_count == 0, (
+            "the re-dispatch is bounded, but the bound is not reached yet "
+            f"({terminal.call_args_list!r})"
+        )
+        assert redispatch.call_count == 2
+        assert verification_loop._repair_not_drained_guard[plan_id] == 2
 
-    # The first hit bumps the counter by ONE.  A second bump would take
-    # it to 2, and the third would cross the ``repair_never_drained``
-    # threshold — a different reason with a different shape.
-    assert verification_loop._repair_not_drained_guard[plan_id] == 1
-    assert not terminal.call_args.args[2].startswith("repair_never_drained")
+        # 3rd undrained stop: the bound trips.  Now the chain stops —
+        # exactly once, and with a reason of its own.
+        callback(0)
+        assert redispatch.call_count == 2, (
+            "the re-dispatch is bounded — the executor is not dispatched a "
+            "fourth time"
+        )
+        assert terminal.call_count == 1, (
+            "expected exactly one terminal verdict, got "
+            f"{terminal.call_args_list!r}"
+        )
+        assert terminal.call_args.args == (
+            plan_id,
+            "loop_stopped",
+            "repair_never_drained:repair_batch_not_drained:2_pending:3x",
+        )
+        assert verification_loop._repair_not_drained_guard[plan_id] == 3
+
+    # The terminal reason is the NEVER-DRAINED one, not the batch's own
+    # reason: ``repair_batch_not_drained:`` is the word for "there is
+    # still work to run", and it must never be used as a verdict.
+    assert terminal.call_args.args[2].startswith("repair_never_drained:")
 
     # The plan was NOT parked.
     assert _read_routing_phase(plan_id, db_path) != QUOTA_WAIT_PHASE

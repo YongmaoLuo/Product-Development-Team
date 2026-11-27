@@ -79,6 +79,7 @@ Run them with:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shlex
@@ -95,6 +96,8 @@ _BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
+import orphan_reaper as reaper  # noqa: E402
+import process_identity as identity  # noqa: E402
 import service_manager as sm  # noqa: E402
 from service_declaration import ServiceDeclaration  # noqa: E402
 from tests.unit.test_service_manager import _free_port  # noqa: E402
@@ -226,13 +229,39 @@ def _is_the_service_spawn(argv: Any) -> bool:
 
 
 class _FakeProc:
-    """The process object a recorded spawn hands back."""
+    """The process object a recorded spawn hands back.
+
+    It answers the whole ``subprocess`` protocol, not just ``poll``:
+    ``subprocess.run`` — which is how a census is taken — builds a
+    process through the same ``Popen`` this recorder replaces, and it
+    needs ``communicate``, ``poll`` and the context-manager protocol to
+    finish.  A recorder that only answers ``poll`` turns a census into
+    an exception, and an exception on the spawn path is worse than the
+    census: it unwinds the caller that asked for it.
+    """
 
     pid = 999997
     returncode = None
 
+    def __init__(self, argv: Optional[List[str]] = None) -> None:
+        self.argv = list(argv or [])
+        #: ``subprocess.run`` reads this back when it builds its result.
+        self.args = list(argv or [])
+
     def poll(self) -> None:
         return None
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def communicate(self, input=None, timeout=None):
+        return ("", "")
+
+    def __enter__(self) -> "_FakeProc":
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        return False
 
 
 class _Spawn:
@@ -316,7 +345,28 @@ class _Spawn:
         return self.spawned_kwargs
 
 
-def _is_service_spawn(argv: Optional[Sequence[str]]) -> bool:
+def _is_service_spawn(argv: List[str]) -> bool:
+    """Is this argv the service's own spawn?
+
+    The service is started through the detached wrapper: the
+    interpreter, ``-c``, and the wrapper's own source — which is the
+    source that calls ``setsid()``.  Anything else the spawn path asks
+    for is a **census**: a helper process the path derives in order to
+    learn something about the process it just started.
+
+    The distinction matters because a census is a second process on the
+    spawn path, and the spawn path's *shape* is what this file pins.  A
+    recorder that took "the last process" for "the service" would read
+    the census as the service.
+    """
+    return (
+        len(argv) >= 3
+        and argv[1] == "-c"
+        and "setsid" in argv[2]
+    )
+
+
+def _is_spawn_by_the_interpreter(argv: Optional[Sequence[str]]) -> bool:
     """True when *argv* is the spawn of the service itself.
 
     The spawn path probes the machine around the spawn it makes: it
@@ -336,6 +386,11 @@ def _is_service_spawn(argv: Optional[Sequence[str]]) -> bool:
     :func:`_is_the_service_spawn` says which of the spawns carries
     the detached wrapper.  The recorder tells them apart by the
     wrapper's shape; this one says what a probe is.
+
+    The name is not the one base side gave it: this branch already
+    had a helper called ``_is_service_spawn``, and it answers the
+    stronger question (the wrapper's shape), so the two judgements
+    keep their own names rather than shadowing each other.
     """
     if not argv:
         return False
@@ -372,8 +427,42 @@ def _install_recorders(monkeypatch, declared: str = "") -> _Spawn:
         # ``os.posix_spawn`` answers with the new process' pid.
         return _FakeProc.pid
 
+    def _watch_the_census_door(module) -> None:
+        """Record what the census asks for, through the door it uses.
+
+        The census does not go through the module-level
+        ``subprocess.Popen`` this recorder replaces: it goes through the
+        ``Popen`` its own module captured at import time (see
+        ``process_identity._REAL_POPEN``), because the census is an
+        observation point and an observation point a fixture can
+        replace is not one -- a census that vanished from the record is
+        a census that hid a second process.
+
+        So the recorder watches **that** door as well.  A recorder that
+        watched only the replaced one would never see the probe, and the
+        pin that says "a probe is not the service" would pass by never
+        seeing one.  The census still runs for real: the watcher hands
+        the work to the door it found.
+        """
+        real = module._REAL_POPEN
+
+        def _watcher(argv, *args, **kwargs):
+            record.calls.append((list(argv), dict(kwargs)))
+            record.probe_argvs.append(list(argv))
+            return real(argv, *args, **kwargs)
+
+        monkeypatch.setattr(module, "_REAL_POPEN", _watcher)
+
     monkeypatch.setattr(sm.subprocess, "Popen", _fake_popen)
     monkeypatch.setattr(os, "posix_spawn", _fake_posix_spawn)
+    # 2026-11-19（合并 base 之后）：两侧的意图都要留下——普查不得被
+    # 模块级 ``subprocess.Popen`` 的替身劫持（本分支的机制：普查走
+    # 各模块导入期捕获的 ``_REAL_POPEN``），而普查留下的痕迹又必须
+    # 录得到（base 侧「探针不是服务」那条判断的前提：它要真的看见
+    # 一次 ``ps``）。这两条并不冲突：录身多看一道门——普查真正走的
+    # 那道门——替身仍然只拦模块级那一道。
+    _watch_the_census_door(reaper)
+    _watch_the_census_door(identity)
     return record
 
 
@@ -619,13 +708,689 @@ def test_argv_preserves_start_cmd_verbatim(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 2b. The registry does not change what the spawn path does
+# ---------------------------------------------------------------------------
+#
+# The registry is a *record* of the spawn, not a part of it.  When the
+# registry was in play the spawn path answered a question it did not
+# have to answer — "when did this process start?" — by running a
+# ``ps``, and that census rode along with the spawn: a second process
+# on a path whose shape is pinned, observed as a second service.
+#
+# So the observed sequence has to be the same either way, and exactly
+# one of the spawns may be the service.
+
+
+def _is_owner_census(argv: List[str]) -> bool:
+    """Is this argv the census of *this* process' own start time?
+
+    The owner marker answers "which process started this one", and the
+    answer is the owner's own start time.  The backend installs that
+    marker at boot, so the census that fills it in is a boot cost and
+    not a spawn cost.
+
+    It still shows up here, because the marker is read once and cached:
+    the first run to ask for it pays for the census and the next one
+    does not.  Comparing a run that asked with a run that did not would
+    show a difference that has nothing to do with the registry, so the
+    boot cost is left out of what is compared.  A census about *any
+    other* pid -- the service's own, say -- is not left out: that one
+    is the spawn path asking about the process it started.
+    """
+    return (
+        len(argv) >= 2
+        and os.path.basename(argv[0]) == "ps"
+        and str(os.getpid()) in argv
+    )
+
+
+def _census_about(argv: List[str], pid: int) -> bool:
+    """Is this argv a census of *pid*'s start time?
+
+    A census is a helper process the spawn path derives in order to
+    learn something about a process it started -- ``ps -o lstart= -p
+    <pid>`` is the shape of it.  The pid in the argv is what says
+    *which* process was asked about.
+    """
+    return (
+        len(argv) >= 2
+        and os.path.basename(argv[0]) == "ps"
+        and str(pid) in argv
+    )
+
+
+def _observed_spawns(monkeypatch, tmp_path, *, registry, port):
+    """The spawns the spawn path asked for, with and without a registry.
+
+    The port is the caller's: the two runs have to be comparable, and
+    the port is part of the environment the child is handed (``PDT_SVC_
+    <NAME>_PORT``), so two runs on two ports are two runs whose
+    environments differ for a reason that has nothing to do with the
+    registry.
+
+    The owner's own census is left out (see :func:`_is_owner_census`):
+    it is a boot cost, and the boot cost lands on whichever run asks
+    first.
+    """
+    if registry is None:
+        monkeypatch.delenv("PDT_SPAWN_REGISTRY", raising=False)
+    else:
+        monkeypatch.setenv("PDT_SPAWN_REGISTRY", str(registry))
+    record, _runtime = _start_recording(
+        monkeypatch, tmp_path, port=port,
+    )
+    return [
+        (argv, kwargs) for argv, kwargs in record.spawns
+        if not _is_owner_census(argv)
+    ]
+
+
+#: The parts of a spawn signature, named -- so a failure can say *what*
+#: differs instead of printing two enormous tuples.
+_SIGNATURE_PARTS = ("argv", "kwargs", "env-keys", "env-digest", "cwd")
+
+
+def _spawn_signature(spawns):
+    """A comparable summary of a spawn sequence.
+
+    The registry's own variable is left out: it is the *input* to the
+    comparison, not part of the spawn's shape.
+
+    The environment is summarised by its **keys** and by a digest of its
+    contents -- never by its values.  The child's environment carries
+    this machine's credentials, and a test that prints them puts them
+    into the test output, into the CI log, and into whatever collects
+    that log; a digest says "these two environments differ" without
+    saying what they are.
+    """
+    signature = []
+    for argv, kwargs in spawns:
+        env = dict(kwargs.get("env") or {})
+        env.pop("PDT_SPAWN_REGISTRY", None)
+        digest = hashlib.sha256(
+            "\0".join(f"{key}={env[key]}" for key in sorted(env)).encode("utf-8")
+        ).hexdigest()
+        signature.append((
+            tuple(argv),
+            tuple(sorted(kwargs)),
+            tuple(sorted(env)),
+            digest,
+            str(kwargs.get("cwd") or ""),
+        ))
+    return signature
+
+
+def _differing_parts(left, right):
+    """The names of the signature parts that differ, per spawn."""
+    differences = []
+    for index, (one, other) in enumerate(zip(left, right)):
+        differing = [
+            name for name, a, b in zip(_SIGNATURE_PARTS, one, other) if a != b
+        ]
+        differences.append((index, tuple(differing)))
+    if len(left) != len(right):
+        differences.append(("length", (len(left), len(right))))
+    return differences
+
+
+def test_the_spawn_sequence_does_not_depend_on_the_spawn_registry(
+    monkeypatch, tmp_path
+):
+    """判据-1: with and without the registry, the spawn is the same spawn.
+
+    One service, one spawn — whether or not anything is writing the
+    service down.
+    """
+    port = _free_port()
+    without = _observed_spawns(
+        monkeypatch, tmp_path, registry=None, port=port,
+    )
+    with_registry = _observed_spawns(
+        monkeypatch, tmp_path, registry=tmp_path / "spawn-registry.jsonl",
+        port=port,
+    )
+
+    sig_without = _spawn_signature(without)
+    sig_with = _spawn_signature(with_registry)
+
+    assert sig_without == sig_with, (
+        "the spawn registry changed the spawn sequence:\n"
+        f"  without the registry: {[list(a) for a, _ in without]!r}\n"
+        f"  with the registry:    {[list(a) for a, _ in with_registry]!r}\n"
+        f"  differing parts: {_differing_parts(sig_without, sig_with)!r}"
+    )
+
+    wrapper_spawns = [
+        argv for argv, _kwargs in with_registry if _is_service_spawn(argv)
+    ]
+    assert len(wrapper_spawns) == 1, (
+        f"the spawn path started {len(wrapper_spawns)} services: "
+        f"{wrapper_spawns!r}"
+    )
+
+
+def test_the_spawn_path_derives_no_process_but_the_service(
+    monkeypatch, tmp_path
+):
+    """判据-1: the spawn path derives no process of its own.
+
+    The service is started through the detached wrapper, and that is
+    the *only* process the start path may ask for.  A helper process
+    derived along the way -- a ``ps`` census to learn when the service
+    started, say -- is a second process on a path whose shape is
+    pinned: every observer of the spawn (the unit tests, the repro
+    harness) reads the last process asked for, and reads the census as
+    the service.
+
+    The census is not observable by its name here -- it is observable by
+    its *absence*: the recorded sequence has to be the service and
+    nothing else.
+    """
+    spawns = _observed_spawns(
+        monkeypatch, tmp_path, registry=None, port=_free_port(),
+    )
+
+    assert len(spawns) == 1, (
+        "the spawn path derived a process besides the service:\n"
+        + "\n".join(f"  {argv!r}" for argv, _kwargs in spawns)
+    )
+    assert _is_service_spawn(spawns[0][0]), (
+        f"the only process the spawn path asked for is not the service: "
+        f"{spawns[0][0]!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2c. The registry costs the spawn path nothing, and says how to read it
+# ---------------------------------------------------------------------------
+#
+# The registry is a *record* of the spawn: the run writes down the
+# process it started, so that the process can be given back when the
+# run is over.  Two things about that record are pinned here.
+#
+# The first is the cost.  The registry used to answer "when did this
+# process start?" by running a ``ps`` about the service's own pid, and
+# the census rode along with the spawn -- a second process on a path
+# whose shape is pinned.  The spawn path already knows the answer (it
+# has just started the process), so the record is written from what the
+# spawn path knows and the census is gone.
+#
+# The second is the *unit*.  The spawn path reads the start time from
+# the kernel in epoch seconds; the platform's own reading is in the
+# platform's own unit -- clock ticks since boot on Linux, whole
+# seconds elsewhere.  A record compared with the wrong unit is a
+# mismatch -- and a mismatch is read as "somebody else's process", so
+# the run would leave its own service running and never give it back.
+
+
+def test_the_registry_does_not_census_the_service(monkeypatch, tmp_path):
+    """Writing the service down does not ask the platform about it.
+
+    The census the registry used to take was about the service's own
+    pid, and it rode along with the spawn.  The spawn path has just
+    started the process, so it knows the answer without asking.
+    """
+    spawns = _observed_spawns(
+        monkeypatch, tmp_path,
+        registry=tmp_path / "spawn-registry.jsonl",
+        port=_free_port(),
+    )
+
+    censuses = [
+        argv for argv, _kwargs in spawns
+        if _census_about(argv, _FakeProc.pid)
+    ]
+    assert censuses == [], (
+        "the registry asked the platform when the service started:\n"
+        + "\n".join(f"  {argv!r}" for argv in censuses)
+    )
+
+
+def _detached_child() -> subprocess.Popen:
+    """A child that outlives the test, in a session of its own."""
+    return subprocess.Popen(
+        ["sleep", "30"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2d. One ruler, and a census nobody can take away
+# ---------------------------------------------------------------------------
+#
+# The registry records *when* the service started, and the reaper reads
+# that record back to decide whether the pid it holds is still the
+# service.  Two things have to hold for that to work:
+#
+# * the record and the reading are on **one ruler** -- epoch seconds,
+#   from the same source.  A record written in clock ticks and a
+#   reading taken in epoch seconds are two readings of one instant
+#   that never match, and the mismatch is read as "somebody else's
+#   process": the run then leaves its own service running.
+# * the census is an **observation point**.  Replacing the module-level
+#   ``subprocess.Popen`` must not be able to take it away, because a
+#   census that vanished from the record is a census nobody saw -- and
+#   a census nobody saw is a census that hid a second process.
+
+
+def _observed_start_epoch(pid: int) -> float:
+    """The start time of *pid*, in epoch seconds, as the platform says it."""
+    observed = reaper._epoch_start_seconds(pid)
+    assert observed, "the platform could not read the start time at all"
+    return float(observed)
+
+
+def _simulate_the_linux_ruler(monkeypatch, epoch: float) -> str:
+    """Make the platform answer in clock ticks since boot, as Linux does.
+
+    ``/proc`` speaks in ticks and ``ps`` speaks in epoch seconds, and
+    the Linux branch is the one the CI runs on -- so it is simulated
+    here.  The tick count is derived from *epoch*, so that the two can
+    be compared, and the boot time is what turns the ticks back into a
+    time.
+
+    Returns the tick count, so a test can say "the record holds the
+    platform's own unit" when it holds it.
+    """
+    hz = os.sysconf("SC_CLK_TCK") or 100
+    boot = epoch - 500.0
+    ticks = str(int(round((epoch - boot) * hz)))
+    monkeypatch.setattr(reaper, "_PROC_START_UNIT_IS_TICKS", True)
+    monkeypatch.setattr(reaper, "_proc_start_ticks", lambda pid: ticks)
+    monkeypatch.setattr(reaper, "_boot_time", lambda: boot)
+    return ticks
+
+
+def test_a_recorded_start_time_is_read_back_on_the_ruler_it_was_written_in(
+    monkeypatch, tmp_path
+):
+    """A service this run started is recognised as this run's.
+
+    The platform's own unit is taken away here -- the Linux case,
+    simulated -- and the record still has to be recognised.  A record
+    compared with the wrong unit is a mismatch, and the mismatch is
+    read as "somebody else's process": the run would leave its own
+    service running.
+
+    The simulation has to act on the ruler the **reaping side** reads:
+    the reaper asks the platform for the start time when it decides
+    whether the pid it holds is still ours, and that reading -- not the
+    one the owner marker uses -- is what the record is compared with.
+    """
+    registry = tmp_path / "spawn-registry.jsonl"
+    monkeypatch.setenv(reaper.SPAWN_REGISTRY_ENV, str(registry))
+    child = _detached_child()
+    try:
+        epoch = _observed_start_epoch(child.pid)
+        _simulate_the_linux_ruler(monkeypatch, epoch)
+
+        # The production path: the service manager writes the service
+        # down when it starts it.
+        sm._register_spawned_service(sm.ServiceRuntime(
+            name="spawn-shape",
+            port=0,
+            pid=child.pid,
+            pgid=None,
+            start_epoch=epoch,
+        ))
+        entries = reaper.read_spawn_registry(registry)
+        assert len(entries) == 1, (
+            f"the registry holds {entries!r} instead of one entry"
+        )
+
+        reaped = reaper.reap_spawned_processes(
+            registry, reason="the gate is over", grace_seconds=3.0,
+        )
+        assert {int(entry["pid"]) for entry in reaped} == {child.pid}, (
+            f"the run did not recognise the service it started: {reaped!r}"
+        )
+    finally:
+        _kill_group(child.pid, child.pid)
+
+
+def _registered_start_epoch(monkeypatch, tmp_path, child) -> str:
+    """What the production path writes down for *child*."""
+    registry = tmp_path / "spawn-registry.jsonl"
+    monkeypatch.setenv(reaper.SPAWN_REGISTRY_ENV, str(registry))
+    epoch = _observed_start_epoch(child.pid)
+    _simulate_the_linux_ruler(monkeypatch, epoch)
+    sm._register_spawned_service(sm.ServiceRuntime(
+        name="spawn-shape",
+        port=0,
+        pid=child.pid,
+        pgid=None,
+        start_epoch=epoch,
+    ))
+    entries = reaper.read_spawn_registry(registry)
+    assert len(entries) == 1, (
+        f"the registry holds {entries!r} instead of one entry"
+    )
+    return str(entries[0].get("start_epoch") or "")
+
+
+def test_the_registry_records_the_start_time_in_epoch_seconds(
+    monkeypatch, tmp_path
+):
+    """The record is epoch seconds -- the ruler the reaper reads on.
+
+    The platform's own unit is clock ticks since boot, and a record
+    written in ticks is read against epoch seconds: the two never
+    match, the mismatch is read as "somebody else's process", and the
+    service this run started is never given back.
+    """
+    child = _detached_child()
+    try:
+        recorded = _registered_start_epoch(monkeypatch, tmp_path, child)
+    finally:
+        _kill_group(child.pid, child.pid)
+
+    assert recorded, "the registry recorded no start time at all"
+    value = float(recorded)
+    assert abs(value - time.time()) < 60.0, (
+        f"the registry recorded {recorded!r}, which is not a time in epoch "
+        f"seconds -- it is the platform's own unit"
+    )
+
+
+def test_a_record_read_on_another_ruler_is_not_our_process(
+    monkeypatch, tmp_path
+):
+    """The same record, read in the platform's own unit, is a stranger's.
+
+    This is the mismatch seen from the other side: the pid is alive,
+    the record is there, and the two readings are on different scales --
+    so the process is not ours and is left alone.
+    """
+    registry = tmp_path / "spawn-registry.jsonl"
+    child = _detached_child()
+    try:
+        recorded = _registered_start_epoch(monkeypatch, tmp_path, child)
+        assert recorded, "the registry recorded no start time at all"
+
+        # The reaping side now answers in the platform's own unit.
+        monkeypatch.setattr(
+            reaper, "_epoch_start_seconds", lambda pid: "12345678",
+        )
+        reaped = reaper.reap_spawned_processes(
+            registry, reason="the gate is over", grace_seconds=3.0,
+        )
+        survivors = reaper.read_spawn_registry(registry)
+    finally:
+        _kill_group(child.pid, child.pid)
+
+    assert reaped == [], (
+        f"a record read on another ruler was given back: {reaped!r}"
+    )
+    assert [int(entry["pid"]) for entry in survivors] == [child.pid], (
+        f"the entry was dropped although nothing was given back: "
+        f"{survivors!r}"
+    )
+
+
+def _spy_on_popen(monkeypatch) -> List[List[str]]:
+    """Replace the module-level ``Popen`` and record what it is asked for.
+
+    The stand-in hands the work to the real ``Popen``, so the census
+    still happens -- what is recorded here is only what went through
+    the *replaced* door.
+    """
+    seen: List[List[str]] = []
+    real_popen = subprocess.Popen
+
+    def _fake_popen(argv, *args, **kwargs):
+        if isinstance(argv, (list, tuple)):
+            seen.append([str(part) for part in argv])
+        else:
+            seen.append([str(argv)])
+        return real_popen(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+    return seen
+
+
+def _censuses(seen: List[List[str]]) -> List[List[str]]:
+    """The ``ps`` spawns that went through the replaced ``Popen``."""
+    return [
+        argv for argv in seen
+        if argv and os.path.basename(argv[0]) == "ps"
+    ]
+
+
+def test_the_census_is_not_hijacked_by_a_replaced_popen(monkeypatch):
+    """The census still runs when the module-level ``Popen`` is replaced.
+
+    The census is an observation point.  A fixture that replaces
+    ``subprocess.Popen`` would take the observation point with it, and
+    the process the spawn path derives would vanish from the record --
+    which is how a census came to be read as "the service spawned
+    twice".  So the census has to run for real, and it has to run
+    *outside* the replaced door.
+    """
+    seen = _spy_on_popen(monkeypatch)
+    pid = os.getpid()
+
+    assert reaper._ps_start_epoch(pid), (
+        "the census did not run at all"
+    )
+    assert reaper._ps_start_epochs([pid]), (
+        "the batched census did not run at all"
+    )
+    assert identity._run_ps(pid), (
+        "the identity fallback did not run at all"
+    )
+    assert sm._run(["ps", "-o", "lstart=", "-p", str(pid)]), (
+        "the service manager's helper did not run at all"
+    )
+
+    censuses = _censuses(seen)
+    assert censuses == [], (
+        "the census was spawned through the replaced Popen:\n"
+        + "\n".join(f"  {argv!r}" for argv in censuses)
+    )
+
+
+def test_the_registry_holds_the_service_and_no_census(monkeypatch, tmp_path):
+    """The record names the service, and only the service.
+
+    A census is a process the spawn path derives in order to learn
+    something; it is never the thing the run started, so it never
+    belongs in the registry of the processes this run started.
+    """
+    registry = tmp_path / "spawn-registry.jsonl"
+    monkeypatch.setenv(reaper.SPAWN_REGISTRY_ENV, str(registry))
+    seen = _spy_on_popen(monkeypatch)
+
+    _record, runtime = _start_recording(
+        monkeypatch, tmp_path, port=_free_port(),
+    )
+    entries = reaper.read_spawn_registry(registry)
+
+    assert [int(entry["pid"]) for entry in entries] == [runtime.pid], (
+        f"the registry holds {entries!r} instead of the service alone"
+    )
+    assert _censuses(seen) == [], (
+        "the spawn path's census went through the replaced Popen:\n"
+        + "\n".join(f"  {argv!r}" for argv in _censuses(seen))
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2e. The name the registry wrote down, and the program it names
+# ---------------------------------------------------------------------------
+#
+# The registry records *what* the service was as well as *when* it
+# started: next to the spelling of the command line it writes down the
+# **identity** of the executable slot -- the family the program belongs
+# to ("python", "pypy", or the name itself).  The launcher rewrites
+# ``argv[0]`` after the exec, so the spelling alone is not something the
+# live process can be compared against; the identity is the ruler the
+# two sides are read under.
+#
+# Two rules have to hold at once, and each of them came from one side of
+# the merge:
+#
+# * the **recorded** name is the ruler.  When the ledger carries one, the
+#   live side is measured against it -- and a name can only ever
+#   *prevent* a match, never make one.
+# * with no recorded name, **two spellings of one program are one
+#   program**: the same file -- or the same macOS framework bundle -- is
+#   the same program, whatever it is called.
+
+#: A start time, in epoch seconds, for the synthetic live process below.
+_CREATE_TIME = 1_700_000_000.5
+
+#: The pid of that synthetic live process.  It is never this process:
+#: the identity rules refuse to match the reader itself.
+_LIVE_PID = 424242
+
+
+def _live_identity(cmdline) -> identity.ProcessIdentity:
+    """The identity a live process reports for *cmdline*."""
+    return identity.ProcessIdentity(
+        pid=_LIVE_PID, create_time=_CREATE_TIME, cmdline=cmdline,
+    )
+
+
+def _one_program_under_two_names(tmp_path):
+    """A program, and a second name for it.
+
+    Returns the program and a symlink that points at it.  The two names
+    are not the same *family* -- that is the point: a name that reduces
+    to another family can only be recognised as the same program by the
+    file behind it.
+    """
+    program = tmp_path / "service-interpreter"
+    program.write_text("#!/bin/sh\nexec \"$@\"\n")
+    launcher = tmp_path / "launcher"
+    launcher.symlink_to(program)
+    return program, launcher
+
+
+def test_the_recorded_name_is_the_ruler_the_live_side_is_measured_on(
+    tmp_path
+):
+    """The name the ledger wrote down is what the live side is measured on.
+
+    The launcher rewrites ``argv[0]`` after the exec, so the record's
+    own spelling is not something the live process can be compared
+    against: the ledger writes the *identity* of that slot down next to
+    it, and that identity is the ruler.
+
+    The recorded name can only ever **prevent** a match.  The pair below
+    is one file under two names -- without a recorded name it is one
+    program (the next pin), and with one it is not, because the live
+    side answers to a name the ledger never wrote down.
+    """
+    program, launcher = _one_program_under_two_names(tmp_path)
+    recorded = (str(program), "-c", "import time; time.sleep(1)")
+    alias = identity.executable_identity(recorded[0])
+    assert alias == "service-interpreter", (
+        f"the recorded name is {alias!r} instead of the name of the program"
+    )
+
+    assert not identity.matches(
+        _live_identity(
+            (str(launcher), "-c", "import time; time.sleep(1)")
+        ),
+        create_time=_CREATE_TIME,
+        cmdline=recorded,
+        argv0_alias=alias,
+    ), (
+        "the live side was recognised although it answers to a name the "
+        "ledger never wrote down"
+    )
+
+    # The name is a ruler, not a wall: the same family is recognised,
+    # under the spelling the platform gives it after the re-exec.
+    python_recorded = (
+        "/opt/venv/bin/python3", "-c", "import time; time.sleep(1)",
+    )
+    python_alias = identity.executable_identity(python_recorded[0])
+    assert python_alias == "python", (
+        f"the recorded name is {python_alias!r} instead of the family"
+    )
+    assert identity.matches(
+        _live_identity(
+            (
+                "/opt/Python.app/Contents/MacOS/Python",
+                "-c",
+                "import time; time.sleep(1)",
+            )
+        ),
+        create_time=_CREATE_TIME,
+        cmdline=python_recorded,
+        argv0_alias=python_alias,
+    ), (
+        "the live side was refused although it answers to the recorded name"
+    )
+
+    # And a program of another family is refused, whatever the ledger
+    # said: a name can only ever prevent a match, never make one.
+    assert not identity.matches(
+        _live_identity(("/bin/bash", "-c", "import time; time.sleep(1)")),
+        create_time=_CREATE_TIME,
+        cmdline=python_recorded,
+        argv0_alias=python_alias,
+    ), (
+        "a program of another family was recognised as the recorded one"
+    )
+
+
+def test_without_a_recorded_name_the_file_is_the_program(tmp_path):
+    """Two spellings of one file are one program.
+
+    A process that re-executes itself is reported under its new
+    ``argv[0]`` from then on, and the recording made a moment earlier
+    still names the old one.  With no recorded name to rule by, the two
+    spellings are compared through the file behind them: the same file
+    is the same program, whatever it is called.
+    """
+    program, launcher = _one_program_under_two_names(tmp_path)
+    recorded = (str(program), "-c", "import time; time.sleep(1)")
+
+    assert identity.matches(
+        _live_identity(
+            (str(launcher), "-c", "import time; time.sleep(1)")
+        ),
+        create_time=_CREATE_TIME,
+        cmdline=recorded,
+    ), (
+        "the same file under another name was not recognised as the same "
+        "program"
+    )
+
+    # A different file under another name is another program.
+    other = tmp_path / "other-interpreter"
+    other.write_text("#!/bin/sh\nexec \"$@\"\n")
+    assert not identity.matches(
+        _live_identity((str(other), "-c", "import time; time.sleep(1)")),
+        create_time=_CREATE_TIME,
+        cmdline=recorded,
+    ), (
+        "a different file was recognised as the recorded program"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 3. A real child runs in a session of its own
 # ---------------------------------------------------------------------------
 
 
 def _kill_group(pgid: Optional[int], pid: Optional[int]) -> None:
-    """Tear a spawned child down: its process group, then the child."""
-    if not pid:
+    """Tear a spawned child down: its process group, then the child.
+
+    The signals are drawn from a named scope -- the pid of the child
+    this test spawned -- so the file says, in the same breath, which
+    processes it is allowed to touch.  Nothing outside the scope is
+    ever signalled.
+    """
+    pid_scope: Tuple[int, ...] = tuple(
+        target for target in (pid,) if target
+    )
+    if not pid_scope:
         return
     try:
         own_group = os.getpgid(0)
@@ -636,12 +1401,13 @@ def _kill_group(pgid: Optional[int], pid: Optional[int]) -> None:
             os.killpg(pgid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
             pass
+    for target in pid_scope:
+        try:
+            os.kill(target, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
     try:
-        os.kill(pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
-    try:
-        os.waitpid(pid, 0)
+        os.waitpid(pid_scope[0], 0)
     except (ChildProcessError, OSError):
         pass
 

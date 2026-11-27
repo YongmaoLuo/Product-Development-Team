@@ -42,6 +42,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 import service_manager as sm  # noqa: E402
+from process_identity import ProcessIdentity  # noqa: E402
 from service_declaration import ServiceDeclaration  # noqa: E402
 from service_freshness import PortProbe  # noqa: E402
 from tests import _host_load  # noqa: E402
@@ -1712,6 +1713,112 @@ def test_stop_service_escalates_when_sigterm_is_ignored(tmp_path):
         assert result["killed"], "expected a SIGKILL escalation"
     finally:
         _force_cleanup(pid)
+
+
+def _watchers_of(name: str, pid: Optional[int]) -> List[threading.Thread]:
+    """The watcher threads that belong to one service.
+
+    The watcher is named after the service it watches, so the threads a
+    round leaves behind can be found by name -- which is what the
+    "every test hands back what it starts" fixture checks, and what this
+    test checks about the stop.
+    """
+    return [
+        thread for thread in threading.enumerate()
+        if thread.name == f"pdt-service-watch-{name}-{pid}"
+    ]
+
+
+@pytest.mark.timeout(180)
+def test_a_stop_returns_only_after_the_service_is_gone(tmp_path: Path):
+    """A stop that returns early leaves the round's watcher running.
+
+    The watcher ends when the process it watches is gone.  A stop that
+    returns before that has not finished stopping the service, and the
+    thread it leaves behind outlives the round that started it: it
+    writes the exit into whatever the environment points at by then,
+    which is how one round's teardown breaks an unrelated one.
+
+    The child here closes its socket the moment it is asked to stop and
+    only then takes its time leaving, so the port frees at once while
+    the process is still there for a moment afterwards -- the shape
+    that let the stop return early.
+    """
+    port = _free_port()
+    script = (
+        "import http.server,os,socketserver,signal,time;"
+        f"srv=socketserver.TCPServer(('127.0.0.1',{port}),"
+        "http.server.SimpleHTTPRequestHandler);"
+        "signal.signal(signal.SIGTERM, lambda *a: "
+        "(srv.server_close(), time.sleep(1.5), os._exit(0)));"
+        "srv.serve_forever()"
+    )
+    decl = _decl(
+        name="slowstop", port=port,
+        start_cmd=f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}",
+        ready_timeout_seconds=READY_TIMEOUT_SECONDS,
+    )
+    runtime = sm.start_service(decl, tmp_path)
+    try:
+        assert runtime.ready is True, runtime.detail
+        assert _watchers_of(runtime.name, runtime.pid), (
+            "the service has no watcher, so this test would prove nothing"
+        )
+
+        result = sm.stop_service(runtime, decl, grace_seconds=20.0)
+
+        assert result["port_free"] is True, result
+        assert not _watchers_of(runtime.name, runtime.pid), (
+            "the stop returned while the service was still running: its "
+            "watcher thread outlived the stop"
+        )
+    finally:
+        if runtime.pid:
+            _force_cleanup(runtime.pid)
+
+
+@pytest.mark.timeout(180)
+def test_a_stop_kills_a_service_that_frees_its_port_and_refuses_to_leave(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A service that frees its port and then refuses to leave.
+
+    The port is free, so the round may go on -- but the process is
+    still there, and so is the thread that watches it.  A stop that
+    leaves that thread behind hands the next round a writer it cannot
+    account for, so the stop has to end the process as well.
+    """
+    port = _free_port()
+    script = (
+        "import http.server,os,socketserver,signal,time;"
+        f"srv=socketserver.TCPServer(('127.0.0.1',{port}),"
+        "http.server.SimpleHTTPRequestHandler);"
+        # The port frees at once; the next SIGTERM is ignored, so only
+        # SIGKILL ends this one.
+        "signal.signal(signal.SIGTERM, lambda *a: (srv.server_close(),"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN), time.sleep(600)));"
+        "srv.serve_forever()"
+    )
+    decl = _decl(
+        name="stubborn", port=port,
+        start_cmd=f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}",
+        ready_timeout_seconds=READY_TIMEOUT_SECONDS,
+    )
+    runtime = sm.start_service(decl, tmp_path)
+    try:
+        assert runtime.ready is True, runtime.detail
+        # The wait for the process to leave is short here, so the test
+        # does not sit out the whole budget.
+        monkeypatch.setattr(sm, "_WATCHER_WAIT_SECONDS", 1.0)
+        result = sm.stop_service(runtime, decl, grace_seconds=20.0)
+        assert result["port_free"] is True, result
+        assert not _watchers_of(runtime.name, runtime.pid), (
+            "the stop returned while the service was still running: its "
+            "watcher thread outlived the stop"
+        )
+    finally:
+        if runtime.pid:
+            _force_cleanup(runtime.pid)
 
 
 #: The service the stop-path pin starts: it answers on its port, and on
@@ -5938,6 +6045,349 @@ def test_stopping_a_relocated_service_never_reaches_the_test_session(
 
 
 # ---------------------------------------------------------------------------
+# The host's timing capability, and the group a stop is allowed to signal
+# ---------------------------------------------------------------------------
+
+
+def test_the_readiness_budget_follows_the_host_s_timing_capability(
+    monkeypatch,
+):
+    """A host that stretches a short sleep needs a longer budget.
+
+    The gate measures how badly this host stretches a short sleep and
+    hands the measurement to the code it runs.  A budget that ignores
+    that measurement is a budget the machine cannot meet, and the
+    service is then reported as "never came up" when it was merely
+    slow — which is what the CI run did on a host that stretched a
+    50 ms sleep into 195 ms.
+    """
+    monkeypatch.setenv(sm.HOST_TIMING_SKEW_ENV, "4.0")
+    assert sm.readiness_budget_seconds(20.0) == pytest.approx(80.0)
+
+    monkeypatch.setenv(sm.HOST_TIMING_SKEW_ENV, "1.0")
+    assert sm.readiness_budget_seconds(20.0) == pytest.approx(20.0)
+
+
+def test_a_host_that_cannot_measure_time_gets_a_generous_budget(monkeypatch):
+    """A host that says it cannot measure wall-clock is believed.
+
+    The gate's verdict is "this host cannot time anything"; the
+    budgets in the code it runs have to widen accordingly, because a
+    budget the host cannot meet is not a measurement of the code.
+    """
+    monkeypatch.delenv(sm.HOST_TIMING_SKEW_ENV, raising=False)
+    monkeypatch.setenv(sm.HOST_TIMING_MEASURABLE_ENV, "0")
+    assert sm.readiness_budget_seconds(20.0) > 20.0
+
+
+def test_the_readiness_wait_runs_on_the_scaled_budget(monkeypatch):
+    """The wait is bounded by the scaled budget, not by the declared one.
+
+    The declared timeout is what the declaration asks for; the budget
+    the wait actually runs on is that number measured against this
+    host's own timing.
+    """
+    seen: dict = {}
+
+    def _fake_wait(decl, timeout_seconds=None):
+        seen["timeout"] = timeout_seconds
+        return True, None
+
+    monkeypatch.setenv(sm.HOST_TIMING_SKEW_ENV, "3.0")
+    monkeypatch.setattr(sm, "_wait_ready_with_evidence", _fake_wait)
+    decl = _decl(ready_timeout_seconds=READY_TIMEOUT_SECONDS)
+    sm.wait_until_ready(decl, float(READY_TIMEOUT_SECONDS))
+    assert seen["timeout"] == pytest.approx(READY_TIMEOUT_SECONDS * 3.0), seen
+
+
+def test_a_stop_never_signals_a_group_the_target_does_not_lead(
+    tmp_path: Path, monkeypatch,
+):
+    """A group is only signalled when the target leads it.
+
+    The service's group is recorded when the child has made itself a
+    group leader.  When it has not — the wait gave up, or the kernel
+    recycled the pid — the group the number happens to be in belongs to
+    somebody else: the caller's own group, or a stranger's.  Signalling
+    that group takes processes this stop never judged, which is how a
+    stop turns into a second bug: the CI run died of a SIGTERM nobody
+    in the repo sent.
+    """
+    groups: List[Tuple[int, int]] = []
+    pids: List[Tuple[int, int]] = []
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: groups.append((int(pgid), int(sig))))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: pids.append((int(pid), int(sig))))
+
+    # The recorded group belongs to a life that is gone; the pid now
+    # sits in a group of somebody else's.
+    monkeypatch.setattr(sm, "_process_group_of", lambda pid: 44712)
+    runtime = sm.ServiceRuntime(name="stub", port=45991, start_cmd="true", cwd=".")
+    runtime.pid = 4242
+    runtime.pgid = 42058
+
+    sm.stop_service(runtime, grace_seconds=0.2)
+
+    assert not groups, (
+        f"the stop signalled a group the target does not lead: {groups}"
+    )
+
+
+def test_a_group_the_target_still_leads_is_signalled(
+    tmp_path: Path, monkeypatch,
+):
+    """The fix does not turn the stop into a no-op.
+
+    A service that is still running and still leads its own group is
+    stopped through that group, exactly as before.
+
+    The group signal is the wider of the two signals, so it needs the
+    wider proof: the leader has to be placeable in time (2026-11-03,
+    VP-018, L2).  The runtime therefore carries the start time it
+    recorded, and the probe reports the same one for the live pid.
+    """
+    groups: List[Tuple[int, int]] = []
+    pids: List[Tuple[int, int]] = []
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: groups.append((int(pgid), int(sig))))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: pids.append((int(pid), int(sig))))
+    monkeypatch.setattr(sm, "_process_group_of", lambda pid: 4242)
+    monkeypatch.setattr(
+        sm,
+        "probe_process_identity",
+        lambda pid: ProcessIdentity(
+            pid=4242,
+            create_time=1_700_000_000.5,
+            pgid=4242,
+        ),
+    )
+
+    runtime = sm.ServiceRuntime(name="stub", port=45992, start_cmd="true", cwd=".")
+    runtime.pid = 4242
+    runtime.pgid = 4242
+    runtime.start_epoch = 1_700_000_000.5
+
+    sm.stop_service(runtime, grace_seconds=0.2)
+
+    assert groups == [(4242, int(signal.SIGTERM))], (
+        f"the stop did not signal the group the service leads: {groups}"
+    )
+
+
+def test_a_stop_falls_back_to_the_pid_when_no_group_can_be_proved(
+    tmp_path: Path, monkeypatch,
+):
+    """Without a provable group the stop still stops the process.
+
+    The group is the thing that cannot be guessed; the pid is the
+    thing the round recorded.  The stop degrades to the pid rather
+    than signalling a group nobody can prove.
+    """
+    groups: List[Tuple[int, int]] = []
+    pids: List[Tuple[int, int]] = []
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: groups.append((int(pgid), int(sig))))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: pids.append((int(pid), int(sig))))
+    # A stranger's group: the pid is in it, but it does not lead it.
+    monkeypatch.setattr(sm, "_process_group_of", lambda pid: 99999)
+
+    runtime = sm.ServiceRuntime(name="stub", port=45993, start_cmd="true", cwd=".")
+    runtime.pid = 4242
+    runtime.pgid = None
+
+    sm.stop_service(runtime, grace_seconds=0.2)
+
+    assert not groups, (
+        f"the stop signalled a group it could not prove: {groups}"
+    )
+    assert (4242, int(signal.SIGTERM)) in pids, (
+        f"the stop did not signal the process it was asked to stop: {pids}"
+    )
+
+
+def test_the_gate_hands_its_host_timing_verdict_to_the_code_it_runs(
+    tmp_path: Path,
+):
+    """The gate measures the host, and the code it runs is told.
+
+    A readiness budget written on an idle machine is a budget written
+    for the wrong machine: on the host that failed the round-4 gate a
+    50 ms sleep took 194 ms, and every service that was "not ready"
+    was measured against a clock that does not keep time.  The gate
+    already measures the host (``host timing probe``); what was missing
+    is that the answer never reached the code under test.
+
+    So the gate exports the verdict — ``PDT_HOST_TIMING_MEASURABLE`` —
+    and the factor it implies — ``PDT_HOST_TIMING_SKEW`` — into the
+    environment of every phase it runs, and the readiness budget reads
+    it from there.
+    """
+    repo_root = _BACKEND_DIR.parent
+    gate = repo_root / "scripts" / "run_tests.sh"
+    assert gate.exists(), f"the gate script is not where it belongs: {gate}"
+
+    log = tmp_path / "env.log"
+    stub = tmp_path / "fake_pytest"
+    stub.write_text(
+        "#!/bin/sh\n"
+        "printf '%s|%s\\n' \"${PDT_HOST_TIMING_MEASURABLE:-}\" "
+        "\"${PDT_HOST_TIMING_SKEW:-}\" >> \"$PDT_STUB_LOG\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PYTEST_BIN"] = str(stub)
+    env["PDT_STUB_LOG"] = str(log)
+    for name in ("PDT_HOST_TIMING_MEASURABLE", "PDT_HOST_TIMING_SKEW",
+                 "PDT_RUN_TESTS_DRY_RUN"):
+        env.pop(name, None)
+
+    completed = subprocess.run(
+        ["bash", str(gate), "--lane", "unit"],
+        capture_output=True,
+        text=True,
+        cwd=str(repo_root),
+        env=env,
+        timeout=300,
+    )
+    assert completed.returncode == 0, (
+        f"the unit lane produced exit code {completed.returncode}:\n"
+        + completed.stdout
+        + completed.stderr
+    )
+    recorded = [
+        line for line in log.read_text(encoding="utf-8").splitlines() if line
+    ]
+    assert recorded, (
+        "the gate ran no phase, so nothing could have been told to it:\n"
+        + completed.stdout
+        + completed.stderr
+    )
+    measurable, _, skew = recorded[0].partition("|")
+    assert measurable in ("0", "1"), (
+        f"the gate did not tell the code whether the host can measure time: "
+        f"{recorded[0]!r}"
+    )
+    assert skew, (
+        f"the gate told the code the verdict but not the factor: "
+        f"{recorded[0]!r}"
+    )
+    assert float(skew) >= 1.0, (
+        f"the factor the gate handed down is not a factor: {recorded[0]!r}"
+    )
+
+
+@pytest.mark.parametrize("lane", ["unit", "e2e", "wallclock"])
+def test_every_phase_the_gate_runs_is_told_the_host_timing_verdict(
+    tmp_path: Path, lane: str,
+):
+    """Every phase the gate runs is measured before it runs.
+
+    The budget a phase runs on has to survive the load *while the phase
+    runs*, so the host is measured before **each** phase — not once for
+    the whole run, and not once for the first phase only.  A phase that
+    ran unmeasured was running on a budget written for somebody else's
+    machine: on the host that failed the round-4 gate a 50 ms sleep
+    took 194 ms.
+
+    All three lanes are checked, because a measurement written by hand
+    at each phase's call site is a measurement the next phase added to
+    the gate will forget.  The wall-clock phase ran unmeasured for
+    exactly that reason: the two calls that existed sat at the call
+    sites of the first two phases, and the third phase had none.
+    """
+    repo_root = _BACKEND_DIR.parent
+    gate = repo_root / "scripts" / "run_tests.sh"
+    assert gate.exists(), f"the gate script is not where it belongs: {gate}"
+
+    log = tmp_path / "env.log"
+    stub = tmp_path / "fake_pytest"
+    stub.write_text(
+        "#!/bin/sh\n"
+        "printf '%s|%s\\n' \"${PDT_HOST_TIMING_MEASURABLE:-}\" "
+        "\"${PDT_HOST_TIMING_SKEW:-}\" >> \"$PDT_STUB_LOG\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PYTEST_BIN"] = str(stub)
+    env["PDT_STUB_LOG"] = str(log)
+    # The verdict is forced so the measurement is the same on every
+    # host: what is under test is *that* the phase is measured, not
+    # what this machine's clock says today.
+    env["PDT_HOST_TIMING_PROBE"] = "pass"
+    for name in ("PDT_HOST_TIMING_MEASURABLE", "PDT_HOST_TIMING_SKEW",
+                 "PDT_HOST_MEASURABLE", "PDT_RUN_TESTS_DRY_RUN"):
+        env.pop(name, None)
+
+    completed = subprocess.run(
+        ["bash", str(gate), "--lane", lane],
+        capture_output=True,
+        text=True,
+        cwd=str(repo_root),
+        env=env,
+        timeout=300,
+    )
+    assert completed.returncode == 0, (
+        f"the {lane} lane produced exit code {completed.returncode}:\n"
+        + completed.stdout
+        + completed.stderr
+    )
+    recorded = [
+        line for line in log.read_text(encoding="utf-8").splitlines() if line
+    ]
+    assert recorded, (
+        f"the {lane} lane ran no phase, so nothing could have been told "
+        f"to it:\n"
+        + completed.stdout
+        + completed.stderr
+    )
+    for record in recorded:
+        measurable, _, skew = record.partition("|")
+        assert measurable in ("0", "1"), (
+            f"the {lane} lane ran a phase that was not told whether the "
+            f"host can measure time: {record!r}\n"
+            + completed.stdout
+            + completed.stderr
+        )
+        assert skew, (
+            f"the {lane} lane ran a phase that was told the verdict but "
+            f"not the factor: {record!r}\n"
+            + completed.stdout
+            + completed.stderr
+        )
+        assert float(skew) >= 1.0, (
+            f"the {lane} lane ran a phase with a factor that is not a "
+            f"factor: {record!r}\n"
+            + completed.stdout
+            + completed.stderr
+        )
+
+
+def test_the_ci_runner_hands_the_host_timing_signal_to_the_code_it_runs():
+    """The runner's subprocess environment carries the host's timing.
+
+    The runner is what spawns the code under test, so the signal has
+    to be in the environment it hands down: the readiness budget reads
+    it from there, and a run whose budget was decided on a host that
+    cannot keep time has to say so.
+    """
+    import verification_ci_runner as vcr
+
+    env = vcr.ci_subprocess_env()
+    measurable = env.get("PDT_HOST_TIMING_MEASURABLE")
+    assert measurable in ("0", "1"), (
+        "the runner did not tell the code it runs whether the host can "
+        f"measure time: {measurable!r}"
+    )
+    skew = env.get("PDT_HOST_TIMING_SKEW")
+    assert skew, "the runner did not hand the factor down"
+    assert float(skew) >= 1.0, (
+        f"the factor the runner handed down is not a factor: {skew!r}"
+    )
+
+
 # The kill audit, and the pids a stop must never name.
 #
 # A gate run that ends with the pytest process killed by a SIGTERM names

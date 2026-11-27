@@ -2003,11 +2003,121 @@ def ci_subprocess_env() -> Dict[str, str]:
     Everything else is inherited unchanged. The gate is the repository's
     own CI entry, and it is entitled to the environment it would have
     run in by hand.
+
+    The one thing that is added is the **host's timing verdict** (see
+    :func:`host_timing_env`): the gate measures the host it runs on and
+    hands the answer to the code under test, and the runner hands the
+    same answer to whatever it spawns, so the two never disagree about
+    the machine the verdict was made on.
     """
-    return {
+    env = {
         key: value
         for key, value in os.environ.items()
         if not key.startswith(_SECRET_FD_ENV_PREFIX)
+    }
+    env.update(host_timing_env())
+    return env
+
+
+# ---------------------------------------------------------------------------
+# The host's timing verdict
+# ---------------------------------------------------------------------------
+#
+# The gate measures the host it runs on (``scripts/run_tests.sh``: five
+# 50 ms sleeps, the median against a threshold) and hands the answer to
+# the code it runs, so a readiness budget is decided on the machine the
+# code is actually running on.  This is the same measurement, made here,
+# for anything the runner spawns itself — and the rule is the same one,
+# so the two answers are the same answer.
+#
+# A host that cannot keep time is not a host whose budgets should be
+# short: a budget written for an idle machine is a budget written for
+# the wrong machine, and the round-4 gate is what showed it (a 50 ms
+# sleep took 194 ms on the host that failed, and every service that came
+# up "not ready" was measured against a clock that does not keep time).
+
+#: The environment variable that carries the verdict: can this host
+#: measure wall-clock time at all?  ``"1"`` yes, ``"0"`` no.
+HOST_TIMING_MEASURABLE_ENV = "PDT_HOST_TIMING_MEASURABLE"
+
+#: The environment variable that carries the factor a wall-clock budget
+#: has to be multiplied by on this host.  ``1.00`` means the host keeps
+#: time.
+HOST_TIMING_SKEW_ENV = "PDT_HOST_TIMING_SKEW"
+
+#: The sleep the host is measured against, in seconds — the same number
+#: the gate's own probe measures.
+HOST_TIMING_SAMPLE_SECONDS = 0.05
+
+#: How long the measured sleep may take before the host is taken to be
+#: unable to measure wall-clock time.
+HOST_TIMING_MAX_SLEEP = 0.06
+
+#: The ceiling on the factor.  A budget that grows without bound is a
+#: budget that hangs.
+HOST_TIMING_MAX_SKEW = 8.0
+
+#: The measured verdict, once per process.  The measurement sleeps, and
+#: every subprocess the runner starts asks for the environment.
+_host_timing_cache: Optional[Dict[str, str]] = None
+
+
+def host_timing_env() -> Dict[str, str]:
+    """The host's timing verdict, in the form the code reads it in.
+
+    An environment that already carries the verdict keeps it: the gate
+    measures the host itself and hands the answer down, and the runner
+    is often started *by* that gate — so the inherited answer is the
+    fresher one, and a second measurement could only disagree with it.
+
+    Measured once per process otherwise: five 50 ms sleeps, the median
+    against the same threshold the gate uses.
+    """
+    global _host_timing_cache
+    inherited = os.environ.get(HOST_TIMING_MEASURABLE_ENV, "").strip()
+    if inherited:
+        return {
+            HOST_TIMING_MEASURABLE_ENV: inherited,
+            HOST_TIMING_SKEW_ENV: os.environ.get(HOST_TIMING_SKEW_ENV, ""),
+        }
+    if _host_timing_cache is None:
+        samples: List[float] = []
+        for _ in range(5):
+            started = time.monotonic()
+            time.sleep(HOST_TIMING_SAMPLE_SECONDS)
+            samples.append(time.monotonic() - started)
+        samples.sort()
+        median = samples[len(samples) // 2]
+        measurable = median <= HOST_TIMING_MAX_SLEEP
+        skew = max(1.0, min(median / HOST_TIMING_SAMPLE_SECONDS, HOST_TIMING_MAX_SKEW))
+        _host_timing_cache = {
+            HOST_TIMING_MEASURABLE_ENV: "1" if measurable else "0",
+            # The factor is handed down whether or not the host can
+            # measure time: the verdict says whether a wall-clock
+            # *assertion* means anything here, the factor says how long
+            # a second takes — and the budget needs the second one.
+            HOST_TIMING_SKEW_ENV: f"{skew:.2f}",
+        }
+    return dict(_host_timing_cache)
+
+
+def parse_host_timing(stdout: str) -> Dict[str, Any]:
+    """What the gate said about the host it ran on.
+
+    The gate measures the host before every phase and says what it
+    found.  That answer is evidence: a verdict made on a host that
+    cannot keep time is a verdict about a different machine than a
+    verdict made on one that can, and the reader has to be able to tell
+    them apart.
+    """
+    note = ""
+    for line in (stdout or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("host timing probe:") and not note:
+            note = stripped.split(":", 1)[1].strip()
+    return {
+        "measurable": "cannot measure" not in note,
+        "note": note,
     }
 
 
@@ -3357,6 +3467,11 @@ def run_ci_verification(
         "spawned_processes_all_given_back": not outstanding,
         "budget_exhausted_in": exhausted_in,
         "gate_elapsed_seconds": gate_elapsed,
+        # What the host the gate ran on could measure.  A verdict made
+        # on a host that cannot keep time is a verdict about a
+        # different machine than one made on a host that can, and the
+        # reader has to be able to tell them apart.
+        "host_timing": parse_host_timing(stdout),
         # The declaration this verdict was based on: which exit codes
         # mean "could not decide", and whether that declaration was
         # usable at all.

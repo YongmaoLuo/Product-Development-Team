@@ -28,6 +28,12 @@ These cases pin the contract:
 * a status write that FAILED keeps the intent, for the next round;
 * a kill that did NOT land → the plan is still running, so the phase
   stays where it is and the reason says ``pause_kill_incomplete``.
+
+A round that is not a pause is judged by the repair batch's
+classification table, so its REASON is the table's verdict (here: the
+repair task never ran, so the batch did not drain).  The killing
+itself is recorded beside it, in ``repair_death`` — a fact about the
+process, kept out of the verdict about the batch.
 """
 
 from __future__ import annotations
@@ -173,6 +179,11 @@ def test_sigterm_without_intent_still_failed(monkeypatch, tmp_path):
 
     The other side of the same door: the pause check must not become a
     way to re-judge an ordinary failure as a pause.
+
+    The crash's DEATH is recorded beside the batch's OUTCOME, not on
+    top of it: the outcome is the classification table's verdict (here
+    "the repair task never ran"), and the death says what happened to
+    the process.
     """
     plan_id = "p-pause-no-intent"
     _seed_plan(tmp_path, plan_id)
@@ -180,7 +191,8 @@ def test_sigterm_without_intent_still_failed(monkeypatch, tmp_path):
     state = _run_repair(monkeypatch, tmp_path, plan_id, returncode=-15)
 
     assert state["status"] == "failed", state
-    assert state["stop_reason"] == "repair_signal:15", state
+    assert state["stop_reason"] == "repair_batch_not_drained:1_pending", state
+    assert state["repair_death"] == "repair_signal:15", state
     assert _exec_status(plan_id) == "failed", (
         "a crash with no pause intent on disk was recorded as stopped"
     )
@@ -297,7 +309,8 @@ def test_corrupt_intent_still_failed(monkeypatch, tmp_path, torn_intent):
     state = _run_repair(monkeypatch, tmp_path, plan_id, returncode=-15)
 
     assert state["status"] == "failed", state
-    assert state["stop_reason"] == "repair_signal:15", state
+    assert state["stop_reason"] == "repair_batch_not_drained:1_pending", state
+    assert state["repair_death"] == "repair_signal:15", state
     assert _exec_status(plan_id) == "failed", (
         "a crash with a damaged pause intent on disk was recorded as "
         "stopped — a damaged file is not evidence of a pause"

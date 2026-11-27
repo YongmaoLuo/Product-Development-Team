@@ -285,6 +285,27 @@ half the readers never see.*
   changed**: the gate still answers 0 / 1 / 3 exactly as before; what it
   pushes is what changed.
 
+- **A verdict output that does not conform is no longer filed as a code
+  failure.** A sub-agent answer that does not satisfy the verdict
+  contract established nothing about the deliverable, so it is carried as
+  `UNKNOWN` with the `infra` failure class instead of `FAILED`
+  (`backend/verification_subagent.py`); a report entry that came back
+  failed without ever claiming a deliverable defect is restored to
+  `UNKNOWN` instead of buying a repair task for something nobody verified
+  (`backend/verification_agent.py`); and the "no conclusion" status has a
+  bucket of its own rather than being folded into the failure counts
+  (`backend/verification_buckets.py`). The repair batch's ending is
+  decided by one classifier, and a death of the executor is recorded
+  beside that verdict instead of being written over it — so "the code is
+  still wrong" and "there is still work to run" no longer collapse into
+  one another (`backend/verification_loop.py`). The convergence summary
+  reads the same ledger and sorts every plan into `passed`,
+  `user_stopped`, `env_blocked`, `infra_flake`, `code_defect` or
+  `unclassified` (`backend/verification/convergence_metrics.py`,
+  `backend/routes/verification.py`). **A verdict did change**: a round
+  that produced no conclusion used to be reported as a failure of the
+  deliverable, and it is now reported as the absence of one.
+
 
 
 ## [0.1.2] - 2026-10-07

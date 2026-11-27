@@ -170,7 +170,10 @@ def test_repair_exit_zero_with_unfinished_tasks_is_not_recorded_completed(
 
     state = _run_repair(monkeypatch, tmp_path, "p-w4", db_path, returncode=0)
 
-    assert state["stop_reason"] == "repair_exited_with_unfinished_tasks:2", (
+    # 2026-11-01: the verdict comes from the shared classifier now, so
+    # the reason says WHAT happened — the batch did not drain, and two
+    # tasks are still queued.
+    assert state["stop_reason"] == "repair_batch_not_drained:2_pending", (
         "rc==0 was accepted as completion while 2 repair tasks never ran — "
         "this is exactly the 'exec_status=completed, stop_reason NULL' "
         "state the guard exists to prevent"
@@ -226,24 +229,25 @@ def test_failed_tasks_alone_do_not_trigger_the_unfinished_gate(
 def test_non_zero_exit_still_reports_repair_non_zero_exit(
     monkeypatch, tmp_path, db_path,
 ):
-    """A non-zero exit fails the round, and the reason says which code.
+    """A non-zero exit is now classified, not just reported.
 
-    The verdict has not changed — the status is still ``failed`` — but
-    the stop reason now carries the return code, so a reader can tell
-    a round that exited 1 from one that exited 3 without going back to
-    the ledger.  (A round killed by a signal writes
-    ``repair_signal:<n>`` instead; see
-    ``test_repair_exit_forensics.py``.)
+    2026-11-01: the repair path stopped writing the bare
+    ``repair_non_zero_exit`` and started writing the classifier's verdict.
+    This round exited non-zero with NO failed row (the only task is a
+    non-repair task that completed), so the verdict is
+    ``repair_gate_red`` — the repair itself did not break, the thing it
+    was repairing is still wrong.  The historical test name is kept so
+    the case stays findable.
     """
     disk = [{"id": "1"}]
     runtime = [_repair_row("1", "completed", None, None)]
     _seed_plan(tmp_path, "p-w4-rc", disk, runtime, db_path)
 
     state = _run_repair(
-        monkeypatch, tmp_path, "p-w4-rc", db_path, returncode=1,
+        monkeypatch, tmp_path, "p-w4-rc", db_path, returncode=3,
     )
     assert state["status"] == "failed"
-    assert state["stop_reason"] == "repair_non_zero_exit:1"
+    assert state["stop_reason"] == "repair_gate_red"
 
 
 # ---------------------------------------------------------------------------

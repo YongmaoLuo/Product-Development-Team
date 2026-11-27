@@ -63,6 +63,8 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from process_identity import executable_identity
+
 #: Name of the ledger file inside a plan directory.
 LEDGER_FILENAME = "process_ledger.jsonl"
 
@@ -140,6 +142,7 @@ _RECORD_FIELDS = (
     "state",
     "created_at",
     "ended_at",
+    "argv0_alias",
 )
 
 #: Serialises appends from concurrent threads (the backend spawns and
@@ -205,6 +208,19 @@ class ProcessRecord:
     state: str = STATE_ALIVE
     created_at: float = field(default_factory=time.time)
     ended_at: Optional[float] = None
+    #: The identity of the executable the row registered, independent of
+    #: where it lives (``"python"``, ``"pypy"``, ``"bash"``, …).
+    #:
+    #: The path in ``cmdline[0]`` is not that identity: macOS's
+    #: framework launcher rewrites ``argv[0]`` a moment after the exec,
+    #: so the same process answers two different paths, and a comparison
+    #: made on the spelling alone can never succeed.  The alias is what
+    #: the live process is compared against, so both sides are read
+    #: under one ruler.
+    #:
+    #: Rows written before this field existed do not carry it; they are
+    #: normalised from the spelling they do carry, when they are read.
+    argv0_alias: str = ""
 
     def __post_init__(self) -> None:
         if self.role not in ROLES:
@@ -217,6 +233,9 @@ class ProcessRecord:
         # line. A mutable list would let a caller change what the
         # ledger says a process was running after the fact.
         self.cmdline = _normalise_cmdline(self.cmdline)
+        self.argv0_alias = str(self.argv0_alias or "").strip() or (
+            executable_identity(self.cmdline[0]) if self.cmdline else ""
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         """JSON-serialisable form of the record."""
@@ -585,6 +604,9 @@ def _record_from_event(event: Mapping[str, Any]) -> Optional[ProcessRecord]:
             ended_at=(
                 None if ended_at is None else _as_float(ended_at)
             ),
+            # A row written before the alias existed does not carry one;
+            # the record normalises it from the spelling it does carry.
+            argv0_alias=str(payload.get("argv0_alias") or ""),
         )
     except (TypeError, ValueError):
         # An unknown role or an unusable field makes the record

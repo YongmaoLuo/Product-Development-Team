@@ -53,6 +53,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 from verification_executor import VerificationExecutor  # noqa: E402
+from verification_phases import infer_phase_order  # noqa: E402
 from tests.judgment_tables import Case, assert_decision_table  # noqa: E402
 
 #: The repository root — three parents up from ``backend/tests/unit/``.
@@ -105,6 +106,22 @@ class _GateStub:
         """The reason an earlier gate layer is missing."""
         self.predecessor_orders.append(gate_order)
         return self.predecessor_reason
+
+    def _gate_block_decision_for(self, gate: Any) -> Any:
+        """The blocking decision of this layer: ``(reason, status)``.
+
+        2026-11-27: the executor answers "may this gate layer run?"
+        with a **pair** — the reason *and* the upstream status — so the
+        stub answers with the same shape.  The reason is the global
+        blocker's when there is one, and the predecessor's otherwise,
+        and the predecessor is asked about the gate's own phase order,
+        the way the executor asks it.
+        """
+        global_reason = self._blocking_gate_reason()
+        if global_reason:
+            return (global_reason, None)
+        gate_order = infer_phase_order(gate) if isinstance(gate, dict) else None
+        return (self._gate_predecessor_reason(gate_order), None)
 
 
 #: Both sources block: the global one is the answer.

@@ -150,11 +150,75 @@ decide_verdict() {
 }
 
 # ---------------------------------------------------------------------------
+# the probe commit
+# ---------------------------------------------------------------------------
+
+# build_probe_commit <tree> <parent> <head-sha>
+#
+# Prints the SHA of a synthetic commit that carries <tree> with <parent>
+# as its single parent.  That is the commit the probe branch publishes:
+# the tree under test, and nothing else.
+#
+# The parent is not optional.  A parentless probe commit is a root
+# commit, and then the pre-push hook's scan of the pushed ref reads the
+# whole tree as added lines -- gitleaks hits the test fixtures main has
+# been publishing for a long time and the hook rejects the push, so the
+# gate could never push its probe branch at all.  The caller resolves a
+# parent that is already on the remote; when it cannot, the gate says
+# inconclusive instead of pushing a probe that would be refused.
+#
+# The identity is fixed and neutral (the operator's own name and email
+# are not published by a probe) and the timestamps are HEAD's own, so
+# the same tree and parent always yield the same SHA: a re-run with an
+# unchanged HEAD pushes the same probe commit instead of a new one.
+#
+# Only a commit *object* is written here, into the local object
+# database.  No ref is created, and nothing is pushed.
+build_probe_commit() {
+    local probe_tree="${1:-}"
+    local probe_parent="${2:-}"
+    local head_sha="${3:-}"
+    local probe_message="ci probe ${head_sha:0:8}: tree of ${head_sha}"
+    local author_date=""
+    local committer_date=""
+
+    if [ -z "${probe_tree}" ] || [ -z "${probe_parent}" ]; then
+        return 1
+    fi
+
+    author_date="$(git show -s --format=%aI HEAD 2>/dev/null || true)"
+    committer_date="$(git show -s --format=%cI HEAD 2>/dev/null || true)"
+
+    # A subshell, so the exported identity and dates do not leak into the
+    # rest of the script.
+    (
+        export GIT_AUTHOR_NAME="ci-gate"
+        export GIT_AUTHOR_EMAIL="ci-gate@users.noreply.github.com"
+        export GIT_COMMITTER_NAME="ci-gate"
+        export GIT_COMMITTER_EMAIL="ci-gate@users.noreply.github.com"
+        if [ -n "${author_date}" ]; then
+            export GIT_AUTHOR_DATE="${author_date}"
+        fi
+        if [ -n "${committer_date}" ]; then
+            export GIT_COMMITTER_DATE="${committer_date}"
+        fi
+        git commit-tree "${probe_tree}" -p "${probe_parent}" -m "${probe_message}"
+    ) 2>/dev/null || return 1
+}
+
+# ---------------------------------------------------------------------------
 # offline entry points
 #
 # These expose the pure verdict logic to the offline tests.  They sit in
 # front of every git and gh call, so they work without a repository, without
 # the gh CLI and without the network.
+#
+# ``--probe-commit`` is the third one.  It needs a repository (it reads
+# HEAD's tree) but still no network and no gh: it prints the SHA of the
+# synthetic commit the probe branch publishes, so the shape of that
+# commit -- HEAD's tree, one parent, none of the local history -- is a
+# contract the offline tests can pin.  It exits 2 when its argument is
+# missing or does not resolve.
 # ---------------------------------------------------------------------------
 
 case "${1:-}" in
@@ -166,6 +230,37 @@ case "${1:-}" in
     --decide)
         shift
         decide_verdict "${1:-}" "${2:-}" "${3:-}" "${4:-}"
+        exit 0
+        ;;
+    --probe-commit)
+        shift
+        probe_base_ref="${1:-}"
+        if [ -z "${probe_base_ref}" ]; then
+            printf 'ci_gha: --probe-commit needs a base ref\n' >&2
+            exit 2
+        fi
+        probe_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+        if [ -z "${probe_root}" ]; then
+            printf 'ci_gha: --probe-commit needs a git repository\n' >&2
+            exit 2
+        fi
+        cd "${probe_root}"
+        probe_base_sha="$(git rev-parse --verify --quiet "${probe_base_ref}^{commit}" 2>/dev/null || true)"
+        if [ -z "${probe_base_sha}" ]; then
+            printf 'ci_gha: --probe-commit cannot resolve the base ref: %s\n' "${probe_base_ref}" >&2
+            exit 2
+        fi
+        probe_tree_sha="$(git rev-parse --verify --quiet "HEAD^{tree}" 2>/dev/null || true)"
+        if [ -z "${probe_tree_sha}" ]; then
+            printf 'ci_gha: --probe-commit cannot resolve the tree of HEAD\n' >&2
+            exit 2
+        fi
+        head_sha="$(git rev-parse --verify --quiet HEAD 2>/dev/null || true)"
+        probe_sha="$(build_probe_commit "${probe_tree_sha}" "${probe_base_sha}" "${head_sha}")" || {
+            printf 'ci_gha: --probe-commit cannot build the probe commit\n' >&2
+            exit 2
+        }
+        printf '%s\n' "${probe_sha}"
         exit 0
         ;;
 esac
@@ -213,7 +308,7 @@ fi
 printf 'ci_gha: branch=%s\n' "${branch}"
 
 # ---------------------------------------------------------------------------
-# 2. push the current tree to a throw-away probe branch
+# 2. push the tree under test (the current tree) to a throw-away probe branch
 # ---------------------------------------------------------------------------
 
 # The probe branch carries the 8-character short SHA, so two concurrent
@@ -226,7 +321,9 @@ branch_slug="${branch//\//-}"
 probe="ci-probe/${branch_slug}-${sha8}"
 printf 'ci_gha: probe branch=%s\n' "${probe}"
 
-# The gate judges the *current tree*, not the branch history.
+# The gate judges the *current tree*, not the branch history: the probe
+# carries the *tree* under test, byte for byte, and none of this
+# repository's local history.
 #
 # The probe branch is therefore not HEAD: it is a single commit built
 # from HEAD's tree with ``git commit-tree``.  Two consequences, both
@@ -237,6 +334,11 @@ printf 'ci_gha: probe branch=%s\n' "${probe}"
 #     ref that is not on a remote yet -- with the probe at HEAD that
 #     meant the whole local branch history, so a gate run could be
 #     blocked by an old commit the current tree no longer contains.
+#     Pushing HEAD would also publish the historical snapshots that the
+#     commit-range privacy scan exists to reject, and it would break the
+#     repository's own rule that a push to the public remote carries one
+#     or two commits.  The hook refusing that push is the hook doing its
+#     job on a range the gate never meant to publish.
 #   * every lane runs on the very same tree, because the tree is the
 #     only thing the probe carries.
 #
@@ -259,19 +361,38 @@ printf 'ci_gha: probe branch=%s\n' "${probe}"
 # (14 findings, measured) and the hook rejects the push, so the gate
 # could never push its probe branch at all.  The parent is what keeps
 # the scan on the *change* instead of on the *tree*.
+head_sha="$(git rev-parse HEAD 2>/dev/null || true)"
+if [ -z "${head_sha}" ]; then
+    die_inconclusive "cannot resolve HEAD"
+fi
 probe_tree="$(git rev-parse "HEAD^{tree}" 2>/dev/null || true)"
 if [ -z "${probe_tree}" ]; then
     die_inconclusive "cannot resolve the tree of HEAD"
 fi
-probe_parent="$(git rev-parse --verify --quiet "origin/main^{commit}" \
-    || git rev-parse --verify --quiet "origin/HEAD^{commit}" || true)"
+# The parent of the probe commit: a commit that is already on the remote,
+# so the pre-push hook's scan of the pushed ref covers the probe commit
+# alone.  ``origin/main`` comes first, ``origin/HEAD`` is the fallback,
+# and the merge base with ``origin/main`` is the last resort -- it is the
+# ancestor the branch actually grew from, and it is reachable from
+# ``refs/remotes/*`` all the same.
+probe_parent="$(git rev-parse --verify --quiet "origin/main^{commit}" 2>/dev/null || true)"
 if [ -z "${probe_parent}" ]; then
+    probe_parent="$(git rev-parse --verify --quiet "origin/HEAD^{commit}" 2>/dev/null || true)"
+fi
+if [ -z "${probe_parent}" ]; then
+    probe_parent="$(git merge-base HEAD origin/main 2>/dev/null || true)"
+fi
+if [ -z "${probe_parent}" ]; then
+    # No remote-tracking base: the probe would be a parentless root
+    # commit, which the pre-push hook rejects (see the comment above).
+    # Say inconclusive rather than push something that cannot land.
     die_inconclusive "cannot resolve a remote-tracking base commit for the probe"
 fi
-probe_commit="$(git commit-tree "${probe_tree}" -p "${probe_parent}" -m "ci probe ${sha8}" 2>/dev/null || true)"
-if [ -z "${probe_commit}" ]; then
+probe_commit=""
+if ! probe_commit="$(build_probe_commit "${probe_tree}" "${probe_parent}" "${head_sha}")"; then
     die_inconclusive "cannot build the probe commit"
 fi
+printf 'ci_gha: probe commit=%s tree-of=%s\n' "${probe_commit}" "${head_sha}"
 
 # Idempotent clean-up: drop a leftover probe branch of the same name
 # (same HEAD, e.g. a re-run) before creating it again.

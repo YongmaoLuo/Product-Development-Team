@@ -27,6 +27,7 @@
   * ``failed_vps``    = FAILED / BLOCKED（要重跑）
   * ``skipped_vps``   = SKIPPED / SPLIT（终态成功，重跑也只会再跳一次）
   * ``deferred_vps``  = DEFERRED / INCONCLUSIVE（**刻意不进任何终态桶**）
+  * ``UNKNOWN``       = **不进任何桶**（「没验出结论」既不是成功也不是失败）
 
 ``BaseExecutor.run`` 的 ``completed_set`` 是 completed ∪ skipped，两者都不在
 里面才会在下一轮重跑 —— 这正是 DEFERRED 的语义：Phase 1 修好之后要把全量
@@ -65,6 +66,15 @@ BUCKET_DEFERRED = "deferred_vps"
 #: 计划作废的两种标记（与 ``VerificationExecutor._vp_retired_marker`` 同名）。
 RETIRED_OBSOLETE = "obsolete"
 RETIRED_SUPERSEDED_BY = "superseded_by"
+
+#: 「没验出结论」那条裁决的状态值。
+#:
+#: 子 agent 的答案解析不出来、重试预算也耗尽时产生的就是它（见
+#: :mod:`verification_subagent` 的 ``VERDICT_UNKNOWN``）。它对交付物**什么都没
+#: 说**：折算成失败 = 给一个没人验过的判据凭空生产一个修复任务；折算成成功
+#: = 把没验过的东西记成「验证通过」。arch 决策点 1：**UNKNOWN 是独立状态，
+#: 不得折算成失败** —— 所以它不进任何桶。
+STATUS_UNKNOWN = "UNKNOWN"
 
 #: BLOCKED 裁决的 reason 前缀。BLOCKED **留在失败桶**里（见
 #: :func:`bucket_for_status`），但「验不下去」和「验了没过」是两种语义 ——
@@ -119,7 +129,7 @@ def bucket_for_status(
 
     :param status: 裁决的 ``status`` 字段（``"PASSED"`` / ``"FAILED"`` /
         ``"BLOCKED"`` / ``"SKIPPED"`` / ``"SPLIT"`` / ``"DEFERRED"`` /
-        ``"INCONCLUSIVE"``）。
+        ``"UNKNOWN"`` / ``"INCONCLUSIVE"``）。
     :param vp_id: 该裁决所属的 VP id —— 只有它能去 ``retired`` 里查作废标记。
     :param retired: ``{vp_id: "obsolete" | "superseded_by"}``，即「计划自己
         作废了哪些 VP」。``None`` 表示没有 VP 被作废。
@@ -128,6 +138,10 @@ def bucket_for_status(
     未知 / 缺失的 status 返回 ``None`` —— **不猜、不兜底成 failed**。把
     一条看不懂的裁决报成失败，比让它不进任何桶更糟：前者会凭空制造一个修复
     任务，后者只是让这个 VP 再跑一轮。
+
+    ``UNKNOWN``（:data:`STATUS_UNKNOWN`）是**认识**但**没有桶**的状态 ——
+    它同样返回 ``None``，但理由不同：不是「看不懂」，而是「没验出结论，
+    不得折算成失败或成功」。
     """
     if not isinstance(status, str):
         return None
@@ -162,6 +176,18 @@ def bucket_for_status(
     if status == "DEFERRED":
         # Phase 2 关卡被门禁延后。**刻意不进任何终态成功桶**。
         return BUCKET_DEFERRED
+
+    if status == STATUS_UNKNOWN:
+        # 「没验出结论」——**刻意不进任何桶**（arch 决策点 1）。
+        #
+        # UNKNOWN 是独立状态，不是 FAILED 的别名：它对交付物什么都没说。
+        # 落进失败桶 = 给一个没人验过的判据凭空生产一个修复任务（还要污染
+        # 失败统计）；落进完成桶 = 把没验过的东西记成「验证通过」。两条都是
+        # 折算，而 UNKNOWN 的全部意义就是「不折算」。
+        #
+        # 刻意**不**兜底成 failed：这条分支与下面那条「不认识的 status 不进
+        # 任何桶」是**不同的**语义 —— 前者是认识但没有桶，后者是根本看不懂。
+        return None
 
     if status == "INCONCLUSIVE":
         # 门禁预算用尽、没能下结论（``verification_ci_runner.
@@ -222,6 +248,7 @@ __all__ = [
     "BUCKET_DEFERRED",
     "RETIRED_OBSOLETE",
     "RETIRED_SUPERSEDED_BY",
+    "STATUS_UNKNOWN",
     "BLOCKED_REASON_PREFIX",
     "blocked_reason",
     "bucket_for_status",

@@ -435,6 +435,18 @@ def _recover_execution_states(plans_dir: Path) -> List[Tuple[str, str]]:
                         plan_dir=plan_dir,
                         execution_repo=execution_repo,
                     )
+                    # The parking writes the phase on a best-effort basis,
+                    # and that write is the one that can be lost: the
+                    # thread that parks is the last code to run before
+                    # the process goes away, so it can be abandoned
+                    # between the phase write and the row write.  The
+                    # repair re-reads the phase and puts it back when the
+                    # write did not land, so the plan does not have to
+                    # wait for a later boot to be visible to the
+                    # scheduler again.  A plan that is already
+                    # ``queued`` — or that has moved on to a terminal
+                    # phase since — is left exactly as it is.
+                    _restore_parked_phase(plan_id, plan_dir)
                 actions.append((plan_id, ACTION_SKIPPED))
             # The plan row names ONE pid; the ledger knows them all.
             # An executor whose owner is gone is a survivor, and the
@@ -581,6 +593,51 @@ def _reconcile_exec_pid(plan_dir: Path, plan_id: str, pid: int) -> str:
     return ACTION_KILLED
 
 
+def _server_went_down_under_this_run(
+    plan_dir: Optional[Path],
+    *,
+    run_started_at: Any = None,
+) -> bool:
+    """Did the *server* go down under the run that started at *run_started_at*?
+
+    **One predicate, one meaning.**  "Was this run interrupted by the
+    server going down?" has exactly one answer, and every writer that
+    has to decide what a dead executor means must be given the *same*
+    answer — otherwise two writers decide the same question by two
+    rules, and the run's verdict depends on which of them ran last.
+    That is not a theoretical hazard: the executor watcher sees the
+    executor die the moment the shutdown kills the tree, while the
+    recovery scan sees it a boot later.  The watcher is the earlier
+    writer, so a watcher that does not ask this question turns an
+    interrupted run into a failed one before the recovery scan ever
+    gets to park it.
+
+    The predicate is one-sided on purpose (see
+    :func:`shutdown_checkpoint.is_shutdown_interrupted`): it may only
+    say yes to a shutdown it can prove, and "cannot prove it" means
+    "the work died", never "the server went down".
+
+    Never raises: this runs on the recovery path, where one plan's
+    failure must not cost every other plan its recovery.
+    """
+    if plan_dir is None:
+        return False
+    from shutdown_checkpoint import is_shutdown_interrupted
+
+    try:
+        return bool(is_shutdown_interrupted(
+            plan_dir,
+            kind="execution",
+            run_started_at=run_started_at,
+        ))
+    except Exception:  # noqa: BLE001 — an unreadable checkpoint is no evidence
+        _server.logger.warning(
+            "[shutdown_checkpoint] could not read the shutdown checkpoint "
+            "plan=%s", getattr(plan_dir, "name", plan_dir), exc_info=True,
+        )
+        return False
+
+
 def _shutdown_interrupted_this_run(
     plan_dir: Path, started_at: Optional[str]
 ) -> bool:
@@ -646,15 +703,18 @@ def _shutdown_park_needs_phase(plan_dir: Path, row: Dict[str, Any]) -> bool:
     the parking: the phase becomes ``queued``, the phase the scheduler
     waits on, and the plan is visible to the scheduler again.
 
+    The verdict itself is read by the shared helper
+    (:func:`_is_a_shutdown_parked_run`): the row that names the server
+    is one shape — ``stopped`` with the reason ``server_shutdown`` —
+    and every reader of that shape asks the same question of the same
+    row, so the recovery scan and the repair cannot disagree about
+    which runs the shutdown parked.
+
     Never raises: this runs on the recovery path, where one plan's
     failure must not cost every other plan its recovery.
     """
-    from shutdown_checkpoint import SHUTDOWN_STOP_REASON
-
     row = row or {}
-    if row.get("exec_status") != "stopped":
-        return False
-    if row.get("stop_reason") != SHUTDOWN_STOP_REASON:
+    if not _is_a_shutdown_parked_run(row):
         return False
     try:
         phase = _server.PlanState(plan_dir).get_current_phase()
@@ -3036,6 +3096,30 @@ def _restore_parked_phase(plan_id: str, plan_dir: Path) -> None:
         )
 
 
+def _park_if_shutdown_interrupted(
+    plan_id: str, plan_dir: Path, state: Dict[str, Any]
+) -> bool:
+    """Park the run if the server went down under it.
+
+    Returns whether the run was parked.  ``False`` means "the work
+    died", which is the answer every other writer of a terminal verdict
+    has to take.
+
+    This is the one place a writer of a terminal verdict asks the
+    question first.  A run the server took down is not a failed run: it
+    is interrupted work, and its phase belongs back in ``queued`` where
+    the scheduler can see it.  Writing ``failed`` instead strands the
+    plan — ``failed`` is terminal, and a terminal phase is in nobody's
+    waiting set.
+    """
+    if not _server_went_down_under_this_run(
+        plan_dir, run_started_at=state.get("started_at"),
+    ):
+        return False
+    _park_shutdown_interrupted(plan_id, plan_dir=plan_dir)
+    return True
+
+
 def _judge_process_dead(
     plan_id: str, row: Optional[Dict[str, Any]]
 ) -> bool:
@@ -5066,11 +5150,31 @@ def start_execution(
                         plan_id,
                     )
                 elif process.returncode > 0:
+                    # The executor died.  Before that is written down as
+                    # a failure, the one question that changes the answer
+                    # has to be asked: did the *server* go down under this
+                    # run?
+                    #
+                    # The shutdown path kills the executor's tree, so the
+                    # watcher sees the executor die with a non-zero code
+                    # and used to write "failed" — earlier than the
+                    # recovery scan, and more authoritative than it.  The
+                    # verdict of an interrupted run is "stopped" with the
+                    # phase "queued"; "failed" is terminal, and a
+                    # terminal phase is in nobody's waiting set, so the
+                    # plan was never resumed.
+                    #
+                    # The predicate is the shared one (see
+                    # :func:`_shutdown_interrupted_this_run`), so this
+                    # writer and the recovery scan cannot disagree.
+                    #
                     # The executor reported a failure of its own, and
                     # that is the reason the run ends with.  The verdict
                     # is written by the one writer that asks the
                     # shutdown checkpoint first: a run the *server*
-                    # interrupted is parked, not failed.
+                    # interrupted is parked, not failed.  The reason
+                    # carries the exit code: ``non_zero_exit`` alone
+                    # cannot tell exit 1 from exit 7.
                     _judge_executor_dead(
                         plan_id, plan_dir,
                         _crash_stop_reason(process.returncode),
@@ -5111,6 +5215,10 @@ def start_execution(
                     # tree with it.  The checkpoint tells the two apart,
                     # so the verdict is written by the same writer in
                     # either case.
+                    #
+                    # A death by signal carries the signal number
+                    # (``signal:9``); a death that carries no number at
+                    # all keeps the reason it always had.
                     _judge_executor_dead(
                         plan_id, plan_dir,
                         _crash_stop_reason(process.returncode),
@@ -5195,11 +5303,27 @@ def start_execution(
             # stranded the plan with no trace in the log.
             _server.logger.exception("executor_watcher_crashed plan=%s", plan_id)
             if state["status"] == "running":
+                # This writer writes a terminal verdict too, so it asks
+                # the same question first (判据-3: every writer of a
+                # terminal failure asks the checkpoint).
+                if _park_if_shutdown_interrupted(
+                    plan_id, plan_dir, state,
+                ):
+                    return
                 state["status"] = "failed"
                 state["stop_reason"] = "process_died_unexpectedly"
                 state["ended_at"] = datetime.now().isoformat()
                 _server.PlanState(plan_dir).transition_to("failed")
-                _write_failed_row(plan_id)
+                # 2026-11-24（本次合并 origin/main@ed425efd）：两侧在这里写的是
+                # **同一个终态写入**，只是一边自己展开、另一边走共享 helper ——
+                # base 侧把它抽成了 `_write_failed_row(...)`（顺带把「终态失败要
+                # 通知人」那段一并接上），本分支侧把写入改成了带
+                # `stop_reason` 的 `update_fields(...)`（行上必须带得上理由）。
+                # 两个意图都留下：走 base 的共享 helper，并把本分支要写进行里的
+                # 理由作为参数传进去 —— `update_status` 与 `update_fields` 在
+                # 终态上等价（都清 `exec_pid`、都写 `exec_status`），所以这一行
+                # 既是 base 的重构，也是本分支的判据。
+                _write_failed_row(plan_id, "process_died_unexpectedly")
                 # The watcher itself crashed: the run is over and the
                 # failure is terminal, so it is announced to a human —
                 # after the terminal writes, so the announcement can

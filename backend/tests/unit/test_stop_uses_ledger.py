@@ -568,3 +568,216 @@ def test_stop_without_handle_and_without_ledger_keeps_idle_semantics(
     assert not (plan_dir / "pause_state.json").exists(), (
         "the idle path writes no resume point"
     )
+
+
+# ---------------------------------------------------------------------------
+# 4) the identity check recognises the process this run spawned
+# ---------------------------------------------------------------------------
+#
+# macOS's CPython launcher re-executes the interpreter and rewrites
+# ``argv[0]`` from ``<venv>/bin/python`` to
+# ``.../Python.app/Contents/MacOS/Python`` — measured on this machine:
+# the spelling changes within ~70ms of the spawn, while the process'
+# start time does not move at all (a delta of 0.000000s).
+#
+# A comparison that reads ``argv[0]`` as a *path* therefore says "not
+# the same process" from that moment on, for ever.  Three things broke
+# at once: the startup reconcile refused to adopt the executor it had
+# just spawned, the reaper refused to kill the survivors it was told to
+# kill (``identity_mismatch``), and the next start of the same plan
+# answered 409 because the orphan was still alive.
+#
+# What is pinned here: a process this run spawned must be recognisable
+# as itself at every point after the spawn — and a pid that has been
+# *recycled* must still not be recognisable.
+
+
+def _spawned_child_identity(pid: int):
+    """The identity of ``pid``, spelled the way the spawn path spells it.
+
+    The spawn path writes the command line down the instant the process
+    exists, and on macOS that is the moment *before* the framework
+    launcher has rewritten ``argv[0]``.  So the recorded spelling is
+    the interpreter's own path, and the live spelling is the framework
+    binary — two spellings of one program.
+    """
+    live = process_identity.probe(pid)
+    assert live is not None, "the test child has no readable identity"
+    recorded = list(live.cmdline)
+    if recorded:
+        recorded[0] = sys.executable
+    return live, recorded
+
+
+def test_a_spawned_child_is_recognised_as_itself_after_the_spawn():
+    """判据-2: the identity check recognises the process at 0s / 0.3s / 1s.
+
+    The start time is the evidence that decides the question — the
+    re-exec does not move it — and the executable's *identity* is what
+    the command line has to agree on, not the path it happens to spell.
+    """
+    proc = _spawn_child()
+    try:
+        live, recorded = _spawned_child_identity(proc.pid)
+        assert live.create_time is not None, (
+            "the kernel did not report a start time for the test child"
+        )
+
+        for delay in (0.0, 0.3, 1.0):
+            if delay:
+                time.sleep(delay)
+            current = process_identity.probe(proc.pid)
+            assert current is not None, (
+                f"the test child has no readable identity at {delay}s"
+            )
+            assert current.matches(
+                create_time=live.create_time, cmdline=recorded,
+            ), (
+                f"the identity check does not recognise the process it "
+                f"spawned, {delay}s after the spawn: recorded={recorded!r} "
+                f"live={list(current.cmdline)!r}"
+            )
+    finally:
+        _cleanup(proc)
+
+
+def test_a_recycled_pid_is_not_recognised_as_the_recorded_process():
+    """The negative control: the same pid, a different life, is not a match.
+
+    A pid is not an identity — the start time is.  A process that
+    inherited the number of a recorded process has a different start
+    time, and the check has to say so even when the command line is
+    word for word the same.
+    """
+    proc = _spawn_child()
+    try:
+        live, recorded = _spawned_child_identity(proc.pid)
+        assert live.create_time is not None
+
+        recycled = process_identity.ProcessIdentity(
+            pid=proc.pid,
+            create_time=live.create_time + 3600.0,
+            cmdline=tuple(recorded),
+        )
+        assert not recycled.matches(
+            create_time=live.create_time, cmdline=recorded,
+        ), (
+            "a pid that was recycled was recognised as the recorded "
+            "process: the start time is the evidence, and it says these "
+            "are two different lives"
+        )
+    finally:
+        _cleanup(proc)
+
+
+def test_a_different_program_is_not_recognised_as_the_recorded_process():
+    """The other negative control: another program is not the recorded one.
+
+    The executable's identity is compared, so a shell is not a python
+    — the relaxation of the path comparison did not become a relaxation
+    of the program comparison.
+    """
+    proc = _spawn_child()
+    try:
+        live, recorded = _spawned_child_identity(proc.pid)
+        assert live.create_time is not None
+
+        other = list(recorded)
+        other[0] = "/bin/sh"
+        assert not live.matches(
+            create_time=live.create_time, cmdline=other,
+        ), (
+            f"a different program was recognised as the recorded one: "
+            f"{other!r}"
+        )
+    finally:
+        _cleanup(proc)
+
+
+# ---------------------------------------------------------------------------
+# The ledger and the live process are compared under one ruler
+# ---------------------------------------------------------------------------
+
+
+def test_the_ledger_records_the_executable_identity_of_what_it_registered(
+    tmp_path: Path,
+):
+    """A row carries the *identity* of its executable, not only its path.
+
+    macOS's framework launcher rewrites ``argv[0]`` a moment after the
+    exec, so the spelling a row carries is not the spelling the kernel
+    reports later — and a comparison made on the spelling alone can
+    never succeed.  The row therefore carries the identity of the
+    executable next to the spelling, and the identity is what the
+    comparison uses.
+    """
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir()
+    record = ledger.ProcessRecord(
+        plan_id="p",
+        role="vp_service",
+        pid=4242,
+        pgid=4242,
+        create_time=1700000000.0,
+        cmdline=(
+            "/opt/homebrew/Frameworks/Python.framework/Versions/3.11/"
+            "Resources/Python.app/Contents/MacOS/Python",
+            "-m", "http.server",
+        ),
+        cwd=".",
+        owner_pid=os.getpid(),
+        owner_role="backend",
+    )
+    ledger.record_spawn(plan_dir, record)
+
+    live = ledger.live_records(plan_dir)[4242]
+    assert live.argv0_alias == "python", (
+        "the row does not carry the identity of the executable it "
+        f"registered: {live.argv0_alias!r}"
+    )
+    # The spelling is kept too: the alias is an addition, not a
+    # replacement, and a reader still wants to see what was run.
+    assert live.cmdline[0].endswith("MacOS/Python"), live.cmdline
+
+
+def test_a_row_written_before_the_alias_existed_is_normalised_when_it_is_read(
+    tmp_path: Path,
+):
+    """A row from an older ledger is read under the same ruler.
+
+    The alias was added to the ledger after the rows had been written,
+    so most rows on disk do not carry it.  Reading one must not make it
+    unreadable: the identity is taken from the spelling the row does
+    carry, at the moment it is read.
+    """
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir()
+    payload = {
+        "event": ledger.EVENT_SPAWN,
+        "ts": 1700000000.0,
+        "terminal": False,
+        "pid": 4242,
+        "record": {
+            "plan_id": "p",
+            "role": "vp_service",
+            "pid": 4242,
+            "pgid": 4242,
+            "create_time": 1700000000.0,
+            "cmdline": ["/usr/bin/python3", "-m", "http.server"],
+            "cwd": ".",
+            "owner_pid": 4242,
+            "owner_role": "backend",
+            "state": ledger.STATE_ALIVE,
+            "created_at": 1700000000.0,
+            "ended_at": None,
+        },
+    }
+    (plan_dir / ledger.LEDGER_FILENAME).write_text(
+        json.dumps(payload) + "\n", encoding="utf-8"
+    )
+
+    live = ledger.live_records(plan_dir)[4242]
+    assert live.argv0_alias == "python", (
+        "a row written before the alias existed was not normalised when "
+        f"it was read: {live.argv0_alias!r}"
+    )

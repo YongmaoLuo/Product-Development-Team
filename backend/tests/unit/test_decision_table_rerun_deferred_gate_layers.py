@@ -25,6 +25,10 @@ there:
 * ``blocked-layer-kept`` — something still blocks it, so nothing is
   dispatched and the layer stays on the deferred list: a layer that is
   still waiting must not be quietly dropped;
+* ``unknown-blocker-marks-the-layer-unavailable`` — the upstream
+  reached no verdict at all (``UNKNOWN``), so the layer is *unavailable*
+  rather than *deferred*: it still is not dispatched, but it must not
+  be recorded as "waiting for a failure that is known";
 * ``empty-layer-skipped`` — a layer with no items in it has nothing to
   run, so it is skipped rather than dispatched.
 
@@ -51,6 +55,7 @@ _BACKEND_DIR = Path(__file__).resolve().parents[2]
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
+from verification_buckets import STATUS_UNKNOWN  # noqa: E402
 from verification_executor import VerificationExecutor  # noqa: E402
 from tests.judgment_tables import Case, assert_decision_table  # noqa: E402
 
@@ -73,6 +78,8 @@ _MANIFEST_TABLE = (
 _BLOCK_REASON = "budget exhausted"
 #: The reason the method writes into the deferral record.
 _DEFERRED_REASON = f"Phase 2 关卡延后：{_BLOCK_REASON}"
+#: The reason the method writes into the "unavailable" record.
+_UNAVAILABLE_REASON = f"Phase 2 关卡不可用：{_BLOCK_REASON}"
 #: The logger the executor writes its dispatch failures to.
 _EXECUTOR_LOGGER = "verification_executor"
 
@@ -124,6 +131,8 @@ class _ExecutorStub:
         self.executed: List[str] = []
         #: The deferral records the method wrote.
         self.marked: List[Dict[str, Any]] = []
+        #: The "unavailable" records the method wrote.
+        self.unknown_marked: List[Dict[str, Any]] = []
 
     # -- what the method under test calls ---------------------------------
 
@@ -140,6 +149,29 @@ class _ExecutorStub:
     def _gate_block_reason_for(self, gate: Any) -> str:
         """The reason this layer is still blocked (empty = it may run)."""
         return self.block_reason
+
+    def _gate_block_decision_for(self, gate: Any) -> Any:
+        """The blocking decision of this layer: ``(reason, status)``.
+
+        2026-11-27: the executor answers "may this layer run?" with a
+        **pair** — the reason *and* the upstream status — because "the
+        upstream never reached a verdict" (``UNKNOWN``) and "the
+        upstream is known to have failed" (``FAILED``) mean different
+        things downstream.  The stub carries no upstream status, so it
+        hands back the reason with no status, exactly as the executor
+        does when nothing upstream is known to have failed.
+        """
+        return (self._gate_block_reason_for(gate), None)
+
+    @staticmethod
+    def _reason_marks_unknown(detail: str) -> bool:
+        """Whether the wording of a reason says "the upstream is UNKNOWN".
+
+        The same wording check the executor does: it is a fallback for
+        the case where the reason was handed in from the outside, so
+        there is no status to read.
+        """
+        return "结论为 UNKNOWN" in detail
 
     def _reason_names_a_verdict(self, reason: str) -> bool:
         """Whether the reason names a verdict that really exists.
@@ -162,6 +194,19 @@ class _ExecutorStub:
                 "layer": [dict(item) for item in layer],
                 "reason": reason,
                 "refresh": refresh,
+            }
+        )
+
+    def _mark_layer_unknown(
+        self,
+        layer: List[Dict[str, Any]],
+        reason: str,
+    ) -> None:
+        """Record that the layer is unavailable ("no verdict upstream")."""
+        self.unknown_marked.append(
+            {
+                "layer": [dict(item) for item in layer],
+                "reason": reason,
             }
         )
 
@@ -214,6 +259,21 @@ class _UnstartableExecutorStub(_ExecutorStub):
         return None
 
 
+class _UnknownBlockingExecutorStub(_ExecutorStub):
+    """A stand-in whose upstream reached no verdict at all.
+
+    2026-11-27: "the upstream never reached a conclusion" (``UNKNOWN``)
+    is not the same thing as "the upstream is known to have failed" — the
+    layer is *unavailable*, not *deferred*.  The executor tells the two
+    apart by the **status** it hands back with the reason, so the stub
+    has to be able to hand a status back too.
+    """
+
+    def _gate_block_decision_for(self, gate: Any) -> Any:
+        """The blocking decision of this layer: ``(reason, UNKNOWN)``."""
+        return (self._gate_block_reason_for(gate), STATUS_UNKNOWN)
+
+
 #: A layer with one verification item in it.
 _LAYER_ONE = [{"id": "L1"}]
 #: A layer with nothing in it.
@@ -223,6 +283,10 @@ _LAYER_EMPTY: List[Dict[str, Any]] = []
 _STUB_DISPATCHABLE = _ExecutorStub("", [_LAYER_ONE])
 #: Something still blocks the layer.
 _STUB_BLOCKED = _ExecutorStub(_BLOCK_REASON, [_LAYER_ONE])
+#: The upstream reached no verdict: the layer is unavailable.
+_STUB_UNKNOWN_BLOCKED = _UnknownBlockingExecutorStub(
+    _BLOCK_REASON, [_LAYER_ONE]
+)
 #: The layer has no items to run.
 _STUB_EMPTY_LAYER = _ExecutorStub("", [_LAYER_EMPTY])
 #: The layer is known to the ledger only, and is still blocked by a verdict
@@ -241,6 +305,11 @@ CASES = [
     Case(
         id="blocked-layer-kept",
         inputs=(_STUB_BLOCKED, None),
+        expected=[],
+    ),
+    Case(
+        id="unknown-blocker-marks-the-layer-unavailable",
+        inputs=(_STUB_UNKNOWN_BLOCKED, None),
         expected=[],
     ),
     Case(
@@ -343,6 +412,47 @@ def test_a_blocked_layer_stays_deferred_with_the_current_reason() -> None:
     ], (
         "the deferral record has to name the current blocker and has to "
         "be refreshed, not left at the reason of an earlier round"
+    )
+
+
+def test_a_layer_blocked_by_an_unknown_upstream_is_marked_unavailable() -> None:
+    """The upstream reached no verdict → the layer is unavailable, not deferred.
+
+    "The upstream never reached a conclusion" and "the upstream is known
+    to have failed" are different facts, and they lead to different
+    records: a layer waiting for a *known* failure is deferred, a layer
+    waiting for a conclusion that never came is unavailable.  Recording
+    the second as the first tells the reader that a failure is known
+    when it is not.
+    """
+    stub = _UnknownBlockingExecutorStub(_BLOCK_REASON, [[{"id": "L1"}]])
+
+    dispatched = asyncio.run(
+        VerificationExecutor.rerun_deferred_gate_layers(stub)
+    )
+
+    assert dispatched == [], (
+        "a layer whose upstream has no verdict must not be dispatched"
+    )
+    assert stub.executed == [], (
+        "a layer whose upstream has no verdict must not run any of its items"
+    )
+    assert stub._deferred_gate_layers == [[{"id": "L1"}]], (
+        "an unavailable layer stays on the deferred list: UNKNOWN is not "
+        "terminal, so the layer still has to be asked later"
+    )
+    assert stub.unknown_marked == [
+        {
+            "layer": [{"id": "L1"}],
+            "reason": _UNAVAILABLE_REASON,
+        }
+    ], (
+        "the layer has to be recorded as unavailable, and the record has "
+        "to name the reason the upstream has no verdict"
+    )
+    assert stub.marked == [], (
+        "an unavailable layer must not also be recorded as deferred: that "
+        "would claim a failure is known when it is not"
     )
 
 

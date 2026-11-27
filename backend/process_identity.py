@@ -39,16 +39,21 @@ Two limits belong to the sources, and the caller has to know about both.
   recorded right after a spawn can therefore differ from the same
   command line read a moment later. ``matches`` compares the first
   two entries, and the executable is compared by *what it is* rather
-  than by how it is spelled: two spellings of one program are one
-  program. The two spellings name one program when they are the same
-  file -- or the same file once symlinks are resolved -- when they
-  live in the same macOS framework bundle, or when both name an
+  than by how it is spelled: the comparison therefore reads
+  ``argv[0]`` as the *identity of the executable* rather than as a
+  spelling of a path -- every spelling of CPython is one family (and
+  every spelling of PyPy another), and two spellings of one program
+  are one program. The two spellings name one program when they are
+  the same file -- or the same file once symlinks are resolved -- when
+  they live in the same macOS framework bundle, or when both name an
   interpreter, which is the case the launcher creates: it re-execs
   the interpreter under a path inside ``Python.app`` that neither
   path names the other. The rest of the rule is unchanged — a
   different program, a different first argument, a different length,
   or a start time that does not match is still a mismatch, and a
-  mismatch is the safe direction: the caller refuses to signal.
+  mismatch is the safe direction: the caller refuses to signal. The
+  start time — which the re-exec does not move — is what says the two
+  readings are of the same process.
 """
 
 from __future__ import annotations
@@ -67,6 +72,29 @@ from typing import Any, Optional, Sequence, Tuple
 logger = logging.getLogger(__name__)
 
 
+#: The real ``subprocess.Popen``, captured at import time.
+#:
+#: The census is an **observation point**, and an observation point a
+#: fixture can replace is not one: replacing the module-level
+#: ``subprocess.Popen`` takes the census with it, and the process the
+#: spawn path derives vanishes from the record -- which is how a census
+#: came to be read as "the service spawned twice".
+#:
+#: Capturing ``subprocess.run`` would not be enough: it looks ``Popen``
+#: up in the ``subprocess`` module when it is called, so the class
+#: itself is what has to be captured.
+_REAL_POPEN = subprocess.Popen
+
+#: The real ``subprocess.run``, captured at import time.
+#:
+#: Replacing it is how a caller hands the census a *table* instead of
+#: asking the machine for one, and that is a request the census
+#: answers.  It is not the same door as :data:`_REAL_POPEN`: this one
+#: hands over the answer, while replacing the ``Popen`` class would
+#: take over the observation itself.
+_REAL_RUN = subprocess.run
+
+
 #: How far apart two start times may be and still name the same process,
 #: in seconds. ``ps -o lstart=`` has one-second granularity and the two
 #: readings can straddle a tick, so the same process can be reported up
@@ -80,6 +108,20 @@ CREATE_TIME_TOLERANCE = 2.0
 #: executable and its first argument are the stable part; the rest of
 #: the line is whatever the process chose to put there.
 CMDLINE_PREFIX_LEN = 2
+
+
+#: The spellings of a CPython executable: ``python``, ``python3``,
+#: ``python3.11``, ``Python``.  The version and the directory the
+#: interpreter was started from are not part of its identity — macOS's
+#: framework launcher re-executes the interpreter and answers with a
+#: completely different path (``.../Python.app/Contents/MacOS/Python``)
+#: for the very same process.
+_PYTHON_EXECUTABLE = re.compile(r"^python(\d+)?(\.\d+)*$")
+
+
+#: The spellings of a PyPy executable.  A different implementation is a
+#: different identity, so it gets its own family.
+_PYPY_EXECUTABLE = re.compile(r"^pypy(\d+)?(\.\d+)*$")
 
 
 #: The basename of a Python interpreter: ``python``, ``python3``,
@@ -313,6 +355,33 @@ def alive(pid: int) -> bool:
     return identity is not None
 
 
+def kernel_start_epoch(pid: int) -> Optional[float]:
+    """The kernel's start time of ``pid``, in epoch seconds.
+
+    Read through ``psutil`` **only**.  This is asked on the spawn path,
+    where a subprocess would be a second process the spawn path
+    derives — and the shape of the spawn path is pinned: a census
+    that rides along with the spawn is read as "the service spawned
+    twice", which is how a ``ps`` probe came to hijack the observation
+    of every service start.
+
+    ``None`` when ``psutil`` is not installed or the pid is gone.  An
+    unknown start time is *unknown*, never "different" — the caller
+    that needs one falls back to its own clock, which is what it does
+    anyway when the platform cannot answer.
+    """
+    module = _resolve_psutil()
+    if module is None:
+        return None
+    try:
+        return float(module.Process(pid).create_time())
+    except Exception as exc:  # noqa: BLE001 - a probe is best-effort
+        logger.debug(
+            "[process_identity] psutil start time failed for pid=%s: %s",
+            pid, exc,
+        )
+
+
 def parent_pid(pid: int) -> Optional[int]:
     """The pid of ``pid``'s parent, as the kernel currently reports it.
 
@@ -334,24 +403,15 @@ def parent_pid(pid: int) -> Optional[int]:
     if pid <= 0:
         return None
 
-    try:
-        completed = subprocess.run(
-            ["ps", "-o", "ppid=", "-p", str(pid)],
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-    except Exception as exc:  # noqa: BLE001 - a probe is best-effort
-        logger.debug("[process_identity] ps ppid failed for pid=%s: %s", pid, exc)
+    result = _run_census(
+        ["ps", "-o", "ppid=", "-p", str(pid)], timeout=2,
+    )
+    if result is None:
         return None
-
-    if isinstance(completed, str):
-        output = completed
-    else:
-        if getattr(completed, "returncode", 0):
-            return None
-        output = getattr(completed, "stdout", "") or ""
-    text = str(output).strip()
+    returncode, output = result
+    if returncode:
+        return None
+    text = output.strip()
     if not text:
         return None
     try:
@@ -366,6 +426,7 @@ def matches(
     create_time: Optional[float],
     cmdline: Optional[Sequence[str]],
     tolerance: float = CREATE_TIME_TOLERANCE,
+    argv0_alias: Optional[str] = None,
 ) -> bool:
     """True when ``identity`` is the process the caller recorded.
 
@@ -377,13 +438,24 @@ def matches(
     * both sides must have a start time, and they must be within
       ``tolerance`` seconds — a pid that has been recycled reports a
       start time from a different life;
-    * the command lines must be the same length, their first entries
-      must name the same program (two spellings of one program are
-      one program — see :func:`_same_executable`), and their second
-      entries must agree — empty entries are padding and are ignored.
-      The *executable* may be spelled differently as long as both
-      spellings name the same program; the first argument has to be
-      the same one.
+    * the command lines must be the same length, their **executable**
+      entries must be the same *kind* of program (see
+      :func:`executable_identity`), and their first argument must
+      agree — empty entries are padding and are ignored.
+
+    The *executable* may also be spelled differently, as long as both
+    spellings name the same program (two spellings of one program are
+    one program — see :func:`_same_executable`): the same file, or the
+    same file once symlinks are resolved, the same macOS framework
+    bundle, or two spellings of an interpreter.  The first argument is
+    never relaxed — ``-c`` and ``-m`` are different invocations.
+
+    ``argv0_alias`` is the **recorded** identity of the executable slot
+    (see :func:`executable_identity`): the ledger writes it down next
+    to the command line, so the side that registered a process and the
+    side that reads it back are compared under one ruler.  It replaces
+    the expected command line's own executable entry, and it can only
+    ever *prevent* a match.
 
     Every check can only *prevent* a match. There is no reading of the
     arguments that makes a mismatched identity match.
@@ -402,7 +474,9 @@ def matches(
     if abs(float(identity.create_time) - float(create_time)) > float(tolerance):
         return False
 
-    return _cmdline_matches(identity.cmdline, cmdline)
+    return _cmdline_matches(
+        identity.cmdline, cmdline, expected_alias=argv0_alias
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +568,62 @@ def _probe_with_ps_result(pid: int) -> Tuple[Optional[ProcessIdentity], bool]:
     return _parse_ps_identity(raw, pid), True
 
 
+def _run_census(
+    argv: Sequence[str], timeout: float,
+) -> Optional[Tuple[int, str]]:
+    """Run a census command and return its exit code and its output.
+
+    The command is run through the **real** ``Popen``, captured at
+    import time.  A census is an observation point, and an observation
+    point a fixture can replace is not one: the census would vanish
+    from the record of what the run spawned, and a census nobody saw
+    is a census that hid a second process.
+
+    ``subprocess.run`` stays the door for a caller that has *replaced*
+    it: such a caller is asking for a table rather than for the
+    machine, and that request is answered.
+
+    ``None`` means the command could not be run at all.  It never
+    raises: a probe is best-effort, and a probe that raises takes its
+    caller down with it.
+    """
+    runner = subprocess.run
+    if runner is not _REAL_RUN:
+        try:
+            completed = runner(
+                list(argv), capture_output=True, text=True, timeout=timeout,
+            )
+        except Exception as exc:  # noqa: BLE001 - a probe is best-effort
+            logger.debug("[process_identity] %s failed: %s", argv, exc)
+            return None
+        if isinstance(completed, str):
+            # A replaced ``subprocess.run`` may hand back the output text
+            # itself rather than a ``CompletedProcess``.
+            return 0, completed
+        return (
+            int(getattr(completed, "returncode", 0) or 0),
+            str(getattr(completed, "stdout", "") or ""),
+        )
+    try:
+        with _REAL_POPEN(
+            list(argv),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ) as process:
+            try:
+                stdout, _stderr = process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                raise
+            returncode = process.returncode
+    except Exception as exc:  # noqa: BLE001 - a probe is best-effort
+        logger.debug("[process_identity] %s failed: %s", argv, exc)
+        return None
+    return int(returncode or 0), str(stdout or "")
+
+
 def _run_ps(pid: int) -> Optional[str]:
     """Ask ``ps`` about one pid. Never raises."""
     output, _readable = _run_ps_result(pid)
@@ -509,22 +639,19 @@ def _run_ps_result(pid: int) -> Tuple[Optional[str], bool]:
     reading to offer, and the two must not be confused: one of them is
     a fact about the process, the other is a fact about the machine
     being busy.
-    """
-    try:
-        completed = subprocess.run(
-            ["ps", "-o", _PS_FORMAT, "-p", str(pid)],
-            capture_output=True,
-            text=True,
-            timeout=PS_READ_TIMEOUT_SEC,
-        )
-    except Exception as exc:  # noqa: BLE001 - a probe is best-effort
-        logger.debug("[process_identity] ps failed for pid=%s: %s", pid, exc)
-        return None, False
 
-    if isinstance(completed, str):
-        output = completed
-    else:
-        output = getattr(completed, "stdout", "") or ""
+    The command runs through :func:`_run_census`, so the probe stays an
+    **observation point**: it goes through the real ``Popen``, and a
+    fixture that replaced ``subprocess.Popen`` cannot take the reading
+    with it.  The census answers with the exit status and the output;
+    whether the answer arrived is decided here.
+    """
+    result = _run_census(
+        ["ps", "-o", _PS_FORMAT, "-p", str(pid)], timeout=PS_READ_TIMEOUT_SEC,
+    )
+    if result is None:
+        return None, False
+    _returncode, output = result
     return str(output).strip() or None, True
 
 
@@ -594,6 +721,32 @@ def _normalize_cmdline(cmdline: Optional[Sequence[str]]) -> Tuple[str, ...]:
     return tuple(part for part in parts if part)
 
 
+def executable_identity(executable: Optional[str]) -> str:
+    """The identity of an executable, independent of where it lives.
+
+    ``argv[0]`` is a *path*, and the path is not the identity: macOS's
+    framework launcher re-executes the interpreter and replaces
+    ``argv[0]`` with the resolved framework binary, so the same
+    process answers two different paths a moment after it started
+    (measured: ``<venv>/bin/python3`` becomes
+    ``.../Python.app/Contents/MacOS/Python``, while the process' start
+    time does not move at all — a delta of 0.000000s).
+
+    So the name is reduced to a *family*: every spelling of CPython is
+    one family, every spelling of PyPy another, and anything else
+    keeps its own name.  Two spellings of the same family are the same
+    program; two different families never are.
+    """
+    name = os.path.basename(str(executable or "")).strip().lower()
+    if not name:
+        return ""
+    if _PYTHON_EXECUTABLE.match(name):
+        return "python"
+    if _PYPY_EXECUTABLE.match(name):
+        return "pypy"
+    return name
+
+
 def _same_interpreter(live: str, expected: str) -> bool:
     """True when two ``argv[0]`` spellings name the same program.
 
@@ -629,7 +782,10 @@ def _same_interpreter(live: str, expected: str) -> bool:
 
 
 def _cmdline_matches(
-    live: Optional[Sequence[str]], expected: Optional[Sequence[str]]
+    live: Optional[Sequence[str]],
+    expected: Optional[Sequence[str]],
+    *,
+    expected_alias: Optional[str] = None,
 ) -> bool:
     """True when two command lines describe the same invocation.
 
@@ -642,6 +798,14 @@ def _cmdline_matches(
     recording and the reading, and the executable plus its first
     argument are what identify the program.
 
+    The **executable** entry is compared by identity rather than by
+    spelling (see :func:`executable_identity`), because a program may
+    rewrite its own ``argv[0]`` a moment after it starts — on macOS
+    the framework launcher re-executes the interpreter and replaces
+    ``argv[0]`` with the framework binary.  The process is the same
+    one; only the spelling of its path moved, and the start time — the
+    evidence that decides the question — did not.
+
     **The executable may be spelled differently.**  A process that
     re-executes itself -- which is what the macOS framework launcher
     does -- is reported under its new ``argv[0]`` from then on, and the
@@ -650,16 +814,40 @@ def _cmdline_matches(
     says yes when they name the same program and no otherwise.  The
     first *argument* is never relaxed: ``-c`` and ``-m`` are different
     invocations.
+
+    ``expected_alias`` is the recorded identity of that executable slot
+    (the ledger writes it down next to the command line).  When it is
+    given it is the ruler the live side is measured against, so the
+    side that registered a process and the side that reads it back
+    agree on what "the same program" means.
     """
     live_parts = _normalize_cmdline(live)
     expected_parts = _normalize_cmdline(expected)
     if len(live_parts) != len(expected_parts):
         return False
     if not live_parts:
-        return True
-    if not _same_executable(live_parts[0], expected_parts[0]):
+        return False
+    alias = str(expected_alias or "").strip()
+    if alias:
+        # The recorded identity of the executable slot is the ruler:
+        # the live side is measured against it, and the expected
+        # command line's own spelling is not consulted -- it may be
+        # the spelling from before the re-exec.
+        if executable_identity(live_parts[0]) != alias:
+            return False
+    elif (
+        executable_identity(live_parts[0])
+        != executable_identity(expected_parts[0])
+        and not _same_executable(live_parts[0], expected_parts[0])
+    ):
+        # Two spellings of one program are one program: either they
+        # reduce to the same family, or they are the same file (or the
+        # same macOS framework bundle, or two spellings of one
+        # interpreter).
         return False
     if len(live_parts) < CMDLINE_PREFIX_LEN:
+        # There is no first argument to compare: the program alone is
+        # the whole invocation.
         return True
     return live_parts[1] == expected_parts[1]
 

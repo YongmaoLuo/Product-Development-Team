@@ -44,6 +44,13 @@ from verification_agent import (
     # uses — the orchestrator does not get a second, looser copy.
     _result_evidence,
 )
+# 2026-11-01: the verdict a gate writes when its answer could not be
+# parsed and its retry budget ran out — the same word
+# ``verification_subagent`` writes (``VERDICT_UNKNOWN``) and the same
+# word ``verification_buckets`` keeps (``STATUS_UNKNOWN``).  It is
+# imported rather than re-spelled: the verdict vocabulary has one home,
+# and the orchestrator does not get a second, looser copy of it.
+from verification_buckets import STATUS_UNKNOWN
 from repair_generator import (
     RepairTaskGenerator,
     # 2026-10-23: the plan's own constraints. ``_plan_intent`` reads the
@@ -993,12 +1000,19 @@ STATUS_INCONCLUSIVE = "INCONCLUSIVE"
 #: status of its own (``verification_agent``'s report builder falls back
 #: to it), so the point was never actually looked at: the round has no
 #: verdict about that point, and — like ``INCONCLUSIVE`` — no verdict
-#: about the deliverable either.
-#:
-#: Spelled here rather than imported for the same reason as
-#: :data:`STATUS_INCONCLUSIVE`: reading a round must not drag the agent
-#: (and the model machinery behind it) into the import time.
-STATUS_UNKNOWN = "UNKNOWN"
+#: about the deliverable either.  The name itself is the one imported
+#: from :mod:`verification_buckets` above.
+
+
+#: The stop reason a round that judged nothing carries when a point's
+#: outcome could not be read (``UNKNOWN``): **the verdict is
+#: unavailable**.  It is neither a deferral (the plan's own business)
+#: nor an environment block (the environment took a point out) — the
+#: gate ran, and its answer could not be parsed.  Reporting that as an
+#: environment block sends the operator looking at the environment for a
+#: fault that is not there (arch decision point 3: 判定不可用有自己的
+#: 停止理由，不伪装成延后或环境阻塞).
+STOP_REASON_VERDICT_UNAVAILABLE = "verdict_unavailable"
 
 
 def _round_judged_nothing(report: Mapping, failed_count: int) -> bool:
@@ -1197,18 +1211,34 @@ def _judged_nothing_cycle_result(report: Mapping) -> dict:
     verbatim, so there is exactly one place where this exit is written
     down.
 
+    Two kinds of round land here, and they do not say the same thing:
+
+    * the environment took points out of the round, or the plan deferred
+      them — the round is ``environment_blocked`` and carries no reason
+      word; the verdict is the ``status``;
+    * a point's outcome could not be read (``UNKNOWN``) — the round
+      stops with ``stop_reason = "verdict_unavailable"`` and is **not**
+      an environment block.  The gate ran and its answer could not be
+      parsed: reporting that as an environment block would send the
+      operator looking at the environment for a fault that is not there
+      (arch decision point 3).
+
     Args:
         report: The round's report.
 
     Returns:
         The round's exit dict.
     """
+    verdict_unavailable = _round_has_unknown_verdict(report)
     return {
         "should_continue": False,
         "should_stop": True,
         # The verdict is the ``status``; the reason vocabulary is
-        # closed, so this stop carries no new word.
-        "stop_reason": None,
+        # closed, so this stop carries no new word — unless a point's
+        # outcome could not be read, which is a reason of its own.
+        "stop_reason": (
+            STOP_REASON_VERDICT_UNAVAILABLE if verdict_unavailable else None
+        ),
         "repair_tasks": [],
         "waiting_for_user": False,
         "status": "loop_stopped",
@@ -1216,7 +1246,9 @@ def _judged_nothing_cycle_result(report: Mapping) -> dict:
         # 2026-10-31: an inconclusive round is the operator's turn —
         # only a human can say whether the gate gets a bigger budget.
         "needs_operator_decision": _round_needs_operator_decision(report),
-        "environment_blocked": True,
+        # 2026-11-01: a round whose verdict was unavailable is not an
+        # environment block — the environment did not take it out.
+        "environment_blocked": not verdict_unavailable,
         # 2026-10-31: which phase ran out of budget — the evidence the
         # operator needs to decide what happens next.
         "budget_exhausted_in": _round_budget_exhausted_in(report),
@@ -6529,6 +6561,15 @@ class VerificationOrchestrator:
         # (``_record_terminal("loop_stopped", ...)``); this branch
         # writes no failure phase and no repair task.
         #
+        # 2026-11-01: one round in here says something else.  A point
+        # whose outcome could not be read (``UNKNOWN``) is not a
+        # deferral and not an environment block — the gate ran and its
+        # answer could not be parsed.  That round carries
+        # ``stop_reason = "verdict_unavailable"`` and is **not**
+        # ``environment_blocked``: reporting it as one would send the
+        # operator looking at the environment for a fault that is not
+        # there.
+        #
         # The check reads the round's own entries, never the derived
         # verdict: a round with no entry at all (``PASSED`` + an empty
         # ``verification_results``) has no verdict to give and must keep
@@ -6559,6 +6600,12 @@ class VerificationOrchestrator:
                     f"[Verification] round {round_number}: the gate ran out "
                     f"of budget in {budget_exhausted_in} — no verdict, an "
                     f"operator has to decide"
+                )
+            elif _round_has_unknown_verdict(report):
+                print(
+                    f"[Verification] round {round_number}: a point's outcome "
+                    f"could not be read — the verdict is unavailable, "
+                    f"nothing to repair"
                 )
             else:
                 print(

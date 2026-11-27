@@ -21,30 +21,47 @@ Import ``open_db`` and ``migrate`` inside the callback's try-block
 so they're in local scope when needed. (Localised imports are fine
 because Python caches them in ``sys.modules``; the only cost is the
 ``import`` statement lookup on the first call.)
+
+Where the closure lives
+-----------------------
+The closure moved out of ``server.py`` and into
+``backend/verification_loop.py``; the check follows it there.  The
+scope is found by AST, not by counting characters: see
+:func:`_callback_body` for why the character window had to go.
 """
 from __future__ import annotations
 
-from pathlib import Path
+from tests.app_source import find_def
 
-import pytest
-from tests.app_source import app_source
+
+def _callback_body() -> str:
+    """The source of the ``_on_repair_complete`` closure, and nothing else.
+
+    The closure is located by **AST**, not by counting characters.
+    The imports this file checks live in the closure's body, and the
+    closure's body is what the AST says it is — so the scope is the
+    closure, and it stays the closure when the code around it moves.
+
+    It used to be a window of 8000 characters, taken from the ``def``
+    line.  The window is a guess about a length, and it guessed
+    wrong: the merge pushed the distance from the closure's start to
+    the migrated alias import past 8000 characters, so the two
+    assertions below fell outside the window and read as "the closure
+    lost its import" — while the closure had never lost anything.  A
+    failure that says the code is gone when the code is there sends
+    the reader to delete the test, and loses the contract.
+
+    A bigger magic number would have the same defect one merge later.
+    The AST has no such number: it knows where the function ends.
+    """
+    return find_def("_on_repair_complete").text
 
 
 def test_server_callback_imports_open_db_and_migrate():
     """Static check: the ``_on_repair_complete`` closure body imports
     ``open_db`` and ``migrate`` so the callback doesn't NameError.
     """
-    src = app_source()
-
-    # Locate _on_repair_complete function
-    cb_start = src.find("def _on_repair_complete")
-    assert cb_start >= 0, "_on_repair_complete not found"
-
-    # Find the next nested def or top-level closure boundary by scanning
-    # until we hit the next dedent that returns to module-level. The
-    # callback body runs roughly 200 lines, so scan the next 400 lines
-    # from cb_start.
-    cb_body = src[cb_start:cb_start + 8000]
+    cb_body = _callback_body()
 
     assert "from state_machine.db.connection import open as open_db" in cb_body, (
         "BUG: _on_repair_complete closure body lost the open_db "
@@ -58,10 +75,7 @@ def test_server_callback_imports_open_db_and_migrate():
 
 def test_callback_uses_aliases_consistently():
     """Pin that the alias names match the call sites."""
-    src = app_source()
-
-    cb_start = src.find("def _on_repair_complete")
-    cb_body = src[cb_start:cb_start + 8000]
+    cb_body = _callback_body()
 
     # open_db is imported with ``as open_db`` so the existing
     # ``open_db(_state_db_path())`` call works without a rename.
@@ -72,4 +86,26 @@ def test_callback_uses_aliases_consistently():
     # ``_migrate(_v_conn)`` call works without a rename.
     assert "import migrate as _migrate" in cb_body, (
         "migrate must be aliased as _migrate so the existing call site works"
+    )
+
+
+def test_the_located_body_is_the_closure_and_not_its_neighbour():
+    """The scope starts at the closure and stops at its end.
+
+    The control for the locator.  A scope that ran past the closure
+    would find the imports of a *different* function and pass for the
+    wrong reason — and a scope that ran to the end of the file would
+    pass whatever the file happens to contain.
+    """
+    located = find_def("_on_repair_complete")
+    body = located.text
+    body_lines = body.splitlines()
+    file_lines = located.source.splitlines()
+
+    assert body_lines[0].startswith("def _on_repair_complete"), (
+        "the located body does not start at the closure: %r" % body_lines[0]
+    )
+    assert len(body_lines) < len(file_lines), (
+        "the located body is the whole file (%d lines); the scope is not "
+        "bounded by the closure" % len(body_lines)
     )

@@ -199,6 +199,20 @@
   `workflow_dispatch`，本来就不跑那个作业。**没有任何裁决被改动**：门禁仍然是
   0 / 1 / 3 那三个退出码；变的只是它推什么。
 
+- **不合规的判定输出不再被记成代码失败。** 子代理给出的答案不满足裁决契约时，
+  关于交付物其实什么都没确立，于是现在它被记成 `UNKNOWN` 并带上 `infra` 失败
+  类别，而不是 `FAILED`（`backend/verification_subagent.py`）；报告里那条判了
+  失败、却从未自述交付物缺陷的条目会被还原成 `UNKNOWN`，而不是留下一条替没人
+  验过的东西买下的修复任务（`backend/verification_agent.py`）；「没有结论」这个
+  状态有了自己的桶，不再被折进失败计数里（`backend/verification_buckets.py`）。
+  修复批次的结束由一个分类器判定，执行器的死亡被记在那个裁决旁边，而不是写在
+  它上面 —— 于是「代码还是不对」与「还有活要干」不再被压成同一件事
+  （`backend/verification_loop.py`）。收敛汇总读的是同一本账，把每个计划归进
+  `passed`、`user_stopped`、`env_blocked`、`infra_flake`、`code_defect` 或
+  `unclassified`（`backend/verification/convergence_metrics.py`、
+  `backend/routes/verification.py`）。**这次改的是裁决本身**：一轮什么都没验出来的
+  情况，过去被报成交付物的失败，现在被报成「没有结论」。
+
 
 
 ## [0.1.2] - 2026-10-07
