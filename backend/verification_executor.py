@@ -4541,12 +4541,35 @@ class VerificationExecutor(BaseExecutor):
         finally:
             self._in_deferred_recheck = False
 
+    def _reason_names_a_verdict(self, reason: str) -> bool:
+        """这条阻塞理由是否点名了一个**真实存在的结论**。
+
+        门禁判据（:meth:`_blocking_gate_reason` / :meth:`_gate_predecessor_reason`）
+        只有两种说法：点名结论（「… 结论为 BLOCKED」），或者说**看不到**结论
+        （「… 尚未产生结论」/「… 尚未执行」）。
+
+        后者意味着这个执行器**读不到**阻塞者的结论 —— 结论是生产路径
+        （:meth:`_record_result`）写下的，不盖出处指纹，执行器重建之后被
+        :mod:`verdict_provenance` 当成「出处过期」整条丢掉。这时候账本里
+        原来那条理由更准确，不该用一句更含糊的话把它覆盖掉。
+        """
+        return "尚未" not in reason
+
     async def rerun_deferred_gate_layers(self, gate: Any = None) -> List[str]:
         """重算被延后的门禁层 —— 前提没了就**在本轮真正跑起来**。
 
         DEFERRED 不是终态：它只意味着「这一轮还没跑」。前提一旦消失
         （阻塞者翻绿、或者更早的关卡过了），那一层就必须补跑 —— 否则
         「整仓门禁真的跑过并且是绿的」这条判据永远兑现不了。
+
+        2026-11-27：**先按账本把被延后
+        的层找回来**（:meth:`_discover_deferred_gate_layers`）。被延后的层
+        记在**进程内**的表（``_deferred_gate_layers``）里，而轮次收口常常
+        跑在**重建过的**执行器上（续跑 / 换进程 / 重启）—— 那张表是空的，
+        账本里那条 DEFERRED 还在。于是这一轮以「关卡从没被问过」收场：
+        VP-017 / VP-018 一次都没被派发，报告里那条 DEFERRED 还带着**过期**
+        的理由（「Phase 1 的 VP-001 结论为 BLOCKED」，而 VP-001 早已
+        PASSED）。账本是真相，内存表只是缓存 —— 收口时先按账本找回那一层。
 
         Args:
             gate: 并发闸（``acquire()`` / ``release()``），与
@@ -4555,18 +4578,46 @@ class VerificationExecutor(BaseExecutor):
         Returns:
             真正派发出去了的关卡 id（空列表 = 全都还在等前提）。
         """
+        # 账本是真相：内存表丢了（执行器重建 / 换进程 / 重启）也要把
+        # 「本轮还有一层没跑」这件事找回来，否则收口什么也派发不出去。
+        #
+        # 先记下「**本进程自己**延后过的那些层」：它们的 DEFERRED 条目是本轮
+        # 自己写下的，理由重算正是目的（必须改口成当前的阻塞者）。只有账本
+        # 才知道的层（执行器重建后才发现的）另作处理 —— 见下面。
+        known_layer_ids = {
+            self._derive_item_id(layer[0])
+            for layer in self._deferred_gate_layers
+            if layer
+        }
+        self._discover_deferred_gate_layers()
         dispatched: List[str] = []
         for layer in list(self._deferred_gate_layers):
             if not layer:
                 continue
+            layer_id = self._derive_item_id(layer[0])
             reason = self._gate_block_reason_for(layer[0])
             if reason:
                 # 还在被挡着：理由刷新（点名当前的阻塞者）。
                 # refresh=True —— 这条本轮 DEFERRED 是本方法自己写的，
                 # 重算它正是目的：理由必须改口成**当前**的阻塞者。
-                self._mark_layer_deferred(
-                    layer, f"Phase 2 关卡延后：{reason}", refresh=True,
-                )
+                if layer_id in known_layer_ids or self._reason_names_a_verdict(reason):
+                    self._mark_layer_deferred(
+                        layer, f"Phase 2 关卡延后：{reason}", refresh=True,
+                    )
+                else:
+                    # 只有账本知道、而执行器又**看不到**阻塞者结论的那一层：
+                    # 账本里那条旧理由（「结论为 BLOCKED」）比新算出来的
+                    # 「本轮尚未产生结论」**更准确** —— 账本里确实有一条
+                    # BLOCKED 结论，只是这个执行器读不到它（生产路径写下的
+                    # 结论没有出处指纹，重建后被 :mod:`verdict_provenance`
+                    # 当成过期丢掉）。拿更含糊的理由覆盖更准确的理由，
+                    # 是在把账本写坏。
+                    logger.info(
+                        "[verification_executor] the deferred gate layer %s is "
+                        "still blocked; keeping the ledger reason as it is "
+                        "(the executor cannot see the blocking verdict)",
+                        layer_id,
+                    )
                 continue
             self._deferred_gate_layers.remove(layer)
             try:
