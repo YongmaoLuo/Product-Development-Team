@@ -371,6 +371,95 @@ class ArchivedPlanError(Exception):
     """Raised when a verification mutation targets an archived plan."""
 
 
+#: The keys of the loop-tracking payload that are **safety counts** rather
+#: than part of the verdict set a reset throws away.
+#:
+#: 2026-11-27.  Both of them answer the same question — *how many times
+#: has this plan already been answered by the machine?*  A reset does not
+#: un-ask the question, so it must not un-count the answer.
+_SAFETY_COUNT_KEYS = ("unjudged_streak", "terminal_auto_streak")
+
+#: The loop-tracking file a reset deletes (and then re-writes with the
+#: safety counts in it).
+_LOOP_TRACKING_FILENAME = "verification_loop_tracking.json"
+
+
+def _read_safety_counts(plan_dir: Path) -> Dict[str, int]:
+    """The safety counts the loop-tracking file carries, if any.
+
+    2026-11-27.  Two of the keys in ``verification_loop_tracking.json``
+    are **safety counts**, not part of the verdict set:
+
+    * ``unjudged_streak`` — how many rounds in a row the chain could
+      not be judged at all;
+    * ``terminal_auto_streak`` — how many times the clock has been
+      asked what happens to this plan at the terminal branch.
+
+    A reset discards the *verdicts* (which points failed, how often the
+    same failure repeated) — that is what a reset is for.  It does not
+    un-ask the questions the machine has already answered on the plan's
+    behalf, so these two counts survive it.
+
+    A count that cannot be read is **not** repaired: a half-written
+    counter is not evidence about anything.  A missing key, a value
+    that is not an ``int`` (``True`` is not a count — ``bool`` is a
+    subclass of ``int``) and a negative count all read as "no count".
+    """
+    path = plan_dir / _LOOP_TRACKING_FILENAME
+    counts: Dict[str, int] = {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return counts
+    if not isinstance(raw, dict):
+        return counts
+    for key in _SAFETY_COUNT_KEYS:
+        value = raw.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            continue
+        if value <= 0:
+            continue
+        counts[key] = int(value)
+    return counts
+
+
+def _write_safety_counts(plan_dir: Path, counts: Dict[str, int]) -> None:
+    """Write the safety counts back into the loop-tracking file.
+
+    2026-11-27.  The write is **atomic** (a temporary file next to the
+    target, then ``os.replace``): a half-written JSON would be read as a
+    corrupt file, which loses the count — the one thing this file is
+    for.
+
+    Best-effort: a reset that cannot preserve a counter is still a
+    reset.  The plan must not be locked out of recovery because a
+    counter could not be written, so a failure here is a warning and
+    nothing more.
+    """
+    if not counts:
+        return
+    path = plan_dir / _LOOP_TRACKING_FILENAME
+    payload: Dict[str, Any] = {"version": 2}
+    for key in _SAFETY_COUNT_KEYS:
+        value = counts.get(key)
+        if value:
+            payload[key] = int(value)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        _server.logger.warning(
+            "[reset] could not preserve the safety counts in %s",
+            path, exc_info=True,
+        )
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def _normalize_verification_status(raw_status: str) -> str:
     """Map orchestrator internal values to the public status set."""
     if not raw_status:
@@ -3016,6 +3105,30 @@ def reset_verification(
         # verification points and every VP-id-keyed artefact across the
         # batch boundary gets re-attributed. It is gated by its own flag
         # below — do not re-add it here.
+        #
+        # 2026-11-27: the loop-tracking file is read **before** it is
+        # deleted, because two of its keys are safety counts and not
+        # part of the verdict set:
+        #
+        #   * ``unjudged_streak`` — how many rounds in a row the chain
+        #     could not be judged at all;
+        #   * ``terminal_auto_streak`` — how many times the clock has
+        #     been asked what happens to this plan at the terminal
+        #     branch.
+        #
+        # Both are *how many times the machine has already answered for
+        # this plan*.  A reset discards the verdicts (which points
+        # failed, how often the same failure repeated) — that is what a
+        # reset is for, and ``previous_failed_keys`` /
+        # ``same_failure_counts`` still go with it, because inheriting
+        # them would stop the very next round on a comparison against a
+        # plan generation that no longer exists.  But a reset does not
+        # un-ask the questions the machine already answered on the
+        # plan's behalf: a plan that was answered by the clock twice
+        # must not get two more free answers because somebody pressed
+        # "rerun this round".  The counts are therefore written back
+        # into the same file (atomically) after the deletion.
+        safety_counts = _read_safety_counts(plan_dir)
         for rel in (
             "verification_report.json",
             "verification_execution_results.json",
@@ -3027,6 +3140,10 @@ def reset_verification(
             # being counted, so inheriting it would stop the very next
             # round on a comparison against a plan generation that no
             # longer exists.
+            #
+            # 2026-11-27: the two SAFETY counts in the same file do
+            # survive it — see the note above.  The file is deleted and
+            # written back with nothing but the counts in it.
             "verification_loop_tracking.json",
         ):
             target = plan_dir / rel
@@ -3036,6 +3153,7 @@ def reset_verification(
                     removed.append(rel)
                 except OSError:
                     _server.logger.exception("[reset] unlink failed %s", target)
+        _write_safety_counts(plan_dir, safety_counts)
         for sub, pattern in (
             ("logs", "verification_*"),
             ("screenshots", "verification_*"),

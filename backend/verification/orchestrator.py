@@ -1705,6 +1705,15 @@ class VerificationOrchestrator:
     #: whoever imported the class and whenever.
     _VP_ID_FROM_POINT = _VP_ID_FROM_POINT
 
+    #: 2026-11-27: the default of the terminal auto-answer streak.
+    #:
+    #: The instance attribute is set in :meth:`__init__` from the
+    #: loop-tracking payload.  This class-level default is what an
+    #: orchestrator that was hand-assembled without ``__init__`` (the
+    #: test doubles that build one attribute by attribute) reads: the
+    #: count of a plan the clock was never asked about is zero.
+    _terminal_auto_streak: int = 0
+
     def __init__(
         self,
         plan_dir: Path,
@@ -1901,6 +1910,22 @@ class VerificationOrchestrator:
         # is simply zero.
         self._unjudged_streak: int = _parse_unjudged_streak(
             tracking_payload.get("unjudged_streak")
+        )
+        # 2026-11-27: ``terminal_auto_streak`` — how many times the clock
+        # has been asked what happens to a plan that ended in the
+        # terminal branch.  Same shape as the unjudged streak above, and
+        # for the same reason: the count has to survive the fresh
+        # orchestrator every round builds, and a reset (the *rerun this
+        # round* answer) has to leave it alone — the count is a **safety
+        # count**, not a verdict that a reset invalidates.
+        #
+        # It exists because the terminal question had no cap of its own:
+        # a decision that fell back to its default answer did not stop
+        # the plan from being asked again on the next round, so the
+        # clock could answer for the plan for ever.  From the third
+        # question on, only a person may answer it.
+        self._terminal_auto_streak: int = _parse_unjudged_streak(
+            tracking_payload.get("terminal_auto_streak")
         )
         self._current_repair_tasks: List[Dict] = []
         self._waiting_for_user = False
@@ -2226,6 +2251,14 @@ class VerificationOrchestrator:
         # it has always written.
         if self._unjudged_streak:
             payload["unjudged_streak"] = int(self._unjudged_streak)
+        # 2026-11-27: how many times the clock has been asked what
+        # happens to this plan at the terminal branch.  Same file, same
+        # write, same read — and the same "only when there is a count
+        # to record" rule: a zero count carries no information, and a
+        # payload without the key is exactly the legacy shape, which the
+        # reader already tolerates.
+        if self._terminal_auto_streak:
+            payload["terminal_auto_streak"] = int(self._terminal_auto_streak)
         # 2026-10-27: the fingerprints ride along with the counts — the
         # same file, the same write, the same read. They are what tells
         # "the same failure again" (the count) apart from "a different
@@ -2282,6 +2315,25 @@ class VerificationOrchestrator:
                 tmp.unlink()
             except OSError:
                 pass
+
+    def _clear_terminal_auto_streak(self) -> None:
+        """End the terminal auto-answer streak — the plan concluded.
+
+        2026-11-27.  ``terminal_auto_streak`` counts how many times the
+        clock has been asked what happens to a plan that ended in the
+        terminal branch.  It has to **survive** the rounds in between —
+        the repair rounds that walk back into the same terminal question
+        — or the count would never reach three and the hard cap would
+        never bite.  So it is not ended by "the round judged something":
+        it ends where the plan itself concluded **without** the terminal
+        question — the round passed, or the environment took the round
+        out.
+
+        The write is the caller's: every caller saves the rest of the
+        loop-tracking payload anyway, and this method is called before
+        that save, so the streak ends in the same write.
+        """
+        self._terminal_auto_streak = 0
 
     # ------------------------------------------------------------------
     # The failure fingerprints
@@ -6632,6 +6684,14 @@ class VerificationOrchestrator:
         # so the unjudged streak ends here: the chain is back on its
         # feet, and the next unjudged round starts counting again.  The
         # write happens only when the streak actually changes.
+        #
+        # The **terminal** streak is deliberately NOT ended here: the
+        # terminal branch is one of the rounds that reach this line, and
+        # the rounds that lead back to it (the repair rounds) reach it
+        # too.  Zeroing it here would leave it at one for ever, and the
+        # hard cap would never bite.  It ends where the plan concluded
+        # without the terminal question — see
+        # :meth:`_clear_terminal_auto_streak`.
         if self._unjudged_streak:
             self._unjudged_streak = 0
             self._save_loop_tracking()
@@ -6663,6 +6723,11 @@ class VerificationOrchestrator:
             self._previous_failed_ids = None
             self._consecutive_same_failure_rounds = 0
             self._last_round = round_number
+            # 2026-11-27: the plan concluded — the environment took the
+            # round out, and the terminal question was not asked.  The
+            # terminal auto-answer streak ends with the conclusion (it
+            # survives the repair rounds on purpose).
+            self._clear_terminal_auto_streak()
             self._save_loop_tracking()
             print(
                 f"[Verification] round {round_number}: the environment "
@@ -6689,6 +6754,11 @@ class VerificationOrchestrator:
             # failure that has already been fixed.
             self._failure_fingerprints = {}
             self._failure_fingerprint_rules = {}
+            # 2026-11-27: the plan concluded — it passed.  Both
+            # auto-answer streaks end here: the unjudged one was ended
+            # above (the round judged something), and the terminal one
+            # ends with the conclusion itself.
+            self._clear_terminal_auto_streak()
             self._save_loop_tracking()
             # All failures resolved — drop the per-VP feedback history
             # so the next plan (if this orchestrator is reused) starts
@@ -6971,13 +7041,42 @@ class VerificationOrchestrator:
                         },
                     )
                 else:
+                    # 2026-11-27: the clock must not answer for this
+                    # plan for ever.  The terminal question is the
+                    # plan-level question, and a decision that fell back
+                    # to its default answer did **not** stop the plan
+                    # from being asked again on the next round (see
+                    # :meth:`_plan_has_terminal_decision`) — so before
+                    # this, the clock could answer the same question
+                    # round after round.
+                    #
+                    # The streak counts how many times the terminal
+                    # question has been put to the clock for this plan.
+                    # It is counted **before** the question is asked
+                    # (so the question that is being asked is counted
+                    # too) and it survives the reset that the *rerun this
+                    # round* answer performs — the count is a safety
+                    # count, not a verdict a reset invalidates.
+                    #
+                    # From the third question on, the question waits for
+                    # a person: no default answer, no deadline.  The
+                    # clock does not get to decide what happens to a
+                    # plan that has already fallen back to the clock
+                    # twice.
+                    self._terminal_auto_streak += 1
+                    self._save_loop_tracking()
+                    strict_terminal = self._terminal_auto_streak > 2
                     decision_id = self._ask_a_human_about(
                         round_number=round_number,
                         question=terminal_question["question"],
                         options=terminal_question["options"],
-                        default_option=terminal_question["default_option"],
+                        default_option=(
+                            None if strict_terminal
+                            else terminal_question["default_option"]
+                        ),
                         vp_id=None,
                         check_open_question=False,
+                        require_answer=strict_terminal,
                     )
                     # 2026-11-05: the decision now exists, so the
                     # round's analysis session and the analysis itself
