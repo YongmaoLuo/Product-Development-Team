@@ -707,8 +707,15 @@ _SHELL_SEGMENT_RE = re.compile(r"&&|\|\||[;|]")
 
 #: An environment assignment inside a start command — ``export FOO=bar``
 #: or a bare ``FOO=bar`` prefix.
+#:
+#: The value stops at a **shell separator**: ``;``, ``&``, ``|`` and
+#: whitespace all end it.  Without that, ``export
+#: PDT_STATE_DB_PATH=/tmp/x/state.db;`` parses as the path
+#: ``"/tmp/x/state.db;"`` — a name no file has — and every comparison
+#: against the path the running instance reports then says "different
+#: database" for one and the same file.
 _START_CMD_ASSIGNMENT_RE = re.compile(
-    r"(?:^|[\s;&|])(?:export\s+)?([A-Z][A-Z0-9_]*)=(\S+)"
+    r"(?:^|[\s;&|])(?:export\s+)?([A-Z][A-Z0-9_]*)=([^\s;&|]+)"
 )
 
 
