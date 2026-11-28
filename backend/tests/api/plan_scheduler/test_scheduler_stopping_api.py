@@ -179,7 +179,14 @@ def _seed_open_command(
     plan_id: str = "p1",
     action: str = "pause",
 ) -> None:
-    """Write a command that was accepted and has not been answered yet."""
+    """Write a command that was accepted and has not been answered yet.
+
+    The row is written **after** the engine is installed.  A command
+    that is still open when the scheduler starts is one a dead process
+    left behind, and the startup fails it: the row of a command that
+    the *running* worker has taken is written after the scheduler is
+    up, which is what this does.
+    """
     SqliteSchedulerStore().record_command(
         conn, plan_id, action, outcome=PENDING_OUTCOME
     )
@@ -203,8 +210,8 @@ def test_state_includes_stopping_rows(install_engine, conn) -> None:
     So the plan has to be named: without the stopping list the
     operator cannot tell "the pause worked" from "the pause was lost".
     """
-    _seed_open_command(conn, "p1", "pause")
     install_engine()
+    _seed_open_command(conn, "p1", "pause")
 
     response = client.get(STATE_PATH)
 
@@ -237,8 +244,8 @@ def test_stopping_row_has_phase_label(install_engine, conn) -> None:
     precisely the thing that has to be a decision somebody made on
     purpose.
     """
-    _seed_open_command(conn, "p1", "pause")
     install_engine()
+    _seed_open_command(conn, "p1", "pause")
 
     response = client.get(STATE_PATH)
 
@@ -277,8 +284,8 @@ def test_state_ok_when_store_busy(install_engine, conn, monkeypatch) -> None:
     world, the command log was the one part it could not read, and
     every other key was answered as usual.
     """
-    _seed_open_command(conn, "p1", "pause")
     engine = install_engine()
+    _seed_open_command(conn, "p1", "pause")
 
     calls: List[Any] = []
 
@@ -318,8 +325,8 @@ def test_plan_in_the_running_line_is_also_listed_as_stopping(
     So both lists carry the plan, and the panel — which prefers the
     stopping row — has both to choose from.
     """
-    _seed_open_command(conn, "p1", "pause")
     install_engine(active=[{"plan_id": "p1", "phase": "running"}])
+    _seed_open_command(conn, "p1", "pause")
 
     response = client.get(STATE_PATH)
 
@@ -344,10 +351,10 @@ def test_answered_command_leaves_the_stopping_list(install_engine, conn) -> None
     by itself on the next read; nothing has to take the row out.
     """
     store = SqliteSchedulerStore()
+    install_engine()
     command_id = store.record_command(
         conn, "p1", "pause", outcome=PENDING_OUTCOME
     )
-    install_engine()
 
     before = client.get(STATE_PATH)
     assert before.status_code == 200, before.text

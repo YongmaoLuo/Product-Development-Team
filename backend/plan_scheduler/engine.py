@@ -419,6 +419,15 @@ FAILED = "failed"
 #: a lifecycle call that may never come back.
 PENDING_ANSWER = "pending"
 
+#: The detail a command that was still open when the process died is
+#: finished with.  The command was **accepted** — the mailbox had it —
+#: and the process was killed before the worker carried it out, so the
+#: command was never carried out at all.  The detail says so in the
+#: words the operator reads.
+RESTARTED_COMMAND_DETAIL = (
+    "the scheduler restarted before carrying this command out"
+)
+
 #: The words the engine adds to the command vocabulary.
 ENGINE_OUTCOMES = frozenset({PENDING, DONE, FAILED, PENDING_ANSWER})
 
@@ -1729,6 +1738,86 @@ class PlanSchedulerEngine:
     # The recovery
     # ------------------------------------------------------------------
 
+    def _reconcile_open_commands(self) -> List[Dict[str, Any]]:
+        """Finish the commands the previous process left open.
+
+        A command is written down the moment the worker takes it out of
+        the mailbox, with the outcome it has *so far* — ``accepted`` —
+        and it is turned into ``done`` or ``failed`` only when the
+        worker has answered.  A process that is killed between those
+        two moments leaves the row behind, and nothing else ever comes
+        back for it: the command is not in the mailbox any more (it was
+        taken), and no worker is left to answer it.
+
+        Such a row is a **stuck** row, not a request: nobody is going to
+        carry it out, and the read model counts it as "stopping" for
+        ever — a plan that finished days ago still shows as stopping.
+
+        So the startup reconciliation finishes what the dead process
+        left open.  Every open command is failed with a detail that
+        says why, and a warning is logged for each of them.
+
+        The reconciliation is safe to repeat: ``finish_command`` only
+        updates a row that is still pending, so a command that was
+        answered in the meantime is left alone, and a second call does
+        nothing.
+
+        It is also safe to run only at startup — which is where it
+        runs: at that moment the worker has not taken a command out of
+        the mailbox yet, so no command of **this** process can be in
+        flight, and every open row belongs to a process that is gone.
+
+        Returns:
+            The commands that were finished, as dicts with the
+            command's ``id``, ``plan_id`` and ``action``.
+        """
+        reconciled: List[Dict[str, Any]] = []
+        try:
+            open_commands = self._store.list_open_commands(self._conn)
+        except Exception as exc:  # noqa: BLE001 — the recovery carries on
+            self._record_error("command", exc)
+            log.exception(
+                "[scheduler] the scheduler could not read the commands it "
+                "found open"
+            )
+            return reconciled
+        for command in open_commands:
+            command_id = int(command.get("id") or 0)
+            if not command_id:
+                continue
+            detail = RESTARTED_COMMAND_DETAIL
+            previous = command.get("detail")
+            if previous:
+                detail = "{0} (the command said: {1})".format(detail, previous)
+            try:
+                finished = self._store.finish_command(
+                    self._conn, command_id, FAILED, detail=detail
+                )
+            except Exception as exc:  # noqa: BLE001 — the row may be retried later
+                self._record_error("command", exc)
+                log.exception(
+                    "[scheduler] the scheduler could not finish the command "
+                    "%s it found open",
+                    command_id,
+                )
+                continue
+            if not finished:
+                # Somebody else answered it in the meantime.
+                continue
+            plan_id = str(command.get("plan_id") or "")
+            action = str(command.get("action") or "")
+            log.warning(
+                "[scheduler] the command %s (plan %s, action %s) was still "
+                "open when the scheduler restarted; it was not carried out",
+                command_id,
+                plan_id,
+                action,
+            )
+            reconciled.append(
+                {"id": command_id, "plan_id": plan_id, "action": action}
+            )
+        return reconciled
+
     def _recover(self) -> Dict[str, Any]:
         """Put the scheduler's own facts back in line after a restart.
 
@@ -1751,6 +1840,10 @@ class PlanSchedulerEngine:
            order is the plan's own — ``updated_at`` and then the plan
            id — so the tail is the same tail on every restart, and the
            number the plan is given is ``MAX(seq) + 1``.
+        4. **A command the dead process left open is failed.**  A
+           command that was taken out of the mailbox but never answered
+           would otherwise stay "stopping" for ever; the restart says
+           plainly that it was never carried out.
 
         The recovery decides nothing and starts nothing: the first tick
         after it is an ordinary tick.  A plan that is already working
@@ -1772,9 +1865,10 @@ class PlanSchedulerEngine:
             A summary of what the recovery did: ``queued`` (the line
             as it stands now), ``backfilled`` (the plans that joined the
             tail), ``adopted`` (the plans that were timed from now),
-            ``removed_slots`` (the rows nobody held any more) and
+            ``removed_slots`` (the rows nobody held any more),
             ``readopted`` (the plans whose run outlived the backend
-            and were given their row back).
+            and were given their row back) and ``reconciled`` (the
+            commands the dead process left open, which were failed).
         """
         stamp = _stamp(self._now())
         summary: Dict[str, Any] = {
@@ -1783,11 +1877,19 @@ class PlanSchedulerEngine:
             "adopted": [],
             "removed_slots": [],
             "readopted": [],
+            "reconciled": [],
         }
         # The re-adoption comes first: a plan that is working again
         # must be working again before the slots are reconciled, or the
         # reconciliation would hand its slot to somebody else.
         summary["readopted"] = self._readopt_surviving_runs()
+        # The commands the dead process left open come first, and they
+        # are finished on their own: they are the facts that say a plan
+        # is still stopping, and a plan that is not stopping any more
+        # must not be shown as stopping.  The write is the store's own
+        # transaction, and it is a row at a time — a command that
+        # cannot be finished must not hold back the queue and the slots.
+        summary["reconciled"] = self._reconcile_open_commands()
         with self._store.transaction(self._conn):
             summary["backfilled"] = self._backfill_queue(stamp)
             adopted, removed = self._recover_slots(stamp)
