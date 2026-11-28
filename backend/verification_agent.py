@@ -9980,6 +9980,138 @@ class Orchestrator:
         nest_asyncio.apply()
         return list(asyncio.run(rerun()))
 
+    def _close_round_gate_layers_late(
+        self,
+        executor: Any,
+        plan_data: dict,
+        execution_results: dict,
+    ) -> dict:
+        """轮次**尾巴**上的晚收口：环境受阻重跑之后再判一次门禁。
+
+        2026-11-28（缺陷：门禁按过期结论延后 —— 顺序上的缝）：收口重算
+        跑在 ``_rerun_environment_blocked_vps`` **之前**，而环境受阻重跑会
+        把一个被环境 BLOCKED 的 Phase 1 验证点**翻成 PASSED**。于是收口
+        重算看到的是**旧的** BLOCKED，被延后的全量门禁层仍然不被派发
+        （2026-11-28 生产实测：VP-017 / VP-018 一次都没被派发，整轮
+        SKIPPED，报告里那条 DEFERRED 还带着过期的理由）。
+
+        晚收口把**最终**的那份执行信封交给门禁，再判一次：
+
+        1. ``set_round_execution_results`` —— 把本轮**最终**结论交给执行器
+           （门禁判定读的就是它；轮次取执行器本轮号，取不到就 ``None``）；
+        2. ``_close_round_gate_layers`` —— 重新判定并派发被延后的层；
+        3. 只有真的派发出去（列表非空）才重建信封，并把**派发层**的条目
+           合并回最终字典 —— 其余条目原样保留（尤其不许覆盖环境受阻
+           重跑刚翻绿的那些）。
+
+        早先那次收口**保留**：常见路径仍然在执行器收口时就解决；这里是
+        **补缝**，靠 ``rerun_deferred_gate_layers`` 的幂等保证不重复派发。
+
+        绝不抛异常：这一段跑在轮次尾巴上 —— 异常只能记日志，替换掉轮次
+        真正的结果比不收口更糟。
+        """
+        if executor is None or not isinstance(execution_results, dict):
+            return execution_results
+        setter = getattr(executor, "set_round_execution_results", None)
+        if setter is None:  # pragma: no cover - defensive
+            return execution_results
+        round_no = self._executor_round_no(executor) or None
+        try:
+            setter(execution_results, round_no=round_no)
+        except Exception:  # noqa: BLE001 - 交账失败不是致命的
+            logger.exception(
+                "[verification_executor] handing the round's final "
+                "execution results to the gate failed",
+            )
+            return execution_results
+        try:
+            dispatched = self._close_round_gate_layers(executor)
+        except Exception:  # noqa: BLE001 - 派发失败不是致命的
+            logger.exception(
+                "[verification_executor] late round-close gate dispatch "
+                "failed",
+            )
+            return execution_results
+        if not dispatched:
+            return execution_results
+        logger.info(
+            "[verification_executor] the late round close dispatched %s",
+            ", ".join(str(layer_id) for layer_id in dispatched),
+        )
+        try:
+            rebuilt = self._build_execution_results_from_executor(
+                plan_data, executor,
+            )
+        except Exception:  # noqa: BLE001 - 重建失败不是致命的
+            logger.exception(
+                "[verification_executor] rebuilding the execution results "
+                "after the late round close failed",
+            )
+            return execution_results
+        execution_results = self._merge_dispatched_gate_results(
+            execution_results, rebuilt, dispatched,
+        )
+        try:
+            execution_results = self._reconcile_round_evidence_conflicts(
+                plan_data, execution_results,
+            )
+        except Exception:  # noqa: BLE001 - 核对失败不是致命的
+            logger.exception(
+                "[verification_executor] reconciling the round's evidence "
+                "after the late round close failed",
+            )
+            return execution_results
+        self._save_execution_results(execution_results)
+        return execution_results
+
+    @staticmethod
+    def _merge_dispatched_gate_results(
+        execution_results: dict,
+        rebuilt: dict,
+        dispatched: List[str],
+    ) -> dict:
+        """把**派发层**的条目合并进最终的执行结果。
+
+        只动派发层（按 id 匹配）：其余条目**原样保留** —— 尤其不许覆盖
+        环境受阻重跑刚翻绿的那些验证点（它们不在派发层里，而它们是这一轮
+        唯一的绿）。合并在**原字典**上就地做，返回的还是同一个字典。
+        """
+        wanted = {str(layer_id) for layer_id in dispatched or []}
+        if not wanted:
+            return execution_results
+        entries = execution_results.get("execution_results")
+        if not isinstance(entries, list):
+            return execution_results
+        rebuilt_entries = (rebuilt or {}).get("execution_results") or []
+        by_id: Dict[str, Dict[str, Any]] = {}
+        for entry in rebuilt_entries:
+            if not isinstance(entry, dict):
+                continue
+            vp_id = entry.get("id", entry.get("vp_id"))
+            if vp_id is None:
+                continue
+            by_id[str(vp_id)] = entry
+        if not (wanted & set(by_id)):
+            return execution_results
+        merged: List[Any] = []
+        replaced = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                merged.append(entry)
+                continue
+            vp_id = entry.get("id", entry.get("vp_id"))
+            key = str(vp_id) if vp_id is not None else None
+            if key is not None and key in wanted and key in by_id:
+                merged.append({**entry, **by_id[key]})
+                replaced.add(key)
+                continue
+            merged.append(entry)
+        for key in wanted:
+            if key in by_id and key not in replaced:
+                merged.append(by_id[key])
+        execution_results["execution_results"] = merged
+        return execution_results
+
     def _recheck_deferred_evidence(
         self, vp_id: str, method: str, verdict: dict,
         vp: Optional[dict] = None,
@@ -15155,6 +15287,11 @@ class Orchestrator:
         # Step 2: delegate Phase 2 to VerificationExecutor. The
         # parent only sequences the call — per-VP work, layer
         # ordering, and short-circuit all live on the executor.
+        #
+        # ``executor`` 在 try 之前先落成 ``None``：轮次尾巴上的晚收口要
+        # 用它，而执行器**没建成**时那一段必须安静地跳过（不能让一个
+        # 未绑定的名字把轮次自己的失败原因盖掉）。
+        executor = None
         try:
             executor = self._build_verification_executor(plan_data)
             # No width, and no gate. How many verification points run at
@@ -15289,6 +15426,24 @@ class Orchestrator:
         # are they run again.  At most once per round.
         execution_results = self._rerun_environment_blocked_vps(
             plan_data, execution_results,
+        )
+
+        # 2026-11-28（缺陷：门禁按过期结论延后 —— 顺序上的缝）：**晚收口**。
+        #
+        # 位置承重：必须在 ``_rerun_environment_blocked_vps`` **之后** ——
+        # 环境受阻重跑会把被环境 BLOCKED 的 Phase 1 验证点翻成 PASSED，
+        # 而收口重算（早先那次，跑在 ``executor.run`` 的 finally 里）看到
+        # 的是**旧的** BLOCKED，于是被延后的全量门禁层仍然不被派发
+        # （2026-11-28 生产实测：VP-017 / VP-018 一次都没跑，整轮
+        # SKIPPED，DEFERRED 还带着过期的理由）。
+        #
+        # 也必须在 ``generate_verification_report`` **之前** —— 报告读的
+        # 就是这份最终字典；晚收口派发出去的层必须体现在报告里。
+        #
+        # 幂等：``rerun_deferred_gate_layers`` 不会重复派发已经派发过 /
+        # 已经知道的层，所以晚收口在常见路径上什么也不做。
+        execution_results = self._close_round_gate_layers_late(
+            executor, plan_data, execution_results,
         )
 
         # Step 3: Phase 3 LLM.
