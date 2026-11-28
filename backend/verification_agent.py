@@ -9890,6 +9890,50 @@ class Orchestrator:
         )
         return [str(vp_id) for vp_id in applied]
 
+    def _give_round_execution_results_to_executor(self, executor: Any) -> None:
+        """Hand the round's execution envelope to the executor's gate.
+
+        2026-11-28（缺陷：门禁按过期结论延后）：轮次收口的门禁重算必须看到
+        **本轮最终结论**。裁决表（``executor._verdicts``）是**跨轮**表 ——
+        同一个 VP 在别的轮次留下的旧 ``BLOCKED`` 还躺在里面，而它不代表本轮。
+        信封是本轮的账，**报告读的就是它**：收口重算与报告必须看同一份账，
+        两份账本撕裂时以本轮最终结论为准。
+
+        信封取自 :meth:`VerificationExecutor.round_execution_envelope` ——
+        与 :meth:`_build_execution_results_from_executor`（报告的信封）
+        **同一个来源**，只是这里只取「id + 状态」：门禁只需要知道「它过没
+        过」。
+
+        轮次隔离由信封自己带（``round``）：轮次已知时只收**本轮**的结论
+        （与报告侧同一道筛）；轮次未知时不筛（不知道轮次不等于没有结论）。
+
+        绝不抛异常：这一段跑在轮次收口的 ``finally`` 里，抛出去会替换掉
+        这一轮真正的失败原因。
+        """
+        setter = getattr(executor, "set_round_execution_results", None)
+        builder = getattr(executor, "round_execution_envelope", None)
+        if setter is None or builder is None:  # pragma: no cover - defensive
+            return
+        try:
+            envelope = builder()
+        except Exception:  # noqa: BLE001 - 读不到账本不是致命的
+            logger.exception(
+                "[verification_executor] could not read the round's "
+                "verdicts for the gate decision",
+            )
+            return
+        if not isinstance(envelope, Mapping):
+            # 不是执行器（替身 / 旧版本）：没有信封就没有本轮的账 ——
+            # 门禁维持既有行为。
+            return
+        try:
+            setter(envelope, round_no=envelope.get("round") or None)
+        except Exception:  # noqa: BLE001 - 交账失败不是致命的
+            logger.exception(
+                "[verification_executor] handing the round's execution "
+                "envelope to the gate failed",
+            )
+
     def _close_round_gate_layers(self, executor: Any) -> List[str]:
         """Round close: re-decide the deferred gate layers, and run them.
 
@@ -15189,6 +15233,20 @@ class Orchestrator:
                 # （那是本轮最后一件能改写结论的事）、在
                 # ``_build_execution_results_from_executor`` **之前**（报告要
                 # 看到真结论）。
+                #
+                # 2026-11-28（缺陷：门禁按过期结论延后）：先把**本轮**的执行
+                # 信封交给门禁判定 —— 收口重算要看到本轮最终结论。裁决表是
+                # **跨轮**表：它里面那条旧 ``BLOCKED`` 不代表本轮，而信封是
+                # 本轮的账（报告读的就是它）。两份账本撕裂时，以本轮最终结论
+                # 为准，否则被延后的全量门禁层永远不被派发（VP-017 / VP-018
+                # 从未被派发，整轮 SKIPPED）。
+                try:
+                    self._give_round_execution_results_to_executor(executor)
+                except Exception:
+                    logger.exception(
+                        "[verification_executor] handing the round's "
+                        "execution envelope to the gate failed",
+                    )
                 try:
                     self._close_round_gate_layers(executor)
                 except Exception:

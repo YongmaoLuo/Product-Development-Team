@@ -81,6 +81,14 @@ languages on purpose: the CI gate reads one string out of both
 changelogs, and a section that exists in only one of them is a section
 half the readers never see.*
 
+- **A round's close judges the deferred gates by the round's own final
+  conclusions.** `backend/verification_executor.py` takes the round's
+  execution envelope from `backend/verification_agent.py` at the close
+  and reads the current round's ledger before the cross-round verdict
+  table, so a stale `BLOCKED` left by an earlier round no longer keeps
+  a deferred full gate from being dispatched; when neither ledger holds
+  a terminal success the previous behaviour is kept word for word.
+
 - **A deferred full gate runs at the round's close once its blocker is
   green.** `backend/verification_executor.py` re-reads the round's own
   ledger before the close rerun, so a gate layer the process-local table
