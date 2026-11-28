@@ -86,6 +86,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -207,6 +208,9 @@ class PauseAndReviewQueueWorld(FailedPlanWorld):
        scheduler's line, so the panel draws it as a card.
     5. The **command row** — the pause the worker has taken and not
        answered.  This is the row the read model's stopping list names.
+       It is written after the server is up (see ``start``), because a
+       command that is still open when the scheduler starts is one a
+       dead process left behind, and the startup fails it.
     6. The **decision** — a pending question, in the HITL table.
     7. The **progress file** — a pending approval, in the plan's own
        durable wait record.
@@ -241,6 +245,13 @@ class PauseAndReviewQueueWorld(FailedPlanWorld):
         hide that behind a green run.  So the refusal carries the
         server's own log — the tail of it — because that is where the
         reason is.
+
+        The command the worker has taken and not answered yet is
+        written **after** the server came up: a command that is still
+        open when the scheduler starts is one a dead process left
+        behind, and the startup fails it.  The row of a command the
+        *running* worker has taken is written after the scheduler is
+        serving, which is what this does.
         """
         try:
             super().start()
@@ -248,6 +259,55 @@ class PauseAndReviewQueueWorld(FailedPlanWorld):
             raise AssertionError(
                 f"{exc}\n--- the server's log (the tail) ---\n{self._server_log_tail()}"
             ) from exc
+        self._seed_open_command()
+
+    def _seed_open_command(self) -> None:
+        """Write the in-flight command, and wait until it is in flight.
+
+        The scheduler's startup reconciles the commands it finds open,
+        so a row written before the scheduler is up is a row the
+        startup fails.  The row is written after the server is up, and
+        the wait makes sure it is still open when the driver looks: if
+        the startup ran after the row was written, the row is written
+        again.
+        """
+        for _ in range(40):
+            self._write_open_command()
+            status, document = self.http("/api/scheduler/state")
+            if status == 200 and any(
+                str(row.get("plan_id") or "") == STOPPING_PLAN_ID
+                for row in ((document or {}).get("stopping") or [])
+            ):
+                return
+            time.sleep(0.25)
+        raise AssertionError(
+            "the in-flight command never reached the stopping list of "
+            "the running scheduler"
+        )
+
+    def _write_open_command(self) -> None:
+        """Write the command the worker has taken and not answered yet.
+
+        This row is the whole reason the plan is drawn as 「停止中」: it
+        is the read model's own fact, and the panel has to draw the
+        name it carries.
+        """
+        if str(BACKEND_DIR) not in sys.path:
+            sys.path.insert(0, str(BACKEND_DIR))
+
+        from plan_scheduler.store import PENDING_OUTCOME, SqliteSchedulerStore
+        from state_machine.db.connection import open as open_db
+
+        connection = open_db(self.db_path)
+        try:
+            SqliteSchedulerStore().record_command(
+                connection,
+                STOPPING_PLAN_ID,
+                "pause",
+                outcome=PENDING_OUTCOME,
+            )
+        finally:
+            connection.close()
 
     def _server_log_tail(self, lines: int = 40) -> str:
         """The tail of the server's log, or a word about its absence."""
@@ -266,7 +326,7 @@ class PauseAndReviewQueueWorld(FailedPlanWorld):
 
         from hitl.models import Decision
         from hitl.store import HitlStore
-        from plan_scheduler.store import PENDING_OUTCOME, SqliteSchedulerStore
+        from plan_scheduler.store import SqliteSchedulerStore
         from plan_state import PLAN_STATE_FILENAME
         from state_machine.db.connection import open as open_db
         from state_machine.db.schema import migrate
@@ -304,17 +364,6 @@ class PauseAndReviewQueueWorld(FailedPlanWorld):
             # The plan the operator pauses is in the scheduler's line,
             # so the panel draws it as a queue card.
             store.enqueue(connection, STOPPING_PLAN_ID)
-
-            # The command the worker has taken and not answered yet.
-            # This row is the whole reason the plan is drawn as
-            # 「停止中」: it is the read model's own fact, and the panel
-            # has to draw the name it carries.
-            store.record_command(
-                connection,
-                STOPPING_PLAN_ID,
-                "pause",
-                outcome=PENDING_OUTCOME,
-            )
         finally:
             connection.close()
 
