@@ -9,7 +9,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from typing import Dict, List, Mapping, NamedTuple, Optional, Set, Tuple, Any
-from fastapi import HTTPException, Request, Response
+from fastapi import Body, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pathlib import Path
 from datetime import datetime, timezone
@@ -3633,7 +3633,7 @@ def _list_plans_body(
 
 
 def _seed_plan_routing_phase(plan_id: str, phase: str) -> None:
-    """INSERT OR IGNORE a ``plan_routing`` row with ``current_phase=phase``.
+    """Create the plan's routing row, holding ``current_phase=phase``.
 
     Task #3.9: the interview phase is now tracked in
     ``plan_routing`` so the routing table is the single source of
@@ -3645,10 +3645,23 @@ def _seed_plan_routing_phase(plan_id: str, phase: str) -> None:
     ``interviewer.start()`` call had already written
     ``interview.json``.
 
-    The call is idempotent (``INSERT OR IGNORE``) so a re-run on
-    a plan that has already advanced past ``phase`` does not
-    regress the row. Failures are non-fatal — the legacy file
-    fallback still works.
+    The write is **create-only**: the row is created when it is
+    missing, and when it is already there *not one column* is
+    written.  A plan whose row has already advanced past ``phase``
+    (e.g. ``prd_review``) is therefore never regressed by a re-run —
+    that is what keeps a restart on a live plan safe.  Failures are
+    non-fatal — the legacy file fallback still works.
+
+    The write goes through the routing repository
+    (:meth:`RoutingRepository.insert_if_missing`) rather than through
+    a statement spelled out here.  ``current_phase`` is the single
+    workflow-state column — the DDL comment in
+    ``backend/state_machine/db/schema.py`` says so — and the routing
+    repository is its only writer; a second, hand-written write of
+    the row would be a second writer of the phase.  The repository's
+    create-only method has exactly the semantics this helper needs:
+    the row is written when it is missing and nothing at all is
+    written when it is there.
 
     The repo + connection follow the same resolution as the rest
     of the server (see ``_state_db_path``): ``PDT_STATE_DB_PATH``
@@ -3665,21 +3678,11 @@ def _seed_plan_routing_phase(plan_id: str, phase: str) -> None:
         try:
             _migrate(conn)
             repo = RoutingRepository(conn)
-            # INSERT OR IGNORE: only insert if the row does not
-            # already exist. An existing row whose ``current_phase``
-            # is past ``phase`` (e.g. ``prd_review``) is NOT
-            # overwritten — this keeps a restart safe.
-            with conn:
-                conn.execute(
-                    "INSERT OR IGNORE INTO plan_routing "
-                    "(plan_id, current_phase, version, updated_at) "
-                    "VALUES (?, ?, 0, ?)",
-                    (
-                        plan_id,
-                        phase,
-                        datetime.now().isoformat(),
-                    ),
-                )
+            # Create-only: the row is written when it is missing and
+            # left alone when it is there.  An existing row whose phase
+            # has advanced past ``phase`` (e.g. ``prd_review``) is NOT
+            # rolled back — this keeps a restart safe.
+            repo.insert_if_missing(plan_id, phase)
         finally:
             conn.close()
     except Exception as exc:  # noqa: BLE001
@@ -4245,4 +4248,383 @@ def get_plan_tasks(plan_id: str):
                 summary[status] += 1
 
     return {"plan_id": plan_id, "tasks": summary}
+
+
+# ---------------------------------------------------------------------------
+# 框架修复条目：受守卫的删除（dismiss）
+# ---------------------------------------------------------------------------
+#
+# 调度页的框架修复分区要给出一个「删除 / 忽略」动作。这里是它的受守卫
+# 形态：**还有修复计划在跑、或者修复 PR 还占着某个仓库的合并槽的条目删
+# 不了** —— 删掉它等于把还在飞的工作藏起来，而所有等着这个修复的计划会
+# 继续挂着，且没有人再看着它们。所以「拒绝」是默认，「删除」是例外。
+#
+# 删除要落两处，两处都不能少：
+#
+# * 计划的 ``framework_fix`` 块 —— 条目住在那里。块里保留读模型需要的
+#   事实（``fingerprint``、修复计划号），多出删除记录，并**释放挂起**：
+#   这个计划不再等这个缺陷了。
+# * 只追加的审计链 —— 一条 ``framework_fix_dismissed`` 事件，带着原因。
+#   审计链活得比写下它的那次进程久，所以「为什么删的」在块没了之后仍然
+#   答得出来。
+
+#: 删除在审计链上留下的事件类型。
+FRAMEWORK_FIX_DISMISSED_EVENT = "framework_fix_dismissed"
+
+#: 拒绝删除时的错误码。
+FRAMEWORK_FIX_ACTIVE_ERROR = "framework_fix_active"
+
+#: 没带原因时的错误码 —— 没人能解释的删除不是删除。
+FRAMEWORK_FIX_MISSING_REASON_ERROR = "missing_reason"
+
+#: 计划不存在时的错误码。
+FRAMEWORK_FIX_PLAN_NOT_FOUND_ERROR = "plan_not_found"
+
+#: 状态库没跑框架修复迁移时的错误码 —— 没人能说出正在修什么，那就谁都
+#: 不许删。
+FRAMEWORK_FIX_UNAVAILABLE_ERROR = "framework_fix_registry_unavailable"
+
+
+def _optional_text(value: Any) -> Optional[str]:
+    """A non-empty string, or ``None``."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _framework_fix_registry() -> Optional[Any]:
+    """The framework-fix registry, or ``None`` when there is none to talk to.
+
+    The registry refuses to create its own schema, so a state database
+    that never ran the framework-fix migration has no registry at all.
+    The endpoint says so (503) instead of pretending the lane is
+    empty: "there is nothing to dismiss" and "we cannot tell what is
+    being worked on" are two different answers, and only one of them is
+    safe to act on.
+    """
+    from framework_fix.registry import FrameworkFixRegistry
+
+    try:
+        return FrameworkFixRegistry()
+    except Exception:  # noqa: BLE001
+        # SchemaNotMigratedError (the migration never ran) or a database
+        # that cannot be opened — both mean "there is no registry to
+        # ask", and both are the caller's 503.
+        return None
+
+
+def _routing_row_exists(plan_id: str) -> bool:
+    """Does this plan have a ``plan_routing`` row?
+
+    A read and nothing else — no migration, no row creation.  The
+    answer decides whether the dismissal may be written into the plan's
+    framework-fix block: the block lives in that row, and writing one
+    for a plan that has no row would plant a row nobody asked for.
+    """
+    from state_machine.db.connection import open as open_db
+
+    try:
+        conn = open_db(_server._state_db_path())
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM plan_routing WHERE plan_id = ?", (plan_id,)
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+    return row is not None
+
+
+def _entry_fingerprint(
+    registry: Any, plan_id: str, block: Dict[str, Any]
+) -> Optional[str]:
+    """Which defect is this plan's framework-fix entry about?
+
+    Two ways to name a defect.  A held business plan names it in its
+    block (``fingerprint``).  A repair plan does not hold anything — it
+    *is* the repair — so its entry is the defect the registry says it
+    is repairing (the registry row carries ``fix_plan_id``).  The block
+    is asked first and the registry second: a block can be missing for
+    reasons that have nothing to do with what kind of plan this is.
+    """
+    named = _optional_text(block.get("fingerprint"))
+    if named:
+        return named
+    try:
+        rows = registry.list_registry()
+    except (sqlite3.Error, ValueError):
+        return None
+    for row in rows:
+        if str(row.get("fix_plan_id") or "") != plan_id:
+            continue
+        candidate = _optional_text(row.get("fingerprint"))
+        if candidate:
+            return candidate
+    return None
+
+
+def _defect_is_open(registry: Any, fingerprint: Optional[str]) -> bool:
+    """Is somebody still repairing this defect?
+
+    ``open`` (and its synonym ``active``) means the repair is in
+    flight; ``reopened`` means the defect came back and is being
+    repaired again.  Both are work that is in flight.  A status word
+    outside the closed set is **not** read as "not open": it means the
+    data is broken, and broken data is not evidence that the repair
+    finished — so the dismissal is refused and an operator can look at
+    it.
+    """
+    if not fingerprint:
+        return False
+    from framework_fix.registry import (
+        REGISTRY_STATUS_OPEN,
+        REGISTRY_STATUS_REOPENED,
+        normalize_status,
+    )
+
+    try:
+        row = registry.lookup(fingerprint)
+    except (sqlite3.Error, ValueError):
+        return True
+    if row is None:
+        return False
+    try:
+        status = normalize_status(row.get("status"))
+    except ValueError:
+        return True
+    return status in (REGISTRY_STATUS_OPEN, REGISTRY_STATUS_REOPENED)
+
+
+def _merge_lease_holders(plan_id: str, fix_plan_id: Optional[str]) -> List[str]:
+    """Which of these plans still hold a repository's merge slot?
+
+    A lease row means a repair PR for that repository is open and has
+    not been merged yet — the repair is still in flight, so the entry
+    must not be dismissed.  The lease is held by the **repair** plan:
+    for a repair plan that is the plan itself, for a held business plan
+    it is the plan it waits on.
+    """
+    from state_machine.db.connection import open as open_db
+
+    try:
+        conn = open_db(_server._state_db_path())
+    except Exception:  # noqa: BLE001
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT fix_plan_id FROM framework_fix_merge_lease "
+            "WHERE fix_plan_id = ? OR fix_plan_id = ?",
+            (plan_id, fix_plan_id or ""),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+    return [str(row[0]) for row in rows]
+
+
+def _dismissal_recorded(plan_id: str, fingerprint: Optional[str]) -> bool:
+    """Has this plan's entry already been dismissed?
+
+    Two records of the same fact: the plan's block (where the entry
+    lives) and the append-only audit chain (where the dismissal was
+    written down).  A plan without a routing row has no block, so the
+    chain is the only place that can answer — and the chain is exactly
+    the place that must answer, because the chain is what outlives the
+    process that dismissed the entry.
+    """
+    from state_machine.db.connection import open as open_db
+
+    try:
+        conn = open_db(_server._state_db_path())
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        rows = conn.execute(
+            "SELECT payload_json FROM framework_fix_event "
+            "WHERE event_type = ? AND (fingerprint = ? OR fingerprint IS NULL)",
+            (FRAMEWORK_FIX_DISMISSED_EVENT, fingerprint or ""),
+        ).fetchall()
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+    for row in rows:
+        try:
+            payload = json.loads(row[0]) if row[0] else {}
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and payload.get("plan_id") == plan_id:
+            return True
+    return False
+
+
+def _attached_plan_ids(registry: Any, fingerprint: Optional[str]) -> List[str]:
+    """The plans that are waiting on this defect's repair.
+
+    They are recorded in the dismissal event, not because the dismissal
+    is theirs to make, but because "who was still waiting when this was
+    dismissed" is a fact the audit chain should hold.
+    """
+    if not fingerprint:
+        return []
+    try:
+        rows = registry.list_attach(fingerprint)
+    except (sqlite3.Error, ValueError):
+        return []
+    seen: List[str] = []
+    for row in rows:
+        plan_id = _optional_text(row.get("plan_id"))
+        if plan_id and plan_id not in seen:
+            seen.append(plan_id)
+    return sorted(seen)
+
+
+def _record_dismissal(
+    plan_id: str,
+    block: Dict[str, Any],
+    reason: str,
+    fingerprint: Optional[str],
+    fix_plan_id: Optional[str],
+    registry: Any,
+) -> None:
+    """Write the dismissal down.
+
+    The block goes through the production writer
+    (``plan_state._write_routing_framework_fix``) so the column is
+    encoded the way every other writer encodes it — and it is written
+    *additively*: the block keeps the facts the read model needs, and
+    only the four keys this dismissal is about change.  The writer is
+    a private helper on purpose: ``PlanState``'s public block API can
+    enter a block and clear one, but it cannot record "this entry was
+    dismissed, and here is why".
+
+    A plan with no routing row gets no block: writing one would plant
+    a row nobody asked for — the audit chain is the record in that
+    case.
+    """
+    from plan_state import _write_routing_framework_fix
+
+    if _routing_row_exists(plan_id):
+        updated = dict(block)
+        updated["dismissed"] = True
+        updated["dismiss_reason"] = reason
+        updated["dismissed_at"] = datetime.now(timezone.utc).isoformat()
+        # The hold is released: the plan is not waiting on this defect
+        # any more.  Everything else the block says stays as it is.
+        updated["hold"] = False
+        _write_routing_framework_fix(plan_id, updated)
+
+    registry.append_event(
+        FRAMEWORK_FIX_DISMISSED_EVENT,
+        {
+            "plan_id": plan_id,
+            "reason": reason,
+            "fingerprint": fingerprint,
+            "fix_plan_id": fix_plan_id,
+            "attached_plans": _attached_plan_ids(registry, fingerprint),
+        },
+        fingerprint=fingerprint,
+        fix_plan_id=fix_plan_id,
+    )
+
+
+@router.post("/api/plan/{plan_id}/framework-fix/dismiss")
+def dismiss_framework_fix_entry(
+    plan_id: str,
+    payload: Optional[Dict[str, Any]] = Body(default=None),
+) -> Any:
+    """Dismiss this plan's framework-fix entry — guarded.
+
+    Answers
+    -------
+    * **200** ``{"dismissed": true}`` — the entry is dismissed: the
+      plan's framework-fix block records it and releases the hold, and
+      the audit chain carries one ``framework_fix_dismissed`` event
+      with the reason.  Dismissing twice is the same as dismissing
+      once — the second call answers 200 and writes nothing.
+    * **400** ``{"error": "missing_reason"}`` — no reason.  A
+      dismissal nobody can explain is not a dismissal.
+    * **404** ``{"error": "plan_not_found"}`` — no such plan.
+    * **409** ``{"error": "framework_fix_active", "fingerprint": ...}``
+      — the defect is still being repaired, or a repair PR still holds
+      the repository's merge slot.  Nothing is dismissed: the entry
+      stays exactly as it was, and the plans waiting on that repair
+      stay blocked with somebody still looking after them.
+    * **503** ``{"error": "framework_fix_registry_unavailable"}`` — the
+      state database has not run the framework-fix migration, so nobody
+      can tell what is being worked on.
+    """
+    reason = payload.get("reason") if isinstance(payload, dict) else None
+    reason = _optional_text(reason)
+    if reason is None:
+        return JSONResponse(
+            status_code=400,
+            content={"error": FRAMEWORK_FIX_MISSING_REASON_ERROR},
+        )
+
+    plan_dir = _server._plan_dir(plan_id)
+    if not plan_dir.exists() and not _routing_row_exists(plan_id):
+        return JSONResponse(
+            status_code=404,
+            content={"error": FRAMEWORK_FIX_PLAN_NOT_FOUND_ERROR},
+        )
+
+    registry = _framework_fix_registry()
+    if registry is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": FRAMEWORK_FIX_UNAVAILABLE_ERROR},
+        )
+
+    from plan_state import PlanState
+
+    plan_state = PlanState(plan_dir)
+    kind = plan_state.get_plan_kind()
+    block = plan_state.get_framework_fix()
+
+    # The repair plan that owns the entry: a repair plan owns itself, a
+    # held business plan owns the plan that is repairing its defect.
+    fix_plan_id = (
+        plan_id if kind == "framework_fix"
+        else (_optional_text(block.get("fix_plan_id")) or plan_id)
+    )
+
+    fingerprint = _entry_fingerprint(registry, plan_id, block)
+
+    # Already dismissed → the same answer, and no second event.
+    if block.get("dismissed") is True or _dismissal_recorded(
+        plan_id, fingerprint
+    ):
+        return {"dismissed": True}
+
+    # Guard one: the defect is still being repaired.
+    if _defect_is_open(registry, fingerprint):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": FRAMEWORK_FIX_ACTIVE_ERROR,
+                "fingerprint": fingerprint,
+            },
+        )
+
+    # Guard two: a repair PR still holds the repository's merge slot.
+    holders = _merge_lease_holders(plan_id, fix_plan_id)
+    if holders:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": FRAMEWORK_FIX_ACTIVE_ERROR,
+                "fingerprint": fingerprint,
+            },
+        )
+
+    _record_dismissal(
+        plan_id, block, reason, fingerprint, fix_plan_id, registry
+    )
+
+    return {"dismissed": True}
 

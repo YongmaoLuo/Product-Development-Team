@@ -2294,6 +2294,64 @@
         "summary": "Get Failure Review"
       }
     },
+    "/api/plan/{plan_id}/framework-fix/dismiss": {
+      "post": {
+        "description": "Dismiss this plan's framework-fix entry \u2014 guarded.\n\nAnswers\n-------\n* **200** ``{\"dismissed\": true}`` \u2014 the entry is dismissed: the\n  plan's framework-fix block records it and releases the hold, and\n  the audit chain carries one ``framework_fix_dismissed`` event\n  with the reason.  Dismissing twice is the same as dismissing\n  once \u2014 the second call answers 200 and writes nothing.\n* **400** ``{\"error\": \"missing_reason\"}`` \u2014 no reason.  A\n  dismissal nobody can explain is not a dismissal.\n* **404** ``{\"error\": \"plan_not_found\"}`` \u2014 no such plan.\n* **409** ``{\"error\": \"framework_fix_active\", \"fingerprint\": ...}``\n  \u2014 the defect is still being repaired, or a repair PR still holds\n  the repository's merge slot.  Nothing is dismissed: the entry\n  stays exactly as it was, and the plans waiting on that repair\n  stay blocked with somebody still looking after them.\n* **503** ``{\"error\": \"framework_fix_registry_unavailable\"}`` \u2014 the\n  state database has not run the framework-fix migration, so nobody\n  can tell what is being worked on.",
+        "operationId": "dismiss_framework_fix_entry_api_plan__plan_id__framework_fix_dismiss_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Payload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Dismiss Framework Fix Entry Api Plan  Plan Id  Framework Fix Dismiss Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Dismiss Framework Fix Entry"
+      }
+    },
     "/api/plan/{plan_id}/lifecycle/start": {
       "post": {
         "description": "\u6309\u68c0\u67e5\u70b9\u7684 kind \u542f\u52a8\u8fd9\u4e2a\u8ba1\u5212\uff08\u6062\u590d\u6267\u884c\u6216\u6062\u590d\u9a8c\u8bc1\uff09\u3002\n\n:raises fastapi.HTTPException: \u672a\u77e5\u8ba1\u5212 404\uff1b\u5904\u7406\u5668\u629b\u51fa\u7684\u5f02\u5e38\u539f\u6837\u900f\u4f20\n    \uff08\u7f3a ``project_dir`` \u90a3\u4e2a 400 \u7531\u6267\u884c\u4fa7\u8bf4\uff0c\u95e8\u9762\u4e0d\u81ea\u5df1\u7f16\uff09\u3002",
@@ -3519,8 +3577,25 @@
     },
     "/api/scheduler/state": {
       "get": {
-        "description": "Answer with the scheduler's read model.\n\nThe engine's own snapshot: the six keys, the queue in the\nproduction order, the numbers the panel shows beside the flags\nthat describe them.\n\nA scheduler that is not running answers the empty document rather\nthan an error \u2014 the endpoint is what the panel polls, and an\nendpoint that fails when there is nothing to report leaves the\noperator with a broken panel and no way to tell an idle scheduler\nfrom a broken one.",
+        "description": "Answer with the scheduler's read model.\n\nThe engine's own snapshot: the nine keys, the queue in the\nproduction order, the numbers the panel shows beside the flags\nthat describe them.\n\nThe ``kind`` parameter picks the partition the caller is asking\nfor: ``plans`` for the ordinary one, ``framework_fix`` for the\nframework-fix lane's own column, ``all`` for both.  The vocabulary\nis closed \u2014 a word outside it is a 422, because a word this route\ncannot answer is a question the caller must be told it asked\nbadly, not one it is quietly handed the whole document for.\n\nA scheduler that is not running answers the empty document rather\nthan an error \u2014 the endpoint is what the panel polls, and an\nendpoint that fails when there is nothing to report leaves the\noperator with a broken panel and no way to tell an idle scheduler\nfrom a broken one.",
         "operationId": "get_scheduler_state_api_scheduler_state_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "default": "all",
+              "enum": [
+                "all",
+                "plans",
+                "framework_fix"
+              ],
+              "title": "Kind",
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -3533,6 +3608,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "Get Scheduler State"

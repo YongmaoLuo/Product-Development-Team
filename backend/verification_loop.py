@@ -8414,6 +8414,103 @@ def _record_round_verdict_persist(
 
 
 # ---------------------------------------------------------------------------
+# Per-tree verification results (2026-11-24, task 20)
+# ---------------------------------------------------------------------------
+def _tree_state(project_dir: Optional[Path]) -> Tuple[str, str, bool]:
+    """这一轮验证跑在哪棵树上。
+
+    拿不到指纹 → ``unknown``：绑不上树的结论照样要落，只是它说���清自己是在
+    哪棵树上得出的 —— 假装它绑上了更糟。
+    """
+    if project_dir is None:
+        return ("unknown", "", False)
+    try:
+        from verification.tree_fingerprint import capture_tree_fingerprint
+    except ImportError:  # pragma: no cover - 两条路径等价
+        from backend.verification.tree_fingerprint import (  # type: ignore
+            capture_tree_fingerprint,
+        )
+    try:
+        captured = capture_tree_fingerprint(Path(project_dir))
+    except Exception:  # noqa: BLE001 - 指纹拿不到不能吃掉一整轮验证
+        return ("unknown", "", False)
+    return (
+        str(captured["tree_fingerprint"]),
+        str(captured["head_commit"]),
+        not bool(captured["dirty"]),
+    )
+
+
+def _record_round_tree_results(
+    plan_id: str,
+    round_no: int,
+    project_dir: Optional[Path],
+    results: List[Dict[str, Any]],
+) -> None:
+    """这一轮每个验证点的结论，按树指纹追加到 ``plan_verification_result``。
+
+    **只追加。** 旧行永远不动 —— 「这棵树过了吗」由这棵树的那几行回答，而不是
+    由「最后一行」回答（后者会把一次失败抹掉）。
+
+    写不进去只记一条日志，不抛：一次写失败不能把一整轮验证带下去 —— 验证本身
+    已经跑完了，读侧的对账会报出差异。
+
+    Module-level, like :func:`_record_round_verdict_persist`: a recorder that
+    can only be reached through the loop cannot be told apart from one that
+    never runs.
+    """
+    if not results:
+        return
+    try:
+        from verification_persistence import (
+            append_verification_result,
+            normalize_result_verdict,
+        )
+    except ImportError:  # pragma: no cover - 两条路径等价
+        from backend.verification_persistence import (  # type: ignore
+            append_verification_result,
+            normalize_result_verdict,
+        )
+
+    tree_fingerprint, base_commit, clean = _tree_state(project_dir)
+
+    for entry in results:
+        if not isinstance(entry, dict):
+            continue
+        vp_id = str(entry.get("id") or entry.get("vp_id") or "")
+        if not vp_id:
+            continue
+        try:
+            verdict = normalize_result_verdict(entry.get("status"))
+        except ValueError:
+            # 认不出来的结论写法 → 「不知道」。不是「通过」：一次没有被证明的
+            # 结论不能当成过了。日志说清它是什么。
+            verdict = "unknown"
+            _server.logger.warning(
+                "[verification_result] unknown verdict status plan=%s "
+                "vp=%s status=%r — recorded as 'unknown'",
+                plan_id, vp_id, entry.get("status"),
+            )
+        try:
+            append_verification_result(
+                plan_id=plan_id,
+                vp_id=vp_id,
+                tree_fingerprint=tree_fingerprint,
+                verdict=verdict,
+                round_no=round_no,
+                base_main_commit=base_commit,
+                clean=clean,
+                source="verification_loop",
+            )
+        except Exception:  # noqa: BLE001 - 写结果失败不影响这一轮
+            _server.logger.exception(
+                "[verification_result] the result row was not written "
+                "plan=%s vp=%s round=%s",
+                plan_id, vp_id, round_no,
+            )
+
+
+# ---------------------------------------------------------------------------
 # The verification-round lease (2026-10-25)
 # ---------------------------------------------------------------------------
 #
@@ -13080,16 +13177,26 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                     last_results = last_round.get("results") or []
                     if isinstance(last_results, list) and last_results:
                         results_lists.append(last_results)
+                round_results: List[Dict[str, Any]] = [
+                    r
+                    for results_list in results_lists
+                    for r in results_list
+                    if isinstance(r, dict)
+                ]
                 failed: List[Dict[str, Any]] = []
                 passed: List[Dict[str, Any]] = []
-                for results_list in results_lists:
-                    for r in results_list:
-                        if not isinstance(r, dict):
-                            continue
-                        if r.get("status") == "FAILED":
-                            failed.append(r)
-                        elif r.get("status") == "PASSED":
-                            passed.append(r)
+                for r in round_results:
+                    if r.get("status") == "FAILED":
+                        failed.append(r)
+                    elif r.get("status") == "PASSED":
+                        passed.append(r)
+                # 2026-11-24 (task 20): 这一轮每个验证点的结论按树指纹**追加**
+                # 到 ``plan_verification_result``。只追加 —— 旧行永远不动，
+                # 「这棵树过了吗」由这棵树的那几行回答，而不是由「最后一行」回答
+                # （后者会把一次失败抹掉）。
+                _record_round_tree_results(
+                    plan_id, round_num, project_dir, round_results,
+                )
                 v_state = _server._verification_state.get(plan_id)
                 if v_state:
                     v_state["verification_status"] = status

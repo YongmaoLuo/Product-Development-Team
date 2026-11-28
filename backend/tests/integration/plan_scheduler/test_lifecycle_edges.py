@@ -83,6 +83,10 @@ import pytest
 # 词表与边表，快照随之按真实值逐项涨（涨在哪些行、为什么涨，写在每一处
 # 旁边）。快照的**用途**没变：它仍然是「词表和边表只能按这一条路变」的
 # 见证 —— 涨过的地方再动一次，还是会打成红。
+#
+# 2026-11-25: 阻塞相位（``blocked_on_framework_fix``，架构决策点 4）进了
+# 词表与**主**边表。验证子表一个字节都没动 —— 它的进边写在主表里，理由
+# 写在那一行旁边。
 # ---------------------------------------------------------------------------
 
 _PHASES_BEFORE = [
@@ -114,6 +118,11 @@ _PHASES_BEFORE = [
     "verification_passed",
     "verification_failed",
     "verification_repairing",
+    # 2026-11-25: 新增——「被框架缺陷阻塞」相位（架构决策点 4）。只有一条
+    # 计划的**全部剩余工作**都被框架缺陷挡住时，它才进这个相位：让出执行/
+    # 验证槽位，回调度队列排队。它插在 ``verification_repairing`` 与
+    # ``user_stopping`` 之间 —— 快照跟着涨，涨在哪儿写在这儿。
+    "blocked_on_framework_fix",
     # 2026-11-20: 新增——plan 级「正在停止」相位。执行停止与验证停止共用它：
     # 停的**动作**与停的**结果**之间必须有一个有名字的相位，否则就会出现
     # 「显示已停、后台仍在派发」。它插在 ``verification_repairing`` 与
@@ -193,6 +202,9 @@ _MAIN_EDGES_BEFORE = {
         "ready",
         "queued",
         "waiting_for_quota",
+        # 2026-11-25: 全部剩余工作被框架缺陷挡住时，执行期的计划也要能进
+        # 阻塞相位（让出执行槽位）。
+        "blocked_on_framework_fix",
     ],
     "waiting_for_quota": ["executing", "ready", "queued", "stopped"],
     "completed": ["verification"],
@@ -210,6 +222,20 @@ _MAIN_EDGES_BEFORE = {
     "verification_passed": ["post_processing"],
     "post_processing": ["completed", "postprocess_failed", "queued"],
     "postprocess_failed": ["post_processing"],
+    # 2026-11-25: 阻塞相位（架构决策点 4）。验证系列的进边写在**主表**里 ——
+    # 验证子表是冻结的安全边界（``verification_passed`` 那一行必须还是空的），
+    # 而 ``transition_to`` 取两张表的并集，所以放哪张表都不影响可走性；这里
+    # 选主表是为了让那张冻结的子表一个字节都不动（同 ``post_processing`` 的
+    # 做法 —— ``PHASE_TRANSITIONS["verification_passed"]`` 就是这么加的）。
+    "verification": ["blocked_on_framework_fix"],
+    "verification_running": ["blocked_on_framework_fix"],
+    "verify_first_pass": ["blocked_on_framework_fix"],
+    "verify_recheck": ["blocked_on_framework_fix"],
+    "verification_failed": ["blocked_on_framework_fix"],
+    "verification_repairing": ["blocked_on_framework_fix"],
+    # 阻塞相位自己的出边：``queued``（挂起被释放后回调度队列）与 ``stopped``
+    # （留给操作者）。它**不是**终态 —— 释放之后计划还要再跑一遍。
+    "blocked_on_framework_fix": ["queued", "stopped"],
 }
 
 # 2026-11-17: 这张表**没有**跟着涨 —— 收尾阶段是工作流层的相位，它的边
@@ -294,6 +320,9 @@ _DEDICATED_EDGES_BEFORE = {
 # 2026-11-17: 终态集合**没有**跟着涨。``post_processing`` 还在干活，
 # ``postprocess_failed`` 还要等人决定是否续跑 —— 两者都不是终态；终态是
 # 「再也不会动了」，把「等人」算成终态就是把人正在看的计划从列表里滤掉。
+#
+# 2026-11-25: 阻塞相位也没有进来 —— 它是**等**（等框架缺陷被修掉），释放
+# 之后计划还要回队列再跑一遍，所以它不是终态。
 _TERMINAL_PHASES_BEFORE = ["archived", "completed", "failed", "stopped"]
 
 

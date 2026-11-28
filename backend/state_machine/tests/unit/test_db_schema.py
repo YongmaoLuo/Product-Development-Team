@@ -214,6 +214,17 @@ def test_migrate_creates_five_tables_and_version(tmp_path: Path) -> None:
     ``_SCHEDULER_OBJECTS``).  A fourth, ``scheduler_setting``, joins them
     there (2026-10-29): the operator's runtime capacity override.
 
+    The framework-fix lane (2026-11-26) adds eight more: the seven
+    ``framework_fix_*`` tables — ``framework_fix_hit``,
+    ``framework_fix_registry``, ``framework_fix_alias``,
+    ``framework_fix_attach``, ``framework_fix_event``,
+    ``framework_fix_merge_lease``, ``framework_fix_repro`` — and
+    ``plan_verification_result``.  They come from the same unconditional,
+    presence-guarded step as the tables above (the same schema module's
+    ``_ensure_framework_fix_tables``, whose module docstring says so at
+    lines 128-141): a new table is not a shape change, so the table's
+    own presence is the better logbook than the schema version.
+
     The test's name keeps the count it was written with, the way the
     backend's copy of the same gate keeps its own name: the anchor
     should keep pointing at the same gate.
@@ -227,12 +238,20 @@ def test_migrate_creates_five_tables_and_version(tmp_path: Path) -> None:
         migrate(conn)
         names = _table_names(conn)
         assert names == [
+            "framework_fix_alias",
+            "framework_fix_attach",
+            "framework_fix_event",
+            "framework_fix_hit",
+            "framework_fix_merge_lease",
+            "framework_fix_registry",
+            "framework_fix_repro",
             "plan_artifacts",
             "plan_decisions",
             "plan_execution",
             "plan_routing",
             "plan_tasks",
             "plan_verification",
+            "plan_verification_result",
             "scheduler_command",
             "scheduler_queue",
             "scheduler_setting",

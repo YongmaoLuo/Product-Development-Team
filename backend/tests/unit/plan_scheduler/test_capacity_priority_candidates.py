@@ -36,6 +36,7 @@ on it — and not how the ledger got there.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -144,6 +145,25 @@ class _World:
         self.store.upsert_slot(
             self.conn, plan_id, now=_utc_iso(acquired_at), priority=priority
         )
+
+    def working_as_fix(self, plan_id: str, started_at: Optional[str] = None) -> None:
+        """Make the plan hold compute **and** be a framework-fix plan.
+
+        The routing row is what says what kind of plan it is: the
+        ``plan_kind`` column names the lane the plan belongs to, and the
+        framework-fix block names the repository it repairs.
+        """
+        self.working(plan_id, started_at=started_at)
+        self.conn.execute(
+            "UPDATE plan_routing SET plan_kind = ?, framework_fix = ? "
+            "WHERE plan_id = ?",
+            (
+                "framework_fix",
+                json.dumps({"repo": "repo-a"}, ensure_ascii=False),
+                plan_id,
+            ),
+        )
+        self.conn.commit()
 
 
 class _RawSlotStore:
@@ -362,4 +382,99 @@ def test_the_order_of_the_candidates_does_not_move(world: _World) -> None:
         "20261101-a",
     ], (
         "the order of the candidates moved: {0!r}".format(candidates)
+    )
+
+
+# ---------------------------------------------------------------------------
+# 5. The candidate carries the protection facts
+# ---------------------------------------------------------------------------
+
+
+def test_a_framework_fix_candidate_is_marked_unpreemptable(world: _World) -> None:
+    """A framework-fix plan's candidate says it may not be interrupted.
+
+    The policy protects a running plan in two ways: by its
+    ``plan_kind`` and by its ``preemptable`` flag.  Both facts have to
+    reach it, and they reach it **on the candidate** — the row the
+    ledger hands over.  A row that carries neither key cannot answer
+    "is this plan protected?", and the answer it gives is "no": a
+    framework-fix plan that has been working for hours is then
+    interrupted like any other, and two repair plans making way for each
+    other is the livelock the lane is built to prevent.
+
+    The protection is **structural** — it does not depend on the plan
+    being young, on the caller asking nicely, or on the plan happening
+    to be the one that is stopped.
+    """
+    world.working_as_fix("20261101-fix", started_at=_local_iso(BASE_EPOCH - 3600))
+    world.slot("20261101-fix", BASE_EPOCH - 3600)
+
+    candidate = _only(world.ledger.evictable(world.clock(), MIN_RUNTIME))
+
+    assert candidate["plan_kind"] == "framework_fix", (
+        "the candidate does not say what kind of plan it is: {0!r}".format(
+            candidate
+        )
+    )
+    assert candidate["preemptable"] is False, (
+        "a framework-fix plan may not be interrupted, and the candidate "
+        "does not say so: {0!r}".format(candidate)
+    )
+
+
+def test_an_ordinary_candidate_is_marked_preemptable(world: _World) -> None:
+    """An ordinary plan's candidate says it may be interrupted.
+
+    The rule is not "everything is protected" — that would starve the
+    scheduler.  An ordinary plan is preemptable, and the candidate says
+    so in the same two words the repair plan uses, so the policy reads
+    one row shape and does not have to guess which kind of plan it is
+    holding.
+    """
+    world.working("20261101-ordinary", started_at=_local_iso(BASE_EPOCH - 3600))
+    world.slot("20261101-ordinary", BASE_EPOCH - 3600)
+
+    candidate = _only(world.ledger.evictable(world.clock(), MIN_RUNTIME))
+
+    assert candidate["plan_kind"] == "normal", (
+        "an ordinary plan's candidate does not say it is ordinary: "
+        "{0!r}".format(candidate)
+    )
+    assert candidate["preemptable"] is True, (
+        "an ordinary plan may be interrupted, and the candidate does not "
+        "say so: {0!r}".format(candidate)
+    )
+
+
+def test_the_protection_facts_do_not_move_the_rest_of_the_answer(
+    world: _World,
+) -> None:
+    """Adding the two keys changes nothing else about the candidate.
+
+    The five keys the candidate already carried are what the rule reads
+    to choose among the plans, and they are read off the same row.  A
+    candidate that carries the protection facts and lost one of the
+    others would be a candidate the policy cannot order.
+    """
+    plan_id = "20261101-whole"
+    world.working_as_fix(plan_id, started_at=_local_iso(BASE_EPOCH - 3600))
+    world.slot(plan_id, BASE_EPOCH - 3600, priority=-10)
+
+    candidate = _only(world.ledger.evictable(world.clock(), MIN_RUNTIME))
+
+    assert candidate["plan_id"] == plan_id
+    assert candidate["acquired_at"] == BASE_EPOCH - 3600
+    assert candidate["elapsed"] == 3600.0
+    assert candidate["created_at"] is not None
+    assert candidate["priority"] == -10
+    assert set(candidate) == {
+        "plan_id",
+        "acquired_at",
+        "created_at",
+        "elapsed",
+        "priority",
+        "plan_kind",
+        "preemptable",
+    }, (
+        "the candidate's key set moved: {0!r}".format(sorted(candidate))
     )

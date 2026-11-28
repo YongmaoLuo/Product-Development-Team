@@ -2987,6 +2987,21 @@ def review_verification_plan_item(
             },
         )
 
+    # 挂起中的验证点不许被 skip 结清。
+    #
+    # skip 说的是「这个验证点不用验了」—— 而它正被挂住就是因为没验出来。
+    # 拒绝发生在写审核状态**之前**，所以审核状态文件一个字都不会被改写：
+    # 被拒绝的那一次 skip 什么也没留下。
+    #
+    # 守卫与起验证 / 重置共用同一个（``routes.verification``）：挂起这件事
+    # 在每个入口上都是同一句判断，不是每个入口各写一份。
+    if action == "skip":
+        from routes.verification import framework_fix_hold_refusal
+
+        hold_refusal = framework_fix_hold_refusal(plan_id)
+        if hold_refusal is not None:
+            return hold_refusal
+
     reason = str(req.note or "").strip()
     if action == "skip" and not reason:
         raise HTTPException(

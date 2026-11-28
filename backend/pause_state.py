@@ -115,12 +115,22 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple, Union
 
+from config_paths import resolve_plans_dir
 from execution_logger import ExecutionLogger
+from plan_scheduler.policy import REASONS
 from utils.atomic_io import atomic_write_json
+
+try:  # pragma: no cover - the two paths are the same module
+    from framework_fix.scheduling import PREEMPTED_REASON
+except ImportError:  # pragma: no cover
+    from backend.framework_fix.scheduling import (  # type: ignore
+        PREEMPTED_REASON,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -408,26 +418,439 @@ def checkpoint_summary(plan_dir: PathLike) -> Optional[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# The pause intent
+# ---------------------------------------------------------------------------
+# The pause intent — why a plan is not running
 # ---------------------------------------------------------------------------
 #
-# The checkpoint above answers "what did the stop interrupt". The intent
-# answers an earlier and simpler question: "was a pause asked for at
-# all, and why". It is written *before* anything acts on the request,
-# because the thing that acts on it is a process that may be killed
-# right after — and a repair round that cannot find an intent on disk
-# has no evidence to give an exit code anything but "failed".
+# The checkpoint above records what a ``stop`` interrupted.  The **intent**
+# is a different thing: it says the plan is *not supposed to be running*,
+# and why.  A plan the framework-fix lane preempted is stopped, but the
+# stop is not the point — the point is that the scheduler decided the plan
+# must wait, and that decision has to outlive the process that made it.
 #
-# The record is deliberately small:
+# Without a durable record of it, a restart brings the plan back as if
+# nothing had happened: the plan runs, the lane's decision does not, and
+# the two disagree about what the scheduler is doing.  So the intent is a
+# small document of its own, written next to the plan's other records and
+# read back by whatever recovers after a restart.
+#
+# Three functions carry it, and they are the whole contract:
+#
+# * :func:`write_pause` — record the intent, and answer what was recorded;
+# * :func:`read_pause` — read it back, or ``None`` when there is none;
+# * :func:`clear_pause` — take it away (the plan is back; it is not paused).
+#
+# The reason is a word from the scheduler's own closed vocabulary
+# (:data:`plan_scheduler.policy.REASONS`) — the same words the panel, the
+# dry run and the API draw.  A word outside that set is **refused** rather
+# than written: an intent nobody can draw is not a record, it is a piece
+# of noise that hides the plans that do have a reason.
+#
+# The lifecycle keeps its own three names for the same thing — they are the
+# ones that write the intent just before the plan is stopped:
+#
+# * :func:`write_pause_intent` — record that a pause was asked for;
+# * :func:`read_pause_intent` — read it back, or ``None`` when there is none;
+# * :func:`clear_pause_intent` — take it away.
+#
+# **One file, one document.**  Both writers write ``pause_intent.json`` into
+# the plan's own directory, so they write the same shape: the two version
+# fields (:data:`_PAUSE_INTENT_VERSION` and :data:`_INTENT_SCHEMA_VERSION`)
+# are one number under two names, and every field either side knows is
+# written by both.  The record is deliberately small:
 #
 #     {
+#       "version": 1,
 #       "schema_version": 1,
-#       "reason": "user_pause",              # why the pause was asked for
-#       "requested_at": "2026-11-20T08:42:50+00:00"   # when it was asked
+#       "plan_id": "p-20261123-120000-a",          # whose plan it is
+#       "reason": "user_pause",                    # the lifecycle's own reason
+#       "scheduler_reason": "preempted",           # the scheduler's own reason
+#       "source": "framework_fix_preemption",      # who decided it must wait
+#       "fix_plan_id": "p-20261123-121500-b",      # the repair plan that took
+#                                                  # the slot
+#       "paused_at": "2026-11-20T08:42:50+00:00",    # when the intent landed
+#       "requested_at": "2026-11-20T08:42:50+00:00", # when it was asked for
+#       "persisted": true
 #     }
 #
-# One file per plan directory, ``pause_intent.json``, written atomically
-# and cleared once the pause has been honoured.
+# **Two reasons, two fields.**  The two layers answer "why is this plan not
+# running" with words from their own vocabularies, and the file keeps both:
+# the lifecycle's reason is ``reason`` (the one the repair round reads — it
+# only asks "was a pause asked for?"), and the scheduler's word from its
+# closed vocabulary is ``scheduler_reason`` (the one the panel draws).  Each
+# reader answers with its own: :func:`read_pause_intent` hands the document
+# over as it is, and :func:`read_pause` presents the scheduler's word as
+# ``reason``.  Neither writer overwrites the other's word.
+#
+# The file is written atomically and cleared once the pause has been
+# honoured.
+
+#: Bumped only on an incompatible change to the intent's shape.  An intent
+#: written by a newer PDT is ignored by an older one: the safe direction
+#: there is "this plan is not paused" rather than "this plan is paused for
+#: a reason this code cannot read".
+_PAUSE_INTENT_VERSION = 1
+
+#: The closed vocabulary of pause reasons.  It is the scheduler's own
+#: closed set — not a copy of it — so a reason the scheduler can say is a
+#: reason this layer accepts, and a word outside the set is refused.
+PAUSE_REASONS: FrozenSet[str] = frozenset(REASONS)
+
+#: The pause was asked for by a person at the panel.
+OPERATOR_SOURCE = "operator"
+
+#: The pause was forced by the framework-fix lane: the plan gave its slot
+#: to a repair plan.
+FRAMEWORK_FIX_SOURCE = "framework_fix_preemption"
+
+#: Every source a pause may have.  The set is closed on purpose: a new
+#: source is a new situation, and it needs a decision nobody has made yet.
+PAUSE_SOURCES: FrozenSet[str] = frozenset(
+    {OPERATOR_SOURCE, FRAMEWORK_FIX_SOURCE}
+)
+
+#: The reason a pause carries when the caller named none: the panel was
+#: used and nothing else was said.
+DEFAULT_PAUSE_REASON = "paused"
+
+
+class PauseReasonError(ValueError):
+    """A reason (or a source) that is not in the closed vocabulary.
+
+    It is raised **before** anything is written: a pause intent nobody can
+    draw is worse than no intent at all, because the plan would come back
+    after a restart believing it may run.
+
+    Attributes:
+        kind: what was wrong — ``reason`` or ``source``.
+        value: the word that was refused.
+    """
+
+    def __init__(self, message: str, *, kind: str = "reason", value: Any = None) -> None:
+        """Hold the refusal and the word it is about.
+
+        Args:
+            message: the sentence the caller is answered with.
+            kind: what was wrong — ``reason`` or ``source``.
+            value: the word that was refused.
+        """
+        super().__init__(message)
+        self.kind = kind
+        self.value = value
+
+
+def checked_reason(reason: Optional[str]) -> str:
+    """The reason to record, checked against the closed vocabulary.
+
+    ``None`` (or an empty word) means "the caller named no reason": the
+    operator's pause, which is :data:`DEFAULT_PAUSE_REASON`.
+
+    Raises:
+        PauseReasonError: the word is not in :data:`PAUSE_REASONS`.
+    """
+    if reason is None:
+        return DEFAULT_PAUSE_REASON
+    text = _text(reason)
+    if text is None or not text.strip():
+        return DEFAULT_PAUSE_REASON
+    if text not in PAUSE_REASONS:
+        raise PauseReasonError(
+            "unknown pause reason: {0!r} (the vocabulary is {1!r})".format(
+                text, sorted(PAUSE_REASONS),
+            ),
+            kind="reason",
+            value=text,
+        )
+    return text
+
+
+def checked_source(reason: str, source: Optional[str]) -> str:
+    """Where the pause came from — the caller's word, or the reason's.
+
+    The caller may say outright; when it does not, the reason decides: the
+    framework-fix lane's preemption is the lane's, everything else is the
+    operator's.
+
+    Raises:
+        PauseReasonError: the word is not in :data:`PAUSE_SOURCES`.
+    """
+    if source is None:
+        if reason == PREEMPTED_REASON:
+            return FRAMEWORK_FIX_SOURCE
+        return OPERATOR_SOURCE
+    text = _text(source)
+    if text not in PAUSE_SOURCES:
+        raise PauseReasonError(
+            "unknown pause source: {0!r} (the vocabulary is {1!r})".format(
+                text, sorted(PAUSE_SOURCES),
+            ),
+            kind="source",
+            value=text,
+        )
+    return text
+
+
+def _checked_plan_id(plan_id: Any) -> str:
+    """The plan id, checked before it becomes a path.
+
+    A plan id names a plan; it does not name a place.  A word carrying a
+    separator would let a caller write outside the plans tree, so it is
+    refused here rather than trusted further down.
+
+    Raises:
+        ValueError: the id is empty or names a path.
+    """
+    text = str(plan_id or "").strip()
+    if not text:
+        raise ValueError("a pause intent needs a plan id")
+    if text in (".", "..") or "/" in text or "\\" in text or os.sep in text:
+        raise ValueError(
+            "a plan id may not name a path: {0!r}".format(plan_id)
+        )
+    return text
+
+
+def _plans_root(root: Optional[PathLike] = None) -> Path:
+    """The plans root the intents live under.
+
+    The root is resolved on **every** call and never cached:
+    ``PDT_PLANS_DIR`` is the harness's escape hatch, and a resolver that
+    answered once would answer with the tree that was current when the
+    module was imported.
+    """
+    if root is not None:
+        return Path(root)
+    return resolve_plans_dir()
+
+
+def _plan_dir_candidates(root: Path, plan_id: str) -> Tuple[Path, Path]:
+    """The two places this plan's directory may be.
+
+    The root may be the plans tree itself or a repository root that holds
+    one, so both are tried — in that order, because the first is where a
+    plan of this tree really lives.  It is the same pair the scheduler's
+    facts reader uses, so a plan's pause intent lands in the very
+    directory the rest of the backend reads.
+    """
+    return (root / plan_id, root / "plans" / plan_id)
+
+
+def _plan_dir_of(plan_id: str, root: Optional[PathLike] = None) -> Path:
+    """The plan's own directory under the plans root."""
+    candidates = _plan_dir_candidates(_plans_root(root), plan_id)
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return candidates[0]
+
+
+def pause_intent_path(plan_id: str, *, root: Optional[PathLike] = None) -> Path:
+    """Where the pause intent of ``plan_id`` lives."""
+    return _plan_dir_of(_checked_plan_id(plan_id), root) / PAUSE_INTENT_FILENAME
+
+
+def _stamp_of(clock: Optional[Callable[[], float]] = None) -> str:
+    """The moment the intent was written, as an aware UTC stamp.
+
+    The clock is a parameter so that a case can move time by hand; the
+    real clock is what the running backend uses.
+    """
+    if clock is None:
+        return _now_iso()
+    try:
+        moment = float(clock())
+    except (TypeError, ValueError):
+        return _now_iso()
+    try:
+        return datetime.fromtimestamp(moment, tz=timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return _now_iso()
+
+
+def _intent_version_known(data: Dict[str, Any]) -> bool:
+    """Whether the document on disk is a shape this code understands.
+
+    Two shapes are in the wild and both are honoured: this layer's own
+    (``version``) and the lifecycle's (``schema_version``) — the two writers
+    of this one file each carry their own name for the same number.  A
+    document that carries neither is **not** read: an intent nobody can
+    read is safer to ignore than to half-believe.
+    """
+    if data.get("version") == _PAUSE_INTENT_VERSION:
+        return True
+    return data.get("schema_version") == _INTENT_SCHEMA_VERSION
+
+
+def write_pause(
+    plan_id: str,
+    reason: Optional[str] = None,
+    *,
+    source: Optional[str] = None,
+    fix_plan_id: Optional[str] = None,
+    root: Optional[PathLike] = None,
+    clock: Optional[Callable[[], float]] = None,
+) -> Dict[str, Any]:
+    """Record why a plan is not running; answer what was recorded.
+
+    The answer is the question that was asked — which plan, which reason,
+    and whether it landed — so a caller can tell a recorded pause from one
+    that only happened in memory.  The record itself (with its timestamp
+    and its source) is read back with :func:`read_pause`.
+
+    Args:
+        plan_id: the plan that is not running.
+        reason: the word from the scheduler's closed vocabulary that says
+            why.  A word outside it is refused and nothing is written.
+            The operator's own pause is the default when it is omitted.
+        source: where the pause came from — the operator or the
+            framework-fix lane.  Derived from the reason when omitted.
+        fix_plan_id: the repair plan that took the slot, when the pause
+            was a preemption.
+        root: the plans root to write under.  The configured one when
+            omitted.
+        clock: the source of "now", in epoch seconds.
+
+    Returns:
+        ``{"plan_id": ..., "reason": ..., "persisted": ...}``.
+
+    Raises:
+        PauseReasonError: the reason or the source is not in the closed
+            vocabulary.  Nothing is written.
+        ValueError: the plan id names a path rather than a plan.
+    """
+    plan = _checked_plan_id(plan_id)
+    reason_text = checked_reason(reason)
+    source_text = checked_source(reason_text, source)
+
+    path = _plan_dir_of(plan, root) / PAUSE_INTENT_FILENAME
+    stamp = _stamp_of(clock)
+    document: Dict[str, Any] = {
+        "version": _PAUSE_INTENT_VERSION,
+        "schema_version": _INTENT_SCHEMA_VERSION,
+        "plan_id": plan,
+        # The scheduler's word is written to **both** fields: to
+        # ``scheduler_reason``, which is where it lives once the lifecycle
+        # has written its own reason, and to ``reason``, so that a pause
+        # that only the scheduler asked for is still a document the
+        # lifecycle's reader can read (it needs a reason to believe).
+        "reason": reason_text,
+        "scheduler_reason": reason_text,
+        "source": source_text,
+        "fix_plan_id": _text(fix_plan_id),
+        "paused_at": stamp,
+        "requested_at": stamp,
+        "persisted": True,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(path, document, logger=logger, reraise=True)
+    except OSError as exc:
+        logger.warning(
+            "pause_intent_unwritable: the pause intent of the plan %s could "
+            "not be written (%s: %s); a restart will not honour it",
+            plan, type(exc).__name__, exc,
+        )
+        return {"plan_id": plan, "reason": reason_text, "persisted": False}
+    return {"plan_id": plan, "reason": reason_text, "persisted": True}
+
+
+def read_pause(
+    plan_id: str, *, root: Optional[PathLike] = None
+) -> Optional[Dict[str, Any]]:
+    """The plan's pause intent, or ``None`` when there is none to honour.
+
+    ``None`` covers every unusable case — absent, unreadable, not JSON,
+    JSON but not an object, or a version this code does not know — so the
+    caller has one answer to handle and no exception to catch.  It is the
+    same degradation the checkpoint above is built on: a plan that cannot
+    be read back is a plan that is resumed from scratch.
+    """
+    try:
+        path = pause_intent_path(plan_id, root=root)
+    except ValueError as exc:
+        logger.warning("pause_intent_unreadable: %s", exc)
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        logger.warning(
+            "pause_intent_unreadable: ignoring unreadable intent %s (%s: %s)",
+            path, type(exc).__name__, exc,
+        )
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not _intent_version_known(data):
+        logger.warning(
+            "pause_intent_version_mismatch: ignoring the intent %s with "
+            "version %r; the plan is treated as not paused",
+            path, data.get("version"),
+        )
+        return None
+    return _scheduler_view(data)
+
+
+def _scheduler_view(data: Dict[str, Any]) -> Dict[str, Any]:
+    """The document as **the scheduler** reads it.
+
+    The scheduler's own word lives in ``scheduler_reason`` as soon as the
+    lifecycle has written its own reason into ``reason``; an intent that
+    only the scheduler wrote carries the same word in both.  The view
+    answers with the scheduler's word under the name the scheduler reads,
+    and leaves the rest of the document exactly as it is on disk.
+    """
+    reason = data.get("scheduler_reason") or data.get("reason")
+    if reason is None or reason == data.get("reason"):
+        return data
+    view = dict(data)
+    view["reason"] = reason
+    return view
+
+
+def clear_pause(plan_id: str, *, root: Optional[PathLike] = None) -> None:
+    """Take the plan's pause intent away; do nothing loudly if it has none.
+
+    Idempotent by design — the resume path calls this unconditionally, and
+    making it conditional on an existing file would only move the
+    ``FileNotFoundError`` to the caller.
+
+    A delete that fails is logged and swallowed.  The caller has already
+    decided the plan is not paused, and failing the resume over a file it
+    can no longer remove would be a strictly worse outcome than one
+    leftover intent.
+    """
+    try:
+        path = pause_intent_path(plan_id, root=root)
+    except ValueError as exc:
+        logger.warning("pause_intent_clear_failed: %s", exc)
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning(
+            "pause_intent_clear_failed: could not remove %s (%s); a stale "
+            "intent may be honoured after a restart",
+            path, type(exc).__name__,
+        )
+
+
+# ---------------------------------------------------------------------------
+# The lifecycle's own pause intent
+# ---------------------------------------------------------------------------
+#
+# The three functions below are the lifecycle's names for the same record
+# the section above keeps: the intent is written *before* anything acts on
+# the request, because the thing that acts on it is a process that may be
+# killed right after — and a repair round that cannot find an intent on
+# disk has no evidence to give an exit code anything but "failed".
+#
+# They live on the plan's directory rather than on a plan id, because the
+# lifecycle is handed the directory and not the id, and they write the very
+# same document the section above writes — see "One file, one document"
+# there.
 
 
 def intent_path(plan_dir: PathLike) -> Path:
@@ -452,10 +875,29 @@ def write_pause_intent(plan_dir: PathLike, *, reason: str) -> Dict[str, Any]:
     the intent, it does not get to decide what a failed store means —
     that call belongs to whoever asked for the pause.
     """
+    stamp = _now_iso()
+    # The record already on disk keeps the fields this layer does not own:
+    # the scheduler writes its own reason and its own source **before** the
+    # lifecycle stops the plan, and this write must not erase them — the
+    # reason from the scheduler's closed vocabulary is the one the panel
+    # draws, and the source says who decided that the plan must wait.
+    existing = read_pause_intent(plan_dir) or {}
     intent: Dict[str, Any] = {
+        "version": _PAUSE_INTENT_VERSION,
         "schema_version": _INTENT_SCHEMA_VERSION,
+        "plan_id": existing.get("plan_id") or Path(plan_dir).name,
+        # This layer's own reason is the one that goes into ``reason``: it
+        # is the reason this call was given, and it is the one the repair
+        # round reads when it asks "was a pause asked for?".  The
+        # scheduler's word stays where it lives — ``scheduler_reason`` —
+        # so that writing this does not erase it.
         "reason": _text(reason),
-        "requested_at": _now_iso(),
+        "scheduler_reason": existing.get("scheduler_reason"),
+        "source": existing.get("source") or OPERATOR_SOURCE,
+        "fix_plan_id": existing.get("fix_plan_id"),
+        "paused_at": existing.get("paused_at") or stamp,
+        "requested_at": stamp,
+        "persisted": True,
     }
 
     path = intent_path(plan_dir)
@@ -520,7 +962,89 @@ def clear_pause_intent(plan_dir: PathLike) -> None:
             path, type(exc).__name__,
         )
 
+def scan_pauses(*, root: Optional[PathLike] = None) -> List[Dict[str, Any]]:
+    """Every pause intent under the plans root.
 
+    This is what a restart reads: the plans that must not come back as if
+    nothing had happened.  The scan is a walk over the plan directories —
+    one file read per plan — and it answers with the intents themselves,
+    so the reader sees the same words the writer wrote.
+    """
+    base = _plans_root(root)
+    found: List[Dict[str, Any]] = []
+    seen: set = set()
+    for container in (base, base / "plans"):
+        if not container.is_dir():
+            continue
+        for candidate in sorted(container.iterdir()):
+            if not candidate.is_dir() or candidate.name in seen:
+                continue
+            intent = read_pause(candidate.name, root=root)
+            if intent is None:
+                continue
+            seen.add(candidate.name)
+            found.append(intent)
+    return found
+
+
+class PauseIntentStore:
+    """The pause intents of the plans under one root.
+
+    The module-level functions above are the same thing with the
+    configured root; this class is the same thing with a root of the
+    caller's choosing.  A **new instance** of it reads exactly what the
+    old one wrote — that is what a restart is, from the point of view of
+    this layer: another reader of the same directory.
+
+    Attributes:
+        root: the plans root this store reads and writes.  The configured
+            one when it was not named.
+    """
+
+    def __init__(self, root: Optional[PathLike] = None) -> None:
+        """Bind the store to a root.
+
+        Args:
+            root: the plans root to read and write.  The configured one
+                when it is omitted.
+        """
+        self._root = Path(root) if root is not None else None
+
+    @property
+    def root(self) -> Path:
+        """The plans root this store reads and writes."""
+        return _plans_root(self._root)
+
+    def write_pause(
+        self,
+        plan_id: str,
+        reason: Optional[str] = None,
+        *,
+        source: Optional[str] = None,
+        fix_plan_id: Optional[str] = None,
+        clock: Optional[Callable[[], float]] = None,
+    ) -> Dict[str, Any]:
+        """Record why a plan is not running; answer what was recorded."""
+        return write_pause(
+            plan_id,
+            reason,
+            source=source,
+            fix_plan_id=fix_plan_id,
+            root=self._root,
+            clock=clock,
+        )
+
+    def read_pause(self, plan_id: str) -> Optional[Dict[str, Any]]:
+        """The plan's pause intent, or ``None``."""
+        return read_pause(plan_id, root=self._root)
+
+    def clear_pause(self, plan_id: str) -> None:
+        """Take the plan's pause intent away."""
+        clear_pause(plan_id, root=self._root)
+
+    def scan(self) -> List[Dict[str, Any]]:
+        """Every pause intent under this store's root."""
+        return scan_pauses(root=self._root)
 # ---------------------------------------------------------------------------
 # The task→session mapping
 # ---------------------------------------------------------------------------

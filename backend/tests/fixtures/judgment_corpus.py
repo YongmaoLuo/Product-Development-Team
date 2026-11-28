@@ -58,6 +58,7 @@
 ``loop``             轮次与截止
 ``subagent``         子代理的证据契约与超时
 ``verification_agent`` 编排层的证据核对与结果聚合
+``framework_fix``     框架缺陷判定：这次失败阻不阻塞，计划显示成什么状态
 ===================  ===============================================
 
 为什么这里不放真实数据
@@ -1569,6 +1570,358 @@ CASES: dict[str, list[dict]] = {
                 "status": "PASSED",
                 "reasons": ["", "出处齐全"],
                 "evidence": {"details": "有一条空理由"},
+            },
+        },
+    ],
+
+    # ------------------------------------------------------------------
+    # 框架缺陷判定：这次失败阻不阻塞，计划对外显示成什么状态。
+    #
+    # 这一组的 ``evidence`` 装的是**判定输入**，不是结论：命中事实、复现
+    # 结论、计划状态与注册表行。结论由金标从判定函数本身读出来——语料
+    # 不写「应该是什么」，它只固定「拿什么去判」。这正是金标的约定：
+    # 冻结行为，不断言正确性。
+    #
+    # ``hit`` 里只有两个布尔事实，因为判定函数只读这两个；其余字段对判
+    # 定没有影响，不写进语料，免得读的人以为它们也在参与判定。
+    # ------------------------------------------------------------------
+    "framework_fix": [
+        {
+            "id": "non-acceptance-critical-never-blocks",
+            "vp": {
+                "id": "VP-201",
+                "verification_method": "code_review",
+                "expected_result": "检查 backend/framework_fix/classifier.py",
+            },
+            "verdict": {
+                "status": "FAILED",
+                "reasons": ["这次失败不落在验收关键上"],
+                "evidence": {
+                    "hit": {
+                        "acceptance_critical": False,
+                        "out_of_scope_change": False,
+                    },
+                    "reproduced": None,
+                    "unclassified_rounds": 0,
+                    "plan_state": {},
+                    "registry_row": {},
+                },
+            },
+        },
+        {
+            "id": "framework-deterministic-reproduction-blocks",
+            "vp": {
+                "id": "VP-202",
+                "verification_method": "code_review",
+                "expected_result": "检查 backend/framework_fix/classifier.py",
+            },
+            "verdict": {
+                "status": "FAILED",
+                "reasons": ["复现成框架缺陷"],
+                "evidence": {
+                    "hit": {
+                        "acceptance_critical": True,
+                        "out_of_scope_change": False,
+                    },
+                    "reproduced": "framework_deterministic",
+                    "unclassified_rounds": 0,
+                    "plan_state": {},
+                    "registry_row": {},
+                },
+            },
+        },
+        {
+            "id": "framework-timeout-reproduction-blocks",
+            "vp": {
+                "id": "VP-203",
+                "verification_method": "code_review",
+                "expected_result": "检查 backend/framework_fix/classifier.py",
+            },
+            "verdict": {
+                "status": "FAILED",
+                "reasons": ["复现成框架超时"],
+                "evidence": {
+                    "hit": {
+                        "acceptance_critical": True,
+                        "out_of_scope_change": False,
+                    },
+                    "reproduced": "framework_timeout",
+                    "unclassified_rounds": 0,
+                    "plan_state": {},
+                    "registry_row": {},
+                },
+            },
+        },
+        {
+            "id": "flake-outranks-out-of-scope-change",
+            "vp": {
+                "id": "VP-204",
+                "verification_method": "code_review",
+                "expected_result": "检查 backend/framework_fix/classifier.py",
+            },
+            "verdict": {
+                "status": "FAILED",
+                "reasons": ["这次是抖动，改动也越界了"],
+                "evidence": {
+                    "hit": {
+                        "acceptance_critical": True,
+                        "out_of_scope_change": True,
+                    },
+                    "reproduced": "flake",
+                    "unclassified_rounds": 0,
+                    "plan_state": {},
+                    "registry_row": {},
+                },
+            },
+        },
+        {
+            "id": "not-reproducible-outranks-out-of-scope-change",
+            "vp": {
+                "id": "VP-205",
+                "verification_method": "code_review",
+                "expected_result": "检查 backend/framework_fix/classifier.py",
+            },
+            "verdict": {
+                "status": "FAILED",
+                "reasons": ["本地复现不出来，改动也越界了"],
+                "evidence": {
+                    "hit": {
+                        "acceptance_critical": True,
+                        "out_of_scope_change": True,
+                    },
+                    "reproduced": "not_reproducible",
+                    "unclassified_rounds": 0,
+                    "plan_state": {},
+                    "registry_row": {},
+                },
+            },
+        },
+        {
+            "id": "out-of-scope-change-blocks-without-a-reproduction",
+            "vp": {
+                "id": "VP-206",
+                "verification_method": "code_review",
+                "expected_result": "检查 backend/framework_fix/classifier.py",
+            },
+            "verdict": {
+                "status": "FAILED",
+                "reasons": ["改动越出了声明的文件集"],
+                "evidence": {
+                    "hit": {
+                        "acceptance_critical": True,
+                        "out_of_scope_change": True,
+                    },
+                    "reproduced": None,
+                    "unclassified_rounds": 0,
+                    "plan_state": {},
+                    "registry_row": {},
+                },
+            },
+        },
+        {
+            "id": "consecutive-unclassified-rounds-exhaust-the-budget",
+            "vp": {
+                "id": "VP-207",
+                "verification_method": "code_review",
+                "expected_result": "检查 backend/framework_fix/classifier.py",
+            },
+            "verdict": {
+                "status": "FAILED",
+                "reasons": ["连续几轮都归不了类"],
+                "evidence": {
+                    "hit": {
+                        "acceptance_critical": True,
+                        "out_of_scope_change": False,
+                    },
+                    "reproduced": "unclassified",
+                    "unclassified_rounds": 2,
+                    "plan_state": {},
+                    "registry_row": {},
+                },
+            },
+        },
+        {
+            "id": "unclassified-reproduction-registers-its-evidence",
+            "vp": {
+                "id": "VP-208",
+                "verification_method": "code_review",
+                "expected_result": "检查 backend/framework_fix/classifier.py",
+            },
+            "verdict": {
+                "status": "FAILED",
+                "reasons": ["跑过了，但归不了类"],
+                "evidence": {
+                    "hit": {
+                        "acceptance_critical": True,
+                        "out_of_scope_change": False,
+                    },
+                    "reproduced": "unclassified",
+                    "unclassified_rounds": 0,
+                    "plan_state": {},
+                    "registry_row": {},
+                },
+            },
+        },
+        {
+            "id": "not-reproduced-yet-needs-a-reproduction",
+            "vp": {
+                "id": "VP-209",
+                "verification_method": "code_review",
+                "expected_result": "检查 backend/framework_fix/classifier.py",
+            },
+            "verdict": {
+                "status": "FAILED",
+                "reasons": ["还没复现过，本轮判不了"],
+                "evidence": {
+                    "hit": {
+                        "acceptance_critical": True,
+                        "out_of_scope_change": False,
+                    },
+                    "reproduced": None,
+                    "unclassified_rounds": 0,
+                    "plan_state": {},
+                    "registry_row": {},
+                },
+            },
+        },
+        {
+            "id": "held-plan-shows-the-blocked-state",
+            "vp": {
+                "id": "VP-210",
+                "verification_method": "code_review",
+                "expected_result": "检查 backend/framework_fix/read_model.py",
+            },
+            "verdict": {
+                "status": "FAILED",
+                "reasons": ["计划的工作被框架缺陷挂起了"],
+                "evidence": {
+                    "hit": {
+                        "acceptance_critical": True,
+                        "out_of_scope_change": False,
+                    },
+                    "reproduced": None,
+                    "unclassified_rounds": 0,
+                    "plan_state": {"framework_fix": {"hold": True}},
+                    "registry_row": {},
+                },
+            },
+        },
+        {
+            "id": "exhausted-outranks-waiting-on-user-merge",
+            "vp": {
+                "id": "VP-211",
+                "verification_method": "code_review",
+                "expected_result": "检查 backend/framework_fix/read_model.py",
+            },
+            "verdict": {
+                "status": "FAILED",
+                "reasons": ["轮次耗尽了，修复也等着合并"],
+                "evidence": {
+                    "hit": {
+                        "acceptance_critical": True,
+                        "out_of_scope_change": False,
+                    },
+                    "reproduced": None,
+                    "unclassified_rounds": 0,
+                    "plan_state": {
+                        "framework_fix": {"status": "waiting_on_user_merge"},
+                    },
+                    "registry_row": {"status": "exhausted"},
+                },
+            },
+        },
+        {
+            "id": "deadlock-outranks-reopened",
+            "vp": {
+                "id": "VP-212",
+                "verification_method": "code_review",
+                "expected_result": "检查 backend/framework_fix/read_model.py",
+            },
+            "verdict": {
+                "status": "FAILED",
+                "reasons": ["修复计划建了却没有执行路径"],
+                "evidence": {
+                    "hit": {
+                        "acceptance_critical": True,
+                        "out_of_scope_change": False,
+                    },
+                    "reproduced": None,
+                    "unclassified_rounds": 0,
+                    "plan_state": {
+                        "framework_fix": {
+                            "status": "scheduler_deadlock_suspected",
+                        },
+                    },
+                    "registry_row": {"status": "reopened"},
+                },
+            },
+        },
+        {
+            "id": "reopened-outranks-waiting-on-user-merge",
+            "vp": {
+                "id": "VP-213",
+                "verification_method": "code_review",
+                "expected_result": "检查 backend/framework_fix/read_model.py",
+            },
+            "verdict": {
+                "status": "FAILED",
+                "reasons": ["合入后重跑又命中了"],
+                "evidence": {
+                    "hit": {
+                        "acceptance_critical": True,
+                        "out_of_scope_change": False,
+                    },
+                    "reproduced": None,
+                    "unclassified_rounds": 0,
+                    "plan_state": {
+                        "framework_fix": {"status": "waiting_on_user_merge"},
+                    },
+                    "registry_row": {"status": "reopened"},
+                },
+            },
+        },
+        {
+            "id": "a-ready-fix-shows-waiting-on-user-merge",
+            "vp": {
+                "id": "VP-214",
+                "verification_method": "code_review",
+                "expected_result": "检查 backend/framework_fix/read_model.py",
+            },
+            "verdict": {
+                "status": "FAILED",
+                "reasons": ["修复做好了，等着批准合并"],
+                "evidence": {
+                    "hit": {
+                        "acceptance_critical": True,
+                        "out_of_scope_change": False,
+                    },
+                    "reproduced": None,
+                    "unclassified_rounds": 0,
+                    "plan_state": {},
+                    "registry_row": {"status": "fixed"},
+                },
+            },
+        },
+        {
+            "id": "a-plan-without-framework-fix-state-shows-nothing",
+            "vp": {
+                "id": "VP-215",
+                "verification_method": "code_review",
+                "expected_result": "检查 backend/framework_fix/read_model.py",
+            },
+            "verdict": {
+                "status": "PASSED",
+                "reasons": ["这个计划没有框架修复的事"],
+                "evidence": {
+                    "hit": {
+                        "acceptance_critical": True,
+                        "out_of_scope_change": False,
+                    },
+                    "reproduced": None,
+                    "unclassified_rounds": 0,
+                    "plan_state": {},
+                    "registry_row": {},
+                },
             },
         },
     ],

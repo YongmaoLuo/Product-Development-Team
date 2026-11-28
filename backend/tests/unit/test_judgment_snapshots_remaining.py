@@ -116,8 +116,8 @@ def _manifest_modules() -> list[str]:
     return sorted({str(point["module"]) for point in _manifest()["points"]})
 
 
-def _group_module(group: str) -> str | None:
-    """The module a group belongs to, found by the naming rule.
+def _module_by_the_naming_rule(group: str) -> str | None:
+    """The inventory module a group is named after, if there is one.
 
     A group is named after its module: the module's own name, or that
     name without the ``verification_`` prefix.  The full name wins when
@@ -133,6 +133,30 @@ def _group_module(group: str) -> str | None:
         if group == module[:-3].removeprefix("verification_"):
             return module
     return None
+
+
+def _group_module(group: str) -> str | None:
+    """The inventory module a group belongs to.
+
+    A group **declared outside the inventory** claims no inventory
+    module at all.  The judgment-point inventory names the modules
+    that make judgments, and a golden group is named after the module
+    it freezes — so a group the inventory does not describe is a hole
+    in the inventory.  The framework-fix lane's judgments live in a
+    **package** (``backend/framework_fix/``) and the census that
+    generates the inventory surveys the flat ``backend/*.py`` modules
+    only, so the inventory names no module for them; the script writes
+    that hole down in ``GROUPS_OUTSIDE_THE_INVENTORY``, together with
+    the files that hold the judgments the group freezes.  Such a group
+    is validated by **those files**, and it must not take an inventory
+    module away from another group.
+
+    Every other group is named after its module — see
+    :func:`_module_by_the_naming_rule`.
+    """
+    if group in snapshots.GROUPS_OUTSIDE_THE_INVENTORY:
+        return None
+    return _module_by_the_naming_rule(group)
 
 
 def _surface_names(module: str) -> set[str]:
@@ -226,12 +250,34 @@ def test_every_verification_module_has_a_group() -> None:
 
     This is the "补齐" the task asks for, stated as a fact about the
     tree: the inventory names the modules that make judgments, every
-    registered group answers to exactly one of them, and none of the
-    ``verification_*`` ones is left without a golden.
+    registered group answers to exactly one of them — or is declared
+    outside the inventory, in which case it is held to the files it
+    declares — and none of the ``verification_*`` ones is left without
+    a golden.
     """
     modules = _manifest_modules()
     claimed: dict[str, str] = {}
     for name in sorted(snapshots.REGISTRY):
+        declared = snapshots.GROUPS_OUTSIDE_THE_INVENTORY.get(name)
+        if declared is not None:
+            # A group declared outside the inventory: it is a hole in
+            # the inventory that the script writes down, so it is held
+            # to the files that hold the judgments it freezes.  It
+            # claims no inventory module — and it must not quietly
+            # claim one by the naming rule either.
+            assert declared, (
+                f"组 {name!r} 登记成清单之外的组，却没有写明它钉住的文件"
+            )
+            for relative in declared:
+                path = _REPO_ROOT / relative
+                assert path.is_file(), (
+                    f"清单之外的组 {name!r} 登记的文件不在：{relative}"
+                )
+            assert _module_by_the_naming_rule(name) is None, (
+                f"组 {name!r} 既登记成清单之外的组，又按命名规则落在某个清单"
+                "模块上；两者只能取一个"
+            )
+            continue
         module = _group_module(name)
         assert module is not None, (
             f"组 {name!r} 的名字不对应任何判定模块；"

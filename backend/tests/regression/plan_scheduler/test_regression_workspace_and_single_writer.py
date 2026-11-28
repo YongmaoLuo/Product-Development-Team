@@ -152,10 +152,26 @@ from plan_lifecycle_service import PlanLifecycleService
 from plan_scheduler.capacity import CapacityLedger
 from plan_scheduler.commands import CommandExecutor
 from plan_scheduler.config import SchedulerConfigLoader
-from plan_scheduler.engine import PlanSchedulerEngine
+from plan_scheduler.engine import (
+    DEADLOCK_SUSPECTED_REASON,
+    FRAMEWORK_FIX_PRIORITY_REASON,
+    PlanSchedulerEngine,
+)
 from plan_scheduler.facts import PlanFactsReader
-from plan_scheduler.policy import REASONS
+from plan_scheduler.policy import PROTECTED_FRAMEWORK_FIX_REASON, REASONS
 from plan_scheduler.store import SqliteSchedulerStore
+
+try:
+    from framework_fix.scheduling import (
+        PREEMPTED_REASON,
+        WAITING_MERGE_SLOT_REASON,
+    )
+except ImportError:  # pragma: no cover — the package's own fallback
+    from backend.framework_fix.scheduling import (  # type: ignore
+        PREEMPTED_REASON,
+        WAITING_MERGE_SLOT_REASON,
+    )
+
 from routes import fast_lane
 from state_machine.db import connection as db_connection
 from state_machine.db.connection import open as open_db
@@ -535,15 +551,51 @@ def _executor_pids() -> List[int]:
 
 
 def _is_plan_routing_write(statement: str) -> bool:
-    """Return whether ``statement`` writes to the ``plan_routing`` table.
+    """Return whether ``statement`` writes the **phase** of ``plan_routing``.
 
     The word is matched as a whole, so ``plan_routing_v5`` — the
     migration's own table — is not a write to ``plan_routing``.
+
+    **An ``UPDATE`` that names no phase column is not a phase write.**
+    The framework-fix lane (2026-11-26) gave ``plan_routing`` a column
+    of its own — the ``framework_fix`` block — and the lane writes it
+    from its own module (``engine.py``'s ``_write_framework_fix_block``,
+    and ``plan_state.py``).  That write says nothing about the phase:
+    the phase is still the one workflow-state column, and it still has
+    one writer.  Counting the lane's block write as a phase write would
+    turn the lane's own column into a second writer of the phase — a
+    defect that is not there.
+
+    An ``INSERT`` / ``REPLACE`` / ``DELETE`` of the row is a phase write
+    whatever else it carries: those write the row itself, and the row
+    carries the phase.
     """
     text = " ".join(str(statement).split()).upper()
     if not text.startswith(("INSERT", "UPDATE", "DELETE", "REPLACE")):
         return False
-    return re.search(r"\bPLAN_ROUTING\b", text) is not None
+    if re.search(r"\bPLAN_ROUTING\b", text) is None:
+        return False
+    if not text.startswith("UPDATE"):
+        return True
+    return _sets_the_phase(text)
+
+
+#: The ``SET`` clause of an ``UPDATE`` — the columns it writes, up to
+#: the ``WHERE`` that ends them.
+_SET_CLAUSE_RE = re.compile(r"(?is)\bSET\b(.*?)(?:\bWHERE\b|\Z)")
+
+
+def _sets_the_phase(text: str) -> bool:
+    """Whether an ``UPDATE``'s SET clause names the phase column.
+
+    The clause is what the statement **writes**, so a column named in
+    the ``WHERE`` does not count: ``SET framework_fix = ? WHERE
+    current_phase = ?`` writes the lane's block and *reads* the phase.
+    """
+    match = _SET_CLAUSE_RE.search(text)
+    if match is None:
+        return False
+    return "CURRENT_PHASE" in match.group(1).upper()
 
 
 #: A statement that writes to the phase table, anywhere in a source.
@@ -558,17 +610,84 @@ _PLAN_ROUTING_WRITE_RE = re.compile(
 )
 
 
+def _opening_quote(source: str, start: int) -> str:
+    """The quote that opens the literal a statement at ``start`` sits in."""
+    index = start - 1
+    while index >= 0:
+        char = source[index]
+        if char == "\\":
+            index -= 2
+            continue
+        if char in ("'", '"'):
+            return char
+        index -= 1
+    return ""
+
+
+def _closing_quote(source: str, quote: str, start: int) -> Optional[int]:
+    """The index of the quote that closes the literal, or ``None``."""
+    index = start
+    while index < len(source):
+        char = source[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == quote:
+            return index
+        index += 1
+    return None
+
+
+def _literal_window(source: str, start: int) -> str:
+    """The text of the string literal a statement at ``start`` sits in.
+
+    A SQL statement is written inside a string, and the string may be
+    split into several implicitly concatenated pieces — so the window
+    runs to the end of the literal (or of the last piece of it), not to
+    the end of the line.  Half a statement is half a ``SET`` clause,
+    and a half-read clause cannot say whether it names the phase.
+    """
+    quote = _opening_quote(source, start)
+    if not quote:
+        return ""
+    end = start
+    while True:
+        closing = _closing_quote(source, quote, end)
+        if closing is None:
+            break
+        end = closing + 1
+        rest = source[end:]
+        stripped = rest.lstrip()
+        if not stripped.startswith(quote):
+            break
+        # The next piece of the concatenation: step over its opening
+        # quote and read on.
+        end += len(rest) - len(stripped) + 1
+    return source[start:end]
+
+
 def _plan_routing_writes(source: str) -> List[str]:
-    """Return the statements in ``source`` that write to ``plan_routing``.
+    """Return the statements in ``source`` that write the **phase**.
 
     The statement is read out of the text, so a write is found whether
     it is spelled out in one line or wrapped over several.  A ``SELECT``
     is not a write and is not returned.
+
+    A write the scanner cannot read whole — a statement that is not
+    inside a string literal — is reported as a write: a scanner that
+    cannot prove a statement is harmless has no business calling it
+    harmless.
     """
-    return [
-        " ".join(match.split())
-        for match in _PLAN_ROUTING_WRITE_RE.findall(source)
-    ]
+    writes: List[str] = []
+    for match in _PLAN_ROUTING_WRITE_RE.finditer(source):
+        statement = " ".join(_literal_window(source, match.start()).split())
+        if not statement:
+            statement = " ".join(match.group(0).split())
+            writes.append(statement)
+            continue
+        if _is_plan_routing_write(statement):
+            writes.append(statement)
+    return writes
 
 
 def _stack_frames() -> Tuple[str, ...]:
@@ -718,6 +837,36 @@ def _panel_reason_text() -> Dict[str, str]:
         r"""([A-Za-z_][A-Za-z0-9_]*)\s*:\s*"([^"]*)\"""", body
     )
     return {name: text for name, text in entries}
+
+
+#: The reasons the framework-fix lane brings of its own.
+#:
+#: The closed vocabulary in :data:`plan_scheduler.policy.REASONS` is the
+#: scheduler's **whole** vocabulary: the ordinary queue's eight words
+#: and the lane's five.  The lane's five are named here by the
+#: production constants that carry them — the engine's two, the
+#: policy's one and the lane's own two — so the split between the two
+#: vocabularies is taken from the code that produces the words and
+#: cannot drift away from it.
+LANE_REASONS = frozenset(
+    {
+        DEADLOCK_SUSPECTED_REASON,
+        FRAMEWORK_FIX_PRIORITY_REASON,
+        PREEMPTED_REASON,
+        PROTECTED_FRAMEWORK_FIX_REASON,
+        WAITING_MERGE_SLOT_REASON,
+    }
+)
+
+#: The reasons the **ordinary** queue can carry.
+#:
+#: These are the words the ordinary column is drawn with.  The lane's
+#: own words are not among them: they belong to the lane's own column
+#: — the read model's ``framework_fixes`` list, whose rows the panel
+#: draws with the lane's own badge words — and the lane's plans are
+#: filtered out of the ordinary lists on the server, so a lane word
+#: never reaches the ordinary queue.
+ORDINARY_REASONS = frozenset(REASONS) - LANE_REASONS
 
 
 # ---------------------------------------------------------------------------
@@ -968,6 +1117,7 @@ def test_regression_workspace_block_is_reported(tmp_path, monkeypatch):
         "parked",
         "waiting",
         "stopping",
+        "framework_fixes",
         "generated_at",
         "review_queue",
     }, body
@@ -982,6 +1132,11 @@ def test_regression_workspace_block_is_reported(tmp_path, monkeypatch):
     # R3 要求的「停止中」那一行）。本场景里没有在飞命令，所以它是空的 —— 但键
     # 必须在，因为面板按名字读它。
     assert body["stopping"] == [], body
+    # 2026-11-26: 读模型多了 framework_fixes 列表（框架修复通道自己的计划）。
+    # 修复计划不在任何一条普通队列里（既没排队等容量，也没跑普通流水线），
+    # 所以没有这个键读模型就根本点不出它。本场景里没有修复计划，所以它是空的
+    # —— 但键必须在，因为面板按名字读它。
+    assert body["framework_fixes"] == [], body
     # 2026-11-24: 状态端点多了 review_queue（「待你审核」聚合区，R5）。三个分组
     # 是固定的，少一个键面板就得多判一次「没有」和「空」的区别，所以按全等比较。
     assert set(body["review_queue"]) == {"pr_merge", "hitl", "approval"}, body
@@ -1004,6 +1159,11 @@ def test_regression_workspace_block_is_reported(tmp_path, monkeypatch):
     panel = _panel_reason_text()
     for row in body["queue"]:
         reason = str(row["reason"])
+        assert reason in ORDINARY_REASONS, (
+            "the ordinary queue carries {0!r}: a word of the "
+            "framework-fix lane's own vocabulary in the ordinary column "
+            "is a word the ordinary panel does not draw".format(reason)
+        )
         assert reason in panel, (
             "the panel has no text for {0!r}: the reason the API "
             "reported is a word nobody sees".format(reason)
@@ -1012,12 +1172,22 @@ def test_regression_workspace_block_is_reported(tmp_path, monkeypatch):
             "the panel draws {0!r} as an empty cell".format(reason)
         )
 
-    # And the panel's vocabulary is the server's: a reason the server
-    # can produce and the panel cannot draw is a reason that never
-    # reaches the operator.
-    assert set(REASONS) <= set(panel), (
+    # And the panel's vocabulary is the **ordinary queue's**: a reason
+    # the ordinary queue can carry and the panel cannot draw is a
+    # reason that never reaches the operator.
+    #
+    # The closed vocabulary the server publishes is the scheduler's
+    # whole vocabulary — the ordinary eight and the lane's five — and
+    # the lane's five are not the ordinary queue's.  They are the
+    # lane's own decisions, they belong to the lane's own column (the
+    # read model's ``framework_fixes`` list, whose rows the panel
+    # draws with the lane's own badge words), and the lane's plans are
+    # filtered out of the ordinary lists on the server.  So the panel
+    # has to draw the ordinary words, and only the ordinary words are
+    # its business.
+    assert set(ORDINARY_REASONS) <= set(panel), (
         "the panel cannot draw {0!r}".format(
-            sorted(set(REASONS) - set(panel))
+            sorted(set(ORDINARY_REASONS) - set(panel))
         )
     )
 
@@ -1138,6 +1308,346 @@ def test_regression_single_writer(tmp_path, monkeypatch):
     assert offenders == [], (
         "the scheduler package writes the phase table itself: {0!r}".format(
             offenders
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Defect 4 — the framework-fix lane holds no phase write of its own
+# ---------------------------------------------------------------------------
+
+#: The framework-fix lane's own package.
+FRAMEWORK_FIX_PACKAGE_DIR = BACKEND_DIR / "framework_fix"
+
+#: The single writer of the phase.
+ROUTING_REPOSITORY = (
+    BACKEND_DIR / "state_machine" / "repositories" / "routing_repository.py"
+)
+
+
+def test_framework_fix_lane_writes_no_workflow_phase():
+    """The framework-fix lane must not write the workflow phase itself.
+
+    ``plan_routing.current_phase`` is the single workflow-state column
+    and the routing repository's phase CAS is its only writer.  The
+    framework-fix lane owns a column of its own — the ``framework_fix``
+    block — and writing that block is not writing the phase: the block
+    says "this plan is waiting for a framework fix", not "this plan is
+    in this workflow phase".
+
+    Two shapes of write used to break that.  One was an
+    ``INSERT OR IGNORE`` that created the row with a made-up phase
+    (``'interview'``): a whole-row write, so it carried the phase with
+    it, and it made the lane a second phase writer next to the
+    repository's CAS.  The other was a ``DELETE`` of the row: also a
+    whole-row write, and also the lane's own.
+
+    The scanner is the one the case above uses, so the two halves of
+    this contract cannot drift apart: an ``UPDATE`` that names no phase
+    column is not a phase write, and an ``INSERT`` / ``REPLACE`` /
+    ``DELETE`` of the row is one whatever else it carries.
+    """
+    modules = sorted(FRAMEWORK_FIX_PACKAGE_DIR.glob("*.py"))
+    assert modules, (
+        "the framework-fix package was not found at {0!r} — a scan of "
+        "nothing proves nothing".format(str(FRAMEWORK_FIX_PACKAGE_DIR))
+    )
+
+    offenders = []
+    for path in modules:
+        source = path.read_text(encoding="utf-8", errors="replace")
+        for statement in _plan_routing_writes(source):
+            offenders.append(f"{path.name}: {statement}")
+    assert offenders == [], (
+        "the framework-fix lane writes the phase table itself: {0!r}".format(
+            offenders
+        )
+    )
+
+
+def test_the_phase_write_scanner_is_not_narrowed():
+    """The scanner still counts every whole-row write as a phase write.
+
+    Narrowing the scanner is the tempting way to make the case above
+    green: stop counting ``INSERT`` / ``REPLACE`` / ``DELETE``, and the
+    lane's two whole-row writes stop being phase writes.  But those
+    writes *are* phase writes — they write the row, and the row carries
+    the phase.  What the scanner may not do is decide *who* may write
+    the phase; that is the single writer's business, not the scanner's.
+
+    So the control is inside the case: the scanner is pointed at
+    statements of each shape, and it has to find every one of them.  A
+    scanner that finds nothing everywhere is indistinguishable from a
+    scanner that finds nothing at all.
+    """
+    for sample in (
+        'conn.execute("INSERT OR IGNORE INTO plan_routing (plan_id) '
+        'VALUES (?)")',
+        'conn.execute("INSERT INTO plan_routing (plan_id, current_phase) '
+        'VALUES (?, ?)")',
+        'conn.execute("REPLACE INTO plan_routing (plan_id) VALUES (?)")',
+        'conn.execute("DELETE FROM plan_routing WHERE plan_id = ?")',
+        'conn.execute("UPDATE plan_routing SET current_phase = ? '
+        'WHERE plan_id = ?")',
+    ):
+        assert _plan_routing_writes(sample), (
+            "the scanner did not find the write in {0!r}: a scan that "
+            "finds nothing proves nothing".format(sample)
+        )
+
+    # And the one shape that is NOT a phase write stays not one: the
+    # lane's own column.  Counting it would turn the lane's block
+    # write into a second writer of the phase — a defect that is not
+    # there.
+    assert not _plan_routing_writes(
+        'conn.execute("UPDATE plan_routing SET framework_fix = ?, '
+        'updated_at = ? WHERE plan_id = ?")'
+    ), "the scanner mistook the lane's own column for the phase"
+
+    # The single writer itself still holds the phase writes — the scan
+    # above is not vacuous because the repository is empty.
+    repository = ROUTING_REPOSITORY.read_text(encoding="utf-8", errors="replace")
+    assert _plan_routing_writes(repository), (
+        "the routing repository holds no phase write, so the scan above "
+        "cannot tell a lane that writes the phase from one that does not"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Defect 4 — the phase's only writer, in the WHOLE production tree
+# ---------------------------------------------------------------------------
+
+#: Directory names that hold no production code: the test trees and the
+#: vendor/cache trees.
+_PRODUCTION_EXCLUDED_DIRS: frozenset = frozenset(
+    {
+        "tests",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".git",
+        "node_modules",
+        ".pytest_cache",
+        ".mypy_cache",
+    }
+)
+
+#: The one-time, idempotent backfills the phase's single writer allows
+#: besides the repository: the legacy waiting-phase rewrite and the v5
+#: stage->phase migration.  Both are migrations that run once over the
+#: rows that already exist — not a second live writer.
+_ALLOWED_PHASE_BACKFILLS: Dict[str, "re.Pattern[str]"] = {
+    "backend/phase_migration.py": re.compile(
+        r"(?is)^UPDATE\s+PLAN_ROUTING\s+SET\s+CURRENT_PHASE\s*=\s*'QUEUED'"
+        r"\s+WHERE\s+CURRENT_PHASE\s*=\s*'READY'$"
+    ),
+    "backend/state_machine/db/schema.py": re.compile(
+        r"(?is)^UPDATE\s+PLAN_ROUTING\s+SET\s+CURRENT_PHASE\s*=\s*\?"
+        r"\s+WHERE\s+PLAN_ID\s*=\s*\?$"
+    ),
+}
+
+#: The verb that opens a statement writing the routing row.
+_PHASE_WRITE_VERB_RE = re.compile(
+    r"(?is)^\s*(?:INSERT\s+(?:OR\s+\w+\s+)?INTO"
+    r"|REPLACE\s+INTO"
+    r"|DELETE\s+FROM"
+    r"|UPDATE\s+(?:OR\s+\w+\s+)?)"
+    r"\s*PLAN_ROUTING\b"
+)
+
+#: The same, narrowed to the UPDATE branch.
+_PHASE_UPDATE_RE = re.compile(
+    r"(?is)^\s*UPDATE\s+(?:OR\s+\w+\s+)?PLAN_ROUTING\b"
+)
+
+
+def _docstring_constant_ids(tree: ast.AST) -> set:
+    """The ids of the string constants that are docstrings.
+
+    A docstring is prose: a module explaining the statement it no
+    longer runs is not running it.  The scanner reads the *literals*,
+    so a prose mention cannot be mistaken for a write.
+    """
+    ids = set()
+    owners = (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    for node in ast.walk(tree):
+        if not isinstance(node, owners):
+            continue
+        body = getattr(node, "body", [])
+        if not body:
+            continue
+        first = body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            ids.add(id(first.value))
+    return ids
+
+
+def _sql_literals(source: str) -> List[str]:
+    """Every string constant in *source* that is not a docstring.
+
+    The parser folds adjacent string literals into one constant, so a
+    statement wrapped over several source lines is read **whole** — a
+    half-read statement cannot say whether it writes the phase.
+    """
+    tree = ast.parse(source)
+    docstrings = _docstring_constant_ids(tree)
+    literals: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if id(node) not in docstrings:
+                literals.append(node.value)
+        elif isinstance(node, ast.JoinedStr):
+            parts = [
+                value.value
+                for value in node.values
+                if isinstance(value, ast.Constant)
+                and isinstance(value.value, str)
+            ]
+            if parts:
+                literals.append("".join(parts))
+    return literals
+
+
+def _is_phase_write_literal(statement: str) -> bool:
+    """Whether *statement* writes the phase of ``plan_routing``.
+
+    A whole-row write (``INSERT`` / ``REPLACE`` / ``DELETE``) writes
+    the row, and the row carries the phase — so it is a phase write
+    whatever else it carries.  An ``UPDATE`` that names no phase column
+    is not a phase write: the lane's own ``framework_fix`` block says
+    nothing about the workflow phase.
+    """
+    text = " ".join(str(statement).split()).upper()
+    if not _PHASE_WRITE_VERB_RE.match(text):
+        return False
+    if _PHASE_UPDATE_RE.match(text):
+        match = _SET_CLAUSE_RE.search(text)
+        return bool(match and "CURRENT_PHASE" in match.group(1).upper())
+    return True
+
+
+def _production_python_files() -> List[Path]:
+    """Every production ``*.py`` under ``backend/``.
+
+    The test trees and the vendor/cache trees are excluded; everything
+    else is production code, whether it lives in a package, in a route
+    module or in a script.  The exclusion looks at the path **relative
+    to ``backend/``** — a checkout that happens to live under a
+    directory called ``tests`` must not have the whole production tree
+    excluded.
+    """
+    files = []
+    for path in sorted(BACKEND_DIR.rglob("*.py")):
+        relative = path.relative_to(BACKEND_DIR).parts
+        if any(part in _PRODUCTION_EXCLUDED_DIRS for part in relative):
+            continue
+        files.append(path)
+    return files
+
+
+def test_the_workflow_phase_has_exactly_one_writer_in_the_whole_tree() -> None:
+    """No production module outside the routing repository writes the phase.
+
+    The two cases above look at one package each.  That is not enough:
+    the phase's single writer is a **tree-wide** property.  A route
+    that creates the routing row with a made-up phase is a second
+    writer just as much as a lane module is, and the route is not in
+    either package.
+
+    This case reads every production string literal under ``backend/``
+    and classifies each ``plan_routing`` statement the way the
+    single-writer contract does: a whole-row write is a phase write
+    (the row carries the phase), an ``UPDATE`` that names the phase
+    column in its ``SET`` clause is a phase write, and an ``UPDATE``
+    that names no phase column is not.
+
+    The allowed writers are the routing repository itself and the two
+    one-time backfills the contract names.  Anything else is a second
+    phase writer.
+    """
+    # The classifier is not vacuous: it has to see every shape of
+    # whole-row write, and it must not mistake a read or a non-phase
+    # UPDATE for one.
+    for sample in (
+        "INSERT OR IGNORE INTO plan_routing "
+        "(plan_id, current_phase, version, updated_at) VALUES (?, ?, 0, ?)",
+        "INSERT INTO plan_routing (plan_id, current_phase) VALUES (?, ?)",
+        "REPLACE INTO plan_routing (plan_id) VALUES (?)",
+        "DELETE FROM plan_routing WHERE plan_id = ?",
+        "UPDATE plan_routing SET current_phase = ? WHERE plan_id = ?",
+    ):
+        assert _is_phase_write_literal(sample), (
+            "the classifier missed a whole-row / phase-column write: "
+            "{0!r}".format(sample)
+        )
+    for sample in (
+        "UPDATE plan_routing SET framework_fix = ?, updated_at = ? "
+        "WHERE plan_id = ?",
+        "SELECT current_phase FROM plan_routing",
+        "CREATE TABLE IF NOT EXISTS plan_routing (plan_id TEXT)",
+    ):
+        assert not _is_phase_write_literal(sample), (
+            "the classifier mistook a non-phase statement for a phase "
+            "write: {0!r}".format(sample)
+        )
+
+    # The scan reaches the tree it claims to cover.
+    files = _production_python_files()
+    relative = {path.relative_to(BACKEND_DIR.parent).as_posix() for path in files}
+    for required in (
+        "backend/routes/plans.py",
+        "backend/framework_fix/lifecycle.py",
+        "backend/plan_scheduler/engine.py",
+        "backend/plan_state.py",
+        "backend/state_machine/repositories/routing_repository.py",
+    ):
+        assert required in relative, (
+            "the scan never reached {0!r} — it is not looking at the "
+            "production tree it claims to cover".format(required)
+        )
+
+    # And the scan is not empty: the single writer itself holds the
+    # phase writes, so a clean scan below means something.
+    repository_rel = "backend/state_machine/repositories/routing_repository.py"
+    repository_writes = [
+        statement
+        for statement in _sql_literals(
+            (BACKEND_DIR.parent / repository_rel).read_text(
+                encoding="utf-8", errors="replace"
+            )
+        )
+        if _is_phase_write_literal(statement)
+    ]
+    assert repository_writes, (
+        "the routing repository holds no phase write — a scan that finds "
+        "nothing anywhere proves nothing"
+    )
+
+    offenders = []
+    for path in files:
+        rel = path.relative_to(BACKEND_DIR.parent).as_posix()
+        if rel == repository_rel:
+            continue
+        source = path.read_text(encoding="utf-8", errors="replace")
+        for statement in _sql_literals(source):
+            if not _is_phase_write_literal(statement):
+                continue
+            normalized = " ".join(statement.split())
+            allowed = _ALLOWED_PHASE_BACKFILLS.get(rel)
+            if allowed is not None and allowed.match(normalized):
+                continue
+            offenders.append("{0}: {1}".format(rel, normalized[:160]))
+
+    assert offenders == [], (
+        "production code outside {0} writes plan_routing's phase column "
+        "or the row itself; current_phase must have exactly one writer "
+        "(the routing repository's phase CAS). Offenders:\n{1}".format(
+            repository_rel, "\n".join(sorted(offenders))
         )
     )
 

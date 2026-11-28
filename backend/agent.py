@@ -133,6 +133,17 @@ from plan_sessions import (
     save_session_id,
     stable_session_id,
 )
+# 2026-11-23 — what a plan IS.
+#
+# ``plan_state`` owns the two columns that answer "what kind of plan is
+# this" (``plan_kind``) and "what is the framework-fix lane doing to
+# it" (``framework_fix``).  The executor reads the FIRST one and asks
+# nothing else: the five-stage template's own validation belongs to the
+# spawner that writes ``tasks.json``, not here.
+#
+# ``plan_state`` does not import this module, so the import carries no
+# cycle risk.
+from plan_state import DEFAULT_PLAN_KIND, PlanState
 from hitl import service as hitl_service
 from utils.atomic_io import atomic_write_json
 from framework.task_graph import DanglingTaskDependency, find_dangling_references
@@ -2591,6 +2602,42 @@ def is_repair_task(task: object) -> bool:
         return False
 
 
+def plan_start_decision(plan: Any) -> Dict[str, Any]:
+    """The executor's ONE plan-kind judgment, as a decision.
+
+    2026-11-23 — PRD decision point 8 / architecture decision point 1.
+    The executor is allowed exactly one judgment about the framework-fix
+    lane: whether the plan it is running is a framework-fix plan.  That
+    judgment exists so a framework-fix plan can take the execution path
+    and start its current task instead of waiting for the ordinary batch
+    dispatch.  Nothing else about how a plan runs changes: there is no
+    second execution path, no new abstraction layer and no new
+    scheduling mechanism.
+
+    ``plan`` is the plan document — the mapping that carries
+    ``plan_kind``.  The answer is two facts:
+
+    * ``plan_kind`` — the plan's kind, ``'normal'`` when the plan says
+      nothing about it.  A plan written before the framework-fix lane
+      existed is an ordinary plan, and reading it as anything else would
+      invent a distinction the plan never made.
+    * ``direct_start`` — whether the plan starts its current task on its
+      own, rather than waiting for the ordinary batch dispatch.
+
+    The function is pure: the same plan always produces the same
+    decision.  It reads the kind it is given and never guesses one —
+    a plan whose kind cannot be read is an error the caller has to
+    hear about, because the ordinary path is the one that waits.
+    """
+    getter = getattr(plan, "get", None)
+    raw = getter("plan_kind", None) if callable(getter) else None
+    plan_kind = str(raw) if raw else DEFAULT_PLAN_KIND
+    return {
+        "plan_kind": plan_kind,
+        "direct_start": plan_kind == "framework_fix",
+    }
+
+
 #: Environment variable carrying the interrupted tasks' session ids when
 #: a paused execution is continued — arch decision point 4 / core
 #: contract 3. A JSON object of ``{"<task id>": "<session id>"}``, set on
@@ -4935,6 +4982,31 @@ class AutonomousAgent:
                                   data={"error": str(e)})
             raise
 
+    def _plan_start_decision(self) -> Dict[str, Any]:
+        """Read this plan's kind and answer the executor's one question.
+
+        2026-11-23 — the executor's one framework-fix seam.  The kind
+        comes from the plan's routing row: the same column every other
+        reader of a plan's kind reads (``PlanState``'s
+        ``get_plan_kind``, task 17).  The plan's directory is the one
+        the tasks file lives in, which is where the plan's id comes
+        from too.
+
+        A read that fails RAISES.  Degrading it into ``normal`` would
+        silently change what the plan does — the ordinary path is the
+        one that waits for the batch — and the plan would never learn
+        that its kind was never read.
+        """
+        tasks_file = getattr(self.task_manager, "tasks_file", None)
+        if tasks_file is None:
+            # A manager without a tasks file has no plan to be a kind
+            # of; the ordinary path is the answer.
+            return plan_start_decision({})
+        plan_dir = Path(tasks_file).parent
+        return plan_start_decision(
+            {"plan_kind": PlanState(plan_dir).get_plan_kind()}
+        )
+
     def run(self, max_tasks: Optional[int] = None, timeout: Optional[int] = None):
         """
         Execute tasks until completion or max_tasks limit.
@@ -5056,6 +5128,33 @@ class AutonomousAgent:
             self.logger.info("execution_started", "Starting task execution",
                              data={"total_tasks": total_tasks, "completed_tasks": completed_tasks,
                                    "max_tasks": max_tasks, "timeout": timeout})
+
+        # 2026-11-23 — the executor's ONE framework-fix seam.
+        #
+        # PRD decision point 8 / architecture decision point 1: the
+        # executor may hold exactly one judgment about the framework-fix
+        # lane — whether the plan it is running is a framework-fix plan.
+        # The judgment exists so a framework-fix plan can start its
+        # current task instead of waiting for the ordinary batch
+        # dispatch.  Everything else about how a plan runs is untouched:
+        # the same layers, the same provider slots, the same retries.
+        #
+        # The kind is read ONCE, here, at the entry: a plan's kind is a
+        # property of the plan, not of the moment.  A read that fails
+        # raises — the ordinary path is the one that waits, so a
+        # degraded answer would quietly change what the plan does.
+        start_decision = self._plan_start_decision()
+        direct_start = bool(start_decision.get("direct_start"))
+        if direct_start and self.logger:
+            self.logger.info(
+                "framework_fix_direct_start",
+                (
+                    "This plan is a framework-fix plan — it starts its "
+                    "current task on its own instead of waiting for the "
+                    "ordinary batch dispatch"
+                ),
+                data=dict(start_decision),
+            )
 
         controller = self._get_provider_controller()
 
@@ -5296,7 +5395,14 @@ class AutonomousAgent:
                             continue
                         schedulable.append(t)
                     if schedulable:
-                        current_micro_layer = schedulable
+                        # A framework-fix plan starts its current task on
+                        # its own — it does not wait for the ordinary
+                        # batch to be assembled and dispatched as one
+                        # unit.  Every other plan keeps dispatching the
+                        # whole micro-layer as one concurrent batch.
+                        current_micro_layer = (
+                            schedulable[:1] if direct_start else schedulable
+                        )
                         break
                 if current_micro_layer is not None:
                     break

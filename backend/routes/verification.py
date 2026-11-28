@@ -872,7 +872,21 @@ def _verification_status_from_db(plan_id: str) -> dict:
         "started_at": record.get("started_at"),
         "updated_at": _status_updated_at(plan_dir, record),
         "stop_reason": record.get("verification_stop_reason"),
+        "vp_results": _read_vp_results(plan_id),
     }
+
+
+def _read_vp_results(plan_id: str) -> List[Dict[str, Any]]:
+    """这个计划的**逐验证点**结论。
+
+    读的是追加表（``plan_verification_result``）—— 每一行绑着一棵树，所以
+    「这个验证点最近怎么样」和「这棵树过了吗」是两个问题，两个答案。
+
+    没有结论时是**空列表**，不是缺字段：没有结论本身就是一条答案。
+    """
+    from verification_persistence import read_vp_results
+
+    return read_vp_results(plan_id=plan_id, db_path=_server._state_db_path())
 
 
 def _status_updated_at(plan_dir: Path, record: dict) -> Optional[str]:
@@ -897,6 +911,86 @@ def _status_updated_at(plan_dir: Path, record: dict) -> Optional[str]:
         return _server.PlanState(plan_dir).get_state().get("last_updated")
     except Exception:  # noqa: BLE001 — a missing state must not 500 the read
         return None
+
+
+#: The error word a plan held by a framework defect is refused with.  It is
+#: the same word the repair generator uses for the same fact
+#: (``repair_generator.SKIPPED_BLOCKED_ON_FRAMEWORK_FIX``) and the same word
+#: the read model projects (``framework_fix.read_model.BLOCKED``) — one
+#: vocabulary for one fact.
+#:
+#: The words themselves live with the guard that produces them
+#: (``verification_persistence``), so the two cannot drift apart: they are
+#: **imported** from there, not written out again here.
+#:
+#: The second word is the one a guard that could **not** read the hold state
+#: answers with.  It is deliberately not :data:`BLOCKED_ON_FRAMEWORK_FIX`:
+#: the guard does not know whether the plan is held, and saying it is would
+#: be a guess dressed up as an answer.
+from verification_persistence import (  # noqa: E402 - the guard owns the words
+    BLOCKED_ON_FRAMEWORK_FIX,
+    FRAMEWORK_FIX_GUARD_UNAVAILABLE,
+)
+
+
+def _framework_fix_hold(plan_id: str) -> Optional[Dict[str, Any]]:
+    """这个计划此刻是否被框架缺陷挂起 —— 返回挂起块，没挂起返回 ``None``。
+
+    判据住在 :func:`verification_persistence.framework_fix_hold_block` ——
+    那是它唯一的调用点。第二个入口（计划书审核的 skip）走同一条路，所以两处
+    不可能各写一份判据然后漂移。
+
+    读不到时抛 :class:`RuntimeError`：**「不知道」不是「没挂起」**。守卫把
+    读失败当成放行，等于把守卫自己变成摆设 —— 一条正被挂起的计划会去跑
+    验证，跑在被框架缺陷弄坏的那份代码上。
+    """
+    from verification_persistence import framework_fix_hold_block
+
+    return framework_fix_hold_block(plan_id)
+
+
+def framework_fix_hold_refusal(plan_id: str) -> Optional[JSONResponse]:
+    """这个计划被框架缺陷挂起了吗 —— 是的话给出拒绝的答复。
+
+    读不到挂起状态时给出 500：**不放行**。一个「读不到就当没挂起」的守卫
+    等于没有守卫，而这里要挡的正是「验证跑在被弄坏的框架上」。
+
+    这是**所有**入口共用的那一个答复：起验证、重置、计划书审核里的 skip
+    都走它，所以「被挂起」在每个入口上都是同一句话。
+    """
+    try:
+        hold = _framework_fix_hold(plan_id)
+    except Exception as exc:  # noqa: BLE001 — 守卫读不到就是读不到
+        _server.logger.exception(
+            "[framework_fix_guard] the hold state of plan=%s could not be "
+            "read: %s", plan_id, exc,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": FRAMEWORK_FIX_GUARD_UNAVAILABLE,
+                "detail": (
+                    "The framework-fix hold state of this plan could not be "
+                    "read; refusing to continue rather than guessing."
+                ),
+            },
+        )
+    if hold is None:
+        return None
+    return JSONResponse(
+        status_code=409,
+        content={
+            "error": BLOCKED_ON_FRAMEWORK_FIX,
+            "fingerprint": str(hold.get("fingerprint") or ""),
+        },
+    )
+
+
+#: The private name the guard used to have, kept so that a caller written
+#: against it keeps working.  The public name is the one to use: the
+#: guard now answers for more than one entry point, and the second one
+#: lives in another module.
+_framework_fix_hold_refusal = framework_fix_hold_refusal
 
 
 def _get_verification_status(plan_id: str) -> dict:
@@ -1821,6 +1915,28 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
             },
         )
 
+    # --- The framework-fix hold gate ------------------------------------
+    # A plan whose work is held by a framework defect must not start a
+    # verification round.  The code such a round would verify is the code
+    # the framework itself broke, so the round fails for a reason that has
+    # nothing to do with the plan's own work — and it spends the plan's
+    # retry budget on it.  The hold is released when the fix is merged;
+    # until then the right answer is "wait", not "run".
+    #
+    # The gate refuses BEFORE anything is written (the branch pipeline
+    # further down materialises a worktree and rewrites ``project_dir``),
+    # and a guard that cannot read the hold state refuses with 500 rather
+    # than letting the start through.
+    #
+    # It sits next to the stopping gate and the round-lease gate: all
+    # three are refusals, and a refusal must not touch the plan's work.
+    # The hold gate comes first because it is the most specific answer
+    # about the plan ("wait for a framework fix"); the round-lease gate
+    # below answers the process-level question ("a round is running").
+    _hold_refusal = framework_fix_hold_refusal(plan_id)
+    if _hold_refusal is not None:
+        return _hold_refusal
+
     # --- The round-lease gate (2026-11-25) --------------------------------
     # A plan whose round is running cannot be started again.  The
     # in-memory guard further down can only see THIS process: after a
@@ -1855,7 +1971,9 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
     # in-memory guard further down is the authority.
     #
     # The gate sits next to the stopping gate on purpose: both are
-    # refusals, and a refusal must not touch the plan's work.
+    # refusals, and a refusal must not touch the plan's work.  The
+    # framework-fix hold gate above is a third refusal of the same kind;
+    # all of them are checked before anything is written.
     _lease = _round_lease_state(plan_dir)
     if _lease["blocking"]:
         return JSONResponse(
@@ -2860,6 +2978,15 @@ def reset_verification(
     if _archived is not None:
         return _archived
 
+    # The framework-fix hold gate — a held plan must not be reset either.
+    # A reset throws the round's state away and starts over; but this round
+    # is waiting for a framework fix, not for a reset.  The gate sits
+    # before anything is written, and a guard that cannot read the hold
+    # state refuses with 500 rather than letting the reset through.
+    _hold_refusal = framework_fix_hold_refusal(plan_id)
+    if _hold_refusal is not None:
+        return _hold_refusal
+
     req = req or _server.ResetVerificationRequest()
 
     # --- live-round guard -------------------------------------------------
@@ -3022,32 +3149,44 @@ def reset_verification(
                 "WHERE plan_id = ?",
                 (now, plan_id),
             )
-            # Direct phase write. ``verification`` is the honest
-            # "in the verification phase, nothing running" value AND one
-            # of the phases the verify ``/start`` CAS admits, so the plan
-            # is immediately restartable without another transition.
-            # Bumping ``version`` keeps the CAS readers that snapshot it
-            # consistent.
-            #
-            # 2026-09-17 (schema v5): this used to write the routING-only
-            # spelling ``verification_idle`` and leave ``current_phase``
-            # at ``verification_repairing`` — so a reset plan read as
-            # "repairing" to the API and "idle" to the scheduler. One
-            # column, one value now.
-            #
-            # 2026-11-04: this statement used to clear the
-            # ``verification`` column as well.  It must not: that column
-            # is not a state source any more (architecture decision
-            # point 3) — it holds the frozen baseline and the hash of the
-            # document it was frozen from, and a whole-column clear took
-            # the baseline with it.  The reset's verdict semantics live
-            # in the authoritative ``plan_verification`` row, which
-            # ``reset_round_counter`` above already rewrote.
-            conn.execute(
-                "UPDATE plan_routing SET current_phase = ?, substage = NULL, "
-                "version = version + 1, updated_at = ? "
-                "WHERE plan_id = ?",
-                ("verification", now, plan_id),
+        # The phase write goes through the **routing repository**.
+        # ``plan_routing.current_phase`` is the single workflow-state
+        # column and the repository is its only writer — a bare
+        # ``UPDATE plan_routing`` here was a second writer, and the
+        # repository's CAS is what keeps the phase and the phase history
+        # from drifting apart.
+        #
+        # ``verification`` is the honest "in the verification phase,
+        # nothing running" value AND one of the phases the verify
+        # ``/start`` CAS admits, so the plan is immediately restartable
+        # without another transition.  The repository bumps ``version``
+        # (so the CAS readers that snapshot it stay consistent) and
+        # leaves ``completed_phases`` alone: a reset discards the
+        # verdicts, not the record of which phases the plan has been
+        # through.
+        #
+        # 2026-09-17 (schema v5): this used to write the routING-only
+        # spelling ``verification_idle`` and leave ``current_phase``
+        # at ``verification_repairing`` — so a reset plan read as
+        # "repairing" to the API and "idle" to the scheduler. One
+        # column, one value now.
+        #
+        # 2026-11-04: the statement used to clear the ``verification``
+        # column as well.  It must not: that column is not a state
+        # source any more (architecture decision point 3) — it holds the
+        # frozen baseline and the hash of the document it was frozen
+        # from, and a whole-column clear took the baseline with it.
+        # The reset's verdict semantics live in the authoritative
+        # ``plan_verification`` row, which ``reset_round_counter`` above
+        # already rewrote.
+        from state_machine.repositories.routing_repository import ConflictError
+
+        try:
+            routing.reset_phase(plan_id, "verification")
+        except ConflictError as exc:
+            return JSONResponse(
+                status_code=409,
+                content={"error": "conflict", "reason": _conflict_reason(exc)},
             )
         summary["cleared"]["verification_row"] = True
         summary["max_rounds"] = max_rounds

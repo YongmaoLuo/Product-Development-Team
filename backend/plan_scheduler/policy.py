@@ -21,11 +21,21 @@ shared state.  The same snapshot always produces the same answer, in
 this process and in the next one.
 
 **One vocabulary for every reason.**  Whatever the decision is, the
-reason attached to it comes from :data:`REASONS`, a closed set of eight
-words.  The panel renders them, the dry run records them and the API
-publishes them; none of them composes a sentence of its own.  A reason
-outside the set is a bug in the policy, not a new situation to be
+reason attached to it comes from :data:`REASONS`, a closed set of
+thirteen words.  The panel renders them, the dry run records them and
+the API publishes them; none of them composes a sentence of its own.  A
+reason outside the set is a bug in the policy, not a new situation to be
 described in a new word.
+
+Eight of those words are the ones the vocabulary had before the
+framework-fix lane; the other five are the lane's own — a plan that
+runs first because it is a framework fix, a plan that was pushed aside
+for one, a plan that is protected from being pushed aside, a plan
+waiting for its repository's merge slot, and a plan whose wait has gone
+on long enough to look like a deadlock.  The lane **adds** words; it
+does not trade old ones away, and the ordering the lane gives its own
+plans is a separate matter from the words themselves: it lives in
+:data:`FRAMEWORK_FIX_PRIORITY`.
 
 **The eviction candidate set is shared.**  The two triggers that may
 interrupt a running plan — an operator asking for a plan to start now,
@@ -60,6 +70,14 @@ is what damps that.
 candidate set is an answer rather than an error:
 :func:`select_victim` returns ``None`` and :func:`converge` stops.
 
+**A protected plan is not a candidate either.**  A framework-fix plan
+is protected — two framework fixes interrupting each other would be a
+livelock — and so is anything the snapshot marks as protected
+(``protected: true`` / ``preemptable: false``).  The reason it carries
+is ``protected_framework_fix``, a word of the closed vocabulary in
+:data:`REASONS`.  :func:`is_protected` and :func:`protection_reason`
+answer the question; :func:`select_victim` applies it.
+
 The snapshot the functions read
 -------------------------------
 
@@ -79,11 +97,22 @@ has a default, so a caller may leave out anything it does not know::
         "running": [                    # the plans holding a slot
             {"plan_id": "r1",
              "elapsed": 600,            # seconds since the slot was taken
-             "priority": 0},            # the caller's number (optional)
+             "priority": 0,             # the caller's number (optional)
+             "plan_kind": "normal",     # "framework_fix" = protected
+             "preemptable": True},      # False = never interrupted
         ],
         "allow_evict": True,            # may a running plan be interrupted?
         "min_runtime_seconds": 600,     # M — the runtime a plan is protected for
     }
+
+**Where ``plan_kind`` and ``preemptable`` come from.**  They are the
+protection facts, and they are produced by the **capacity ledger** — by
+the candidate rows it hands over (``CapacityLedger.evictable``), which
+read the routing view the ledger keeps.  The policy does not go and
+look for them: it reads the two keys on the entry it is given, so a
+caller that builds a running set out of something else has to carry the
+two keys on it too.  An entry that carries neither cannot answer "is
+this plan protected?" — and the answer it gives is "no".
 """
 
 from __future__ import annotations
@@ -93,17 +122,29 @@ from typing import Any, Dict, List, Optional
 from .config import DEFAULT_MIN_RUNTIME_SECONDS
 
 __all__ = [
+    "COUNTED_PHASES",
+    "FRAMEWORK_FIX_KIND",
+    "FRAMEWORK_FIX_PRIORITY",
+    "ORDINARY_MIN_PRIORITY",
+    "PROTECTED_FRAMEWORK_FIX_REASON",
     "REASONS",
     "Snapshot",
     "admission_verdict",
+    "is_protected",
+    "protection_reason",
     "select_victim",
     "converge",
 ]
 
 #: The closed vocabulary of reasons.  Every decision the policy makes
 #: carries one of these words, and the panel, the dry run and the API
-#: all read the same eight.  It is a *set* on purpose: there is no
+#: all read the same thirteen.  It is a *set* on purpose: there is no
 #: order to it, because a reason is a label and not a step.
+#:
+#: The first eight words listed are the ones the vocabulary had before
+#: the framework-fix lane; the five listed after them are the lane's
+#: own.  The lane adds words to the set and takes none away, so a reader
+#: that knows the eight still recognises every one of them.
 REASONS = frozenset(
     {
         "running",
@@ -114,6 +155,76 @@ REASONS = frozenset(
         "hitl_pending",
         "paused",
         "over_capacity",
+        # 2026-11-23 (framework-fix lane): the five words the lane
+        # adds — a plan that runs first because it is a framework fix,
+        # one that was pushed aside for one, one that is protected from
+        # being pushed aside, one waiting for its repository's merge
+        # slot, and one whose wait has gone on long enough to look like
+        # a deadlock.
+        "framework_fix_priority",
+        "preempted_by_framework_fix",
+        "protected_framework_fix",
+        "waiting_merge_slot",
+        "scheduler_deadlock_suspected",
+    }
+)
+
+#: The priority the framework-fix lane puts a plan of its own kind on.
+#:
+#: Smaller runs first — the queue sorts plans by ascending priority —
+#: so the lane's own plans have to sit on a level **below** the ordinary
+#: ones to stand in front of them.  The value is the smallest there is
+#: and it is *reserved*: it is the level a framework-fix plan occupies,
+#: and :data:`ORDINARY_MIN_PRIORITY` is the level an ordinary plan
+#: occupies.  Two levels, one order — a framework-fix plan always
+#: stands ahead of an ordinary plan.
+#:
+#: This is the lane's own level, not the queue row's ``priority``
+#: column: the column keeps deciding among the plans that share a
+#: level, and the level itself is what puts the lane's plans in front.
+FRAMEWORK_FIX_PRIORITY = 0
+
+#: The priority an ordinary plan occupies in the framework-fix lane:
+#: one level behind :data:`FRAMEWORK_FIX_PRIORITY`, and therefore
+#: behind every framework-fix plan the lane puts in front of it.
+ORDINARY_MIN_PRIORITY = FRAMEWORK_FIX_PRIORITY + 1
+
+#: The word a plan's ``plan_kind`` carries when it is a repair of the
+#: framework itself.  It is the same word
+#: :data:`plan_scheduler.queue.FRAMEWORK_FIX_KIND` uses; the two packages
+#: do not import each other (``queue`` imports *this* module), so the
+#: word is repeated here — and the two MUST agree, or a framework-fix
+#: plan would be protected under one name and not the other.
+FRAMEWORK_FIX_KIND = "framework_fix"
+
+#: The reason a running plan is protected from being interrupted: it is
+#: a framework fix, and two framework fixes interrupting each other
+#: would be a livelock.  It is one of the words in :data:`REASONS`, so
+#: the panel, the dry run and the API all draw it.
+PROTECTED_FRAMEWORK_FIX_REASON = "protected_framework_fix"
+
+#: The phases in which a plan counts against the active quota.
+#:
+#: A plan counts while it **holds compute**: an execution subprocess
+#: running (``executing``), or a verification round working on it (the
+#: verification phases — ``user_stopping`` among them, because a plan
+#: that is winding down still holds its worker, and a scheduler that
+#: stopped counting it would hand its slot away too early).
+#:
+#: A plan that is *waiting* holds nothing and counts for nothing: it is
+#: queued for its turn, parked for provider quota, or waiting for a
+#: human to answer.  Neither does a plan that has finished.  The quota
+#: is a budget of workers, so a plan that is not working must not spend
+#: it.
+COUNTED_PHASES = frozenset(
+    {
+        "executing",
+        "verification_running",
+        "verify_first_pass",
+        "verify_recheck",
+        "verification_repairing",
+        "verification_rerunning",
+        "user_stopping",
     }
 )
 
@@ -164,6 +275,32 @@ def _number(value: Any, default: float) -> float:
 def _plan_id(entry: Any) -> str:
     """Return the plan id of a queued or running entry."""
     return str(_value(entry, "plan_id", ""))
+
+
+def _flag(value: Any) -> bool:
+    """Read a boolean marker by its meaning.
+
+    SQLite and JSON turn a boolean into ``0`` / ``1`` / ``"true"`` /
+    ``"false"``, and all four spellings have been seen.  ``bool()`` on
+    its own reads the string ``"false"`` as true.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() not in (
+            "",
+            "0",
+            "false",
+            "no",
+            "none",
+            "null",
+            "off",
+        )
+    return bool(value)
 
 
 def _elapsed(entry: Any) -> float:
@@ -309,6 +446,41 @@ def admission_verdict(snapshot: Snapshot) -> str:
 # ---------------------------------------------------------------------------
 
 
+def is_protected(entry: Any) -> bool:
+    """Return whether a running plan is protected from being interrupted.
+
+    A framework-fix plan is **always** protected: two framework fixes
+    interrupting each other would be a livelock, and the lane's own
+    admission rule (``preemptable`` is constantly false) says so
+    structurally rather than by good luck.
+
+    The snapshot may also say it directly — ``protected: true`` or
+    ``preemptable: false`` — which is the same fact written another
+    way; the scheduler honours either spelling.
+    """
+    kind = str(_value(entry, "plan_kind", ""))
+    if kind == FRAMEWORK_FIX_KIND:
+        return True
+    if _flag(_value(entry, "protected", False)):
+        return True
+    preemptable = _value(entry, "preemptable", None)
+    if preemptable is not None and not _flag(preemptable):
+        return True
+    return False
+
+
+def protection_reason(entry: Any) -> Optional[str]:
+    """Return why a running plan may not be interrupted, or ``None``.
+
+    The reason is one of the words in :data:`REASONS` —
+    ``protected_framework_fix`` — so the panel, the dry run and the API
+    all draw it from the same closed vocabulary.
+    """
+    if not is_protected(entry):
+        return None
+    return PROTECTED_FRAMEWORK_FIX_REASON
+
+
 def select_victim(snapshot: Snapshot, min_runtime_seconds: float) -> Optional[str]:
     """Return the plan that may be interrupted, or ``None`` if there is none.
 
@@ -316,6 +488,13 @@ def select_victim(snapshot: Snapshot, min_runtime_seconds: float) -> Optional[st
     seconds — ``elapsed >= M``, and *not* ``elapsed > M``: the
     protection window is exactly that long, and a threshold that is off
     by one either voids the protection or stalls the scheduler for good.
+
+    A plan that is **protected** is not a candidate at all, however
+    long it has been running: a framework-fix plan is protected
+    (:func:`is_protected`), because two framework fixes interrupting
+    each other would be a livelock.  The reason it carries is
+    ``protected_framework_fix`` — a word of the closed vocabulary in
+    :data:`REASONS`.
 
     Among the candidates the order is **two stages**:
 
@@ -351,7 +530,9 @@ def select_victim(snapshot: Snapshot, min_runtime_seconds: float) -> Optional[st
     """
     threshold = _number(min_runtime_seconds, DEFAULT_MIN_RUNTIME_SECONDS)
     candidates = [
-        entry for entry in _running_entries(snapshot) if _elapsed(entry) >= threshold
+        entry
+        for entry in _running_entries(snapshot)
+        if _elapsed(entry) >= threshold and not is_protected(entry)
     ]
     if not candidates:
         return None

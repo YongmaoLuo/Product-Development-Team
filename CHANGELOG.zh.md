@@ -133,6 +133,45 @@
   正是第一个丢掉的东西。这个 job 读的是 `pull_request.commits` ——
   也就是 PR 页面自己显示的数字 —— 并接入 merge gate 的 `needs`。
 
+- **失败点只在双条件下阻塞。** `backend/framework_fix/classifier.py` 里的
+  `decide()` 就是这条新规则的全部：只有「验收关键 **且**（已复现为框架缺陷
+  （`framework_deterministic`、`framework_timeout`）或改动越界）」时才算
+  `blocking`。两个合取项都要成立 —— 只成立其一，或只成立其二，都不是框架
+  缺陷。非验收关键的失败点**永不阻塞**，别的条件成立与否都不改变这一点。
+  复现结论是 `flake` 或 `not_reproducible` 的同样不阻塞，而且它**优先于**
+  「改动越界」：刚被证明是 flaky 的这一轮，不会因为改动也越了界就被按住。
+  「改动越界」这一半自己就能成立 —— 改动越出计划范围，无需先复现即可
+  `blocking`。复现过却归不了类的失败点是 `unclassified`，登记为证据；连续
+  两轮如此则是 `exhausted`，交给人看；还没复现的失败点是 `needs_repro`，
+  本轮不阻塞。产出是一个 `FailureDecision`，它的 `blocking` 标志恰在处置
+  为 `blocking` 时为真 —— 而非验收关键与 flaky 复现产出的都是
+  `not_blocking`。
+
+- **计划现在有了类型，执行器只在一处读它。** `plan_kind`
+  （`backend/plan_state.py`）说明一个计划是什么：`normal` 是普通业务计划，
+  `framework_fix` 是为了修框架本身而存在的计划。执行器
+  （`backend/agent.py`）里只有一处判断缝隙 `plan_start_decision()`：
+  `framework_fix` 计划不再等批量调度，直接开跑当前任务，因为这类计划的意义
+  就在于现在就到那个任务。执行的其它一切都没变 —— 没有第二条执行路径，
+  没有新的调度机制，没有第二处判断。没说自己是什么类型的计划按 `normal`
+  处理，行为与现状逐字未变；而类型读不出来时**抛错**，不猜：猜成 `normal`
+  会悄悄改掉这条计划正在做的事，而它自己永远不会知道。
+
+- **验证结果按树追加，状态接口现在说得出结论出自哪棵树。** 结果行只写一次，
+  永不更新：同一个验证点在另一棵树上再跑一次，就在只追加的表
+  `plan_verification_result`（`backend/state_machine/db/schema.py`）里再追加
+  一行 —— 于是「在什么代码上试过什么」被保留下来而不是被覆盖；一次失败若
+  覆盖了自己先前那一行，账就少了一行。把这些行读回来是 `read_vp_results()`
+  （`backend/verification_persistence.py`），而状态响应
+  （`backend/routes/verification.py`）现在多带一个 `vp_results`：每个验证点
+  一行，取最新那棵树上的那行，带上该验证点的 `tree_fingerprint`，以及它
+  一共留下过几行（`history_count`）。还没有结论时是空列表，而不是缺字段 ——
+  「还没有裁决」本身就是一条答案。被框架缺陷挂起的计划不许起验证、也不许
+  重置：那一轮等的是框架被修好，而不是再一次尝试；拒绝是 `409`，带上
+  `blocked_on_framework_fix` 与它被挂在哪个缺陷上。守卫读不到挂起状态时
+  拒绝（`500`），**不放行**：把「读不到」当成「没挂起」的守卫等于没有
+  守卫。
+
 - **base drift 的基线改为每个 plan 自己声明（`backend/verification_agent.py`）。**
   分支该跟谁比，是**仓库**的属性，不是部署的属性：remote 可能叫 `origin`
   也可能叫 `github`，默认分支可能叫 `main` 也可能叫 `master`。一个环境变量

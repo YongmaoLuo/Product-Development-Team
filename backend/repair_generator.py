@@ -26,6 +26,33 @@ scope of a row that declared none is derived by the shared rule
 (:func:`test_command_rules.derive_files_to_modify`) rather than by a
 second copy of the path-reading logic kept in this module.
 
+A defect the framework-fix lane already owns is not repaired here
+either: the guard asks the registry before anything is generated, and a
+failure whose fingerprint the registry knows gets no local repair task —
+one defect gets one fix, and a second fix for the same signature fights
+the first one over the same files.
+
+The guard lives in :meth:`RepairTaskGenerator.generate_repair_contents`,
+because that is where the repair path the auto-loop actually drives
+arrives: the orchestrator (:mod:`verification.orchestrator`) and the
+terminal-decision port (:mod:`hitl.terminal_decision_port`) ask for
+content directly, and neither of them goes through
+:meth:`RepairTaskGenerator.generate`. :meth:`generate` runs the same
+guard over the same failures and hands its answer down, so there is one
+judgement here rather than two that can drift apart.
+
+A hit is not merely skipped: the failure is **attached** to the fix
+plan and the plan is **held** (arch decision point 4 — the discovering
+plan stops repairing by itself and waits). Skipping alone would leave
+the defect broken with nothing waiting for it.
+
+What the guard does not do is change the callers. The orchestrator
+computes its own coverage target (``repair_candidates``) and reads an
+empty repair batch as ``no_repair_tasks`` — a verdict that would judge a
+blocked plan a failure — so the orchestrator still has to learn which
+candidates were framework-blocked. The guard records them
+(``blocked_vps``) so that learning has something to read.
+
 What does not live here, and why
 --------------------------------
 This module grew a requirement-driven chain first: understand the
@@ -72,6 +99,26 @@ from verification_persistence import VerificationPersistenceManager
 # ``verification_agent`` to avoid pulling that module (and its prompt
 # stack) into every importer of the repair generator.
 _MAX_REPAIR_PROMPT_CHARS = 8000
+
+
+#: The reason a repair batch was skipped: the plan's work is blocked on a
+#: framework fix, and the framework-fix lane owns that defect (arch decision
+#: point 4 — the discovering plan stops repairing by itself).
+#:
+#: It is the same word the display model projects
+#: (``framework_fix.read_model.BLOCKED``): this is the generating side
+#: saying out loud *why* no repair task appeared for a failure.
+SKIPPED_BLOCKED_ON_FRAMEWORK_FIX = "blocked_on_framework_fix"
+
+
+#: Where an attach written by the repair guard comes from. The registry
+#: records *who* attached a validation point, and "the repair generator
+#: found this defect is already owned" is a different source from the
+#: clean-main reproduction that usually discovers the defect in the
+#: first place. A source is not decoration: it is how somebody reading
+#: the attach rows later tells "the plan asked to be attached" from
+#: "the repair path found it was already taken".
+GUARD_ATTACH_SOURCE = "repair_guard"
 
 
 #: One resumable session per plan, shared by that plan's repair-content
@@ -758,6 +805,40 @@ class RepairTaskGenerator:
         # repair task appeared for one of the failures.
         self.filtered_vps: List[Dict[str, Any]] = []
 
+        # The failures the framework-fix guard refused to turn into repair
+        # tasks, each with the fingerprint it matched on. Rewritten on
+        # every round, exactly like ``filtered_vps`` above.
+        #
+        # It exists because ``skipped_reason`` only says *that* something
+        # was skipped, not *which*: a caller that has to attach the
+        # skipped validation points to the fix plan, or show an operator
+        # why VP-3 got no repair task, needs the individual failures and
+        # the fingerprints they matched on — the registry is keyed by
+        # fingerprint, so that is the handle both jobs use.
+        self.blocked_vps: List[Dict[str, Any]] = []
+
+        # How deep the framework-fix guard currently is. The guard is
+        # re-entrant: :meth:`generate` runs it, and the content call it
+        # makes runs it again over the survivors. Only the outermost run
+        # owns ``blocked_vps`` — an inner run that rewrote the attribute
+        # would erase the outer round's record of what it blocked.
+        self._guard_depth = 0
+
+        # The framework-fix lane's answer for each fingerprint this round,
+        # keyed by ``(round, fingerprint)``. The guard runs twice per round
+        # (once in ``generate``, once in the content call), and the decision
+        # entry point **registers** the hit it judges — asking it twice
+        # would count one round as two, and "three consecutive unclassified
+        # rounds" would come two rounds early. So the answer is asked for
+        # once per fingerprint per round and remembered.
+        self._framework_fix_answers: Dict[
+            Tuple[int, str], Optional[Dict[str, Any]]
+        ] = {}
+
+        # Which round those answers belong to. A new round starts a fresh
+        # set: last round's answer is about last round's hit.
+        self._framework_fix_round: Optional[int] = None
+
         # File paths
         self.prd_file = self.plan_dir / "prd.json"
         self.prd_md_file = self.plan_dir / "prd.md"
@@ -787,6 +868,751 @@ class RepairTaskGenerator:
     #: for **every** outstanding point in one call per round, so this is
     #: at most two extra calls per round, not per task.
     MAX_TEST_COMMAND_FILL_ATTEMPTS = 2
+
+    # ------------------------------------------------------------------
+    # The framework-fix guard (arch decision point 4)
+    # ------------------------------------------------------------------
+    #
+    # A defect the framework-fix lane owns is not repaired locally as
+    # well. The registry is the one place that says "this signature is
+    # being fixed by the framework-fix lane"; a local repair for the same
+    # signature would be a **second** fix for one defect, and the two
+    # would edit the same files and fight over them.
+    #
+    # So the guard asks the registry **before** anything is generated, and
+    # the failures it recognises never reach the model. What it decides
+    # is *whether* to repair, never *how*: the failures that survive it
+    # go down the unchanged path (the model's content, then the
+    # assembler's local fields).
+    #
+    # Two rules keep the guard from stopping more than it should:
+    #
+    # * a failure that names **its own** fingerprint is attributed to it,
+    #   so a plan held on one defect still repairs its other, unrelated
+    #   failures (PRD decision point 4 — a blocked plan's unrelated work
+    #   keeps going);
+    # * a registry that cannot be read is **not** evidence that the
+    #   defect belongs to somebody else. The guard degrades to "nothing is
+    #   blocked" and leaves a log line, because a plan that repairs what
+    #   it should not is a smaller failure than a plan that stops
+    #   repairing what it should.
+
+    def generate(
+        self,
+        plan_id: str,
+        failures: Sequence[Dict[str, Any]],
+        held_fp: Optional[str] = None,
+        round_number: int = 1,
+    ) -> Dict[str, Any]:
+        """Turn this round's failures into repair tasks — unless the
+        framework-fix lane already owns them.
+
+        Args:
+            plan_id: The plan the failures belong to. It names the plan
+                whose ``framework_fix`` block is read when ``held_fp`` is
+                not given.
+            failures: This round's failures. Each one may carry its own
+                ``fingerprint``; a failure that carries none is
+                attributed to the plan's held fingerprint.
+            held_fp: The fingerprint the plan is held on. ``None`` means
+                "read it from the plan's own ``framework_fix`` block".
+            round_number: The round the repair tasks belong to.
+
+        Returns:
+            ``{"tasks": [...], "skipped_reason": str | None}``. The
+            reason is ``blocked_on_framework_fix`` when at least one
+            failure was skipped and ``None`` when none was.
+        """
+        records = self._failure_records(failures)
+        self.blocked_vps = []
+        if not records:
+            # Nothing to repair means nothing is generated — and nothing is
+            # read either: a round with no failures has no fingerprint to
+            # look up and no reason to report.
+            return {"tasks": [], "skipped_reason": None}
+        # The fingerprint the plan is held on, resolved **once**. The
+        # content call below runs the same guard over the survivors, and
+        # it has to judge them by the same held fingerprint this pass
+        # judged them by — otherwise the two passes could disagree about
+        # the same failure.
+        held = self._held_fingerprint(plan_id, held_fp)
+        survivors = self._guard_failures(
+            plan_id, records, held, round_number,
+        )
+        skipped_reason = (
+            SKIPPED_BLOCKED_ON_FRAMEWORK_FIX if self.blocked_vps else None
+        )
+        if not survivors:
+            return {"tasks": [], "skipped_reason": skipped_reason}
+        return {
+            "tasks": self._build_tasks(survivors, round_number, held),
+            "skipped_reason": skipped_reason,
+        }
+
+    def _failure_records(
+        self, failures: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """The failures, normalised into the shape the repair path reads.
+
+        A failure names its verification point as ``id`` (the shape
+        :func:`verification.verification_report_reader.extract_failed_vps_from_report`
+        produces) or as ``vp_id``; both spellings are accepted, and every
+        other key the caller put on the record is kept.
+        """
+        records: List[Dict[str, Any]] = []
+        for failure in failures or []:
+            if not isinstance(failure, dict):
+                continue
+            record = dict(failure)
+            vp_id = str(record.get("id") or record.get("vp_id") or "").strip()
+            if vp_id:
+                record["id"] = vp_id
+            records.append(record)
+        return records
+
+    def _guard_failures(
+        self,
+        plan_id: str,
+        records: Sequence[Dict[str, Any]],
+        held: str,
+        round_number: int,
+    ) -> List[Dict[str, Any]]:
+        """Run the framework-fix guard over the failures; return the survivors.
+
+        The guard is re-entrant: :meth:`generate` runs it, and the content
+        call it makes runs it again over the survivors. The second run
+        blocks nothing — the survivors are, by construction, not owned by
+        the framework-fix lane — but it must not **rewrite** the record of
+        what the first run blocked, so ``blocked_vps`` belongs to the
+        outermost run alone.
+        """
+        outermost = self._guard_depth == 0
+        if outermost:
+            self.blocked_vps = []
+        self._guard_depth += 1
+        try:
+            blocked, survivors = self._split_blocked_failures(
+                plan_id, records, held, round_number,
+            )
+        finally:
+            self._guard_depth -= 1
+        if outermost:
+            self.blocked_vps = blocked
+        return survivors
+
+    def _split_blocked_failures(
+        self,
+        plan_id: str,
+        records: Sequence[Dict[str, Any]],
+        held: str,
+        round_number: int,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Split the failures into the ones the framework-fix lane owns and
+        the ones this plan may repair itself.
+
+        The first list holds **entries**, not the failure records: each
+        entry names the failure (``id``), the fingerprint it matched on,
+        and why it was skipped. The fingerprint is the handle the registry
+        is keyed by, so it is what the caller needs to attach the skipped
+        failure to the fix plan.
+
+        A failure the lane owns is not merely skipped — it is attached to
+        the fix plan and this plan is held (see
+        :meth:`_hold_on_framework_fix`). The failure leaves the model
+        input either way: one defect gets one fix, and a second fix for
+        the same signature fights the first one over the same files.
+
+        **谁归谁修**是判定入口（``framework_fix.spawner.dispatch_hit``）答的，
+        不是这里猜的：它按判定公式回答「这一轮该不该建框架修复计划、这次
+        失败归不归框架修复车道管」。它答「不归」（一次 flake、只在本地复现
+        的缺陷、归不了类的复现），这次失败就由本计划自己修 —— 本地继续。
+        它**答不出来**（还没复现、材料不足），守卫退回老路：注册表说谁归
+        谁修。
+        """
+        # The registry is opened once, and only when there is a fingerprint
+        # to look up: a round with nothing to check must not touch the
+        # database (nor log that it could not).
+        registry: Optional[Any] = None
+        registry_read = False
+        blocked: List[Dict[str, Any]] = []
+        survivors: List[Dict[str, Any]] = []
+        for record in records:
+            fingerprint = self._failure_fingerprint(record, held)
+            if not fingerprint:
+                # 这条失败没有指名任何已知缺陷 —— 但它可能自带材料，那就能
+                # 算出它的指纹（一次新的缺陷，交给判定入口去判它是不是框
+                # 架缺陷）。
+                fingerprint = self._fingerprint_from_record(record)
+            if not fingerprint:
+                # The failure belongs to no known defect, so nothing holds
+                # it back.
+                survivors.append(record)
+                continue
+            if not registry_read:
+                registry = self._registry(plan_id)
+                registry_read = True
+            answer = self._framework_fix_answer(
+                plan_id, record, fingerprint, registry, round_number,
+            )
+            action = str((answer or {}).get("action") or "")
+            if (
+                answer is not None
+                and action not in self._DISPATCH_NO_ANSWER
+                and not answer.get("blocking")
+            ):
+                # 判定说这不是阻塞的框架缺陷 —— 它不归框架修复车道管，
+                # 本计划自己修（本地继续）。
+                #
+                # 「本轮判不了」（还没复现）**不算**这一句：那不是「不归
+                # 框架修复车道管」，那是还没判。判不了的时候守卫退回老路
+                # —— 注册表说谁归谁修。
+                survivors.append(record)
+                continue
+            row = self._registered_row(registry, fingerprint)
+            fix_plan_id = str((answer or {}).get("fix_plan_id") or "")
+            if row is None and not fix_plan_id:
+                # 没人认领这个缺陷 —— 本地修。
+                survivors.append(record)
+                continue
+            if row is not None and self._is_the_fix_plan(plan_id, row):
+                # This plan **is** the fix plan for that defect. A fix
+                # plan does not spawn another fix plan, so the guard
+                # does not hold it — it is the one doing the fixing.
+                survivors.append(record)
+                continue
+            print(
+                f"[Repair] repair_task_skipped_blocked_on_framework_fix "
+                f"plan_id={plan_id} fingerprint={fingerprint} "
+                f"failed_vp_id={record.get('id', '')} "
+                f"reason=the framework-fix lane owns this defect — a "
+                f"local repair would be a second fix for it"
+            )
+            self._hold_on_framework_fix(
+                plan_id,
+                str(record.get("id") or ""),
+                fingerprint,
+                round_number,
+            )
+            blocked.append(
+                {
+                    "id": str(record.get("id") or ""),
+                    "fingerprint": fingerprint,
+                    "reason": SKIPPED_BLOCKED_ON_FRAMEWORK_FIX,
+                }
+            )
+        return blocked, survivors
+
+    # ------------------------------------------------------------------
+    # 判定入口（生产接线）
+    # ------------------------------------------------------------------
+    #
+    # 判定公式在 ``framework_fix.classifier`` 里，**判定入口**在
+    # ``framework_fix.spawner.dispatch_hit``：把一次失败交给它，它答一句
+    # 「这一轮该不该建框架修复计划、建了哪个、这次失败归不归它管」。
+    #
+    # 守卫在问模型之前先问它 —— 一次 flake 不该换来一个框架修复计划，
+    # 一个只在 plan 分支上复现的缺陷也不该。而它的答复是**权威的**：说
+    # 不阻塞就不阻塞（本地继续修），说阻塞就归框架修复车道管。
+    #
+    # 它**答不出来**的时候（还没复现、材料不足），答复是空的 —— 那时
+    # 守卫退回老路（注册表说谁归谁修），而不是替它猜。
+
+    #: 判定入口的答复里，「这一轮判不了」的两种。
+    #:
+    #: 这两种答复**不改**守卫的老路：「还没复现」不是「不归框架修复车道
+    #: 管」，那是还没判。判不了的时候，守卫照旧问注册表：这个缺陷归谁
+    #: 修。
+    _DISPATCH_NO_ANSWER = ("needs_repro", "skipped")
+
+    def _framework_fix_answer(
+        self,
+        plan_id: str,
+        record: Dict[str, Any],
+        fingerprint: str,
+        registry: Optional[Any],
+        round_number: int,
+    ) -> Optional[Dict[str, Any]]:
+        """判定入口对这次失败的答复 —— 答不出来就是 ``None``。
+
+        **一轮问一次。** 守卫在 ``generate`` 与 ``generate_repair_contents``
+        里各跑一遍（同一轮的两次判定），而判定入口会把它判过的那次命中
+        **登记**下来 —— 登记两次就把「连续几轮归不了类」数错了（一轮算两
+        轮），第三轮升级问人这条不变式就坏了。所以答复按（轮次，指纹）
+        缓存：同一轮里的第二次判定读的是同一份答复。
+        """
+        round_no = int(round_number or 0)
+        if self._framework_fix_round != round_no:
+            # 新的一轮 —— 上一轮的答复不作数（它判的是上一轮那次命中）。
+            self._framework_fix_answers = {}
+            self._framework_fix_round = round_no
+        key = (round_no, fingerprint)
+        if key in self._framework_fix_answers:
+            return self._framework_fix_answers[key]
+        answer = self._dispatch_framework_fix(
+            plan_id, record, fingerprint, registry, round_number,
+        )
+        self._framework_fix_answers[key] = answer
+        return answer
+
+    def _dispatch_framework_fix(
+        self,
+        plan_id: str,
+        record: Dict[str, Any],
+        fingerprint: str,
+        registry: Optional[Any],
+        round_number: int,
+    ) -> Optional[Dict[str, Any]]:
+        """把这次失败交给框架修复的判定入口。
+
+        复现结论由**复现协议**产出，判定入口去读它；还没有结论时判定入口
+        答「本轮判不了」（``needs_repro``）—— 本轮不建计划。
+
+        Returns:
+            判定入口的答复（``action`` / ``blocking`` / ``disposition`` /
+            ``fix_plan_id``）；**答不出来**就是 ``None``。
+        """
+        try:
+            from framework_fix.classifier import FailureHit
+            from framework_fix.spawner import dispatch_hit
+        except Exception as exc:  # noqa: BLE001 — 接线断了也不该掀翻这一轮
+            print(
+                f"[Repair] repair_framework_fix_unavailable plan_id={plan_id} "
+                f"error={exc!r}"
+            )
+            return None
+
+        material = self._hit_material(record, fingerprint, registry)
+        if material is None:
+            # 没有材料就算不出指纹 —— 这次失败的身份不明，判不了。
+            return None
+        computed = self._fingerprint_of(material)
+        if not computed:
+            return None
+        canonical = self._canonical_fingerprint(registry, fingerprint)
+        if fingerprint and computed not in (fingerprint, canonical):
+            # 材料与这个指纹对不上 —— 不拿别的缺陷的材料去判这次失败。
+            print(
+                f"[Repair] repair_framework_fix_material_mismatch "
+                f"plan_id={plan_id} fingerprint={fingerprint} "
+                f"computed={computed}"
+            )
+            return None
+
+        try:
+            hit = FailureHit(
+                vp_id=str(record.get("id") or ""),
+                plan_id=plan_id,
+                error_class=str(material["error_class"]),
+                first_error_line=str(material["first_error_line"]),
+                framework_files=list(material["framework_files"]),
+                acceptance_critical=self._acceptance_critical(record),
+                out_of_scope_change=self._out_of_scope_change(record),
+            )
+        except Exception as exc:  # noqa: BLE001 — 造不出命中就判不了
+            print(
+                f"[Repair] repair_framework_fix_hit_unbuildable "
+                f"plan_id={plan_id} fingerprint={fingerprint} error={exc!r}"
+            )
+            return None
+
+        try:
+            return dispatch_hit(
+                hit=hit,
+                reproduction=self._latest_reproduction(fingerprint, computed),
+                repo=str(self.project_dir),
+                registry=registry,
+            )
+        except Exception as exc:  # noqa: BLE001 — 判定失败不该掀翻这一轮
+            print(
+                f"[Repair] repair_framework_fix_dispatch_failed "
+                f"plan_id={plan_id} fingerprint={fingerprint} error={exc!r}"
+            )
+            return None
+
+    def _hit_material(
+        self,
+        record: Dict[str, Any],
+        fingerprint: str,
+        registry: Optional[Any],
+    ) -> Optional[Dict[str, Any]]:
+        """这次失败的指纹材料 —— 记录自己带的，或注册表那一行带的。
+
+        指纹的原料是三样：框架文件集、错误类别、首错行。生产里的失败记录
+        不带这三样（验证报告给的是摘要与证据路径），所以材料常常来自
+        **注册表那一行** —— 那个指纹登记过了，那一行存着当初算出它的材料。
+
+        拿不到材料就返回 ``None``：没有材料的指纹不是身份，是噪声。
+
+        记录自带的材料与手里这个指纹对不上时，**不拿它** —— 那是别的缺陷的
+        材料；那时用注册表那一行的材料（这个指纹登记时用过的）。
+        """
+        own = self._record_material(record)
+        if own is not None:
+            computed = self._fingerprint_of(own)
+            if not fingerprint or computed in (
+                fingerprint,
+                self._canonical_fingerprint(registry, fingerprint),
+            ):
+                return own
+        if not fingerprint or registry is None:
+            return None
+        row = self._registered_row(registry, fingerprint)
+        if row is None:
+            return None
+        try:
+            from framework_fix.lifecycle import hit_material_of
+        except Exception as exc:  # noqa: BLE001 — 读不到材料就是没有材料
+            print(
+                f"[Repair] repair_framework_fix_material_unreadable "
+                f"fingerprint={fingerprint} error={exc!r}"
+            )
+            return None
+        return hit_material_of(row)
+
+    @staticmethod
+    def _record_material(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """失败记录自己带的指纹材料 —— 没有就是 ``None``。"""
+        files = record.get("framework_files")
+        error_class = str(record.get("error_class") or "").strip()
+        if not isinstance(files, (list, tuple)) or not files:
+            return None
+        if not error_class:
+            return None
+        return {
+            "framework_files": [str(item) for item in files],
+            "error_class": error_class,
+            "first_error_line": str(
+                record.get("first_error_line") or ""
+            ).strip(),
+        }
+
+    def _fingerprint_from_record(self, record: Dict[str, Any]) -> str:
+        """失败记录自己带的材料算出来的指纹 —— 没有材料就是空字符串。
+
+        一条**新的**失败没有指名任何已知缺陷，但它可能自带材料 —— 那就能
+        算出它的指纹，交给判定入口去判（它是不是一个框架缺陷，要判过
+        才知道）。
+        """
+        material = self._record_material(record)
+        if material is None:
+            return ""
+        return self._fingerprint_of(material)
+
+    @staticmethod
+    def _canonical_fingerprint(
+        registry: Optional[Any], fingerprint: str,
+    ) -> str:
+        """这个指纹的规范指纹 —— 解析不出来就是它自己。"""
+        if registry is None or not fingerprint:
+            return fingerprint
+        try:
+            return str(registry.resolve_fingerprint(fingerprint) or fingerprint)
+        except Exception:  # noqa: BLE001 — 解析不出来就是它自己
+            return fingerprint
+
+    @staticmethod
+    def _fingerprint_of(material: Dict[str, Any]) -> str:
+        """这份材料算出来的指纹 —— 算不出就是空字符串。"""
+        try:
+            from framework_fix.fingerprint import compute_fingerprint
+
+            return compute_fingerprint(
+                framework_files=list(material["framework_files"]),
+                error_class=str(material["error_class"]),
+                first_error_line=str(material["first_error_line"]),
+            )
+        except Exception:  # noqa: BLE001 — 算不出就是算不出
+            return ""
+
+    def _acceptance_critical(self, record: Dict[str, Any]) -> bool:
+        """这次命中是不是验收关键的。
+
+        生产里的事实是：**能走到修复轮的失败都是交付物坏了**
+        （``deliverable_defect``）—— 那正是验收面上的失败，所以默认是
+        「验收关键」。别的类别（判据本身坏了、环境没跑成）各有各的处置，
+        不落进修复轮，也就不该被判成验收关键。
+
+        记录自己说了就算数。
+        """
+        stated = record.get("acceptance_critical")
+        if isinstance(stated, bool):
+            return stated
+        failure_class = str(record.get("failure_class") or "").strip()
+        if not failure_class:
+            # 没有分类 —— 生产口径是「交付物坏了」。
+            return True
+        try:
+            from verification.failure_triage import DELIVERABLE_DEFECT
+        except Exception:  # noqa: BLE001 — 读不到分类表就按「验收关键」
+            return True
+        return failure_class == DELIVERABLE_DEFECT
+
+    @staticmethod
+    def _out_of_scope_change(record: Dict[str, Any]) -> bool:
+        """这次修复是不是越界（改动超出计划声明的范围）。
+
+        记录自己说了就算数。默认否：修复轮拿到的失败是「产物坏了」，
+        越界是另一条路（``out_of_scope`` 类别），它不落进修复轮。
+        """
+        stated = record.get("out_of_scope_change")
+        if isinstance(stated, bool):
+            return stated
+        return False
+
+    @staticmethod
+    def _latest_reproduction(*fingerprints: str) -> Optional[Any]:
+        """这些指纹最近一次的复现结论 —— 没有就是 ``None``。
+
+        复现结论由复现协议产出。它还没产出时，判定入口读到的是「还没
+        复现」—— 本轮判不了（``needs_repro``），本轮不建计划。
+
+        传进来的指纹不止一个时按顺序找：机械指纹与规范指纹可能不是同一
+        个（语义复核把两个签名并成一个之后就是这样），而复现协议记的是
+        它自己那份机械指纹。
+        """
+        try:
+            from framework_fix.repro import latest_result
+        except Exception:  # noqa: BLE001 — 读不到就是没有结论
+            return None
+        for fingerprint in fingerprints:
+            if not fingerprint:
+                continue
+            try:
+                result = latest_result(fingerprint)
+            except Exception:  # noqa: BLE001 — 读不到就是没有结论
+                result = None
+            if result is not None:
+                return result
+        return None
+
+    def _held_fingerprint(self, plan_id: str, held_fp: Optional[str]) -> str:
+        """The fingerprint this plan is held on.
+
+        An explicit value wins — **including the empty string**, which
+        means "this plan is held on nothing". Only ``None`` falls back to
+        the plan's own ``framework_fix`` block, and the difference
+        matters: the guard writes that block when it holds a plan, so a
+        pass that resolved "no held fingerprint" and then read the block
+        back would attribute the next pass's failures to a defect this
+        pass never held the plan on. A plan that is not held has no
+        fingerprint, and a failure with no fingerprint is not blocked by
+        anything.
+        """
+        if isinstance(held_fp, str):
+            return held_fp.strip()
+        block = self._framework_fix_block(plan_id)
+        fingerprint = block.get("fingerprint")
+        if isinstance(fingerprint, str) and fingerprint.strip():
+            return fingerprint.strip()
+        return ""
+
+    def _failure_fingerprint(
+        self, record: Dict[str, Any], held: str,
+    ) -> str:
+        """The fingerprint a failure is attributed to.
+
+        A failure that names its own fingerprint is attributed to it: a
+        plan held on one defect may still have another failure that is a
+        plain local defect, and that one is repaired here. A failure that
+        names none belongs to whatever the plan is held on.
+        """
+        own = record.get("fingerprint")
+        if isinstance(own, str) and own.strip():
+            return own.strip()
+        return held
+
+    def _framework_fix_block(self, plan_id: str) -> Dict[str, Any]:
+        """The plan's ``framework_fix`` block — ``{}`` when it cannot be read.
+
+        A block that cannot be read is not a block that says "held": the
+        guard degrades to "nothing is blocked" rather than to "everything
+        is blocked".
+        """
+        try:
+            from plan_state import PlanState
+
+            block = PlanState(self.plan_dir).get_framework_fix()
+        except Exception as exc:  # noqa: BLE001 — the fallback covers this
+            print(
+                f"[Repair] repair_guard_block_unreadable plan_id={plan_id} "
+                f"error={exc!r}"
+            )
+            return {}
+        return block if isinstance(block, dict) else {}
+
+    def _registry(self, plan_id: str) -> Optional[Any]:
+        """The framework-fix registry — ``None`` when it cannot be opened.
+
+        The registry refuses to invent its own schema, so a database that
+        never ran the migration raises instead of answering. The guard
+        treats that as "the registry knows nothing" and repairs as
+        before.
+        """
+        try:
+            from framework_fix.registry import FrameworkFixRegistry
+
+            return FrameworkFixRegistry()
+        except Exception as exc:  # noqa: BLE001 — the fallback covers this
+            print(
+                f"[Repair] repair_guard_registry_unreadable plan_id={plan_id} "
+                f"error={exc!r}"
+            )
+            return None
+
+    def _is_registered(
+        self, registry: Optional[Any], fingerprint: str,
+    ) -> bool:
+        """Does the registry know this fingerprint?
+
+        A row of **any** status counts: ``open`` means somebody is fixing
+        it, ``fixed`` means the fix is in but the tree has not been
+        re-run against it yet, and ``reopened`` means it came back. All
+        three say the same thing to this plan — the framework-fix lane
+        owns that defect, so this plan does not repair it.
+        """
+        return self._registered_row(registry, fingerprint) is not None
+
+    def _registered_row(
+        self, registry: Optional[Any], fingerprint: str,
+    ) -> Optional[Dict[str, Any]]:
+        """The registry row for this fingerprint — ``None`` when there is none.
+
+        A registry that cannot be read is **not** evidence that the defect
+        belongs to somebody else: the guard degrades to "nothing is
+        blocked" and leaves a log line, because a plan that repairs what
+        it should not is a smaller failure than a plan that stops
+        repairing what it should.
+        """
+        if registry is None:
+            return None
+        try:
+            row = registry.lookup(fingerprint)
+        except Exception as exc:  # noqa: BLE001 — the fallback covers this
+            print(
+                f"[Repair] repair_guard_registry_unreadable "
+                f"fingerprint={fingerprint} error={exc!r}"
+            )
+            return None
+        return row if isinstance(row, dict) else None
+
+    def _is_the_fix_plan(
+        self, plan_id: str, row: Dict[str, Any],
+    ) -> bool:
+        """Is this plan the fix plan for that defect?
+
+        A fix plan does not spawn another fix plan: the rule that keeps
+        "one signature → one fix plan" from turning into "one signature →
+        two fix plans" must not hold the fix plan itself. Two facts have
+        to agree:
+
+        * the registry row points at this plan, and
+        * this plan really is a framework-fix plan.
+
+        The pointer alone says nothing — the registry defaults a row's
+        ``fix_plan_id`` to the plan that *discovered* the defect, so a
+        plan that found the defect points at itself without being the
+        plan that fixes it. The kind is what tells the two apart (the
+        same rule the spawner uses when it looks for an existing fix
+        plan).
+        """
+        if str(row.get("fix_plan_id") or "").strip() != plan_id:
+            return False
+        return self._plan_kind(plan_id) == "framework_fix"
+
+    def _plan_kind(self, plan_id: str) -> str:
+        """What kind of plan this is — ``normal`` or ``framework_fix``.
+
+        A kind that cannot be read is not a framework-fix kind: the guard
+        errs towards holding, because holding is the side that keeps
+        "one defect, one fix" true.
+        """
+        try:
+            from plan_state import PlanState
+
+            return str(PlanState(self.plan_dir).get_plan_kind() or "")
+        except Exception as exc:  # noqa: BLE001 — the fallback covers this
+            print(
+                f"[Repair] repair_guard_plan_kind_unreadable "
+                f"plan_id={plan_id} error={exc!r}"
+            )
+            return ""
+
+    def _hold_on_framework_fix(
+        self,
+        plan_id: str,
+        vp_id: str,
+        fingerprint: str,
+        round_number: int,
+    ) -> None:
+        """Attach the failure to the fix plan and hold this plan.
+
+        Two facts have to be written, and they live in two places:
+
+        * the **attach** (registry) says "this plan is waiting for that
+          fix". Only the registry can say it: a plan directory cannot
+          see the other plans, and one defect may hold five plans' worth
+          of validation points.
+        * the **hold** (plan state) says "this plan is stopped". Only the
+          plan's own state can say it.
+
+        A failure that is only *skipped* is waiting for nothing: the
+        round would go on, the defect would stay broken, and nothing
+        would come back for it. So the guard writes both — the hold
+        through :mod:`framework_fix.lifecycle`, which writes the attach
+        and the block as one act.
+
+        A failure here does **not** put the failure back: the registry
+        already says the framework-fix lane owns the defect, and a second
+        local fix for it is exactly what this guard exists to prevent.
+        The failure is logged instead.
+        """
+        try:
+            from framework_fix.lifecycle import FrameworkFixLifecycle
+            from plan_state import PlanState
+
+            lifecycle = FrameworkFixLifecycle(
+                plan_state=PlanState(self.plan_dir),
+            )
+            lifecycle.hold(
+                plan_id=plan_id,
+                vp_id=vp_id,
+                fingerprint=fingerprint,
+                round_no=round_number,
+                source=GUARD_ATTACH_SOURCE,
+            )
+        except Exception as exc:  # noqa: BLE001 — the fallback covers this
+            print(
+                f"[Repair] repair_guard_hold_failed plan_id={plan_id} "
+                f"failed_vp_id={vp_id} fingerprint={fingerprint} "
+                f"error={exc!r}"
+            )
+
+    def _build_tasks(
+        self,
+        failures: Sequence[Dict[str, Any]],
+        round_number: int,
+        held_fp: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """The existing repair path: the model's content, then the local
+        fields the assembler owns.
+
+        The same two steps the repair path has always taken (see
+        :meth:`generate_repair_contents` and :class:`RepairTaskAssembler`),
+        in the same order.
+
+        ``held_fp`` is the fingerprint the plan is held on, handed down so
+        that the guard inside the content call judges the survivors by the
+        same held fingerprint this pass judged them by.
+        """
+        contents = self.generate_repair_contents(
+            list(failures), round_number, held_fp=held_fp,
+        )
+        assembler = RepairTaskAssembler(
+            round_number=round_number,
+            failed_vps=list(failures),
+            plan_path=str(self.plan_dir / "verification_plan.json"),
+        )
+        return assembler.assemble(contents)
 
     def _resolve_repair_test_command(
         self,
@@ -3237,6 +4063,7 @@ class _RepairContentGeneratorMixin:
         repair_outcomes: Optional[Dict[str, Dict[str, Any]]] = None,
         plan_intent: Optional[Sequence[str]] = None,
         unclaimed_files: Optional[Sequence[str]] = None,
+        held_fp: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Single LLM call producing repair content for each failed VP.
 
@@ -3289,6 +4116,11 @@ class _RepairContentGeneratorMixin:
                 produce a repair task for each file or to fold it into
                 an existing task's ``files_to_modify``. ``None`` (the
                 default) renders no section.
+            held_fp: the fingerprint the plan is held on, when the
+                caller knows it. ``None`` means "read it from the plan's
+                own ``framework_fix`` block". It is handed down by
+                :meth:`generate` so that both passes of the guard judge
+                the same failure by the same fingerprint.
 
         Returns:
             A list of content dicts, one per failed VP, each carrying:
@@ -3315,7 +4147,8 @@ class _RepairContentGeneratorMixin:
 
             Returns an empty list only when there is genuinely nothing to
             repair: either ``failed_vps`` was empty, or every failed VP
-            it carried was refused by the failure-class filter below.
+            it carried was refused by the framework-fix guard above or by
+            the failure-class filter below.
 
             Raises:
                 RepairGenerationError: the LLM call failed, or it
@@ -3330,6 +4163,31 @@ class _RepairContentGeneratorMixin:
         """
         if not failed_vps:
             return []
+        # The framework-fix guard, before anything else. A defect the
+        # framework-fix lane owns gets no local repair task, and the
+        # failure is attached to the fix plan instead (arch decision
+        # point 4 — the discovering plan stops repairing by itself).
+        #
+        # It runs here, at the top of the content call, because this is
+        # where the production repair path arrives: the orchestrator and
+        # the terminal-decision port ask for content directly and never
+        # go through :meth:`generate`. A guard that lived only in
+        # :meth:`generate` would leave those two paths giving one defect
+        # a second, local fix — two fixes editing the same files.
+        #
+        # It runs before the class filter and before the prompt is built,
+        # so the model is never asked about a failure that will not get a
+        # task.
+        plan_id = self.plan_dir.name
+        survivors = self._guard_failures(
+            plan_id,
+            self._failure_records(failed_vps),
+            self._held_fingerprint(plan_id, held_fp),
+            round_number,
+        )
+        if not survivors:
+            return []
+        failed_vps = survivors
         # 2026-10-22 (P0-2): only a deliverable defect may become a
         # repair task. The other three classes want a different remedy
         # (see the block above :func:`select_repairable_failed_vps`),

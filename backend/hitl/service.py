@@ -215,12 +215,15 @@ __all__ = [
     "ALREADY_RUNNING",
     "DecisionRejected",
     "FAILED",
+    "MERGE_APPROVAL_OPTIONS",
     "NO_ENGINE",
     "RESUMED",
+    "SOURCE_FRAMEWORK_FIX",
     "UNKNOWN",
     "answer_decision",
     "blocked_task_ids",
     "create_decision",
+    "create_merge_decision",
     "expire_due",
     "heartbeat_decision",
     "list_decisions",
@@ -234,6 +237,16 @@ PathLike = Union[str, Path]
 #: does not know about HITL — it carries whatever event it is handed —
 #: so the name is the service's, and the payload is the service's too.
 EVENT_DECISION_CREATED = "hitl_decision_created"
+
+#: The answers a framework-fix merge approval is asked with.  ``approve``
+#: is the affirmative one; ``reject`` is the safe default — PRD decision
+#: point 7: without the user's approval the fix is not merged.
+MERGE_APPROVAL_OPTIONS = ("approve", "reject")
+
+#: The source recorded on a framework-fix merge question.  The plan panel
+#: and the notification carry the same word for the same thing, so the
+#: two cannot drift apart.
+SOURCE_FRAMEWORK_FIX = "framework_fix"
 
 #: The note recorded when the plan's outlet names nobody who can be
 #: asked: the hook list is empty, or every entry in it is one the
@@ -617,6 +630,77 @@ def _event_payload(decision: Decision) -> Dict[str, Any]:
         "default_option": decision.default_option,
         "deadline_at": decision.deadline_at,
     }
+
+
+def create_merge_decision(
+    plan_id: str,
+    pr_url: str,
+    ci_conclusion: str,
+    plan_dir: PathLike,
+    *,
+    store: Optional[HitlStore] = None,
+    now: Optional[datetime] = None,
+    task_id: Optional[str] = None,
+) -> Decision:
+    """Ask the user to approve a framework-fix merge — the urgent question.
+
+    A framework-fix PR is not merged on the system's own judgement: the
+    user approves it (PRD decision point 7 — without an explicit approval
+    the fix is not merged).  So "the CI is green" is not a message, it is
+    a **question**: the PR number, the CI conclusion and the answer to
+    give, in one decision, delivered through the outlet this service
+    already owns.
+
+    The default answer is ``reject``.  A missed deadline must not merge
+    anything — the absence of an answer is not an approval.
+
+    Parameters
+    ----------
+    plan_id:
+        The fix plan whose merge is being asked about.
+    pr_url:
+        The pull request the user is asked to approve.  It is in the
+        question, so the user can act on the message alone.
+    ci_conclusion:
+        What CI said — the other half of what the user needs in order to
+        decide without asking a second question.
+    plan_dir:
+        The plan's directory — the one that holds its
+        ``hitl_config.json`` and names the destinations to ask.
+    store:
+        The store to write through.  One is opened for the call when not
+        given.
+    now:
+        The clock reading used for the timestamps and the deadline.
+    task_id:
+        The task the question is about, when it is about one.
+
+    Returns:
+        Decision
+        The stored question — ``pending`` when somebody was asked.
+
+    Raises:
+        DecisionRejected
+            When the request cannot become a decision that works.  The
+            refusal is written to the audit mirror before the exception
+            is raised.
+    """
+    conclusion = ci_conclusion.strip() if isinstance(ci_conclusion, str) else ""
+    question = (
+        f"框架修复 PR {pr_url} 已就绪（CI: {conclusion or '未知'}）。"
+        "回复 approve 合入，回复 reject 放弃。"
+    )
+    request = DecisionRequest(
+        plan_id=plan_id,
+        source=SOURCE_FRAMEWORK_FIX,
+        task_id=task_id,
+        question=question,
+        options=list(MERGE_APPROVAL_OPTIONS),
+        default_option="reject",
+        mode=DecisionMode.STRICT.value,
+        timeout_sec=None,
+    )
+    return create_decision(request, plan_dir, store=store, now=now)
 
 
 def _dispatch_in_background(

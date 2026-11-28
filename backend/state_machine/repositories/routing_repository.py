@@ -36,6 +36,24 @@ When both hold the row is updated to ``(new_phase, substage)`` and
 untouched and :class:`ConflictError` is raised (a 409 to the API
 caller).
 
+The single writer
+-----------------
+``current_phase`` has exactly one writer, and it is this class.  Three
+of its methods touch the phase, and all three are here for that
+reason — a caller that wrote ``plan_routing`` on its own would be a
+second writer:
+
+  * :meth:`try_mark_phase` — the CAS above.
+  * :meth:`reset_phase` — the verification reset's phase write.  Same
+    CAS shape, but it leaves ``completed_phases`` alone: a reset
+    discards the verdicts, not the phase history.
+  * :meth:`delete` — the whole row goes, the phase with it.
+
+The other write methods name columns the phase does not live in
+(``verification``, ``completed_phases``, ``flags``, …).  Those are
+not phase writes, and they do not need to be: the phase is one
+column, and one column has one writer.
+
 Concurrency safety
 ------------------
 SQLite WAL is in autocommit mode (``isolation_level=None``) and we
@@ -756,12 +774,23 @@ class RoutingRepository:
             payload["baseline_doc_sha256"] = str(doc_sha256 or "")
             blob = json.dumps(payload)
             if row is None:
+                # The phase column is deliberately NOT named here.  The
+                # schema's ``current_phase TEXT NOT NULL DEFAULT
+                # 'interview'`` covers it, so the row lands on exactly
+                # the phase the old statement spelled out — but the
+                # statement itself no longer carries a phase.
+                #
+                # Why that matters: this repository is the phase's only
+                # writer.  A bootstrap write that names the phase is a
+                # write of the phase, and the fewer of those there are,
+                # the more the single-writer contract means.  A write
+                # that does not need to move the phase must not pretend
+                # it did.
                 self._conn.execute(
                     "INSERT INTO plan_routing ("
-                    " plan_id, current_phase, verification, version,"
-                    " updated_at"
-                    ") VALUES (?, ?, ?, 0, ?)",
-                    (plan_id, "interview", blob, self._now_iso()),
+                    " plan_id, verification, version, updated_at"
+                    ") VALUES (?, ?, 0, ?)",
+                    (plan_id, blob, self._now_iso()),
                 )
             else:
                 self._conn.execute(
@@ -978,3 +1007,96 @@ class RoutingRepository:
         )
 
         return True
+
+    def reset_phase(self, plan_id: str, new_phase: str) -> bool:
+        """Move the row to ``new_phase`` **without** touching the history.
+
+        This is the phase write the verification reset needs.  The plan
+        goes back to the ``verification`` phase so it is immediately
+        restartable, but the phase **history**
+        (``completed_phases``) is left exactly as it was: a reset
+        discards the verdicts, not the record of which phases the plan
+        has been through.  That is why this is a method of its own and
+        not :meth:`try_mark_phase` — the CAS maintains the history with
+        the same rules ``PlanState.transition_to`` applies, and the
+        reset must not apply them.
+
+        It is a CAS all the same.  The row is read and written inside
+        ONE ``BEGIN IMMEDIATE`` transaction, and the write is
+        predicated on the version that read observed, so a row that
+        moved underneath the write raises :class:`ConflictError` instead
+        of being overwritten.  The caller answers 409 for it.
+
+        The write is a whole-row write in the sense that matters: it
+        names ``current_phase``.  That is why it lives HERE and not in
+        the caller — the routing row's phase has exactly one writer,
+        and this repository is it.
+
+        Returns:
+            ``True`` when the row was moved; ``False`` when the plan has
+            no routing row (nothing was written — the same answer the
+            bare ``UPDATE ... WHERE plan_id = ?`` gave the caller
+            before this method existed).
+
+        Raises:
+            ConflictError: the row could not be written (the version
+                moved between the read and the write, or the database
+                was busy).
+        """
+        with self._txn() as c:
+            cur = c.execute(
+                "SELECT current_phase, version FROM plan_routing "
+                "WHERE plan_id = ?",
+                (plan_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return False
+            current_phase, current_version = row[0], int(row[1])
+            cur = c.execute(
+                "UPDATE plan_routing "
+                "SET current_phase = ?, substage = NULL, version = ?, "
+                "updated_at = ? "
+                "WHERE plan_id = ? AND version = ?",
+                (
+                    new_phase,
+                    current_version + 1,
+                    self._now_iso(),
+                    plan_id,
+                    current_version,
+                ),
+            )
+            if cur.rowcount == 0:
+                raise ConflictError(
+                    plan_id=plan_id,
+                    reason=(
+                        f"version mismatch: row was bumped between read "
+                        f"and update (expected version {current_version})"
+                    ),
+                    current_phase=current_phase,
+                    current_version=current_version,
+                )
+        return True
+
+    def delete(self, plan_id: str) -> bool:
+        """Delete the plan's routing row.
+
+        The whole row goes — the phase with it.  So this is a write of
+        the phase, and it lives here for the same reason the phase CAS
+        does: the routing row has exactly one writer, and a caller that
+        removed the row behind its back would be a second one.
+
+        Returns:
+            ``True`` when a row was deleted; ``False`` when the plan had
+            no routing row (nothing was written).
+
+        Raises:
+            ConflictError: the row could not be deleted (the database
+                was busy).
+        """
+        with self._txn():
+            cur = self._conn.execute(
+                "DELETE FROM plan_routing WHERE plan_id = ?",
+                (plan_id,),
+            )
+        return cur.rowcount > 0

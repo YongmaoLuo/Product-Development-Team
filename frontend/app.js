@@ -197,7 +197,15 @@ async function api(path, options = {}) {
         let err = await res.json().catch(() => ({ detail: res.statusText }));
         let detail = err.detail;
         if (Array.isArray(detail) && detail.length) detail = JSON.stringify(detail);
-        throw new Error(detail || `HTTP ${res.status}`);
+        const error = new Error(detail || `HTTP ${res.status}`);
+        // The status code travels with the failure: a caller that has
+        // to tell one refusal from another — a 409 from a write that
+        // may not happen yet, say — cannot do it from the message
+        // alone, because the message is the server's word for it.
+        error.status = res.status;
+        error.detail = err.detail;
+        error.error = err.error;
+        throw error;
     }
     return res.json();
 }
@@ -4026,11 +4034,18 @@ function renderSchedulerTerminalPlans(plans) {
     given: the order of the queue, the numbers of the capacity and the
     words on the reasons are all the server's. */
 function renderScheduler(snapshot) {
-    const data = snapshot && typeof snapshot === "object" ? snapshot : {};
+    // The ordinary lists are drawn without the framework-fix lane's
+    // own plans: a repair plan is in the lane's column or in the
+    // ordinary one, never in both.  The read model already partitions
+    // them — the panel does not take that on trust, because a plan
+    // drawn twice would show the operator two different things.
+    const data = withoutFrameworkFixes(snapshot);
     renderSchedulerCapacity(data);
     renderSchedulerQueue(data);
     renderSchedulerRunning(data);
     renderSchedulerWaiting(data);
+    // The lane's own column, drawn from the snapshot as it came in.
+    renderFrameworkFixes(snapshot);
     // The review queue is part of the same read model: what is waiting
     // for the operator's answer is answered by the same document that
     // answers what is running.
@@ -4039,6 +4054,336 @@ function renderScheduler(snapshot) {
     // re-opened here, so a repaint does not close them under the
     // operator's eyes.
     schedulerRestoreOpenCards();
+}
+
+// --- The framework-fix lane's own column ---
+
+/** The badge's word for each of the lane's display states.
+
+    The five states are a **closed** set — the backend's own vocabulary
+    (``framework_fix.read_model.DISPLAY_STATES``) — and this table
+    carries exactly those five words and no others.  A state nobody
+    wrote a word for would render as a raw token, and a raw token
+    tells the operator nothing; so the table and the backend's set
+    have to be the same set, and the gate that checks it says so. */
+const FRAMEWORK_FIX_BADGE_LABELS = {
+    blocked_on_framework_fix: "被框架缺陷阻塞",
+    waiting_on_user_merge: "等待合并",
+    framework_fix_exhausted: "轮次耗尽",
+    scheduler_deadlock_suspected: "疑似调度死锁",
+    reopened: "合入后重现",
+};
+
+/** The badge's word for one display state.
+
+    A state outside the closed set is drawn as the state itself: a word
+    the panel cannot name is still a word the operator can read, and
+    hiding it would hide the fact that the row is in a state nobody
+    wrote a label for. */
+function frameworkFixBadgeLabel(state) {
+    const key = String(state || "");
+    if (!key) return "未知状态";
+    return FRAMEWORK_FIX_BADGE_LABELS[key] || key;
+}
+
+/** The entries the operator has dismissed in this session.
+
+    The server records a dismissal in the plan's own block and in the
+    append-only audit chain — but the read model does not take the
+    entry out of the partition yet, so the panel's five-second poll
+    would put it straight back and the 忽略 button would undo itself,
+    once every five seconds, for as long as the operator sat there.
+
+    So the panel keeps its own answer for the session it is in: an
+    entry the operator dismissed is not drawn again.  This hides the
+    entry from the operator who dismissed it and from nobody else —
+    the server still answers for everything else, and the entry is
+    still the server's to name. */
+const dismissedFrameworkFixPlanIds = new Set();
+
+/** The lane's own plan ids — the plans that belong to its column and
+    to no other one.
+
+    The ids come out of the read model's own partition, so the panel
+    and the server agree on which plans are the lane's. */
+function frameworkFixPlanIds(snapshot) {
+    const rows = snapshot && Array.isArray(snapshot.framework_fixes)
+        ? snapshot.framework_fixes
+        : [];
+    const ids = new Set();
+    rows.forEach((row) => {
+        const planId = row && row.plan_id ? String(row.plan_id) : "";
+        if (planId) ids.add(planId);
+    });
+    return ids;
+}
+
+/** The snapshot without the lane's own plans.
+
+    The four ordinary lists are filtered here, so a plan that arrives
+    in both columns is drawn in the lane's column only.  A snapshot
+    that names no lane plans is handed back untouched. */
+function withoutFrameworkFixes(snapshot) {
+    const data = snapshot && typeof snapshot === "object" ? snapshot : {};
+    const ids = frameworkFixPlanIds(data);
+    if (!ids.size) return data;
+    const filtered = { ...data };
+    ["queue", "running", "waiting", "parked"].forEach((key) => {
+        const rows = Array.isArray(data[key]) ? data[key] : [];
+        filtered[key] = rows.filter((row) => {
+            const planId = row && row.plan_id ? String(row.plan_id) : "";
+            return !ids.has(planId);
+        });
+    });
+    return filtered;
+}
+
+/** The pull request's address, if it is one a link may point at.
+
+    The address comes from the server, and escaping it is not enough:
+    ``escapeHtml`` makes a string safe to put **in** the markup, not
+    safe to point a link **at**.  A ``javascript:`` address survives
+    escaping unchanged, so the scheme is checked here and an address
+    that is not an HTTP(S) one counts as no address at all — the entry
+    then draws no link, exactly as it does when the repair has no pull
+    request yet. */
+function frameworkFixPullRequestUrl(value) {
+    const url = value == null ? "" : String(value).trim();
+    if (!url) return "";
+    if (!/^https?:\/\//i.test(url)) return "";
+    return url;
+}
+
+/** The lane's own column, drawn from the read model's partition.
+
+    The column is **hidden while it is empty**: an empty column takes
+    no room on the panel, so a scheduler with no repair plans looks
+    exactly as it did before the lane existed.
+
+    Each entry carries the plan's own id, the badge that says which
+    state the entry is in, and the one operation the operator has on
+    it — 忽略, which asks first and writes only after the answer.
+
+    It also carries the two facts the read model already sends and
+    that the operator cannot do without: **which round** of which plan
+    failed (a plan that fails three times produces three repair plans
+    that look identical otherwise), and the **pull request** that
+    carries the fix — the fix is not on the branch the operator is
+    looking at, and the pull request's address is the only place it can
+    be read.  Both are optional: an entry that names neither draws
+    neither, and a missing field must not reach the panel as
+    ``undefined``. */
+function renderFrameworkFixes(snapshot) {
+    const panel = $("#framework-fix-panel");
+    const list = $("#framework-fix-list");
+    if (!panel || !list) return;
+
+    const rows = (snapshot && Array.isArray(snapshot.framework_fixes)
+        ? snapshot.framework_fixes
+        : []).filter((row) => {
+            // An entry the operator dismissed is not drawn again: the
+            // read model still names it, and the poll would otherwise
+            // put it straight back.
+            const planId = row && row.plan_id ? String(row.plan_id) : "";
+            return !dismissedFrameworkFixPlanIds.has(planId);
+        });
+
+    if (!rows.length) {
+        list.innerHTML = "";
+        panel.classList.add("hidden");
+        return;
+    }
+
+    panel.classList.remove("hidden");
+    list.innerHTML = rows.map((row) => {
+        const item = row || {};
+        const planId = item.plan_id ? String(item.plan_id) : "";
+        const state = item.display_state ? String(item.display_state) : "";
+        const badge = state ? escapeHtml(state) : "unknown";
+        const summary = item.signature_summary
+            ? String(item.signature_summary)
+            : "";
+        const blocked = Number(item.attach_blocked_count || 0);
+        const source = item.source && item.source.plan_id
+            ? String(item.source.plan_id)
+            : "";
+        // The round the failure came from.  It is optional: a row that
+        // names no round (or a round of zero) says only which plan
+        // failed, and never says "undefined" or "NaN".
+        const round = Number(item.source && item.source.round);
+        const roundLabel = Number.isFinite(round) && round > 0
+            ? `第 ${round} 轮`
+            : "";
+        const sourceLabel = source
+            ? `来自 ${source}${roundLabel ? ` ${roundLabel}` : ""}`
+            : roundLabel;
+        const prUrl = frameworkFixPullRequestUrl(item.pr_url);
+        return `
+            <div class="ff-entry" data-plan-id="${escapeHtml(planId)}">
+                <span class="ff-plan-id">${escapeHtml(planId)}</span>
+                <span class="ff-badge ${badge}">${escapeHtml(frameworkFixBadgeLabel(state))}</span>
+                ${summary ? `<span class="ff-summary">${escapeHtml(summary)}</span>` : ""}
+                ${sourceLabel ? `<span class="ff-source">${escapeHtml(sourceLabel)}</span>` : ""}
+                ${prUrl ? `<a class="ff-pr-link" href="${escapeHtml(prUrl)}" target="_blank" rel="noopener noreferrer">PR</a>` : ""}
+                ${blocked ? `<span class="ff-blocked">阻塞 ${escapeHtml(blocked)}</span>` : ""}
+                <button class="ff-dismiss" type="button" data-plan-id="${escapeHtml(planId)}">忽略</button>
+            </div>`;
+    }).join("");
+}
+
+/** What the panel says after a dismissal was refused.
+
+    The refusal is the backend's own answer — the repair is still
+    running, or its pull request still holds the repository's merge
+    slot — and the operator has to be able to read it. */
+function frameworkFixNotice(text, level) {
+    const notice = $("#framework-fix-notice");
+    if (!notice) return;
+    notice.textContent = String(text || "");
+    notice.classList.remove("hidden");
+    notice.classList.toggle("framework-fix-notice-error", level === "error");
+    notice.classList.toggle("framework-fix-notice-ok", level !== "error");
+}
+
+/** Take a dismissed entry off the panel.
+
+    The entry is gone because the server dismissed it, not because the
+    panel decided so: this only runs after the server has answered
+    that the dismissal was written. */
+function frameworkFixRemoveEntry(planId) {
+    const list = $("#framework-fix-list");
+    if (!list) return;
+    const id = String(planId || "");
+    list.querySelectorAll(".ff-entry").forEach((entry) => {
+        if (String(entry.dataset.planId || "") === id) {
+            entry.remove();
+        }
+    });
+    if (!list.querySelector(".ff-entry")) {
+        const panel = $("#framework-fix-panel");
+        if (panel) panel.classList.add("hidden");
+    }
+}
+
+/** Ask the operator to confirm a dismissal — and to say why.
+
+    The server refuses a dismissal nobody can explain, so the reason is
+    asked for here rather than typed into a box afterwards.  Cancelling
+    resolves ``null``, and the caller writes nothing at all: the
+    endpoint is not called.
+
+    Returns a promise of the answer — an object carrying the plan id
+    and the reason — or ``null`` when the operator cancelled. */
+function confirmFrameworkFixDismiss(planId) {
+    return new Promise((resolve) => {
+        const layer = $("#framework-fix-confirm");
+        if (!layer) {
+            resolve(null);
+            return;
+        }
+        const input = $("#framework-fix-reason");
+        const error = $("#framework-fix-confirm-error");
+        const text = $("#framework-fix-confirm-text");
+        const ok = $("#framework-fix-confirm-ok");
+        const cancel = $("#framework-fix-confirm-cancel");
+        const id = String(planId || "");
+
+        if (input) input.value = "";
+        if (error) {
+            error.textContent = "";
+            error.classList.add("hidden");
+        }
+        if (text) {
+            text.textContent = `计划 ${id} 的框架修复条目将被忽略。`;
+        }
+        layer.classList.remove("hidden");
+        if (input) input.focus();
+
+        const close = (answer) => {
+            layer.classList.add("hidden");
+            if (ok) ok.removeEventListener("click", onOk);
+            if (cancel) cancel.removeEventListener("click", onCancel);
+            document.removeEventListener("keydown", onKey);
+            resolve(answer);
+        };
+        const onOk = () => {
+            const reason = input ? String(input.value || "").trim() : "";
+            if (!reason) {
+                if (error) {
+                    error.textContent = "忽略原因必填 —— 一次没人能解释的忽略不是忽略。";
+                    error.classList.remove("hidden");
+                }
+                return;
+            }
+            close({ planId: id, reason });
+        };
+        const onCancel = () => close(null);
+        const onKey = (event) => {
+            if (event && event.key === "Escape") onCancel();
+        };
+
+        if (ok) ok.addEventListener("click", onOk);
+        if (cancel) cancel.addEventListener("click", onCancel);
+        document.addEventListener("keydown", onKey);
+    });
+}
+
+/** Write the dismissal — the only place the endpoint is called.
+
+    The 409 is the answer that matters: the defect is still being
+    repaired, or the repair's pull request still holds the
+    repository's merge slot.  Nothing was dismissed in that case, so
+    the entry stays exactly where it was and the reason is shown
+    instead. */
+async function dismissFrameworkFix(planId, reason) {
+    const id = String(planId || "");
+    try {
+        await api(`/plan/${encodeURIComponent(id)}/framework-fix/dismiss`, {
+            method: "POST",
+            body: JSON.stringify({ reason: String(reason || "") }),
+        });
+    } catch (err) {
+        const status = err && err.status ? Number(err.status) : 0;
+        if (status === 409) {
+            frameworkFixNotice(
+                "这条修复仍在进行中，或它的 PR 仍占用着合并槽 —— 现在不能忽略。",
+                "error",
+            );
+            return false;
+        }
+        const message = err && err.message ? String(err.message) : "未知错误";
+        frameworkFixNotice(`忽略失败：${message}`, "error");
+        return false;
+    }
+    dismissedFrameworkFixPlanIds.add(id);
+    frameworkFixRemoveEntry(id);
+    frameworkFixNotice(`已忽略计划 ${id} 的框架修复条目。`, "ok");
+    return true;
+}
+
+/** The 忽略 button's own path: ask, then write.
+
+    The two are two functions on purpose.  The question is asked
+    first, and an empty answer — a cancelled confirmation — writes
+    nothing: the endpoint is not called at all. */
+async function frameworkFixDismissClick(planId) {
+    const answer = await confirmFrameworkFixDismiss(planId);
+    if (!answer) return;
+    await dismissFrameworkFix(answer.planId, answer.reason);
+}
+
+/** One listener for every 忽略 button: the entries are drawn by the
+    renderer, so they are bound by delegation rather than one by one. */
+function bindFrameworkFixActions() {
+    const panel = $("#framework-fix-panel");
+    if (!panel) return;
+    panel.addEventListener("click", (event) => {
+        const target = event.target;
+        const button = target && target.closest ? target.closest(".ff-dismiss") : null;
+        if (!button) return;
+        event.preventDefault();
+        frameworkFixDismissClick(button.dataset.planId);
+    });
 }
 
 /** The failure each read last had, filed under the read that had it.
@@ -5048,6 +5393,7 @@ function init() {
     });
     bindSchedulerActions();
     bindSchedulerCards();
+    bindFrameworkFixActions();
     // The review queue: a row that names no link goes to the plan it
     // is about, through the plan list's own navigation.
     bindSchedulerReviewQueue();

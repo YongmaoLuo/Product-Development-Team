@@ -182,6 +182,76 @@ def _call_sites(source: str, name: str) -> list[tuple[int, str]]:
     return sites
 
 
+def _block_after(text: str, pattern: str) -> str:
+    """The text of the block that opens after ``pattern`` matches.
+
+    The same brace pairing ``_catch_blocks`` uses: the shapes this
+    file inspects are short and uniformly indented.  The point of the
+    helper is that a gate can name *which* block it means — "the
+    ``if (!res.ok)`` branch" — without naming a line number, and get
+    that branch's own text back.
+    """
+    match = re.search(pattern, text)
+    assert match is not None, f"block {pattern!r} not found in the source"
+    start = text.find("{", match.end())
+    assert start != -1, f"block {pattern!r} has no opening brace"
+    depth = 0
+    for index in range(start, len(text)):
+        char = text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start + 1 : index]
+    raise AssertionError(f"unbalanced braces in block {pattern!r}")
+
+
+def _strip_js_comments(text: str) -> str:
+    """``text`` with the JavaScript comments removed.
+
+    The comments are kept out of the shape checks on purpose: a comment
+    that mentions ``throw`` must not be able to satisfy the assertion
+    that the failure branch throws.  String literals — single, double
+    and template — are left alone, so a ``//`` inside one is not read
+    as the start of a comment.
+    """
+    out: list[str] = []
+    index = 0
+    length = len(text)
+    quote: str | None = None
+    while index < length:
+        char = text[index]
+        if quote is not None:
+            out.append(char)
+            if char == "\\" and index + 1 < length:
+                out.append(text[index + 1])
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in "'\"`":
+            quote = char
+            out.append(char)
+            index += 1
+            continue
+        if char == "/" and index + 1 < length:
+            following = text[index + 1]
+            if following == "/":
+                end = text.find("\n", index)
+                index = length if end == -1 else end
+                continue
+            if following == "*":
+                end = text.find("*/", index + 2)
+                index = length if end == -1 else end + 2
+                continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
 def test_api_keeps_throwing_on_a_failed_response() -> None:
     """``api()`` must not turn a failed read into an empty answer.
 
@@ -190,6 +260,14 @@ def test_api_keeps_throwing_on_a_failed_response() -> None:
     resolves to ``[]`` is indistinguishable from a backend that really
     has no plans — and the whole point of the backend's refusal is that
     the two must not look alike.
+
+    The contract is checked on the failure **branch**, not on the
+    wording of the throw.  The branch has to build an ``Error`` and
+    throw it; how it says it is free — the branch may carry the status
+    code and the server's detail on the error, because a caller that
+    has to tell one refusal from another cannot do it from the message
+    alone.  A branch that logs the failure and returns an empty list
+    fails here exactly as it fails in the browser.
     """
     body = _function_body(_source(_APP_JS), "api")
 
@@ -197,10 +275,17 @@ def test_api_keeps_throwing_on_a_failed_response() -> None:
         "api() no longer branches on a failed response — a non-ok "
         "answer would be parsed as data."
     )
-    assert "throw new Error" in body, (
-        "api() no longer throws on a failed response: the refusal would "
-        "be swallowed, and an empty plans list would look like a normal "
-        "answer."
+
+    failure = _strip_js_comments(_block_after(body, r"if\s*\(!res\.ok\)"))
+    assert re.search(r"\bnew\s+Error\s*\(", failure), (
+        "api()'s failure branch no longer builds an Error: the refusal "
+        "would be swallowed, and an empty plans list would look like a "
+        "normal answer."
+    )
+    assert re.search(r"\bthrow\b", failure), (
+        "api()'s failure branch builds an Error but never throws it: the "
+        "refusal would be swallowed, and an empty plans list would look "
+        "like a normal answer."
     )
 
 

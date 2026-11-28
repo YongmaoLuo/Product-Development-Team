@@ -26,7 +26,12 @@ contract) is inserted **between** two pre-existing phases, so "the old
 vocabulary sits at the head of the live one" stopped being true.  What
 is true — and what this file now pins — is that the old vocabulary is an
 **ordered subsequence** of the live one, and that the live vocabulary is
-the old one plus exactly the three names in :data:`PHASES_AFTER`.
+the old one plus exactly the four names in :data:`PHASES_AFTER`.
+
+The framework-fix lane's own phase (``blocked_on_framework_fix``,
+2026-11-25) is the fourth one: a plan whose work is all blocked by a
+framework defect stops and waits for the repair to land, and that wait
+is a phase like any other — not a terminal one, and not a failure.
 
 The transition case pins the **entry** into the new phase.  The approved
 architecture extends the phase model with::
@@ -112,11 +117,27 @@ def test_phase_constants_exist():
 #: plan-level stopping phase the stop contract introduced: a stop is a
 #: process with an order, and the phase that says "a stop is in progress"
 #: is part of the vocabulary like any other.
-PHASES_AFTER = ("post_processing", "postprocess_failed", "user_stopping")
+#:
+#: ``blocked_on_framework_fix`` is the framework-fix lane's own phase
+#: (2026-11-25): a plan whose every remaining item is blocked by a
+#: framework defect gives up its execution / verification slot and waits
+#: for the repair to land.  It is a phase and not a failure — being
+#: blocked is not having done the work badly — so it neither writes a
+#: failure verdict nor spends a retry, and it is not terminal: the plan
+#: goes back to ``queued`` once the repair is released.
+#:
+#: The four names are listed in the order the live vocabulary carries
+#: them, so a reader can line the list up against ``VALID_PHASES``.
+PHASES_AFTER = (
+    "post_processing",
+    "postprocess_failed",
+    "blocked_on_framework_fix",
+    "user_stopping",
+)
 
 
 def test_new_phases_are_additive():
-    """The vocabulary grew by exactly three names and kept the old order.
+    """The vocabulary grew by exactly four names and kept the old order.
 
     The old invariant — "the pre-existing phases sit at the head of the
     vocabulary, in order" — died with the plan-level stopping phase:

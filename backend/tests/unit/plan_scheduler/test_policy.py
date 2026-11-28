@@ -30,9 +30,11 @@ The contracts this file pins:
 4. **Convergence is bounded.**  The scheduler stops as soon as it fits
    inside the capacity, and it stops when there is nobody left to
    evict — it never spins.
-5. **Every reason is one of the eight.**  The vocabulary is closed: the
-   panel renders it, the dry run records it, the API publishes it, and
-   none of them composes a sentence of its own.
+5. **Every reason is one of the thirteen.**  The vocabulary is closed:
+   the panel renders it, the dry run records it, the API publishes it,
+   and none of them composes a sentence of its own.  The first eight
+   words are the ones the vocabulary had before the framework-fix lane;
+   the lane adds five of its own and takes none away.
 
 The tests assert **the decision the operator sees** — the reason, the
 plan id, the order of the victims — and not the shape of the snapshot
@@ -365,7 +367,7 @@ def test_converge_with_a_capacity_of_zero_empties_the_running_set() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 5. Every reason is one of the eight
+# 5. Every reason is one of the thirteen
 # ---------------------------------------------------------------------------
 
 
@@ -375,15 +377,23 @@ def test_converge_with_a_capacity_of_zero_empties_the_running_set() -> None:
     ids=[case[0] for case in _ADMISSION_CASES],
 )
 def test_reason_in_closed_enum(label: str, snapshot: dict, expected: str) -> None:
-    """Every branch answers with one of the eight reasons — and with the right one."""
+    """Every branch answers with one of the thirteen reasons — and with the right one."""
     verdict = admission_verdict(snapshot)
 
     assert verdict in REASONS
     assert verdict == expected
 
 
-def test_reasons_are_the_documented_eight() -> None:
-    """The vocabulary is exactly the eight words the panel and the API share."""
+def test_reasons_are_the_documented_thirteen() -> None:
+    """The vocabulary is exactly the thirteen words the panel and the API share.
+
+    The first eight are the words the vocabulary had before the
+    framework-fix lane; the lane adds five of its own and takes none
+    away, so a reader that knows the eight still recognises every one
+    of them.  The set is closed — a word outside it is a word the panel
+    cannot draw — and it is compared exactly, so a word that goes
+    missing is as much a break as one that turns up.
+    """
     assert REASONS == {
         "running",
         "waiting_for_slot",
@@ -393,6 +403,11 @@ def test_reasons_are_the_documented_eight() -> None:
         "hitl_pending",
         "paused",
         "over_capacity",
+        "framework_fix_priority",
+        "preempted_by_framework_fix",
+        "protected_framework_fix",
+        "waiting_merge_slot",
+        "scheduler_deadlock_suspected",
     }
 
 
