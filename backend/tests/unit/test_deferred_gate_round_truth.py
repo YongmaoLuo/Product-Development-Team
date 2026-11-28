@@ -48,6 +48,18 @@
    派发；
 6. ``test_the_gate_layer_stays_deferred_when_the_round_ledger_agrees``
    —— 负控：本轮账本也是 BLOCKED → 不派发、DEFERRED 保留。
+
+另加两条**顺序**的用例（生产入口 ``run_full_verification`` 走一遍）：
+收口重算原本跑在「环境受阻重跑」**之前**，而环境受阻重跑会把被环境
+BLOCKED 的 Phase 1 验证点翻成 PASSED —— 重算看到的是旧的 BLOCKED，
+被延后的全量关卡层仍然一次都没被派发（2026-11-28 生产实测：VP-017 /
+VP-018 从未被跑，整轮 SKIPPED，DEFERRED 还带着过期的理由）。
+
+7. ``test_the_late_close_dispatches_the_gate_layer_after_the_env_rerun``
+   —— 回归用例（修前必红）：环境受阻重跑把阻塞者翻绿 → **晚收口**必须
+   真正派发那条关卡层，且它不再带着旧 BLOCKED 理由留在最终字典里；
+8. ``test_the_late_close_does_not_dispatch_when_the_blocker_is_still_red``
+   —— 负控：阻塞者仍被挡着 → 晚收口不得派发，DEFERRED 保留。
 """
 
 from __future__ import annotations
@@ -336,3 +348,205 @@ def test_the_gate_layer_stays_deferred_when_the_round_ledger_agrees(
     assert "VP-017" not in calls, "阻塞者仍挡着时关卡不得执行"
     assert executor._verdicts["VP-017"]["status"] == "DEFERRED"
     assert executor._verdicts["VP-018"]["status"] == "DEFERRED"
+
+
+# ---------------------------------------------------------------------------
+# 晚收口：环境受阻重跑之后，门禁必须按**最终**结论再判一次
+# ---------------------------------------------------------------------------
+#
+# 事故（2026-11-28 K-Magic 实测）
+# ------------------------------
+# 收口重算跑在 ``_rerun_environment_blocked_vps`` **之前**：环境受阻重跑
+# 把一个被环境 BLOCKED 的 Phase 1 验证点翻成 PASSED，而重算看到的是旧的
+# BLOCKED —— 于是被延后的全量门禁层（VP-017 / VP-018）一次都没被派发，
+# 报告里那条 DEFERRED 还带着过期理由，整轮 SKIPPED。
+#
+# 契约
+# ----
+# 1. 环境受阻重跑**之后**、生成报告**之前**要再收口一次：按本轮**最终**
+#    结论重判门禁，被延后的层**必须真的被派发**；
+# 2. 派发层的条目回到最终字典里，且**不再**是「带旧 BLOCKED 理由的
+#    DEFERRED」；
+# 3. 环境受阻重跑刚翻绿的那些验证点**不许**被合并覆盖。
+
+
+class _Stub:
+    """只为了 ``_freshness_cache`` / ``_rebuild_coordinator``。"""
+
+    def clear(self) -> None:
+        pass
+
+
+def _late_close_plan() -> Dict[str, Any]:
+    """LLM schema 的计划（``verification_points``）：Phase 1 + 两条关卡。"""
+    return {
+        "verification_points": [
+            {
+                "id": "VP-001",
+                "verification_method": "automated_test",
+                "title": "vp VP-001",
+                "expected_result": "通过",
+            },
+            {
+                "id": "VP-017",
+                "verification_method": "full_ci",
+                "verification_phase": 2,
+                "phase_order": 1,
+                "title": "全量 Nightly CI",
+                "expected_result": "通过",
+            },
+            {
+                "id": "VP-018",
+                "verification_method": "e2e",
+                "verification_phase": 2,
+                "phase_order": 2,
+                "title": "全量 E2E",
+                "expected_result": "通过",
+            },
+        ],
+    }
+
+
+def _late_close_agent(tmp_path: Path, executor: Any, plan_data: Dict[str, Any]):
+    """一个只桩掉「与本用例无关的协作者」的轮次编排器。
+
+    走的是**生产入口** :meth:`Orchestrator.run_full_verification` ——
+    执行器收口、环境受阻重跑、晚收口、生成报告，都在同一个函数里按
+    真实的顺序跑一遍（桩掉的全是与门禁/收口无关的协作者：计划生成、
+    服务预检、树的指纹、报告的 LLM 判定）。
+    """
+    from verification_agent import Orchestrator
+
+    agent = Orchestrator.__new__(Orchestrator)
+    agent.plan_dir = tmp_path / "plan"
+    agent.plan_dir.mkdir(parents=True, exist_ok=True)
+    agent.project_dir = tmp_path / "project"
+    agent.verif_repo = None
+    agent._freshness_cache = _Stub()
+    agent._rebuild_coordinator = _Stub()
+    agent._clear_verification_state_files = lambda: None
+    agent.start_verification_round = lambda round_number: None
+    agent.generate_verification_plan = lambda: plan_data
+    agent._preflight_service_freshness = lambda plan_data: None
+    agent._resolve_service_placeholders = lambda plan_data: plan_data
+    agent._current_tree_fingerprint = lambda: "eb64e8a:aaa"
+    agent._build_verification_executor = lambda plan_data: executor
+    agent._note_vp_capacity = lambda peak: None
+    agent._flush_deferred_evidence_checks = lambda executor: []
+    agent._quarantine_round_tree_mutation = lambda executor: None
+    agent._run_base_drift_preflight = lambda: None
+    agent._run_binary_freshness_round_preflight = lambda: None
+    agent._run_round_service_preflight = lambda: None
+    # 证据核对：本用例里没有互相矛盾的证据 —— 真实实现此时也是原样返回。
+    agent._reconcile_round_evidence_conflicts = (
+        lambda plan_data, execution_results: execution_results
+    )
+    agent.generate_verification_report = lambda execution_results: {
+        "overall_status": "PASSED",
+        "execution_results": execution_results,
+    }
+    return agent
+
+
+def _environment_rerun_flips_the_blocker(
+    plan_data: Dict[str, Any], execution_results: dict,
+) -> dict:
+    """环境受阻重跑的**替身**：把被环境 BLOCKED 的 Phase 1 验证点翻绿。
+
+    真实实现（``_rerun_environment_blocked_vps``）做的事就是这一件：服务
+    回来之后重跑一遍，把重跑的结论**合并进** ``execution_results``。这里
+    只驱动它对轮次顺序的影响 —— 翻绿发生在**晚收口之前**，正是这一缝的
+    要害。
+    """
+    for entry in execution_results.get("execution_results") or []:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("id")) == "VP-001":
+            entry["status"] = "PASSED"
+            entry["actual_result"] = "VP-001 stub (the service came back)"
+    return execution_results
+
+
+def _final_entries(execution_results: dict) -> Dict[str, Dict[str, Any]]:
+    return {
+        str(entry.get("id")): entry
+        for entry in execution_results.get("execution_results") or []
+        if isinstance(entry, dict)
+    }
+
+
+def test_the_late_close_dispatches_the_gate_layer_after_the_env_rerun(
+    tmp_path: Path,
+) -> None:
+    """回归用例：环境受阻重跑把阻塞者翻绿 → 晚收口必须派发那条关卡层。
+
+    修前必红：收口重算跑在环境受阻重跑**之前**，看到的是旧的 BLOCKED，
+    于是 VP-017 / VP-018 一次都没被派发，报告里那条 DEFERRED 还带着
+    「Phase 1 的 VP-001 结论为 BLOCKED」的理由，整轮 SKIPPED。
+    """
+    plan = _plan(
+        _vp("VP-001"),
+        _vp("VP-017", verification_phase=2, phase_order=1, title="全量 Nightly CI"),
+        _vp("VP-018", verification_phase=2, phase_order=2, title="全量 E2E"),
+    )
+    executor, calls = _make_executor(
+        plan, tmp_path, {"VP-001": "BLOCKED"}, round_no=1,
+    )
+    agent = _late_close_agent(tmp_path, executor, _late_close_plan())
+    agent._rerun_environment_blocked_vps = _environment_rerun_flips_the_blocker
+
+    report = agent.run_full_verification(round_number=1)
+
+    # 门禁层**真的**被派发了（执行器跑过了它，不只是账本上换了状态）。
+    assert "VP-017" in calls, (
+        "晚收口必须在本轮真正派发被延后的关卡层（VP-017 从未被跑过）"
+    )
+    assert "VP-018" in calls, (
+        "晚收口必须在本轮真正派发被延后的关卡层（VP-018 从未被跑过）"
+    )
+
+    # 派生行为：最终字典里那条门禁不再是「带旧 BLOCKED 理由的 DEFERRED」。
+    entries = _final_entries(report["execution_results"])
+    assert entries["VP-017"]["status"] == "PASSED", (
+        "派发出去的关卡层必须带着真实结论回到最终字典"
+    )
+    assert "BLOCKED" not in str(entries["VP-017"].get("actual_result")), (
+        "派发出去的关卡层不得还留着旧 BLOCKED 的理由"
+    )
+    assert entries["VP-018"]["status"] == "PASSED"
+
+    # 环境受阻重跑刚翻绿的那一条**不许**被合并覆盖。
+    assert entries["VP-001"]["status"] == "PASSED", (
+        "环境受阻重跑刚翻绿的验证点不许被晚收口的合并覆盖"
+    )
+
+
+def test_the_late_close_does_not_dispatch_when_the_blocker_is_still_red(
+    tmp_path: Path,
+) -> None:
+    """负控：阻塞者仍被挡着 → 晚收口不得派发，DEFERRED 保留。
+
+    晚收口只是**补缝**：门禁的判定语义一点没变 —— 阻塞者没有翻绿时，
+    被延后的层仍然只能等。
+    """
+    plan = _plan(
+        _vp("VP-001"),
+        _vp("VP-017", verification_phase=2, phase_order=1, title="全量 Nightly CI"),
+        _vp("VP-018", verification_phase=2, phase_order=2, title="全量 E2E"),
+    )
+    executor, calls = _make_executor(
+        plan, tmp_path, {"VP-001": "BLOCKED"}, round_no=1,
+    )
+    agent = _late_close_agent(tmp_path, executor, _late_close_plan())
+    # 环境受阻重跑没有翻绿（服务还是没起来）。
+    agent._rerun_environment_blocked_vps = (
+        lambda plan_data, execution_results: execution_results
+    )
+
+    report = agent.run_full_verification(round_number=1)
+
+    assert "VP-017" not in calls, "阻塞者仍挡着时关卡不得执行"
+    assert "VP-018" not in calls, "阻塞者仍挡着时关卡不得执行"
+    entries = _final_entries(report["execution_results"])
+    assert entries["VP-017"]["status"] == "DEFERRED"
+    assert entries["VP-018"]["status"] == "DEFERRED"
