@@ -182,6 +182,75 @@ def test_external_status_equals():
     assert failed.passed is False
 
 
+def test_external_status_equals_reads_the_status_off_the_command_output():
+    """A record with no explicit status: the command's stdout is the observation.
+
+    The executor fills no ``external_status`` — it fills the exit code and
+    the two streams — so for a record it produced the printed output is
+    the only place the observed status can be read from.  A command that
+    watches an external state prints it (``gh pr view --json state
+    --jq .state`` prints ``MERGED``), so that output is the observation.
+    """
+    predicate = {"kind": "external_status_equals", "equals": "MERGED"}
+
+    verdict = judge(
+        _item(predicate),
+        [_evidence(exit_code=0, stdout="MERGED\n", stderr="", external_status=None)],
+    )
+
+    assert verdict.passed is True
+    assert "MERGED" in verdict.reason
+
+
+def test_external_status_equals_from_the_command_output_still_fails_on_another_status():
+    """The same evidence, another status: the output decides, and it says no."""
+    predicate = {"kind": "external_status_equals", "equals": "OPEN"}
+
+    verdict = judge(
+        _item(predicate),
+        [_evidence(exit_code=0, stdout="MERGED\n", stderr="", external_status=None)],
+    )
+
+    assert verdict.passed is False
+
+
+def test_an_explicit_external_status_wins_over_the_command_output():
+    """A record that carries the status says it — stdout does not override it."""
+    predicate = {"kind": "external_status_equals", "equals": "MERGED"}
+
+    verdict = judge(
+        _item(predicate),
+        [_evidence(exit_code=0, stdout="OPEN", stderr="", external_status="MERGED")],
+    )
+
+    assert verdict.passed is True
+
+
+def test_external_status_equals_without_any_status_is_a_fail():
+    """Nothing to observe — no explicit status, no stdout — is a FAIL."""
+    predicate = {"kind": "external_status_equals", "equals": "MERGED"}
+
+    verdict = judge(
+        _item(predicate),
+        [_evidence(exit_code=0, stdout="", stderr="", external_status=None)],
+    )
+
+    assert verdict.passed is False
+
+
+def test_external_status_equals_with_an_empty_stdout_carries_no_status():
+    """A record that printed nothing carries no status, so it cannot pass."""
+    predicate = {"kind": "external_status_equals", "equals": "MERGED"}
+
+    verdict = judge(
+        _item(predicate),
+        [_evidence(exit_code=0, stdout="", stderr="a warning", external_status=None)],
+    )
+
+    assert verdict.passed is False
+    assert "no external status" in verdict.reason
+
+
 # ---------------------------------------------------------------------------
 # Evidence sufficiency: no evidence is a FAIL, never a PASS.
 # ---------------------------------------------------------------------------

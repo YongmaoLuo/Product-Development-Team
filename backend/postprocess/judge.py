@@ -54,6 +54,11 @@ kind                        passes when
 ``git_diff_empty``          the observed product-code diff is empty
 ==========================  ==========================================
 
+``external_status_equals`` observes the status from the record's
+``external_status`` field when it carries one, and otherwise from the
+command's stdout — the executor fills no ``external_status``, so for a
+record it produced the printed output is the observation.
+
 ``git_diff_empty`` is A5's own criterion: a requirement book that wants
 the finishing stage to leave the product code alone says so with it, and
 the diff the evidence carries decides — empty passes, a non-empty diff
@@ -346,11 +351,36 @@ def _judge_regex_match(
 def _judge_external_status_equals(
     predicate: Mapping[str, Any], record: Any, root: Optional[Path]
 ) -> Tuple[bool, str]:
-    """The observed external status is the one the predicate names."""
+    """The observed external status is the one the predicate names.
+
+    The observation comes from the **record**, and the record's own
+    ``external_status`` field wins when it carries one.  But the
+    executor never fills that field — it fills the exit code and the two
+    output streams, nothing else — so a record that came off the
+    executor has ``external_status = None`` and this predicate would
+    then decide FAIL for every evidence record, no matter what the
+    command actually observed.
+
+    So when the field is absent the observation is read off the
+    command's **stdout**, which is where this predicate's observation
+    has always come from in practice: the command that watches an
+    external state prints that state and nothing else — e.g.
+    ``gh pr view --json state --jq .state`` prints ``MERGED`` — and
+    ``_is_usable`` already requires output for this kind, precisely
+    because the output is the evidence.  The stdout is stripped before
+    it is compared, so a trailing newline does not decide the verdict.
+
+    An explicit ``external_status`` still wins over stdout, and stdout
+    that is empty leaves the predicate with no observation at all,
+    which is a FAIL.
+    """
     expected = _first_present(predicate, ("equals", "value", "expected", "status"))
     actual = _read(record, "external_status", None)
     if actual is None:
-        return False, "evidence carries no external status"
+        observed = str(_read(record, "stdout", "") or "").strip()
+        if not observed:
+            return False, "evidence carries no external status"
+        actual = observed
     if str(actual) == str(expected):
         return True, f"external_status {actual!r} == {expected!r}"
     return False, f"external_status {actual!r} != {expected!r}"
