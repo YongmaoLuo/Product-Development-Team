@@ -989,6 +989,19 @@ class VerificationExecutor(BaseExecutor):
         # 那条环。
         self._in_deferred_recheck: bool = False
 
+        # 2026-11-28（本轮最终结论）：**本轮**的执行信封（由编排器在轮次
+        # 收口时交给门禁判定）。
+        #
+        # 裁决表（``_verdicts``）是跨轮表：同一个 VP 在别的轮次留下的旧结论
+        # 还躺在里面。门禁重算只读它，就会把「裁决表里还留着旧 BLOCKED」
+        # 当成「本轮仍被挡着」，被延后的全量门禁层永远不被派发
+        # （2026-11-28 实测：VP-017 / VP-018 从未被派发，整轮 SKIPPED）。
+        # 信封是本轮的账 —— 报告读的就是它；收口重算必须读同一份账。
+        self._round_execution_results: Optional[Mapping[str, Any]] = None
+        #: 信封属于哪一轮（``None`` = 不知道）。轮次已知且与本轮不符时
+        #: 不采信它 —— 上一轮的信封不代表这一轮。
+        self._round_execution_round: Optional[int] = None
+
         # Progress state mirrors. ``_current_vp`` shadows
         # :attr:`BaseExecutor._current_item` so the on-disk schema
         # (``current_vp``) is preserved even though the base class
@@ -1203,6 +1216,10 @@ class VerificationExecutor(BaseExecutor):
         # 刚被清掉的那几条结论（清空等于没做）。
         self._verdicts = {}
         self._verdicts_by_round = {}
+        # 2026-11-28：本轮信封也是「本轮」的账 —— 轮次重置时一起清，
+        # 留着它等于让上一轮的信封替这一轮说话。
+        self._round_execution_results = None
+        self._round_execution_round = None
         self._pending_vps = []
         self._failed_vps = []
         self._skipped_vps = []
@@ -4170,6 +4187,152 @@ class VerificationExecutor(BaseExecutor):
             or []
         )
 
+    def set_round_execution_results(
+        self,
+        execution_results: Optional[Mapping[str, Any]],
+        *,
+        round_no: Optional[int] = None,
+    ) -> None:
+        """把**本轮**的执行信封交给门禁判定。
+
+        2026-11-28（缺陷：门禁按过期结论延后）：裁决表（``_verdicts``）是
+        **跨轮**表 —— 同一个 VP 在别的轮次留下的旧结论还躺在里面。轮次收口
+        的门禁重算只读它，于是「裁决表里还留着旧 ``BLOCKED``」被当成了
+        「本轮仍被挡着」，被延后的全量门禁层**永远不被派发**
+        （2026-11-28 实测：VP-017 / VP-018 一次都没被派发，整轮 SKIPPED）。
+
+        执行信封（``execution_results``）是本轮的账 —— 报告读的就是它。
+        收口重算必须与报告看**同一份账**：两份账本撕裂时，以本轮最终结论
+        为准。
+
+        轮次隔离：信封带着它属于哪一轮。轮次已知且与本轮不符时**不采信**
+        （上一轮的信封不代表这一轮）；轮次未知时采信 —— 不知道轮次不等于
+        没有结论。
+        """
+        self._round_execution_results = execution_results
+        self._round_execution_round = round_no
+
+    def round_execution_envelope(self) -> Dict[str, Any]:
+        """本轮的执行信封（``id`` + ``status``）—— 门禁判定读的那份账。
+
+        与 :meth:`collect_verdicts` **同一个来源**（本轮账本优先，跨轮表
+        兜底）：报告读的是它，门禁重算读的也必须是它。两份账本撕裂时
+        （2026-11-28 实测：裁决表里 VP-001 还留着旧 ``BLOCKED``，而本轮
+        的信封里它是 ``PASSED``），以本轮最终结论为准。
+
+        轮次已知时只收**本轮**的结论（与报告侧同一道筛）；轮次未知时不筛
+        —— 不知道轮次不等于没有结论。
+        """
+        current = self._verdict_round_no()
+        bucket = self._current_round_bucket()
+        vp_ids = list(bucket)
+        vp_ids.extend(
+            vp_id for vp_id in self._verdicts if vp_id not in bucket
+        )
+        entries: List[Dict[str, Any]] = []
+        for vp_id in vp_ids:
+            verdict = bucket.get(vp_id) or self._verdicts.get(vp_id) or {}
+            if not isinstance(verdict, dict):
+                continue
+            if current > 0 and self._verdict_round_of(verdict) != current:
+                continue
+            status = verdict.get("status")
+            if status is None:
+                continue
+            entries.append({"id": str(vp_id), "status": str(status)})
+        return {"execution_results": entries, "round": current}
+
+    def _round_execution_status(self, vp_id: Any) -> Optional[str]:
+        """本轮执行信封里这个 VP 的**终态成功**状态（读不到返回 ``None``）。
+
+        只认终态成功（``PASSED`` / ``SKIPPED`` / ``SPLIT``）：
+
+        * ``DEFERRED`` 是「这一轮还没跑」，不是「它过了」；
+        * ``UNKNOWN`` 是「没验出结论」—— 拿它放行门禁等于把「不知道」说成
+          「通过了」；
+        * 失败（``FAILED`` / ``BLOCKED``）不参与放行：门禁「读不到结论」时
+          维持既有语义（下游记 ``UNKNOWN``），不因为信封多说了一句就把
+          ``UNKNOWN`` 换成别的。
+        """
+        # ``getattr``：执行器也可能被绕过 ``__init__`` 造出来（既有测试
+        # 就是这么干的），那时这两个新字段压根不存在。
+        envelope_round = getattr(self, "_round_execution_round", None)
+        if envelope_round is not None:
+            current = self._verdict_round_no()
+            if current > 0 and int(envelope_round) != current:
+                logger.info(
+                    "[verification_executor] plan_id=%s: the execution "
+                    "envelope belongs to round %s, not to round %s — it is "
+                    "not used for the gate decision",
+                    self.plan_id, envelope_round, current,
+                )
+                return None
+        envelope = getattr(self, "_round_execution_results", None)
+        if not isinstance(envelope, Mapping):
+            return None
+        entries = envelope.get("execution_results")
+        raw_status: Any = None
+        if isinstance(entries, Mapping):
+            entry = entries.get(str(vp_id))
+            if isinstance(entry, Mapping):
+                raw_status = entry.get("status")
+        elif isinstance(entries, (list, tuple)):
+            for entry in entries:
+                if not isinstance(entry, Mapping):
+                    continue
+                entry_id = entry.get("id")
+                if entry_id is None:
+                    entry_id = entry.get("vp_id")
+                if str(entry_id) != str(vp_id):
+                    continue
+                raw_status = entry.get("status")
+                break
+        if raw_status is None:
+            return None
+        status = str(raw_status).strip().upper()
+        if status not in _TERMINAL_SUCCESS_STATUSES:
+            return None
+        return status
+
+    def _round_ledger_success(self, vp_id: Any) -> Optional[str]:
+        """本轮账本里这个 VP 的**终态成功**状态（读不到返回 ``None``）。
+
+        本轮账本（``_verdicts_by_round`` 的当前轮那一份）是**本轮真跑出来
+        的执行结果** —— 报告读的就是它（:meth:`collect_verdicts` 的
+        「本轮账本优先」）。收口的门禁重算读的是**跨轮**的裁决表
+        （``_verdicts``），两份账本撕裂时（跨轮表里那条旧 ``BLOCKED``，
+        本轮账本里已经是 ``PASSED``）关卡层就会被一个已经不成立的旧结论
+        永远挡在门外。
+
+        只认终态成功（``PASSED`` / ``SKIPPED`` / ``SPLIT``）：本轮账本说
+        「它没过」时维持既有语义（读不到结论 → 下游 ``UNKNOWN``）。
+
+        轮次隔离：只读**当前轮**那一份账本（轮次未知时读「没有轮次戳」
+        的那一份 —— 那是轮次未知时唯一说得通的答案，见
+        :meth:`_current_round_bucket`）。
+        """
+        buckets = getattr(self, "_verdicts_by_round", None)
+        if not isinstance(buckets, dict):
+            # 执行器也可能被绕过 ``__init__`` 造出来（既有测试就是这么干的），
+            # 那时压根没有轮次账本。
+            return None
+        current = self._verdict_round_no()
+        bucket = buckets.get(current) or {} if current > 0 else buckets.get(0) or {}
+        entry = bucket.get(vp_id)
+        if not isinstance(entry, dict):
+            entry = bucket.get(str(vp_id))
+        if not isinstance(entry, dict):
+            return None
+        if not self._verdict_is_current_round(vp_id, entry):
+            return None
+        status = entry.get("status")
+        if status is None:
+            return None
+        status = str(status).strip().upper()
+        if status not in _TERMINAL_SUCCESS_STATUSES:
+            return None
+        return status
+
     def _terminal_status_of(self, vp_id: Any) -> Optional[str]:
         """该 VP **本轮**记录的结论状态（无结论返回 None）。
 
@@ -4178,7 +4341,32 @@ class VerificationExecutor(BaseExecutor):
         （返回 ``None``），并记一条 ``stale_verdict_ignored``。沿用旧轮的
         结论等于把上一轮的失败当成本轮的失败：2026-11-02 实测里 round 3
         的 VP-015 就是这样被判 DEFERRED 的，而本轮 VP-009 实际 PASSED。
+
+        2026-11-28（本轮最终结论）：**本轮执行信封优先**。裁决表是跨轮表，
+        它里面那条「旧 ``BLOCKED``」不代表本轮；信封是本轮的账，报告读的
+        就是它。收口重算必须与报告看同一份账 —— 否则两层账本撕裂时，关卡层
+        会因为一个已经不成立的旧结论被永远挡在门外（VP-017 / VP-018 从未
+        被派发，整轮 SKIPPED）。
+
+        信封只贡献**终态成功**：信封说「它没过」时维持既有语义（读不到
+        结论 → 下游 ``UNKNOWN``），不因为信封多说了一句就改写别的语义。
+
+        2026-11-28（本轮执行结果优先）：**本轮账本**（``_verdicts_by_round``
+        里本轮那一份 = 本轮真跑出来的执行结果，报告读的就是它）里的终态
+        成功同样优先于跨轮裁决表。跨轮表（``_verdicts``）里那条旧
+        ``BLOCKED`` 不代表本轮 —— 它与本轮账本撕裂时，关卡层会因为一个
+        已经不成立的旧结论被永远挡在门外（VP-017 / VP-018 从未被派发，
+        整轮 SKIPPED）。
+
+        本轮账本也**只贡献终态成功**：它说「它没过 / 还没跑」时维持既有
+        语义（读不到结论 → 下游 ``UNKNOWN``），不改写别的语义。
         """
+        truth = self._round_execution_status(vp_id)
+        if truth is not None:
+            return truth
+        ledger_truth = self._round_ledger_success(vp_id)
+        if ledger_truth is not None:
+            return ledger_truth
         verdict = self._verdicts.get(vp_id)
         if not isinstance(verdict, dict):
             return None
