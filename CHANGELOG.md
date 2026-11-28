@@ -370,6 +370,44 @@ half the readers never see.*
   that produced no conclusion used to be reported as a failure of the
   deliverable, and it is now reported as the absence of one.
 
+- **A verification point may not take a number before its definition is
+  complete.** `backend/verification_plan_delta.py` checks a delta entry
+  before its id is handed out: it needs a title and a supported verification
+  method, and it needs an expected result for every method but the
+  whole-repository gate — for that one the criterion is the exit code of
+  its entry, so a missing description is not a missing criterion. The
+  method's own payload gaps (a bare `json_path`, a `full_ci` without its
+  `ci_entry`) are reported beside the missing fields, and the definitions
+  are written back into `verification_plan.json`, so the next round has
+  something to dispatch. An id whose definition never landed used to run
+  never, while the failure it had earned was carried forward as if it were
+  real. **No verdict changed**: a gate that really passed still passes.
+
+- **A whole-repository gate counts only when this round produced it.**
+  `backend/verification_executor.py` marks every verdict with
+  `executed_this_round`; a Phase 2 full-gate verdict that was hydrated from
+  the ledger instead of produced this round is superseded and reported
+  `DEFERRED` — the verdict it replaced, and the commit that verdict judged,
+  are kept as audit trail — instead of being carried into the report as this
+  round's PASSED. **A verdict did change**: a gate conclusion an earlier
+  round earned no longer stands in for this round's.
+
+- **A conclusion says which commit it judged.**
+  `backend/verification_agent.py` and `backend/verification_executor.py`
+  stamp every verdict with `judged_head`, and
+  `backend/verification_ci_runner.py` writes the CI gate's `head_sha` /
+  `tree_sha` / `started_at` / `project_dir` into the artifact and its
+  `judged_head` into the verdict. An artifact whose `head_sha` is missing,
+  or no longer the current HEAD, is not reused: the gate runs again, and the
+  result records which old conclusion was ignored. **No verdict changed**: a
+  gate that really passed on this tree still passes.
+
+- **The lines a pull request proposes are measured, not only the tree.**
+  `.github/workflows/ci.yml` runs the changed-line coverage floor over the
+  lines a pull request touches, beside the whole-tree floor, and fetches the
+  base branch with full history — so that comparison is a measurement rather
+  than an assumption.
+
 
 
 ## [0.1.2] - 2026-10-07

@@ -1,0 +1,196 @@
+{
+  "commit": "8046e97",
+  "provenance": {
+    "commit_sha": "8046e97a467e782abf71ab43c9a7164c128fecf6",
+    "source": "backend/coding_tool.py at the baseline commit",
+    "method": "the baseline commit's tree is materialized with `git archive` into a temporary directory and driven there; the capture never imports the working tree's coding_tool",
+    "coding_tool_sha256": "d4f35571dd4b2996f34efebce6d2cd130325a22164bd2664ecfcb65a4b618b05",
+    "env_delta_meaning": "env_delta is the environment the command line itself contributes; run_env_delta is the run's own per-run identifiers, recorded with their values replaced"
+  },
+  "cases": [
+    {
+      "name": "create_mcp_tools_model",
+      "argv": [
+        "claude",
+        "--verbose",
+        "--output-format",
+        "stream-json",
+        "--permission-mode",
+        "bypassPermissions",
+        "--append-system-prompt",
+        "S",
+        "--model",
+        "m1",
+        "--mcp-config",
+        "/tmp/pdt-claude-baseline/workdir/mcp.json",
+        "--session-id",
+        "11111111-1111-1111-1111-111111111111",
+        "--allowedTools",
+        "Bash"
+      ],
+      "cwd": "/tmp/pdt-claude-baseline/workdir",
+      "env_delta": {},
+      "run_env_delta": {
+        "PDT_SUBAGENT_UUID": "<per-run-uuid>",
+        "PDT_SUBAGENT_LOG_FILE": "<per-run-tmp>/subagent_<per-run-uuid>_activity.log"
+      }
+    },
+    {
+      "name": "create_mcp_settings",
+      "argv": [
+        "claude",
+        "--verbose",
+        "--output-format",
+        "stream-json",
+        "--permission-mode",
+        "bypassPermissions",
+        "--mcp-config",
+        "/tmp/pdt-claude-baseline/workdir/mcp.json",
+        "--session-id",
+        "11111111-1111-1111-1111-111111111111",
+        "--settings",
+        "<private-dir>/subagent_settings_<uuid>.json"
+      ],
+      "cwd": "/tmp/pdt-claude-baseline/workdir",
+      "env_delta": {},
+      "run_env_delta": {
+        "PDT_SUBAGENT_UUID": "<per-run-uuid>",
+        "PDT_SUBAGENT_LOG_FILE": "<per-run-tmp>/subagent_<per-run-uuid>_activity.log"
+      }
+    },
+    {
+      "name": "create_tools_sys",
+      "argv": [
+        "claude",
+        "--verbose",
+        "--output-format",
+        "stream-json",
+        "--permission-mode",
+        "bypassPermissions",
+        "--append-system-prompt",
+        "S",
+        "--session-id",
+        "11111111-1111-1111-1111-111111111111",
+        "--allowedTools",
+        "Bash,Read"
+      ],
+      "cwd": "/tmp/pdt-claude-baseline/workdir",
+      "env_delta": {},
+      "run_env_delta": {
+        "PDT_SUBAGENT_UUID": "<per-run-uuid>",
+        "PDT_SUBAGENT_LOG_FILE": "<per-run-tmp>/subagent_<per-run-uuid>_activity.log"
+      }
+    },
+    {
+      "name": "create_plain",
+      "argv": [
+        "claude",
+        "--verbose",
+        "--output-format",
+        "stream-json",
+        "--permission-mode",
+        "bypassPermissions",
+        "--session-id",
+        "11111111-1111-1111-1111-111111111111"
+      ],
+      "cwd": "/tmp/pdt-claude-baseline/workdir",
+      "env_delta": {},
+      "run_env_delta": {
+        "PDT_SUBAGENT_UUID": "<per-run-uuid>",
+        "PDT_SUBAGENT_LOG_FILE": "<per-run-tmp>/subagent_<per-run-uuid>_activity.log"
+      }
+    },
+    {
+      "name": "resume_mcp_tools_sys",
+      "argv": [
+        "claude",
+        "--verbose",
+        "--output-format",
+        "stream-json",
+        "--permission-mode",
+        "bypassPermissions",
+        "--append-system-prompt",
+        "S",
+        "--mcp-config",
+        "/tmp/pdt-claude-baseline/workdir/mcp.json",
+        "--resume",
+        "11111111-1111-1111-1111-111111111111",
+        "--allowedTools",
+        "Bash"
+      ],
+      "cwd": "/tmp/pdt-claude-baseline/workdir",
+      "env_delta": {},
+      "run_env_delta": {
+        "PDT_SUBAGENT_UUID": "<per-run-uuid>",
+        "PDT_SUBAGENT_LOG_FILE": "<per-run-tmp>/subagent_<per-run-uuid>_activity.log"
+      }
+    },
+    {
+      "name": "resume_mcp_sys",
+      "argv": [
+        "claude",
+        "--verbose",
+        "--output-format",
+        "stream-json",
+        "--permission-mode",
+        "bypassPermissions",
+        "--append-system-prompt",
+        "S",
+        "--mcp-config",
+        "/tmp/pdt-claude-baseline/workdir/mcp.json",
+        "--resume",
+        "11111111-1111-1111-1111-111111111111"
+      ],
+      "cwd": "/tmp/pdt-claude-baseline/workdir",
+      "env_delta": {},
+      "run_env_delta": {
+        "PDT_SUBAGENT_UUID": "<per-run-uuid>",
+        "PDT_SUBAGENT_LOG_FILE": "<per-run-tmp>/subagent_<per-run-uuid>_activity.log"
+      }
+    },
+    {
+      "name": "resume_tools_settings",
+      "argv": [
+        "claude",
+        "--verbose",
+        "--output-format",
+        "stream-json",
+        "--permission-mode",
+        "bypassPermissions",
+        "--resume",
+        "11111111-1111-1111-1111-111111111111",
+        "--allowedTools",
+        "Bash,Read",
+        "--settings",
+        "<private-dir>/subagent_settings_<uuid>.json"
+      ],
+      "cwd": "/tmp/pdt-claude-baseline/workdir",
+      "env_delta": {},
+      "run_env_delta": {
+        "PDT_SUBAGENT_UUID": "<per-run-uuid>",
+        "PDT_SUBAGENT_LOG_FILE": "<per-run-tmp>/subagent_<per-run-uuid>_activity.log"
+      }
+    },
+    {
+      "name": "resume_model",
+      "argv": [
+        "claude",
+        "--verbose",
+        "--output-format",
+        "stream-json",
+        "--permission-mode",
+        "bypassPermissions",
+        "--model",
+        "m1",
+        "--resume",
+        "11111111-1111-1111-1111-111111111111"
+      ],
+      "cwd": "/tmp/pdt-claude-baseline/workdir",
+      "env_delta": {},
+      "run_env_delta": {
+        "PDT_SUBAGENT_UUID": "<per-run-uuid>",
+        "PDT_SUBAGENT_LOG_FILE": "<per-run-tmp>/subagent_<per-run-uuid>_activity.log"
+      }
+    }
+  ]
+}

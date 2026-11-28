@@ -257,6 +257,33 @@
   `backend/routes/verification.py`）。**这次改的是裁决本身**：一轮什么都没验出来的
   情况，过去被报成交付物的失败，现在被报成「没有结论」。
 
+- **一条验证点没把定义写全，就不许占号。** `backend/verification_plan_delta.py`
+  在发出增量条目的 id 之前先验它的定义：标题、受支持的验证方法都要有；预期结果
+  则**除整仓门禁外都要有** —— 整仓门禁的判据是入口的退出码，缺一句描述不是缺了
+  判据。方法自己的判据载荷缺口（裸 `json_path`、`full_ci` 缺 `ci_entry`）与缺字段
+  一起报出来；定义随后落进 `verification_plan.json`，下一轮才有东西可分派 ——
+  定义从未落盘的那个 id 过去一次没跑过，它挣到的失败却被原样沿用，当成真的。
+  **没有任何裁决被改动**：真过了的门禁还是过。
+
+- **整仓门禁只有本轮真跑出来的那一次才算数。**
+  `backend/verification_executor.py` 给每条裁决盖上 `executed_this_round`：Phase 2
+  全量关卡那份从库里水合回来的历史结论被作废，报告里记成 `DEFERRED` —— 被作废的
+  那条结论与它判在哪次提交上一起留作审计痕迹 —— 而不是被原样端上来当本轮的
+  PASSED。**这次改的是裁决本身**：上一轮挣来的门禁结论，不再冒充这一轮的。
+
+- **一条结论说清自己判的是哪次提交。**
+  `backend/verification_agent.py` 与 `backend/verification_executor.py` 给每条裁决
+  盖上 `judged_head`；`backend/verification_ci_runner.py` 把整仓门禁的 `head_sha` /
+  `tree_sha` / `started_at` / `project_dir` 写进工件，把 `judged_head` 写进裁决。
+  工件的 `head_sha` 缺失、或与当前 HEAD 不是同一棵树时，旧结论不许沿用：门禁重跑，
+  结果里记下被忽略的是哪一份旧结论。**没有任何裁决被改动**：在这棵树上真过了的
+  门禁还是过。
+
+- **PR 提出的那些行是被量出来的，不只是整棵树被量。**
+  `.github/workflows/ci.yml` 在整树覆盖率地板之外，跑一遍「本次改动行」的覆盖率
+  地板，并把基线分支按完整历史取下来 —— 这样那次比较才是量出来的，而不是假设
+  出来的。
+
 
 
 ## [0.1.2] - 2026-10-07

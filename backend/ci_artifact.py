@@ -167,6 +167,26 @@ CI_ARTIFACT_FIELDS: FrozenSet[str] = frozenset({
     "gate_result",
     "gate_result_available",
     "gate_result_error",
+    # 2026-11-28 (merge): the **provenance** of the run — which commit
+    # and which tree it ran against, when it started, which directory it
+    # ran in, and which commit the verdict is judged against.  The
+    # runner writes all five (on the schema-failure path and on the
+    # normal path), so the contract has to allow them: without them
+    # the runner rejects its own artifact.  They are spelled out
+    # literally (see the module docstring) — the derivation that keeps
+    # the contract and the producer equal reads the producer's source,
+    # and a key behind a constant is invisible to it.
+    "head_sha",
+    "tree_sha",
+    "started_at",
+    "project_dir",
+    "judged_head",
+    # 2026-11-28 (merge): what happened to the **previous** round's
+    # artifact — whether it still described the current tree or was
+    # ignored (and why).  Written by the runner on the normal path
+    # only, spelled out literally for the same reason as the five
+    # keys above.
+    "superseded_artifact",
 })
 
 #: The keys every CI artifact carries, on every path.
