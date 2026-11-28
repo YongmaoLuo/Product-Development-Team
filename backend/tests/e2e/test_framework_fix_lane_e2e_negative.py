@@ -155,9 +155,13 @@ BLOCKING_ERROR_LINE = "AssertionError: framework lane dropped the hold"
 FLAKE_CLASSIFICATION = "flake"
 BLOCKING_CLASSIFICATION = "framework_deterministic"
 
-#: 守卫的两种答复：被框架缺陷挂住 / 产物自相矛盾。
+#: 守卫的两种答复：被框架缺陷挂住 / 计划书不满足契约。
+#:
+#: 2026-11-13（main）：「产物冲突 → 409 artifact_conflict」那道门禁已被有意移除
+#: （两类产物共存合法，``plan_artifacts.detect`` 按「任务优先」归入 dev 分支，
+#: detect 的输出域里已经没有 ``conflict``），所以这里不再有冲突这个答复。
 BLOCKED_ON_FRAMEWORK_FIX = "blocked_on_framework_fix"
-ARTIFACT_CONFLICT = "artifact_conflict"
+VERIFICATION_PLAN_INVALID = "verification_plan_invalid"
 
 #: 修复计划的五段任务模板（架构决策点 4）。
 TASK_TEMPLATE_STEPS = ("locate", "fix", "targeted_test", "gate", "open_pr")
@@ -597,14 +601,18 @@ def test_flake_not_blocking(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
             f"flake 不得生成修复计划；实际目录 {_plan_dirs(backend.plans_dir)!r}"
         )
 
-        # 守卫没有挂起它：端点答的是产物冲突，不是「被框架缺陷挂住」。
+        # 守卫没有挂起它：端点答的是计划书校验错误，不是「被框架缺陷挂住」。
         status, body = _start_verification(backend.base_url, FLAKE_PLAN_ID)
         assert isinstance(body, dict), f"答复必须是一个文档；实际 {body!r}"
         assert body.get("error") != BLOCKED_ON_FRAMEWORK_FIX, (
             "flake 不得被挂起；实际 HTTP {0}: {1!r}".format(status, body)
         )
-        assert body.get("error") == ARTIFACT_CONFLICT, (
-            "没有挂起的计划答的是产物冲突；实际 HTTP {0}: {1!r}".format(
+        # 2026-11-13（main）：产物冲突不再是 409 —— 共存合法、按「任务优先」
+        # 归入 dev 分支，那道门禁已被有意移除。这颗种子计划的计划书故意不满足
+        # 十章节契约，所以先被计划书校验挡下（422）。负控要证明的仍然成立：
+        # 答案不是「被框架缺陷挂住」。
+        assert body.get("error") == VERIFICATION_PLAN_INVALID, (
+            "没有挂起的计划答的是计划书校验错误；实际 HTTP {0}: {1!r}".format(
                 status, body
             )
         )
@@ -679,8 +687,12 @@ def test_non_critical_not_blocking(
         assert body.get("error") != BLOCKED_ON_FRAMEWORK_FIX, (
             "非关键命中不得被挂起；实际 HTTP {0}: {1!r}".format(status, body)
         )
-        assert body.get("error") == ARTIFACT_CONFLICT, (
-            "没有挂起的计划答的是产物冲突；实际 HTTP {0}: {1!r}".format(
+        # 2026-11-13（main）：产物冲突不再是 409 —— 共存合法、按「任务优先」
+        # 归入 dev 分支，那道门禁已被有意移除。这颗种子计划的计划书故意不满足
+        # 十章节契约，所以先被计划书校验挡下（422）。负控要证明的仍然成立：
+        # 答案不是「被框架缺陷挂住」。
+        assert body.get("error") == VERIFICATION_PLAN_INVALID, (
+            "没有挂起的计划答的是计划书校验错误；实际 HTTP {0}: {1!r}".format(
                 status, body
             )
         )
