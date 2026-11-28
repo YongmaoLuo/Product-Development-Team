@@ -72,3 +72,35 @@ scheduler:
   min_runtime_seconds: 0
   tick_seconds: 5
   command_timeout_seconds: 30
+
+# The framework-fix lane's settings.
+#
+# The section is optional: a file without it runs the lane on the
+# defaults below, and a file that names some of the settings leaves the
+# rest on their defaults too.  A setting whose value cannot be used —
+# a capacity of zero, say — is refused outright rather than being
+# quietly replaced, so a mistake is found where it was written.
+#
+#   framework_fix:
+#     max_active: 2               # active fix plans allowed at the same time
+#     max_per_repo: 2             # fix plans allowed per framework repository
+#     oversubscribe: 1            # slots that may be taken beyond the ceiling
+#     repro_runs: 2               # rounds one signature may be fixed in
+#     merge_reminder_minutes: 30  # how often an unapproved merge is announced again
+#     waiting_on_user_merge_hours: 2  # how long an unapproved merge waits before it escalates
+#     deadlock_minutes: 10        # a fix plan with no execution path for this long escalates
+#     auto_merge: false           # merge a fix plan's work without asking — off by default
+framework_fix:
+  max_active: 2
+  max_per_repo: 2
+  oversubscribe: 1
+  repro_runs: 2
+  merge_reminder_minutes: 30
+  waiting_on_user_merge_hours: 2
+  deadlock_minutes: 10
+  # Merging a fix plan is the operator's decision, so the switch is off
+  # unless the operator turns it on — and only the boolean `true` turns
+  # it on.  A missing key, an empty value or a quoted "true" leaves it
+  # off: this switch is the one setting here whose wrong answer
+  # touches somebody else's repository.
+  auto_merge: false

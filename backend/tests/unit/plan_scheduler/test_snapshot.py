@@ -271,7 +271,7 @@ def test_key_set_is_closed() -> None:
 
     The phase is one of the row's keys now — what the plan is doing,
     in the routing layer's own words — and it is a key of **both** rows
-    and of neither of the document's nine keys.
+    and of neither of the document's ten keys.
 
     The eighth key — ``parked`` — was added on purpose too: a plan
     parked for quota holds no slot and is in no line, so the two lists
@@ -283,6 +283,11 @@ def test_key_set_is_closed() -> None:
     commands the scheduler has accepted and not answered yet are a
     list of their own, so a plan on its way to a stop is visible before
     it is stopped.  The set is still compared **exactly**.
+
+    The tenth key — ``framework_fixes`` — was added for the same reason
+    once more: the framework-fix lane's own plans are in no ordinary
+    line either, so the two lists above could never name them.  The
+    set is still compared **exactly**.
     """
     result = build(_state())
 
@@ -295,6 +300,7 @@ def test_key_set_is_closed() -> None:
         "waiting",
         "parked",
         "stopping",
+        "framework_fixes",
         "generated_at",
     }
     assert set(result["capacity"]) == {"total", "used", "source"}
@@ -392,6 +398,9 @@ def test_a_state_with_nothing_in_it_still_builds() -> None:
     assert result["parked"] == []
     # And nothing is stopping, for the same reason.
     assert result["stopping"] == []
+    # And the framework-fix lane has nothing of its own, for the same
+    # reason: an empty list, not a missing key.
+    assert result["framework_fixes"] == []
     assert set(result) == {
         "capacity",
         "queue_length",
@@ -401,5 +410,6 @@ def test_a_state_with_nothing_in_it_still_builds() -> None:
         "waiting",
         "parked",
         "stopping",
+        "framework_fixes",
         "generated_at",
     }

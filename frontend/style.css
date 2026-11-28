@@ -1945,3 +1945,155 @@ main#app > .loading {
     display: flex;
     gap: 8px;
 }
+
+/* ─── The framework-fix lane's own column ─── */
+
+/* The column is a partition of its own: the lane's plans are drawn
+   here and in no other list.  It is hidden while it is empty, so an
+   empty column takes no room on the panel. */
+.framework-fix-panel {
+    margin-bottom: 16px;
+}
+
+.framework-fix-subtitle {
+    margin-top: 12px;
+}
+
+.framework-fix-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+/* One entry: the plan's id, the badge that says which state it is
+   in, the quiet facts, and the one operation the operator has. */
+.ff-entry {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 10px 14px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 13px;
+}
+
+.ff-plan-id {
+    font-weight: 600;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.ff-summary,
+.ff-source,
+.ff-blocked {
+    color: var(--text-dim);
+    font-size: 12px;
+}
+
+/* The badge: which of the five states the entry is in.  Each state
+   has its own colour, because the operator has to tell "waiting for
+   a merge" from "the rounds ran out" at a glance. */
+.ff-badge {
+    padding: 2px 10px;
+    border-radius: 99px;
+    background: var(--surface3);
+    color: var(--text-dim);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.ff-badge.blocked_on_framework_fix { background: var(--danger-bg); color: var(--danger); }
+.ff-badge.waiting_on_user_merge { background: var(--warning-bg); color: var(--warning); }
+.ff-badge.framework_fix_exhausted { background: var(--danger-bg); color: var(--danger); }
+.ff-badge.scheduler_deadlock_suspected { background: var(--warning-bg); color: var(--warning); }
+.ff-badge.reopened { background: var(--info-bg); color: var(--info); }
+
+/* The one operation the operator has on an entry. */
+.ff-dismiss {
+    margin-left: auto;
+    padding: 4px 12px;
+    font-size: 12px;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-dim);
+    cursor: pointer;
+}
+
+.ff-dismiss:hover { background: var(--surface2); color: var(--warning); border-color: var(--warning); }
+
+/* What the panel says after a dismissal was refused. */
+.framework-fix-notice {
+    margin: 0 0 8px;
+    padding: 8px 12px;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+}
+
+.framework-fix-notice-error { background: var(--danger-bg); color: var(--danger); }
+.framework-fix-notice-ok { background: var(--success-bg); color: var(--success); }
+
+/* The dismissal question.  It is a layer over the panel: the operator
+   answers it, and cancelling writes nothing at all. */
+.ff-confirm-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 200;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.6);
+}
+
+.ff-confirm-dialog {
+    width: min(480px, calc(100vw - 32px));
+    padding: 20px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+}
+
+.ff-confirm-title {
+    margin-bottom: 8px;
+    font-size: 15px;
+    font-weight: 600;
+}
+
+.ff-confirm-text {
+    margin-bottom: 12px;
+    color: var(--text-dim);
+    font-size: 13px;
+}
+
+.ff-confirm-label {
+    display: block;
+    margin-bottom: 4px;
+    color: var(--text-dim);
+    font-size: 12px;
+}
+
+.ff-confirm-input {
+    width: 100%;
+    padding: 8px 10px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    font-size: 13px;
+    font-family: inherit;
+}
+
+.ff-confirm-error {
+    margin-top: 8px;
+    color: var(--danger);
+    font-size: 12px;
+}
+
+.ff-confirm-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 16px;
+}
+

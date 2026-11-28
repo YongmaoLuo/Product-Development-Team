@@ -188,6 +188,62 @@ half the readers never see.*
   thing to go. The job reads `pull_request.commits` — the number the pull
   request itself shows — and joins the merge gate's `needs`.
 
+- **A failure point blocks only under the dual condition.** `decide()` in
+  `backend/framework_fix/classifier.py` is the whole of the new rule: a
+  failure blocks when it is acceptance-critical **and** either the failure
+  was reproduced as a framework defect (`framework_deterministic`,
+  `framework_timeout`) or the change went out of scope. Both halves have
+  to hold — the first one alone, or the second one alone, is not a
+  framework defect. A failure that is not acceptance-critical never
+  blocks, whatever else is true of it. A reproduction that came back
+  `flake` or `not_reproducible` does not block either, and it outranks
+  the out-of-scope half: a run that has just been shown to be flaky is
+  not held on the strength of a change that also wandered. The
+  out-of-scope half stands on its own — a change that reached outside the
+  plan's scope blocks without anyone having to reproduce anything first.
+  A failure that was reproduced but cannot be classified is `unclassified`
+  and is registered as evidence; two such rounds in a row are `exhausted`
+  and go to a human; a failure that has not been reproduced yet is
+  `needs_repro` and does not block yet. What comes out is a
+  `FailureDecision`, whose `blocking` flag is true exactly when the
+  disposition is `blocking` — and never `not_blocking`, which is what a
+  non-critical failure and a flaky reproduction both produce.
+
+- **A plan now has a kind, and the executor reads it in exactly one
+  place.** `plan_kind` (`backend/plan_state.py`) says what a plan is:
+  `normal` for an ordinary business plan, `framework_fix` for a plan that
+  exists to repair the framework itself. The executor (`backend/agent.py`)
+  carries exactly one judgment seam, `plan_start_decision()`: a
+  `framework_fix` plan skips the wait for a scheduled batch and starts its
+  current task directly, because the point of such a plan is to reach that
+  task now. Nothing else about execution changed — no second execution
+  path, no new scheduling mechanism, no second judgment. A plan that says
+  nothing about its kind is treated as `normal` and behaves exactly as
+  before, and a plan whose kind cannot be read raises instead of being
+  guessed at: guessing `normal` would silently change what that plan is
+  doing, and the plan itself would never know.
+
+- **Verification results are appended per tree, and the status endpoint
+  now says which tree a verdict came from.** A result row is written once
+  and never updated: the same verification point run again on another tree
+  appends another row to the append-only table `plan_verification_result`
+  (`backend/state_machine/db/schema.py`), so what was tried on which code
+  is kept rather than overwritten — a failure that overwrote its own
+  earlier row would leave the ledger one row short. Reading those rows
+  back is `read_vp_results()` (`backend/verification_persistence.py`),
+  and the status response (`backend/routes/verification.py`) now carries
+  `vp_results`: one row per verification point, the row from the most
+  recent tree, with that point's `tree_fingerprint` and the number of
+  rows it has accumulated as `history_count`. No conclusions yet is an
+  empty list rather than a missing field, because "no verdict yet" is
+  itself an answer. A plan held for a framework defect may not start or
+  reset a verification round — that round is waiting for the framework to
+  be repaired, not for another attempt — and the refusal is `409` with
+  `blocked_on_framework_fix` and the fingerprint of the defect it is held
+  on. A guard that cannot read the hold state refuses with `500` instead
+  of letting the round through: a guard that reads "could not tell" as
+  "not held" is not a guard.
+
 - **The base-drift check now names its base per plan
   (`backend/verification_agent.py`).** The base a branch is measured
   against is a property of the **repository**, not of the deployment:

@@ -332,6 +332,175 @@
       }
     ]
   },
+  "framework_fix": {
+    "cases": [
+      {
+        "id": "non-acceptance-critical-never-blocks",
+        "out": {
+          "blocking": false,
+          "display_state": null,
+          "disposition": "not_blocking",
+          "register": true,
+          "reproduce": false,
+          "unclassified_rounds": 0
+        }
+      },
+      {
+        "id": "framework-deterministic-reproduction-blocks",
+        "out": {
+          "blocking": true,
+          "display_state": null,
+          "disposition": "blocking",
+          "register": true,
+          "reproduce": false,
+          "unclassified_rounds": 0
+        }
+      },
+      {
+        "id": "framework-timeout-reproduction-blocks",
+        "out": {
+          "blocking": true,
+          "display_state": null,
+          "disposition": "blocking",
+          "register": true,
+          "reproduce": false,
+          "unclassified_rounds": 0
+        }
+      },
+      {
+        "id": "flake-outranks-out-of-scope-change",
+        "out": {
+          "blocking": false,
+          "display_state": null,
+          "disposition": "not_blocking",
+          "register": true,
+          "reproduce": false,
+          "unclassified_rounds": 0
+        }
+      },
+      {
+        "id": "not-reproducible-outranks-out-of-scope-change",
+        "out": {
+          "blocking": false,
+          "display_state": null,
+          "disposition": "not_blocking",
+          "register": true,
+          "reproduce": false,
+          "unclassified_rounds": 0
+        }
+      },
+      {
+        "id": "out-of-scope-change-blocks-without-a-reproduction",
+        "out": {
+          "blocking": true,
+          "display_state": null,
+          "disposition": "blocking",
+          "register": true,
+          "reproduce": false,
+          "unclassified_rounds": 0
+        }
+      },
+      {
+        "id": "consecutive-unclassified-rounds-exhaust-the-budget",
+        "out": {
+          "blocking": false,
+          "display_state": null,
+          "disposition": "exhausted",
+          "register": true,
+          "reproduce": false,
+          "unclassified_rounds": 2
+        }
+      },
+      {
+        "id": "unclassified-reproduction-registers-its-evidence",
+        "out": {
+          "blocking": false,
+          "display_state": null,
+          "disposition": "unclassified",
+          "register": true,
+          "reproduce": true,
+          "unclassified_rounds": 0
+        }
+      },
+      {
+        "id": "not-reproduced-yet-needs-a-reproduction",
+        "out": {
+          "blocking": false,
+          "display_state": null,
+          "disposition": "needs_repro",
+          "register": false,
+          "reproduce": true,
+          "unclassified_rounds": 0
+        }
+      },
+      {
+        "id": "held-plan-shows-the-blocked-state",
+        "out": {
+          "blocking": false,
+          "display_state": "blocked_on_framework_fix",
+          "disposition": "needs_repro",
+          "register": false,
+          "reproduce": true,
+          "unclassified_rounds": 0
+        }
+      },
+      {
+        "id": "exhausted-outranks-waiting-on-user-merge",
+        "out": {
+          "blocking": false,
+          "display_state": "framework_fix_exhausted",
+          "disposition": "needs_repro",
+          "register": false,
+          "reproduce": true,
+          "unclassified_rounds": 0
+        }
+      },
+      {
+        "id": "deadlock-outranks-reopened",
+        "out": {
+          "blocking": false,
+          "display_state": "scheduler_deadlock_suspected",
+          "disposition": "needs_repro",
+          "register": false,
+          "reproduce": true,
+          "unclassified_rounds": 0
+        }
+      },
+      {
+        "id": "reopened-outranks-waiting-on-user-merge",
+        "out": {
+          "blocking": false,
+          "display_state": "reopened",
+          "disposition": "needs_repro",
+          "register": false,
+          "reproduce": true,
+          "unclassified_rounds": 0
+        }
+      },
+      {
+        "id": "a-ready-fix-shows-waiting-on-user-merge",
+        "out": {
+          "blocking": false,
+          "display_state": "waiting_on_user_merge",
+          "disposition": "needs_repro",
+          "register": false,
+          "reproduce": true,
+          "unclassified_rounds": 0
+        }
+      },
+      {
+        "id": "a-plan-without-framework-fix-state-shows-nothing",
+        "out": {
+          "blocking": false,
+          "display_state": null,
+          "disposition": "needs_repro",
+          "register": false,
+          "reproduce": true,
+          "unclassified_rounds": 0
+        }
+      }
+    ]
+  },
   "loop": {
     "cases": [
       {

@@ -8,7 +8,7 @@
     <meta http-equiv="Expires" content="0">
     <title>Spec-Driven Dev System</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%234f46e5'/%3E%3Ctext x='8' y='12' font-size='10' text-anchor='middle' fill='white' font-family='sans-serif'%3ES%3C/text%3E%3C/svg%3E">
-    <link rel="stylesheet" href="style.css?v=17">
+    <link rel="stylesheet" href="style.css?v=18">
 </head>
 <body>
     <div id="app-layout">
@@ -118,6 +118,24 @@
                 <div id="scheduler-action-result" class="scheduler-action-result hidden">
                     <span id="scheduler-action-outcome" class="scheduler-action-outcome"></span>
                     <span id="scheduler-action-detail" class="scheduler-action-detail"></span>
+                </div>
+
+<!-- The framework-fix lane's own column.  The repair
+                     plans live here and in no other list: a plan is in
+                     the framework-fix column or in the ordinary one,
+                     never in both.  The block is hidden while the
+                     column is empty — an empty column takes no room
+                     on the panel, so a scheduler with no repair plans
+                     looks exactly as it did before the lane existed.
+
+                     It is a div, not a section: the scheduler view
+                     holds no nested section — five sibling gates read
+                     it as "everything up to its first closing tag",
+                     and a nested one would cut the view in half. -->
+                <div id="framework-fix-panel" class="framework-fix-panel hidden">
+                    <h3 class="scheduler-subtitle framework-fix-subtitle">框架修复</h3>
+                    <p id="framework-fix-notice" class="framework-fix-notice hidden"></p>
+                    <div id="framework-fix-list" class="framework-fix-list"></div>
                 </div>
 
                 <!-- The review queue (待你审核): what is waiting for the
@@ -484,6 +502,26 @@
         </main>
     </div>
 
-    <script src="app.js?v=20"></script>
+    <!-- The dismissal question.  The 忽略 button never writes by
+         itself: the operator says why, confirms, and only then is the
+         endpoint called.  Cancelling writes nothing at all — the
+         reason is required by the server ("a dismissal nobody can
+         explain is not a dismissal"), so the box asks for it here
+         rather than letting the server refuse a half-typed question. -->
+    <div id="framework-fix-confirm" class="ff-confirm-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="framework-fix-confirm-title">
+        <div class="ff-confirm-dialog">
+            <h4 id="framework-fix-confirm-title" class="ff-confirm-title">忽略这条框架修复？</h4>
+            <p id="framework-fix-confirm-text" class="ff-confirm-text"></p>
+            <label class="ff-confirm-label" for="framework-fix-reason">忽略原因（必填）</label>
+            <input id="framework-fix-reason" class="ff-confirm-input" type="text" autocomplete="off" placeholder="说明为什么这条修复可以忽略">
+            <p id="framework-fix-confirm-error" class="ff-confirm-error hidden"></p>
+            <div class="ff-confirm-actions">
+                <button id="framework-fix-confirm-cancel" class="btn btn-outline" type="button">取消</button>
+                <button id="framework-fix-confirm-ok" class="btn" type="button">确认忽略</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js?v=22"></script>
 </body>
 </html>

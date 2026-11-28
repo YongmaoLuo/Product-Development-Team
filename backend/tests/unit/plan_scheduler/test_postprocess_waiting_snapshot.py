@@ -28,9 +28,10 @@ grew a **terminal summary**:
    database: the snapshot is what everybody reads, and a read that
    shells out or opens a connection is a read that can block the tick.
 
-The nine-key shape is asserted exactly — not as a subset.  The sixth
+The ten-key shape is asserted exactly — not as a subset.  The sixth
 key became the seventh on purpose (the waiting list), the eighth is the
-parked list and the ninth the stopping list, and a subset
+parked list, the ninth the stopping list and the tenth the
+framework-fix lane's own plans, and a subset
 assertion would let the next key in without anybody deciding to add
 it.
 """
@@ -145,12 +146,12 @@ def _write_report(plans_dir: Path, plan_id: str = "p1") -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# 1. The shape is closed — nine keys, and the waiting row's eleven
+# 1. The shape is closed — ten keys, and the waiting row's eleven
 # ---------------------------------------------------------------------------
 
 
-def test_snapshot_has_eight_keys() -> None:
-    """The read model carries exactly nine keys.
+def test_snapshot_has_ten_keys() -> None:
+    """The read model carries exactly ten keys.
 
     The seventh is ``waiting`` — added on purpose, because the panel
     could not show what the operator was waiting for.  The eighth is
@@ -158,6 +159,8 @@ def test_snapshot_has_eight_keys() -> None:
     hold no slot and are in no line.  The ninth is ``stopping`` — the
     commands the scheduler has accepted and not answered yet, so a
     plan that is on its way to a stop is visible before it is stopped.
+    The tenth is ``framework_fixes`` — the framework-fix lane's own
+    plans, which are in no ordinary line either.
     The set is compared exactly and not as a subset: a subset assertion
     would let the next key in without anybody deciding to add it.
     """
@@ -172,6 +175,7 @@ def test_snapshot_has_eight_keys() -> None:
         "waiting",
         "parked",
         "stopping",
+        "framework_fixes",
         "generated_at",
     }
 

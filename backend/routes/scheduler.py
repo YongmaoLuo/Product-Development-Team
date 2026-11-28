@@ -62,11 +62,12 @@ command's own vocabulary of outcomes becomes an HTTP status code and a
 document, and the rules of that translation are the same for all four
 actions.
 
-The nine keys
+The ten keys
 --------------
 ``capacity``, ``queue_length``, ``over_capacity``, ``queue``,
-``running``, ``waiting``, ``parked``, ``stopping`` and ``generated_at``
-— the document the panel renders andthe LUI reports.  The list lives in
+``running``, ``waiting``, ``parked``, ``framework_fixes``, ``stopping``
+and ``generated_at`` — the document
+the panel renders andthe LUI reports.  The list lives in
 :func:`plan_scheduler.snapshot.build`, which is the only place it is
 written down; this module does not repeat it, because a second copy of
 the key set is a second thing to keep in step with the first.
@@ -76,6 +77,21 @@ capacity.  It holds no slot and is in no line, so the panel would not
 see those plans at all unless the read model named them — and its rows
 carry a phase, so they carry the label of that phase like every other
 row does.
+
+The ``framework_fixes`` list is the framework-fix lane's own plans —
+the ones the routing layer says are ``plan_kind="framework_fix"``.  The
+four ordinary lists do **not** name them: a repair plan is in the
+framework-fix column or in the ordinary one, never in both, because a
+panel that showed the same plan twice would show the operator two
+different things.
+
+The ``kind`` parameter picks the partition the caller is asking for:
+``plans`` for the ordinary one, ``framework_fix`` for the lane's own
+column, ``all`` for both.  The vocabulary is closed — a word outside it
+is a 422, because a word this route cannot answer is a question the
+caller has to be told it asked badly, not one it is quietly handed the
+whole document for.  The capacity block is the scheduler's own fact and
+stays in every answer: a repair plan holds a slot like any other plan.
 
 The ``stopping`` list is the commands the scheduler has accepted and
 not answered yet.  A plan that is asked to pause leaves the running
@@ -230,7 +246,7 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, Iterator, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Iterator, List, Literal, Optional, Tuple
 
 from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -267,7 +283,14 @@ from plan_scheduler.commands import (
 from plan_scheduler.capacity import CAPACITY_OVERRIDE_KEY
 from plan_scheduler.engine import FAILED, PENDING_ANSWER
 from plan_scheduler.review_queue import build_review_queue
-from plan_scheduler.snapshot import build, postprocess_summary
+from plan_scheduler.snapshot import (
+    FRAMEWORK_FIXES_KEY,
+    KIND_ALL,
+    KIND_FRAMEWORK_FIX,
+    KIND_PLANS,
+    build,
+    postprocess_summary,
+)
 
 # The finishing stage's waiting lifecycle.  The registry is the one
 # thing that may move a deadline, append an audit entry or give up on
@@ -362,7 +385,7 @@ def _empty_snapshot() -> Dict[str, Any]:
     """The idle scheduler's read model.
 
     Assembled by the production builder out of an empty state, so the
-    idle document has the very same eight keys as a busy one — a caller
+    idle document has the very same nine keys as a busy one — a caller
     does not have to branch on "is there anything to show" before it
     can read the answer.
     """
@@ -505,13 +528,51 @@ def _with_phase_labels(payload: Dict[str, Any]) -> Dict[str, Any]:
     return labeled
 
 
+def _apply_kind(document: Dict[str, Any], kind: str) -> Dict[str, Any]:
+    """Answer one partition of the read model.
+
+    ``plans`` — the ordinary partition, and an empty framework-fix
+    partition.  ``framework_fix`` — the framework-fix partition, and an
+    empty ordinary one.  ``all`` — both, which is what the panel that
+    draws one screen for everything asks for.
+
+    The capacity block is the scheduler's own fact and stays in every
+    answer: a repair plan holds a slot like any other plan, and the
+    operator looking at the repair column still has to know how much of
+    the scheduler is in use.
+    """
+    answer = dict(document)
+
+    if kind == KIND_PLANS:
+        answer[FRAMEWORK_FIXES_KEY] = []
+        return answer
+
+    if kind == KIND_FRAMEWORK_FIX:
+        for name in _ROW_LISTS + ("waiting",):
+            answer[name] = []
+        answer["queue_length"] = 0
+        return answer
+
+    return answer
+
+
 @router.get("/api/scheduler/state")
-def get_scheduler_state(request: Request) -> Dict[str, Any]:
+def get_scheduler_state(
+    request: Request,
+    kind: Literal["all", "plans", "framework_fix"] = KIND_ALL,
+) -> Dict[str, Any]:
     """Answer with the scheduler's read model.
 
-    The engine's own snapshot: the six keys, the queue in the
+    The engine's own snapshot: the nine keys, the queue in the
     production order, the numbers the panel shows beside the flags
     that describe them.
+
+    The ``kind`` parameter picks the partition the caller is asking
+    for: ``plans`` for the ordinary one, ``framework_fix`` for the
+    framework-fix lane's own column, ``all`` for both.  The vocabulary
+    is closed — a word outside it is a 422, because a word this route
+    cannot answer is a question the caller must be told it asked
+    badly, not one it is quietly handed the whole document for.
 
     A scheduler that is not running answers the empty document rather
     than an error — the endpoint is what the panel polls, and an
@@ -519,22 +580,30 @@ def get_scheduler_state(request: Request) -> Dict[str, Any]:
     operator with a broken panel and no way to tell an idle scheduler
     from a broken one.
     """
-    document = _scheduler_read_model(request)
+    document = _scheduler_read_model(request, kind)
     document["review_queue"] = _review_queue()
     return document
 
 
-def _scheduler_read_model(request: Request) -> Dict[str, Any]:
+def _scheduler_read_model(
+    request: Request, kind: str = KIND_ALL
+) -> Dict[str, Any]:
     """The engine's read model, with the finishing stage's waits in it.
 
     The engine's snapshot, labelled and merged with the durable waits —
     and nothing else.  The review queue is a key of its own and is
     added by the route that answers (see :func:`get_scheduler_state`).
+
+    The partition the caller asked for is applied here: the route passes
+    its ``kind`` down, and the read model answers that partition — the
+    ordinary one, the framework-fix lane's own column, or both.
     """
     engine = getattr(request.app.state, "scheduler_engine", None)
 
     if engine is None:
-        return _state_with_waiting(_with_phase_labels(_empty_snapshot()))
+        return _state_with_waiting(
+            _with_phase_labels(_apply_kind(_empty_snapshot(), kind))
+        )
 
     try:
         snapshot = engine.snapshot()
@@ -543,11 +612,13 @@ def _scheduler_read_model(request: Request) -> Dict[str, Any]:
         # as far as the panel is concerned — and the panel must keep
         # answering.  The failure is logged rather than swallowed.
         logger.exception("the scheduler's snapshot could not be read")
-        return _state_with_waiting(_with_phase_labels(_empty_snapshot()))
+        return _state_with_waiting(
+            _with_phase_labels(_apply_kind(_empty_snapshot(), kind))
+        )
 
     if not isinstance(snapshot, Mapping):
         # An answer that is not a document is not the read model: the
-        # panel reads the eight keys by name, and a document without them
+        # panel reads the nine keys by name, and a document without them
         # leaves it reading keys that are not there.  The idle document
         # is the one answer this route is allowed to give on its own,
         # so the panel keeps polling and keeps getting the read model.
@@ -556,9 +627,13 @@ def _scheduler_read_model(request: Request) -> Dict[str, Any]:
             "answering the idle read model",
             type(snapshot).__name__,
         )
-        return _state_with_waiting(_with_phase_labels(_empty_snapshot()))
+        return _state_with_waiting(
+            _with_phase_labels(_apply_kind(_empty_snapshot(), kind))
+        )
 
-    return _state_with_waiting(_with_phase_labels(dict(snapshot)))
+    return _state_with_waiting(
+        _with_phase_labels(_apply_kind(dict(snapshot), kind))
+    )
 
 
 # ---------------------------------------------------------------------------

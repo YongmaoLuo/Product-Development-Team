@@ -80,12 +80,23 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional
 
-from .capacity import CAPACITY_OVERRIDE_KEY
+from .capacity import (
+    CAPACITY_OVERRIDE_KEY,
+    FRAMEWORK_FIX_MAX_ACTIVE_KEY,
+    FRAMEWORK_FIX_MAX_PER_REPO_KEY,
+    FRAMEWORK_FIX_OVERSUBSCRIBE_KEY,
+    FRAMEWORK_FIX_OVERSUBSCRIBE_LEASE_KEY,
+)
 from .queue import queue_key
 from .retry import retry_on_busy
 
 __all__ = [
     "CAPACITY_OVERRIDE_KEY",
+    "FRAMEWORK_FIX_LIMIT_KEYS",
+    "FRAMEWORK_FIX_MAX_ACTIVE_KEY",
+    "FRAMEWORK_FIX_MAX_PER_REPO_KEY",
+    "FRAMEWORK_FIX_OVERSUBSCRIBE_KEY",
+    "FRAMEWORK_FIX_OVERSUBSCRIBE_LEASE_KEY",
     "PENDING_OUTCOME",
     "SqliteSchedulerStore",
 ]
@@ -104,6 +115,16 @@ PENDING_OUTCOME = "accepted"
 #: module is where the row is read and written.  It is *defined* beside the
 #: ledger that reads it so that a caller which only needs the key — the
 #: route that writes the override — does not have to import this module.
+
+#: The three keys the framework-fix lane's capacity ceilings live under,
+#: in the order the ledger reads them.  They are imported above from
+#: :mod:`plan_scheduler.capacity` — the ledger owns the rules, this module
+#: owns the rows.
+FRAMEWORK_FIX_LIMIT_KEYS = (
+    FRAMEWORK_FIX_MAX_ACTIVE_KEY,
+    FRAMEWORK_FIX_MAX_PER_REPO_KEY,
+    FRAMEWORK_FIX_OVERSUBSCRIBE_KEY,
+)
 
 
 #: The columns of ``scheduler_queue``, in the order they are read.
@@ -794,3 +815,128 @@ class SqliteSchedulerStore:
                 "DELETE FROM scheduler_setting WHERE key = ?", (key,)
             )
             return cursor.rowcount > 0
+
+    # ------------------------------------------------------------------
+    # The lease on the slot beyond the capacity
+    # ------------------------------------------------------------------
+    def get_oversubscribe_lease(self, conn: sqlite3.Connection) -> Optional[str]:
+        """Who holds the slot beyond the scheduler's capacity.
+
+        The slot is the framework-fix lane's own, and it is a **lease**:
+        at most one repair plan holds it at a time.  The holder is
+        written down rather than derived from a count, because a count
+        cannot say *which* plan took the lane's slot — only *how many*
+        plans are running.
+
+        Args:
+            conn: the connection to read on.
+
+        Returns:
+            The plan id that holds the lease, or ``None`` when the slot
+            is free.
+        """
+        raw = self.get_setting(conn, FRAMEWORK_FIX_OVERSUBSCRIBE_LEASE_KEY)
+        holder = str(raw or "").strip()
+        return holder or None
+
+    def set_oversubscribe_lease(self, conn: sqlite3.Connection, plan_id: str) -> None:
+        """Write this plan down as the holder of the slot beyond the capacity.
+
+        The key is the primary key, so writing it twice replaces the
+        holder rather than adding a second one: there is one slot, so
+        there is one holder.
+
+        Args:
+            conn: the connection to write on.
+            plan_id: the plan that takes the slot.
+        """
+        self.set_setting(
+            conn, FRAMEWORK_FIX_OVERSUBSCRIBE_LEASE_KEY, str(plan_id)
+        )
+
+    def release_oversubscribe_lease(
+        self, conn: sqlite3.Connection, plan_id: str
+    ) -> bool:
+        """Give the slot back — but only if that plan is the one holding it.
+
+        A lease is released by its holder, not by anybody: a plan that
+        does not hold the lease must not take it away from the plan
+        that does.
+
+        Args:
+            conn: the connection to write on.
+            plan_id: the plan that gives the slot back.
+
+        Returns:
+            ``True`` when this plan held the lease and it is released,
+            ``False`` when it held nothing.
+        """
+        holder = self.get_oversubscribe_lease(conn)
+        if holder is None or holder != str(plan_id):
+            return False
+        return self.delete_setting(conn, FRAMEWORK_FIX_OVERSUBSCRIBE_LEASE_KEY)
+
+    # ------------------------------------------------------------------
+    # The framework-fix lane's ceilings
+    # ------------------------------------------------------------------
+
+    def get_framework_fix_limits(
+        self, conn: sqlite3.Connection
+    ) -> Dict[str, Optional[str]]:
+        """Read the lane's three capacity ceilings, as they stand.
+
+        A ceiling nobody set reads as ``None`` — "the configured value
+        applies" — and not as a number and not as an empty string: the
+        caller has to be able to tell "not set" apart from "set to
+        nothing".
+
+        Args:
+            conn: the connection to read on.
+
+        Returns:
+            The three keys of :data:`FRAMEWORK_FIX_LIMIT_KEYS`, each
+            mapped to the value stored under it or to ``None``.
+        """
+        return {key: self.get_setting(conn, key) for key in FRAMEWORK_FIX_LIMIT_KEYS}
+
+    def set_framework_fix_limits(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        max_active: Optional[int] = None,
+        max_per_repo: Optional[int] = None,
+        oversubscribe: Optional[int] = None,
+    ) -> Dict[str, Optional[str]]:
+        """Write the ceilings that are named, and read back what is in force.
+
+        Only the ceilings that are given are written; the ones that are
+        not keep the value they had.  A ceiling of ``0`` *is* a value —
+        it is how an operator says "admit nothing" — so it is written,
+        while ``None`` means "leave this one alone".
+
+        The rows are the whole point: a ceiling that lives in a row
+        survives a restart, so an operator who turns a ceiling down
+        finds it still turned down after the scheduler comes back.
+
+        Args:
+            conn: the connection to write on.
+            max_active: the global ceiling — how many framework-fix
+                plans may hold compute at the same time, everywhere.
+            max_per_repo: the per-repository ceiling.
+            oversubscribe: how many slots may be taken beyond the
+                ceiling.
+
+        Returns:
+            The three keys of :data:`FRAMEWORK_FIX_LIMIT_KEYS`, each
+            mapped to the value now stored under it or to ``None``.
+        """
+        given = {
+            FRAMEWORK_FIX_MAX_ACTIVE_KEY: max_active,
+            FRAMEWORK_FIX_MAX_PER_REPO_KEY: max_per_repo,
+            FRAMEWORK_FIX_OVERSUBSCRIBE_KEY: oversubscribe,
+        }
+        for key, value in given.items():
+            if value is None:
+                continue
+            self.set_setting(conn, key, str(int(value)))
+        return self.get_framework_fix_limits(conn)

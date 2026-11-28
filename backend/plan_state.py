@@ -12,6 +12,16 @@ The legacy ``plan_state.json`` file is no longer written by
 :class:`PlanState`; on first read of a plan whose file exists but
 whose ``plan_routing`` row does not, the contents are migrated to
 SQLite (one-shot, atomic) and the file is ignored thereafter.
+
+Two further columns carry the framework-fix lane's state (added by the
+2026-11-23 migration): ``plan_kind`` (``normal`` / ``framework_fix``) and
+``framework_fix`` (a JSON block, ``{}`` meaning "no framework-fix state").
+:class:`PlanState` reads them via :meth:`PlanState.get_plan_kind` /
+:meth:`PlanState.get_framework_fix` and writes them via
+:meth:`PlanState.enter_block` / :meth:`PlanState.exit_block`. They are
+**not** phase values: the phase vocabulary stays untouched, and the
+framework-fix display states are projected by
+``backend/framework_fix/read_model.py``.
 """
 
 import hashlib
@@ -20,7 +30,7 @@ import json
 import logging
 import os
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional, List, Dict, Any
@@ -56,6 +66,14 @@ PLAN_STATE_FILENAME: str = "plan_state.json"
 #: (``backend/tests/unit/test_plan_state_verification_read.py::
 #: test_default_max_rounds_matches_the_server_constant``).
 DEFAULT_MAX_VERIFICATION_ROUNDS: int = 4
+
+#: ``plan_routing.plan_kind`` 的默认值 —— 一个普通业务计划。
+#:
+#: 2026-11-23: ``plan_kind`` 区分「普通计划」（``normal``）与「框架修复
+#: 计划」（``framework_fix``，由框架修复 lane 为框架缺陷建的修复计划）。
+#: 这一列是任务 1 的迁移加上去的，列的 DEFAULT 就是这个值，所以旧行读出来
+#: 一律是它 —— 框架修复特性上线之前写下的计划，本来就不是修复计划。
+DEFAULT_PLAN_KIND: str = "normal"
 
 #: 模块级 logger。
 #:
@@ -187,6 +205,108 @@ def _decode_json_column(value: Any, default: Any) -> Any:
         return json.loads(value)
     except (TypeError, ValueError):
         return default
+
+
+def _utc_now_iso() -> str:
+    """当前 UTC 时间的 ISO-8601 串（``...Z``）。
+
+    与 ``RoutingRepository._now_iso`` 同一口径 —— ``plan_routing.updated_at``
+    是那一列的写者，两边格式不同会让按字符串排序的消费者看到错乱的顺序。
+    """
+    return (
+        datetime.now(tz=timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _read_framework_fix_columns(
+    conn: Any,
+    plan_id: str,
+) -> tuple[str, Dict[str, Any]]:
+    """从一条已打开的连接上读 ``plan_kind`` / ``framework_fix`` 两列。
+
+    返回 ``(plan_kind, framework_fix)``。读不到（表没有这两列、没有这一行、
+    值坏掉）一律给文档化的默认值：普通计划 + 空块。**不抛错** —— 一个框架
+    修复特性上线之前写下的计划，本来就没有框架修复状态；把它读成异常等于
+    让一次旧数据的存在变成一次崩溃。
+    """
+    try:
+        row = conn.execute(
+            "SELECT plan_kind, framework_fix FROM plan_routing WHERE plan_id = ?",
+            (plan_id,),
+        ).fetchone()
+    except Exception:  # noqa: BLE001
+        return DEFAULT_PLAN_KIND, {}
+    if row is None:
+        return DEFAULT_PLAN_KIND, {}
+    kind = row[0] or DEFAULT_PLAN_KIND
+    block = _decode_json_column(row[1], {})
+    if not isinstance(block, dict):
+        block = {}
+    return str(kind), block
+
+
+def _read_routing_framework_fix(
+    plan_id: str,
+) -> Optional[tuple[str, Dict[str, Any]]]:
+    """读 ``plan_routing`` 的两列；**读不到**时返回 ``None``。
+
+    ``None`` 与「读到空块」是两件不同的事：前者是数据库读不了（调用方该
+    知道这个答案不可信），后者是「这个计划确实没有框架修复状态」。
+
+    这一条是**纯读**：不迁移、不建行、不写任何东西。列不存在时读路径给出
+    默认值就够了 —— 那正是旧计划该有的答案。
+    """
+    try:
+        from state_machine.db.connection import open as _open_db
+    except ImportError:
+        return None
+    try:
+        conn = _open_db(_state_db_path())
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        return _read_framework_fix_columns(conn, plan_id)
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        conn.close()
+
+
+def _write_routing_framework_fix(plan_id: str, block: Dict[str, Any]) -> None:
+    """把 ``framework_fix`` 块写进 ``plan_routing`` 行。
+
+    **写失败抛错**（不吞）：挂起写不进去却报告成功，比写失败更糟 ——
+    读模型会按「没挂起」渲染，而计划其实停在被阻塞的状态上。抛错让调用方
+    能重试。
+
+    行不存在时先建一行：``insert_if_missing`` 只写 ``plan_id`` /
+    ``current_phase`` / ``version`` / ``updated_at``，不碰别人拥有的列
+    （相位 CAS 的 ``version`` / ``substage`` 尤其不能被顺手动）。
+    """
+    from state_machine.db.connection import open as _open_db
+    from state_machine.db.schema import migrate as _migrate
+    from state_machine.repositories.routing_repository import RoutingRepository
+
+    conn = _open_db(_state_db_path())
+    try:
+        # 迁移是幂等的补列步骤 —— 列不存在时写不进去。
+        _migrate(conn)
+        RoutingRepository(conn).insert_if_missing(plan_id, "interview")
+        conn.execute(
+            "UPDATE plan_routing SET framework_fix = ?, updated_at = ? "
+            "WHERE plan_id = ?",
+            (
+                json.dumps(block, ensure_ascii=False),
+                _utc_now_iso(),
+                plan_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _verification_status_for_phase(phase: Optional[str]) -> Optional[str]:
@@ -357,6 +477,16 @@ def migrate_mirror_stop_reason(
 # ``<repo>/plans/<fixture-id>/`` in the operator's live tree.
 plans_dir: Path = resolve_plans_dir()
 
+#: 「被框架缺陷阻塞」相位（架构决策点 4，2026-11-25）。
+#:
+#: 命中框架缺陷之后原计划要停下来等修复。**部分阻塞**时计划还有别的活要干，
+#: 相位不动；**全部阻塞**时（一点活都不剩了）计划进这个相位：让出执行/验证
+#: 槽位，回调度队列排队等修复合入。
+#:
+#: 它不是终态（释放之后还要再跑一遍），也不是失败（被挡住不是做砸了）——
+#: 所以进它的那条路绝不写失败裁决、绝不消耗重试预算。
+BLOCKED_PHASE = "blocked_on_framework_fix"
+
 VALID_PHASES = [
     "interview",
     "interview_complete",
@@ -432,6 +562,24 @@ VALID_PHASES = [
     "verification_passed",
     "verification_failed",
     "verification_repairing",
+    # 2026-11-25: ``blocked_on_framework_fix`` —— 「被框架缺陷阻塞」
+    # （架构决策点 4）。
+    #
+    # 命中框架缺陷之后，原计划**停下来**等修复。停下来有两种：部分阻塞
+    # （还有别的活要干 —— 计划继续做那些）与全部阻塞（一点活都不剩了）。
+    # 只有后一种才需要一个**相位**：它把计划从「跑着的活」里摘出来，让出
+    # 执行/验证槽位，回调度队列排队等修复合入。
+    #
+    # 它**不是**终态：挂起被释放之后，计划还要回队列再跑一遍（出边
+    # ``queued``）。它也**不是**失败：被框架缺陷挡住不是这条计划做砸了，
+    # 所以绝不写失败裁决、绝不消耗重试预算。
+    #
+    # 五个可见状态里只有它落在相位上，其余四个
+    # （``waiting_on_user_merge`` / ``framework_fix_exhausted`` /
+    # ``scheduler_deadlock_suspected`` / ``reopened``）住在 ``framework_fix``
+    # JSON 块里 —— 展示由读模型（``backend/framework_fix/read_model.py``）
+    # 投影。
+    "blocked_on_framework_fix",
     # 2026-11-20: ``user_stopping`` —— 「正在停止」（**plan 级**）。
     #
     # 过去 stop 只有一条边：从 ``verification_running`` /
@@ -537,6 +685,11 @@ PHASE_LABELS: Dict[str, str] = {
     # 未命中时回退为阶段名本身，于是这个相位会以裸英文 ``user_stopping``
     # 的样子出现在卡片与页面上 —— 那是**词表内部**的名词，读者认不出来。
     "user_stopping": "正在停止",
+    # 2026-11-25: ``blocked_on_framework_fix``（被框架缺陷阻塞）—— 架构
+    # 决策点 4 的那个相位。字面与前端徽章表（``frontend/app.js`` 的
+    # ``FRAMEWORK_FIX_BADGE_LABELS``）一致：读者在卡片上看到的词与后端
+    # 词表里的词是同一个。
+    "blocked_on_framework_fix": "被框架缺陷阻塞",
 }
 
 #: Historical phase values that are no longer written anywhere, mapped
@@ -656,7 +809,7 @@ PHASE_TRANSITIONS = {
     #
     # 2026-10-26 (merge): 加上 ``waiting_for_quota`` —— 执行期发现所有
     # provider 都没余量了，计划停在这个相位上等人（容量回来再启动）。
-    "executing": ["completed", "failed", "stopped", "ready", "queued", "waiting_for_quota"],
+    "executing": ["completed", "failed", "stopped", "ready", "queued", "waiting_for_quota", "blocked_on_framework_fix"],
     # 2026-10-24: the parked-for-capacity state. Three ways out:
     # ``executing`` (capacity came back — restart the work), ``ready``
     # (pull it back to the manual gate), ``stopped`` (park it for
@@ -712,6 +865,32 @@ PHASE_TRANSITIONS = {
     "post_processing": ["completed", "postprocess_failed", "queued"],
     # 续跑：从失败相位回到收尾阶段本身（同相位重入是幂等的 no-op）。
     "postprocess_failed": ["post_processing"],
+    # 2026-11-25: 阻塞相位（架构决策点 4）。
+    #
+    # **进边写在主表里** —— 验证子表是冻结的安全边界
+    # （``verification_passed`` 那一行必须还是空的），而 ``transition_to``
+    # 取两张表的并集，所以放哪张表都不影响可走性；这里选主表是为了让那张
+    # 冻结的子表一个字节都不动。同 ``post_processing`` 的做法 ——
+    # ``PHASE_TRANSITIONS["verification_passed"]`` 就是这么加的。
+    #
+    # 进边有两条来路：
+    #
+    # * 执行期的计划（``executing``）：执行撞上框架缺陷，全部剩余工作都被
+    #   挡住时也要让出执行槽位；
+    # * 验证系列的计划（``verification`` / ``verification_running`` /
+    #   ``verify_first_pass`` / ``verify_recheck`` / ``verification_failed`` /
+    #   ``verification_repairing``）：这一轮验证的活全被挡住了。
+    #
+    # 出边只有两条：``queued``（挂起被释放后回调度队列，让它重新被调度一
+    # 次）与 ``stopped``（留给操作者）。它**不是**终态 —— 释放之后计划还要
+    # 再跑一遍，所以出边里没有终态。
+    "verification": ["blocked_on_framework_fix"],
+    "verification_running": ["blocked_on_framework_fix"],
+    "verify_first_pass": ["blocked_on_framework_fix"],
+    "verify_recheck": ["blocked_on_framework_fix"],
+    "verification_failed": ["blocked_on_framework_fix"],
+    "verification_repairing": ["blocked_on_framework_fix"],
+    "blocked_on_framework_fix": ["queued", "stopped"],
 }
 
 #: 相位 ``archived`` 的**通用目标**规则里，唯一不能作为源相位的那些。
@@ -1050,12 +1229,25 @@ class PlanState:
             )
         except Exception:  # noqa: BLE001
             verification_row = None
+        try:
+            plan_kind, framework_fix = _read_framework_fix_columns(
+                conn, self.plan_dir.name
+            )
+        except Exception:  # noqa: BLE001
+            plan_kind, framework_fix = DEFAULT_PLAN_KIND, {}
         finally:
             conn.close()
         if row is None:
             return None
         # Map SQLite columns back to the legacy ``_state`` shape.
-        return self._sqlite_row_to_state(row, verification_row)
+        state = self._sqlite_row_to_state(row, verification_row)
+        # The framework-fix columns travel with the rest of the state so
+        # that ``get_state()`` is a complete picture of the plan — the
+        # read model (``backend/framework_fix/read_model.py``) reads the
+        # block straight out of it.
+        state["plan_kind"] = plan_kind
+        state["framework_fix"] = framework_fix
+        return state
 
     def _migrate_mirror_stop_reason(self, row: dict) -> Optional[dict]:
         """Carry a legacy mirror-column stop reason into the authoritative row.
@@ -1538,6 +1730,151 @@ class PlanState:
         """
         mode, _is_fallback = mode_from_flags(self._state.get("flags", {}))
         return mode
+
+    # --- 框架修复：plan_kind 与 framework_fix 块 --------------------------
+    #
+    # 架构决策点 4：五种可见状态里只有 ``blocked_on_framework_fix`` 落在
+    # **相位**上（且只在「全部剩余工作被阻塞」时），其余四种
+    # （``waiting_on_user_merge`` / ``framework_fix_exhausted`` /
+    # ``scheduler_deadlock_suspected`` / ``reopened``）住在 ``framework_fix``
+    # JSON 块里 —— 展示由读模型（``backend/framework_fix/read_model.py``）
+    # 投影。
+    #
+    # 所以这一节改的是**两列**：``plan_kind`` 说这个 plan 是什么计划，
+    # ``framework_fix`` 说它此刻被框架缺陷挡成了什么样。
+    #
+    # 2026-11-25：相位词表**多了一个相位** —— ``blocked_on_framework_fix``
+    # 进了 ``VALID_PHASES`` / ``PHASE_TRANSITIONS`` / ``PHASE_LABELS``
+    # （架构决策点 4 要求它有常量与合法迁移）。它只在「全部剩余工作被阻塞」
+    # 时被写入 —— 那个判定由 ``backend/framework_fix/lifecycle.py`` 做，
+    # 这里提供的是**相位机制**（写进去 / 从里面出来）。
+
+    def get_plan_kind(self) -> str:
+        """这个 plan 是什么计划 —— ``normal`` 或 ``framework_fix``。
+
+        读的是**活库里的那一列**，不是构造时的快照：计划种类是别人写的，
+        读的人要看到最新的。
+
+        读不出来时（数据库不可用）退回构造时缓存的值，再退回
+        :data:`DEFAULT_PLAN_KIND` —— 旧计划没有这个概念，读成普通计划。
+        """
+        read = _read_routing_framework_fix(self.plan_dir.name)
+        if read is not None:
+            return read[0]
+        cached = self._state.get("plan_kind")
+        return str(cached) if cached else DEFAULT_PLAN_KIND
+
+    def get_framework_fix(self) -> dict:
+        """这个 plan 的框架修复块 —— ``{}`` 表示没有框架修复状态。
+
+        读的是**活库里的那一块**：挂起是别人写的，读模型要看到最新的。
+
+        读不出来时（数据库不可用）退回构造时缓存的值，再退回 ``{}``。
+        """
+        read = _read_routing_framework_fix(self.plan_dir.name)
+        if read is not None:
+            return dict(read[1])
+        cached = self._state.get("framework_fix")
+        return dict(cached) if isinstance(cached, dict) else {}
+
+    def enter_block(
+        self,
+        plan_id: str,
+        *,
+        fingerprint: str,
+        fix_plan_id: str,
+    ) -> None:
+        """把这个 plan 挂进框架修复块。
+
+        块里记着三件事：本计划被挂住了（``hold``）、挂它的是哪个框架缺陷
+        （``fingerprint``）、以及替它修的计划是谁（``fix_plan_id``）。第四个
+        键 ``unclassified_rounds`` 是**别的写者**维护的计数（分类器判不出
+        这一轮属于哪个缺陷时递增），挂起动作不碰它。
+
+        幂等：重复调用**不重置** ``unclassified_rounds``。把它清零等于把
+        「判不出来」的历史抹掉了 —— 而「判不出来几轮」正是决定这个签名
+        是否耗尽的依据。
+
+        写失败抛错（见 :func:`_write_routing_framework_fix`）：挂起写不进去
+        却报告成功，比写失败更糟。
+        """
+        read = _read_routing_framework_fix(plan_id)
+        current = dict(read[1]) if read is not None else {}
+        rounds = current.get("unclassified_rounds")
+        if not isinstance(rounds, int) or isinstance(rounds, bool):
+            rounds = 0
+        block = dict(current)
+        block["hold"] = True
+        block["fingerprint"] = fingerprint
+        block["fix_plan_id"] = fix_plan_id
+        block["unclassified_rounds"] = rounds
+        _write_routing_framework_fix(plan_id, block)
+        if plan_id == self.plan_dir.name:
+            self._state["framework_fix"] = dict(block)
+
+    def exit_block(self, plan_id: str) -> None:
+        """把这个 plan 从框架修复块里放出来。
+
+        没有块 → **无操作**：不写库，连行都不建。退块不是一次写，它只是
+        「把挂起撤掉」—— 没有挂起可撤的时候，它什么都不做。
+
+        有块 → 把块清空，列回到 ``{}`` —— 也就是「这个计划没有框架修复
+        状态」这个文档化的默认值。块里的历史（哪个指纹、哪个修复计划）
+        由注册表的挂接记录保存，不靠这块 JSON 记。
+        """
+        read = _read_routing_framework_fix(plan_id)
+        if read is not None and not read[1]:
+            return
+        _write_routing_framework_fix(plan_id, {})
+        if plan_id == self.plan_dir.name:
+            self._state["framework_fix"] = {}
+
+    # --- 框架修复：阻塞相位 -----------------------------------------------
+    def enter_blocked_phase(self) -> bool:
+        """把这条计划移进「被框架缺陷阻塞」相位。
+
+        这个方法只做**相位机制**：判断当前相位能不能走到阻塞相位，然后走。
+        「该不该阻塞」（全部剩余工作是不是都被挡住了）是**业务判定** ——
+        由 ``backend/framework_fix/lifecycle.py`` 拿着挂起事实做完了才调
+        这里的。
+
+        走不动就**不动**：当前相位没有到阻塞相位的那条边时返回 ``False``，
+        相位留在原处。一个「该阻塞却没阻塞」的计划仍然是能看见、能操作的
+        计划；一个「被硬推进去」的计划则落在没人能解释的相位上。
+
+        Args:
+            无 —— 作用对象是这条计划自己（``self.plan_dir.name``）。
+
+        Returns:
+            计划此刻是否停在阻塞相位上（已经在上面也算）。
+        """
+        self.reload()
+        current = self._state.get("current_phase", "")
+        if current == BLOCKED_PHASE:
+            return True
+        allowed = set(PHASE_TRANSITIONS.get(current, []))
+        allowed.update(VERIFICATION_PHASE_TRANSITIONS.get(current, []))
+        if BLOCKED_PHASE not in allowed:
+            return False
+        self.transition_to(BLOCKED_PHASE)
+        return True
+
+    def leave_blocked_phase(self) -> bool:
+        """把这条计划从阻塞相位带回调度队列。
+
+        挂起被释放之后，计划要回队列重新被调度一次 —— 它不是终态：被框架
+        缺陷挡住的那段时间不算「做砸了」，计划还要把那件事做完。
+
+        不在阻塞相位上 → 返回 ``False``，什么都不做。
+
+        Returns:
+            是否真的移出去了。
+        """
+        self.reload()
+        if self._state.get("current_phase", "") != BLOCKED_PHASE:
+            return False
+        self.transition_to("queued")
+        return True
 
     # --- Phase Transitions ---
 

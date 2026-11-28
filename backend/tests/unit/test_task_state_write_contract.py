@@ -469,6 +469,11 @@ ACKNOWLEDGED_CALL_SITES: Dict[str, str] = {
         "fields={'status'}，且只作用于当前 status='in_progress' 的行 —— "
         "拥有者进程已死，回收为 pending。刻意不写 end_ts / failure_reason / "
         "commit_sha / attempt：那不是判决，未完成的任务不能留下终态痕迹",
+    "framework_fix/lifecycle.py::FrameworkFixLifecycle._restore_retry_count":
+        "fields={'attempt'} —— 只写这一列，且只作用于该验证点的任务行里 attempt "
+        "高于冻结值的那些行（挂起窗口里消耗的预算不算数，按挂起那一刻的值按回去）。"
+        "刻意不写 status / failure_reason / end_ts / commit_sha：计数回退不是判决，"
+        "不得把任务的终态痕迹、失败现场或提交号一起抹掉",
     "state_machine/repositories/_task_progress_migration.py"
     "::migrate_tasks_json_to_progress":
         "旧 task_progress JSON 一次性迁移，runtime_entry 为整行运行态",

@@ -90,6 +90,7 @@ deterministic ``{file_path}:{line_no}:{pattern_name}`` message so the backend ca
 from __future__ import annotations
 
 import ast
+import importlib.util
 import json
 import os
 import re
@@ -113,6 +114,30 @@ import pytest
 
 # Backend root directory (the parent of ``server.py`` and ``state_machine/``).
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
+
+#: The backend's own copy of the schema-table gate — and the **single
+#: source of truth** for the table set ``migrate()`` creates.
+#:
+#: It lives in ``backend/tests/static_gates/``, which is not a package
+#: (there is no ``__init__.py`` there), so it is loaded by path — the
+#: same way ``scripts/judgment_snapshots.py`` is loaded elsewhere in
+#: this suite.  The module is registered in ``sys.modules`` before it
+#: is executed, and the registered name is unique to this file so
+#: nothing else can collide with it.
+_SCHEMA_TABLE_SOURCE = (
+    _BACKEND_ROOT
+    / "tests"
+    / "static_gates"
+    / "test_sqlite_schema_tables_exactly_four_plus_version.py"
+)
+_SCHEMA_TABLE_MODULE_NAME = "pdt_core_schema_tables_source_of_truth"
+_schema_spec = importlib.util.spec_from_file_location(
+    _SCHEMA_TABLE_MODULE_NAME, _SCHEMA_TABLE_SOURCE
+)
+assert _schema_spec and _schema_spec.loader
+_schema_tables = importlib.util.module_from_spec(_schema_spec)
+sys.modules[_SCHEMA_TABLE_MODULE_NAME] = _schema_tables
+_schema_spec.loader.exec_module(_schema_tables)
 
 # The request guard's header name and value, read from the module rather
 # than spelled out, so a rename on the server side cannot leave this
@@ -1259,39 +1284,39 @@ def test_e2e_teardown_guard(exec_instance_setup) -> None:
 # ``schema_version`` row is the bootstrap migration-logbook, NOT a
 # business table — but it is required (schema is "not migrated" if the
 # row is missing).
-_CORE_SCHEMA_TABLES: frozenset[str] = frozenset(
-    {
-        "plan_routing",
-        "plan_execution",
-        "plan_verification",
-        "plan_artifacts",
-        # v4 (2026-09-09) split
-        # per-task runtime state out of plan_execution.task_progress
-        # into this relational table — see
-        # state_machine/db/schema.py "The five plan_* tables".
-        "plan_tasks",
-        # v7 (2026-10-21) HITL
-        # the human-in-the-loop decision store, created by
-        # state_machine/db/schema.py "_ensure_plan_decisions" on every
-        # migrate() call — the same call that creates the tables above.
-        "plan_decisions",
-        # v7 (2026-10-28) native scheduler
-        # the scheduler's own three facts — the queue order, the slot
-        # occupancy and the operator commands — created by
-        # state_machine/db/schema.py "_SCHEDULER_OBJECTS" on every
-        # migrate() call, the same call that creates the tables above.
-        "scheduler_queue",
-        "scheduler_slot",
-        "scheduler_command",
-        # v7 (2026-10-29) the operator's runtime settings — the fourth
-        # scheduler table.  It is a member of the same
-        # "_SCHEDULER_OBJECTS" tuple, so migrate() creates it in the
-        # same call as the three above; it belongs in this set for the
-        # same reason they do.
-        "scheduler_setting",
-        "schema_version",
-    }
-)
+#
+# The set is **imported**, not written out here.  The backend's own
+# copy of this gate —
+# ``backend/tests/static_gates/test_sqlite_schema_tables_exactly_four_plus_version.py``
+# — is the single source of truth for what ``migrate()`` creates, and a
+# second hand-maintained copy of the list is a second contract: it
+# drifts, and the drift turns a gate red in a place nobody looked.
+#
+# What moved into the set, and why (the gate's own docstring says the
+# same, and the DDL it names is in ``state_machine/db/schema.py``):
+#
+#   * v4 (2026-09-09) ``plan_tasks`` — per-task runtime state lifted
+#     out of ``plan_execution.task_progress``.
+#   * v7 (2026-10-21) ``plan_decisions`` — the human-in-the-loop
+#     decision store (``_ensure_plan_decisions``).
+#   * v7 (2026-10-28) ``scheduler_queue`` / ``scheduler_slot`` /
+#     ``scheduler_command`` — the native scheduler's own three facts
+#     (``_SCHEDULER_OBJECTS``), and (2026-10-29)
+#     ``scheduler_setting``, the operator's runtime capacity override.
+#   * 2026-11-26 the framework-fix lane's eight tables: the seven
+#     ``framework_fix_*`` tables (``framework_fix_hit``,
+#     ``framework_fix_registry``, ``framework_fix_alias``,
+#     ``framework_fix_attach``, ``framework_fix_event``,
+#     ``framework_fix_merge_lease``, ``framework_fix_repro``) and
+#     ``plan_verification_result`` — created by the same unconditional,
+#     presence-guarded ``_ensure_framework_fix_tables`` step as the
+#     tables above.
+#
+# The contract these three gates hold is unchanged by the import: a
+# table that ``migrate()`` does not create is still a violation (see
+# ``_STALE_BUSINESS_TABLES`` and the ``extras`` computation below), and
+# a core table that is missing is still a failure.
+_CORE_SCHEMA_TABLES: frozenset[str] = _schema_tables.EXPECTED_SCHEMA_TABLES
 
 # Legacy business tables that the state-machine refactor explicitly
 # forbids.  Their presence means the migration never happened (or a

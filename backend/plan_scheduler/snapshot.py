@@ -50,13 +50,13 @@ model down over a field that is allowed to be absent.
 
 The shape is closed
 -------------------
-The document has exactly nine keys: ``capacity``, ``queue_length``,
+The document has exactly ten keys: ``capacity``, ``queue_length``,
 ``over_capacity``, ``queue``, ``running``, ``waiting``, ``parked``,
-``stopping`` and ``generated_at``.  A field that appears without being
-declared is a field the panel cannot render and the LUI cannot rely
-on, so adding one is a decision and not an accident.  The five lists
-are always lists — an empty scheduler
-produces five empty lists, never five ``null``s, because ``null``
+``framework_fixes``, ``stopping`` and ``generated_at``.  A field that
+appears without being declared is a field the panel cannot render and
+the LUI cannot rely on, so adding one is a decision and not an
+accident.  The six lists are always lists — an empty scheduler
+produces six empty lists, never six ``null``s, because ``null``
 would be a second answer to "how many are waiting".
 
 The seventh key was added on purpose
@@ -119,6 +119,26 @@ running line keep their key sets.  A reader written against the six
 keys is still reading a document it was written for — it finds more
 keys, which is what a backward-compatible addition looks like.
 
+The ninth key is the framework-fix lane's own column
+---------------------------------------------------
+The document carries a ninth key: ``framework_fixes``.  It is the
+framework-fix lane's own plans — the ones the routing layer says are
+``plan_kind="framework_fix"`` — and the four ordinary lists do **not**
+name them: a repair plan is in the framework-fix column or in the
+ordinary one, never in both.  A panel that showed the same plan twice
+would show the operator two different things.
+
+The partition is read from the lane's own tables — the routing row,
+the registry, the attach table and the merge lease — and every entry
+carries the ``display_state`` the framework-fix lane's own read model
+projects (:func:`framework_fix.read_model.project_display_state`), so
+the panel, the notification and this document cannot tell the operator
+three different stories about one plan.
+
+The key is always there: no repair plan is an **empty list**, not a
+missing key.  A caller that walks the column must not have to ask
+whether the column exists first.
+
 The parked row is not a queued row
 ----------------------------------
 A parked plan is neither running nor waiting: it holds no slot and it
@@ -129,8 +149,8 @@ quota layer's own word rather than the queue policy's, because a
 parked plan stopped for want of provider capacity and not for want of
 a slot.
 
-The ninth key is ``stopping``
------------------------------
+The tenth key is ``stopping``
+------------------------------
 A plan that is asked to pause leaves the running line **before** it
 comes back: the stop is a request the worker has not answered yet, and
 in that gap the plan is in neither the running line nor the queue.  The
@@ -217,26 +237,43 @@ layer that wrote it chose that word on purpose.
 
 from __future__ import annotations
 
+import json
+import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from postprocess.report import read_report
 
 from quota_resume import KIND_EXECUTION, QUOTA_PARK_REASON
 
+from config_paths import resolve_plans_dir, resolve_state_db_path
+
+from state_machine.db.connection import open as open_state_db
+
+try:  # pragma: no cover - 两条路径等价，取先成功的那条
+    from framework_fix.read_model import project_display_state
+except ImportError:  # pragma: no cover
+    from backend.framework_fix.read_model import project_display_state  # type: ignore
+
 from .config import DEFAULT_CAPACITY, DEFAULT_MIN_RUNTIME_SECONDS
 from .policy import REASONS
-from .queue import queue_key
+from .queue import FRAMEWORK_FIX_KIND, queue_key
 
 __all__ = [
     "build",
+    "framework_fix_facts",
+    "framework_fix_view",
     "postprocess_summary",
     "with_postprocess",
     "CAPACITY_SOURCE_CONFIG",
     "CAPACITY_SOURCE_OVERRIDE",
     "DEFAULT_CAPACITY_SOURCE",
+    "FRAMEWORK_FIXES_KEY",
+    "KIND_ALL",
+    "KIND_FRAMEWORK_FIX",
+    "KIND_PLANS",
     "POSTPROCESS_KEYS",
     "STOPPING_KEYS",
     "WAITING_KEYS",
@@ -300,6 +337,24 @@ STOPPING_KEYS = frozenset(
 #: The terminal summary's three keys — the report's own fields, under
 #: the names the panel reads them by.
 POSTPROCESS_KEYS = frozenset({"spec_sha256", "terminal_status", "item_verdicts"})
+
+#: The key the framework-fix lane's plans live under.  It is a key of the
+#: document beside the four ordinary lists: the panel renders it as its
+#: own column, and the ordinary lists do not name the lane's plans.
+FRAMEWORK_FIXES_KEY = "framework_fixes"
+
+#: The kinds of plan the API can be asked for.  The vocabulary is
+#: closed: a word outside it cannot be answered, so it is a 422 rather
+#: than a quiet ``all``.
+KIND_ALL = "all"
+KIND_PLANS = "plans"
+KIND_FRAMEWORK_FIX = "framework_fix"
+
+#: The attach statuses the partition counts.  A **blocked** attachment
+#: is a plan whose work waits for this defect; a **registered** one is
+#: a plan that will be re-run once the fix lands.  The two numbers are
+#: the panel's "how much is waiting" and "how much is coming back".
+_ATTACH_COUNTED_STATUSES = ("blocked", "registered")
 
 #: The wait statuses that are **settled**.  A wait that is not pending
 #: any more cannot be extended: its deadline is a deadline nobody is
@@ -811,6 +866,344 @@ def _waiting_view(state: Any, now: float) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# The framework-fix partition
+# ---------------------------------------------------------------------------
+
+
+def _query(conn: Any, sql: str, parameters: Sequence[Any] = ()) -> List[Any]:
+    """Run one read and return its rows.
+
+    A query that cannot run — a database that has not been migrated, a
+    table that is not there — answers **no rows** rather than raising.
+    The partition is then empty, which is the safe direction: a read
+    model that cannot see the lane's plans says so, and it does not
+    take the whole snapshot down over it.
+    """
+    try:
+        return list(conn.execute(sql, parameters))
+    except Exception:  # noqa: BLE001 — a read must not take the snapshot down
+        return []
+
+
+def _json_object(value: Any) -> Dict[str, Any]:
+    """Read a JSON column as an object.
+
+    Anything that is not an object — a column that was never written, a
+    column that holds a list, a column that holds broken JSON — is an
+    empty object.  A field that cannot be read is "not known", and
+    guessing a shape for it would be a second answer to whatever it
+    was supposed to say.
+    """
+    if isinstance(value, Mapping):
+        return dict(value)
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def _in_clause(values: Sequence[str]) -> str:
+    """The ``IN`` clause for a list of values, as SQL text."""
+    return ", ".join("?" for _ in values)
+
+
+def framework_fix_facts() -> Dict[str, Any]:
+    """Read the framework-fix lane's own facts from the state database.
+
+    The facts are the lane's own tables: the routing layer's answer to
+    "which plans are the lane's own" (``plan_routing``), the registry's
+    answer to "what defect does each one repairs", the attach table's
+    counts and the merge lease's PR link.
+
+    A database that cannot be read answers an empty set of facts: the
+    partition is then empty and the ordinary lists are not filtered.  A
+    read model that cannot see the lane's plans must not pretend it has
+    seen them, and it must not take the whole snapshot down over it
+    either.
+
+    Returns:
+        A mapping with five keys:
+
+        * ``plans`` — the routing rows of the lane's plans, each with
+          its ``plan_id``, its ``current_phase`` and its
+          ``framework_fix`` block;
+        * ``registry`` — the registry row of each plan, by plan id;
+        * ``attaches`` — the attach counts of each fingerprint, by
+          status;
+        * ``leases`` — the merge lease of each repository, by
+          repository;
+        * ``hits`` — the first hit of each fingerprint, by fingerprint.
+    """
+    facts: Dict[str, Any] = {
+        "plans": [],
+        "registry": {},
+        "attaches": {},
+        "leases": {},
+        "hits": {},
+    }
+
+    try:
+        path = resolve_state_db_path()
+        if not path.exists():
+            return facts
+        conn = open_state_db(path)
+    except Exception:  # noqa: BLE001 — a read must not take the snapshot down
+        return facts
+
+    try:
+        conn.row_factory = sqlite3.Row
+
+        plans = _query(
+            conn,
+            "SELECT plan_id, current_phase, framework_fix FROM plan_routing "
+            "WHERE plan_kind = ?",
+            (FRAMEWORK_FIX_KIND,),
+        )
+        facts["plans"] = [
+            {
+                "plan_id": str(row["plan_id"] or ""),
+                "current_phase": row["current_phase"],
+                "block": _json_object(row["framework_fix"]),
+            }
+            for row in plans
+            if str(row["plan_id"] or "")
+        ]
+
+        plan_ids = [str(plan["plan_id"]) for plan in facts["plans"]]
+        if not plan_ids:
+            return facts
+
+        registry: Dict[str, Any] = {}
+        for row in _query(
+            conn,
+            "SELECT fingerprint, fix_plan_id, repo, status, key_json, "
+            "first_seen_at, created_at, merged_at, merge_commit "
+            "FROM framework_fix_registry WHERE fix_plan_id IN ("
+            + _in_clause(plan_ids)
+            + ")",
+            plan_ids,
+        ):
+            registry.setdefault(str(row["fix_plan_id"] or ""), dict(row))
+        facts["registry"] = registry
+
+        fingerprints = sorted(
+            {
+                str(row.get("fingerprint") or "")
+                for row in registry.values()
+                if str(row.get("fingerprint") or "")
+            }
+        )
+        repos = sorted(
+            {
+                str(row.get("repo") or "")
+                for row in registry.values()
+                if str(row.get("repo") or "")
+            }
+        )
+
+        if fingerprints:
+            marks = _in_clause(fingerprints)
+            counts: Dict[str, Dict[str, int]] = {}
+            for row in _query(
+                conn,
+                "SELECT fingerprint, status FROM framework_fix_attach "
+                "WHERE fingerprint IN (" + marks + ")",
+                fingerprints,
+            ):
+                fingerprint = str(row["fingerprint"] or "")
+                status = str(row["status"] or "")
+                if status not in _ATTACH_COUNTED_STATUSES:
+                    continue
+                counted = counts.setdefault(fingerprint, {})
+                counted[status] = counted.get(status, 0) + 1
+            facts["attaches"] = counts
+
+            hits: Dict[str, Any] = {}
+            for row in _query(
+                conn,
+                "SELECT fingerprint, plan_id, round FROM framework_fix_hit "
+                "WHERE fingerprint IN (" + marks + ") ORDER BY created_at, hit_id",
+                fingerprints,
+            ):
+                hits.setdefault(
+                    str(row["fingerprint"] or ""),
+                    {
+                        "plan_id": str(row["plan_id"] or ""),
+                        "round": int(row["round"] or 0),
+                    },
+                )
+            facts["hits"] = hits
+
+        if repos:
+            for row in _query(
+                conn,
+                "SELECT repo, fix_plan_id, pr_url FROM framework_fix_merge_lease "
+                "WHERE repo IN (" + _in_clause(repos) + ")",
+                repos,
+            ):
+                facts["leases"].setdefault(str(row["repo"] or ""), dict(row))
+    finally:
+        conn.close()
+
+    return facts
+
+
+def _plan_title(plan_id: str) -> str:
+    """The plan's own title — the one line it says what it is.
+
+    The repair plan writes its requirement into ``tasks.json`` when it
+    is created.  A plan whose file cannot be read has no title: an
+    empty string is a title the panel can show as "no title", and a
+    made-up one would be worse.
+    """
+    try:
+        path = resolve_plans_dir() / plan_id / "tasks.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — a missing title is not an error
+        return ""
+    if not isinstance(document, dict):
+        return ""
+    requirement = document.get("requirement")
+    return str(requirement).strip() if requirement else ""
+
+
+def _signature_summary(key: Mapping[str, Any]) -> str:
+    """The signature of a defect, in the words the panel shows.
+
+    The signature is the fingerprint's key: the error class, the first
+    error line and the framework files the fix will touch.  The summary
+    is the first two of them and the names of the files — one line,
+    because a column that wraps is a column nobody reads.
+    """
+    klass = str(key.get("error_class") or "").strip()
+    line = str(key.get("first_error_line") or "").strip()
+    head = f"{klass}: {line}" if klass and line else (klass or line)
+
+    raw = key.get("framework_files")
+    if isinstance(raw, str):
+        raw = [raw]
+    files = [str(item).strip() for item in raw or [] if str(item).strip()]
+    if not files:
+        return head
+
+    shown = ", ".join(files[:3])
+    if len(files) > 3:
+        shown = f"{shown} +{len(files) - 3}"
+    return f"{head} [{shown}]"
+
+
+def _partition_entry(
+    plan: Mapping[str, Any], facts: Mapping[str, Any]
+) -> Dict[str, Any]:
+    """One entry of the framework-fix partition.
+
+    The fields are the ones the panel and the notification both show
+    (架构决策点 6): the plan and its title, the kind, where the defect
+    came from, the signature in one line, the state it displays, the
+    two attach counts and the PR link.
+
+    The state is the framework-fix lane's own projection — the same
+    function the notification reads — and it falls back to the plan's
+    own phase when there is no special state to show.  A repair plan
+    that is simply running has a state too: its phase.
+    """
+    plan_id = str(plan.get("plan_id") or "")
+    block = plan.get("block")
+    block = dict(block) if isinstance(block, Mapping) else {}
+
+    registry = facts.get("registry") or {}
+    registry_row = registry.get(plan_id) or {}
+    fingerprint = str(
+        registry_row.get("fingerprint") or block.get("fingerprint") or ""
+    )
+    repo = str(registry_row.get("repo") or block.get("repo") or "")
+
+    # The counts are the attach table's own — the live ones, and only
+    # the live ones.  The generator's snapshot of them is the count of
+    # the moment the plan was created: it is not a fallback, because it
+    # stays where it is after an attachment is exhausted, and a read
+    # model that answered it would say a number the table does not
+    # support.
+    counts = (facts.get("attaches") or {}).get(fingerprint) or {}
+    blocked = int(counts.get("blocked", 0) or 0)
+    registered = int(counts.get("registered", 0) or 0)
+
+    # Where the defect came from: the plan that hit it and the round it
+    # hit it in.  The hit table knows the round; the routing block
+    # knows the plan.
+    hit = (facts.get("hits") or {}).get(fingerprint) or {}
+    source_plan_id = str(
+        block.get("source_plan_id") or hit.get("plan_id") or ""
+    )
+    source_round = int(hit.get("round") or block.get("source_round") or 0)
+
+    # The PR link is this plan's own: the merge slot of a repository
+    # belongs to the plan that holds it, and a plan that waits for the
+    # slot has no PR yet.
+    lease = (facts.get("leases") or {}).get(repo) or {}
+    pr_url = None
+    if str(lease.get("fix_plan_id") or "") == plan_id:
+        pr_url = lease.get("pr_url") or None
+
+    display_state = project_display_state(
+        {
+            "current_phase": plan.get("current_phase"),
+            "framework_fix": block,
+        },
+        registry_row or None,
+    )
+    if not display_state:
+        display_state = str(plan.get("current_phase") or "") or None
+
+    return {
+        "plan_id": plan_id,
+        "title": _plan_title(plan_id),
+        "kind": FRAMEWORK_FIX_KIND,
+        "source": {"plan_id": source_plan_id, "round": source_round},
+        "signature_summary": _signature_summary(
+            _json_object(registry_row.get("key_json"))
+        ),
+        "display_state": display_state,
+        "attach_blocked_count": blocked,
+        "attach_registered_count": registered,
+        "pr_url": pr_url,
+        "created_at": str(
+            block.get("created_at") or registry_row.get("created_at") or ""
+        ),
+    }
+
+
+def framework_fix_view(state: Any) -> List[Dict[str, Any]]:
+    """The framework-fix partition — the lane's own plans, as the panel reads them.
+
+    Args:
+        state: the state of one tick.  A state that carries the lane's
+            facts under ``framework_fix_facts`` is read from it — a
+            caller that has already read them does not read them
+            twice; otherwise the facts are read from the state
+            database.
+
+    Returns:
+        One entry per framework-fix plan, in plan-id order.  No repair
+        plan is an **empty list**, not a missing key: a caller that
+        walks the column must not have to ask whether the column is
+        there first.
+    """
+    facts = _field(state, "framework_fix_facts", None)
+    if not isinstance(facts, Mapping):
+        facts = framework_fix_facts()
+
+    entries = [
+        _partition_entry(plan, facts)
+        for plan in (facts.get("plans") or [])
+        if isinstance(plan, Mapping)
+    ]
+    return sorted(entries, key=lambda entry: str(entry.get("plan_id") or ""))
+
+
 # The stopping list
 # ---------------------------------------------------------------------------
 
@@ -896,13 +1289,19 @@ def build(state: Any) -> Dict[str, Any]:
     Returns:
         The document the panel renders and the LUI reports.  Its keys
         are exactly ``capacity``, ``queue_length``, ``over_capacity``,
-        ``queue``, ``running``, ``waiting``, ``parked``, ``stopping``
-        and ``generated_at``.  The capacity block carries the number
-        and its source — ``total``, ``used`` and ``source`` — the
-        waiting list carries one row per wait, with the question and
-        the time left on it, the parked list carries the plans stopped
-        for want of provider capacity, and the stopping list carries
-        the commands that were accepted and have not been answered yet.
+        ``queue``, ``running``, ``waiting``, ``parked``,
+        ``framework_fixes``, ``stopping`` and ``generated_at``.  The
+        capacity block carries the number and its source — ``total``,
+        ``used`` and ``source`` — the waiting list carries one row per
+        wait, with the question and the time left on it, the parked list
+        carries the plans stopped for want of provider capacity, and the
+        stopping list carries the commands that were accepted and have
+        not been answered yet.
+
+        The framework-fix lane's own plans are in their own column and
+        in **no** other one: a repair plan is either in the
+        framework-fix partition or in the ordinary lists, never in
+        both.
     """
     running_rows = _entries(state, "running")
 
@@ -924,19 +1323,41 @@ def build(state: Any) -> Dict[str, Any]:
         DEFAULT_MIN_RUNTIME_SECONDS,
     )
 
-    queue = _queue_view(state)
+    # The framework-fix lane's own column — read first, because the
+    # ordinary lists are filtered by it.
+    partition = framework_fix_view(state)
+    fix_ids = {str(entry.get("plan_id") or "") for entry in partition}
+
+    queue = [
+        row for row in _queue_view(state) if row["plan_id"] not in fix_ids
+    ]
+    running = [
+        row
+        for row in _running_view(state, now, min_runtime)
+        if row["plan_id"] not in fix_ids
+    ]
+    parked = [
+        row for row in _parked_view(state) if row["plan_id"] not in fix_ids
+    ]
+    waiting = [
+        row for row in _waiting_view(state, now) if row["plan_id"] not in fix_ids
+    ]
 
     return {
         "capacity": {"total": total, "used": used, "source": source},
         "queue_length": len(queue),
         "over_capacity": used > total,
         "queue": queue,
-        "running": _running_view(state, now, min_runtime),
-        "waiting": _waiting_view(state, now),
+        "running": running,
+        "waiting": waiting,
         # The plans parked for quota — the facts' answer.  A state that
         # names none is an empty list: nothing parked is a normal thing
         # to look at, and a list is an answer a caller can walk.
-        "parked": _parked_view(state),
+        "parked": parked,
+        # The framework-fix lane's own plans — the panel's other column.
+        # The key is always there: no repair plan is an empty list,
+        # not a missing key.
+        FRAMEWORK_FIXES_KEY: partition,
         # The plans that are stopping — the commands the scheduler has
         # accepted and not answered yet.  A state that names none is an
         # empty list: nothing is stopping is a normal thing to look at.

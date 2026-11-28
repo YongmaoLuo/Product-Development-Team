@@ -103,6 +103,15 @@ BASE_EPOCH = 1_700_000_000.0
 #: and is not answered is in neither the running line nor the queue,
 #: so the read model has to name it somewhere: that is the 「停止中」
 #: row the requirements ask for, and it may never be missing.
+#:
+#: The tenth key is ``framework_fixes`` — the framework-fix lane's own
+#: plans.  A repair plan is in no ordinary line either: it is neither
+#: queued for capacity nor running the ordinary pipeline, so without
+#: this key the read model could not name it at all.  It is the key
+#: ``plan_scheduler.snapshot.FRAMEWORK_FIXES_KEY`` builds the document
+#: with, and the unit-side pins of the same document already carry ten
+#: keys (``test_row_shape_contract.py``, ``test_snapshot.py``,
+#: ``test_postprocess_waiting_snapshot.py``).
 SNAPSHOT_KEYS = {
     "capacity",
     "queue_length",
@@ -112,6 +121,7 @@ SNAPSHOT_KEYS = {
     "waiting",
     "parked",
     "stopping",
+    "framework_fixes",
     "generated_at",
 }
 

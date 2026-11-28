@@ -8,22 +8,29 @@ admission ran another — and the operator's only way to find out which
 was which would be to watch plans start in the wrong order.
 
 So there is exactly one order, and it is a **pure function of the
-row**: :func:`queue_key` reads ``promote_order``, ``priority`` and
-``seq`` and returns the key a row is sorted by.  The same rows always
-produce the same order, in this process and in the next one — a restart
-does not rearrange the queue, because the order lives in the persisted
-columns and not in the memory of the process that happened to be
-running.
+row**: :func:`queue_key` reads ``plan_kind``, ``promote_order``,
+``priority`` and ``seq`` and returns the key a row is sorted by.  The
+same rows always produce the same order, in this process and in the
+next one — a restart does not rearrange the queue, because the order
+lives in the persisted columns and not in the memory of the process
+that happened to be running.
 
 The key mirrors the order the schema documents for the queue table
-(``(promote_order IS NULL), promote_order, priority, seq``):
+(``(promote_order IS NULL), promote_order, priority, seq``), with the
+framework-fix lane's partition in front of it:
 
-* the first element is ``True`` for a plan that was never promoted and
-  ``False`` for one that was, so promoted plans sort ahead of the
-  unpromoted ones;
-* the second is the ``promote_order`` itself — a promotion is recorded
-  as a decreasing counter, so the most recent promotion has the
-  smallest number and runs first;
+* the first element is the **partition** the row is in — the lane's own
+  :data:`~plan_scheduler.policy.FRAMEWORK_FIX_PRIORITY` for a
+  framework-fix plan, and :data:`~plan_scheduler.policy.ORDINARY_MIN_PRIORITY`
+  for an ordinary one.  It comes first because it settles the biggest
+  question there is to settle: a framework-fix plan runs ahead of every
+  ordinary plan, however the ordinary plan was promoted or prioritised;
+* the second is the **promotion slot** — ``0`` for a plan that was
+  never promoted, and the ``promote_order`` itself for one that was.  A
+  promotion is recorded as a decreasing counter that starts below zero,
+  so a promoted row's slot is negative and sorts ahead of the neutral
+  ``0`` of an unpromoted row; among promoted rows the most recent
+  promotion, with the smallest number, runs first;
 * the third is the plan's ``priority``;
 * the fourth is the ``seq`` — the unique, monotonic tie-breaker that
   makes the order total, and that makes a queue with nothing promoted
@@ -54,12 +61,18 @@ from __future__ import annotations
 import sqlite3
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
+from .policy import FRAMEWORK_FIX_PRIORITY, ORDINARY_MIN_PRIORITY
+
 if TYPE_CHECKING:  # pragma: no cover - imported for the type only
     from .store import SqliteSchedulerStore
 
-#: The key a queue row is ordered by: promoted-first, then by promotion
-#: order, then by priority, then by arrival.
-QueueKey = Tuple[bool, int, int, int]
+#: The ``plan_kind`` a framework-fix plan carries — a repair of the
+#: framework itself, which the lane runs ahead of the ordinary plans.
+FRAMEWORK_FIX_KIND = "framework_fix"
+
+#: The key a queue row is ordered by: the partition the row is in, then
+#: the promotion slot, then by priority, then by arrival.
+QueueKey = Tuple[int, int, int, int]
 
 #: A queue row.  It is either a mapping (a row the caller assembled) or
 #: a ``sqlite3.Row`` (a row read out of the queue table); both are read
@@ -87,6 +100,21 @@ def _field(row: QueueRow, name: str, default: Any) -> Any:
     return default if value is None else value
 
 
+def _partition(row: QueueRow) -> int:
+    """Return the partition the row is in.
+
+    A framework-fix plan is in the lane's own partition, which runs
+    ahead of the ordinary one.  Every other plan is an ordinary plan —
+    including a row that says nothing about its kind at all: the queue's
+    rows do not all carry one, and a row without one may not be
+    mistaken for a framework-fix plan.
+    """
+    kind = _field(row, "plan_kind", None)
+    if kind == FRAMEWORK_FIX_KIND:
+        return FRAMEWORK_FIX_PRIORITY
+    return ORDINARY_MIN_PRIORITY
+
+
 def queue_key(row: QueueRow) -> QueueKey:
     """Return the key a queue row is ordered by.
 
@@ -96,24 +124,32 @@ def queue_key(row: QueueRow) -> QueueKey:
     operator panel and the restart recovery share one order without
     agreeing on anything else.
 
-    A row that was never promoted (``promote_order`` is ``NULL``) sorts
-    behind every promoted row; a promoted row sorts ahead of them, and
-    the more recently it was promoted — the smaller its
-    ``promote_order`` — the further ahead it sorts.  Within the same
-    promotion state the plan's ``priority`` decides, and ``seq`` — the
-    unique tie-breaker — decides last, which leaves an untouched queue
-    in plain arrival order.
+    A framework-fix plan is in the lane's own partition and an ordinary
+    plan in the one behind it, and the partition is the first element of
+    the key: a framework-fix plan runs ahead of every ordinary plan,
+    whatever the ordinary plan was promoted or prioritised as.  A row
+    that says nothing about its kind is an ordinary plan.
+
+    Inside a partition the order is the one the queue always had.  A
+    row that was never promoted (``promote_order`` is ``NULL``) sorts
+    behind every promoted row of its partition; a promoted row sorts
+    ahead of them, and the more recently it was promoted — the smaller
+    its ``promote_order`` — the further ahead it sorts.  Within the
+    same promotion state the plan's ``priority`` decides, and ``seq`` —
+    the unique tie-breaker — decides last, which leaves an untouched
+    queue in plain arrival order.
     """
+    partition = _partition(row)
     promote_order = _field(row, "promote_order", None)
     priority = int(_field(row, "priority", 0))
     seq = int(_field(row, "seq", 0))
 
     if promote_order is None:
-        # Never promoted: the first element sorts it behind every
-        # promoted row, and the second is a neutral 0 — promoted rows
-        # are compared among themselves by their own promote_order.
-        return (True, 0, priority, seq)
-    return (False, int(promote_order), priority, seq)
+        # Never promoted: the promotion slot is a neutral 0.  A promoted
+        # row's slot is the negative number its promotion was recorded
+        # as, so it sorts ahead of this one.
+        return (partition, 0, priority, seq)
+    return (partition, int(promote_order), priority, seq)
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +293,7 @@ def consume_promotion(conn: sqlite3.Connection, plan_id: str) -> Optional[int]:
 
 
 __all__ = [
+    "FRAMEWORK_FIX_KIND",
     "QueueKey",
     "QueueRow",
     "consume_promotion",

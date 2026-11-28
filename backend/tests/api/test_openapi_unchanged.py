@@ -53,7 +53,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 #: Directory holding this file (``backend/tests/api/``).
 _TESTS_DIR = Path(__file__).resolve().parent
@@ -246,6 +246,7 @@ SNAPSHOT_PATH = _TESTS_DIR / "openapi_snapshot.json"
 # 形状是**两侧的并集**（88 条路径），两侧的指纹常量各自只描述自己那一半的
 # 形状，合并后都已过期，故按同一条规矩重取——当时现算出的值是 `e164c9d7…`
 # （该值已被下一次合并的现算值取代，见下）。
+#: 
 #: 2026-11-23（合入 origin/main / deb9b009）：两侧各自新增了对外端点，合并后
 #: 的对外形状是**两侧的并集**（90 条路径 = 本分支侧 88 条 + base 侧 89 条 −
 #: 公共 87 条；本分支侧的 `GET /api/plan/{plan_id}/failure-review` 与 base 侧的
@@ -256,46 +257,117 @@ SNAPSHOT_PATH = _TESTS_DIR / "openapi_snapshot.json"
 #: （`_fingerprint(json.loads(SNAPSHOT_PATH.read_text()))`），再与线上 app 实际
 #: 发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零差异（90 条路径，
 #: 路径集合、`components` 与 `info` 逐项相等，整份 schema 相等）、指纹相同——
-#: 才把该值写进本常量（`b021d16f…`）。
-# 2026-11-24（合入 origin/main / deb9b009 —— PR #194「验证从 queued 起跑」，
-# 本次合并）：**又一次**两侧各钉各的基线。本分支侧钉的是 `664fcf55…`
-# （88 条路径，描述 2026-11-20 合并后的形状），base 侧钉的是 `e164c9d7…`
-# （89 条路径，描述 base 自己那一半的形状）——**两者各自都只描述合并前的
-# 自己**，对合并态都已过期。合并后的快照文件是两侧改动的并集（90 条路径
-# = 本分支侧 88 条 + base 侧 89 条 − 公共 87 条），故按同一条规矩重取：
-# 先由合并态的 `openapi_snapshot.json` 规范形式现算（`23e44d09…`），再与
-# 线上 app 实际发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零
-# 差异、指纹相同——才把该值写进本常量。判定强度不变：比对逻辑、负控与指纹
-# 比对的强度都未改动，移动的只是锚点。
-#
-# 2026-11-24（本次合并 origin/main@ed425efd）：**又一次**两侧各钉各的基线。
-# 本分支侧钉的是 `23e44d09…`（90 条路径，描述 2026-11-24 合并 deb9b009 后的
-# 形状），base 侧钉的是 `b021d16f…`（90 条路径，描述 base 自己那一半的形状）
-# ——**两者各自都只描述合并前的自己**，对合并态都已过期。合并后的快照文件是
-# 两侧改动的并集（91 条路径 = 本分支侧 90 条 + base 侧 90 条 − 公共 89 条；
-# 本分支侧的 `GET /api/verification/convergence-summary` 与 base 侧的
-# `GET /api/plan/{plan_id}/failure-review` 同时在），故按同一条规矩重取：
-# 先由合并态的 `openapi_snapshot.json` 规范形式现算（`5ac3569b…`），再与
-# 线上 app 实际发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零
-# 差异（91 条路径，路径集合、`components` 与 `info` 逐项相等，整份 schema
-# 相等）、指纹相同——才把该值写进本常量。判定强度不变：比对逻辑、负控与
-# 指纹比对的强度都未改动，移动的只是锚点。
-#
-# 2026-11-26（本次合并 origin/main@ae55ae26 —— PR #209「postprocess 收尾
-# 护栏」及其之前的 PR #206/#207/#208）：**又一次**两侧各钉各的基线。
-# 本分支侧钉的是 `5ac3569b…`（91 条路径，描述 2026-11-24 合并 ed425efd 后的
-# 形状），base 侧钉的是 `df12726c…`（90 条路径，描述 base 自己那一半的形状）
-# ——**两者各自都只描述合并前的自己**，对合并态都已过期。合并后的快照文件是
-# 两侧改动的并集（91 条路径 = 本分支侧 91 条 + base 侧 90 条 − 公共 90 条；
-# 本分支侧独有的 `GET /api/verification/convergence-summary` 仍在里面，base
-# 侧对 `POST /api/verification/{plan_id}/reset` 的文档改动（轮次租约拒绝
-# 刷新）也在里面 —— 两侧改的是快照文件的不同位置，自动合并无冲突），故按
-# 同一条规矩重取：先由合并态的 `openapi_snapshot.json` 规范形式现算
-# （`0f900535…`），再与线上 app 实际发布的 schema（`openapi_snapshot()`）
-# 交叉验证——两者逐项零差异（91 条路径，路径集合、`components` 与 `info`
-# 逐项相等，整份 schema 相等）、指纹相同——才把该值写进本常量。判定强度
-# 不变：比对逻辑、负控与指纹比对的强度都未改动，移动的只是锚点。
-BASELINE_FINGERPRINT = "0f9005356c7ec85eb8ad7bd353ff7be60cdfa04d3e9347f976c7e0f1affee9b1"
+#: 才把该值写进本常量（`b021d16f…`；该值已被下一次合并的现算值取代，见下）。
+#: 
+#: 2026-11-24（框架修复车道重钉 / 本分支）：本车道给对外 HTTP 契约加了两处
+#: 东西——新增端点 `POST /api/plan/{plan_id}/framework-fix/dismiss`（框架修复
+#: 条目的显式关闭），以及给 `GET /api/scheduler/state` 加了 `kind` 查询参数
+#: （`plans` / `framework_fix` / `all` 的分区过滤，默认 `all`，故老调用方
+#: 不受影响）。故按同一条规矩重取基线：`openapi_snapshot.json` 相对上一版
+#: **只增不删**——新增路径 1 条、删除路径 0 条；`/api/scheduler/state` 的
+#: 方法集合未变（仍是 `get`），只多了 `kind` 参数与随之而来的 `422` 响应，
+#: 其余路径逐项相等，`components.schemas` 与 `info` 逐项相等（实测：新增
+#: 路径 1 条 / 删除 0 条 / 变更 1 条；schema 集合增 0 删 0）。
+#: 快照与指纹在**同一次变更**里更新：快照文件是删掉旧文件后由本门禁自己
+#: 从**真实 app**（独立子进程、关掉调试路由）重新生成的，不是手改的；指纹
+#: 由重新生成后落盘的快照现算（`_fingerprint(json.loads(SNAPSHOT_PATH.read_text()))`），
+#: 再与线上 app 实际发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项
+#: 零差异、指纹相同——才把该值写进本常量（`ae218e41…`；该值已被下一次合并
+#: 的现算值取代，见下）。
+#: 
+#: 2026-11-24（合入 origin/main / 9900373b）：本次合并两侧又各自新增了对外
+#: 端点——本分支侧的 `POST /api/plan/{plan_id}/framework-fix/dismiss` 与 base
+#: 侧的 `GET /api/plan/{plan_id}/failure-review`——合并后的对外形状是**两侧
+#: 的并集**（91 条路径 = 本分支侧 90 条 + base 侧 90 条 − 公共 89 条）。
+#: 实测：相对本分支侧只**新增** `failure-review` 一条（删除 0 条、变更 0 条）；
+#: 相对 base 侧**新增** `framework-fix/dismiss` 一条、**变更**
+#: `/api/scheduler/state` 一条（本分支给它加的 `kind` 查询参数，合并态保留
+#: 本分支那一版），删除 0 条；`components` 与 `info` 逐项相等。两侧的指纹
+#: 常量各自只描述自己那一半的形状，合并后都已过期，故按同一条规矩重取：删掉
+#: `openapi_snapshot.json` 让本门禁自己从**真实 app**（独立子进程、关掉调试
+#: 路由）重新生成一份，再由该快照的规范形式现算指纹
+#: （`_fingerprint(json.loads(SNAPSHOT_PATH.read_text()))`），并与线上 app 实际
+#: 发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零差异、指纹相同
+#: ——才把该值写进本常量（`39771fb7…`）。
+#: 
+#: 2026-11-25（合入 origin/main / 22c5f3a4）：本次合并两侧又各自重钉了基线
+#: 指纹——本分支侧是 `39771fb7…`（上一条），base 侧是 `df12726c…`（base 在
+#: 22c5f3a4 上现算的值）。两侧的值各自只描述自己那一半的形状，合并后都已
+#: 过期，故按同一条规矩重取。
+#: 
+#: 实测（合并态）：路径集合**与本分支侧完全相同**（仍是 91 条，新增 0 条、
+#: 删除 0 条），唯一**变更**的是 `/api/verification/{plan_id}/reset` 的
+#: `description`——base 给这个端点的 docstring 补了「轮次租约」的说明，而
+#: docstring 就是 OpenAPI 里的 description，故契约里那一段文字变了；该端点
+#: 的方法集合未变（仍是 `post`），`requestBody` 与 `parameters` 逐项相等，
+#: `components` 与 `info` 逐项相等。相对 base 侧则是本分支侧的
+#: `framework-fix/dismiss` 一条新增与 `/api/scheduler/state` 的 `kind` 查询
+#: 参数一条变更。
+#: 
+#: 快照文件是本次合并的 `openapi_snapshot.json`（两侧的改动落在 JSON 的不同
+#: 区域，故自动合并的结果即**两侧的并集**；实测它与线上 app 实际发布的
+#: schema 逐项零差异）。指纹由该快照的规范形式现算
+#: （`_fingerprint(json.loads(SNAPSHOT_PATH.read_text()))`），再与线上 app
+#: 实际发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零差异、指纹
+#: 相同——才把该值写进本常量（`7539d59d…`）。
+#:
+#: 2026-11-24（合入 origin/main / deb9b009 —— PR #194「验证从 queued 起跑」，
+#: 本次合并）：**又一次**两侧各钉各的基线。本分支侧钉的是 `664fcf55…`
+#: （88 条路径，描述 2026-11-20 合并后的形状），base 侧钉的是 `e164c9d7…`
+#: （89 条路径，描述 base 自己那一半的形状）——**两者各自都只描述合并前的
+#: 自己**，对合并态都已过期。合并后的快照文件是两侧改动的并集（90 条路径
+#: = 本分支侧 88 条 + base 侧 89 条 − 公共 87 条），故按同一条规矩重取：
+#: 先由合并态的 `openapi_snapshot.json` 规范形式现算（`23e44d09…`），再与
+#: 线上 app 实际发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零
+#: 差异、指纹相同——才把该值写进本常量。判定强度不变：比对逻辑、负控与指纹
+#: 比对的强度都未改动，移动的只是锚点。
+#: 
+#: 2026-11-24（本次合并 origin/main@ed425efd）：**又一次**两侧各钉各的基线。
+#: 本分支侧钉的是 `23e44d09…`（90 条路径，描述 2026-11-24 合并 deb9b009 后的
+#: 形状），base 侧钉的是 `b021d16f…`（90 条路径，描述 base 自己那一半的形状）
+#: ——**两者各自都只描述合并前的自己**，对合并态都已过期。合并后的快照文件是
+#: 两侧改动的并集（91 条路径 = 本分支侧 90 条 + base 侧 90 条 − 公共 89 条；
+#: 本分支侧的 `GET /api/verification/convergence-summary` 与 base 侧的
+#: `GET /api/plan/{plan_id}/failure-review` 同时在），故按同一条规矩重取：
+#: 先由合并态的 `openapi_snapshot.json` 规范形式现算（`5ac3569b…`），再与
+#: 线上 app 实际发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零
+#: 差异（91 条路径，路径集合、`components` 与 `info` 逐项相等，整份 schema
+#: 相等）、指纹相同——才把该值写进本常量。判定强度不变：比对逻辑、负控与
+#: 指纹比对的强度都未改动，移动的只是锚点。
+#: 
+#: 2026-11-26（本次合并 origin/main@ae55ae26 —— PR #209「postprocess 收尾
+#: 护栏」及其之前的 PR #206/#207/#208）：**又一次**两侧各钉各的基线。
+#: 本分支侧钉的是 `5ac3569b…`（91 条路径，描述 2026-11-24 合并 ed425efd 后的
+#: 形状），base 侧钉的是 `df12726c…`（90 条路径，描述 base 自己那一半的形状）
+#: ——**两者各自都只描述合并前的自己**，对合并态都已过期。合并后的快照文件是
+#: 两侧改动的并集（91 条路径 = 本分支侧 91 条 + base 侧 90 条 − 公共 90 条；
+#: 本分支侧独有的 `GET /api/verification/convergence-summary` 仍在里面，base
+#: 侧对 `POST /api/verification/{plan_id}/reset` 的文档改动（轮次租约拒绝
+#: 刷新）也在里面 —— 两侧改的是快照文件的不同位置，自动合并无冲突），故按
+#: 同一条规矩重取：先由合并态的 `openapi_snapshot.json` 规范形式现算
+#: （`0f900535…`），再与线上 app 实际发布的 schema（`openapi_snapshot()`）
+#: 交叉验证——两者逐项零差异（91 条路径，路径集合、`components` 与 `info`
+#: 逐项相等，整份 schema 相等）、指纹相同——才把该值写进本常量。判定强度
+#: 不变：比对逻辑、负控与指纹比对的强度都未改动，移动的只是锚点。
+#: 2026-11-27（本次合并 origin/main@4029f0ff）：**又一次**两侧各钉各的基线。
+#: 本分支侧钉的是 `7539d59d…`（91 条路径，描述 2026-11-25 合并 22c5f3a4 后的
+#: 形状），base 侧钉的是 `0f900535…`（91 条路径，描述 base 自己那一半的形状）
+#: ——**两者各自都只描述合并前的自己**，对合并态都已过期。合并后的快照文件是
+#: 两侧改动的并集：实测 92 条路径 = 本分支侧 91 条 + base 侧 91 条 − 公共
+#: 90 条，且合并态的路径集合**正好等于两侧的并集**（逐条比对：合并态的路径
+#: 集合与「本分支侧 ∪ base 侧」逐条相等）。本分支侧独有的 `POST
+#: /api/plan/{plan_id}/framework-fix/dismiss` 与 base 侧独有的 `GET
+#: /api/verification/convergence-summary` 同时在；公共路径里只有
+#: `/api/scheduler/state` 一条**内容**不同（本分支给它加了 `kind` 查询参数，
+#: 合并态保留本分支那一版），`components` 与 `info` 三侧逐项相等。
+#: 快照文件是本次合并的 `openapi_snapshot.json`（两侧的改动落在 JSON 的不同
+#: 区域，故自动合并的结果即**两侧的并集**；实测它与线上 app 实际发布的
+#: schema 逐项零差异）。指纹由该快照的规范形式现算
+#: （`_fingerprint(json.loads(SNAPSHOT_PATH.read_text()))`），再与线上 app
+#: 实际发布的 schema（`openapi_snapshot()`）交叉验证——两者逐项零差异、指纹
+#: 相同——才把该值写进本常量。判定强度不变：比对逻辑、负控与指纹比对的强度
+#: 都未改动，移动的只是锚点。
+BASELINE_FINGERPRINT = "0b603305cb03aef498c5fac31b5c416f0875ddfc91ced757e1c05d40035cf87c"
 
 #: The capture runs in its own process so the schema is the one a clean
 #: start produces: debug routes off, no schema cache carried over from
@@ -568,3 +640,153 @@ def test_snapshot_comparison_detects_a_new_endpoint() -> None:
 
     # And the same comparison must call an unchanged schema unchanged.
     assert describe_differences(baseline, baseline) == []
+
+
+# ---------------------------------------------------------------------------
+# 3) The additive-only policy — a re-pin may only ever grow the contract
+# ---------------------------------------------------------------------------
+
+#: The endpoints the HTTP contract carried **before** the framework-fix
+#: lane started adding to it, with the methods each one answered.
+#:
+#: This is a hand-picked sample, not the whole surface: it spans the
+#: families the service serves (health, plans, plan state, the scheduler,
+#: execution, hitl, verification) and it pins the two endpoints this
+#: branch's own work sits next to — ``/api/scheduler/state`` (which grew
+#: the ``kind`` query parameter) and ``/api/verification/{plan_id}/progress``
+#: (which grew the runtime ``vp_results`` field).
+#:
+#: Every entry here was read off the **previous** baseline, so a test that
+#: passes against the new baseline is saying something real: the old
+#: contract is still inside the new one.
+_LEGACY_ENDPOINTS: Dict[str, Set[str]] = {
+    "/api/health": {"get"},
+    "/api/plans": {"get"},
+    "/api/plan/import": {"post"},
+    "/api/plan/{plan_id}/state": {"get", "post"},
+    "/api/plan/{plan_id}/status": {"get"},
+    "/api/plan/{plan_id}/tasks": {"get"},
+    "/api/plan/{plan_id}/scheduler/{action}": {"post"},
+    "/api/execution/{plan_id}/start": {"post"},
+    "/api/execution/{plan_id}/status": {"get"},
+    "/api/hitl/{plan_id}/decisions": {"get", "post"},
+    "/api/scheduler/state": {"get"},
+    "/api/scheduler/finishing": {"get"},
+    "/api/scheduler/capacity": {"post"},
+    "/api/verification/{plan_id}/progress": {"get"},
+    "/api/verification/{plan_id}/status": {"get"},
+    "/api/verification/{plan_id}/reset": {"post"},
+    "/api/verification/{plan_id}/postprocess/resume": {"post"},
+}
+
+#: The request/response models the contract carried before, with the
+#: fields each one had.  A field that disappears is a caller that stops
+#: being able to send — or read — what it was sending — or reading —.
+_LEGACY_FIELDS: Dict[str, Set[str]] = {
+    "ImportPlanRequest": {"content", "project_dir", "requirement", "tasks", "title"},
+    "StartPlanRequest": {"project_dir", "sync_targets", "tool"},
+    "StartVerificationRequest": {"auto_fix", "force", "max_parallel", "max_rounds", "tool"},
+    "StopPlanRequest": {"requeue"},
+    "PlanStateUpdateRequest": {"arch_enabled", "current_phase", "test_enabled"},
+    "RevisePlanRequest": {"content", "feedback"},
+    "ResetVerificationRequest": {
+        "clear_artifacts",
+        "clear_root_cause_chain",
+        "clear_verification_plan",
+        "force",
+        "restart_at_round",
+        "supersede_repair_tasks",
+    },
+    "HTTPValidationError": {"detail"},
+    "ValidationError": {"loc", "msg", "type"},
+    "_ExecutionStatusResponse": {"plan_id", "status", "logs", "project_dir"},
+}
+
+
+def _missing_endpoints(schema: Dict[str, Any]) -> List[str]:
+    """The legacy endpoints this schema no longer carries, described."""
+    paths = schema.get("paths", {})
+    missing: List[str] = []
+    for path in sorted(_LEGACY_ENDPOINTS):
+        if path not in paths:
+            missing.append(f"removed endpoint: {path}")
+            continue
+        methods = set(paths[path])
+        for gone in sorted(_LEGACY_ENDPOINTS[path] - methods):
+            missing.append(f"removed method: {gone.upper()} {path}")
+    return missing
+
+
+def _missing_fields(schema: Dict[str, Any]) -> List[str]:
+    """The legacy model fields this schema no longer carries, described."""
+    schemas = schema.get("components", {}).get("schemas", {})
+    missing: List[str] = []
+    for name in sorted(_LEGACY_FIELDS):
+        if name not in schemas:
+            missing.append(f"removed model: {name}")
+            continue
+        properties = schemas[name].get("properties", {})
+        for gone in sorted(_LEGACY_FIELDS[name] - set(properties)):
+            missing.append(f"removed field: {name}.{gone}")
+    return missing
+
+
+def test_backward_compat() -> None:
+    """The contract only ever grew: the old endpoints and fields are still there.
+
+    Re-taking the baseline is a licence to **add** to the HTTP surface —
+    a new endpoint, a new query parameter, a new response code.  It is
+    never a licence to take something away, and the comparator cannot
+    tell the two apart: a schema that lost an endpoint looks exactly like
+    one that gained it, as far as "the snapshot differs" goes.
+
+    So this check pins the direction of the change.  Both the schema the
+    service publishes and the baseline committed next to it must still
+    carry the endpoints and fields the contract had before this lane
+    started extending it.
+    """
+    committed = json.loads(SNAPSHOT_PATH.read_text(encoding="utf-8"))
+    live = openapi_snapshot()
+
+    for label, schema in (("the published schema", live), (SNAPSHOT_PATH.name, committed)):
+        missing = _missing_endpoints(schema) + _missing_fields(schema)
+        assert not missing, (
+            f"{label} no longer carries part of the old HTTP contract:\n  "
+            + "\n  ".join(missing)
+            + "\nA baseline re-take may only add to the contract. Something "
+            "that used to be there is gone — that is a breaking change, not "
+            "a re-pin."
+        )
+
+
+def test_fingerprint_matches() -> None:
+    """One number describes the contract: the constant, the live schema, the snapshot.
+
+    The gate has three corners — the constant that travels with the code,
+    the snapshot file in the repository, and the schema the service
+    publishes right now.  This check ties all three together in one
+    place: if the constant is the fingerprint of both the live schema and
+    the committed snapshot, then it describes the contract that is
+    actually in force, and the two artefacts that pin it cannot disagree.
+
+    The fingerprint is computed, never typed in: it is the SHA-256 of the
+    schema's canonical form (the parsed JSON, re-serialised with sorted
+    keys and no whitespace).
+    """
+    live = _fingerprint(openapi_snapshot())
+    committed = _fingerprint(json.loads(SNAPSHOT_PATH.read_text(encoding="utf-8")))
+
+    assert live == BASELINE_FINGERPRINT, (
+        "the committed fingerprint does not describe the schema the service "
+        f"publishes today (live {live}, constant {BASELINE_FINGERPRINT}). "
+        "The HTTP contract moved relative to the committed baseline; if "
+        "that was intended, re-take the snapshot and update "
+        "BASELINE_FINGERPRINT in the same commit."
+    )
+    assert committed == BASELINE_FINGERPRINT, (
+        "the committed fingerprint does not describe the committed snapshot "
+        f"(snapshot {committed}, constant {BASELINE_FINGERPRINT}). The two "
+        "artefacts that pin the HTTP contract disagree about what the "
+        "contract is; the fingerprint must be computed from the snapshot's "
+        "canonical JSON, not written by hand."
+    )

@@ -9,13 +9,17 @@ for plan-level state.  The ``sqlite_master`` table name set for the
 state-machine database MUST be EXACTLY::
 
     {plan_routing, plan_execution, plan_verification, plan_artifacts,
-     plan_tasks, plan_decisions, scheduler_queue, scheduler_slot,
-     scheduler_command, scheduler_setting, schema_version}
+     plan_tasks, plan_decisions, plan_verification_result,
+     scheduler_queue, scheduler_slot, scheduler_command,
+     scheduler_setting, framework_fix_hit, framework_fix_registry,
+     framework_fix_alias, framework_fix_attach, framework_fix_event,
+     framework_fix_merge_lease, framework_fix_repro, schema_version}
 
-i.e. the ``plan_*`` "concern" tables, the four ``scheduler_*`` tables
-and one ``schema_version`` migration logbook table.  No legacy
-``plans``, ``plan_meta``, or ``plan_activity`` tables are allowed; no
-extra ``plan_*`` or ``scheduler_*`` tables are allowed either.
+i.e. the ``plan_*`` "concern" tables, the four ``scheduler_*`` tables,
+the framework-fix lane's own tables and one ``schema_version``
+migration logbook table.  No legacy ``plans``, ``plan_meta``, or
+``plan_activity`` tables are allowed; no extra ``plan_*`` or
+``scheduler_*`` tables are allowed either.
 
 The brief calls this out as:
 
@@ -38,6 +42,20 @@ issued), created by the same ``migrate`` call as the tables above.
 operator changes while the scheduler runs, the capacity override above
 all -- a row in the state database, because the configuration file it
 overrides is tracked by git and may not be rewritten at runtime.
+
+The framework-fix lane (2026-11-26) added eight more: the seven
+``framework_fix_*`` tables -- ``framework_fix_hit`` (every hit and its
+disposition), ``framework_fix_registry`` (the defect registry),
+``framework_fix_alias`` (the semantic-review aliases),
+``framework_fix_attach`` (which plan / VP / round waits on which fix),
+``framework_fix_event`` (the append-only audit chain),
+``framework_fix_merge_lease`` (one un-merged fix PR per repository) and
+``framework_fix_repro`` (the per-repository reproduction queue) -- plus
+``plan_verification_result`` (the append-only per-tree verification
+results).  The architecture for that lane puts them in
+``state_machine/db/schema.py`` and states that the existing tables keep
+their semantics, so the *expectation* moves with them: a product
+contract change updates every test that asserts the old contract.
 The *expectation* is the set below, and the set is what the schema has
 to equal.
 
@@ -88,6 +106,12 @@ from state_machine.db.schema import migrate  # noqa: E402
 # (the native scheduler's queue order, slot occupancy, operator
 # commands and runtime settings — see the same schema module's
 # ``_SCHEDULER_OBJECTS``).
+#
+# The framework-fix lane's eight tables joined that set on 2026-11-26:
+# the seven ``framework_fix_*`` tables and ``plan_verification_result``.
+# The set is still compared for **equality** — one table too many is as
+# wrong as one too few — so the expectation moves with the schema
+# instead of the schema being held back at the old contract.
 EXPECTED_SCHEMA_TABLES: frozenset[str] = frozenset(
     {
         "plan_routing",
@@ -96,10 +120,18 @@ EXPECTED_SCHEMA_TABLES: frozenset[str] = frozenset(
         "plan_artifacts",
         "plan_tasks",
         "plan_decisions",
+        "plan_verification_result",
         "scheduler_queue",
         "scheduler_slot",
         "scheduler_command",
         "scheduler_setting",
+        "framework_fix_hit",
+        "framework_fix_registry",
+        "framework_fix_alias",
+        "framework_fix_attach",
+        "framework_fix_event",
+        "framework_fix_merge_lease",
+        "framework_fix_repro",
         "schema_version",
     }
 )

@@ -131,9 +131,22 @@ LEGACY_TABLE_NAMES: tuple[str, ...] = (
 #: ``state_machine/db/schema.py``'s ``_ensure_plan_decisions``).
 #: Schema v7 (2026-10-28) added the three ``scheduler_*`` tables — the
 #: native scheduler's queue order, slot occupancy and operator commands
-#: (see the same schema module's ``_SCHEDULER_OBJECTS``).  This list is
-#: where the state-machine side says so; the backend's own copy of the
-#: same gate lives in
+#: (see the same schema module's ``_SCHEDULER_OBJECTS``) — and
+#: ``scheduler_setting`` (2026-10-29), the operator's runtime capacity
+#: override, which is a member of the same tuple.
+#:
+#: The framework-fix lane (2026-11-26) added eight more — the seven
+#: ``framework_fix_*`` tables (``framework_fix_hit``,
+#: ``framework_fix_registry``, ``framework_fix_alias``,
+#: ``framework_fix_attach``, ``framework_fix_event``,
+#: ``framework_fix_merge_lease``, ``framework_fix_repro``) and
+#: ``plan_verification_result``.  They come from the same
+#: unconditional, presence-guarded step as the tables above
+#: (``state_machine/db/schema.py``'s ``_ensure_framework_fix_tables``,
+#: whose module docstring says so at lines 128-141): a new table is not
+#: a shape change, so the table's own presence is the better logbook
+#: than the schema version.  This list is where the state-machine side
+#: says so; the backend's own copy of the same gate lives in
 #: ``backend/tests/static_gates/test_sqlite_schema_tables_exactly_four_plus_version.py``.
 EXPECTED_SCHEMA_TABLES: frozenset[str] = frozenset(
     {
@@ -143,10 +156,18 @@ EXPECTED_SCHEMA_TABLES: frozenset[str] = frozenset(
         "plan_artifacts",
         "plan_tasks",
         "plan_decisions",
+        "plan_verification_result",
         "scheduler_queue",
         "scheduler_slot",
         "scheduler_command",
         "scheduler_setting",
+        "framework_fix_hit",
+        "framework_fix_registry",
+        "framework_fix_alias",
+        "framework_fix_attach",
+        "framework_fix_event",
+        "framework_fix_merge_lease",
+        "framework_fix_repro",
         "schema_version",
     }
 )

@@ -125,6 +125,30 @@ are created with ``CREATE TABLE IF NOT EXISTS`` and their indexes with
 ``CREATE [UNIQUE] INDEX IF NOT EXISTS``, so re-running the migration
 is a no-op.
 
+The framework-fix tables (2026-11-23) are the eight tables the
+framework-fix lane keeps its facts in — ``framework_fix_hit`` (every
+hit and its disposition), ``framework_fix_registry`` (the defect
+registry), ``framework_fix_alias`` (the semantic-review aliases),
+``framework_fix_attach`` (which plan / VP / round waits on which fix),
+``framework_fix_event`` (the append-only audit chain),
+``framework_fix_merge_lease`` (one un-merged fix PR per repository),
+``framework_fix_repro`` (the per-repository reproduction queue) and
+``plan_verification_result`` (the append-only per-tree verification
+results).  They are applied by the unconditional, presence-guarded
+:func:`_ensure_framework_fix_tables` step, for the same reason the
+scheduler tables are: the schema version is a *cache* of the
+shape-changing migrations, and a new table is not a shape change — the
+table's presence is the better logbook.
+
+``plan_routing`` gains two columns in the same step:
+``plan_kind`` tells an ordinary plan apart from a framework-fix plan,
+and ``framework_fix`` carries that plan's framework-fix state block.
+Both are added to an existing table in place with ``ALTER TABLE ...
+ADD COLUMN`` (see :func:`_ensure_plan_routing_columns`), so an
+operator's ``state.db`` is upgraded rather than left behind, and the
+rows that were already there read back as ordinary plans with an empty
+framework block.
+
 The ``schema_version`` table is the migration-logbook: a single
 INTEGER column primary key recording which schema version is live.
 This is the bootstrap version (1) so the first ``INSERT`` is
@@ -180,7 +204,23 @@ CREATE TABLE IF NOT EXISTS plan_routing (
   flags TEXT,
   verification TEXT,
   last_updated TEXT,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  -- Which kind of plan this is (2026-11-23).  ``normal`` is an
+  -- ordinary business plan; ``framework_fix`` is a repair plan the
+  -- framework-fix lane created for a defect in the framework itself.
+  -- The column is appended LAST on purpose: ``ALTER TABLE ... ADD
+  -- COLUMN`` appends, so a table created by this DDL and one upgraded
+  -- in place (see ``_ensure_plan_routing_columns``) carry the same
+  -- column order — a reader comparing ``PRAGMA table_info`` output
+  -- sees one shape, not two.
+  plan_kind TEXT NOT NULL DEFAULT 'normal',
+  -- The framework-fix state block of this plan (JSON).  It holds the
+  -- states that are not workflow phases — ``waiting_on_user_merge``,
+  -- ``framework_fix_exhausted``, ``scheduler_deadlock_suspected``,
+  -- ``reopened`` — so that ``current_phase`` stays the single
+  -- workflow-state column.  ``{}`` means "this plan has no
+  -- framework-fix state".
+  framework_fix TEXT NOT NULL DEFAULT '{}'
 )
 """
 
@@ -559,6 +599,250 @@ _SCHEDULER_OBJECTS: tuple[tuple[str, str], ...] = (
     ("scheduler_command", _DDL_SCHEDULER_COMMAND),
     ("idx_scheduler_command_plan", _DDL_SCHEDULER_COMMAND_INDEX),
     ("scheduler_setting", _DDL_SCHEDULER_SETTING),
+)
+
+# ---------------------------------------------------------------------------
+# The framework-fix tables (2026-11-23)
+# ---------------------------------------------------------------------------
+#
+# The framework-fix lane produces facts that have to outlive the process
+# that produced them: a defect that was hit and reproduced, the repair
+# plan that is fixing it, the plans that are waiting for it, the events
+# that happened along the way, and the verification results that say
+# whether the repair actually fixed the tree.  They live in this
+# database — next to the plan facts they refer to — so that "is this
+# plan blocked on a framework fix?" and "which fix plan is it waiting
+# for?" are readable in one transaction and cannot disagree.
+
+#: Every hit, and what was done about it.  A hit is recorded even when
+#: it does not block: a non-blocking hit only *registers* its
+#: signature (``disposition='register_signature'``) and never creates a
+#: repair plan, but it still has to be on record, because the repair
+#: plan created later attaches the registered hits too.
+#:
+#: ``blocking`` is an INTEGER (0/1) rather than a boolean because
+#: SQLite has no boolean type and a reader must not have to guess
+#: whether "1" means "true".
+_DDL_FRAMEWORK_FIX_HIT = """
+CREATE TABLE IF NOT EXISTS framework_fix_hit (
+  hit_id                 TEXT PRIMARY KEY,
+  fingerprint            TEXT NOT NULL,
+  plan_id                TEXT NOT NULL,
+  vp_id                  TEXT,
+  task_id                TEXT,
+  round                  INTEGER,
+  classification         TEXT NOT NULL,
+  blocking               INTEGER NOT NULL,
+  disposition            TEXT NOT NULL,
+  evidence_path          TEXT,
+  first_seen_at          TEXT NOT NULL,
+  created_at             TEXT NOT NULL
+)
+"""
+
+#: The lookup a reader needs: "every hit of this fingerprint, oldest
+#: first" — the input of the registry's dedup answer.
+_DDL_FRAMEWORK_FIX_HIT_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_framework_fix_hit_fingerprint
+  ON framework_fix_hit(fingerprint, created_at)
+"""
+
+#: The defect registry: ONE row per canonical fingerprint.  The
+#: fingerprint is the primary key, so "is there already a repair plan
+#: for this defect?" is a single lookup and cannot answer "yes" twice.
+#:
+#: ``repo`` is an operational field, NOT part of the fingerprint: the
+#: same defect in two repositories is the same defect, and the
+#: repository only decides where the reproduction is queued.
+#:
+#: The JSON columns hold summaries and paths, never the raw evidence
+#: itself — the raw log stays in the plan's ``framework_fix/``
+#: directory, so the state database does not grow with log files.
+_DDL_FRAMEWORK_FIX_REGISTRY = """
+CREATE TABLE IF NOT EXISTS framework_fix_registry (
+  fingerprint            TEXT PRIMARY KEY,
+  fix_plan_id            TEXT NOT NULL,
+  repo                   TEXT NOT NULL,
+  status                 TEXT NOT NULL,
+  key_json               TEXT NOT NULL,
+  framework_files_json   TEXT NOT NULL,
+  evidence_summary_json  TEXT NOT NULL,
+  semantic_review_json   TEXT,
+  first_seen_at          TEXT NOT NULL,
+  created_at             TEXT NOT NULL,
+  merged_at              TEXT,
+  merge_commit           TEXT,
+  retention_until        TEXT
+)
+"""
+
+#: The semantic-review aliases: a fingerprint that a later agent
+#: review judged to be the same defect as another one.  ``resolve``
+#: reads this table first, so a mechanically different fingerprint can
+#: still find the repair plan that is already running for it.
+_DDL_FRAMEWORK_FIX_ALIAS = """
+CREATE TABLE IF NOT EXISTS framework_fix_alias (
+  alias_fingerprint      TEXT PRIMARY KEY,
+  canonical_fingerprint  TEXT NOT NULL,
+  created_at             TEXT NOT NULL
+)
+"""
+
+#: Which plan / verification point / round is waiting on which fix.
+#: The registry is the only structure that can express "several plans
+#: wait on one repair plan", and it is where that relation lives
+#: rather than in a plan directory (a plan directory cannot see the
+#: other plans).
+#:
+#: ``held_since`` is the moment the hold started, kept separately from
+#: the retry budget: a blocked verification point freezes its
+#: ``attempt`` / ``retry`` counters, so the time it spent waiting must
+#: not be charged against them.
+_DDL_FRAMEWORK_FIX_ATTACH = """
+CREATE TABLE IF NOT EXISTS framework_fix_attach (
+  attach_id              TEXT PRIMARY KEY,
+  fingerprint            TEXT NOT NULL,
+  plan_id                TEXT NOT NULL,
+  vp_id                  TEXT NOT NULL,
+  round                  INTEGER NOT NULL,
+  source                 TEXT NOT NULL,
+  status                 TEXT NOT NULL,
+  held_since             TEXT NOT NULL,
+  resolved_at            TEXT,
+  result_id              TEXT
+)
+"""
+
+#: The audit chain.  Every state transition, every agent judgement,
+#: every alias write and every merge-lease acquisition appends one row
+#: here, so that "what happened to this defect?" is answered by the
+#: database rather than by the log of whichever process happened to be
+#: running.
+_DDL_FRAMEWORK_FIX_EVENT = """
+CREATE TABLE IF NOT EXISTS framework_fix_event (
+  event_id               TEXT PRIMARY KEY,
+  fingerprint            TEXT,
+  fix_plan_id            TEXT,
+  event_type             TEXT NOT NULL,
+  payload_json           TEXT NOT NULL,
+  created_at             TEXT NOT NULL
+)
+"""
+
+#: At most ONE un-merged repair PR per repository.  The repository is
+#: the primary key, so the lease is taken by inserting the row: two
+#: repair plans cannot both hold the same repository's merge slot, and
+#: the loser sees the existing lease instead of racing for it.
+_DDL_FRAMEWORK_FIX_MERGE_LEASE = """
+CREATE TABLE IF NOT EXISTS framework_fix_merge_lease (
+  repo                   TEXT PRIMARY KEY,
+  fix_plan_id            TEXT NOT NULL,
+  pr_url                 TEXT,
+  acquired_at            TEXT NOT NULL
+)
+"""
+
+#: The reproduction queue.  A reproduction runs the failing command
+#: twice on a clean ``main`` in a throw-away detached worktree, so the
+#: verdict ("deterministic framework defect" / "flake" / "not
+#: reproducible" / "unclassified") is a function of two recorded
+#: attempts rather than of a judgement call.
+#:
+#: ``request_json`` and ``result_json`` hold the request envelope and
+#: the structured result; the raw logs live next to the plan's
+#: evidence files.
+_DDL_FRAMEWORK_FIX_REPRO = """
+CREATE TABLE IF NOT EXISTS framework_fix_repro (
+  repro_id       TEXT PRIMARY KEY,
+  repo           TEXT NOT NULL,
+  plan_id        TEXT NOT NULL,
+  failure_ref    TEXT,
+  base_ref       TEXT NOT NULL,
+  status         TEXT NOT NULL,
+  request_json   TEXT NOT NULL,
+  result_json    TEXT,
+  queued_at      TEXT NOT NULL,
+  started_at     TEXT,
+  finished_at    TEXT
+)
+"""
+
+#: The serialisation of the reproductions, enforced by the database
+#: rather than by the caller: a repository may have at most ONE running
+#: reproduction at a time, because two reproductions of the same
+#: repository would race for the same temporary worktree and could hand
+#: each other a contaminated verdict.
+#:
+#: The index is *partial* — it only covers the running rows — so the
+#: finished history of a repository (and the queued backlog) is not
+#: blocked by it.
+_DDL_FRAMEWORK_FIX_REPRO_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_framework_fix_repro_running
+  ON framework_fix_repro(repo)
+  WHERE status = 'running'
+"""
+
+#: The append-only verification results.  A verification point is
+#: re-run after a repair is merged, and the OLD verdict must stay on
+#: record: a re-run that overwrote its predecessor would make the
+#: history of a plan unreadable and would let a "passed" verdict hide
+#: the failure that caused the repair.  So this table is INSERT-only —
+#: every run appends a row.
+#:
+#: ``tree_fingerprint`` is what makes the results comparable: a result
+#: is only about the tree it was produced on, so "did this
+#: verification point pass on the current tree?" is a lookup by
+#: ``(plan_id, vp_id, tree_fingerprint)``.
+_DDL_PLAN_VERIFICATION_RESULT = """
+CREATE TABLE IF NOT EXISTS plan_verification_result (
+  result_id        TEXT PRIMARY KEY,
+  plan_id          TEXT NOT NULL,
+  round            INTEGER NOT NULL,
+  vp_id            TEXT NOT NULL,
+  tree_fingerprint TEXT NOT NULL,
+  base_main_commit TEXT NOT NULL,
+  clean            INTEGER NOT NULL,
+  verdict          TEXT NOT NULL,
+  source           TEXT NOT NULL,
+  fix_plan_id      TEXT,
+  evidence_path    TEXT,
+  created_at       TEXT NOT NULL
+)
+"""
+
+#: The lookup the "did it pass on the current tree?" question needs.
+_DDL_PLAN_VERIFICATION_RESULT_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_pvr_plan_vp_tree
+  ON plan_verification_result(plan_id, vp_id, tree_fingerprint, created_at)
+"""
+
+#: Every object the framework-fix migration owns, with the DDL that
+#: creates it.  The name is the presence key: an object that exists
+#: needs no DDL.
+_FRAMEWORK_FIX_OBJECTS: tuple[tuple[str, str], ...] = (
+    ("framework_fix_hit", _DDL_FRAMEWORK_FIX_HIT),
+    ("idx_framework_fix_hit_fingerprint", _DDL_FRAMEWORK_FIX_HIT_INDEX),
+    ("framework_fix_registry", _DDL_FRAMEWORK_FIX_REGISTRY),
+    ("framework_fix_alias", _DDL_FRAMEWORK_FIX_ALIAS),
+    ("framework_fix_attach", _DDL_FRAMEWORK_FIX_ATTACH),
+    ("framework_fix_event", _DDL_FRAMEWORK_FIX_EVENT),
+    ("framework_fix_merge_lease", _DDL_FRAMEWORK_FIX_MERGE_LEASE),
+    ("framework_fix_repro", _DDL_FRAMEWORK_FIX_REPRO),
+    ("idx_framework_fix_repro_running", _DDL_FRAMEWORK_FIX_REPRO_INDEX),
+    ("plan_verification_result", _DDL_PLAN_VERIFICATION_RESULT),
+    ("idx_pvr_plan_vp_tree", _DDL_PLAN_VERIFICATION_RESULT_INDEX),
+)
+
+#: The columns ``plan_routing`` gained for the framework-fix lane, and
+#: the declaration each one is added with.  The declaration is the
+#: full column definition (``TYPE NOT NULL DEFAULT ...``) because
+#: ``ALTER TABLE ... ADD COLUMN`` needs the constraint and the default
+#: in the same breath — a column added without a default would make
+#: every row that was already there read back as NULL, and a plan
+#: whose kind is unknown must not be mistaken for a framework-fix plan.
+_PLAN_ROUTING_FRAMEWORK_FIX_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("plan_kind", "TEXT NOT NULL DEFAULT 'normal'"),
+    ("framework_fix", "TEXT NOT NULL DEFAULT '{}'"),
 )
 
 # Order matters: the six ``plan_*`` tables come first, then the
@@ -1102,6 +1386,95 @@ def _ensure_scheduler_tables(conn: sqlite3.Connection) -> None:
         conn.execute(ddl)
 
 
+def _ensure_framework_fix_tables(conn: sqlite3.Connection) -> None:
+    """Create the framework-fix tables and their indexes when missing.
+
+    The framework-fix lane keeps eight facts of its own — the hits, the
+    defect registry, the semantic aliases, the attach records, the
+    audit events, the merge leases, the reproduction queue and the
+    append-only verification results.  They live in this database, next
+    to the plan facts they refer to, so that "is this plan blocked on a
+    framework fix?" and "which fix plan is it waiting for?" are
+    readable in one transaction and cannot disagree.
+
+    Guarded by the *presence of the objects* rather than by the version
+    row, for the same reason as :func:`_ensure_scheduler_tables`: the
+    presence check is self-describing and idempotent, and a database
+    that somehow reached the current version without the tables heals
+    itself on the next ``migrate`` instead of failing every later read
+    with *"no such table: framework_fix_registry"*.  This is also why
+    adding these tables needs no schema version bump: a database that
+    already reached the current version gets them on its next
+    ``migrate``.
+
+    One read of ``sqlite_master`` answers "is anything missing?".  When
+    nothing is missing the step costs that single read and issues no
+    DDL — which is what keeps the hot path (a fresh connection per
+    request) free of write locks.  When something *is* missing the
+    whole DDL set is replayed: every statement is ``IF NOT EXISTS``, so
+    the objects that were already there are left exactly as they are.
+    """
+    present = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'index')"
+        )
+    }
+    if all(name in present for name, _ddl in _FRAMEWORK_FIX_OBJECTS):
+        return
+    for _name, ddl in _FRAMEWORK_FIX_OBJECTS:
+        conn.execute(ddl)
+
+
+def _ensure_plan_routing_columns(conn: sqlite3.Connection) -> None:
+    """Add the framework-fix columns a ``plan_routing`` table is missing.
+
+    ``plan_kind`` tells an ordinary plan apart from a framework-fix
+    plan, and ``framework_fix`` carries the plan's framework-fix state
+    block.  ``CREATE TABLE IF NOT EXISTS`` cannot change a table that
+    already exists, so a database written before these columns existed
+    keeps the ten columns it was created with — and every write that
+    carries a plan kind has nowhere to put it.  The upgrade is
+    therefore *additive*: read the live column set with ``PRAGMA
+    table_info`` and ``ALTER TABLE`` the missing ones in.
+
+    The read is what makes it safe to run on every ``migrate``: a
+    current table has both columns, so the step costs one ``PRAGMA``
+    and no write lock — the hot path a per-request connection open
+    depends on is untouched.
+
+    ``ALTER TABLE ... ADD COLUMN`` appends, so an upgraded table ends
+    up with the same column order as one created by the DDL above (the
+    two columns are declared LAST there for exactly this reason).
+
+    The rows that were already there keep their values: SQLite applies
+    the column's DEFAULT to them, so a plan written before the
+    framework-fix lane existed reads back as an ordinary plan with an
+    empty framework block.
+    """
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(plan_routing)")
+    }
+    if not existing:
+        # ``plan_routing`` is not there (or is not a table): there is
+        # nothing to add the columns to, and the CREATE TABLE that
+        # makes it declares them already.
+        return
+    for name, declaration in _PLAN_ROUTING_FRAMEWORK_FIX_COLUMNS:
+        if name in existing:
+            continue
+        try:
+            conn.execute(
+                f"ALTER TABLE plan_routing ADD COLUMN {name} {declaration}"
+            )
+        except sqlite3.OperationalError:
+            # Another process added the column between the PRAGMA and
+            # the ALTER (SQLite's write lock serialises the two, so
+            # this is the only way to lose the race).  The column is
+            # there, which is all this step wanted.
+            pass
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     """Create the six ``plan_*`` tables, the four ``scheduler_*``
     tables and the ``schema_version`` row.
@@ -1190,6 +1563,29 @@ def migrate(conn: sqlite3.Connection) -> None:
     # presence guard is what makes a database that somehow missed the
     # tables heal itself instead of failing every later read.
     _ensure_scheduler_tables(conn)
+
+    # The framework-fix tables are ensured on EVERY call, for the same
+    # reason the scheduler tables are: the framework-fix lane's own
+    # facts (hits, registry, aliases, attach records, audit events,
+    # merge leases, reproductions, per-tree verification results) must
+    # sit next to the plan facts in this database, and the objects'
+    # presence is a better logbook than the version row.  The recorded
+    # version cannot tell "a database from before the framework-fix
+    # lane" apart from "a database from after it" — both say 7 — so
+    # the step is presence-guarded instead.  See
+    # ``_ensure_framework_fix_tables``.
+    _ensure_framework_fix_tables(conn)
+
+    # The two framework-fix columns of ``plan_routing`` are ensured on
+    # EVERY call, for the same reason the deliverable columns of
+    # ``plan_tasks`` are: the recorded schema version cannot tell an
+    # OLD table apart from a current one, and a table that predates
+    # the columns would have nowhere to put a plan kind.  The guard is
+    # the presence of the columns themselves rather than the version
+    # row, so an operator's database written by an older backend is
+    # upgraded rather than left behind.  See
+    # ``_ensure_plan_routing_columns``.
+    _ensure_plan_routing_columns(conn)
 
 
 def _migrate_schema(conn: sqlite3.Connection) -> None:
@@ -1295,6 +1691,20 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     # See ``_v6_drop_execution_current_phase``.
     # ----------------------------------------------------------------
     _v6_drop_execution_current_phase(conn)
+
+    # ----------------------------------------------------------------
+    # The framework-fix lane (2026-11-23): the eight tables its facts
+    # live in, and the two ``plan_routing`` columns that tell an
+    # ordinary plan apart from a framework-fix plan.
+    #
+    # Both steps are idempotent and presence-guarded, so they are also
+    # run unconditionally by ``migrate()`` — the recorded schema
+    # version cannot tell a database from before the framework-fix lane
+    # apart from one from after it, and a table that predates the
+    # columns would have nowhere to put a plan kind.
+    # ----------------------------------------------------------------
+    _ensure_framework_fix_tables(conn)
+    _ensure_plan_routing_columns(conn)
 
     # Record the bootstrap schema version.  We use ``INSERT OR
     # IGNORE`` so a second migrate() call (where the row already

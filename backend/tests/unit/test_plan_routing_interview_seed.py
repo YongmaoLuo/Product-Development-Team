@@ -11,12 +11,20 @@ row existed for the plan, and ``_infer_phase`` returned
 interview and a plan with a completed interview were
 indistinguishable to anyone reading the routing table.
 
-The fix: ``_seed_plan_routing_phase(plan_id, phase)`` INSERTs a
+The fix: ``_seed_plan_routing_phase(plan_id, phase)`` creates a
 ``plan_routing`` row at plan creation (called from
 ``/api/interview/start``) so the routing table is the source of
 truth for the interview phase from the very first request
-onwards. The call is ``INSERT OR IGNORE`` so a re-run on a plan
-that has already advanced past ``phase`` does not regress the row.
+onwards. The write is **create-only** — the row is written when it
+is missing and not one column is written when it is already there —
+so a re-run on a plan that has already advanced past ``phase`` does
+not regress the row.
+
+The write goes through the routing repository's create-only method
+(:meth:`RoutingRepository.insert_if_missing`).  ``current_phase`` is
+the single workflow-state column and the routing repository is its
+only writer, so a helper that spelled the statement out for itself
+would be a second writer of the phase.
 
 This test file pins the contract:
 
@@ -29,12 +37,16 @@ This test file pins the contract:
      state DB through ``PDT_STATE_DB_PATH`` env override (same path
      as ``server._state_db_path``) so a hermetic test DB is
      honoured.
+  4. ``test_seed_writes_through_the_routing_repository`` — the
+     helper reaches the phase through the routing repository, so it
+     is not a second writer of the phase.
 
 TDD spec:
 
   - test_seed_inserts_row_when_absent
   - test_seed_is_idempotent_on_existing_row
   - test_seed_writes_through_state_db_path
+  - test_seed_writes_through_the_routing_repository
 """
 
 from __future__ import annotations
@@ -187,4 +199,49 @@ def test_seed_writes_through_state_db_path(tmp_path) -> None:
     assert phase == "interview", (
         f"helper must write through _state_db_path; "
         f"got current_phase={phase!r} at db_path={db_path!r}"
+    )
+
+
+def test_seed_writes_through_the_routing_repository(monkeypatch) -> None:
+    """The seed must reach the phase through the routing repository.
+
+    ``plan_routing.current_phase`` is the single workflow-state column
+    (the DDL comment in ``backend/state_machine/db/schema.py`` says so)
+    and the routing repository is its only writer.  A seed helper that
+    spelled the statement out for itself would be a **second** writer of
+    the phase — the same defect the framework-fix lane used to have,
+    and the one the single-writer contract exists to prevent.
+
+    So the helper must call the repository's **create-only** write:
+    the row is created when it is missing, and not one column is
+    written when it is already there.
+    """
+    from state_machine.repositories import routing_repository as _routing
+
+    calls = []
+    original = _routing.RoutingRepository.insert_if_missing
+
+    def _spy(self, plan_id: str, phase: str) -> bool:
+        calls.append((plan_id, phase))
+        return original(self, plan_id, phase)
+
+    monkeypatch.setattr(
+        _routing.RoutingRepository, "insert_if_missing", _spy
+    )
+
+    from server import _seed_plan_routing_phase, _state_db_path
+
+    _seed_plan_routing_phase("plan-via-repository", phase="interview")
+
+    assert calls == [("plan-via-repository", "interview")], (
+        "the seed must write the phase through the routing repository; "
+        "it called {0!r} instead".format(calls)
+    )
+
+    phase, _ = _read_plan_routing_phase(
+        _state_db_path(), "plan-via-repository"
+    )
+    assert phase == "interview", (
+        f"the repository call must have created the row; "
+        f"got current_phase={phase!r}"
     )

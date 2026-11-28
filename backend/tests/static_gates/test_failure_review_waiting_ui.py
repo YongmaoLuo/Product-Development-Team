@@ -65,7 +65,17 @@ _FAILURE_REVIEW = "failure_review"
 
 #: The cache-busting version ``index.html`` gives ``app.js``.  The
 #: browser must not keep the old file after the panel changed.
-_APP_JS_VERSION = 20
+#:
+#: 2026-11-24（合入 origin/main / 9900373b）：合并后的 `frontend/index.html` 把
+#: ``app.js`` 的缓存版本号前移到 ``?v=21``（本分支在 deb9b009 之后自己改的，
+#: base 侧此后没有再改这个文件），本 gate 仍钉着合并前的 ``?v=20``，于是
+#: ``test_asset_version_bumped`` 红了。按该 gate 的既定流程把这个版本号前移到合并态
+#: 的实测值——不是抄来的：``grep 'app.js?v=' frontend/index.html`` 读出 ``?v=21``。
+#: 2026-11-26（repair-14「框架修复条目补来源轮次与 PR 链接」）：`frontend/app.js`
+#: 改了（条目多画了「第 N 轮」与 PR 链接），`frontend/index.html` 随之把缓存版本号
+#: 前移到 ``?v=22``。按该 gate 的既定流程把这个版本号再前移一次——不是抄来的：
+#: ``grep 'app.js?v=' frontend/index.html`` 读出 ``?v=22``。
+_APP_JS_VERSION = 22
 
 
 # ---------------------------------------------------------------------------

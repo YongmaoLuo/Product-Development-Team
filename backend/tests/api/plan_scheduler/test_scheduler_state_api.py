@@ -12,7 +12,7 @@ with a 404 (``{"detail": "Not found"}``) instead of the snapshot.
    the guard header is refused by the middleware before it reaches a
    handler, so a 403 here would mean the route sits outside the
    guarded surface; a 404 would mean the catch-all swallowed it.
-2. **The key set is closed.**  The document has exactly ten keys.  A
+2. **The key set is closed.**  The document has exactly eleven keys.  A
    field that appears without being declared is a field the panel
    cannot render and the LUI cannot rely on.  The seventh key is
    ``waiting`` — the finishing stage's waits, which
@@ -25,7 +25,9 @@ with a 404 (``{"detail": "Not found"}``) instead of the snapshot.
    queue nor the running line can ever name them.  The ninth key is
    ``stopping`` — the commands the scheduler has accepted and not
    answered yet.  The tenth key is ``review_queue`` — the rows the
-   panel's review block draws, added by the route that answers.
+   panel's review block draws, added by the route that answers.  The
+   eleventh key is ``framework_fixes`` — the framework-fix lane's own
+   plans, which are in no ordinary line either.
 3. **The queue is in the production order.**  The rows come back
    sorted by ``plan_scheduler.queue.queue_key`` — the comparator the
    admission check uses — and the position of each row counts from
@@ -51,10 +53,10 @@ The read model and the report
 Four places carry the shape this file pins, and they are named here so
 that a reader of a failure knows where the truth lives:
 
-* ``plan_scheduler.snapshot.build`` — the **nine-key** document:
+* ``plan_scheduler.snapshot.build`` — the **ten-key** document:
   ``capacity``, ``queue_length``, ``over_capacity``, ``queue``,
-  ``running``, ``waiting``, ``parked``, ``stopping`` and
-  ``generated_at``.
+  ``running``, ``waiting``, ``parked``, ``framework_fixes``,
+  ``stopping`` and ``generated_at``.
 * ``plan_scheduler.snapshot.WAITING_KEYS`` — the **eleven-key** waiting
   row: ``plan_id``, ``item_id``, ``wait_type``, ``question``,
   ``deadline``, ``remaining_seconds``, ``extendable``,
@@ -150,7 +152,7 @@ STATE_PATH = "/api/scheduler/state"
 #: is a route that was registered too late.
 CATCH_ALL_PATH = "/{path:path}"
 
-#: The ten keys the read model carries — and no others.
+#: The eleven keys the read model carries — and no others.
 #:
 #: The seventh is ``waiting``: the finishing stage's waits, merged into
 #: the document by ``routes.scheduler._state_with_waiting``.  It is a
@@ -169,6 +171,10 @@ CATCH_ALL_PATH = "/{path:path}"
 #: The tenth is ``review_queue``: the rows the panel's review block
 #: draws.  It is added by the route that answers, so it is a key of
 #: the answer and not of the engine's snapshot.
+#:
+#: The eleventh is ``framework_fixes``: the framework-fix lane's own
+#: plans — the panel's other column.  It is a list too, and it is
+#: always there: no repair plan is an empty list, not a missing key.
 EXPECTED_KEYS = {
     "capacity",
     "queue_length",
@@ -177,6 +183,7 @@ EXPECTED_KEYS = {
     "running",
     "waiting",
     "parked",
+    "framework_fixes",
     "stopping",
     "generated_at",
     "review_queue",
@@ -291,7 +298,7 @@ def test_state_returns_200_not_catchall(install_engine):
 
 
 def test_state_key_set_closed(install_engine):
-    """The document has exactly ten keys.
+    """The document has exactly eleven keys.
 
     A field that appears without being declared is a field the panel
     cannot render and the LUI cannot rely on, so the set is asserted
@@ -310,7 +317,9 @@ def test_state_key_set_closed(install_engine):
     The ninth key is ``stopping`` — the commands the scheduler has
     accepted and not answered yet.  The tenth key is ``review_queue``
     — the rows the panel's review block draws, added by the route that
-    answers.
+    answers.  The eleventh key is ``framework_fixes`` — the
+    framework-fix lane's own plans, which are in no ordinary line
+    either.
 
     The rows carry two more fields than the document does: the
     ``phase`` — the routing layer's own word for what the plan is
@@ -366,16 +375,16 @@ def test_state_key_set_closed(install_engine):
     }, sorted(body["running"][0])
 
 
-def test_state_key_set_is_the_eight_key_contract(install_engine):
-    """The live document carries the ten names — written out here.
+def test_state_key_set_is_the_eleven_key_contract(install_engine):
+    """The live document carries the eleven names — written out here.
 
     ``EXPECTED_KEYS`` is the constant the other cases compare against,
     and a constant can be edited in the same commit as the code that
     produced it: when the two drift together, the comparison still
     passes and the contract has quietly changed.  So this case writes
-    the ten names out **literally** and does not read
+    the eleven names out **literally** and does not read
     ``EXPECTED_KEYS`` at all — the contract itself is pinned here, and
-    a change to any of the ten names has to be a decision somebody
+    a change to any of the eleven names has to be a decision somebody
     made on purpose.
 
     The seventh name is ``waiting``: the finishing stage's waits, which
@@ -392,6 +401,10 @@ def test_state_key_set_is_the_eight_key_contract(install_engine):
     The ninth name is ``stopping``: the commands the scheduler has
     accepted and not answered yet.  The tenth name is ``review_queue``:
     the rows the panel's review block draws.
+
+    The eleventh name is ``framework_fixes``: the framework-fix lane's
+    own plans.  It is a list as well, and it is a list whether the
+    lane has any work or not.
     """
     install_engine({"capacity": 4, "used": 0, "queue": [], "running": []})
 
@@ -407,12 +420,14 @@ def test_state_key_set_is_the_eight_key_contract(install_engine):
         "running",
         "waiting",
         "parked",
+        "framework_fixes",
         "stopping",
         "generated_at",
         "review_queue",
     }, sorted(body)
     assert isinstance(body["waiting"], list), body["waiting"]
     assert isinstance(body["parked"], list), body["parked"]
+    assert isinstance(body["framework_fixes"], list), body["framework_fixes"]
     assert isinstance(body["stopping"], list), body["stopping"]
     assert isinstance(body["review_queue"], dict), body["review_queue"]
 
@@ -520,7 +535,7 @@ def test_state_broken_engine_answers_empty_not_500(monkeypatch):
 def test_state_non_document_snapshot_answers_empty_not_500(monkeypatch):
     """An engine that answers with something that is not a document.
 
-    The read model is a document with ten keys, and the panel reads
+    The read model is a document with eleven keys, and the panel reads
     those keys by name.  An engine that hands back something else —
     ``None`` today, a list tomorrow — has not answered the question,
     and a document that is not the read model would leave the panel

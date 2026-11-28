@@ -39,9 +39,9 @@ assertion would still pass when a field was added, and adding a field
 is precisely the thing that has to be a decision.
 
 The document's own keys are asserted too, and they are asserted as
-**eight** — a sub-phase is a field on a *row*, and it did not turn the
-document into a ninth-key document.  Two keys were added beside the
-original six, and neither took the place of one of them.
+**ten** — a sub-phase is a field on a *row*, and it did not turn the
+document into a document with a key of its own.  Four keys were added
+beside the original six, and none took the place of one of them.
 
 The seventh key is ``waiting``: the finishing stage's waits, which
 ``plan_scheduler.snapshot.build`` puts in the document and
@@ -55,6 +55,14 @@ nor the running line can ever name them.  It was added beside the
 others and not instead of one of them — the keys keep their names,
 their types and their meanings, so a reader written against them is
 still reading a document it was written for.
+
+The ninth key is ``stopping``: the commands the scheduler has accepted
+and not answered yet, so a plan that is on its way to a stop is visible
+before it is stopped.
+
+The tenth key is ``framework_fixes``: the framework-fix lane's own
+plans, which are in no ordinary line either.  It was added beside the
+others on the same terms.
 """
 
 from __future__ import annotations
@@ -107,7 +115,7 @@ RUNNING_ROW_KEYS = {
 
 #: The keys the **document** carries — and no others.
 #:
-#: Nine.  The phase was a field on a *row* and did not turn the
+#: Ten.  The phase was a field on a *row* and did not turn the
 #: document into a seventh-key document; the seventh key is
 #: ``waiting`` — the finishing stage's waits, a list of the panel's
 #: waiting block, put there by ``plan_scheduler.snapshot.build`` and
@@ -117,7 +125,9 @@ RUNNING_ROW_KEYS = {
 #: of the two lists above can ever name them.  The ninth key is
 #: ``stopping`` — the commands the scheduler has accepted and not
 #: answered yet, so a plan that is on its way to a stop is visible
-#: before it is stopped.  All three were added beside
+#: before it is stopped.  The tenth key is ``framework_fixes`` — the
+#: framework-fix lane's own plans, which are in no ordinary line
+#: either.  All four were added beside
 #: the original six and not instead of one of them: the keys keep their
 #: names, their types and their meanings.
 TOP_LEVEL_KEYS = {
@@ -129,6 +139,7 @@ TOP_LEVEL_KEYS = {
     "waiting",
     "parked",
     "stopping",
+    "framework_fixes",
     "generated_at",
 }
 
@@ -225,7 +236,7 @@ def test_running_row_keys_include_phase() -> None:
 
 
 def test_top_level_keys_unchanged() -> None:
-    """The document still carries exactly its eight keys.
+    """The document still carries exactly its ten keys.
 
     The phase was added to the **rows**, and the document is not a row:
     a reader that finds a ninth key at the top level is reading a
@@ -241,6 +252,11 @@ def test_top_level_keys_unchanged() -> None:
 
     The eighth key, ``parked``, was written down here too, so that the
     next person to touch the whitelist knows it is deliberate.
+
+    The tenth key, ``framework_fixes``, is the framework-fix lane's own
+    plans — they are in no ordinary line either, so the read model is
+    the only place that can name them.  It was written down here for
+    the same reason.
     """
     result = build(_state([_queue_row("p1", 1)], [_running_row("r1", 400.0)]))
 

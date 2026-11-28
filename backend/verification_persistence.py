@@ -42,12 +42,15 @@ import gzip
 import os
 import re
 import shutil
+import sqlite3
 import tempfile
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Sequence
 
 from bounded_log import append_bounded_line, rotated_log_paths
+from framework.clock import utcnow_iso
 from plan_artifacts import TASKS_FILENAME
 from verification_report_md import (
     _entry_id,
@@ -55,6 +58,11 @@ from verification_report_md import (
     is_test_mode_cost_skip,
     render as render_markdown,
 )
+
+try:  # pragma: no cover - 两条路径等价，取先成功的那条
+    from config_paths import resolve_state_db_path
+except ImportError:  # pragma: no cover
+    from backend.config_paths import resolve_state_db_path  # type: ignore
 
 
 #: The derived Markdown view's filename, next to ``verification_report.json``.
@@ -1131,3 +1139,418 @@ class VerificationPersistenceManager:
         # Filter to strings only — defensive against a malformed
         # report that accidentally stored ints / dicts.
         return [vp_id for vp_id in value if isinstance(vp_id, str)]
+
+
+# ---------------------------------------------------------------------------
+# 只追加的验证结果行（``plan_verification_result``）
+# ---------------------------------------------------------------------------
+#: 结果行的来源：框架修复这条链上的**首次**结论 —— 缺陷被登记时的那一轮。
+#:
+#: 它是这条链的基线：后来的每一次重跑都是拿它比的。没有它，「修了之后是好了
+#: 还是换了个样子」就没有可比的起点。
+RESULT_SOURCE_INITIAL = "initial"
+
+#: 结果行的来源：修复合入之后，在含修复的树上重跑的那一次。
+RESULT_SOURCE_FRAMEWORK_FIX_RERUN = "framework_fix_rerun"
+
+#: 结果行的来源：已修复的签名又被撞上（延迟命中）之后的那一次重跑。
+#:
+#: 它与 :data:`RESULT_SOURCE_FRAMEWORK_FIX_RERUN` 的区别不在**做了什么**
+#: （都是重跑），而在**为什么**：这一轮是修复合入**之后**才撞上的。
+RESULT_SOURCE_LATE_HIT_RERUN = "late_hit_rerun"
+
+#: 结果行的来源词表。集合外的词不是「新语义」，是拼错了。
+RESULT_SOURCES = frozenset(
+    {
+        "verification_loop",
+        RESULT_SOURCE_INITIAL,
+        RESULT_SOURCE_FRAMEWORK_FIX_RERUN,
+        RESULT_SOURCE_LATE_HIT_RERUN,
+        "manual",
+    }
+)
+
+#: 结果行的结论词表。
+RESULT_VERDICTS = frozenset({"passed", "failed", "skipped", "unknown"})
+
+#: 各种写法的结论 → 结果行真正写的那一个。
+_VERDICT_ALIASES = {
+    "passed": "passed",
+    "pass": "passed",
+    "ok": "passed",
+    "success": "passed",
+    "verification_passed": "passed",
+    "failed": "failed",
+    "fail": "failed",
+    "failure": "failed",
+    "error": "failed",
+    "verification_failed": "failed",
+    "skipped": "skipped",
+    "skip": "skipped",
+    "deferred": "skipped",
+    "unknown": "unknown",
+    "inconclusive": "unknown",
+    "not_run": "unknown",
+}
+
+
+def normalize_result_verdict(verdict: Any) -> str:
+    """把各种写法的结论归一成 :data:`RESULT_VERDICTS` 里的那一个。
+
+    ``None`` 归成 ``unknown`` —— 「没跑出结论」是一个真实的结论，不是「不知道
+    是哪个词」。别的写法认不出来就**抛错**：拼错的结论看起来和没人写过的结论
+    一模一样，而那会把一次失败记成一次「不知道」。
+
+    Raises:
+        ValueError: 这个写法不在词表里。
+    """
+    if verdict is None:
+        return "unknown"
+    text = " ".join(str(verdict).split()).lower()
+    resolved = _VERDICT_ALIASES.get(text)
+    if resolved is None:
+        raise ValueError(
+            f"unknown verification verdict {verdict!r}; expected one of "
+            f"{sorted(RESULT_VERDICTS)}"
+        )
+    return resolved
+
+
+# ---------------------------------------------------------------------------
+# 框架缺陷挂起的守卫 —— 「这个计划此刻被挂住了吗」的**唯一**判据
+# ---------------------------------------------------------------------------
+#: 一个被框架缺陷挂住的计划被拒绝时带的错误词。它与修复生成器用的同一个词
+#: （``repair_generator.SKIPPED_BLOCKED_ON_FRAMEWORK_FIX``）、与读模型投影出来
+#: 的同一个词（``framework_fix.read_model.BLOCKED``）是同一个词 —— 一件事一个
+#: 词。
+BLOCKED_ON_FRAMEWORK_FIX = "blocked_on_framework_fix"
+
+#: 守卫**读不到**挂起状态时带的错误词。它刻意不是上面那个：守卫并不知道这个
+#: 计划有没有被挂起，说它被挂住了是「把猜测打扮成答案」。
+FRAMEWORK_FIX_GUARD_UNAVAILABLE = "framework_fix_guard_unavailable"
+
+
+class FrameworkFixGuardError(RuntimeError):
+    """守卫的拒绝。两个子类都带一个能映射成 HTTP 状态码的错误词。"""
+
+    #: 这条拒绝带的错误词。
+    error: str = FRAMEWORK_FIX_GUARD_UNAVAILABLE
+
+    #: 这条拒绝对应的 HTTP 状态码。
+    status_code: int = 500
+
+    def __init__(self, message: str = "", *, fingerprint: str = "") -> None:
+        super().__init__(message or self.error)
+        #: 挂住这个计划的缺陷指纹（读得到才有）。
+        self.fingerprint = str(fingerprint or "")
+
+
+class FrameworkFixGuardUnavailable(FrameworkFixGuardError):
+    """挂起状态读不出来 —— 守卫给不出答案，所以不放行。"""
+
+    error = FRAMEWORK_FIX_GUARD_UNAVAILABLE
+    status_code = 500
+
+
+class BlockedOnFrameworkFix(FrameworkFixGuardError):
+    """这个计划被框架缺陷挂住了 —— 这次写入被拒。"""
+
+    error = BLOCKED_ON_FRAMEWORK_FIX
+    status_code = 409
+
+
+def framework_fix_hold_block(plan_id: str) -> Optional[Dict[str, Any]]:
+    """这个计划此刻的挂起块 —— 没挂起返回 ``None``。
+
+    挂起的载体住在计划的 ``framework_fix`` 块里：``hold`` 标记，以及
+    ``paused_by``（挂到了哪个修复计划上）。判据取自读模型
+    （``framework_fix.read_model._is_held``）—— **这里是它唯一的调用点**，
+    所以第二个入口不可能自己重写一份判据然后写错。
+
+    相位那个载体（``current_phase == "blocked_on_framework_fix"``）不参与判定：
+    相位是挂起的**投影**，块才是挂起本身的落点。
+
+    Args:
+        plan_id: 计划号。
+
+    Returns:
+        挂起块（字典）；这个计划没被挂起时是 ``None``。
+
+    Raises:
+        FrameworkFixGuardUnavailable: 挂起状态**读不出来**。「不知道」不是
+            「没挂起」—— 读失败当成没挂起，守卫就成了摆设。
+    """
+    from framework_fix.read_model import _is_held
+    from plan_state import _read_routing_framework_fix
+
+    read = _read_routing_framework_fix(plan_id)
+    if read is None:
+        raise FrameworkFixGuardUnavailable(
+            f"the framework-fix hold state of plan {plan_id!r} could not be read"
+        )
+    block = read[1]
+    if not isinstance(block, dict):
+        return None
+    if _is_held({}, block):
+        return block
+    return None
+
+
+def framework_fix_is_held(plan_id: str) -> bool:
+    """这个计划此刻被框架缺陷挂住了吗。
+
+    Raises:
+        FrameworkFixGuardUnavailable: 挂起状态读不出来。
+    """
+    return framework_fix_hold_block(plan_id) is not None
+
+
+def refuse_verdict_when_held(plan_id: str) -> None:
+    """这个计划被挂起了吗 —— 是的话把这次写入拒掉。
+
+    给落盘层用：调用方拿到的是一个**异常**，不是一个答复。它映射成 409 时说
+    的就是「这个计划被框架缺陷挡着」；验证循环接住它、记一行日志、不落行 ——
+    那条 ``skipped`` 结论于是没有结清任何东西。
+
+    Args:
+        plan_id: 计划号。
+
+    Raises:
+        BlockedOnFrameworkFix: 这个计划被框架缺陷挂住了。
+        FrameworkFixGuardUnavailable: 挂起状态读不出来（同样不放行）。
+    """
+    hold = framework_fix_hold_block(plan_id)
+    if hold is None:
+        return
+    fingerprint = str(hold.get("fingerprint") or "")
+    # The message carries the plan and the defect on purpose.  The
+    # verification loop catches this exception and logs it — so the
+    # message is the only place the operator learns **which** defect is
+    # holding the plan.  A refusal that does not say which defect is
+    # holding it is a refusal nobody can act on.
+    raise BlockedOnFrameworkFix(
+        f"plan {plan_id!r} is held by the framework defect "
+        f"{fingerprint or '(fingerprint unknown)'}; this write is refused",
+        fingerprint=fingerprint,
+    )
+
+
+def _result_db_path(db_path: Optional[Path] = None) -> Path:
+    """结果行落在哪个库。不给就用应用现在用的那个。"""
+    if db_path is not None:
+        return Path(db_path)
+    return Path(resolve_state_db_path())
+
+
+def _migrate_result_table(conn: sqlite3.Connection) -> None:
+    """迁移是幂等的补列步骤 —— 列不存在时写不进去。
+
+    表本身是「新增」而不是「改形状」，所以迁移按**表在不在**来判断，而不是
+    按版本号：版本号只是形状变更的缓存，而这张表在不在才是更好的账本。
+    """
+    try:  # pragma: no cover - 两条路径等价，取先成功的那条
+        from state_machine.db.schema import migrate
+    except ImportError:  # pragma: no cover
+        from backend.state_machine.db.schema import migrate  # type: ignore
+
+    migrate(conn)
+
+
+def append_verification_result(
+    *,
+    plan_id: str,
+    vp_id: str,
+    tree_fingerprint: str,
+    verdict: str,
+    round_no: int = 1,
+    base_main_commit: str = "",
+    clean: bool = True,
+    source: str = "verification_loop",
+    fix_plan_id: Optional[str] = None,
+    evidence_path: Optional[str] = None,
+    db_path: Optional[Path] = None,
+) -> str:
+    """追加一行验证结果，返回它的行 id。
+
+    **只追加，永不更新。** 这张表的全部不变式就是这一句：一次重跑写一行，旧行
+    原地不动。「这棵树过了吗」这个问题由**这棵树**的那几行回答，而不是由「最后
+    一行」回答 —— 后者会把一次失败抹掉。
+
+    每一行都绑着一棵树（``tree_fingerprint``）：同一个验证点在不同的树上结论
+    可以不同，两条结论都留着，各自说清自己是在哪棵树上得出的。
+
+    Args:
+        plan_id: 结论属于哪个计划。
+        vp_id: 哪个验证点。
+        tree_fingerprint: 结论是在哪棵树上得出的（``sha256:`` 前缀）。
+        verdict: 结论。各种写法都认（见 :func:`normalize_result_verdict`）。
+        round_no: 第几轮。
+        base_main_commit: 基准 main 的 commit。
+        clean: 当时工作区是不是干净的。
+        source: 这一行的来源（见 :data:`RESULT_SOURCES`）。
+        fix_plan_id: 这次重跑是为哪个修复计划跑的。
+        evidence_path: 证据文件的位置（原文不入库）。
+        db_path: 落在哪个库。``None`` 表示应用现在用的那个。
+
+    Returns:
+        这一行的 ``result_id``。
+
+    Raises:
+        ValueError: 参数不合法（空计划号 / 空验证点 / 空指纹 / 词表外的词）。
+        BlockedOnFrameworkFix: 结论是 ``skipped``，而这个计划正被框架缺陷挂住
+            —— 挂起中的验证点不许被 skip 结清。
+        FrameworkFixGuardUnavailable: 挂起状态读不出来（同样不放行）。
+    """
+    plan = str(plan_id or "").strip()
+    vp = str(vp_id or "").strip()
+    tree = str(tree_fingerprint or "").strip()
+    if not plan:
+        raise ValueError("plan_id must be a non-empty string")
+    if not vp:
+        raise ValueError("vp_id must be a non-empty string")
+    if not tree:
+        raise ValueError("tree_fingerprint must be a non-empty string")
+    resolved = normalize_result_verdict(verdict)
+    origin = str(source or "").strip()
+    if origin not in RESULT_SOURCES:
+        raise ValueError(
+            f"unknown result source {source!r}; expected one of "
+            f"{sorted(RESULT_SOURCES)}"
+        )
+    number = int(round_no)
+    if number < 0:
+        raise ValueError("round_no must not be negative")
+
+    # 挂起中的验证点不许被一条 ``skipped`` 结论结清。一条 skipped 结论说的
+    # 是「这个验证点不用验了」—— 而它正被挂住就是因为没验出来。拒绝发生
+    # 在落行之前，所以这一行根本不会存在：验证点仍然是欠账。
+    #
+    # 与 skip 无关的结论保持原语义：挂起不改变「这一轮实际观察到了什么」。
+    if resolved == "skipped":
+        refuse_verdict_when_held(plan)
+
+    result_id = uuid.uuid4().hex
+    conn = sqlite3.connect(str(_result_db_path(db_path)))
+    try:
+        _migrate_result_table(conn)
+        conn.execute(
+            "INSERT INTO plan_verification_result ("
+            "  result_id, plan_id, round, vp_id, tree_fingerprint,"
+            "  base_main_commit, clean, verdict, source, fix_plan_id,"
+            "  evidence_path, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                result_id,
+                plan,
+                number,
+                vp,
+                tree,
+                str(base_main_commit or ""),
+                1 if clean else 0,
+                resolved,
+                origin,
+                fix_plan_id,
+                evidence_path,
+                utcnow_iso(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return result_id
+
+
+def read_verification_results(
+    *,
+    plan_id: Optional[str] = None,
+    vp_id: Optional[str] = None,
+    tree_fingerprint: Optional[str] = None,
+    db_path: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    """读验证结果行 —— 按写入顺序。
+
+    按 ``rowid`` 排而不是按时间戳：同一微秒里落两行的事在这里同样会发生，
+    而 ``result_id`` 是随机的 —— 按它排等于随机排历史。
+
+    Args:
+        plan_id: 只读这个计划的行。
+        vp_id: 只读这个验证点的行。
+        tree_fingerprint: 只读这棵树的行。
+        db_path: 读哪个库。``None`` 表示应用现在用的那个。
+
+    Returns:
+        结果行（字典），最早的在前。
+    """
+    clauses: List[str] = []
+    params: List[Any] = []
+    if plan_id is not None:
+        clauses.append("plan_id = ?")
+        params.append(str(plan_id))
+    if vp_id is not None:
+        clauses.append("vp_id = ?")
+        params.append(str(vp_id))
+    if tree_fingerprint is not None:
+        clauses.append("tree_fingerprint = ?")
+        params.append(str(tree_fingerprint))
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    conn = sqlite3.connect(str(_result_db_path(db_path)))
+    conn.row_factory = sqlite3.Row
+    try:
+        _migrate_result_table(conn)
+        rows = conn.execute(
+            "SELECT * FROM plan_verification_result" + where + " ORDER BY rowid",
+            params,
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
+
+
+def read_vp_results(
+    *,
+    plan_id: Optional[str] = None,
+    db_path: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    """读出**逐验证点**的结论 —— 每个验证点一行。
+
+    追加表里同一个验证点可以有很多行：每棵树一行，每跑一次重跑再一行。
+    这里**每个验证点只给一行** —— 最新那棵树上的那行，也就是最后写进去的
+    那行（表按 ``rowid`` 排序，所以「最后写进去」就是「最新的那棵树」）。
+
+    历史没有消失：``history_count`` 说这个验证点一共留了几行。「这棵树过了
+    吗」由这棵树的那几行回答；「这个验证点最近怎么样」由这一行回答 —— 两个
+    问题，两个答案，谁也不冒充谁。
+
+    Args:
+        plan_id: 只读这个计划的行。``None`` 表示所有计划。
+        db_path: 读哪个库。``None`` 表示应用现在用的那个。
+
+    Returns:
+        结论列表（字典）。没有结果时是空列表 —— 不是缺字段，是「还没有
+        结论」。
+    """
+    rows = read_verification_results(plan_id=plan_id, db_path=db_path)
+
+    latest: Dict[str, Dict[str, Any]] = {}
+    counts: Dict[str, int] = {}
+    for row in rows:
+        vp_id = str(row.get("vp_id") or "").strip()
+        if not vp_id:
+            continue
+        counts[vp_id] = counts.get(vp_id, 0) + 1
+        # 后写的那行覆盖先写的那行 —— 留下的就是最后写进去的那条。
+        latest[vp_id] = row
+
+    results: List[Dict[str, Any]] = []
+    for vp_id, row in latest.items():
+        results.append(
+            {
+                "vp_id": vp_id,
+                "status": str(row.get("verdict") or "unknown"),
+                "tree_fingerprint": str(row.get("tree_fingerprint") or ""),
+                "round": int(row.get("round") or 0),
+                "history_count": counts.get(vp_id, 1),
+            },
+        )
+    return results

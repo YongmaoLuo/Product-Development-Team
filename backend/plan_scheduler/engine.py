@@ -77,6 +77,11 @@ phase                        what it does
 ``record``                   write the decisions down
 ===========================  ==============================================
 
+The last phase carries one more thing: a repair that landed is
+re-verified there.  The phase list is a fixed contract, so the
+re-verification rides on ``record`` instead of adding a phase of its
+own — see :meth:`PlanSchedulerEngine._rerun_merged_repairs`.
+
 A phase that raises does not take the tick with it: the failure is
 recorded and the tick goes on, and the next tick runs as if nothing
 had happened.  A scheduler that stopped because one write failed would
@@ -177,9 +182,20 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 from .commands import CommandRejected, CommandResult
 from .config import (
@@ -190,7 +206,12 @@ from .config import (
     SchedulerConfig,
 )
 from .facts import QUEUED_PHASE
-from .policy import admission_verdict, converge
+from .policy import (
+    FRAMEWORK_FIX_KIND,
+    FRAMEWORK_FIX_PRIORITY,
+    admission_verdict,
+    converge,
+)
 from .retry import is_db_locked, retry_on_busy
 from .snapshot import (
     CAPACITY_SOURCE_CONFIG,
@@ -199,23 +220,94 @@ from .snapshot import (
 )
 from .store import CAPACITY_OVERRIDE_KEY
 
+try:  # pragma: no cover - the two paths are the same module
+    from framework_fix.scheduling import (
+        DEADLOCK_THRESHOLD_SECONDS,
+        PREEMPTED_REASON,
+        detect_deadlock,
+        select_victim,
+    )
+except ImportError:  # pragma: no cover
+    from backend.framework_fix.scheduling import (  # type: ignore
+        DEADLOCK_THRESHOLD_SECONDS,
+        PREEMPTED_REASON,
+        detect_deadlock,
+        select_victim,
+    )
+
+try:  # pragma: no cover - the two paths are the same module
+    from framework_fix.registry import ATTACH_STATUS_BLOCKED
+except ImportError:  # pragma: no cover
+    from backend.framework_fix.registry import (  # type: ignore
+        ATTACH_STATUS_BLOCKED,
+    )
+
+try:  # pragma: no cover - the two paths are the same module
+    from framework_fix.notify import due_reminders
+    from framework_fix.notify import emit as emit_framework_fix_event
+except ImportError:  # pragma: no cover
+    from backend.framework_fix.notify import (  # type: ignore
+        due_reminders,
+    )
+    from backend.framework_fix.notify import (  # type: ignore
+        emit as emit_framework_fix_event,
+    )
+
+try:  # pragma: no cover - the two paths are the same module
+    from framework_fix import lifecycle as framework_fix_lifecycle
+except ImportError:  # pragma: no cover
+    from backend.framework_fix import lifecycle as framework_fix_lifecycle  # type: ignore
+
 log = logging.getLogger(__name__)
 
 __all__ = [
     "ACTIONS",
+    "DEADLOCK_SUSPECTED_REASON",
     "DONE",
     "ENGINE_OUTCOMES",
     "FAILED",
+    "FRAMEWORK_FIX_PRIORITY_REASON",
     "PENDING",
     "PENDING_ANSWER",
     "SCHEDULER_INTENT_FILE",
     "TICK_PHASES",
     "THREAD_NAME",
+    "WAITING_FOR_SLOT_REASON",
     "EngineCommandResult",
     "EngineParts",
     "PlanSchedulerEngine",
     "is_permanent_failure",
+    "rerun_after_merge",
+    "tick",
 ]
+
+
+def rerun_after_merge(
+    fix_plan_id: str,
+    *,
+    worktree: Optional[Path] = None,
+    registry: Any = None,
+) -> List[Any]:
+    """Re-verify what was waiting on a merged repair.
+
+    The call goes **through the lifecycle module**, so the lifecycle
+    stays the authority on what a rerun does, and the entry is looked
+    up when the call is made — not when this module was imported.  This
+    module keeps the name as well, so there is one place to look for the
+    entry and the chain can be watched at either end of it.
+
+    Args:
+        fix_plan_id: the repair plan that landed.
+        worktree: the tree that carries the repair — where the attached
+            verification points are run.
+        registry: the registry the verdicts are written to.
+
+    Returns:
+        One conclusion per verification point that was re-run.
+    """
+    return framework_fix_lifecycle.rerun_after_merge(
+        fix_plan_id, worktree=worktree, registry=registry
+    )
 
 
 @dataclass(frozen=True)
@@ -583,6 +675,33 @@ def _stamp(epoch: float) -> str:
     )
 
 
+def _rerun_summary(outcomes: Sequence[Any]) -> Dict[str, Any]:
+    """What the re-verification of a landed repair came out as.
+
+    The summary is small on purpose: how many verification points were
+    re-run, and how many of them passed.  It travels with the merge
+    announcement -- "the fix landed" is worth more when it says what the
+    re-run said about it.
+    """
+    passed = 0
+    failed = 0
+    for outcome in outcomes or ():
+        status = ""
+        if isinstance(outcome, dict):
+            status = str(outcome.get("new_status") or "").strip().lower()
+        else:
+            status = str(getattr(outcome, "new_status", "") or "").strip().lower()
+        if status in ("passed", "skipped"):
+            passed += 1
+        else:
+            failed += 1
+    return {
+        "verdicts": len(outcomes or ()),
+        "passed": passed,
+        "failed": failed,
+    }
+
+
 def _same_invocation(
     live: Sequence[str], recorded: Sequence[str]
 ) -> bool:
@@ -639,6 +758,688 @@ def _safe_priority(slot: Any) -> int:
     if isinstance(value, float) and value.is_integer():
         return int(value)
     return 0
+
+
+def _routing_table_is_missing(exc: BaseException) -> bool:
+    """Whether one of the lane's tables is simply not there.
+
+    A deployment without the framework-fix migration has no routing
+    table (and no attachment table) at all.  That is not a fault to
+    shout about — the lane sees no plans and the ordinary scheduler
+    carries on — so the reader treats it as "no facts" rather than as
+    a failure.
+    """
+    return (
+        isinstance(exc, sqlite3.OperationalError)
+        and "no such table" in str(exc)
+    )
+
+
+def _repo_of_block(raw: Any) -> str:
+    """Return the repository a plan's framework-fix block names.
+
+    The block is the JSON the routing row carries: ``{"repo": ...,
+    "fingerprint": ...}``.  A block that cannot be read names no
+    repository, and a plan that names none is bound by the lane's
+    global ceiling only.
+    """
+    if raw is None:
+        return ""
+    if isinstance(raw, dict):
+        block: Any = raw
+    else:
+        try:
+            block = json.loads(str(raw))
+        except (TypeError, ValueError):
+            return ""
+    if not isinstance(block, dict):
+        return ""
+    repo = block.get("repo")
+    if repo is None:
+        return ""
+    return str(repo).strip()
+
+
+# ---------------------------------------------------------------------------
+# The framework-fix lane
+# ---------------------------------------------------------------------------
+#
+# The lane is a **hard requirement**: a repair plan takes an execution
+# path as soon as it exists — a free slot, or an ordinary plan that may
+# be pushed aside for it.  Two rules come out of that:
+#
+# * the lane goes **before** the ordinary queue is filled, because the
+#   ordinary queue would otherwise take the room the repair plan needs;
+# * a repair plan is **never** a victim — not even for another repair
+#   plan, because two repair plans interrupting each other would be a
+#   livelock.
+#
+# The function below is the lane's own decision, and it is **pure**: it
+# reads its arguments and nothing else.  The clock comes in as an
+# argument (so a case may move it by hand), the ledger comes in as a
+# callable (so the lane's ceilings stay the ledger's business), and the
+# notice outlet comes in as a callable (so the caller decides how a
+# notice is delivered).  The engine owns the writing.
+
+#: The reason a plan carries when the framework-fix lane gave it an
+#: execution path.  It is one of the words in
+#: :data:`plan_scheduler.policy.REASONS`, so the panel, the dry run and
+#: the API all draw it.
+FRAMEWORK_FIX_PRIORITY_REASON = "framework_fix_priority"
+
+#: The reason a plan carries when its wait has gone on long enough to
+#: look like a deadlock.  It is one of the words in
+#: :data:`plan_scheduler.policy.REASONS` too.
+DEADLOCK_SUSPECTED_REASON = "scheduler_deadlock_suspected"
+
+#: The reason a plan carries while it waits for a slot.  It is one of
+#: the words in :data:`plan_scheduler.policy.REASONS`.
+WAITING_FOR_SLOT_REASON = "waiting_for_slot"
+
+#: The phase a repair plan reaches when its repair is in the tree.
+#:
+#: It is the plan's own phase, not a word of the scheduler's: the repair
+#: plan finishes, and finishing it is what puts the fix in the tree.
+REPAIR_MERGED_PHASE = "completed"
+
+#: The key the plan's framework-fix block carries once the repair it
+#: brought has been re-verified on the tree that carries the fix.
+#:
+#: It is a **mark**, not a state: it says the re-verification has been
+#: done, so a tick does not do it again.  The mark is cleared when the
+#: plan is no longer merged — a repair that is reopened and merged again
+#: is re-verified again.
+RERUN_AFTER_MERGE_MARKER = "rerun_after_merge_at"
+
+#: The key the plan's framework-fix block carries once the merge of its
+#: repair has been announced to a human.
+#:
+#: It is a **mark**, not a state: it says the announcement has gone out,
+#: so a tick does not say it again.  The mark is written only when the
+#: notice was really delivered -- a notice swallowed by the quiet hours
+#: was never heard by anyone, and marking it would lose it for good.
+#:
+#: The mark is cleared when the plan is no longer merged, so a repair that
+#: is reopened and merged again is announced again.
+MERGED_NOTIFIED_MARKER = "merged_notified_at"
+
+# ---------------------------------------------------------------------------
+# The merge approval
+# ---------------------------------------------------------------------------
+
+#: Where the framework-fix lane keeps its reports inside the tree it
+#: works in.  It is the same place the spawner tells the fix plan to
+#: write them.
+FRAMEWORK_FIX_REPORT_DIR = (".pdt", "framework_fix")
+
+#: The report the open-PR task writes.  It is the only place the PR
+#: address and the CI conclusion are written down, so it is the only
+#: place the merge question can be read from.
+FRAMEWORK_FIX_OPEN_PR_REPORT = "open_pr.md"
+
+#: The machine-readable field that carries the PR address.
+PR_URL_FIELD = "pr_url"
+
+#: The machine-readable field that carries the CI conclusion.
+CI_CONCLUSION_FIELD = "ci_conclusion"
+
+#: The CI conclusions that mean "green" — the only ones that make a
+#: merge question worth asking.  A question about a red PR is a
+#: question nobody can answer yet.
+GREEN_CI_CONCLUSIONS = frozenset({"passed", "success"})
+
+#: The status a repair plan carries while it waits for the operator to
+#: approve its merge.  The read model projects it, so the panel shows
+#: the wait instead of a plan that looks stuck.
+WAITING_ON_USER_MERGE_STATUS = "waiting_on_user_merge"
+
+
+def _report_fields(text: str) -> Dict[str, str]:
+    """The machine-readable fields of a fix plan's report.
+
+    A field is a line of the form ``name: value`` — the name is one of
+    the two the merge approval needs, the value is everything after the
+    first colon.  The parser is deliberately narrow: a line that is not
+    a field is ignored, and a field nobody asked about is ignored too.
+    A report is written by a person or by a model, so it carries prose
+    as well; the prose is not data.
+    """
+    fields: Dict[str, str] = {}
+    for line in str(text or "").splitlines():
+        name, separator, value = line.partition(":")
+        if not separator:
+            continue
+        key = name.strip().lstrip("-*# ").strip().lower()
+        if key not in (PR_URL_FIELD, CI_CONCLUSION_FIELD):
+            continue
+        fields[key] = value.strip()
+    return fields
+
+
+def _lane_field(entry: Any, name: str, default: Any = None) -> Any:
+    """Read ``name`` off an entry, whatever shape the entry has.
+
+    A mapping answers ``get``; anything else answers by attribute.  A
+    value that is there but ``None`` reads as the default — for the
+    lane's purposes "no value" and "an empty value" mean the same
+    thing.
+    """
+    getter = getattr(entry, "get", None)
+    if callable(getter):
+        value = getter(name, default)
+    else:
+        value = getattr(entry, name, default)
+    return default if value is None else value
+
+
+def _lane_kind(entry: Any) -> str:
+    """The kind of plan an entry is — ``framework_fix`` or something else."""
+    return str(_lane_field(entry, "plan_kind", "") or "")
+
+
+def _lane_repo(entry: Any) -> str:
+    """The repository an entry repairs.
+
+    The repository is named by the entry itself (``repo``) or by its
+    framework-fix block (``framework_fix.repo``) — the block is where
+    the routing row keeps it.
+    """
+    for name in ("repo", "repository"):
+        value = _lane_field(entry, name, None)
+        if value:
+            return str(value)
+    block = _lane_field(entry, "framework_fix", None)
+    if isinstance(block, dict):
+        value = block.get("repo")
+        if value:
+            return str(value)
+    return ""
+
+
+def _lane_stalled_since(entry: Any) -> Optional[float]:
+    """When the entry started waiting for an execution path.
+
+    ``None`` means **unknown**: without a starting point there is no
+    "how long has it waited" to be had, and a guess is worse than
+    saying so.
+    """
+    for name in ("stalled_since", "created_at"):
+        value = _lane_field(entry, name, None)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _lane_repo_is_running(running: Sequence[Any], repo: str) -> bool:
+    """Whether a repair plan of this repository is already running.
+
+    Two repair plans of one repository work on the same code, and
+    running them at the same time makes them fight over it.  The one
+    behind waits.
+    """
+    if not repo:
+        return False
+    for row in running:
+        if _lane_kind(row) != FRAMEWORK_FIX_KIND:
+            continue
+        if _lane_repo(row) == repo:
+            return True
+    return False
+
+
+def _lane_running_row(entry: Any, repo: str) -> Dict[str, Any]:
+    """The row a repair plan joins the running set with.
+
+    The row says what kind of plan it is, so the lane's own rule — a
+    repair plan is never a victim — holds for the plans this tick
+    started as well as for the ones it found.
+    """
+    row: Dict[str, Any] = {
+        "plan_id": str(_lane_field(entry, "plan_id", "") or ""),
+        "plan_kind": FRAMEWORK_FIX_KIND,
+        "repo": repo,
+        "elapsed_s": 0.0,
+    }
+    priority = _lane_field(entry, "priority", None)
+    if priority is not None:
+        row["priority"] = priority
+    return row
+
+
+def _lane_verdict(
+    admit: Optional[Callable[..., Dict[str, Any]]],
+    entry: Any,
+    plan_id: str,
+    repo: str,
+    running: Sequence[Any],
+    capacity: Optional[int],
+    used: Optional[int] = None,
+    freed_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Ask the capacity ledger whether this repair plan may run.
+
+    The ledger owns the lane's ceilings — the merge slot of the
+    repository, the ceiling of one repository, the ceiling of the lane
+    itself — and the tick does not second-guess them.
+
+    ``used`` is how many plans hold compute as this tick counts them:
+    the ledger needs it to tell an ordinary slot from the lane's own
+    slot beyond the capacity, and the tick is the only one that knows
+    about the plans it started in this very tick.
+
+    ``freed_by`` is the plan this tick is pushing aside: its slot frees
+    up for the plan that is asking, so the ledger must not count it as
+    occupied — otherwise the lane's own slot beyond the capacity would
+    be handed out for a place that is free.
+
+    A ledger that cannot answer is a ledger that says nothing, and the
+    safe answer to "nothing" is "not now": the plan waits a tick and
+    asks again.
+    """
+    if admit is None:
+        return {
+            "admit": True,
+            "reason": FRAMEWORK_FIX_PRIORITY_REASON,
+            "oversubscribed": 0,
+        }
+    running_global = sum(
+        1 for row in running if _lane_kind(row) == FRAMEWORK_FIX_KIND
+    )
+    try:
+        verdict = admit(
+            kind=FRAMEWORK_FIX_KIND,
+            repo=repo or None,
+            running_global=running_global,
+            plan_id=plan_id,
+            capacity=capacity,
+            used=used,
+            freed_by=freed_by,
+        )
+    except Exception as exc:  # noqa: BLE001 — the tick must survive
+        log.warning(
+            "[scheduler] the capacity ledger could not be asked about the "
+            "framework fix plan %s (%s: %s); the plan waits",
+            plan_id,
+            type(exc).__name__,
+            exc,
+        )
+        return {"admit": False, "reason": WAITING_FOR_SLOT_REASON}
+    if not isinstance(verdict, dict):
+        return {"admit": False, "reason": WAITING_FOR_SLOT_REASON}
+    return verdict
+
+
+def _lane_wait(
+    notify: Callable[[str, Dict[str, Any]], None],
+    now: float,
+    entry: Any,
+    plan_id: str,
+    reason: str,
+    reasons: Dict[str, str],
+    escalate: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> None:
+    """Record that a repair plan is waiting — and escalate a long wait.
+
+    The reason word is one of the scheduler's own words: the panel, the
+    dry run and the API all draw from the same closed vocabulary.
+
+    A wait that has gone on long enough to look like a deadlock
+    replaces the reason with the deadlock word and sends a notice: ten
+    minutes without an execution path means that nobody is going to
+    wake this plan up.
+
+    The notice is not the whole escalation.  A message on a wall needs
+    nobody to answer it; a **question** does.  So the deadlock also
+    goes to HITL — the one place where a human is asked to decide
+    something.  Both happen, and neither replaces the other: the
+    notice says what happened, the question asks what to do about it.
+    """
+    reasons[plan_id] = reason
+    stalled_since = _lane_stalled_since(entry)
+    if not detect_deadlock(now, stalled_since=stalled_since):
+        return
+    reasons[plan_id] = DEADLOCK_SUSPECTED_REASON
+    payload: Dict[str, Any] = {
+        "plan_id": plan_id,
+        "repo": _lane_repo(entry),
+        "stalled_since": stalled_since,
+        "waited_s": (
+            (now - stalled_since) if stalled_since is not None else None
+        ),
+        "reason": DEADLOCK_SUSPECTED_REASON,
+    }
+    plan_dir = _lane_field(entry, "plan_dir", None)
+    if plan_dir:
+        payload["plan_dir"] = str(plan_dir)
+    try:
+        notify(DEADLOCK_SUSPECTED_REASON, payload)
+    except Exception as exc:  # noqa: BLE001 — a notice must not stop the tick
+        log.warning(
+            "[scheduler] the framework fix notice for the plan %s could not "
+            "be sent (%s: %s)",
+            plan_id,
+            type(exc).__name__,
+            exc,
+        )
+    if escalate is None:
+        return
+    try:
+        escalate(payload)
+    except Exception as exc:  # noqa: BLE001 — an escalation must not stop the tick
+        log.warning(
+            "[scheduler] the framework fix deadlock of the plan %s could "
+            "not be escalated (%s: %s)",
+            plan_id,
+            type(exc).__name__,
+            exc,
+        )
+
+
+#: The source recorded on the question a deadlock escalation asks.  It
+#: says **who** is asking, so a reader of the decision table can tell a
+#: scheduler deadlock from a merge approval.
+DEADLOCK_ESCALATION_SOURCE = "framework_fix_deadlock"
+
+#: The answer a deadlock escalation is asked with.  Answering it says
+#: "I know" — and, because an ordinary answer resumes the plan, the
+#: plan goes back into the schedule.
+DEADLOCK_ESCALATION_OPTION = "ack"
+
+
+def _lane_escalate_hitl(payload: Dict[str, Any]) -> bool:
+    """Ask a human what to do about a repair plan that cannot start.
+
+    Ten minutes without an execution path is a deadlock: nobody is going
+    to wake this plan up.  The notice says so; the **question** is what
+    makes it an escalation — and the question belongs in HITL, the one
+    place where a human is asked to decide something.
+
+    The question is asked **once**.  The tick runs every few seconds,
+    and a plan that stays deadlocked would otherwise ask the same
+    question over and over — the way a notice would be sent over and
+    over.  An open question of the same kind for the same plan is the
+    answer to "was it asked already".
+
+    The question carries no task: it is about the plan, not about one
+    of its tasks, so answering it does not put the plan's own schedule
+    on hold behind itself.
+    """
+    plan_id = str(payload.get("plan_id") or "")
+    if not plan_id:
+        return False
+    try:
+        from hitl.models import DecisionRequest, DecisionStatus
+        from hitl.service import create_decision, list_decisions
+    except ImportError as exc:  # pragma: no cover — the seam is always there
+        log.warning(
+            "[scheduler] the human decision service could not be reached "
+            "(%s: %s); the deadlock of the plan %s stays a notice",
+            type(exc).__name__,
+            exc,
+            plan_id,
+        )
+        return False
+    try:
+        for decision in list_decisions(plan_id):
+            if decision.source != DEADLOCK_ESCALATION_SOURCE:
+                continue
+            if decision.status in (
+                DecisionStatus.PENDING.value,
+                DecisionStatus.PAUSED.value,
+            ):
+                # The question is already on the table — asking it again
+                # would only make the person ignore it.
+                return True
+        plan_dir = str(payload.get("plan_dir") or "")
+        if not plan_dir:
+            from config_paths import resolve_plans_dir
+
+            plan_dir = str(Path(resolve_plans_dir()) / plan_id)
+        question = (
+            f"[{DEADLOCK_ESCALATION_SOURCE}] 框架修复计划 {plan_id} "
+            f"等待执行路径已超过 {DEADLOCK_THRESHOLD_SECONDS // 60} 分钟"
+            "（疑似调度死锁）。回复 ack 确认已处理。"
+        )
+        request = DecisionRequest(
+            plan_id=plan_id,
+            source=DEADLOCK_ESCALATION_SOURCE,
+            task_id=None,
+            question=question,
+            options=[DEADLOCK_ESCALATION_OPTION],
+            default_option=DEADLOCK_ESCALATION_OPTION,
+        )
+        create_decision(
+            request,
+            plan_dir,
+            # The question has to stay answerable: a plan whose outlet
+            # names nobody would otherwise close it as unroutable
+            # before anybody could answer it.
+            settle_unrouted=False,
+            # And it has to wait for a person rather than for the
+            # clock: the plan's own configuration would otherwise make
+            # it an ``auto`` decision with a deadline, and the expiry
+            # sweep would settle it half an hour later — the system
+            # answering a question that asks a human what to do.
+            require_answer=True,
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 — the tick must survive
+        log.warning(
+            "[scheduler] the deadlock of the framework fix plan %s could "
+            "not be escalated (%s: %s)",
+            plan_id,
+            type(exc).__name__,
+            exc,
+        )
+        return False
+
+
+def tick(
+    now: Optional[float] = None,
+    *,
+    framework_queue: Iterable[Any] = (),
+    running: Iterable[Any] = (),
+    capacity: Optional[int] = None,
+    used: Optional[int] = None,
+    admit: Optional[Callable[..., Dict[str, Any]]] = None,
+    notify: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    escalate: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Dict[str, Any]:
+    """What the framework-fix lane decided this tick.
+
+    The lane's rule is a hard one: a repair plan takes an execution
+    path as soon as it exists — a free slot, or an ordinary plan that
+    may be pushed aside for it.  The lane does not queue behind the
+    ordinary plans, and it does not wait for a turn.
+
+    A plan that cannot take a path **waits**: it does not grow the
+    capacity, because a slot is a claim on the machine and a claim
+    nobody made is a claim nobody honours.
+
+    Args:
+        now: the moment this tick decides on.  Epoch seconds.
+        framework_queue: the repair plans that are waiting for an
+            execution path.  Each entry names its ``plan_id``, its
+            ``plan_kind`` and the ``repo`` it repairs; ``stalled_since``
+            says when it started waiting.
+        running: the plans that hold compute right now.  Each entry
+            names its ``plan_id``; ``plan_kind``, ``priority`` and
+            ``elapsed_s`` are read when they are there.
+        capacity: how many plans the scheduler may run at the same
+            time.  ``None`` means "not known" — then nothing is in the
+            way.
+        used: how many plans hold compute now.  ``None`` means the
+            running set is the answer.
+        admit: the capacity ledger's own admission.  It is called with
+            ``kind``, ``repo``, ``running_global``, ``plan_id`` and
+            ``capacity``, and it answers ``{"admit": bool, "reason":
+            str}``.  ``None`` means there is no ledger to ask.
+        notify: where a deadlock notice goes.  It is called with the
+            event type and the payload.
+        escalate: where a deadlock **question** goes.  It is called with
+            the same payload, once the wait has gone on long enough to
+            look like a deadlock.  ``None`` means the lane's own
+            escalation — a question in the human decision table
+            (:func:`_lane_escalate_hitl`).
+
+    Returns:
+        ``{"started": [...], "preempted": [...], "reasons": {...}}``:
+        the plans that took an execution path, the plans that were
+        pushed aside for them, and the reason every waiting plan waits
+        for.  A plan that took a path carries no reason — it is not
+        waiting.
+
+    Examples:
+        >>> tick(now=1000.0, framework_queue=[
+        ...     {"plan_id": "fx1", "plan_kind": "framework_fix", "repo": "app"},
+        ... ], running=[], capacity=2, used=0)
+        {'started': ['fx1'], 'preempted': [], 'reasons': {}}
+    """
+    moment = time.time() if now is None else float(now)
+    started: List[str] = []
+    preempted: List[str] = []
+    reasons: Dict[str, str] = {}
+    notifier = notify if notify is not None else _lane_notify
+    escalator = escalate if escalate is not None else _lane_escalate_hitl
+
+    running_rows: List[Any] = list(running or ())
+    occupied = int(used) if used is not None else len(running_rows)
+    limit = int(capacity) if capacity is not None else None
+    seen: set = set()
+
+    for entry in framework_queue or ():
+        plan_id = str(_lane_field(entry, "plan_id", "") or "")
+        if not plan_id or plan_id in seen:
+            continue
+        seen.add(plan_id)
+        repo = _lane_repo(entry)
+
+        if _lane_repo_is_running(running_rows, repo):
+            # A repair plan of this repository is already working on
+            # this code.  The one behind waits.
+            _lane_wait(
+                notifier,
+                moment,
+                entry,
+                plan_id,
+                WAITING_FOR_SLOT_REASON,
+                reasons,
+                escalator,
+            )
+            continue
+
+        victim: Optional[Dict[str, str]] = None
+        oversubscribed = False
+        verdict: Optional[Dict[str, Any]] = None
+        if limit is not None and occupied >= limit:
+            # Every slot is taken.  Somebody ordinary may be pushed
+            # aside for the repair plan — and only somebody ordinary:
+            # the lane's own plans are protected.
+            victim = select_victim(running_rows)
+            if victim is None:
+                # No slot and nobody to make room.  There is exactly one
+                # place the scheduler may run past its capacity, and it
+                # is the **oversubscribe slot** — and the capacity
+                # ledger owns it (one only, and only while the
+                # scheduler is not already over its ceiling).  So the
+                # lane asks the ledger rather than growing the capacity
+                # on its own: a slot is a claim on the machine.
+                verdict = _lane_verdict(
+                    admit, entry, plan_id, repo, running_rows, limit, occupied
+                )
+                if not verdict.get("admit"):
+                    # The ledger says no — it is the authority on the
+                    # ceilings, and the tick does not second-guess them.
+                    _lane_wait(
+                        notifier,
+                        moment,
+                        entry,
+                        plan_id,
+                        str(verdict.get("reason") or WAITING_FOR_SLOT_REASON),
+                        reasons,
+                        escalator,
+                    )
+                    continue
+                if int(verdict.get("oversubscribed") or 0) != 1:
+                    # The ledger says yes — but not to the slot beyond
+                    # the ceiling, so there is still no path for this
+                    # plan.  It waits for the next tick.
+                    _lane_wait(
+                        notifier,
+                        moment,
+                        entry,
+                        plan_id,
+                        WAITING_FOR_SLOT_REASON,
+                        reasons,
+                        escalator,
+                    )
+                    continue
+                oversubscribed = True
+
+        if verdict is None:
+            # A victim that is pushed aside frees a slot: the plan that
+            # takes it must see the room that is about to be made, or
+            # the ledger would hand out the lane's own slot beyond the
+            # capacity for a place that is free.
+            freed_by = str((victim or {}).get("plan_id") or "") or None
+            verdict = _lane_verdict(
+                admit,
+                entry,
+                plan_id,
+                repo,
+                running_rows,
+                limit,
+                occupied - 1 if freed_by else occupied,
+                freed_by,
+            )
+        if not verdict.get("admit"):
+            # The ledger says no — the lane's own ceilings are its
+            # business, and the tick does not second-guess them.
+            _lane_wait(
+                notifier,
+                moment,
+                entry,
+                plan_id,
+                str(verdict.get("reason") or WAITING_FOR_SLOT_REASON),
+                reasons,
+                escalator,
+            )
+            continue
+
+        if victim is not None:
+            victim_id = str(victim.get("plan_id") or "")
+            preempted.append(victim_id)
+            reasons[victim_id] = str(victim.get("reason") or PREEMPTED_REASON)
+            running_rows = [
+                row
+                for row in running_rows
+                if str(_lane_field(row, "plan_id", "")) != victim_id
+            ]
+        else:
+            occupied += 1
+
+        if oversubscribed:
+            # The plan runs on the slot beyond the ceiling, so the word
+            # that says why it is running goes with it.
+            reasons[plan_id] = FRAMEWORK_FIX_PRIORITY_REASON
+
+        started.append(plan_id)
+        running_rows.append(_lane_running_row(entry, repo))
+
+    return {"started": started, "preempted": preempted, "reasons": reasons}
+
+
+def _lane_notify(event: str, payload: Dict[str, Any]) -> None:
+    """Send a framework-fix notice through the lane's own outlet.
+
+    The outlet swallows delivery failures on purpose: a notice that
+    could not be delivered must not take the tick with it.
+    """
+    emit_framework_fix_event(event, payload)
 
 
 # ---------------------------------------------------------------------------
@@ -768,6 +1569,20 @@ class PlanSchedulerEngine:
         self._errors: List[Tuple[str, BaseException]] = []
         self._ticks = 0
         self._next_tick_at = 0.0
+        #: What the routing table says about every plan, read once per
+        #: tick: the kind of the plan and the repository it repairs.
+        #: The tick reads it from several places, and the table is the
+        #: one authority on both.
+        self._routing: Dict[str, Dict[str, str]] = {}
+        #: What the routing table says about every plan, read once per
+        #: **read-model document**: the read side's own copy of the
+        #: answer above, read through the read connection.
+        #:
+        #: The two caches are kept apart on purpose.  The tick reads the
+        #: write connection and the read model reads the read one, so
+        #: one shared cache would hand the panel a row the worker is
+        #: holding a lock on — or the worker a row the panel read.
+        self._read_routing: Dict[str, Dict[str, str]] = {}
 
         # The read-side twin is built **here**, when the engine is
         # built, and not on the first read: a twin that were built
@@ -1578,6 +2393,11 @@ class PlanSchedulerEngine:
         """
         if not self._bound:
             return build({})
+        # The read side's routing facts belong to one document: the
+        # panel's document is a moment, and the routing table is read
+        # again for the next one.  The tick keeps its own copy, which
+        # lives as long as the tick does.
+        self._read_routing = {}
         return build(
             self._read_state(
                 conn=self._read_conn,
@@ -1808,6 +2628,7 @@ class PlanSchedulerEngine:
         next one is due the usual number of seconds later.
         """
         self._tick_decisions = []
+        self._routing = {}
         for name in TICK_PHASES:
             if name != TICK_PHASE_REFRESH_CONFIG and not self._may_schedule():
                 # The scheduler is off: this tick is over, and the rest
@@ -2039,23 +2860,35 @@ class PlanSchedulerEngine:
     def _phase_fill(self) -> None:
         """Put the free slots to work.
 
-        The head of the queue is the plan the next admission is about,
-        and the policy says whether it may start: it has to be due, its
-        workspace has to be free, and a slot has to be waiting.  A
-        head that may not start holds the queue — the line is a line,
-        and the scheduler does not skip anybody.
+        The **framework-fix lane goes first**: a repair plan takes an
+        execution path as soon as it exists, and the ordinary queue
+        would otherwise take the room it needs.
+
+        The head of the ordinary queue is the plan the next admission
+        is about, and the policy says whether it may start: it has to
+        be due, its workspace has to be free, and a slot has to be
+        waiting.  A head that may not start holds the queue — the line
+        is a line, and the scheduler does not skip anybody.
+
+        The repair plans are not in that line: the lane owns them, with
+        its own rules (the merge slot of the repository, the ceiling of
+        one repository, the preemption, the deadlock).  The ordinary
+        queue may not admit them — a plan the lane held back must not
+        be let in by the back door.
         """
         state = self._state
         if state is None:
             return
+        self._fill_framework_fix(state)
+        self._advance_merge_approvals()
         held: set = set()
         while True:
             if int(state["used"]) >= int(state["capacity"]):
                 return
-            queued = state["queued"]
+            queued = self._ordinary_line(state)
             if not queued:
                 return
-            if admission_verdict(state) != "running":
+            if admission_verdict(self._ordinary_state(state, queued)) != "running":
                 return
             head = queued[0]
             plan_id = str(head["plan_id"])
@@ -2069,7 +2902,723 @@ class PlanSchedulerEngine:
             self._admit(state, plan_id, int(head.get("priority") or 0))
             if key is not None:
                 held.add(key)
-            state["queued"] = queued[1:]
+            state["queued"] = [
+                row
+                for row in state["queued"]
+                if str(row.get("plan_id") or "") != plan_id
+            ]
+
+    def _ordinary_line(self, state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """The ordinary queue — the queue without the lane's own plans.
+
+        A repair plan is the lane's business: it has ceilings of its own
+        (the merge slot of the repository, the ceiling of one
+        repository, the ceiling of the lane) and rules of its own (the
+        preemption, the deadlock).  The ordinary queue may not admit it
+        — a plan the lane held back must not be let in by the back
+        door, or the lane's answer would be a word nobody keeps.
+        """
+        return [
+            row
+            for row in state.get("queued", [])
+            if str(row.get("plan_kind") or "") != FRAMEWORK_FIX_KIND
+        ]
+
+    def _ordinary_state(
+        self, state: Dict[str, Any], queued: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """The state as the ordinary queue reads it.
+
+        The admission check asks about the **head** of the queue, and
+        the head of the ordinary queue is the head of the ordinary
+        line — the repair plans are not in it.
+        """
+        ordinary = dict(state)
+        ordinary["queued"] = queued
+        return ordinary
+
+    # ------------------------------------------------------------------
+    # The framework-fix lane
+    # ------------------------------------------------------------------
+
+    def _fill_framework_fix(self, state: Dict[str, Any]) -> None:
+        """Give the framework-fix lane its execution path.
+
+        The decision is the lane's own (:func:`tick`); the writing is
+        the engine's: the slot is written, the decision is recorded,
+        and the reason a plan waits for is written down.  A wait nobody
+        can see is a wait nobody acts on — so the reason goes into the
+        plan's own framework-fix block, which is where the visible
+        states live (the read model projects that block).
+        """
+        queue = self._framework_fix_queue(state)
+        if not queue:
+            return
+        outcome = tick(
+            self._now(),
+            framework_queue=queue,
+            running=self._framework_fix_running(state),
+            capacity=int(state["capacity"]),
+            used=int(state["used"]),
+            admit=getattr(self._ledger, "admit", None),
+            notify=self._notify_framework_fix,
+        )
+        started = set(outcome["started"])
+        for victim_id in outcome["preempted"]:
+            self._decide(
+                "stop",
+                victim_id,
+                str(outcome["reasons"].get(victim_id) or PREEMPTED_REASON),
+            )
+        for plan_id in outcome["started"]:
+            self._admit(
+                state,
+                plan_id,
+                FRAMEWORK_FIX_PRIORITY,
+                reason=FRAMEWORK_FIX_PRIORITY_REASON,
+            )
+            state["queued"] = [
+                row
+                for row in state["queued"]
+                if str(row.get("plan_id") or "") != plan_id
+            ]
+        for plan_id, reason in outcome["reasons"].items():
+            if plan_id in started:
+                # A plan that took a path is not waiting.
+                continue
+            self._write_pause_reason(plan_id, reason)
+
+    def _framework_fix_queue(
+        self, state: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """The repair plans that are waiting for an execution path.
+
+        The queue table says where a plan stands; the routing row says
+        what kind of plan it is.  So the lane's queue is the ordinary
+        queue, narrowed to the repair plans in it.
+        """
+        routing = self._routing_facts()
+        queue: List[Dict[str, Any]] = []
+        for row in state.get("queued", []):
+            plan_id = str(row.get("plan_id") or "")
+            if not plan_id:
+                continue
+            fact = routing.get(plan_id) or {}
+            if str(fact.get("kind") or "") != FRAMEWORK_FIX_KIND:
+                continue
+            queue.append(
+                {
+                    "plan_id": plan_id,
+                    "plan_kind": FRAMEWORK_FIX_KIND,
+                    "repo": str(fact.get("repo") or ""),
+                    "priority": int(row.get("priority") or 0),
+                    "stalled_since": self._plan_created_at(plan_id),
+                    "plan_dir": self._plan_dir_of(plan_id),
+                }
+            )
+        return queue
+
+    def _framework_fix_running(
+        self, state: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """The running plans, as the lane reads them.
+
+        The lane needs two things the ordinary running view does not
+        carry: the **kind** of the plan (a repair plan is never a
+        victim) and the repository it repairs (two repair plans of one
+        repository do not work at the same time).
+
+        It needs a third one, and it is the lane's **second** victim
+        key: how many blocked attachments the plan carries.  A plan
+        with a lot of work hanging on it is a plan whose preemption
+        spreads the widest, so it is preempted later.  That number
+        lives in ``framework_fix_attach`` — it is counted here, live,
+        and not guessed at.
+        """
+        routing = self._routing_facts()
+        blocked_counts = self._attach_blocked_counts()
+        running: List[Dict[str, Any]] = []
+        for row in state.get("running", []):
+            plan_id = str(row.get("plan_id") or "")
+            if not plan_id:
+                continue
+            fact = routing.get(plan_id) or {}
+            running.append(
+                {
+                    "plan_id": plan_id,
+                    "plan_kind": str(fact.get("kind") or ""),
+                    "repo": str(fact.get("repo") or ""),
+                    "priority": int(row.get("priority") or 0),
+                    "elapsed_s": float(row.get("elapsed") or 0.0),
+                    "attach_blocked_count": int(blocked_counts.get(plan_id, 0)),
+                }
+            )
+        return running
+
+    def _attach_blocked_counts(self) -> Dict[str, int]:
+        """How many blocked attachments each plan carries right now.
+
+        The count is read from ``framework_fix_attach`` on the same
+        connection the routing facts are read from — the lane decides
+        on what the database says **now**, not on what it said when the
+        plan started: an attachment that was resolved a minute ago is
+        no longer a reason to keep that plan running.
+
+        Only the ``blocked`` attachments count.  A ``registered`` one
+        is a non-blocking remark — it holds no execution and waits for
+        the repair to be merged, so it does not make a plan expensive
+        to preempt.
+
+        A table that is not there yet is not a fault: the count is
+        zero for everybody, and the lane still works — the second key
+        simply ties for every plan.
+        """
+        conn = self._conn
+        if conn is None:
+            return {}
+        try:
+            rows = conn.execute(
+                "SELECT plan_id, COUNT(*) FROM framework_fix_attach "
+                "WHERE status = ? GROUP BY plan_id",
+                (ATTACH_STATUS_BLOCKED,),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            if _routing_table_is_missing(exc):
+                log.debug(
+                    "[scheduler] there is no attachment table yet; the "
+                    "framework fix lane sees no blocked work"
+                )
+            else:
+                log.warning(
+                    "[scheduler] the attachment table could not be read "
+                    "(%s: %s); the framework fix lane sees no blocked work",
+                    type(exc).__name__,
+                    exc,
+                )
+            return {}
+        except Exception as exc:  # noqa: BLE001 — the tick must survive
+            log.debug(
+                "[scheduler] the attachment table could not be read "
+                "(%s: %s); the framework fix lane sees no blocked work",
+                type(exc).__name__,
+                exc,
+            )
+            return {}
+        counts: Dict[str, int] = {}
+        for row in rows:
+            plan_id = str(row[0] or "")
+            if not plan_id:
+                continue
+            try:
+                counts[plan_id] = int(row[1] or 0)
+            except (TypeError, ValueError):
+                counts[plan_id] = 0
+        return counts
+
+    def _routing_facts(
+        self, conn: Optional[sqlite3.Connection] = None
+    ) -> Dict[str, Dict[str, str]]:
+        """What the routing table says about every plan.
+
+        The routing row carries the two things the lane needs: the kind
+        of the plan (``framework_fix`` or ``normal``) and its
+        framework-fix block, which names the repository it repairs.  The
+        routing table is the one authority on both (the cross-repo
+        contract says so), so the lane reads it here rather than
+        guessing from anywhere else.
+
+        The answer is read once per tick: several places want it, and
+        the table does not change under a tick.
+
+        The connection is the one the **caller** reads on.  The tick
+        reads the write connection — it decides on what it has just
+        written — and the read model reads the read connection, so the
+        panel's document does not wait for the worker's transaction.  A
+        read that quietly fell back to the write connection would put
+        the lock back where the read/write split took it out, and a
+        panel that waits for the worker is a panel that shows nothing
+        while the worker works.  Each side keeps its own cache, so the
+        two never read each other's row.
+        """
+        conn = self._conn if conn is None else conn
+        on_write_side = conn is self._conn
+        cache = self._routing if on_write_side else self._read_routing
+        if cache:
+            return cache
+        facts: Dict[str, Dict[str, str]] = {}
+        try:
+            rows = conn.execute(
+                "SELECT plan_id, plan_kind, framework_fix FROM plan_routing"
+            ).fetchall()
+        except sqlite3.Error as exc:
+            if _routing_table_is_missing(exc):
+                # A deployment without the framework-fix migration has
+                # no routing table at all.  That is not a fault to
+                # shout about: the lane sees no plans and the ordinary
+                # scheduler carries on.
+                log.debug(
+                    "[scheduler] there is no routing table yet; the "
+                    "framework fix lane sees no plans"
+                )
+            else:
+                log.warning(
+                    "[scheduler] the routing table could not be read (%s: %s); "
+                    "the framework fix lane sees no plans",
+                    type(exc).__name__,
+                    exc,
+                )
+            rows = []
+        except Exception as exc:  # noqa: BLE001 — the tick must survive
+            log.debug(
+                "[scheduler] the routing table could not be read (%s: %s); "
+                "the framework fix lane sees no plans",
+                type(exc).__name__,
+                exc,
+            )
+            rows = []
+        for row in rows:
+            plan_id = str(row[0] or "")
+            if not plan_id:
+                continue
+            facts[plan_id] = {
+                "kind": str(row[1] or ""),
+                "repo": _repo_of_block(row[2]),
+            }
+        if on_write_side:
+            self._routing = facts
+        else:
+            self._read_routing = facts
+        return facts
+
+    def _plan_created_at(self, plan_id: str) -> Optional[float]:
+        """When the plan was created — the start of its waiting.
+
+        The plan's own directory is its own record of when it came into
+        existence.  A facts reader that cannot answer says so, and a
+        plan whose start is unknown is a plan whose wait cannot be
+        measured — which is not the same as a plan that has waited for
+        no time at all.
+        """
+        reader = getattr(self._facts, "plan_created_at", None)
+        if not callable(reader):
+            return None
+        try:
+            created = reader(plan_id)
+        except Exception as exc:  # noqa: BLE001 — the tick must survive
+            log.warning(
+                "[scheduler] the creation time of the plan %s could not be "
+                "read (%s: %s)",
+                plan_id,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+        if created is None:
+            return None
+        try:
+            return float(created)
+        except (TypeError, ValueError):
+            return None
+
+    def _plan_dir_of(self, plan_id: str) -> Optional[str]:
+        """The plan's own directory — where a notice about it goes."""
+        for candidate in self._plan_dir_candidates(plan_id):
+            if candidate.exists():
+                return str(candidate)
+        return None
+
+    def _write_pause_reason(self, plan_id: str, reason: str) -> None:
+        """Write down why a repair plan is not running.
+
+        The reason is one of the scheduler's own words, and it goes into
+        the plan's own framework-fix block: that block is where the
+        visible states live, so a reason written anywhere else would be
+        a reason nobody sees.
+
+        A wait that looks like a deadlock also says so **in the block's
+        own vocabulary** — the status word the read model knows — and
+        says when it was noticed.
+        """
+        log.info(
+            "[scheduler] the framework fix plan %s is waiting: %s",
+            plan_id,
+            reason,
+        )
+        block = self._framework_fix_block(plan_id)
+        wanted = dict(block)
+        wanted["pause_reason"] = reason
+        if reason == DEADLOCK_SUSPECTED_REASON:
+            if not block.get("deadlock_suspected_at"):
+                wanted["status"] = DEADLOCK_SUSPECTED_REASON
+                wanted["deadlock_suspected_at"] = _stamp(self._now())
+        if wanted == block:
+            # Nothing changed — a tick that says the same thing again
+            # does not write it again.
+            return
+        self._write_framework_fix_block(plan_id, wanted)
+
+    def _framework_fix_block(self, plan_id: str) -> Dict[str, Any]:
+        """The plan's own framework-fix block — empty when there is none."""
+        try:
+            row = self._conn.execute(
+                "SELECT framework_fix FROM plan_routing WHERE plan_id = ?",
+                (plan_id,),
+            ).fetchone()
+        except Exception as exc:  # noqa: BLE001 — the tick must survive
+            log.warning(
+                "[scheduler] the framework fix block of the plan %s could "
+                "not be read (%s: %s)",
+                plan_id,
+                type(exc).__name__,
+                exc,
+            )
+            return {}
+        if row is None or not row[0]:
+            return {}
+        try:
+            block = json.loads(str(row[0]))
+        except (TypeError, ValueError):
+            return {}
+        return block if isinstance(block, dict) else {}
+
+    def _write_framework_fix_block(
+        self, plan_id: str, block: Dict[str, Any]
+    ) -> None:
+        """Write the plan's own framework-fix block back."""
+        try:
+            with self._store.transaction(self._conn):
+                self._conn.execute(
+                    "UPDATE plan_routing SET framework_fix = ?, "
+                    "updated_at = ? WHERE plan_id = ?",
+                    (
+                        json.dumps(block, ensure_ascii=False),
+                        _stamp(self._now()),
+                        plan_id,
+                    ),
+                )
+        except Exception as exc:  # noqa: BLE001 — the tick must survive
+            log.warning(
+                "[scheduler] the framework fix block of the plan %s could "
+                "not be written (%s: %s)",
+                plan_id,
+                type(exc).__name__,
+                exc,
+            )
+
+    def _notify_framework_fix(
+        self, event: str, payload: Dict[str, Any]
+    ) -> None:
+        """Send a framework-fix notice — once per deadlock.
+
+        The tick runs every few seconds, so a plan that stays deadlocked
+        would send a notice every tick, and that is how a person learns
+        to ignore the notices.  The plan's own block says whether it has
+        already been reported: a notice that has been sent is not sent
+        again.
+        """
+        plan_id = str(payload.get("plan_id") or "")
+        if plan_id and self._framework_fix_block(plan_id).get(
+            "deadlock_suspected_at"
+        ):
+            return
+        emit_framework_fix_event(event, payload)
+
+    # ------------------------------------------------------------------
+    # The merge approval
+    # ------------------------------------------------------------------
+
+    def _advance_merge_approvals(self) -> None:
+        """Advance the merge approval of every framework-fix plan.
+
+        The rhythm is the PRD's decision point 7, and it has three beats:
+
+        * **The CI went green** -> the operator is asked, once, whether
+          the fix may be merged.  The question is a decision that waits
+          for an answer, not a message on a wall: without an answer
+          nothing is merged.
+        * **Nobody answered for ``merge_reminder_minutes``** -> the
+          question is asked again.
+        * **Nobody answered for ``waiting_on_user_merge_hours``** -> the
+          plan is escalated: its status becomes ``waiting_on_user_merge``
+          and the escalation goes out.
+
+        Everything is computed from the plan's own block, so a tick that
+        says the same thing again says nothing again: ``merge_ready_at``
+        is the mark of "asked", ``merge_reminder_30m_at`` the mark of
+        "asked again", ``waiting_on_user_merge_at`` the mark of
+        "escalated".
+
+        The thresholds come from the configuration file, not from this
+        file: a number written where it is used is a number nobody can
+        change without reading the code.
+
+        The whole step is **failure-isolated**: a merge question that
+        cannot be asked is not a reason to stop scheduling.
+        """
+        try:
+            self._advance_merge_approvals_safely()
+        except Exception as exc:  # noqa: BLE001 — the tick must survive
+            log.warning(
+                "[scheduler] the merge approvals could not be advanced "
+                "(%s: %s)",
+                type(exc).__name__,
+                exc,
+            )
+
+    def _advance_merge_approvals_safely(self) -> None:
+        """The merge approval itself — the part that may fail."""
+        settings = self._framework_fix_settings()
+        reminder_minutes = int(settings["merge_reminder_minutes"])
+        escalation_hours = int(settings["waiting_on_user_merge_hours"])
+        now = datetime.fromtimestamp(self._now(), tz=timezone.utc)
+
+        plan_ids = [plan_id for plan_id, _phase in self._repair_plans()]
+        for plan_id in plan_ids:
+            self._announce_merge_ready(plan_id, now)
+
+        leases: List[Dict[str, Any]] = []
+        for plan_id in plan_ids:
+            lease = dict(self._framework_fix_block(plan_id))
+            lease["plan_id"] = plan_id
+            leases.append(lease)
+
+        for plan_id in due_reminders(
+            now, leases, threshold_minutes=reminder_minutes
+        ):
+            self._remind_merge(plan_id, now)
+
+        for plan_id in plan_ids:
+            self._escalate_merge(plan_id, now, escalation_hours)
+
+    def _announce_merge_ready(self, plan_id: str, now: datetime) -> None:
+        """Ask the operator whether the fix may be merged — once.
+
+        The question is asked when the CI has gone green and nobody has
+        been asked yet.  ``merge_ready_at`` is the mark of "asked": a
+        tick that finds it does not ask again.
+
+        The mark is written **only when the question was really
+        delivered**.  A question that fell into the quiet hours was
+        swallowed — writing the mark anyway would lose it for good, and
+        nobody would ever be asked.
+        """
+        block = self._framework_fix_block(plan_id)
+        if block.get("merge_ready_at"):
+            return
+
+        report = self._read_open_pr_report(plan_id)
+        if report is None:
+            return
+        fields = _report_fields(report)
+        pr_url = str(fields.get(PR_URL_FIELD) or "").strip()
+        ci_conclusion = str(fields.get(CI_CONCLUSION_FIELD) or "").strip()
+        if not pr_url:
+            # No PR address — there is nothing to approve yet.
+            return
+        if ci_conclusion.lower() not in GREEN_CI_CONCLUSIONS:
+            # The CI is not green — a question about a red PR is a
+            # question nobody can answer yet.
+            return
+
+        plan_dir = self._plan_dir_of(plan_id)
+        if not plan_dir:
+            return
+
+        self._backfill_merge_lease(plan_id, block, pr_url)
+
+        record = emit_framework_fix_event(
+            "merge_ready",
+            {
+                "plan_id": plan_id,
+                "plan_dir": plan_dir,
+                "pr_url": pr_url,
+                "ci_conclusion": ci_conclusion,
+            },
+            now=now,
+        )
+        if not isinstance(record, dict) or not record.get("delivered"):
+            # Swallowed by the quiet hours, or the outlet is down: the
+            # question was not asked, so the mark is not written and the
+            # next tick asks again.
+            return
+
+        wanted = dict(self._framework_fix_block(plan_id))
+        wanted["merge_ready_at"] = _stamp(self._now())
+        wanted["ci_conclusion"] = ci_conclusion
+        wanted["pr_url"] = pr_url
+        self._write_framework_fix_block(plan_id, wanted)
+
+    def _remind_merge(self, plan_id: str, now: datetime) -> None:
+        """Ask again — the question has been waiting for a while.
+
+        The mark is written **only when the reminder was really
+        delivered**: a reminder swallowed by the quiet hours is not a
+        reminder, and the tick after the window sends it.
+        """
+        block = self._framework_fix_block(plan_id)
+        if block.get("merge_reminder_30m_at"):
+            return
+        plan_dir = self._plan_dir_of(plan_id)
+        if not plan_dir:
+            return
+
+        record = emit_framework_fix_event(
+            "merge_reminder_30m",
+            {
+                "plan_id": plan_id,
+                "plan_dir": plan_dir,
+                "pr_url": str(block.get("pr_url") or ""),
+                "ci_conclusion": str(block.get("ci_conclusion") or ""),
+            },
+            now=now,
+        )
+        if not isinstance(record, dict) or not record.get("delivered"):
+            return
+
+        wanted = dict(self._framework_fix_block(plan_id))
+        wanted["merge_reminder_30m_at"] = _stamp(self._now())
+        self._write_framework_fix_block(plan_id, wanted)
+
+    def _escalate_merge(
+        self, plan_id: str, now: datetime, escalation_hours: int
+    ) -> None:
+        """Escalate a merge question nobody answered.
+
+        The plan's status becomes ``waiting_on_user_merge`` — the word
+        the read model projects — and the escalation goes out.  The
+        status is written whether or not the escalation was delivered:
+        the state is a fact about the plan, and the notification is only
+        an attempt to tell somebody about it.
+        """
+        block = self._framework_fix_block(plan_id)
+        if block.get("waiting_on_user_merge_at"):
+            return
+        ready_at = self._epoch(block.get("merge_ready_at"))
+        if ready_at is None:
+            # Not merge-ready yet — there is nothing to escalate.
+            return
+        deadline = datetime.fromtimestamp(
+            ready_at, tz=timezone.utc
+        ) + timedelta(hours=escalation_hours)
+        if now < deadline:
+            return
+
+        wanted = dict(block)
+        wanted["status"] = WAITING_ON_USER_MERGE_STATUS
+        wanted["waiting_on_user_merge_at"] = _stamp(self._now())
+        self._write_framework_fix_block(plan_id, wanted)
+
+        emit_framework_fix_event(
+            "waiting_on_user_merge",
+            {
+                "plan_id": plan_id,
+                "plan_dir": self._plan_dir_of(plan_id) or "",
+                "pr_url": str(block.get("pr_url") or ""),
+                "ci_conclusion": str(block.get("ci_conclusion") or ""),
+            },
+            now=now,
+        )
+
+    def _backfill_merge_lease(
+        self, plan_id: str, block: Dict[str, Any], pr_url: str
+    ) -> None:
+        """Put the PR address on this repair plan's merge lease.
+
+        The lease is taken when the fix plan starts; the PR address is
+        only known once the PR is open.  The registry already knows how
+        to fill the address into a lease the plan owns, so the lease row
+        ends up carrying the address — and the panel, which reads the
+        address off the lease, shows which PR is waiting.
+
+        A lease somebody else owns is not touched: the registry says so
+        and answers ``False``.
+        """
+        repo = str(block.get("repo") or "").strip()
+        if not repo:
+            return
+        registry = self._framework_fix_registry()
+        if registry is None:
+            return
+        try:
+            acquired = registry.acquire_merge_lease(repo, plan_id, pr_url)
+        except Exception as exc:  # noqa: BLE001 — the tick must survive
+            log.warning(
+                "[scheduler] the merge lease of the repair plan %s could "
+                "not be backfilled (%s: %s)",
+                plan_id,
+                type(exc).__name__,
+                exc,
+            )
+            return
+        if not acquired:
+            log.info(
+                "[scheduler] the merge lease of the repository %s is held "
+                "by another repair plan; the address of the PR %s was not "
+                "written on it",
+                repo,
+                pr_url,
+            )
+
+    def _read_open_pr_report(self, plan_id: str) -> Optional[str]:
+        """The open-PR report of the tree this plan worked in.
+
+        The report is written by the fix plan's own open-PR task, in the
+        tree the fix was made in — so it is read from there, not from
+        the plan's directory.
+        """
+        project_dir = self._project_dir_of(plan_id)
+        if project_dir is None:
+            return None
+        path = project_dir.joinpath(
+            *FRAMEWORK_FIX_REPORT_DIR
+        ) / FRAMEWORK_FIX_OPEN_PR_REPORT
+        try:
+            return path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            log.debug(
+                "[scheduler] the open PR report of the repair plan %s "
+                "could not be read (%s: %s)",
+                plan_id,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+    def _framework_fix_settings(self) -> Dict[str, Any]:
+        """The framework-fix lane's settings, as the configuration says.
+
+        The thresholds are read from the configuration file, not from
+        this file: a number written where it is used is a number nobody
+        can change without reading the code.
+
+        A configuration that cannot be read falls back to the defaults:
+        a tick that stops because of a number in a file is a lane nobody
+        repairs.
+        """
+        try:
+            from config import (
+                DEFAULT_FRAMEWORK_FIX_CONFIG,
+                framework_fix_settings,
+            )
+        except ImportError:  # pragma: no cover - the two paths are the same
+            from backend.config import (  # type: ignore
+                DEFAULT_FRAMEWORK_FIX_CONFIG,
+                framework_fix_settings,
+            )
+        try:
+            settings = framework_fix_settings()
+        except Exception as exc:  # noqa: BLE001 — the tick must survive
+            log.warning(
+                "[scheduler] the framework-fix settings could not be read "
+                "(%s: %s); the defaults apply",
+                type(exc).__name__,
+                exc,
+            )
+            settings = {}
+        merged = dict(DEFAULT_FRAMEWORK_FIX_CONFIG)
+        if isinstance(settings, dict):
+            merged.update(settings)
+        return merged
 
     def _phase_execute(self) -> None:
         """Carry the decisions out, and put the free slots to work again.
@@ -2136,6 +3685,10 @@ class PlanSchedulerEngine:
 
         The record is the same four fields the dry run writes, so the
         two exits can be lined up against each other.
+
+        It also carries the re-verification of a landed repair: the
+        tick's phase list is a fixed contract, so the re-verification
+        rides on the last phase instead of adding a phase of its own.
         """
         stamp = _stamp(self._now())
         for decision in self._tick_decisions:
@@ -2147,6 +3700,281 @@ class PlanSchedulerEngine:
                     "reason": decision.get("reason"),
                 }
             )
+        self._rerun_merged_repairs()
+
+    def _rerun_merged_repairs(self) -> None:
+        """A repair that landed: re-verify what was waiting on it.
+
+        The merge is **observed** here — the repair plan reached its
+        terminal phase, so its fix is in the tree.  Everything that was
+        waiting on that fix is put back on the tree that carries it and
+        re-run there, and the new verdict is **appended**: the old
+        verdicts stay where they are, untouched.
+
+        Without this the chain stops at "the fix merged": nobody runs
+        the verification points the fix was supposed to repair, so
+        nobody finds out whether it did.
+
+        The rerun happens **once per merge**.  The plan's own
+        framework-fix block carries the mark, and the mark is cleared
+        when the plan is no longer merged — so a repair that is
+        reopened and merged again is re-verified again, and a repair
+        that stays merged is not verified over and over.
+
+        The merge is also **announced** once per merge: the approval
+        chain asks whether the repair may be merged, but nobody says
+        whether it **was**.  The announcement carries its own mark, and
+        that mark goes away with the merge too.
+        """
+        for plan_id, phase in self._repair_plans():
+            if phase == REPAIR_MERGED_PHASE:
+                summary = self._rerun_merged_repair(plan_id)
+                self._announce_merged(plan_id, summary)
+            else:
+                self._rearm_rerun_mark(plan_id)
+
+    def _repair_plans(self) -> List[Tuple[str, str]]:
+        """The repair plans and the phase each one is in."""
+        try:
+            rows = self._conn.execute(
+                "SELECT plan_id, current_phase FROM plan_routing "
+                "WHERE plan_kind = ?",
+                (FRAMEWORK_FIX_KIND,),
+            ).fetchall()
+        except Exception as exc:  # noqa: BLE001 — the tick must survive
+            log.debug(
+                "[scheduler] the repair plans could not be read (%s: %s)",
+                type(exc).__name__,
+                exc,
+            )
+            return []
+        return [
+            (str(row[0] or ""), str(row[1] or ""))
+            for row in rows
+            if str(row[0] or "")
+        ]
+
+    def _rearm_rerun_mark(self, plan_id: str) -> None:
+        """Clear the marks of a repair that is not merged (any more).
+
+        A repair that is reopened and merged again has to be re-verified
+        again — so the mark of the previous merge goes away with the
+        merge.  The same goes for the announcement of that merge: two
+        merges are two events, and the second one has to be said too.
+        """
+        block = self._framework_fix_block(plan_id)
+        if not block.get(RERUN_AFTER_MERGE_MARKER) and not block.get(
+            MERGED_NOTIFIED_MARKER
+        ):
+            return
+        wanted = dict(block)
+        wanted.pop(RERUN_AFTER_MERGE_MARKER, None)
+        wanted.pop("rerun_after_merge_verdicts", None)
+        wanted.pop(MERGED_NOTIFIED_MARKER, None)
+        self._write_framework_fix_block(plan_id, wanted)
+
+    def _announce_merged(
+        self, plan_id: str, summary: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Say once that the repair landed.
+
+        The merge approval chain asks whether the repair may be merged
+        (``merge_ready`` -> the 30-minute reminder -> the two-hour
+        escalation).  Nobody asks whether it **was** merged: the request
+        goes out, the operator approves, the PR lands -- and the fact
+        that the work is done is never said out loud.
+
+        The mark is written **only when the notice was really delivered**.
+        A notice swallowed by the quiet hours was heard by nobody, and
+        marking it would lose it for good.
+
+        A notice that cannot be sent is not a reason to stop the tick.
+        """
+        block = self._framework_fix_block(plan_id)
+        if block.get(MERGED_NOTIFIED_MARKER):
+            # The announcement has gone out already.  A tick that says
+            # the same thing again says nothing again.
+            return
+
+        plan_dir = self._plan_dir_of(plan_id)
+        if not plan_dir:
+            # Nowhere to send it to -- and no mark, so the next tick tries
+            # again.
+            return
+
+        payload: Dict[str, Any] = {
+            "plan_id": plan_id,
+            "plan_dir": plan_dir,
+            "fingerprint": str(block.get("fingerprint") or ""),
+        }
+        if summary:
+            payload["rerun"] = summary
+
+        now = datetime.fromtimestamp(self._now(), tz=timezone.utc)
+        try:
+            record = emit_framework_fix_event("merged", payload, now=now)
+        except Exception as exc:  # noqa: BLE001 — a notice must not stop the tick
+            log.warning(
+                "[scheduler] the merge notice for the repair plan %s could "
+                "not be sent (%s: %s)",
+                plan_id,
+                type(exc).__name__,
+                exc,
+            )
+            return
+        if not isinstance(record, dict) or not record.get("delivered"):
+            # Not delivered (the quiet hours swallowed it, or the outlet
+            # is down) -- no mark, so the next tick tries again.
+            log.info(
+                "[scheduler] the merge notice for the repair plan %s was not "
+                "delivered: %s",
+                plan_id,
+                (record or {}).get("suppressed") if isinstance(record, dict)
+                else "no record",
+            )
+            return
+
+        wanted = dict(block)
+        wanted[MERGED_NOTIFIED_MARKER] = _stamp(self._now())
+        self._write_framework_fix_block(plan_id, wanted)
+        log.info(
+            "[scheduler] the repair plan %s was merged and announced",
+            plan_id,
+        )
+
+    def _rerun_merged_repair(
+        self, plan_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Re-verify the attachments of one merged repair — once.
+
+        Returns a summary of the re-verification (how many verification
+        points were re-run and how they came out), or ``None`` when
+        nothing was re-verified this time.  The summary is what the merge
+        announcement carries: "the fix landed" is worth more when it says
+        what the re-run said.
+        """
+        block = self._framework_fix_block(plan_id)
+        if block.get(RERUN_AFTER_MERGE_MARKER):
+            # The merge was already re-verified.  A tick that says the
+            # same thing again does not do it again.
+            return None
+
+        registry = self._framework_fix_registry()
+        if registry is None:
+            log.debug(
+                "[scheduler] the repair plan %s cannot be re-verified: "
+                "there is no state database to write the verdicts to",
+                plan_id,
+            )
+            return None
+
+        worktree = self._project_dir_of(plan_id)
+        try:
+            outcomes = rerun_after_merge(
+                plan_id, worktree=worktree, registry=registry
+            )
+        except Exception as exc:  # noqa: BLE001 — the tick must survive
+            log.warning(
+                "[scheduler] the merged repair plan %s could not be "
+                "re-verified (%s: %s)",
+                plan_id,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+        wanted = dict(block)
+        wanted[RERUN_AFTER_MERGE_MARKER] = _stamp(self._now())
+        wanted["rerun_after_merge_verdicts"] = len(outcomes)
+        self._write_framework_fix_block(plan_id, wanted)
+        log.info(
+            "[scheduler] the merged repair plan %s was re-verified on %s "
+            "verification points",
+            plan_id,
+            len(outcomes),
+        )
+        return _rerun_summary(outcomes)
+
+    def _framework_fix_registry(self) -> Optional[Any]:
+        """The registry on **this** engine's database — or ``None``.
+
+        The registry writes the verdicts, so it has to write them into
+        the database the engine reads: a registry pointed at another
+        file would leave the engine's own database without a trace of
+        the re-verification.
+        """
+        path = self._state_db_path()
+        if path is None:
+            return None
+        try:
+            from framework_fix.registry import FrameworkFixRegistry
+        except ImportError:  # pragma: no cover - the two paths are the same
+            from backend.framework_fix.registry import (  # type: ignore
+                FrameworkFixRegistry,
+            )
+        try:
+            return FrameworkFixRegistry(path)
+        except Exception as exc:  # noqa: BLE001 — a registry that cannot be
+            log.warning(  # opened is not a reason to stop the tick
+                "[scheduler] the framework-fix registry could not be opened "
+                "on %s (%s: %s)",
+                path,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+    def _state_db_path(self) -> Optional[Path]:
+        """The file this engine's connection writes to — or ``None``.
+
+        The database knows its own file; asking it is more reliable than
+        asking the environment, which may point somewhere else.
+
+        ``PRAGMA database_list`` answers three columns — the sequence
+        number, the name and the file — so the name is the **second**
+        one and the file the third.
+        """
+        try:
+            rows = self._conn.execute("PRAGMA database_list").fetchall()
+        except Exception:  # noqa: BLE001 — the tick must survive
+            return None
+        for row in rows:
+            if len(row) < 3:
+                continue
+            if str(row[1] or "") == "main":
+                path = str(row[2] or "")
+                if path:
+                    return Path(path)
+        return None
+
+    def _project_dir_of(self, plan_id: str) -> Optional[Path]:
+        """The tree this plan's work happens in — where its fix lives.
+
+        The execution row is the authority on that: it is where the
+        plan was actually worked on, so it is the tree that carries the
+        repair once the plan is done.
+        """
+        from state_machine.repositories.execution_repository import (
+            ExecutionRepository,
+        )
+
+        try:
+            summary = ExecutionRepository(self._conn).summary(plan_id)
+        except Exception as exc:  # noqa: BLE001 — the tick must survive
+            log.debug(
+                "[scheduler] the project directory of the plan %s could not "
+                "be read (%s: %s)",
+                plan_id,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+        if not summary:
+            return None
+        project_dir = str(summary.get("project_dir") or "").strip()
+        if not project_dir:
+            return None
+        return Path(project_dir)
 
     # ------------------------------------------------------------------
     # The pruning
@@ -2369,7 +4197,7 @@ class PlanSchedulerEngine:
         capacity = int(state["capacity"])
         if int(state["used"]) <= capacity:
             return []
-        victims = converge(state, capacity)
+        victims = converge(self._convergence_view(state), capacity)
         for victim in victims:
             self._decide("stop", victim, "over_capacity")
         if victims:
@@ -2382,6 +4210,37 @@ class PlanSchedulerEngine:
                 ", ".join(victims),
             )
         return victims
+
+    def _convergence_view(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """The state as the over-capacity rule reads it.
+
+        The running rows of the state do not say what kind of plan each
+        one is — and the eviction rule's protection is read from that
+        kind (:func:`plan_scheduler.policy.is_protected`): a
+        framework-fix plan may not be interrupted, because two repair
+        plans making way for each other would be a livelock.
+
+        So the rule reads a **copy** whose rows say the kind.  The rows
+        the state itself carries keep their own shape: the state is
+        what the panel and the snapshot read, and their shape is not
+        the eviction rule's business.
+        """
+        routing = self._routing_facts()
+        if not routing:
+            return state
+        running: List[Dict[str, Any]] = []
+        for row in state.get("running", []):
+            plan_id = str(row.get("plan_id") or "")
+            kind = str((routing.get(plan_id) or {}).get("kind") or "")
+            if not kind:
+                running.append(row)
+                continue
+            annotated = dict(row)
+            annotated["plan_kind"] = kind
+            running.append(annotated)
+        view = dict(state)
+        view["running"] = running
+        return view
 
     def _workspace_is_busy(self, key: Any, held: Any) -> bool:
         """Return whether the directory a plan works in is taken.
@@ -2409,7 +4268,13 @@ class PlanSchedulerEngine:
             return True
         return bool(self._ledger.workspace_busy(key))
 
-    def _admit(self, state: Dict[str, Any], plan_id: str, priority: int = 0) -> None:
+    def _admit(
+        self,
+        state: Dict[str, Any],
+        plan_id: str,
+        priority: int = 0,
+        reason: str = "running",
+    ) -> None:
         """Give a plan its slot and decide that it starts.
 
         The slot is written before the decision is made, and it carries
@@ -2432,11 +4297,16 @@ class PlanSchedulerEngine:
             priority: the priority the plan runs at — the number the
                 queue row carried.  A plan nobody gave a number to
                 runs at 0.
+            reason: the word the decision carries.  It is one of the
+                closed vocabulary the panel, the dry run and the API
+                draw from: an ordinary plan is admitted because it is
+                ``running``, a repair plan because it is a
+                ``framework_fix_priority``.
         """
         self._store.upsert_slot(
             self._conn, plan_id, _stamp(self._now()), priority=int(priority)
         )
-        self._decide("admit", plan_id, "running")
+        self._decide("admit", plan_id, reason)
         state["used"] = int(state["used"]) + 1
 
     # ------------------------------------------------------------------
@@ -2656,6 +4526,7 @@ class PlanSchedulerEngine:
         waiting = {
             str(row["plan_id"]): row for row in waiting_rows
         }
+        routing = self._routing_facts(conn=conn)
         queued: List[Dict[str, Any]] = []
         existing_ids: Set[str] = set()
         max_seq = 0
@@ -2683,6 +4554,12 @@ class PlanSchedulerEngine:
                     # that was never promoted is not promoted now.
                     "promote_order": row.get("promote_order"),
                     "due": bool(fact.get("due", True)),
+                    # The kind of the plan, as the routing row says it.
+                    # The framework-fix lane's plans are not in the
+                    # ordinary line — they have a lane of their own.
+                    "plan_kind": str(
+                        (routing.get(plan_id) or {}).get("kind") or ""
+                    ),
                     # The phase the plan is in, as the facts read it
                     # and passed it on.  The engine does not map it to
                     # a label: the label is the routing layer's job.

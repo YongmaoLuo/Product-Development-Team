@@ -53,7 +53,22 @@ BASE_EPOCH = 1_700_000_000.0
 
 #: How long the caller's wait is bounded to.  It is the point of the
 #: case: the bound is reached long before the command is finished.
-COMMAND_TIMEOUT = 0.01
+#:
+#: The bound has to leave room for the **handshake** (2026-11-27).  The
+#: worker writes the command down before it carries the action out, and
+#: the id the pending answer carries is read at the moment the answer
+#: is built -- so a handshake that has not happened yet is an answer
+#: without an id.  Under a ten millisecond bound a loaded CI runner
+#: reached that bound before the worker had even been scheduled (the
+#: worker was measured at 0.36 seconds there), the answer came back
+#: pending **without** an id, and the case failed for a reason that had
+#: nothing to do with the contract it is about.
+#:
+#: A second is the bound here: the handshake is a thread hand-off and a
+#: row write, and a second leaves it room on a machine that is busy.
+#: The bound is still far below the lifecycle's sleep, so the answer is
+#: still forced to be pending -- which is the point of the case.
+COMMAND_TIMEOUT = 1.0
 
 #: The budget the *answered command* case runs under.
 #:
@@ -66,16 +81,23 @@ COMMAND_TIMEOUT = 0.01
 #: room for the answer, so that the case measures the id and nothing
 #: else.
 #:
-#: One second is the *upper bound of the wait*, not an assertion: the
+#: Two seconds is the *upper bound of the wait*, not an assertion: the
 #: case does not claim the answer arrives within it.  The case asserts
 #: on the command's record -- that it reaches ``done`` -- and waits for
 #: that record with a bounded poll, so the verdict does not depend on
-#: how fast the machine is.
-ANSWERED_COMMAND_TIMEOUT = 1.0
+#: how fast the machine is.  The budget is the handshake's room as
+#: well (2026-11-27): the answer carries the id, and the id exists
+#: only once the handshake has happened.
+ANSWERED_COMMAND_TIMEOUT = 2.0
 
 #: How long the lifecycle takes.  The wait must not last this long — it
 #: is the whole difference between a bounded wait and a hung handler.
-LIFECYCLE_SLEEP = 0.5
+#:
+#: The sleep is three times the bound (2026-11-27), so the answer
+#: cannot arrive inside the bound and the case's own claim -- that the
+#: wait lasted less than the lifecycle's sleep, and therefore did not
+#: wait for the lifecycle -- holds with room to spare.
+LIFECYCLE_SLEEP = 3.0
 
 #: The outcomes a finished command's record may carry.  A command that
 #: is still in flight carries ``accepted``; these are the two words a

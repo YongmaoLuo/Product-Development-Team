@@ -72,6 +72,13 @@ ROUND_VERDICTS = [
 #: The published shape of the status answer.  The stopping half of the
 #: answer is added at runtime and only while a stop is in progress, so
 #: an idle plan's answer is exactly these keys — nothing more.
+#:
+#: ``vp_results`` (2026-11-26, the framework-fix lane's own verification
+#: points) is part of the answer like any other key: it is the
+#: **per-verification-point** verdicts read out of the append-only
+#: ``plan_verification_result`` table, and a plan with no verdict yet
+#: answers an empty list — an empty list is an answer, not a missing
+#: key.
 _IDLE_STATUS_KEYS = {
     "plan_id",
     "current_phase",
@@ -85,6 +92,7 @@ _IDLE_STATUS_KEYS = {
     "started_at",
     "updated_at",
     "stop_reason",
+    "vp_results",
 }
 
 #: The keys the stopping half of the answer adds.  They are **absent**

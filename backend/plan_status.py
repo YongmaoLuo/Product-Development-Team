@@ -650,6 +650,14 @@ _PHASE_STATUS_BUCKETS = {
     # 等待相位（``ready`` 是它的历史别名，读路径自己归一化）。
     "queued": "queued",
     "ready": "queued",
+    # 2026-11-25: ``blocked_on_framework_fix``（被框架缺陷阻塞）—— **等待**，
+    # 不是终态：这条计划的全部剩余工作被框架缺陷挡着，它让出了执行/验证
+    # 槽位，在等修复合入。挂起被释放之后它回队列再跑一遍。
+    #
+    # 它落在 ``queued`` 桶里而不是别的桶：桶回答的是「这条计划现在是什么」，
+    # 而这条计划**没完** —— 把它算成终态（``completed`` / ``failed``）等于
+    # 把一条还在等着的计划从人的视野里抹掉。
+    "blocked_on_framework_fix": "queued",
 }
 
 #: 修复相位（含它的历史别名 ``verification_rerunning``）。
@@ -716,6 +724,7 @@ def listing_status_bucket(
     ``stopped`` / ``verification_loop_stopped`` / ``user_stopping``  ``stopped``
     ``completed`` / ``verification_passed``  ``completed``
     ``queued``（``ready`` 是旧词）   ``queued``
+    ``blocked_on_framework_fix``    ``queued``（在等，不是在完）
     ==============================  ==========
 
     ``None`` means "this phase says nothing about the bucket" — an empty

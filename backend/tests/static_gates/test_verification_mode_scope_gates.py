@@ -672,8 +672,36 @@ FROZEN_REQUIREMENTS_HASH: str = (
 #: that merged schema.  This is a move of the frozen baseline, not a
 #: loosening of the gate: the assertion, the comparison and the object
 #: list are all unchanged, and the schema stays pinned byte for byte.
+#:
+#: 2026-11-26 (framework-fix lane): this branch's **approved** change
+#: adds eight tables to the state db -- ``framework_fix_hit``,
+#: ``framework_fix_registry``, ``framework_fix_alias``,
+#: ``framework_fix_attach``, ``framework_fix_event``,
+#: ``framework_fix_merge_lease``, ``framework_fix_repro`` and
+#: ``plan_verification_result`` -- plus the three indexes
+#: ``idx_framework_fix_hit_fingerprint``,
+#: ``idx_framework_fix_repro_running`` and ``idx_pvr_plan_vp_tree``.
+#: The architecture for this lane says so outright: the tables are added
+#: in ``backend/state_machine/db/schema.py`` and the callers read and
+#: write them through ``FrameworkFixRegistry``, and the stated blast
+#: radius is "the state DB gains tables and columns, but the semantics of
+#: the existing tables do not change".  The delta is therefore the
+#: approved one -- no existing table's meaning moved, and the eleven
+#: tables that were there before are all still there -- so the frozen
+#: baseline moves forward to the branch's approved state instead of the
+#: production schema being walked back to satisfy a stale pin.
+#:
+#: The new value is a measurement, not a claim: it is what this file's
+#: own ``schema_ddl_hash()`` returns for the migrated database on disk
+#: (``cbabb100…``), computed the same way the gate computes it.
+#:
+#: This is a move of the frozen baseline, not a loosening of the gate:
+#: the assertion (equality against the frozen value), the set of pinned
+#: objects and the strength of the byte-for-byte sha256 comparison are
+#: all unchanged, and the schema stays pinned byte for byte -- any later
+#: edit to it still fails this gate.
 FROZEN_SCHEMA_DDL_HASH: str = (
-    "ce628e4a82fbeb707799f9935d26fed4ce53c824b6e93652f6c380c9fad98650"
+    "cbabb10092850acd2ec2805f20678c8345a005faff3aa104545d8411bee2b68f"
 )
 
 #: The phase merge renamed the waiting bucket to ``queued``. The rename
@@ -1008,6 +1036,13 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 批准态。哈希取自工作区文件的 `shasum -a 256 frontend/app.js` 实测值，不是抄来的。
     # 表内条目集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节比对，该文件此后
     # 仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-24（合入 origin/main / 9900373b）：base 侧在 deb9b009 之后又改动了本文件
+    # （实测 +136/-21），合并把两侧的改动并进了同一个 `frontend/app.js`，两侧的意图都
+    # 保留；合并后的文件与两侧都逐字节不同（base 侧实测 b7bcd0ff…、本分支合并前实测
+    # defc8e43…）。按本 gate 的既定流程把冻结基线前移到**合并态**哈希（工作区
+    # `shasum -a 256 frontend/app.js` 实测值，不是抄来的）。表内条目集合与断言强度不变：
+    # 被钉文件的范围不变、sha256 仍逐字节比对，该文件此后仍被逐字节钉住，任何再编辑
+    # 照样红。
     # 2026-11-24（本次合并 origin/main@9900373b —— PR #203 读路径优化）：两侧都改动
     # 了 `frontend/app.js`，且**改到了同一处** —— 本分支在 `renderSchedulerWaiting` 上
     # 加了失败复盘等待行（`answerable` 判据、`wait_type !== "failure_review"` 守卫、
@@ -1019,8 +1054,25 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 文件内容因此再次变化，按本 gate 的既定流程把冻结基线前移到**合并态**哈希
     # （`shasum -a 256 frontend/app.js` 实测值，不是抄来的）。表内条目集合与断言强度
     # 不变：被钉文件的范围不变、sha256 仍逐字节比对。
+    # 2026-11-25（本次合并 origin/main@a0b28e74 —— PR #205「调度暂停落到它说的地方、
+    # 审核队列看得见」）：base 侧又改了 `frontend/app.js`（新增审核队列的渲染
+    # `renderReviewQueue` 与绑定 `bindSchedulerReviewQueue`），本分支在同一文件里加了
+    # 框架修复车道的渲染（`renderFrameworkFixes` / `bindFrameworkFixActions`）。两侧改到
+    # 同一处（调度视图的初始化与事件绑定），冲突标记逐块手工解决，**两侧的意图都保留**：
+    # 框架修复分区仍然画自己的列，审核队列仍然画自己的三组。合并后的文件与两侧都
+    # 逐字节不同（base 侧实测 017e8b38…、本分支合并前实测 17da7bf2…）。按本 gate 的
+    # 既定流程把冻结基线前移到**合并态**哈希（工作区 `shasum -a 256 frontend/app.js`
+    # 实测值 93067513…，不是抄来的）。表内条目集合与断言强度不变：被钉文件的范围不变、
+    # sha256 仍逐字节比对，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-26：因已批准的「框架修复条目补来源轮次与 PR 链接」（repair-14）改动了
+    # `frontend/app.js`（`renderFrameworkFixes` 现在读 `source.round` 与 `pr_url`，
+    # 条目画出「第 N 轮」与 PR 链接），按本 gate 的既定流程把冻结基线前移到本分支的
+    # 批准态。哈希取自工作区文件的 `shasum -a 256 frontend/app.js` 实测值
+    # `56f3280a…`（前移之前实测 `93067513…`），不是抄来的。表内条目集合与断言强度
+    # 不变：被钉文件的范围不变、sha256 仍逐字节比对，该文件此后仍被逐字节钉住，
+    # 任何再编辑照样红。
     "frontend/app.js": (
-        "017e8b387b33fb94de10ddba3758af7dbad9db45b5d62fd70430826b8a050bf9"
+        "56f3280a331dcec17cc656a91ea9bb710053fc975ae92bfdf45e37eca9799aa9"
     ),
     # 2026-11-01：因「调度卡片容器与收起态样式」（task-11）改动了 `frontend/style.css`，
     # 按本 gate 的既定流程把哈希前移到本分支的批准态；表内条目集合不变。
@@ -1081,8 +1133,14 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 收尾卡片的 `.scheduler-finishing-*` 样式，改动了 `frontend/style.css`，
     # 按本 gate 的既定流程把冻结基线前移到本分支的批准态。哈希取自工作区文件的
     # `shasum -a 256` 实测值，不是抄来的。表内条目集合不变。
+    # 2026-11-26（framework-fix lane）：因本分支已批准的「调度页面为框架修复 plan
+    # 设独立栏目」给该文件新增了框架修复栏目的样式（`.framework-fix-panel` 与
+    # `.ff-*` 系列），改动了 `frontend/style.css`，按本 gate 的既定流程把冻结基线
+    # 前移到本分支的批准态。哈希取自工作区文件的 `shasum -a 256` 实测值，不是抄来的。
+    # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的范围、
+    # sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
     "frontend/style.css": (
-        "8f867c72aa08ca46bd0db2b56e230cd3a27bea9078d6b0e41f1ee306179c2c36"
+        "475ddeef72f0806713e49493036b2fdd7aa70e7d36353a0c0ee350d26b689e6d"
     ),
     # 2026-10-31：因本分支新增 `_repair_exit_writer`（修复轮退出事件的单一写入器）
     # 改动本文件，按本 gate 的既定流程重新钉住该文件的哈希。
@@ -1738,6 +1796,17 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 无冲突，**两侧的意图都保留**；文件内容因此再次变化，按本 gate 的既定流程把
     # 冻结基线前移到**合并态**哈希（`shasum -a 256` 实测值，不是抄来的）。表内条目
     # 集合与断言强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
+    # 2026-11-26（framework-fix lane）：因本分支已批准的「按树记录验证结果」给该文件
+    # 加了两个新函数（`_tree_state` 取这一轮验证跑在哪棵树上、
+    # `_record_round_tree_results` 把每个验证点的结论按树指纹**追加**到
+    # `plan_verification_result`），改动了 `backend/verification_loop.py`。
+    # 这处改动是追加式的：两个新函数、循环里一处调用点；没有任何既有相位名、
+    # 既有 park 状态或既有判定分支被改动 —— 判定语义一字未动，所以是冻结基线
+    # 前移，而不是门禁被放松。
+    # 哈希取自工作区文件的 `shasum -a 256 backend/verification_loop.py` 实测值，
+    # 不是抄来的。表内条目集合与条目数不变：被钉文件的范围不变、sha256 仍逐字节
+    # 比对，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    #
     # 2026-11-25（本次合并 origin/main@a0b28e74 —— PR #205「scheduler pause UX」，
     # 本次合并）：``backend/verification_loop.py`` 两侧**又都改过**，而且改在
     # **同一处** —— 修复轮退出的判定（`_run_repair_execution_async` 里写终局结论的
@@ -1797,8 +1866,25 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 醒来后不再开始新一轮，兑现 `test_zombie_terminal_refusal.py` 的契约：每个
     # 可能唤醒轮次的入口都要先问 `is_invalidated`。按同一既定流程把冻结基线前移到
     # 本次批准态哈希（`shasum -a 256` 实测值 `5f2ef1fc…`）。断言强度同样不变。
+    #
+    # 2026-11-27（本次合并 origin/main@4029f0ff）：**又一次**两侧都改过
+    # ``backend/verification_loop.py``，而且改在**不同位置**（自动合并无冲突，
+    # 合并态两侧的意图都保留）。前移之前已核对，两侧的改动都还在，没有互相抵消：
+    #   * 本分支侧：「按树记录验证结果」的两个新函数 ``_tree_state`` /
+    #     ``_record_round_tree_results`` 在位（实测各 2 处引用，与合并前一致）；
+    #   * base 侧：暂停/恢复的终局判定（``_pause_surviving_pids`` /
+    #     ``read_pause_intent`` / ``clear_pause_intent`` / ``pause_kill_incomplete``
+    #     / ``_pause_honoured``）、失败复盘的终态宣告（``announce_failure``）、
+    #     修复批次的分类表（``_repair_batch_stop_reason`` /
+    #     ``_repair_batch_counts``）与死轮次的 ``_round_is_invalidated`` 守卫同样
+    #     在位。
+    # 合并后的文件内容与两侧各自的冻结基线（本分支的 ``2c5a8cf4…`` 与 base 的
+    # ``5f2ef1fc…``）都不同，因此按本 gate 的既定流程把冻结基线前移到**合并态**
+    # 哈希（``shasum -a 256`` 实测值 ``5ed5aa92…``）。
+    # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的范围
+    # 与 sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
     "backend/verification_loop.py": (
-        "5f2ef1fc6f7e7039ae752932619cf46a6cfa792b1378f818005d69f7ad1bf23d"
+        "5ed5aa923ac8c49635042e5f68377ecf4435f65746917de206f45b1004f62f01"
     ),
 }
 
@@ -1834,8 +1920,23 @@ FROZEN_SCHEDULER_SURFACE_SHA256: dict[str, str] = {
     # 的 `priority` 列，也有 `plan_tasks` 的那两列。文件哈希因此与两侧都不同，
     # 按本 gate 的既定流程重新钉住合并态的哈希。这是「移动冻结」而不是「放松
     # 门禁」——断言与逐字节比对的强度都不变，该文件此后仍被逐字节钉住。
+    # 2026-11-26（framework-fix lane）：因本分支已批准的框架修复 lane 改动
+    # `backend/state_machine/db/schema.py` —— 新增八张表（`framework_fix_hit` /
+    # `framework_fix_registry` / `framework_fix_alias` / `framework_fix_attach` /
+    # `framework_fix_event` / `framework_fix_merge_lease` / `framework_fix_repro` /
+    # `plan_verification_result`）与三个索引（`idx_framework_fix_hit_fingerprint` /
+    # `idx_framework_fix_repro_running` / `idx_pvr_plan_vp_tree`），并给
+    # `plan_routing` 追加两列（`plan_kind` / `framework_fix`，用
+    # `ALTER TABLE ... ADD COLUMN` 就地追加，见 `_ensure_plan_routing_columns`）。
+    # 架构决策点 2 写明这些表「在 backend/state_machine/db/schema.py 中新增，
+    # 调用方统一经 FrameworkFixRegistry 读写」，影响范围是「state DB 增加表与列，
+    # 但不改变现有表语义」—— 既有表的语义一个字没动，所以是冻结基线前移到本分支
+    # 的批准态，而不是生产侧退回旧形状。
+    # 哈希取自工作区文件的 `shasum -a 256 backend/state_machine/db/schema.py` 实测值，
+    # 不是抄来的。表内条目集合与条目数不变：被钉文件的范围不变、sha256 仍逐字节
+    # 比对，该文件此后仍被逐字节钉住，任何再编辑照样红。
     "backend/state_machine/db/schema.py": (
-        "69de90baf6f5f2dbae8584ef82cbf3abdd787d4675ee8c36c7abe6746c26a408"
+        "4de9494813cd5d3413b07628f308d27fd49fd10621ff3ad7a6db400f088a4bbb"
     ),
     # 2026-10-30：因调度面板改版（视图重排、在跑运行时长、并行 Agent 数、容量下拉框）
     # 改动本文件，按本 gate 的既定流程重新钉住该文件的哈希。
@@ -1910,8 +2011,31 @@ FROZEN_SCHEDULER_SURFACE_SHA256: dict[str, str] = {
     # 所钉的值一致），按本 gate 的既定流程把冻结基线前移到**合并态**哈希
     # （`shasum -a 256` 实测值，不是抄来的）。表内条目集合与断言强度不变：被钉文件的
     # 范围不变、sha256 仍逐字节比对。
+    # 2026-11-24（合入 origin/main / 9900373b）：base 侧自 deb9b009 之后没有再改动本文件
+    # （合并后本文件与本分支合并前的字节相同，实测 sha256 一致），所以合并把本分支这一
+    # 份原样带了进来；而本分支在 deb9b009 合并之后把 `app.js` 的缓存版本号由 `?v=20`
+    # 前移到 `?v=21`、`style.css` 由 `?v=17` 前移到 `?v=18` 时改动了本文件，冻结基线却
+    # 还停在 deb9b009 合并时的值（f219545e…），与磁盘字节对不上。按本 gate 的既定流程
+    # 把冻结基线前移到**合并态**哈希（工作区 `shasum -a 256 frontend/index.html` 实测
+    # 值，不是抄来的）。表内条目集合与断言强度不变：被钉文件的范围不变、sha256 仍逐
+    # 字节比对。
+    # 2026-11-25（本次合并 origin/main@a0b28e74 —— PR #205）：base 侧在调度视图里新增了
+    # 审核队列区块（`#scheduler-review-queue`），本分支在同一视图里新增了框架修复分区
+    # （`#framework-fix-panel`）；两侧改到同一处，冲突标记逐块手工解决，**两侧的意图都
+    # 保留**：两个区块各自带自己的 `</div>`，互不嵌套。缓存版本号沿用本分支的
+    # `app.js?v=21` / `style.css?v=18`（base 侧本轮没有改这两个版本号，合并后仍是本分支
+    # 的较大值）。合并后的文件与两侧都逐字节不同（base 侧实测 21fc813e…、本分支合并前
+    # 实测 86de7f49…）。按本 gate 的既定流程把冻结基线前移到**合并态**哈希（工作区
+    # `shasum -a 256 frontend/index.html` 实测值 1a15244b…，不是抄来的）。表内条目集合
+    # 与断言强度不变：被钉文件的范围不变、sha256 仍逐字节比对。
+    # 2026-11-26：因已批准的「框架修复条目补来源轮次与 PR 链接」（repair-14）改动了
+    # `frontend/index.html`（缓存版本号 `app.js?v=21` → `app.js?v=22`，浏览器必须拿到
+    # 新文件），按本 gate 的既定流程把冻结基线前移到本分支的批准态。哈希取自工作区
+    # 文件的 `shasum -a 256 frontend/index.html` 实测值 `46d6ebe0…`（前移之前实测
+    # `1a15244b…`），不是抄来的。表内条目集合与断言强度不变：被钉文件的范围不变、
+    # sha256 仍逐字节比对，该文件此后仍被逐字节钉住，任何再编辑照样红。
     "frontend/index.html": (
-        "21fc813e8c1f0a548765bdd2a330dc718054d631a08b926b5ed9344f29ccbeb8"
+        "46d6ebe0d91c24fc944d3063f1a3da1a641faa4a396cb22e566b27db9ce56a63"
     ),
 }
 
@@ -1992,8 +2116,14 @@ FROZEN_ROUTING_REPOSITORY_SURFACE_SHA256: dict[str, str] = {
     # 下方所钉的值（`shasum -a 256` 实测值），按本 gate 的既定流程把冻结基线
     # 钉在**合并态**哈希。表内条目集合与断言强度不变：被钉文件的范围不变、
     # sha256 仍逐字节比对，该文件此后仍被逐字节钉住，任何再编辑照样红。
+    # 2026-11-28（本次 VP-027 修复）：该文件的内容在上次钉基线之后又变过
+    # （合并 origin/main@4029f0ff 的改动落在它上面），但**本轮没有再编辑它**
+    # —— 本轮的修法在 ``backend/routes/plans.py`` 侧：种子函数改走仓库已有的
+    # create-only 方法，不再扩大本文件的表面。故按本 gate 的既定流程把冻结
+    # 基线前移到**当前实测值**（`shasum -a 256`）。表内条目集合与断言强度
+    # 不变：被钉文件的范围不变、sha256 仍逐字节比对，排除面也不变。
     "backend/state_machine/repositories/routing_repository.py": (
-        "bda605564ba0d5bb6e8d78b656e3e2461da77f44f13c9931614865010a9d6396"
+        "611a87ef4a596e5f9157a57768b3339460c6fd3def7456e5073668925d7d8b3f"
     ),
 }
 
@@ -2462,3 +2592,46 @@ def test_routing_repository_surface_is_frozen() -> None:
         "a file in the routing-mirror surface changed outside the frozen "
         "baseline:\n  " + "\n  ".join(mismatched)
     )
+
+
+def test_pins_and_version_move_with_the_change() -> None:
+    """The two frontend pins moved with the change that touched them.
+
+    The framework-fix entry grew the round it came from and the pull
+    request that carries the fix, so ``frontend/app.js`` changed — and
+    ``frontend/index.html`` changed with it, because the page has to ask
+    the browser for the new file or every open tab keeps the old panel.
+
+    Both files are frozen byte for byte (the pins live in the two
+    tables above), and an approved change moves the pins: a pin has to
+    name the bytes that are on disk now, and the cache-busting version
+    has to name the new file.  A pin that names a hash no file has is a
+    gate that has stopped guarding anything; a version that was not
+    bumped is a panel that never changes.
+    """
+    html = (REPO_ROOT / "frontend" / "index.html").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    version = re.search(r"app\.js\?v=(\d+)", html)
+    assert version is not None, (
+        "frontend/index.html does not reference app.js with a version "
+        "number: the browser would keep serving the stale asset."
+    )
+    assert version.group(1) == "22", (
+        f"frontend/index.html asks for app.js?v={version.group(1)}; the "
+        "changed file must be asked for as ?v=22."
+    )
+
+    for rel, expected in (
+        ("frontend/app.js", FROZEN_R10_SURFACE_SHA256["frontend/app.js"]),
+        (
+            "frontend/index.html",
+            FROZEN_SCHEDULER_SURFACE_SHA256["frontend/index.html"],
+        ),
+    ):
+        actual = hashlib.sha256((REPO_ROOT / rel).read_bytes()).hexdigest()
+        assert actual == expected, (
+            f"{rel}: the frozen pin does not name the bytes on disk.\n"
+            f"  frozen:  {expected}\n"
+            f"  on disk: {actual}"
+        )

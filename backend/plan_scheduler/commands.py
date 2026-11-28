@@ -186,6 +186,12 @@ from state_machine.repositories.execution_repository import (
     PlanNotFoundError,
 )
 
+# The pause intent — the durable record of *why* a plan is not running.
+# It lives in the pause-state layer, not here: this layer asks for the
+# intent to be written and reads back what was written; the layer owns
+# the file and the vocabulary of reasons.
+import pause_state
+
 log = logging.getLogger(__name__)
 
 __all__ = [
@@ -588,7 +594,12 @@ class CommandExecutor:
         return self._command("promote", plan_id, command_id, self._do_promote)
 
     def pause(
-        self, plan_id: str, *, command_id: Optional[int] = None
+        self,
+        plan_id: str,
+        *,
+        reason: Optional[str] = None,
+        source: Optional[str] = None,
+        command_id: Optional[int] = None,
     ) -> CommandResult:
         """Park a plan: stop it, and let it give its slot back.
 
@@ -598,15 +609,32 @@ class CommandExecutor:
         stops holding compute.  The phase is the lifecycle's to move; the
         executor only asks.
 
+        The pause is **written down** as well as carried out: the reason
+        goes into the pause-state layer, so a plan the framework-fix lane
+        pushed aside is still parked after a restart instead of coming
+        back running.  A reason outside the scheduler's closed vocabulary
+        is refused before anything happens — a pause nobody can read back
+        is a pause a restart would undo.
+
         Args:
             plan_id: the plan to pause.
+            reason: why the plan is parked — one of the scheduler's own
+                words.  The operator's own pause is the default.
+            source: where the pause came from — the operator or the
+                framework-fix lane.  Derived from the reason when it is
+                not given.
             command_id: the command row to finish; a new one is written
                 when it is omitted.
 
         Returns:
             The :class:`CommandResult`.
         """
-        return self._command("pause", plan_id, command_id, self._do_pause)
+        return self._command(
+            "pause",
+            plan_id,
+            command_id,
+            lambda pid: self._do_pause(pid, reason, source),
+        )
 
     def resume(
         self, plan_id: str, *, command_id: Optional[int] = None
@@ -687,8 +715,19 @@ class CommandExecutor:
             return CONFLICT, "not_queued"
         return APPLIED, "promote_order:{0}".format(order)
 
-    def _do_pause(self, plan_id: str) -> Tuple[str, Optional[str]]:
+    def _do_pause(
+        self,
+        plan_id: str,
+        reason: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> Tuple[str, Optional[str]]:
         """Carry out a pause; return the outcome and the detail.
+
+        The reason is checked **before** anything happens.  A pause whose
+        reason cannot be written down is a pause a restart would undo:
+        the plan would come back running while the answer said it was
+        parked.  So a word outside the closed vocabulary is a conflict,
+        and the plan is left alone.
 
         The lifecycle call is run through :func:`retry_on_busy`: the
         lifecycle writes to the shared state database, and a write that
@@ -703,16 +742,50 @@ class CommandExecutor:
         did not cooperate, and waiting does not make it cooperate.  Its
         own reason is the answer.
 
-        The pause intent the lifecycle writes stays on disk either way:
-        it is written before the plan is stopped, precisely because the
-        process that does the stopping may be killed a moment later.
+        The pause intent stays on disk when the pause may still be
+        honoured: it is written before the plan is stopped, precisely
+        because the process that does the stopping may be killed a moment
+        later — and a database that stayed busy is exactly that kind of
+        moment.  It is taken away when the plan is definitely not parked
+        and is not going to be: a refusal (the phase does not allow the
+        pause) and a plan that does not exist.  An intent that says "this
+        plan is not supposed to be running" beside a plan that is running
+        keeps a plan parked that nobody parked.
         """
         if self._phase_of(plan_id) is None:
             return NOT_FOUND, "no_such_plan"
 
         try:
+            checked_reason = pause_state.checked_reason(reason)
+            checked_source = pause_state.checked_source(checked_reason, source)
+        except pause_state.PauseReasonError as exc:
+            return CONFLICT, "unknown_reason:{0}".format(exc.value)
+
+        # The intent is written **first**: it is the decision, and the
+        # plan stopping is the decision being carried out.  A write that
+        # fails does not stop the pause — the park still happens, and the
+        # detail says the intent did not land, so the answer is honest
+        # about what a restart will remember.
+        intent = pause_state.write_pause(
+            plan_id,
+            checked_reason,
+            source=checked_source,
+            clock=self._clock,
+        )
+
+        try:
             result = retry_on_busy(lambda: self._lifecycle.pause_plan(plan_id))
         except Exception as exc:  # noqa: BLE001 — the type decides
+            if is_db_locked(exc):
+                # The database stayed busy: the pause did not happen — but
+                # the intent **stays**.  The process that does the stopping
+                # may be dead already, and the repair round still needs the
+                # intent to tell a pause from a crash.  The answer says the
+                # pause did not happen, in its own words.
+                return CONFLICT, DATABASE_LOCKED_DETAIL
+            # The plan was not parked, and it is not going to be: it must
+            # not keep a pause intent that says it is.
+            self._forget_pause_intent(plan_id)
             if self._is_not_found(exc):
                 return NOT_FOUND, "no_such_plan"
             rejection = self._as_rejection(exc)
@@ -720,12 +793,12 @@ class CommandExecutor:
                 # The lifecycle refused: the refusal is the caller's
                 # answer, and it travels on as it came.
                 raise rejection from exc
-            if is_db_locked(exc):
-                # The database stayed busy: the pause did not happen.
-                # The answer says so in its own words.
-                return CONFLICT, DATABASE_LOCKED_DETAIL
             raise
         if not getattr(result, "ok", True):
+            # The plan was not parked, so it is not paused — and a plan
+            # that is not paused must not carry an intent that says it
+            # is.
+            self._forget_pause_intent(plan_id)
             return CONFLICT, getattr(result, "detail", None) or "conflict"
 
         # The plan gave its slot back.  The ledger is the authority on
@@ -733,10 +806,29 @@ class CommandExecutor:
         # has just changed.  Reconciling here is what makes the ledger
         # say what the facts say, instead of the next tick having to.
         self._ledger.reconcile()
-        return APPLIED, getattr(result, "detail", None) or "paused"
+        detail = getattr(result, "detail", None) or "paused"
+        if not intent.get("persisted", False):
+            # The park happened; the reason did not land on disk.  The
+            # detail says so — a restart would not honour this pause.
+            detail = "{0}:intent_not_persisted".format(detail)
+        return APPLIED, detail
+
+    def _forget_pause_intent(self, plan_id: str) -> None:
+        """Take away a pause intent that does not describe the plan.
+
+        The intent says the plan is not supposed to be running.  When the
+        pause did not happen, that sentence is false, and a restart that
+        read it would keep a plan parked that nobody parked.
+        """
+        pause_state.clear_pause(plan_id)
 
     def _do_resume(self, plan_id: str) -> Tuple[str, Optional[str]]:
         """Carry out a resume; return the outcome and the detail.
+
+A resume takes the pause **away**: the plan is not parked any
+        more, so the pause intent — the record that said it was — goes
+        with it.  An intent left behind would keep the plan parked after
+        a restart, long after the plan came back.
 
         The lifecycle call is run through :func:`retry_on_busy`, for
         the same reason the pause is: the lifecycle writes to the shared
@@ -763,6 +855,10 @@ class CommandExecutor:
             )
         if self._is_running(plan_id):
             # A plan that is working has no "put it back to wait" to do.
+            # It is also not parked, so any pause intent it still
+            # carries is stale — and a stale intent would park it again
+            # after a restart.
+            self._forget_pause_intent(plan_id)
             return CONFLICT, "running"
 
         try:
@@ -812,6 +908,7 @@ class CommandExecutor:
             # The engine pulled the plan up in the meantime: it is
             # working, so it was not lost.  The resume did what it came
             # to do — one moment later than it said.
+            self._forget_pause_intent(plan_id)
             return APPLIED, "resumed"
         if phase != QUEUED_PHASE:
             # The phase did not move: the plan is not waiting, and
@@ -822,6 +919,7 @@ class CommandExecutor:
             # The phase says the plan is waiting, but the queue does not
             # hold it: the row is gone, so the plan waits nowhere.
             return CONFLICT, "resume_not_queued:queued"
+        self._forget_pause_intent(plan_id)
         return APPLIED, "resumed"
 
     def _do_start(self, plan_id: str) -> Tuple[str, Optional[str]]:

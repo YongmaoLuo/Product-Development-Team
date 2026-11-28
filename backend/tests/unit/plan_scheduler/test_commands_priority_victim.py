@@ -38,6 +38,7 @@ subprocess — so the cases stay inside the unit layer.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -129,4 +130,59 @@ def test_zero_threshold_picks_the_shortest_at_command_layer(world: _World) -> No
     assert victim == "fresh", (
         "the plan that has run the shortest was not the one that was "
         "interrupted: {0!r}".format(victim)
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2. A framework-fix plan is never the victim
+# ---------------------------------------------------------------------------
+
+
+def test_a_framework_fix_plan_is_never_the_victim(world: _World) -> None:
+    """The command layer will not interrupt a running framework-fix plan.
+
+    This is the layer where the answer matters: an explicit ``start``
+    is the one action the operator can take that interrupts somebody,
+    and the capacity is what makes it happen.  When the capacity is
+    full, the executor asks the policy who may be interrupted and stops
+    that plan.
+
+    A framework-fix plan may not be interrupted — **structurally**, not
+    because it happens to be young or because the caller asked nicely.
+    Two repair plans making way for each other would be a livelock, and
+    the lane is built to make that impossible rather than unlikely.
+
+    The executor hands the ledger's candidates to the policy as they
+    are, so the protection has to travel **on the candidate**.  When it
+    does not, the policy cannot answer "is this plan protected?", the
+    answer it gives is "no", and the repair plan is stopped like any
+    other plan.
+
+    The case is **differential**: the same world, the same age and the
+    same priority, with only the plan's kind changed.  An ordinary plan
+    of the same shape is interrupted; the repair plan is not.
+    """
+    world.working("20261101-ordinary", started_at=BASE_EPOCH - 3600)
+    world.slot("20261101-ordinary", BASE_EPOCH - 3600, priority=0)
+    world.working("20261101-fix", started_at=BASE_EPOCH - 3600)
+    world.slot("20261101-fix", BASE_EPOCH - 3600, priority=0)
+    world.conn.execute(
+        "UPDATE plan_routing SET plan_kind = ?, framework_fix = ? "
+        "WHERE plan_id = ?",
+        (
+            "framework_fix",
+            json.dumps({"repo": "repo-a"}, ensure_ascii=False),
+            "20261101-fix",
+        ),
+    )
+    world.conn.commit()
+
+    executor = world.executor_factory(min_runtime_seconds=0)
+    victim = executor._select_victim(0)
+
+    assert victim == "20261101-ordinary", (
+        "the framework-fix plan was chosen as the victim: {0!r}".format(victim)
+    )
+    assert victim != "20261101-fix", (
+        "the operator start interrupted a running framework-fix plan"
     )

@@ -13,12 +13,14 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
 import warnings
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock
 
 import pytest
@@ -2973,3 +2975,599 @@ def isolated_runtime_plan_state():
             if isinstance(store, dict):
                 store.clear()
                 store.update(snapshot)
+
+
+# ---------------------------------------------------------------------------
+# The framework-fix lane's shared fixtures
+# ---------------------------------------------------------------------------
+#
+# The framework-fix lane keeps its facts in the state database,
+# reproduces failures on a clean ``main`` in a throw-away worktree, and
+# measures its time thresholds (ten minutes to a deadlock, thirty
+# minutes to a reminder, two hours to a merge wait) against an injected
+# clock.  Each of those three needs test data, and each of them is
+# dangerous to get wrong:
+#
+#   * a state database that is not the test's own file writes test plans
+#     into the operator's live ``state.db`` — which is how ``vp-*`` plan
+#     ids ended up in a real plan list once already;
+#   * a fixture repository that is the real repository leaves worktrees,
+#     branches and temporary files behind;
+#   * a failure source that is not deterministic turns the very tests
+#     that classify flakes into flakes themselves;
+#   * a clock that is faked by swallowing ``sleep`` turns every timing
+#     assertion into a no-op that always passes.
+#
+# So the five fixtures below are deliberately boring: each one owns a
+# directory inside ``tmp_path``, each one refuses to work outside it,
+# and each one is deterministic by construction.
+
+#: The eight tables the framework-fix migration owns.  The ``state_db``
+#: fixture runs the migration and then checks this set, because a
+#: registry test that has to migrate by hand is a registry test that
+#: can pass against a database production never opens.
+_FRAMEWORK_FIX_TABLES = frozenset(
+    {
+        "framework_fix_hit",
+        "framework_fix_registry",
+        "framework_fix_alias",
+        "framework_fix_attach",
+        "framework_fix_event",
+        "framework_fix_merge_lease",
+        "framework_fix_repro",
+        "plan_verification_result",
+    }
+)
+
+
+@pytest.fixture
+def state_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A migrated state database that belongs to this test alone.
+
+    The redirect goes through ``PDT_STATE_DB_PATH`` — the variable every
+    backend module honours — and it is then **verified**, not assumed:
+    the fixture asks the application's own resolver
+    (``config_paths.resolve_state_db_path``) where the database would
+    really live, and refuses to hand anything back when the answer is
+    outside ``tmp_path``.  A fixture that silently fell back to the live
+    database would be the worst kind of test bug, because it writes into
+    the operator's data and the test still passes.
+
+    The migration is the production one (``state_machine.db.schema``),
+    so the eight framework-fix tables are there before the first test
+    body runs.  A registry test that has to migrate by hand is a
+    registry test that can pass against a database production never
+    opens.
+
+    Returns:
+        The path of the database file.  It lives inside ``tmp_path``,
+        so pytest throws it away with the rest of the test's scratch
+        space.
+    """
+    db_path = tmp_path / "state.db"
+    monkeypatch.setenv("PDT_STATE_DB_PATH", str(db_path))
+
+    # Ask the application, not the environment variable we just set.
+    resolved = _resolve_state_db_path().resolve()
+    if not _is_within(resolved, tmp_path.resolve()):
+        raise RuntimeError(
+            "the state_db fixture must resolve inside tmp_path; the "
+            f"application resolved {resolved}, which is outside "
+            f"{tmp_path.resolve()}.  Refusing to hand out a database: a "
+            "test that writes to the live state.db plants its own rows "
+            "in the operator's data."
+        )
+
+    from state_machine.db.connection import open as open_db
+    from state_machine.db.schema import migrate
+
+    conn = open_db(db_path)
+    try:
+        migrate(conn)
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    finally:
+        conn.close()
+
+    missing = _FRAMEWORK_FIX_TABLES - tables
+    if missing:
+        raise RuntimeError(
+            "the state_db fixture must hand back a migrated database; "
+            f"these framework-fix tables are missing: {sorted(missing)}"
+        )
+
+    return db_path
+
+
+#: The identity the fixture commits under.  Local to the fixture
+#: repository, so nothing here can reach a commit made in the real
+#: repository or in the developer's own worktree.
+_FIXTURE_GIT_USER = "PDT Fixture"
+_FIXTURE_GIT_EMAIL = "pdt-fixture@example.invalid"
+
+
+def _hermetic_git_env() -> Dict[str, str]:
+    """The environment the fixture repository is built in.
+
+    The global and the system git configuration are neutralised.  They
+    are the two places a developer's machine can put settings that
+    change what ``git init`` and ``git commit`` do:
+
+    * ``init.templateDir`` — git copies the template's ``hooks/`` into
+      every repository it creates, so a ``pre-commit`` hook from a
+      project template lands in the fixture repository;
+    * ``core.hooksPath`` — git then *runs* the hook from there, and a
+      hook that fails (a linter that fails on the fixture's two
+      throw-away files, a hook that needs the project's
+      ``node_modules``) aborts the fixture's commits.
+
+    Either one would make the fixture repository behave differently on
+    different machines, which is the opposite of what a test fixture is
+    for.  The fixture repository is a *fixture*: it has to be the same
+    repository everywhere, or the tests built on it are only true on
+    the machine that ran them last.
+
+    ``GIT_TERMINAL_PROMPT=0`` is the second half of the same promise:
+    a misconfigured remote must fail the fixture, not block it on a
+    prompt nobody is there to answer.
+
+    (Both variables are honoured by git 2.32 and newer.  On an older
+    git they are ignored, and the fixture falls back to the ambient
+    configuration — degraded, but never broken.)
+    """
+    env = dict(os.environ)
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_SYSTEM"] = os.devnull
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+def _git(*args: str, cwd: Optional[Path] = None) -> str:
+    """Run one git command and return its stdout.
+
+    ``safe.directory=*`` is passed because git refuses to operate in a
+    repository owned by somebody else ("dubious ownership"), and that
+    refusal has nothing to do with the test — it would only make the
+    fixture fail on a machine whose temporary directory is not owned by
+    the user running the suite.
+
+    The command runs in :func:`_hermetic_git_env`, so the fixture
+    repository is the same repository on every machine.
+
+    Raises:
+        RuntimeError: the command failed.  The stderr is carried along,
+            because "git push failed" without the reason is not an
+            answer.
+    """
+    command = ["git", "-c", "safe.directory=*"]
+    if cwd is not None:
+        command += ["-C", str(cwd)]
+    command += list(args)
+    proc = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        env=_hermetic_git_env(),
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args)} failed with exit code {proc.returncode}: "
+            f"{proc.stderr.strip()}"
+        )
+    return proc.stdout
+
+
+@pytest.fixture
+def fixture_repo(tmp_path: Path) -> Dict[str, Any]:
+    """A git repository a test can commit to, clone from and check out.
+
+    The shape is the one the reproduction protocol needs: a **bare**
+    origin, a clone of it, and the commit the clone's ``main`` points
+    at.  The protocol clones the origin into a throw-away worktree and
+    runs the failing command there, so the origin must be clonable and
+    must not carry a working tree of its own.
+
+    Two commits, no more: the first is the baseline, the second is the
+    change a test wants to reproduce *against*.  Everything is local —
+    the "origin" is a directory, so the fixture never touches the
+    network and never touches the real repository.
+
+    Returns:
+        ``{"origin": Path, "clone": Path, "main_commit": str}``.
+    """
+    origin = tmp_path / "origin"
+    seed = tmp_path / "seed"
+    clone = tmp_path / "clone"
+
+    _git("init", "--bare", "-b", "main", str(origin))
+
+    # The seed carries the two commits.  It is a separate directory
+    # because a bare repository has no working tree to commit into.
+    _git("init", "-b", "main", str(seed))
+    _git("config", "user.name", _FIXTURE_GIT_USER, cwd=seed)
+    _git("config", "user.email", _FIXTURE_GIT_EMAIL, cwd=seed)
+    _git("config", "commit.gpgsign", "false", cwd=seed)
+
+    (seed / "README.md").write_text("# fixture repo\n", encoding="utf-8")
+    _git("add", "README.md", cwd=seed)
+    _git("commit", "-m", "fixture: initial commit", cwd=seed)
+
+    (seed / "src").mkdir()
+    (seed / "src" / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    _git("add", "-A", cwd=seed)
+    _git("commit", "-m", "fixture: second commit", cwd=seed)
+
+    main_commit = _git("rev-parse", "HEAD", cwd=seed).strip()
+
+    _git("remote", "add", "origin", str(origin), cwd=seed)
+    _git("push", "origin", "main", cwd=seed)
+
+    _git("clone", str(origin), str(clone))
+    _git("config", "user.name", _FIXTURE_GIT_USER, cwd=clone)
+    _git("config", "user.email", _FIXTURE_GIT_EMAIL, cwd=clone)
+    _git("config", "commit.gpgsign", "false", cwd=clone)
+
+    return {"origin": origin, "clone": clone, "main_commit": main_commit}
+
+
+#: A fixed assertion failure.  The traceback's last line is the first
+#: error line a caller reads, and it is the same every time — that is
+#: what makes the source *deterministic* rather than merely *failing*.
+_DETERMINISTIC_FAILURE_SOURCE = '''\
+raise AssertionError("deterministic fixture failure")
+'''
+
+#: A failure that fails once and then passes.  The counter file is what
+#: makes it flaky rather than random: a source that flipped a coin would
+#: make the classification tests flaky themselves.
+_FLAKY_FAILURE_SOURCE = '''\
+import os
+import sys
+
+counter_path = sys.argv[1]
+count = 0
+if os.path.exists(counter_path):
+    with open(counter_path, encoding="utf-8") as handle:
+        count = int((handle.read() or "0").strip() or "0")
+count += 1
+with open(counter_path, "w", encoding="utf-8") as handle:
+    handle.write(str(count))
+
+if count == 1:
+    raise AssertionError("flaky fixture failure (attempt 1)")
+'''
+
+#: A source that never finishes inside the deadline.  The sleep is real:
+#: the point of the source is to be killed by a deadline, and a source
+#: that returned early would be a slow success, not a timeout.
+_TIMEOUT_FAILURE_SOURCE = '''\
+import sys
+import time
+
+time.sleep(float(sys.argv[1]))
+'''
+
+#: A source that passes.
+_GREEN_SOURCE = '''\
+print("green fixture ok")
+'''
+
+#: How long the timeout source sleeps, and the deadline it is run
+#: under.  The sleep is much longer than the deadline so the deadline
+#: is what decides — the margin is what keeps the test from turning
+#: into a coin flip on a loaded machine.
+_TIMEOUT_SOURCE_SLEEP_S = 30.0
+_TIMEOUT_SOURCE_DEADLINE_S = 1.0
+
+
+@pytest.fixture
+def failure_fixtures(tmp_path: Path) -> Dict[str, Dict[str, Any]]:
+    """Four deterministic failure sources, as real commands.
+
+    The reproduction protocol runs the failing command twice on a clean
+    ``main`` and classifies the two attempts, so the sources have to be
+    real commands with real exit codes — a source that only *looks* like
+    a failure would make every classification test a test of the
+    fixture.
+
+    The four sources are the four outcomes the classifier distinguishes:
+
+    ``deterministic``
+        Fails the same way every time — the same exit code, the same
+        first error line.
+    ``flake``
+        Fails on its first run and passes on its second, driven by a
+        counter file rather than by a coin flip.
+    ``timeout``
+        Never finishes inside the deadline it is given.
+    ``green``
+        Passes.
+
+    Returns:
+        A dict keyed by those four names.  Each entry carries the
+        ``command`` (an argv list), the ``expected_exit_codes`` it
+        produces across repeated runs, the ``first_error_line`` it
+        prints when it fails, and the ``timeout_s`` a caller should
+        give it.
+    """
+    root = tmp_path / "failure_fixtures"
+    root.mkdir(parents=True, exist_ok=True)
+
+    deterministic_script = root / "deterministic_failure.py"
+    deterministic_script.write_text(
+        _DETERMINISTIC_FAILURE_SOURCE, encoding="utf-8"
+    )
+
+    flake_script = root / "flaky_failure.py"
+    flake_script.write_text(_FLAKY_FAILURE_SOURCE, encoding="utf-8")
+    flake_counter = root / "flake.count"
+
+    timeout_script = root / "timeout_failure.py"
+    timeout_script.write_text(_TIMEOUT_FAILURE_SOURCE, encoding="utf-8")
+
+    green_script = root / "green_source.py"
+    green_script.write_text(_GREEN_SOURCE, encoding="utf-8")
+
+    return {
+        "deterministic": {
+            "command": [sys.executable, str(deterministic_script)],
+            "expected_exit_codes": (1,),
+            "first_error_line": "AssertionError: deterministic fixture failure",
+            "timeout_s": None,
+        },
+        "flake": {
+            "command": [sys.executable, str(flake_script), str(flake_counter)],
+            "expected_exit_codes": (1, 0),
+            "first_error_line": "AssertionError: flaky fixture failure (attempt 1)",
+            "timeout_s": None,
+        },
+        "timeout": {
+            "command": [
+                sys.executable,
+                str(timeout_script),
+                str(_TIMEOUT_SOURCE_SLEEP_S),
+            ],
+            "expected_exit_codes": (),
+            "first_error_line": "",
+            "timeout_s": _TIMEOUT_SOURCE_DEADLINE_S,
+        },
+        "green": {
+            "command": [sys.executable, str(green_script)],
+            "expected_exit_codes": (0,),
+            "first_error_line": "",
+            "timeout_s": None,
+        },
+    }
+
+
+#: The instant every ``frozen_clock`` starts at.  A fixed one, not
+#: "now": a clock that starts at the wall clock is only half frozen,
+#: and a test that asserts on a timestamp would have to tolerate
+#: whatever the machine's clock happened to say.
+FROZEN_CLOCK_START = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+
+class _FrozenClock:
+    """An injectable clock: it hands out the time it was given.
+
+    Two rules, and both of them are load-bearing:
+
+    * it moves only when it is told to (``advance``), so a test can
+      assert on "ten minutes later" without waiting ten minutes;
+    * it never moves backwards.  A deadline that has passed must not
+      un-expire, so ``advance`` refuses a negative step loudly rather
+      than quietly rewinding the clock.
+
+    The clock is also **callable**, and that is not decoration: the
+    scheduler takes its clock as "a zero-argument callable returning
+    epoch seconds" (``plan_scheduler.capacity.CapacityLedger``,
+    ``plan_scheduler.engine.Engine`` and ``plan_scheduler.dryrun`` all
+    default to ``time.time``), so the fixture's clock is handed to it
+    as it is.  A clock that only had a ``now()`` method would have to
+    be wrapped by every caller — and the wrapper is exactly where the
+    wall clock would sneak back in.
+    """
+
+    def __init__(self, start: datetime) -> None:
+        self._now = start
+
+    def now(self) -> datetime:
+        """The current instant — tz-aware UTC, like the framework's own."""
+        return self._now
+
+    def advance(self, seconds: float) -> datetime:
+        """Move the clock forward by ``seconds`` and return the new now.
+
+        Raises:
+            ValueError: ``seconds`` is negative.  The clock does not run
+                backwards, and a request to do so is a bug in the
+                caller rather than a thing to absorb.
+        """
+        if seconds < 0:
+            raise ValueError(
+                f"the clock must not move backwards; asked for {seconds}s"
+            )
+        self._now = self._now + timedelta(seconds=seconds)
+        return self._now
+
+    def timestamp(self) -> float:
+        """The current instant as epoch seconds.
+
+        This is the shape ``plan_scheduler.commands`` takes for its
+        ``clock`` argument.
+        """
+        return self._now.timestamp()
+
+    def __call__(self) -> float:
+        """The current instant as epoch seconds — the scheduler's clock.
+
+        Same reading as :meth:`timestamp`, in the shape the scheduler
+        asks for: a zero-argument callable returning epoch seconds.
+        """
+        return self.timestamp()
+
+    def utcnow_iso(self) -> str:
+        """The current instant the way ``framework.clock`` spells it."""
+        return self._now.isoformat(timespec="microseconds")
+
+
+@pytest.fixture
+def frozen_clock(monkeypatch: pytest.MonkeyPatch) -> _FrozenClock:
+    """An injected clock, wired into the backend's one time source.
+
+    ``backend/framework/clock.py`` is the single place every framework
+    timestamp comes from (architecture decision point 5), so the clock
+    is injected *there* — by replacing the ``datetime`` that module
+    reads — rather than by patching every caller.  Patching the module
+    attribute ``utcnow_iso`` would have been the shorter way, and it
+    would have been wrong: a dozen modules do
+    ``from framework.clock import utcnow_iso``, which binds the
+    function at import time, and those modules would have gone on
+    reading the wall clock.
+
+    What the fixture does **not** do is touch ``time.sleep``.  It
+    replaces the time source, not the waiting: a fixture that swallowed
+    the sleeps would make every timing assertion in the suite finish
+    instantly and pass for reasons that have nothing to do with the
+    code under test.
+
+    Returns:
+        The :class:`_FrozenClock`.  ``now()`` reads it, ``advance()``
+        moves it, and calling it reads the epoch seconds the scheduler
+        takes as its clock.
+    """
+    clock = _FrozenClock(FROZEN_CLOCK_START)
+
+    from framework import clock as framework_clock
+
+    class _FrozenDatetime(datetime):
+        """``datetime`` whose ``now()`` reads the injected clock."""
+
+        @classmethod
+        def now(cls, tz=None):
+            moment = clock.now()
+            if tz is None:
+                return moment.replace(tzinfo=None)
+            return moment.astimezone(tz)
+
+    monkeypatch.setattr(framework_clock, "datetime", _FrozenDatetime)
+    return clock
+
+
+#: The framework files the plan factory attributes its defects to.  They
+#: are real modules of the lane, so a fingerprint computed from them is
+#: the fingerprint production would compute.
+_FRAMEWORK_FIXTURE_FILES = (
+    "classifier.py",
+    "fingerprint.py",
+    "read_model.py",
+    "repro.py",
+)
+
+
+@pytest.fixture
+def framework_fix_plan_factory(frozen_clock: _FrozenClock):
+    """Build N framework-fix plans, deterministically.
+
+    The plans are what the scheduler and the attach records are seeded
+    from, so each one carries everything the lane records about a
+    defect: the plan itself (``plan_routing``), the registry row
+    (fingerprint, key, files), the hit that produced it, and the attach
+    record saying which business plan is waiting on it.
+
+    The fingerprints are **distinct**: two plans carrying the same
+    fingerprint would be one defect with two repair plans, which is the
+    exact situation the registry's uniqueness constraint exists to
+    prevent.  They are computed with the production functions
+    (``framework_fix.fingerprint``) rather than spelled out here, so the
+    fixture cannot drift away from the fingerprint the code computes.
+
+    The timestamps come from the injected clock, so two runs of the
+    same test produce byte-identical plans.
+
+    Returns:
+        A callable: ``make(count, repo=...)`` returns a list of plan
+        dicts.
+    """
+    from framework_fix.fingerprint import canonical_key, compute_fingerprint
+    from plan_scheduler.policy import FRAMEWORK_FIX_PRIORITY
+
+    def make_plans(count: int, *, repo: str = "fixture-repo") -> List[Dict[str, Any]]:
+        """Build ``count`` framework-fix plans."""
+        if count < 0:
+            raise ValueError(f"count must not be negative; got {count}")
+
+        plans: List[Dict[str, Any]] = []
+        for index in range(1, count + 1):
+            plan_id = f"fx-fix-{index:04d}"
+            framework_files = [
+                "backend/framework_fix/"
+                + _FRAMEWORK_FIXTURE_FILES[
+                    (index - 1) % len(_FRAMEWORK_FIXTURE_FILES)
+                ]
+            ]
+            error_class = "AssertionError"
+            first_error_line = (
+                f"AssertionError: framework fix fixture failure {index}"
+            )
+            key = canonical_key(
+                framework_files=framework_files,
+                error_class=error_class,
+                first_error_line=first_error_line,
+            )
+            fingerprint = compute_fingerprint(
+                framework_files=framework_files,
+                error_class=error_class,
+                first_error_line=first_error_line,
+            )
+            created_at = frozen_clock.utcnow_iso()
+            block = {
+                "status": "active",
+                "hold": False,
+                "fingerprint": fingerprint,
+                "repo": repo,
+                "first_seen_at": created_at,
+                "created_at": created_at,
+            }
+            attach = [
+                {
+                    "attach_id": f"fx-attach-{index:04d}",
+                    "fingerprint": fingerprint,
+                    "plan_id": f"fx-biz-{index:04d}",
+                    "vp_id": f"vp-{index:03d}",
+                    "round": 1,
+                    "source": "framework_fix",
+                    "status": "blocked",
+                    "held_since": created_at,
+                }
+            ]
+            plans.append(
+                {
+                    "plan_id": plan_id,
+                    "plan_kind": "framework_fix",
+                    "title": (
+                        f"framework fix: {error_class} in {framework_files[0]}"
+                    ),
+                    "current_phase": "executing",
+                    "priority": FRAMEWORK_FIX_PRIORITY,
+                    "fingerprint": fingerprint,
+                    "repo": repo,
+                    "error_class": error_class,
+                    "first_error_line": first_error_line,
+                    "framework_files": framework_files,
+                    "acceptance_critical": True,
+                    "out_of_scope_change": False,
+                    "disposition": "blocking",
+                    "key": key,
+                    "framework_fix": block,
+                    "attach": attach,
+                    "created_at": created_at,
+                }
+            )
+        return plans
+
+    return make_plans
