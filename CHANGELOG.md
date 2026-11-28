@@ -370,7 +370,15 @@ half the readers never see.*
   that produced no conclusion used to be reported as a failure of the
   deliverable, and it is now reported as the absence of one.
 
-
+- **A round's close re-decides the deferred gates one last time, after
+  the environment re-run.** `backend/verification_agent.py` hands the
+  executor the round's **final** execution envelope once more once the
+  environment-blocked points have been re-run, and then re-decides the
+  deferred gate layers: a blocker that only turned green in that re-run
+  now lets its layer run in the same round, instead of the layer being
+  reported deferred on a reason that stopped being true. **This changes
+  the verdict**: a layer whose blocking point was flipped by the re-run
+  is no longer reported as deferred — it carries its own conclusion.
 
 ## [0.1.2] - 2026-10-07
 
