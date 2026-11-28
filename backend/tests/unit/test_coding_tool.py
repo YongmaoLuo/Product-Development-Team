@@ -9,6 +9,7 @@ These tests verify that:
 """
 
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -19,6 +20,7 @@ import time
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1864,3 +1866,321 @@ def test_the_prompt_is_written_before_the_dispatch_registration(monkeypatch):
         "the prompt after it can starve the child of its prompt; "
         f"order={order!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# The dispatch's own watch: the paths that are easy to leave uncovered.
+#
+# Every case below drives the production entry point that owns the line
+# it names -- the environment delta the runner merges, the watch that
+# measures silence, the stream forwarder that reports tool activity, the
+# sandbox report the dispatch logs after the run, and the session mapping
+# the dispatch records. Nothing here calls a private helper to make a
+# number move; the assertions are about what the production path does.
+# ---------------------------------------------------------------------------
+
+
+def _watch_process(stdout_close_error=None, kill_error=None):
+    """A child handle whose stdout and kill can be made to fail."""
+
+    class _Stdout:
+        def close(self):
+            if stdout_close_error is not None:
+                raise stdout_close_error
+
+    class _Process:
+        def __init__(self):
+            self.stdout = _Stdout()
+
+        def kill(self):
+            if kill_error is not None:
+                raise kill_error
+
+    return _Process()
+
+
+class _EventThatNeverFires:
+    """The total watcher's flag, standing in for one that never fires."""
+
+    def is_set(self):
+        return False
+
+    def wait(self, timeout=None):
+        raise RuntimeError("the watcher's wait failed")
+
+
+class TestClaudeCodingToolDispatchWatch:
+    """The dispatch's watch, its stream report and its session mapping."""
+
+    @pytest.fixture(autouse=True)
+    def _no_providers(self, monkeypatch):
+        """Block real provider detection for all tests in this class."""
+        monkeypatch.setattr(
+            ClaudeCodingTool, "_load_provider_from_db", staticmethod(lambda provider_name: {})
+        )
+
+    def _make_mock_process(self, stdout_lines, stderr="", returncode=0):
+        """Build a child handle that satisfies the interactive read path."""
+        mock_proc = MagicMock()
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdout = iter(stdout_lines)
+        mock_proc.stderr.read.return_value = stderr
+        mock_proc.wait.return_value = returncode
+        mock_proc.poll.return_value = returncode
+        return mock_proc
+
+    def _init_event(self, session_id="00000000-0000-0000-0000-000000000000"):
+        """Build the ``system init`` event interactive mode emits first."""
+        return json.dumps({"type": "system", "subtype": "init", "session_id": session_id})
+
+    def _dispatch_runner(self, idle_sec=10, total_sec=60):
+        """A dispatch runner with no child behind it."""
+        return ct._DispatchRunner(
+            tool=MagicMock(),
+            harness=MagicMock(),
+            idle_sec=idle_sec,
+            total_sec=total_sec,
+            plan_id=None,
+        )
+
+    # -- the environment the runner merges ---------------------------------
+
+    def test_a_key_the_dispatch_removed_travels_as_an_empty_value(self, monkeypatch):
+        """A removed key cannot be expressed by an add-only delta.
+
+        The delta is exactly the difference between what the dispatch
+        wants and what the process inherited, so a key the dispatch
+        dropped has to travel as the empty value -- the closest honest
+        answer an add-only delta can carry.
+        """
+        monkeypatch.setenv("PDT_WATCH_REMOVED_KEY", "inherited")
+        monkeypatch.setenv("PDT_WATCH_KEPT_KEY", "inherited")
+
+        delta = ct._environment_delta({"PDT_WATCH_KEPT_KEY": "changed"})
+
+        assert delta["PDT_WATCH_REMOVED_KEY"] == ""
+        assert delta["PDT_WATCH_KEPT_KEY"] == "changed"
+
+    # -- the watch that measures silence -----------------------------------
+
+    def test_a_blank_line_is_not_forwarded_to_the_parser(self):
+        """A line that says nothing is dropped before the parser sees it."""
+        runner = self._dispatch_runner()
+
+        runner.note_line("   \n")
+
+        runner.harness.parse_stream.assert_not_called()
+
+    def test_the_idle_watch_closes_a_stream_it_cannot_close(self):
+        """A stream that cannot be closed is not worth an exception.
+
+        The idle watch closes the child's stdout when the child has gone
+        quiet. A pipe that is already gone makes that close raise, and
+        the watcher must not die on it: the reader is the one that turns
+        the closed pipe into an idle timeout.
+        """
+        runner = self._dispatch_runner(idle_sec=0)
+        process = _watch_process(stdout_close_error=OSError("already closed"))
+
+        runner._idle_timer(process)
+
+        assert runner.idle_fired.is_set() is False
+
+    def test_the_total_watch_survives_a_failing_wait(self):
+        """A watcher whose wait fails gives up quietly.
+
+        The wait is how the watcher learns the reader has finished. If
+        the wait itself raises, the watcher has nothing left to do --
+        but it must not take the exception out of the reader's thread.
+        """
+        runner = self._dispatch_runner(total_sec=60)
+        runner.total_fired = _EventThatNeverFires()
+        process = _watch_process()
+
+        runner._total_timer(process)
+
+        assert runner.total_triggered is False
+
+    def test_the_total_watch_falls_back_to_a_direct_kill(self, monkeypatch):
+        """A group kill that fails is followed by a direct kill.
+
+        The cap fired, so the child has to go: the group kill is tried
+        first, and when it fails the child is killed directly. A direct
+        kill that fails too, and a stdout that cannot be closed, are
+        both survivable -- the reader is what reports the timeout.
+        """
+        def _group_kill(process, sig=None):
+            raise OSError("no such process group")
+
+        monkeypatch.setattr(ct, "kill_process_group", _group_kill)
+        runner = self._dispatch_runner(total_sec=-1)
+        process = _watch_process(
+            stdout_close_error=OSError("already closed"),
+            kill_error=OSError("no such process"),
+        )
+
+        runner._total_timer(process)
+
+        assert runner.total_triggered is True
+
+    # -- the stream report -----------------------------------------------
+
+    def test_the_stream_report_names_the_tools_the_agent_called(self, caplog):
+        """A tool call and its answer are both reported.
+
+        The report reads the blocks of the event the child's own parser
+        produced. A block that is not a mapping is not a block at all
+        and is skipped; a tool call and a tool answer are the two the
+        main log cares about.
+        """
+        runner = self._dispatch_runner()
+        event = SimpleNamespace(raw={"message": {"content": [
+            "not a block at all",
+            {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+            {"type": "tool_result", "tool_use_id": "tool-1", "content": "done"},
+        ]}})
+
+        with caplog.at_level(logging.INFO, logger="coding_tool"):
+            runner._forward(event)
+
+        reported = " ".join(record.getMessage() for record in caplog.records)
+        assert "tool_use" in reported
+        assert "Bash" in reported
+        assert "tool_result" in reported
+        assert "tool-1" in reported
+
+    def test_a_tool_input_that_cannot_be_serialised_is_summarised_not_raised(self, caplog):
+        """An input the log cannot serialise is reported as such.
+
+        The summary is deliberately a prefix of the input's JSON. An
+        input that cannot be serialised at all must not take the run
+        down -- the report says so in plain words instead.
+        """
+        runner = self._dispatch_runner()
+
+        with caplog.at_level(logging.INFO, logger="coding_tool"):
+            runner._log_tool_use({"name": "Odd", "input": {"unserialisable": object()}})
+
+        reported = " ".join(record.getMessage() for record in caplog.records)
+        assert "tool_use" in reported
+        assert "unserialisable" in reported
+
+    def test_a_tool_answer_made_of_blocks_is_flattened_into_a_summary(self, caplog):
+        """A tool answer is a string or a list of blocks; both are summarised."""
+        runner = self._dispatch_runner()
+
+        with caplog.at_level(logging.INFO, logger="coding_tool"):
+            runner._log_tool_result({
+                "tool_use_id": "tool-2",
+                "content": [{"text": "first "}, "second"],
+            })
+
+        reported = " ".join(record.getMessage() for record in caplog.records)
+        assert "tool_result" in reported
+        assert "tool-2" in reported
+        assert "first second" in reported
+
+    # -- the sandbox report ----------------------------------------------
+
+    @patch("coding_tool.subprocess.Popen")
+    def test_a_sandboxed_run_reports_the_profile_it_ran_under(self, mock_popen):
+        """A run the runner confined says which profile confined it.
+
+        The runner decides the sandbox and reports what it did in the
+        run's result. The dispatch turns that into a log line naming the
+        profile, so the operator can see what the child was confined to.
+        """
+        mock_popen.return_value = self._make_mock_process([
+            self._init_event(),
+            json.dumps({"type": "result", "result": "ok", "is_error": False}),
+        ])
+        decision = ct.claude_sandbox.SandboxDecision(
+            command=["/bin/sh", "-c", "true"],
+            profile=Path("/tmp/pdt-watch-profile.sb"),
+            reason="applied",
+            detail="applied",
+        )
+        log = MagicMock()
+
+        with patch.object(
+            ct.claude_sandbox, "wrap_command", return_value=decision
+        ), patch.object(
+            ct.claude_sandbox,
+            "resolve_sandbox_profile_file",
+            return_value=Path("/tmp/pdt-watch-profile.sb"),
+        ):
+            tool = ClaudeCodingTool(cwd=_REPO_ROOT, logger=log)
+            tool._run_claude_interactive("test prompt")
+
+        sandboxed = [
+            call for call in log.info.call_args_list
+            if call.args and call.args[0] == "subagent_sandboxed"
+        ]
+        assert sandboxed, "a confined run must report its profile"
+        assert sandboxed[0].kwargs["data"]["profile"] == "/tmp/pdt-watch-profile.sb"
+
+    @patch("coding_tool.subprocess.Popen")
+    def test_a_sandboxed_run_whose_profile_cannot_be_read_says_so(self, mock_popen):
+        """A profile the operator's machine cannot name is not worth a crash.
+
+        The report is a convenience: it names the profile the child ran
+        under. When the profile file cannot be resolved the run still
+        happened, so the report says "no profile" rather than failing.
+        """
+        mock_popen.return_value = self._make_mock_process([
+            self._init_event(),
+            json.dumps({"type": "result", "result": "ok", "is_error": False}),
+        ])
+        decision = ct.claude_sandbox.SandboxDecision(
+            command=["/bin/sh", "-c", "true"],
+            profile=Path("/tmp/pdt-watch-profile.sb"),
+            reason="applied",
+            detail="applied",
+        )
+        log = MagicMock()
+
+        with patch.object(
+            ct.claude_sandbox, "wrap_command", return_value=decision
+        ), patch.object(
+            ct.claude_sandbox,
+            "resolve_sandbox_profile_file",
+            side_effect=OSError("the profile file is gone"),
+        ):
+            tool = ClaudeCodingTool(cwd=_REPO_ROOT, logger=log)
+            tool._run_claude_interactive("test prompt")
+
+        sandboxed = [
+            call for call in log.info.call_args_list
+            if call.args and call.args[0] == "subagent_sandboxed"
+        ]
+        assert sandboxed, "a confined run must report, even without a profile"
+        assert sandboxed[0].kwargs["data"]["profile"] is None
+
+    # -- the session mapping ----------------------------------------------
+
+    def test_a_session_id_this_backend_did_not_mint_is_not_mapped(self, monkeypatch, tmp_path):
+        """An id the backend does not mint stays the name of the session.
+
+        The mapping exists so that a later process can find the
+        conversation a create really opened. An observed id that is not
+        shaped like one of this backend's session ids cannot be resumed,
+        so nothing is written -- and the pinned key stays the name of
+        the session.
+        """
+        from harness.session_map import SessionMap
+
+        mapping = SessionMap(tmp_path / "session-map.json")
+        monkeypatch.setattr(ct, "plan_session_map", lambda plan_id: mapping)
+        tool = ClaudeCodingTool(cwd=_REPO_ROOT)
+
+        observed = tool._register_session_mapping("pinned-key", "not-a-session-id")
+
+        assert observed == "not-a-session-id"
+        assert not (tmp_path / "session-map.json").exists()
+
+    def test_a_mapping_without_a_pinned_key_resolves_to_nothing(self, monkeypatch):
+        """No pinned key means no conversation, and nothing is invented."""
+        monkeypatch.setattr(ct, "plan_session_map", lambda plan_id: None)
+        tool = ClaudeCodingTool(cwd=_REPO_ROOT)
+
+        assert tool._mapped_session(None) is None
